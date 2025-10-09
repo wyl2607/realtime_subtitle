@@ -1,0 +1,12 @@
+# 核心依赖
+faster-whisper>=1.0.0        # Whisper 语音识别
+requests>=2.28.0              # Ollama API 调用
+torch>=2.0.0                  # PyTorch (GPU加速，faster-whisper依赖)
+numpy>=1.24.0                 # 数值计算
+
+# 音频处理
+pyaudiowpatch>=0.2.0          # Windows 系统音频捕获 (WASAPI Loopback)
+librosa>=0.10.0               # 音频重采样和处理
+
+# 用户界面
+PyQt5>=5.15.0                 # GUI 框架

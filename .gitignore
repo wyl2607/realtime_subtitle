@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 模型缓存
+.cache/
+models/
+
+# 日志
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
