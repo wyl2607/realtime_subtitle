@@ -4,11 +4,28 @@ Whisper + LLM 句子队列翻译模块
 """
 import warnings
 import logging
+import sys
+import os
 import time
-import torch
 import requests
 import re
 import numpy as np
+
+# torch本身在这个项目里没用（faster-whisper走ctranslate2），但venv里的
+# ctranslate2版本会在内部无条件import torch。必须在下面往PATH里注入
+# nvidia cublas目录【之前】加载torch——注入后再首次加载torch出现过
+# c10.dll初始化失败(WinError 1114)，先加载则一直稳定
+import torch
+
+# ctranslate2 在 Windows 上通过 LoadLibraryA("cublas64_12.dll") 按名加载，
+# 只认 PATH，不认 os.add_dll_directory 注册的路径，所以要直接塞进 PATH
+if sys.platform == "win32":
+    try:
+        import nvidia.cublas
+        os.environ["PATH"] = os.path.join(list(nvidia.cublas.__path__)[0], "bin") + os.pathsep + os.environ["PATH"]
+    except ImportError:
+        pass
+
 from faster_whisper import WhisperModel
 from difflib import SequenceMatcher
 import config
@@ -43,23 +60,29 @@ class WhisperQueueTranslator:
             # 最后一句的稳定性检测
             self.last_sentence = None  # 上次的最后一句
             self.last_sentence_count = 0  # 最后一句连续出现次数
-            self.last_audio_time = time.time()  # 最后一次音频时间
+            self.last_audio_time = time.time()  # 最后一次处理音频的墙钟时间（flush用）
+            self.last_capture_end = None  # 上一段音频在采集端结束的时刻（算真实间隔用）
             
             # 音频上下文缓冲（滑动窗口）
             self.audio_context_buffer = []
             
             # 创建复用的HTTP会话（用于Ollama）
             self.ollama_session = requests.Session()
-            
+
+            # 启动时检查Ollama是否可达（不可达只警告，不中断启动）
+            try:
+                self.ollama_session.get(f"{config.OLLAMA_BASE_URL}/api/version", timeout=2)
+                print(f"✅ Ollama 连接正常 ({config.OLLAMA_MODEL})")
+            except requests.RequestException:
+                print(f"⚠️  无法连接 Ollama ({config.OLLAMA_BASE_URL})，字幕将只显示德语原文")
+                print(f"   请确认 Ollama 已启动: ollama serve")
+
             elapsed = time.time() - start_time
             print(f"✅ Whisper 模型加载完成！({elapsed:.1f}秒)")
             print(f"✅ 句子队列翻译方案已启用（队列大小: {self.max_queue_size}）")
             
             # 显示设备信息
             print(f"   设备: {config.WHISPER_DEVICE.upper()}")
-            if config.WHISPER_DEVICE == "cuda" and torch.cuda.is_available():
-                gpu_name = torch.cuda.get_device_name(0)
-                print(f"   GPU: {gpu_name}")
             
         except Exception as e:
             print(f"❌ 模型加载失败: {e}")
@@ -130,50 +153,45 @@ class WhisperQueueTranslator:
             self.sentence_queue.pop(0)
         return item
     
-    def _translate_single_sentence(self, sentence, english_context):
-        """翻译单个句子"""
+    def _format_bilingual(self, source_text, translation):
+        """格式化为德中双语字幕"""
+        # 翻译失败时translation就是德语原文，双语模式下避免同一句显示两遍
+        if getattr(config, "SHOW_BILINGUAL", False) and translation != source_text:
+            return f"{source_text}\n{translation}"
+        return translation
+
+    def _translate_single_sentence(self, sentence, german_context):
+        """翻译单个句子（德语 -> 中文）"""
         try:
-            # 构建prompt（明确LLM职责）
-            prompt = f"""/no_think 你是一个专业的实时字幕翻译助手，请完成以下翻译任务：
+            # 术语表只注入当前句子/上下文里真出现的词条，prompt保持精简
+            haystack = f"{german_context} {sentence}".lower()
+            matched_terms = [
+                f"{de} → {zh}" for de, zh in config.GLOSSARY.items()
+                if de.lower() in haystack
+            ]
+            glossary_block = ""
+            if matched_terms:
+                glossary_block = "\n【术语表：以下人名/党派/术语必须照用这些译名】\n" + "\n".join(matched_terms[:12]) + "\n"
 
-【核心要求】
-⚠️ 必须结合上下文理解当前句子的真实含义，不要进行孤立的字面翻译
-⚠️ 根据上下文判断词语的实际意思（例如：在分手场景中，"I'm done" 应译为"我受够了"而非"我完成了"）
+            prompt = f"""/no_think 你是专业的德语实时字幕翻译助手。请把德语句子翻译成自然流畅的简体中文。
 
-【如何使用上下文】
-1. 先阅读英文上下文，理解当前的情境、场景、话题
-2. 判断当前句子在这个情境中的真实意图和情感色彩
-3. 选择符合情境的中文表达，而不是直译
-4. 注意人物代词（he/she/they）的指代关系
-5. 注意时态和语气的连贯性
-6. 注意专有名词的一致性（如人名、地名）
-
-【翻译要求】
-1. 必须参考上下文来确定词语的准确含义
-2. 翻译要准确、流畅、符合中文表达习惯
-3. 保持与上下文的情境一致性和语义连贯性
-4. 仅输出中文翻译结果，不要有任何解释或多余内容
-
-【示例】
-上下文："I can't do this anymore. We're not working out."
-待翻译："I'm done."
-分析：这是分手场景，"done"表示受够了、结束关系
-正确翻译：我受够了。
-错误翻译：我完成了。❌
-
-【英文上下文】
+【要求】
+1. 结合上下文理解句意，不要机械直译
+2. 保留说话语气和口语感
+3. 专有名词保持一致
+4. 只输出中文翻译，不要解释，不要输出德语
+{glossary_block}
+【德语上下文】
 ***
-{english_context if english_context else "（无上下文）"}
+{german_context if german_context else "（无上下文）"}
 ***
 
-【当前需要翻译的句子】
+【当前德语句子】
 ***
 {sentence}
 ***
 
-请先在心中理解上下文的情境，然后翻译当前句子。
-输出：
-【中文翻译结果】
+中文翻译：
 """
             
             response = self.ollama_session.post(
@@ -182,15 +200,18 @@ class WhisperQueueTranslator:
                     "model": config.OLLAMA_MODEL,
                     "prompt": prompt,
                     "stream": False,
+                    "think": False,
                     "options": {
                         "temperature": 0.3,
                         "top_p": 0.9,
                         "num_predict": 512,
-                        "num_ctx": 2048,
+                        "num_ctx": 4096,  # prompt多了术语表，2048偏紧
                         "num_gpu": 50,
                     }
                 },
-                timeout=30
+                # 实时字幕等不起30秒：单线程翻译池被一次慢请求堵住时，
+                # 音频队列(约5秒容量)必然溢出丢音频，超时后显示德语原文往前走
+                timeout=10
             )
             
             if response.status_code == 200:
@@ -203,24 +224,41 @@ class WhisperQueueTranslator:
                 
                 return translation
             else:
+                print(f"   ⚠️  Ollama 返回错误 (HTTP {response.status_code})，显示德语原文")
                 return sentence
-                
+
         except Exception as e:
-            if config.SHOW_PERFORMANCE:
-                print(f"   ⚠️  翻译失败: {e}")
+            print(f"   ⚠️  翻译失败: {e}，显示德语原文")
             return sentence
     
-    def translate(self, audio_data):
-        """翻译音频"""
+    def translate(self, audio_data, capture_time=None):
+        """翻译音频
+
+        Args:
+            audio_data: numpy float32 音频
+            capture_time: 采集端提交这段音频的时刻（段尾时间戳）。
+                用它算两段音频之间的真实间隔——之前用两次translate()调用
+                的间隔当"静音时长"，结果把Whisper自己0.3-1.5秒的处理耗时
+                也算成了静音，连续说话时也会误判"说完了"
+        """
         try:
-            if config.SHOW_PERFORMANCE:
-                start_time = time.time()
-            
-            # 更新最后一次音频时间
-            current_time = time.time()
-            silence_duration = current_time - self.last_audio_time
-            self.last_audio_time = current_time
-            
+            start_time = time.time()
+            self.last_audio_time = start_time  # flush_pending靠它判断"多久没新音频"
+
+            # 真实音频间隔 = 当前段开始时刻 - 上一段结束时刻
+            if capture_time is None:
+                capture_time = start_time
+            segment_start = capture_time - len(audio_data) / config.SAMPLE_RATE
+            real_gap = (segment_start - self.last_capture_end) if self.last_capture_end else 0.0
+            self.last_capture_end = capture_time
+
+            # 长时间没声音（暂停/直播安静）后恢复：暂停前的音频上下文已经过时，
+            # 不清掉会把旧内容拼进新音频里重新识别一遍
+            if real_gap > 5.0 and self.audio_context_buffer:
+                if config.SHOW_PERFORMANCE:
+                    print(f"   🧹 音频中断{real_gap:.1f}秒，清空音频上下文")
+                self.audio_context_buffer = []
+
             # 添加当前音频到上下文缓冲区
             self.audio_context_buffer.append(audio_data)
             if len(self.audio_context_buffer) > config.AUDIO_CONTEXT_WINDOW:
@@ -291,12 +329,10 @@ class WhisperQueueTranslator:
                     else:
                         self.last_sentence = current_last_sentence
                         self.last_sentence_count = 1
-                    
-                    # 条件2：静音时间超过0.5秒
-                    if silence_duration > 0.5:
-                        last_sentence_stable = True
-                        if config.SHOW_PERFORMANCE:
-                            print(f"   ✅ 最后一句稳定（静音{silence_duration:.1f}秒）")
+
+                    # 说明：之前这里还有"两次调用间隔>0.5秒就算稳定"的条件，
+                    # 但那个间隔混入了识别耗时，连续说话时也频繁误触发，
+                    # 导致半截句被提前翻译。真正说完了的尾句由flush_pending()兜底。
                 else:
                     # 已翻译过，不再处理
                     if config.SHOW_PERFORMANCE:
@@ -313,20 +349,14 @@ class WhisperQueueTranslator:
                 # 如果最后一句稳定，也翻译
                 if last_sentence_stable:
                     sentences_to_translate.append(sentences[-1])
-                
-                # 简化调试输出
-                pass
-                        
+
             elif len(sentences) == 2:
                 # 跳过第一句，最后一句根据稳定性
                 if last_sentence_stable:
                     sentences_to_translate = [sentences[1]]
                 else:
                     sentences_to_translate = []
-                
-                # 简化调试输出
-                pass
-                        
+
             else:
                 # 只有1句，根据稳定性
                 if last_sentence_stable:
@@ -351,21 +381,22 @@ class WhisperQueueTranslator:
                 
                 # 合并所有短句子
                 combined_sentence = " ".join([item['text'] for item in untranslated_short_sentences])
-                english_context = " ".join([item['text'] for item in self.sentence_queue])
+                german_context = " ".join([item['text'] for item in self.sentence_queue])
                 
                 if config.SHOW_PERFORMANCE:
                     print(f"   🔤 翻译(合并): {combined_sentence[:50]}...")
                 
-                translation = self._translate_single_sentence(combined_sentence, english_context)
+                translation = self._translate_single_sentence(combined_sentence, german_context)
                 
                 if translation:
+                    display_text = self._format_bilingual(combined_sentence, translation)
                     # 标记所有短句子为已翻译（使用相同的翻译）
                     for item in untranslated_short_sentences:
                         item['is_translated'] = True
                         item['translation'] = translation
                     
                     # 添加翻译结果
-                    new_translations.append(translation)
+                    new_translations.append(display_text)
             
             for sentence in sentences_to_translate:
                 # 检查句子长度（单词数）
@@ -381,10 +412,7 @@ class WhisperQueueTranslator:
                 
                 # 步骤3：查找相似句子
                 similar_item = self._find_similar_sentence(sentence)
-                
-                # 简化调试输出
-                pass
-                
+
                 if similar_item:
                     # 找到相似句子
                     if similar_item['is_translated']:
@@ -395,20 +423,20 @@ class WhisperQueueTranslator:
                     # 没有相似句子，添加到队列
                     similar_item = self._add_sentence_to_queue(sentence)
                 
-                # 步骤4：翻译句子（使用队列中的英文原文作为上下文）
-                # 获取最近的英文上下文（最多10条）
-                english_context = " ".join([item['text'] for item in self.sentence_queue])
+                # 步骤4：翻译句子（使用队列中的德语原文作为上下文）
+                german_context = " ".join([item['text'] for item in self.sentence_queue])
                 
                 if config.SHOW_PERFORMANCE:
                     print(f"   🔤 翻译({word_count}词): {sentence}")
                 
-                translation = self._translate_single_sentence(sentence, english_context)
+                translation = self._translate_single_sentence(sentence, german_context)
                 
                 if translation:
+                    display_text = self._format_bilingual(sentence, translation)
                     # 标记为已翻译并保存
                     similar_item['is_translated'] = True
                     similar_item['translation'] = translation
-                    new_translations.append(translation)
+                    new_translations.append(display_text)
             
             # 步骤5：合并所有新翻译
             result = " ".join(new_translations) if new_translations else ""
@@ -429,6 +457,49 @@ class WhisperQueueTranslator:
             traceback.print_exc()
             return ""
     
+    def flush_pending(self, idle_seconds=2.0):
+        """把积压的未翻译句子强制翻译掉（尾句兜底）
+
+        短句平时要攒够3个才合并翻译、末句要"连续出现2次"才算稳定——
+        一段话说完之后没有新音频，translate()就不会再被调用，
+        最后一两句会永远卡在队列里不显示。主程序定时调用这里兜底：
+        距离上一次收到音频超过idle_seconds才动手，说话中途不会插手。
+        和translate()跑在同一个单线程池里，天然串行，不需要加锁。
+        """
+        if time.time() - self.last_audio_time < idle_seconds:
+            return ""
+
+        pending = [item for item in self.sentence_queue if not item['is_translated']]
+
+        # 末句可能因为"未稳定"从来没进过队列，这里一并捞回来
+        if self.last_sentence:
+            similar = self._find_similar_sentence(self.last_sentence)
+            if similar is None:
+                pending.append(self._add_sentence_to_queue(self.last_sentence))
+            elif not similar['is_translated'] and similar not in pending:
+                pending.append(similar)
+            self.last_sentence = None
+            self.last_sentence_count = 0
+
+        if not pending:
+            return ""
+
+        combined = " ".join(item['text'] for item in pending)
+        german_context = " ".join(item['text'] for item in self.sentence_queue)
+
+        if config.SHOW_PERFORMANCE:
+            print(f"   🧹 收尾翻译{len(pending)}句: {combined[:50]}{'...' if len(combined) > 50 else ''}")
+
+        translation = self._translate_single_sentence(combined, german_context)
+        if not translation:
+            return ""
+
+        for item in pending:
+            item['is_translated'] = True
+            item['translation'] = translation
+
+        return self._format_bilingual(combined, translation)
+
     def __del__(self):
         """清理资源"""
         try:
@@ -436,8 +507,6 @@ class WhisperQueueTranslator:
                 del self.model
             if hasattr(self, 'ollama_session'):
                 self.ollama_session.close()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
         except:
             pass
 

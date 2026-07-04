@@ -1,12 +1,19 @@
 # 核心依赖
 faster-whisper>=1.0.0        # Whisper 语音识别
 requests>=2.28.0              # Ollama API 调用
-torch>=2.0.0                  # PyTorch (GPU加速，faster-whisper依赖)
+torch>=2.0.0                  # CPU版即可：项目本身不用torch，但ctranslate2内部会import它
 numpy>=1.24.0                 # 数值计算
+
+# CUDA 运行库（缺了程序起不来！）
+# Windows下ctranslate2按名字LoadLibraryA加载cublas64_12.dll，
+# translator_queue.py 会把 nvidia.cublas 包的 bin 目录塞进 PATH
+nvidia-cublas-cu12>=12.0
+nvidia-cudnn-cu12>=9.0
 
 # 音频处理
 pyaudiowpatch>=0.2.0          # Windows 系统音频捕获 (WASAPI Loopback)
-librosa>=0.10.0               # 音频重采样和处理
+soxr>=0.3.0                   # 音频重采样（librosa太重，只用得到resample，底层就是soxr）
 
 # 用户界面
 PyQt5>=5.15.0                 # GUI 框架
+keyboard>=0.13.0              # 全局快捷键（Ctrl+Alt+P 暂停/继续）

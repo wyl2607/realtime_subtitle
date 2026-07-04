@@ -10,6 +10,7 @@ import config
 class SubtitleSignals(QObject):
     """信号对象（用于线程安全的UI更新）"""
     update = pyqtSignal(str)
+    status = pyqtSignal(str)  # 状态提示（如暂停/继续），不进字幕历史
 
 
 class DraggableWidget(QWidget):
@@ -48,19 +49,29 @@ class SettingsWindow(DraggableWidget):
         self.setWindowTitle("⚙️ 参数调节（可拖动）")
         self.setWindowFlags(Qt.WindowStaysOnTopHint)
         self.setGeometry(100, 100, 500, 600)
-        
+
+        # 记录启动时的config默认值（用于"恢复默认值"）
+        self._defaults = {
+            'MIN_AUDIO_DURATION': config.MIN_AUDIO_DURATION,
+            'MAX_AUDIO_DURATION': config.MAX_AUDIO_DURATION,
+            'SILENCE_DURATION': config.SILENCE_DURATION,
+            'ENERGY_THRESHOLD_SPEECH': config.ENERGY_THRESHOLD_SPEECH,
+            'MAX_SUBTITLE_LENGTH': config.MAX_SUBTITLE_LENGTH,
+            'AUDIO_CONTEXT_WINDOW': config.AUDIO_CONTEXT_WINDOW,
+        }
+
         layout = QVBoxLayout()
-        
+
         # 音频时长设置
         duration_group = QGroupBox("音频时长设置")
         duration_layout = QVBoxLayout()
-        
+
         self.min_duration_slider = self._create_slider(
-            "最小音频时长", 0.5, 3.0, config.MIN_AUDIO_DURATION, 0.1,
+            "最小音频时长", 0.1, 3.0, config.MIN_AUDIO_DURATION, 0.1,
             lambda v: setattr(config, 'MIN_AUDIO_DURATION', v)
         )
         self.max_duration_slider = self._create_slider(
-            "最大音频时长", 1.0, 5.0, config.MAX_AUDIO_DURATION, 0.5,
+            "最大音频时长", 0.3, 5.0, config.MAX_AUDIO_DURATION, 0.1,
             lambda v: setattr(config, 'MAX_AUDIO_DURATION', v)
         )
         self.silence_slider = self._create_slider(
@@ -90,12 +101,12 @@ class SettingsWindow(DraggableWidget):
         display_layout = QVBoxLayout()
         
         self.max_length_slider = self._create_slider(
-            "最大字符数", 50, 300, config.MAX_SUBTITLE_LENGTH, 10,
+            "最大字符数", 50, 600, config.MAX_SUBTITLE_LENGTH, 10,
             lambda v: setattr(config, 'MAX_SUBTITLE_LENGTH', int(v))
         )
-        
+
         self.audio_context_slider = self._create_slider(
-            "识别音频窗口", 1, 10, config.AUDIO_CONTEXT_WINDOW, 1,
+            "识别音频窗口", 1, 30, config.AUDIO_CONTEXT_WINDOW, 1,
             lambda v: setattr(config, 'AUDIO_CONTEXT_WINDOW', int(v))
         )
         
@@ -125,11 +136,11 @@ class SettingsWindow(DraggableWidget):
         label_widget = QLabel(f"{label}:")
         label_widget.setMinimumWidth(120)
         
-        # 滑块
+        # 滑块（用round避免浮点截断，如0.01/0.001=9.999...被int截成9）
         slider = QSlider(Qt.Horizontal)
-        slider.setMinimum(int(min_val / step))
-        slider.setMaximum(int(max_val / step))
-        slider.setValue(int(current_val / step))
+        slider.setMinimum(round(min_val / step))
+        slider.setMaximum(round(max_val / step))
+        slider.setValue(round(current_val / step))
         
         # 数值显示
         value_label = QLabel(f"{current_val:.3f}")
@@ -152,22 +163,19 @@ class SettingsWindow(DraggableWidget):
         return {'widget': widget, 'slider': slider, 'label': value_label, 'step': step}
     
     def _reset_defaults(self):
-        """恢复默认值"""
-        config.MIN_AUDIO_DURATION = 1.0
-        config.MAX_AUDIO_DURATION = 2.0
-        config.SILENCE_DURATION = 0.6
-        config.ENERGY_THRESHOLD_SPEECH = 0.01
-        config.MAX_SUBTITLE_LENGTH = 150
-        config.AUDIO_CONTEXT_WINDOW = 5
-        
-        # 更新滑块位置
-        self.min_duration_slider['slider'].setValue(int(1.0 / self.min_duration_slider['step']))
-        self.max_duration_slider['slider'].setValue(int(2.0 / self.max_duration_slider['step']))
-        self.silence_slider['slider'].setValue(int(0.6 / self.silence_slider['step']))
-        self.speech_threshold_slider['slider'].setValue(int(0.01 / self.speech_threshold_slider['step']))
-        self.max_length_slider['slider'].setValue(int(150 / self.max_length_slider['step']))
-        self.audio_context_slider['slider'].setValue(int(5 / self.audio_context_slider['step']))
-        
+        """恢复默认值（恢复到config.py里的启动默认值）"""
+        # 通过滑块setValue触发valueChanged回调，自动同步config和数值标签
+        pairs = [
+            (self.min_duration_slider, 'MIN_AUDIO_DURATION'),
+            (self.max_duration_slider, 'MAX_AUDIO_DURATION'),
+            (self.silence_slider, 'SILENCE_DURATION'),
+            (self.speech_threshold_slider, 'ENERGY_THRESHOLD_SPEECH'),
+            (self.max_length_slider, 'MAX_SUBTITLE_LENGTH'),
+            (self.audio_context_slider, 'AUDIO_CONTEXT_WINDOW'),
+        ]
+        for slider_info, key in pairs:
+            slider_info['slider'].setValue(round(self._defaults[key] / slider_info['step']))
+
         print("🔄 参数已恢复默认值")
 
 class SubtitleWindow:
@@ -182,9 +190,9 @@ class SubtitleWindow:
         # 创建信号对象
         self.signals = SubtitleSignals()
         
-        # 字幕历史（保存最近3行）
+        # 字幕历史（双语时每条占2行，窗口高度220px放不下3条6行，只留2条）
         self.subtitle_history = []
-        self.max_lines = 3
+        self.max_lines = 2 if config.SHOW_BILINGUAL else 3
         
         # 创建主容器窗口（使用可拖动的容器）
         self.container = DraggableWidget()
@@ -293,6 +301,7 @@ class SubtitleWindow:
         
         # 连接信号到槽（线程安全）
         self.signals.update.connect(self._update_text)
+        self.signals.status.connect(self._show_status)
         
         print("✅ 字幕窗口已创建")
         print(f"   位置: ({config.WINDOW_X}, {config.WINDOW_Y})")
@@ -345,11 +354,29 @@ class SubtitleWindow:
             # 空文本不更新显示
             pass
     
+    def show_status(self, text):
+        """显示一条状态提示（线程安全，可从任何线程调用）
+
+        和字幕不同：不进subtitle_history，下一条真字幕到来时自然被覆盖
+        """
+        self.signals.status.emit(text)
+
+    def _show_status(self, text):
+        """内部状态显示（在主线程执行）"""
+        combined = self.subtitle_history + [text]
+        self.window.setText("\n".join(combined))
+        self.window.show()
+
     def _minimize_window(self):
-        """最小化字幕窗口"""
-        self.window.hide()
-        if config.SHOW_PERFORMANCE:
-            print("   ➖ 字幕已最小化")
+        """最小化/恢复字幕窗口（之前点一次就永久隐藏且窗口缩成一条，改成可切换）"""
+        if self.window.isVisible():
+            self.window.hide()
+            if config.SHOW_PERFORMANCE:
+                print("   ➖ 字幕已最小化（再点一次➖恢复）")
+        else:
+            self.window.show()
+            if config.SHOW_PERFORMANCE:
+                print("   ➕ 字幕已恢复")
     
     def _toggle_settings(self):
         """切换设置窗口显示"""
