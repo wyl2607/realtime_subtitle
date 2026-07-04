@@ -9,7 +9,11 @@
 WHISPER_MODEL = "large-v3-turbo"  # tiny, base, small, medium, large-v3, large-v3-turbo
 WHISPER_DEVICE = "cuda"  # cuda 或 cpu
 WHISPER_COMPUTE_TYPE = "int8"  # float16, int8, int8_float16 (large-v3建议int8)
-WHISPER_LANGUAGE = "de"  # 固定德语识别
+# 源语言（Whisper语言代码）。运行中可用 Ctrl+Alt+L 在 LANGUAGE_CYCLE 里循环切换，
+# 不需要重启：语言只是识别参数，模型本身是多语言的
+SOURCE_LANGUAGE = "de"
+LANGUAGE_CYCLE = ["de", "en"]  # 热键循环切换的语言列表，想看别的语言往里加
+LANGUAGE_NAMES = {"de": "德语", "en": "英语", "fr": "法语", "es": "西班牙语", "ja": "日语"}
 WHISPER_TASK = "transcribe"  # "transcribe"=转录原语言, "translate"=翻译成英文
 WHISPER_BEAM_SIZE = 3  # beam search 大小，large-v3用3就够了（减少延迟）
 WHISPER_TEMPERATURE = 0.0  # 温度参数，0=确定性输出，提高标点一致性
@@ -99,6 +103,25 @@ GLOSSARY = {
     "Verfassungsschutz": "联邦宪法保卫局",
     "Grundgesetz": "基本法",
 }
+
+# ============ 幻觉字幕黑名单 ============
+# Whisper在静音/纯音乐段落会凭空生成电视字幕组的版权惯用语
+# （训练数据里的电视字幕都带这些，实测2小时里606条字幕混进17条）。
+# 识别出的片段只要包含以下任一子串（不区分大小写）就直接丢弃。
+# 注意只放"真人说话几乎不可能出现"的词，避免误杀
+HALLUCINATION_BLACKLIST = [
+    "untertitel",          # "Untertitelung des ZDF, 2020" 及各种变体
+    "amara.org",           # 社区字幕平台署名
+    "copyright",           # "Copyright WDR 2021" 等
+    "danke fürs zuschauen",
+    "vielen dank für's zuschauen",
+    "thanks for watching",  # 英语源的同类幻觉
+    "subtitles by",
+]
+
+# ============ 字幕记录 ============
+SAVE_TRANSCRIPT = True  # 把每条字幕（原文+译文+时间）存到文件，方便回看/搜索/学语言
+TRANSCRIPT_DIR = "transcripts"  # 相对仓库目录，每天一个文件 YYYY-MM-DD.txt
 
 # ============ 日志配置 ============
 SHOW_PERFORMANCE = True  # 显示性能指标

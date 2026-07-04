@@ -69,6 +69,18 @@ class WhisperQueueTranslator:
             # 创建复用的HTTP会话（用于Ollama）
             self.ollama_session = requests.Session()
 
+            # 字幕记录（原文+译文+时间戳，每天一个文件）
+            self._transcript_ok = bool(getattr(config, "SAVE_TRANSCRIPT", False))
+            if self._transcript_ok:
+                self._transcript_dir = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), config.TRANSCRIPT_DIR)
+                try:
+                    os.makedirs(self._transcript_dir, exist_ok=True)
+                    print(f"📝 字幕记录已开启: {config.TRANSCRIPT_DIR}\\日期.txt")
+                except OSError as e:
+                    print(f"⚠️  字幕记录目录创建失败，记录功能关闭: {e}")
+                    self._transcript_ok = False
+
             # 启动时检查Ollama是否可达（不可达只警告，不中断启动）
             try:
                 self.ollama_session.get(f"{config.OLLAMA_BASE_URL}/api/version", timeout=2)
@@ -88,6 +100,32 @@ class WhisperQueueTranslator:
             print(f"❌ 模型加载失败: {e}")
             raise
     
+    def _is_hallucination(self, text):
+        """判断识别片段是否为Whisper幻觉（静音时凭空生成的电视字幕惯用语）"""
+        lowered = text.lower()
+        return any(pattern in lowered for pattern in config.HALLUCINATION_BLACKLIST)
+
+    def _save_transcript(self, source_text, translation):
+        """把一条字幕追加到当天的记录文件（失败一次就关闭，不刷屏）"""
+        if not self._transcript_ok:
+            return
+        try:
+            path = os.path.join(self._transcript_dir, time.strftime("%Y-%m-%d") + ".txt")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] {source_text}\n")
+                f.write(f"           {translation}\n\n")
+        except OSError as e:
+            print(f"⚠️  字幕记录写入失败，记录功能关闭: {e}")
+            self._transcript_ok = False
+
+    def clear_context(self):
+        """清空识别/翻译上下文（切换源语言时调用，跑在翻译线程池里保证串行）"""
+        self.audio_context_buffer = []
+        self.sentence_queue = []
+        self.last_sentence = None
+        self.last_sentence_count = 0
+        print("🧹 已清空识别与翻译上下文")
+
     def _normalize_text(self, text):
         """标准化文本（用于相似度对比）"""
         text = text.lower().strip()
@@ -161,8 +199,10 @@ class WhisperQueueTranslator:
         return translation
 
     def _translate_single_sentence(self, sentence, german_context):
-        """翻译单个句子（德语 -> 中文）"""
+        """翻译单个句子（源语言 -> 中文）"""
         try:
+            lang_name = config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)
+
             # 术语表只注入当前句子/上下文里真出现的词条，prompt保持精简
             haystack = f"{german_context} {sentence}".lower()
             matched_terms = [
@@ -173,20 +213,20 @@ class WhisperQueueTranslator:
             if matched_terms:
                 glossary_block = "\n【术语表：以下人名/党派/术语必须照用这些译名】\n" + "\n".join(matched_terms[:12]) + "\n"
 
-            prompt = f"""/no_think 你是专业的德语实时字幕翻译助手。请把德语句子翻译成自然流畅的简体中文。
+            prompt = f"""/no_think 你是专业的{lang_name}实时字幕翻译助手。请把{lang_name}句子翻译成自然流畅的简体中文。
 
 【要求】
 1. 结合上下文理解句意，不要机械直译
 2. 保留说话语气和口语感
 3. 专有名词保持一致
-4. 只输出中文翻译，不要解释，不要输出德语
+4. 只输出中文翻译，不要解释，不要输出{lang_name}原文
 {glossary_block}
-【德语上下文】
+【{lang_name}上下文】
 ***
 {german_context if german_context else "（无上下文）"}
 ***
 
-【当前德语句子】
+【当前{lang_name}句子】
 ***
 {sentence}
 ***
@@ -273,7 +313,7 @@ class WhisperQueueTranslator:
             # Whisper识别
             segments, info = self.model.transcribe(
                 combined_audio,
-                language=config.WHISPER_LANGUAGE,
+                language=config.SOURCE_LANGUAGE,
                 task=config.WHISPER_TASK,
                 beam_size=config.WHISPER_BEAM_SIZE,
                 temperature=config.WHISPER_TEMPERATURE,
@@ -282,12 +322,18 @@ class WhisperQueueTranslator:
                 initial_prompt=None,  # 移除initial_prompt，避免被当作识别结果
             )
             
-            # 收集识别结果
+            # 收集识别结果（顺手丢掉幻觉片段——静音时Whisper会背出
+            # "Untertitelung des ZDF"之类的电视字幕版权惯用语）
             full_text = ""
             for segment in segments:
                 text = segment.text.strip()
-                if text:
-                    full_text += text + " "
+                if not text:
+                    continue
+                if self._is_hallucination(text):
+                    if config.SHOW_PERFORMANCE:
+                        print(f"   🚫 丢弃幻觉片段: {text[:40]}")
+                    continue
+                full_text += text + " "
             full_text = full_text.strip()
             
             if config.SHOW_PERFORMANCE:
@@ -390,11 +436,12 @@ class WhisperQueueTranslator:
                 
                 if translation:
                     display_text = self._format_bilingual(combined_sentence, translation)
+                    self._save_transcript(combined_sentence, translation)
                     # 标记所有短句子为已翻译（使用相同的翻译）
                     for item in untranslated_short_sentences:
                         item['is_translated'] = True
                         item['translation'] = translation
-                    
+
                     # 添加翻译结果
                     new_translations.append(display_text)
             
@@ -433,6 +480,7 @@ class WhisperQueueTranslator:
                 
                 if translation:
                     display_text = self._format_bilingual(sentence, translation)
+                    self._save_transcript(sentence, translation)
                     # 标记为已翻译并保存
                     similar_item['is_translated'] = True
                     similar_item['translation'] = translation
@@ -498,6 +546,7 @@ class WhisperQueueTranslator:
             item['is_translated'] = True
             item['translation'] = translation
 
+        self._save_transcript(combined, translation)
         return self._format_bilingual(combined, translation)
 
     def __del__(self):

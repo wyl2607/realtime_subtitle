@@ -137,8 +137,25 @@ class SubtitleApp:
             except OSError as e:
                 print(f"⚠️  切换暂停状态失败: {e}")
 
+        def switch_language():
+            cycle = config.LANGUAGE_CYCLE
+            try:
+                idx = cycle.index(config.SOURCE_LANGUAGE)
+            except ValueError:
+                idx = -1  # 当前语言不在循环列表里（手改过config），切到列表第一个
+            config.SOURCE_LANGUAGE = cycle[(idx + 1) % len(cycle)]
+            name = config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)
+            # 旧语言的音频/句子上下文会污染新语言的识别和翻译，清掉（在翻译线程里串行执行）
+            try:
+                self.translator_executor.submit(self.translator.clear_context)
+            except RuntimeError:
+                return  # 程序正在退出，线程池已关闭
+            self.subtitle_window.show_status(f"🌐 源语言已切换: {name}")
+            print(f"🌐 [热键] 源语言切换为: {name}")
+
         keyboard.add_hotkey("ctrl+alt+p", toggle_pause)
-        print("⌨️  全局快捷键已注册: Ctrl+Alt+P = 暂停/继续（游戏里也能按）")
+        keyboard.add_hotkey("ctrl+alt+l", switch_language)
+        print("⌨️  全局快捷键已注册: Ctrl+Alt+P = 暂停/继续, Ctrl+Alt+L = 切换源语言")
 
     def _flush_check(self):
         """定时兜底：一段话说完后没有新音频，translate()不会再被调用，
@@ -252,6 +269,8 @@ class SubtitleApp:
         print(f"   - 语音停顿检测: {config.SILENCE_DURATION}秒")
         print(f"   - 翻译: Qwen + Whisper (Ollama {config.OLLAMA_MODEL})")
         print(f"   - 设备: {config.WHISPER_DEVICE.upper()}")
+        print(f"   - 源语言: {config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)}")
+        print(f"   - 快捷键: Ctrl+Alt+P 暂停/继续, Ctrl+Alt+L 切换源语言")
         print("\n" + "=" * 60)
         print("🎉 开始享受实时字幕吧！")
         print("=" * 60 + "\n")
