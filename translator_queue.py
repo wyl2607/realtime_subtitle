@@ -391,6 +391,15 @@ class WhisperQueueTranslator:
 
         self._append_committed(committed)
         self._enqueue_sentences(self._extract_sentences())
+
+        # 聊天/嘈杂语音下Whisper经常整段不打标点，残句永远凑不成句 →
+        # 超长就不等标点直接翻（实测聊天时德语堆在live行、中文迟迟不出）
+        if len(self.pending_text.split()) > config.MAX_PENDING_WORDS:
+            if config.SHOW_PERFORMANCE:
+                print(f"   ✂️  残句超{config.MAX_PENDING_WORDS}词无标点，强制送翻译")
+            self._enqueue_sentences([self.pending_text])
+            self.pending_text = ""
+
         self._emit_display()
 
         if config.SHOW_PERFORMANCE:

@@ -115,7 +115,12 @@ class OnlineASRProcessor:
             x = p.pop(-1)
             l += len(x) + 1
             prompt.append(x)
-        return "".join(prompt[::-1])
+        text = "".join(prompt[::-1])
+        # Whisper会模仿prompt的文风：嘈杂语音识别出的无标点文本进了prompt，
+        # 会诱导后续继续不打标点（恶性循环，句子切分全靠标点）。补个句号打断
+        if text and text[-1] not in ".!?…":
+            text += "."
+        return text
 
     def _is_hallucination(self, text):
         lowered = text.lower()
