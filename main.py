@@ -105,13 +105,16 @@ class SubtitleApp:
         # 积压设硬上限：识别速度赶不上时（比如GPU被游戏占着），无上限排队
         # 只会让字幕滞后越滚越大，不如丢块保实时。
         # 翻译已经在独立worker里跑，这里的积压纯粹是ASR跟不上（阈值可以更紧）
+        # 上限6：GPU偶发尖峰（Ollama和Whisper抢卡，单次识别到过2.5秒）会瞬间
+        # 积压3-5个，正常节奏下每块能追回~0.26秒、几秒内消化完。0.5秒节奏实测
+        # 上限4时3分钟丢1块——精听丢词比短暂滞后3秒更伤，放宽到6
         with self._pending_lock:
-            if self._pending_tasks >= 4:
+            if self._pending_tasks >= 6:
                 print(f"⚠️  识别积压 {self._pending_tasks} 个任务，丢弃本块音频保实时性")
                 return
             self._pending_tasks += 1
             pending = self._pending_tasks
-        if pending > 2:
+        if pending > 3:
             print(f"⚠️  识别积压 {pending} 个任务，字幕会有延迟（可考虑调大提交节奏或缩小缓冲上限）")
         future = self.translator_executor.submit(self.translator.translate, audio_data, capture_time)
         # 添加一个回调，当翻译完成后更新UI
