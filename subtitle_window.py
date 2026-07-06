@@ -9,7 +9,8 @@
 """
 import sys
 import html
-from PyQt5.QtWidgets import QLabel, QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSlider, QPushButton, QGroupBox
+import time
+from PyQt5.QtWidgets import QLabel, QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSlider, QPushButton, QGroupBox, QTextEdit
 from PyQt5.QtCore import Qt, pyqtSignal, QObject
 import config
 
@@ -65,6 +66,7 @@ class SettingsWindow(DraggableWidget):
             'IDLE_FLUSH_SEC': config.IDLE_FLUSH_SEC,
             'ENERGY_THRESHOLD_SPEECH': config.ENERGY_THRESHOLD_SPEECH,
             'MAX_SUBTITLE_LENGTH': config.MAX_SUBTITLE_LENGTH,
+            'MAX_SENTENCE_PAIRS': config.MAX_SENTENCE_PAIRS,
         }
 
         layout = QVBoxLayout()
@@ -112,7 +114,13 @@ class SettingsWindow(DraggableWidget):
             lambda v: setattr(config, 'MAX_SUBTITLE_LENGTH', int(v))
         )
 
+        self.max_pairs_slider = self._create_slider(
+            "句对条数", 1, 5, config.MAX_SENTENCE_PAIRS, 1,
+            lambda v: setattr(config, 'MAX_SENTENCE_PAIRS', int(v))
+        )
+
         display_layout.addWidget(self.max_length_slider['widget'])
+        display_layout.addWidget(self.max_pairs_slider['widget'])
         display_group.setLayout(display_layout)
         
         # 添加到主布局
@@ -172,11 +180,59 @@ class SettingsWindow(DraggableWidget):
             (self.idle_flush_slider, 'IDLE_FLUSH_SEC'),
             (self.speech_threshold_slider, 'ENERGY_THRESHOLD_SPEECH'),
             (self.max_length_slider, 'MAX_SUBTITLE_LENGTH'),
+            (self.max_pairs_slider, 'MAX_SENTENCE_PAIRS'),
         ]
         for slider_info, key in pairs:
             slider_info['slider'].setValue(round(self._defaults[key] / slider_info['step']))
 
         print("🔄 参数已恢复默认值")
+
+class HistoryWindow(QWidget):
+    """本场字幕历史（可滚动回看，精听时往上翻错过的句子）
+
+    只存内存里的本场内容；跨天/跨场的完整记录在 transcripts/ 目录。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("📜 字幕历史（本场）")
+        self.setWindowFlags(Qt.WindowStaysOnTopHint)
+        self.setGeometry(150, 120, 720, 560)
+
+        layout = QVBoxLayout()
+        self.text = QTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setStyleSheet(f"""
+            QTextEdit {{
+                background-color: rgb(20, 20, 20);
+                color: white;
+                font-size: {config.FONT_SIZE - 4}px;
+                font-family: {config.FONT_FAMILY};
+                border: none;
+                padding: 8px;
+            }}
+        """)
+        layout.addWidget(self.text)
+
+        hint = QLabel("往上滚动可回看；停在底部时新字幕自动跟进。完整记录在 transcripts\\ 目录。")
+        hint.setStyleSheet("color: #888; font-size: 12px;")
+        layout.addWidget(hint)
+        self.setLayout(layout)
+
+    def append_pair(self, german, chinese):
+        sb = self.text.verticalScrollBar()
+        at_bottom = sb.value() >= sb.maximum() - 10  # 用户没往上翻才自动跟进
+
+        cursor = self.text.textCursor()
+        cursor.movePosition(cursor.End)
+        stamp = time.strftime("%H:%M:%S")
+        block = f'<span style="color:#777">[{stamp}]</span> {html.escape(german)}<br>' if german else ""
+        block += f'<span style="color:#9ad0ff">{html.escape(chinese)}</span><br><br>'
+        cursor.insertHtml(block)
+
+        if at_bottom:
+            sb.setValue(sb.maximum())
+
 
 class SubtitleWindow:
     """字幕悬浮窗"""
@@ -232,6 +288,13 @@ class SubtitleWindow:
         self.minimize_btn.clicked.connect(self._minimize_window)
         self.minimize_btn.setToolTip("最小化字幕")
         
+        # 创建历史按钮
+        self.history_btn = QPushButton("📜")
+        self.history_btn.setFixedSize(30, 30)
+        self.history_btn.setStyleSheet(button_style)
+        self.history_btn.clicked.connect(self._toggle_history)
+        self.history_btn.setToolTip("字幕历史（可滚动回看）")
+
         # 创建设置按钮
         self.settings_btn = QPushButton("⚙️")
         self.settings_btn.setFixedSize(30, 30)
@@ -280,6 +343,7 @@ class SubtitleWindow:
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
         btn_layout.addWidget(self.minimize_btn)
+        btn_layout.addWidget(self.history_btn)
         btn_layout.addWidget(self.settings_btn)
         btn_layout.addWidget(self.quit_btn)
         container_layout.addLayout(btn_layout)
@@ -301,6 +365,9 @@ class SubtitleWindow:
         
         # 创建设置窗口（初始隐藏）
         self.settings_window = SettingsWindow()
+
+        # 创建历史窗口（初始隐藏）
+        self.history_window = HistoryWindow()
         
         # 连接信号到槽（线程安全）
         self.signals.update.connect(self._update_text)
@@ -350,6 +417,7 @@ class SubtitleWindow:
         while len(self.sentence_pairs) > max_pairs:
             self.sentence_pairs.pop(0)
         self.status_line = ""
+        self.history_window.append_pair(german, chinese)
         self._render()
         if config.SHOW_PERFORMANCE:
             print(f"💬 字幕: {chinese[:50]}{'...' if len(chinese) > 50 else ''}")
@@ -417,6 +485,15 @@ class SubtitleWindow:
             self.settings_window.hide()
         else:
             self.settings_window.show()
+
+    def _toggle_history(self):
+        """切换历史窗口显示"""
+        if self.history_window.isVisible():
+            self.history_window.hide()
+        else:
+            self.history_window.show()
+            sb = self.history_window.text.verticalScrollBar()
+            sb.setValue(sb.maximum())
     
     def _quit_application(self):
         """退出程序"""
