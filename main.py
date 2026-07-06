@@ -6,8 +6,6 @@ import warnings
 import logging
 import sys
 import os
-from threading import Lock
-from concurrent.futures import ThreadPoolExecutor
 
 # 控制台可能默认使用非UTF-8编码（如cp1252），会导致emoji/中文print崩溃
 if sys.platform == "win32":
@@ -66,13 +64,7 @@ class SubtitleApp:
             print(f"❌ 音频捕获初始化失败: {e}")
             sys.exit(1)
         
-        # 创建一个单线程的线程池来处理耗时的翻译任务
-        self.translator_executor = ThreadPoolExecutor(max_workers=1)
-
-        # 待处理任务计数（用于检测翻译积压导致的字幕延迟）
-        self._pending_lock = Lock()
-        self._pending_tasks = 0
-
+        # 识别/翻译线程池都由translator自己管理（收件箱合并模式，永不丢块）
         self.running = False
         print("✅ 所有组件初始化完成")
     
@@ -101,24 +93,9 @@ class SubtitleApp:
             audio_duration = len(audio_data) / config.SAMPLE_RATE
             print(f"\n📦 处理音频块: {audio_duration:.2f}秒")
 
-        # 提交识别任务到线程池，不阻塞当前线程。
-        # 积压设硬上限：识别速度赶不上时（比如GPU被游戏占着），无上限排队
-        # 只会让字幕滞后越滚越大，不如丢块保实时。
-        # 翻译已经在独立worker里跑，这里的积压纯粹是ASR跟不上（阈值可以更紧）
-        # 上限6：GPU偶发尖峰（Ollama和Whisper抢卡，单次识别到过2.5秒）会瞬间
-        # 积压3-5个，正常节奏下每块能追回~0.26秒、几秒内消化完。0.5秒节奏实测
-        # 上限4时3分钟丢1块——精听丢词比短暂滞后3秒更伤，放宽到6
-        with self._pending_lock:
-            if self._pending_tasks >= 6:
-                print(f"⚠️  识别积压 {self._pending_tasks} 个任务，丢弃本块音频保实时性")
-                return
-            self._pending_tasks += 1
-            pending = self._pending_tasks
-        if pending > 3:
-            print(f"⚠️  识别积压 {pending} 个任务，字幕会有延迟（可考虑调大提交节奏或缩小缓冲上限）")
-        future = self.translator_executor.submit(self.translator.translate, audio_data, capture_time)
-        # 添加一个回调，当翻译完成后更新UI
-        future.add_done_callback(self.on_translation_completed)
+        # 音频进translator收件箱：识别线程忙时块在收件箱里攒着，
+        # 醒来一口气全塞进缓冲只识别一遍——GPU被游戏抢走时字幕只滞后不丢词
+        self.translator.enqueue_audio(audio_data, capture_time)
 
     def _setup_hotkey(self):
         """注册全局暂停快捷键 Ctrl+Alt+P
@@ -154,11 +131,8 @@ class SubtitleApp:
                 idx = -1  # 当前语言不在循环列表里（手改过config），切到列表第一个
             config.SOURCE_LANGUAGE = cycle[(idx + 1) % len(cycle)]
             name = config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)
-            # 旧语言的音频/句子上下文会污染新语言的识别和翻译，清掉（在翻译线程里串行执行）
-            try:
-                self.translator_executor.submit(self.translator.clear_context)
-            except RuntimeError:
-                return  # 程序正在退出，线程池已关闭
+            # 旧语言的音频/句子上下文会污染新语言的识别和翻译，清掉（在识别线程里串行执行）
+            self.translator.request_clear_context()
             self.subtitle_window.show_status(f"🌐 源语言已切换: {name}")
             print(f"🌐 [热键] 源语言切换为: {name}")
 
@@ -167,36 +141,13 @@ class SubtitleApp:
         print("⌨️  全局快捷键已注册: Ctrl+Alt+P = 暂停/继续, Ctrl+Alt+L = 切换源语言")
 
     def _flush_check(self):
-        """定时兜底：一段话说完后没有新音频，translate()不会再被调用，
-        队列里攒着的未翻译尾句由这里冲出去（具体判断在flush_pending里）"""
+        """定时兜底：一段话说完后没有新音频，识别不会再被触发，
+        队列里攒着的未翻译尾句由这里冲出去（忙时不插队，判断在translator里）"""
         if not self.running:
             return
-        with self._pending_lock:
-            if self._pending_tasks > 0:
-                return  # 还有音频在排队处理，translate自己会消化
-            self._pending_tasks += 1
-        future = self.translator_executor.submit(self.translator.flush_pending)
-        future.add_done_callback(self.on_translation_completed)
+        self.translator.request_flush()
 
-    def on_translation_completed(self, future):
-        """
-        翻译完成后的回调（在线程池的线程中执行）
-        """
-        with self._pending_lock:
-            self._pending_tasks -= 1
 
-        if not self.running:
-            return
-
-        try:
-            # 显示由translator的on_display/on_pair回调直接驱动，
-            # 这里只消化异常（translate内部已兜底，这是最后防线）
-            future.result()
-        except Exception as e:
-            print(f"❌ 识别任务执行错误: {e}")
-            import traceback
-            traceback.print_exc()
-    
     def start(self):
         """启动应用"""
         print("\n🚀 正在启动应用...")
@@ -248,10 +199,8 @@ class SubtitleApp:
         except Exception as e:
             print(f"⚠️  停止音频捕获时出错: {e}")
 
-        # 优雅地关闭线程池（先ASR后翻译：ASR关完就不会再往翻译队列塞句子）
-        print("   - 正在关闭识别线程...")
-        self.translator_executor.shutdown(wait=True, cancel_futures=False)
-        print("   - 正在关闭翻译线程...")
+        # 优雅地关闭识别/翻译线程（translator内部先ASR后翻译）
+        print("   - 正在关闭识别与翻译线程...")
         self.translator.shutdown()
 
         print("👋 应用已关闭，再见！")

@@ -77,6 +77,15 @@ class WhisperQueueTranslator:
             self.last_audio_time = time.time()  # flush_pending靠它判断"多久没新音频"
             self.last_capture_end = None  # 上一段音频在采集端结束的时刻（算真实间隔用）
 
+            # ASR收件箱：采集线程只管往里放，识别线程每次醒来把攒下的块
+            # 一口气全塞进缓冲、只识别一遍。GPU被游戏/共享抢走时字幕只是
+            # 滞后几秒，不丢词；GPU恢复后自动追上（旧方案是每块一个任务，
+            # 积压满8个就丢块——聊天场景实测丢过）
+            self._asr_lock = Lock()
+            self._audio_inbox = []      # [(audio, capture_time)]
+            self._asr_scheduled = False
+            self._asr_executor = ThreadPoolExecutor(max_workers=1)
+
             # 翻译队列：ASR线程往里放完整句子，翻译worker每次醒来把积压的全部
             # 合并成一次Ollama请求（自带积压治理，说话快时翻译永远追得上）
             self._tx_lock = Lock()
@@ -302,20 +311,63 @@ class WhisperQueueTranslator:
         else:
             self.pending_text = committed_text
 
-    def translate(self, audio_data, capture_time=None):
-        """处理一块音频：喂给增量识别器，新提交的德语立即上屏，完整句子送翻译
-
-        Args:
-            audio_data: numpy float32 音频 (16kHz mono)
-            capture_time: 采集端提交这段音频的时刻（段尾时间戳），算真实音频间隔
-        """
+    def enqueue_audio(self, audio_data, capture_time):
+        """采集线程调用：音频进收件箱，识别线程没醒着就唤醒它（永不丢块）"""
+        with self._asr_lock:
+            self._audio_inbox.append((audio_data, capture_time))
+            n = len(self._audio_inbox)
+            if self._asr_scheduled:
+                if n in (6, 12):  # GPU被抢时的提示，不丢数据
+                    print(f"⚠️  GPU繁忙，字幕滞后约{n * config.CHUNK_SUBMIT_SECONDS:.0f}秒（攒了{n}块待识别，会自动追上）")
+                return
+            self._asr_scheduled = True
         try:
-            start_time = time.time()
-            self.last_audio_time = start_time
+            self._asr_executor.submit(self._process_inbox)
+        except RuntimeError:
+            pass  # 程序正在退出
 
-            # 真实音频间隔 = 当前段开始时刻 - 上一段结束时刻
+    def request_flush(self):
+        """main的定时器调用：空闲收尾。识别忙着就不插队（它自己会消化）"""
+        with self._asr_lock:
+            if self._asr_scheduled or self._audio_inbox:
+                return
+        try:
+            self._asr_executor.submit(self.flush_pending)
+        except RuntimeError:
+            pass
+
+    def request_clear_context(self):
+        """切换语言时调用：清上下文任务排进识别线程保证串行"""
+        try:
+            self._asr_executor.submit(self.clear_context)
+        except RuntimeError:
+            pass
+
+    def _process_inbox(self):
+        """识别线程主循环：把收件箱里攒下的块一次性处理完，空了才睡"""
+        while True:
+            with self._asr_lock:
+                items = self._audio_inbox
+                self._audio_inbox = []
+                if not items:
+                    self._asr_scheduled = False
+                    return
+            try:
+                self._process_items(items)
+            except Exception as e:
+                print(f"❌ 识别错误: {e}")
+                import traceback
+                traceback.print_exc()
+
+    def _process_items(self, items):
+        """把一批音频块塞进识别缓冲，整批只识别一遍"""
+        start_time = time.time()
+        self.last_audio_time = start_time
+
+        for audio_data, capture_time in items:
             if capture_time is None:
                 capture_time = start_time
+            # 真实音频间隔 = 当前段开始时刻 - 上一段结束时刻
             segment_start = capture_time - len(audio_data) / config.SAMPLE_RATE
             real_gap = (segment_start - self.last_capture_end) if self.last_capture_end else 0.0
             self.last_capture_end = capture_time
@@ -333,24 +385,21 @@ class WhisperQueueTranslator:
                     self.pending_text = ""
 
             self.processor.insert_audio_chunk(audio_data)
-            committed, unstable = self.processor.process_iter()
-            self._last_unstable = unstable
 
-            self._append_committed(committed)
-            self._enqueue_sentences(self._extract_sentences())
-            self._emit_display()
+        committed, unstable = self.processor.process_iter()
+        self._last_unstable = unstable
 
-            if config.SHOW_PERFORMANCE:
-                elapsed = time.time() - start_time
-                shown = committed if committed else "(无新提交)"
-                print(f"   ⏱️  {elapsed:.2f}秒 | 缓冲{self.processor.buffer_seconds():.1f}秒 | ✅ {shown[:60]}")
-                if unstable:
-                    print(f"   ⏳ 未稳定: {unstable[:60]}")
+        self._append_committed(committed)
+        self._enqueue_sentences(self._extract_sentences())
+        self._emit_display()
 
-        except Exception as e:
-            print(f"❌ 识别错误: {e}")
-            import traceback
-            traceback.print_exc()
+        if config.SHOW_PERFORMANCE:
+            elapsed = time.time() - start_time
+            shown = committed if committed else "(无新提交)"
+            merged = f"(合并{len(items)}块)" if len(items) > 1 else ""
+            print(f"   ⏱️  {elapsed:.2f}秒{merged} | 缓冲{self.processor.buffer_seconds():.1f}秒 | ✅ {shown[:60]}")
+            if unstable:
+                print(f"   ⏳ 未稳定: {unstable[:60]}")
 
     def flush_pending(self):
         """空闲兜底：一段话说完后没有新音频，未提交尾部/未成句残句会一直挂着。
@@ -383,7 +432,9 @@ class WhisperQueueTranslator:
         self._emit_display()
 
     def shutdown(self):
-        """关闭翻译worker（main.stop调用）"""
+        """关闭识别/翻译线程（main.stop调用）。先ASR后翻译：
+        ASR关完就不会再往翻译队列塞句子"""
+        self._asr_executor.shutdown(wait=True, cancel_futures=False)
         self._tx_executor.shutdown(wait=True, cancel_futures=False)
 
     def __del__(self):
