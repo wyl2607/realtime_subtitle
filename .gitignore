@@ -28,3 +28,5 @@ Thumbs.db
 subtitle.pid
 .paused
 transcripts/
+subtitle.err.log
+window_state.json

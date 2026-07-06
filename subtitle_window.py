@@ -10,9 +10,14 @@
 import sys
 import html
 import time
-from PyQt5.QtWidgets import QLabel, QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSlider, QPushButton, QGroupBox, QTextEdit
+import json
+import os
+from PyQt5.QtWidgets import QLabel, QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSlider, QPushButton, QGroupBox, QTextEdit, QSizeGrip
 from PyQt5.QtCore import Qt, pyqtSignal, QObject
 import config
+
+# 窗口位置/大小/字号的持久化文件（重启后恢复用户调好的布局）
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "window_state.json")
 
 class SubtitleSignals(QObject):
     """信号对象（用于线程安全的UI更新）"""
@@ -52,12 +57,13 @@ class DraggableWidget(QWidget):
 
 class SettingsWindow(DraggableWidget):
     """参数调节窗口"""
-    
-    def __init__(self):
+
+    def __init__(self, on_font_change=None):
         super().__init__()
+        self._on_font_change = on_font_change  # 字号变了要让字幕/历史窗口重刷样式
         self.setWindowTitle("⚙️ 参数调节（可拖动）")
         self.setWindowFlags(Qt.WindowStaysOnTopHint)
-        self.setGeometry(100, 100, 500, 600)
+        self.setGeometry(100, 100, 500, 640)
 
         # 记录启动时的config默认值（用于"恢复默认值"）
         self._defaults = {
@@ -67,6 +73,7 @@ class SettingsWindow(DraggableWidget):
             'ENERGY_THRESHOLD_SPEECH': config.ENERGY_THRESHOLD_SPEECH,
             'MAX_SUBTITLE_LENGTH': config.MAX_SUBTITLE_LENGTH,
             'MAX_SENTENCE_PAIRS': config.MAX_SENTENCE_PAIRS,
+            'FONT_SIZE': config.FONT_SIZE,
         }
 
         layout = QVBoxLayout()
@@ -119,8 +126,18 @@ class SettingsWindow(DraggableWidget):
             lambda v: setattr(config, 'MAX_SENTENCE_PAIRS', int(v))
         )
 
+        def set_font_size(v):
+            config.FONT_SIZE = int(v)
+            if self._on_font_change:
+                self._on_font_change()
+
+        self.font_size_slider = self._create_slider(
+            "字体大小", 14, 36, config.FONT_SIZE, 1, set_font_size
+        )
+
         display_layout.addWidget(self.max_length_slider['widget'])
         display_layout.addWidget(self.max_pairs_slider['widget'])
+        display_layout.addWidget(self.font_size_slider['widget'])
         display_group.setLayout(display_layout)
         
         # 添加到主布局
@@ -181,6 +198,7 @@ class SettingsWindow(DraggableWidget):
             (self.speech_threshold_slider, 'ENERGY_THRESHOLD_SPEECH'),
             (self.max_length_slider, 'MAX_SUBTITLE_LENGTH'),
             (self.max_pairs_slider, 'MAX_SENTENCE_PAIRS'),
+            (self.font_size_slider, 'FONT_SIZE'),
         ]
         for slider_info, key in pairs:
             slider_info['slider'].setValue(round(self._defaults[key] / slider_info['step']))
@@ -242,6 +260,11 @@ class SubtitleWindow:
         # 创建QApplication实例
         self.app = QApplication(sys.argv)
         self.app.setQuitOnLastWindowClosed(False)
+
+        # 恢复上次的窗口布局（字号要在建字幕标签之前生效）
+        self._state = self._load_state()
+        if "font_size" in self._state:
+            config.FONT_SIZE = int(self._state["font_size"])
         
         # 创建信号对象
         self.signals = SubtitleSignals()
@@ -322,18 +345,7 @@ class SubtitleWindow:
         
         # 创建字幕标签
         self.window = QLabel()
-        self.window.setStyleSheet(f"""
-            QLabel {{
-                background-color: {config.BACKGROUND_COLOR};
-                color: {config.TEXT_COLOR};
-                font-size: {config.FONT_SIZE}px;
-                font-family: {config.FONT_FAMILY};
-                padding: {config.PADDING};
-                border-radius: {config.BORDER_RADIUS}px;
-                border: 2px solid {config.BORDER_COLOR};
-                line-height: 1.5;
-            }}
-        """)
+        self._apply_styles()
         self.window.setAlignment(Qt.AlignLeft | Qt.AlignBottom)
         self.window.setWordWrap(True)
         self.window.setTextFormat(Qt.RichText)  # live行灰色尾部/双层显示需要富文本
@@ -348,23 +360,36 @@ class SubtitleWindow:
         btn_layout.addWidget(self.quit_btn)
         container_layout.addLayout(btn_layout)
         container_layout.addWidget(self.window)
-        
+
+        # 右下角缩放手柄：无边框窗口没有系统边框可拖，用QSizeGrip补上
+        grip_row = QHBoxLayout()
+        grip_row.addStretch()
+        self.size_grip = QSizeGrip(self.container)
+        self.size_grip.setStyleSheet("background: transparent;")
+        grip_row.addWidget(self.size_grip)
+        container_layout.addLayout(grip_row)
+
         self.container.setLayout(container_layout)
-        # 设置窗口大小，确保不超出屏幕范围
+        # 窗口几何：优先用上次退出时保存的（用户拖过/缩放过就记住），没有才用config默认
+        state = self._state
         screen = self.app.primaryScreen().geometry()
-        max_width = min(config.WINDOW_WIDTH, screen.width() - 100)
-        max_height = min(config.WINDOW_HEIGHT + 40, screen.height() - 100)
-        
-        self.container.setGeometry(
-            min(config.WINDOW_X, screen.width() - max_width),
-            min(config.WINDOW_Y, screen.height() - max_height),
-            max_width,
-            max_height
-        )
+        w = min(state.get("w", config.WINDOW_WIDTH), screen.width() - 100)
+        h = min(state.get("h", config.WINDOW_HEIGHT + 40), screen.height() - 100)
+        x = max(0, min(state.get("x", config.WINDOW_X), screen.width() - w))
+        y = max(0, min(state.get("y", config.WINDOW_Y), screen.height() - h))
+        self.container.setGeometry(x, y, w, h)
+        # 布局持久化：停止脚本是Stop-Process强杀，aboutToQuit不可靠，
+        # 用定时器检查——布局变了才写盘（15秒一次，无变化零开销）
+        self._last_saved_state = None
+        from PyQt5.QtCore import QTimer
+        self._state_timer = QTimer()
+        self._state_timer.timeout.connect(self._save_state_if_changed)
+        self._state_timer.start(15000)
+        self.app.aboutToQuit.connect(self._save_state_if_changed)
         self.container.show()
         
-        # 创建设置窗口（初始隐藏）
-        self.settings_window = SettingsWindow()
+        # 创建设置窗口（初始隐藏）；字号滑块变化时重刷字幕/历史窗口样式
+        self.settings_window = SettingsWindow(on_font_change=self._apply_styles)
 
         # 创建历史窗口（初始隐藏）
         self.history_window = HistoryWindow()
@@ -383,6 +408,56 @@ class SubtitleWindow:
         print("   💡 点击 ⚙️ 按钮可打开参数调节面板")
         print("   💡 点击 ❌ 按钮可退出程序")
     
+    # ------------------------------------------------------------------
+    # 样式与布局持久化
+    # ------------------------------------------------------------------
+    def _apply_styles(self):
+        """按当前config刷新字幕标签/历史窗口的样式（字号滑块实时调用）"""
+        self.window.setStyleSheet(f"""
+            QLabel {{
+                background-color: {config.BACKGROUND_COLOR};
+                color: {config.TEXT_COLOR};
+                font-size: {config.FONT_SIZE}px;
+                font-family: {config.FONT_FAMILY};
+                padding: {config.PADDING};
+                border-radius: {config.BORDER_RADIUS}px;
+                border: 2px solid {config.BORDER_COLOR};
+                line-height: 1.5;
+            }}
+        """)
+        if hasattr(self, "history_window"):
+            self.history_window.text.setStyleSheet(f"""
+                QTextEdit {{
+                    background-color: rgb(20, 20, 20);
+                    color: white;
+                    font-size: {config.FONT_SIZE - 4}px;
+                    font-family: {config.FONT_FAMILY};
+                    border: none;
+                    padding: 8px;
+                }}
+            """)
+
+    @staticmethod
+    def _load_state():
+        try:
+            with open(STATE_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+
+    def _save_state_if_changed(self):
+        g = self.container.geometry()
+        state = {"x": g.x(), "y": g.y(), "w": g.width(), "h": g.height(),
+                 "font_size": config.FONT_SIZE}
+        if state == self._last_saved_state:
+            return
+        try:
+            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(state, f)
+            self._last_saved_state = state
+        except OSError:
+            pass  # 存不上就下次用默认布局，不值得报错
+
     # ------------------------------------------------------------------
     # 线程安全的对外接口（从ASR/翻译线程调用）
     # ------------------------------------------------------------------
