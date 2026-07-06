@@ -32,6 +32,7 @@ CHUNK_SIZE = 4096  # 每次读取的帧数（减少处理频率）
 # 采集端按固定节奏喂音频块，识别端整缓冲识别+词级前缀提交
 CHUNK_SUBMIT_SECONDS = 0.8  # 采集端每攒够这么多秒就提交一块（识别节奏）
 BUFFER_TRIM_SEC = 12.0  # 识别音频缓冲超过这么多秒就在已完成segment处裁剪
+BUFFER_KEEP_SEC = 8.0  # segment裁剪不满足条件时的兜底：按已提交词边界裁到只剩这么多秒
 IDLE_FLUSH_SEC = 2.0  # 静音这么多秒后，把未提交尾部/未翻译残句冲出去
 ENERGY_THRESHOLD_SPEECH = 0.01  # 静音门：整块能量低于此且上一块也静音则不提交（省GPU）
 
@@ -101,6 +102,8 @@ GLOSSARY = {
     "Rundfunkbeitrag": "广播电视费",
     "Verfassungsschutz": "联邦宪法保卫局",
     "Grundgesetz": "基本法",
+    # 惯用语（直播实测被字面直译的）
+    "Kohl nicht fett": "（惯用语 den Kohl nicht fett machen = 起不了多大作用，不是人名科尔）",
 }
 
 # ============ 幻觉字幕黑名单 ============

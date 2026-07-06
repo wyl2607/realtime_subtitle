@@ -159,9 +159,24 @@ class OnlineASRProcessor:
         if len(self.commited) > 200:
             self.commited = self.commited[-200:]
 
-        # 缓冲超长：在倒数第二个已完成 segment 结尾处裁剪
+        # 缓冲超长：优先在倒数第二个已完成 segment 结尾处裁剪
         if len(self.audio_buffer) / self.SAMPLING_RATE > config.BUFFER_TRIM_SEC:
             self._chunk_completed_segment(res)
+
+        # segment裁剪对连续不停顿的语音经常不满足条件（直播实测缓冲涨到26秒、
+        # 单次识别2.4秒、开始丢块）——兜底：直接在已提交词边界裁，
+        # 保留最近 BUFFER_KEEP_SEC 秒音频作为识别上下文
+        if len(self.audio_buffer) / self.SAMPLING_RATE > config.BUFFER_TRIM_SEC:
+            self._chunk_at_committed_word()
+
+        # 绝对硬上限：长段音乐/噪音（能量高但无语音）一个词都提交不出来，
+        # 上面两种裁剪都无处可裁，缓冲会干涨（直播实测涨到59秒）。
+        # 超过 TRIM+KEEP 还裁不动就直接丢最旧音频——这时丢的必然是音乐不是话
+        cur_sec = len(self.audio_buffer) / self.SAMPLING_RATE
+        if cur_sec > config.BUFFER_TRIM_SEC + config.BUFFER_KEEP_SEC:
+            if config.SHOW_PERFORMANCE:
+                print(f"   ✂️  缓冲{cur_sec:.0f}秒无可裁词（音乐/噪音），硬裁至{config.BUFFER_KEEP_SEC:.0f}秒")
+            self._chunk_at(self.buffer_time_offset + cur_sec - config.BUFFER_KEEP_SEC)
 
         committed_text = "".join(t for _, _, t in committed).strip()
         unstable_text = "".join(t for _, _, t in self.transcript_buffer.complete()).strip()
@@ -179,6 +194,24 @@ class OnlineASRProcessor:
                 e = ends[-2] + self.buffer_time_offset
             if e <= t:
                 self._chunk_at(e)
+
+    def _chunk_at_committed_word(self):
+        """兜底裁剪：在"距缓冲末尾至少 BUFFER_KEEP_SEC 秒"的最新已提交词结尾处裁。
+        已提交词之后才是未稳定区，在词边界裁不会切掉还没定稿的内容。"""
+        if not self.commited:
+            return
+        latest_allowed = self.buffer_time_offset + len(self.audio_buffer) / self.SAMPLING_RATE - config.BUFFER_KEEP_SEC
+        cut = None
+        for _, end, _ in reversed(self.commited):
+            if end <= self.buffer_time_offset:
+                break  # 已经滚出缓冲的词，再往前没意义
+            if end <= latest_allowed:
+                cut = end
+                break
+        if cut is not None:
+            if config.SHOW_PERFORMANCE:
+                print(f"   ✂️  兜底裁剪至已提交词边界 (保留{config.BUFFER_KEEP_SEC:.0f}秒)")
+            self._chunk_at(cut)
 
     def _chunk_at(self, time):
         self.transcript_buffer.pop_commited(time)
