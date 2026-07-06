@@ -8,15 +8,16 @@
 # 速度与medium相当，int8下显存占用差不多（~2GB）
 WHISPER_MODEL = "large-v3-turbo"  # tiny, base, small, medium, large-v3, large-v3-turbo
 WHISPER_DEVICE = "cuda"  # cuda 或 cpu
-WHISPER_COMPUTE_TYPE = "int8"  # float16, int8, int8_float16 (large-v3建议int8)
+WHISPER_COMPUTE_TYPE = "float16"  # float16, int8, int8_float16
 # 源语言（Whisper语言代码）。运行中可用 Ctrl+Alt+L 在 LANGUAGE_CYCLE 里循环切换，
 # 不需要重启：语言只是识别参数，模型本身是多语言的
 SOURCE_LANGUAGE = "de"
 LANGUAGE_CYCLE = ["de", "en"]  # 热键循环切换的语言列表，想看别的语言往里加
 LANGUAGE_NAMES = {"de": "德语", "en": "英语", "fr": "法语", "es": "西班牙语", "ja": "日语"}
 WHISPER_TASK = "transcribe"  # "transcribe"=转录原语言, "translate"=翻译成英文
-WHISPER_BEAM_SIZE = 3  # beam search 大小，large-v3用3就够了（减少延迟）
-WHISPER_TEMPERATURE = 0.0  # 温度参数，0=确定性输出，提高标点一致性
+WHISPER_BEAM_SIZE = 3  # beam search 大小。whisper_streaming作者用5，这里用3保延迟
+# 注：whisper_streaming作者在L40上实测 int8_float16 比 float16 慢~20%且质量更差，
+# 如果换 float16 后单次识别耗时反而降了，就保持 float16
 
 # ============ Qwen + Ollama 翻译配置 ============
 OLLAMA_MODEL = "qwen3:8b"  # Ollama 模型名称
@@ -26,17 +27,13 @@ OLLAMA_BASE_URL = "http://localhost:11434"  # Ollama API 地址
 SAMPLE_RATE = 16000  # 采样率（Hz）
 CHUNK_SIZE = 4096  # 每次读取的帧数（减少处理频率）
 
-# ============ 音频捕获层VAD配置（audio_capture.py使用）============
-MIN_AUDIO_DURATION = 0.4  # 最小音频时长（秒）
-MAX_AUDIO_DURATION = 0.5  # 最大音频时长（秒）
-SILENCE_DURATION = 0.6  # 静音持续时长（秒）
-ENERGY_THRESHOLD_SPEECH = 0.01  # 语音能量阈值
-
-# ============ 音频上下文配置 ============
-# Whisper识别时保留的音频片段数量（滑动窗口）。
-# 每来一块新音频就把整个窗口重新识别一遍，窗口大小直接决定单次识别耗时：
-# 之前20段(~10秒)时单次要0.6秒，赶不上0.5秒一块的产出速度，积压过35个任务
-AUDIO_CONTEXT_WINDOW = 10
+# ============ 流式识别配置（streaming_asr.py / audio_capture.py）============
+# local agreement 增量识别（2026-07-06 重写）：不再由能量VAD切"语音片段"，
+# 采集端按固定节奏喂音频块，识别端整缓冲识别+词级前缀提交
+CHUNK_SUBMIT_SECONDS = 0.8  # 采集端每攒够这么多秒就提交一块（识别节奏）
+BUFFER_TRIM_SEC = 12.0  # 识别音频缓冲超过这么多秒就在已完成segment处裁剪
+IDLE_FLUSH_SEC = 2.0  # 静音这么多秒后，把未提交尾部/未翻译残句冲出去
+ENERGY_THRESHOLD_SPEECH = 0.01  # 静音门：整块能量低于此且上一块也静音则不提交（省GPU）
 
 # ============ 字幕窗口配置 ============
 WINDOW_WIDTH = 1200  # 窗口宽度（像素）
@@ -47,6 +44,8 @@ FONT_SIZE = 22  # 字体大小
 FONT_FAMILY = "Microsoft YaHei, Arial"  # 字体
 MAX_SUBTITLE_LENGTH = 400  # 字幕最大字符数（双语显示需要更多空间）
 SHOW_BILINGUAL = True  # 同时显示德语原文和中文翻译
+UNSTABLE_TEXT_COLOR = "#999999"  # live行里未稳定（还可能变）的德语尾部颜色
+MAX_SENTENCE_PAIRS = 2  # 悬浮窗保留的已完成句对（德+中）条数
 
 # 窗口样式
 BACKGROUND_COLOR = "rgba(0, 0, 0, 255)"  # 背景色（纯黑）

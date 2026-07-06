@@ -54,6 +54,11 @@ class SubtitleApp:
             print(f"❌ 字幕窗口初始化失败: {e}")
             sys.exit(1)
         
+        # 接线：识别提交的德语立即上屏（live行），翻译完成变句对
+        # 两个回调都走Qt信号，从任何线程调都安全
+        self.translator.on_display = self.subtitle_window.update_live
+        self.translator.on_pair = self.subtitle_window.add_pair
+
         # 初始化音频捕获（传入回调函数）
         try:
             self.audio_capture = AudioCapture(callback=self.on_audio_received)
@@ -96,17 +101,18 @@ class SubtitleApp:
             audio_duration = len(audio_data) / config.SAMPLE_RATE
             print(f"\n📦 处理音频块: {audio_duration:.2f}秒")
 
-        # 提交翻译任务到线程池，不阻塞当前线程。
+        # 提交识别任务到线程池，不阻塞当前线程。
         # 积压设硬上限：识别速度赶不上时（比如GPU被游戏占着），无上限排队
-        # 只会让字幕滞后越滚越大（实测到过35个≈半分钟延迟），不如丢块保实时
+        # 只会让字幕滞后越滚越大，不如丢块保实时。
+        # 翻译已经在独立worker里跑，这里的积压纯粹是ASR跟不上（阈值可以更紧）
         with self._pending_lock:
-            if self._pending_tasks >= 8:
-                print(f"⚠️  翻译积压 {self._pending_tasks} 个任务，丢弃本块音频保实时性")
+            if self._pending_tasks >= 4:
+                print(f"⚠️  识别积压 {self._pending_tasks} 个任务，丢弃本块音频保实时性")
                 return
             self._pending_tasks += 1
             pending = self._pending_tasks
-        if pending > 5:
-            print(f"⚠️  翻译积压 {pending} 个任务，字幕会有延迟（可考虑换更小的Whisper模型）")
+        if pending > 2:
+            print(f"⚠️  识别积压 {pending} 个任务，字幕会有延迟（可考虑调大提交节奏或缩小缓冲上限）")
         future = self.translator_executor.submit(self.translator.translate, audio_data, capture_time)
         # 添加一个回调，当翻译完成后更新UI
         future.add_done_callback(self.on_translation_completed)
@@ -180,16 +186,11 @@ class SubtitleApp:
             return
 
         try:
-            subtitle = future.result()
-            
-            # 更新字幕（whisper_streaming会自动累积，我们直接显示）
-            if subtitle and subtitle.strip():
-                self.subtitle_window.update_subtitle(subtitle)
-            # else:
-            #     如果没有输出，说明还在累积，不需要提示
-            
+            # 显示由translator的on_display/on_pair回调直接驱动，
+            # 这里只消化异常（translate内部已兜底，这是最后防线）
+            future.result()
         except Exception as e:
-            print(f"❌ 翻译任务执行错误: {e}")
+            print(f"❌ 识别任务执行错误: {e}")
             import traceback
             traceback.print_exc()
     
@@ -244,10 +245,12 @@ class SubtitleApp:
         except Exception as e:
             print(f"⚠️  停止音频捕获时出错: {e}")
 
-        # 优雅地关闭线程池
-        print("   - 正在关闭翻译器线程...")
+        # 优雅地关闭线程池（先ASR后翻译：ASR关完就不会再往翻译队列塞句子）
+        print("   - 正在关闭识别线程...")
         self.translator_executor.shutdown(wait=True, cancel_futures=False)
-        
+        print("   - 正在关闭翻译线程...")
+        self.translator.shutdown()
+
         print("👋 应用已关闭，再见！")
     
     def _print_usage(self):
@@ -265,8 +268,8 @@ class SubtitleApp:
         print("   7. 或按 Ctrl+C 中断程序")
         print("\n⚙️  当前配置：")
         print(f"   - Whisper模型: {config.WHISPER_MODEL}")
-        print(f"   - 处理模式: 动态分句 ({config.MIN_AUDIO_DURATION}-{config.MAX_AUDIO_DURATION}秒)")
-        print(f"   - 语音停顿检测: {config.SILENCE_DURATION}秒")
+        print(f"   - 处理模式: local agreement 增量识别 (每{config.CHUNK_SUBMIT_SECONDS}秒一块, 缓冲上限{config.BUFFER_TRIM_SEC:.0f}秒)")
+        print(f"   - 收尾静音: {config.IDLE_FLUSH_SEC}秒")
         print(f"   - 翻译: Qwen + Whisper (Ollama {config.OLLAMA_MODEL})")
         print(f"   - 设备: {config.WHISPER_DEVICE.upper()}")
         print(f"   - 源语言: {config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)}")
