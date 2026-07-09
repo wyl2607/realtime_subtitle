@@ -30,3 +30,6 @@ subtitle.pid
 transcripts/
 subtitle.err.log
 window_state.json
+
+# 本机降级/个人配置（install.ps1 生成）
+config_local.py

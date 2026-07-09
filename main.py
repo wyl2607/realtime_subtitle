@@ -56,6 +56,7 @@ class SubtitleApp:
         # 两个回调都走Qt信号，从任何线程调都安全
         self.translator.on_display = self.subtitle_window.update_live
         self.translator.on_pair = self.subtitle_window.add_pair
+        self.translator.on_draft = self.subtitle_window.update_draft
 
         # 初始化音频捕获（传入回调函数）
         try:

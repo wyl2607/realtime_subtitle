@@ -1,531 +1,117 @@
-# 🎬 实时字幕翻译软件
+# 🎬 实时字幕翻译系统（德语直播 → 中文双语字幕）
 
-<div align="center">
+完全本地运行的实时字幕系统：捕获电脑正在播放的任何声音（YouTube / ZDF 直播 /
+Netflix / 语音聊天……），实时识别德语并翻译成中文，以置顶悬浮窗双语显示。
+**全程离线推理，不向任何云端发送音频或文本。**
 
-[![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
-[![Whisper](https://img.shields.io/badge/Whisper-Faster--Whisper-orange.svg)](https://github.com/SYSTRAN/faster-whisper)
-[![Qwen](https://img.shields.io/badge/LLM-Qwen-purple.svg)](https://github.com/QwenLM/Qwen)
+```
+系统声音 ──WASAPI Loopback──▶ Faster-Whisper (large-v3-turbo, CUDA)
+              │                       │ local agreement 增量识别
+              │                       ▼
+              │               德语句子流 ──▶ Ollama (qwen3:8b) 德→中翻译
+              │                       │
+              ▼                       ▼
+        悬浮窗：德语先行上屏 + 草稿中文 + 正式双语句对
+```
 
-**基于 Faster-Whisper + Qwen 的高质量实时字幕翻译系统**
+## ✨ 特点
 
-[功能特点](#-功能特点) • [快速开始](#-快速开始) • [配置说明](#-配置说明) • [常见问题](#-常见问题)
-
-</div>
-
----
-
-## 📖 项目简介
-
-这是一款完全本地运行的实时字幕翻译软件，能够捕获系统音频输出并实时生成高质量的中文字幕。采用先进的 AI 技术栈，提供影院级的字幕体验。
-
-> ⚠️ **重要提示**：本项目需要本地安装 **Ollama** 来运行 Qwen 大语言模型进行翻译推理，所有处理完全在本地完成，无需联网，保护隐私安全。
-
-### 核心技术
-
-- 🎯 **语音识别**：Faster-Whisper（OpenAI Whisper 的优化实现）
-- 🤖 **智能翻译**：Qwen 大语言模型（通过本地 Ollama 运行）
-- 🎵 **音频捕获**：WASAPI Loopback（系统级音频捕获）
-- 🖼️ **界面框架**：PyQt5（跨平台 GUI）
-
----
-
-## ✨ 功能特点
-
-### 🚀 核心功能
-
-- ✅ **完全本地运行** - 所有处理在本地完成，隐私安全
-- ✅ **通用音频支持** - 支持任何播放声音的应用（YouTube、Netflix、本地视频等）
-- ✅ **超低延迟** - 0.3-0.8秒的端到端延迟
-- ✅ **高质量翻译** - 基于 Qwen 大模型，理解上下文，翻译自然流畅
-- ✅ **智能断句** - 自动检测语音停顿，准确分句
-- ✅ **去重机制** - 避免重复翻译，节省资源
-- ✅ **上下文管理** - 保留历史句子，提高翻译连贯性
-
-### 🎨 用户体验
-
-- 🖼️ **悬浮窗显示** - 置顶显示，不干扰其他操作
-- ⚙️ **GUI 参数调节** - 可视化调整各项参数，无需修改代码
-- 📊 **性能监控** - 实时显示处理时间和队列状态
-- 🎛️ **灵活配置** - 支持自定义能量阈值、时长、窗口样式等
-
-### 💡 智能特性
-
-- 🧠 **情境感知翻译** - 根据上下文判断词语真实含义（如分手场景中的"I'm done"翻译为"我受够了"而非"我完成了"）
-- 📦 **短句合并** - 自动合并短句子（≤20词），提高翻译质量
-- ⏱️ **静音触发** - 静音超过0.5秒自动翻译，确保最后一句不遗漏
-- 🔄 **连续性检测** - 句子连续出现2次即确认翻译，响应迅速
-
----
+- **德语先行显示**：识别一提交立即上屏（灰色部分表示还可能修正），中文随后跟上
+- **草稿中文**：不用等句子说完——识别到半句就先给一版浅蓝斜体草稿翻译，正式翻译完成后自动替换
+- **local agreement 增量识别**：词级前缀提交，根治流式识别的重复碎片问题
+  （移植自 [whisper_streaming](https://github.com/ufal/whisper_streaming)，MIT）
+- **术语表翻译**：德国政党/政客/政治术语按标准译名翻（AfD→德国选择党、Schuldenbremse→债务刹车），在 `config.py` 的 `GLOSSARY` 里可自行扩充
+- **幻觉过滤**：自动拦截 Whisper 在静音/音乐段凭空生成的"Untertitelung des ZDF"类电视字幕惯用语
+- **抗 GPU 抢占**：边玩游戏边用也不丢词——GPU 被抢时字幕只是滞后几秒，恢复后自动追上
+- **窗口自适应**：悬浮窗边缘拖拽缩放，窗口越大自动显示越多历史句对；位置/大小/字号重启后记住
+- **字幕存档**：每天一个文件存在 `transcripts/`（时间+原文+译文），方便回看和学德语
+- **运行时切换**：`Ctrl+Alt+P` 暂停/继续（模型留在显存，秒恢复）、`Ctrl+Alt+L` 德语↔英语切换
 
 ## 🖥️ 系统要求
 
-### 最低配置
+| | 推荐配置 | 最低配置（自动降级） |
+|---|---|---|
+| 系统 | Windows 10/11 64位 | 同左（**仅支持 Windows**，音频捕获用 WASAPI） |
+| 显卡 | NVIDIA 8GB+ 显存（如 RTX 3060/4070） | 无 N 卡也能跑（CPU 模式，延迟明显变大） |
+| 内存 | 16GB | 8GB |
+| 硬盘 | 约 10GB（Python 依赖 + 识别模型 + 翻译模型） | 约 6GB |
+| Python | 3.9 – 3.12 | 同左 |
+| 其它 | [Ollama](https://ollama.com/)（本地跑翻译模型，安装脚本会引导安装） | 同左 |
 
-- **操作系统**：Windows 10/11（64位）
-- **Python**：3.8 或更高版本
-- **GPU**：NVIDIA GPU，4GB+ 显存
-- **内存**：8GB RAM
-- **硬盘**：5GB 可用空间（模型存储）
+## 🚀 安装（一键脚本）
 
-### 推荐配置
-
-- **GPU**：RTX 3060 或更高
-- **内存**：16GB RAM
-- **处理器**：Intel i5 / AMD Ryzen 5 或更高
-
-### 软件依赖
-
-- **Ollama**：⚠️ **必须安装**，用于本地运行 Qwen 翻译模型（[下载地址](https://ollama.com/)）
-- **CUDA Toolkit**：11.8+ （GPU 加速，推荐）
-
----
-
-## 🚀 快速开始
-
-### ⚠️ 前置要求：安装 Ollama（必需）
-
-本项目使用 **Ollama** 在本地运行 Qwen 大语言模型进行翻译推理，这是项目正常运行的**必要条件**。
-
-**第一步：安装 Ollama**
-
-1. 从 [Ollama官网](https://ollama.com/) 下载并安装 Ollama
-2. 安装后，Ollama 会在后台运行（默认端口 11434）
-3. 拉取 Qwen 翻译模型：
-```bash
-ollama pull qwen3:8b
-```
-
-**验证 Ollama 安装：**
-```bash
-# 检查 Ollama 是否运行
-ollama list
-
-# 测试模型（应该能看到输出）
-ollama run qwen3:8b "Hello"
-```
-
-### 第二步：安装本项目
-
-```bash
-# 克隆项目
-git clone https://github.com/your-username/realtime_subtitle.git
+```powershell
+git clone https://github.com/wyl2607/realtime_subtitle.git
 cd realtime_subtitle
+powershell -ExecutionPolicy Bypass -File install.ps1
+# 国内网络加速：powershell -ExecutionPolicy Bypass -File install.ps1 -Mirror
+```
 
-# 创建虚拟环境（推荐）
+脚本会自动：检查 Python → 检测显卡（没有 N 卡自动生成 CPU 降级配置）→
+建 venv 装依赖 → 引导安装 Ollama 并拉取翻译模型 → 在桌面生成
+**「德语直播实时字幕」快捷方式文件夹**（启动/停止/暂停 + 操作说明）。
+
+之后每次使用：双击桌面的 `启动字幕.bat`，播放德语视频即可。
+首次启动会自动下载 Whisper 识别模型（约 1.6GB），耐心等待。
+
+<details>
+<summary>手动安装（不用脚本）</summary>
+
+```powershell
 python -m venv venv
-venv\Scripts\activate  # Windows
-
-# 安装 Python 依赖
-pip install -r requirements.txt
+venv\Scripts\pip install -r requirements.txt
+# 安装 Ollama: https://ollama.com/download
+ollama pull qwen3:8b
+venv\Scripts\python -u main.py
 ```
+</details>
 
-### 第三步：启动 Ollama 服务（如果未运行）
+## 🎛️ 使用
 
-```bash
-# Windows: Ollama 通常会自动启动
-# 如果没有运行，手动启动：
-ollama serve
-```
+| 操作 | 方式 |
+|---|---|
+| 移动窗口 | 鼠标按住窗口任意位置拖动 |
+| 缩放窗口 | 鼠标拖窗口**边缘/四角**（窗口越大显示的历史越多） |
+| 暂停/继续 | 全局快捷键 `Ctrl+Alt+P`（游戏全屏时也有效） |
+| 切换识别语言 | `Ctrl+Alt+L`（默认德语↔英语，`config.LANGUAGE_CYCLE` 可加） |
+| 回看本场字幕 | 点击悬浮窗 📜 按钮（可滚动） |
+| 调参数 | 点击 ⚙️ 按钮（识别节奏/字号/句对条数等，实时生效） |
+| 退出 | 点击 ❌ 按钮或双击 `停止字幕.bat` |
 
-### 第四步：运行程序
+字幕颜色含义：**白色**=已确定德语；*灰色斜体*=还可能修正的德语尾部；
+<i>浅蓝斜体</i>=草稿中文（先给你看个大概）；浅灰=正式中文翻译。
 
-```bash
-python main.py
-```
+## ⚙️ 配置
 
-**首次运行说明：**
-- ✅ 确保 Ollama 正在运行（`ollama list` 检查）
-- ✅ Whisper 模型会自动下载（约 150MB-1.5GB）
-- ✅ 模型缓存到 `~/.cache/huggingface/`
-- ✅ 启动完成后会出现字幕悬浮窗
-- ✅ 翻译请求会发送到本地 Ollama（http://localhost:11434）
-
-### 第五步：使用
-
-1. ✅ 启动程序后，字幕窗口显示在屏幕底部
-2. ✅ 播放任何视频或音频
-3. ✅ 字幕会自动识别并翻译显示
-4. ✅ 点击 ⚙️ 按钮可调整参数
-5. ✅ 按 `Ctrl+C` 或点击 ❌ 退出程序
-
----
-
-## ⚙️ 配置说明
-
-### 核心配置（config.py）
-
-#### Whisper 模型配置
+所有参数集中在 [config.py](config.py)，每项都有注释。个人调参建议写在
+`config_local.py`（不进 git，会覆盖 config.py 同名项）。常用项：
 
 ```python
-WHISPER_MODEL = "small"              # 模型：tiny, base, small, medium, large-v3
-WHISPER_DEVICE = "cuda"              # 设备：cuda 或 cpu
-WHISPER_COMPUTE_TYPE = "int8"        # 精度：float16, int8
-WHISPER_LANGUAGE = None              # 语言：None（自动检测）或 "en", "zh", "ja"
+WHISPER_MODEL = "large-v3-turbo"   # 显存不够改 "medium" / "small"
+OLLAMA_MODEL = "qwen3:8b"          # 机器弱改 "qwen3:1.7b"
+SOURCE_LANGUAGE = "de"             # 源语言
+DRAFT_TRANSLATION = True           # 草稿中文（不想要就 False）
+GLOSSARY = {...}                   # 德→中术语表，遇到翻错的专名往里加
 ```
-
-#### Qwen 翻译配置（Ollama）
-
-```python
-OLLAMA_MODEL = "qwen3:8b"            # Ollama 模型名称（需提前 ollama pull）
-OLLAMA_BASE_URL = "http://localhost:11434"  # Ollama 本地 API 地址
-```
-
-> 💡 **注意**：所有翻译请求都发送到本地 Ollama 服务，不会上传到云端。
-
-#### 音频捕获配置
-
-```python
-MIN_AUDIO_DURATION = 0.4             # 最小音频时长（秒）
-MAX_AUDIO_DURATION = 0.5             # 最大音频时长（秒）
-SILENCE_DURATION = 0.6               # 静音持续时长（秒）
-ENERGY_THRESHOLD_SPEECH = 0.01       # 语音能量阈值
-```
-
-#### 字幕窗口配置
-
-```python
-WINDOW_WIDTH = 1200                  # 窗口宽度（像素）
-WINDOW_HEIGHT = 150                  # 窗口高度（像素）
-WINDOW_X = 360                       # 窗口X坐标
-WINDOW_Y = 750                       # 窗口Y坐标
-FONT_SIZE = 22                       # 字体大小
-MAX_SUBTITLE_LENGTH = 300            # 字幕最大字符数
-```
-
-### 模型选择指南
-
-| 模型 | 显存占用 | 速度 | 准确度 | 适用场景 |
-|------|---------|------|--------|----------|
-| tiny | 1GB | ⚡⚡⚡⚡⚡ | ⭐⭐ | 极速模式，实时性优先 |
-| base | 1GB | ⚡⚡⚡⚡ | ⭐⭐⭐ | **推荐**，平衡性能与质量 |
-| small | 2GB | ⚡⚡⚡ | ⭐⭐⭐⭐ | 高质量，标点符号更准确 |
-| medium | 5GB | ⚡⚡ | ⭐⭐⭐⭐⭐ | 专业场景 |
-| large-v3 | 10GB | ⚡ | ⭐⭐⭐⭐⭐ | 最高质量 |
-
-**推荐配置：** `small` + `int8` + `qwen3:8b`
-
----
-
-## 📊 性能指标
-
-### 测试环境
-
-- **显卡**：RTX 3060 (12GB)
-- **模型**：small + int8
-- **翻译**：qwen3:8b
-
-### 实测数据
-
-| 指标 | 数值 | 说明 |
-|-----|------|------|
-| 端到端延迟 | 0.5-0.8秒 | 语音结束到字幕显示 |
-| Whisper 识别 | 0.2-0.3秒 | 语音识别时间 |
-| Qwen 翻译 | 0.3-0.5秒 | 单句翻译时间 |
-| 显存占用 | 2-3GB | Whisper + Qwen |
-| CPU 占用 | 10-20% | 音频捕获+处理 |
-| 准确度 | 90-95% | 清晰音频环境 |
-
----
-
-## 🎯 使用场景
-
-### 适用场景 ✅
-
-- 🎬 **观看外语视频** - YouTube、Netflix、本地视频
-- 🎮 **游戏实况** - 实时翻译游戏语音
-- 📺 **直播字幕** - Twitch、B站等直播平台
-- 🎵 **音乐翻译** - 理解歌词含义
-- 📞 **会议记录** - 实时翻译远程会议
-- 🎓 **学习辅助** - 外语学习材料
-
-### 不适用场景 ❌
-
-- ❌ 多人同时说话（会识别混乱）
-- ❌ 环境噪音很大（影响识别准确度）
-- ❌ 说话速度极快（可能遗漏部分内容）
-- ❌ 专业术语很多（需要调整翻译模型）
-
----
-
-## 🔧 项目结构
-
-```
-realtime_subtitle/
-├── main.py                    # 主程序入口
-├── translator_queue.py        # Whisper + Qwen 句子队列翻译器
-├── audio_capture.py           # 系统音频捕获（WASAPI Loopback）
-├── subtitle_window.py         # 字幕悬浮窗 + GUI 参数面板
-├── config.py                  # 配置文件（所有可调参数）
-├── requirements.txt           # Python 依赖列表
-├── README.md                  # 项目说明文档
-└── 实时字幕软件开发方案.md   # 开发设计文档
-```
-
-### 核心模块说明
-
-#### 1. audio_capture.py
-- 使用 WASAPI Loopback 捕获系统音频
-- 实时能量检测（VAD）
-- 动态音频缓冲管理
-- 语音停顿检测
-
-#### 2. translator_queue.py
-- Whisper 语音识别（faster-whisper）
-- Qwen 上下文感知翻译
-- 句子队列管理（去重、排序）
-- 短句合并（≤20词）
-- 稳定性检测（连续出现/静音触发）
-
-#### 3. subtitle_window.py
-- PyQt5 悬浮窗
-- 字幕实时显示
-- GUI 参数调节面板（能量阈值、时长、样式等）
-- 窗口置顶显示
-
-#### 4. main.py
-- 线程管理（音频捕获、翻译、UI）
-- 异步任务调度
-- 资源清理
-
----
 
 ## ❓ 常见问题
 
-### Q1: 提示 "Ollama 连接失败" 或 "翻译失败"？
+**启动报 `cublas64_12.dll` 找不到** — venv 里要装 `nvidia-cublas-cu12`
+和 `nvidia-cudnn-cu12`（requirements.txt 已包含；重装 faster-whisper 后需重装）。
 
-**原因**：Ollama 服务未运行或模型未安装。
+**字幕全是德语没有中文** — Ollama 没在运行或模型没拉。`ollama list` 检查，
+`ollama pull qwen3:8b` 拉取。启动日志 `subtitle.log` 里会有明确提示。
 
-**解决方案：**
-```bash
-# 1. 检查 Ollama 是否运行
-ollama list
+**识别速度跟不上（日志里"GPU繁忙"频繁出现）** — ⚙️ 面板把"提交节奏"调大到
+1.0 秒，或 `config_local.py` 里换小模型。
 
-# 2. 如果没有运行，启动 Ollama 服务
-ollama serve
+**没有 N 卡的电脑能用吗** — 能，install.ps1 会自动生成 CPU 降级配置
+（small 模型 + qwen3:1.7b），但延迟会从 1-2 秒涨到 5-10 秒。
 
-# 3. 确认模型已安装
-ollama list | grep qwen3
+## 🙏 致谢与许可
 
-# 4. 如果模型未安装，拉取模型
-ollama pull qwen3:8b
-
-# 5. 测试 Ollama API 是否正常
-curl http://localhost:11434/api/tags
-
-# 6. 测试模型是否能推理
-ollama run qwen3:8b "translate to chinese: Hello"
-```
-
-**Windows 用户注意**：
-- Ollama 安装后会自动启动，托盘图标显示在任务栏
-- 如果看不到 Ollama 图标，从开始菜单启动 Ollama
-- 确保防火墙允许 Ollama 使用 11434 端口
-
-### Q2: 模型下载很慢或失败？
-
-**解决方案：**
-```bash
-# 使用国内镜像
-export HF_ENDPOINT=https://hf-mirror.com
-
-# 或手动下载模型到：
-~/.cache/huggingface/hub/
-```
-
-### Q3: GPU 内存不足？
-
-**解决方案：**
-1. 使用更小的 Whisper 模型：`WHISPER_MODEL = "tiny"` 或 `"base"`
-2. 使用更小的 Qwen 模型：`ollama pull qwen3:1.7b`
-3. 调整精度：`WHISPER_COMPUTE_TYPE = "int8"`
-
-### Q4: 字幕不显示或卡顿？
-
-**排查步骤：**
-1. ✅ 检查终端是否有错误信息
-2. ✅ 确认系统正在播放音频
-3. ✅ 检查 Ollama 是否正常运行
-4. ✅ 降低 `AUDIO_CONTEXT_WINDOW` 到 10-20
-5. ✅ 增加 `SILENCE_DURATION` 到 0.8-1.0
-
-### Q5: 翻译质量不理想？
-
-**优化建议：**
-1. 📝 使用更大的 Qwen 模型：
-   ```bash
-   ollama pull qwen3:14b    # 14B 参数模型（更好的理解能力）
-   ollama pull qwen3:32b    # 32B 参数模型（最高质量）
-   ```
-   然后修改 `config.py`：`OLLAMA_MODEL = "qwen3:14b"`
-
-2. 📝 确保音频清晰，减少背景噪音
-3. 📝 调整翻译 Prompt（在 `translator_queue.py` 的 `_translate_single_sentence` 方法中）
-4. 📝 增加 `LLM_TRANSLATION_HISTORY_SIZE` 提供更多上下文
-
-### Q6: 句子被截断或重复？
-
-**解决方案：**
-1. 调整 `MIN_AUDIO_DURATION` 和 `MAX_AUDIO_DURATION`
-2. 调整 `SILENCE_DURATION`（静音阈值）
-3. 调整 `ENERGY_THRESHOLD_SPEECH`（能量阈值）
-4. 使用 GUI 面板实时调整参数
-
-### Q7: CPU/GPU 占用过高？
-
-**优化方案：**
-1. 减小 `AUDIO_CONTEXT_WINDOW`（默认 30）
-2. 增加 `CHUNK_SIZE`（减少处理频率）
-3. 使用 INT8 量化：`WHISPER_COMPUTE_TYPE = "int8"`
-4. 限制 Ollama GPU 层数：`ollama run qwen3:8b --gpu-layers 20`
-
----
-
-## 🛠️ 高级用法
-
-### 自定义翻译 Prompt
-
-编辑 `translator_queue.py` 中的 `_translate_single_sentence` 方法：
-
-```python
-prompt = f"""你是专业字幕翻译，请翻译：
-
-上下文：{english_context}
-当前句子：{sentence}
-
-要求：
-1. 理解情境，不要字面翻译
-2. 保持语气和情感
-3. 只输出中文翻译
-
-翻译：
-"""
-```
-
-### 添加其他语言支持
-
-```python
-# config.py
-WHISPER_LANGUAGE = "ja"  # 日语
-WHISPER_LANGUAGE = "ko"  # 韩语
-WHISPER_LANGUAGE = "fr"  # 法语
-# 支持所有 Whisper 支持的语言
-```
-
-### 使用其他 LLM 模型
-
-本项目支持任何 Ollama 支持的模型，只需在本地拉取模型并修改配置：
-
-```bash
-# 拉取其他 Ollama 模型
-ollama pull llama3:8b      # Meta Llama 3
-ollama pull mistral:7b     # Mistral AI
-ollama pull deepseek-coder # DeepSeek
-
-# 修改 config.py
-OLLAMA_MODEL = "llama3:8b"
-```
-
-**模型对比：**
-| 模型 | 参数量 | 中文能力 | 推荐度 |
-|------|--------|----------|--------|
-| qwen3:8b | 8B | ⭐⭐⭐⭐⭐ | **推荐** |
-| qwen3:14b | 14B | ⭐⭐⭐⭐⭐ | 高质量 |
-| llama3:8b | 8B | ⭐⭐⭐ | 英文优先 |
-| mistral:7b | 7B | ⭐⭐ | 速度快 |
-
----
-
-## 🤝 贡献指南
-
-欢迎贡献代码！请遵循以下步骤：
-
-1. Fork 本仓库
-2. 创建特性分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交更改 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 提交 Pull Request
-
-### 代码规范
-
-- 使用中文注释
-- 遵循 PEP 8 规范
-- 添加必要的类型提示
-- 保持函数简洁（单一职责）
-
----
-
-## 📝 开发路线图
-
-### 已完成 ✅
-
-- [x] Whisper 语音识别
-- [x] Qwen 上下文翻译
-- [x] 句子队列去重
-- [x] 短句合并翻译
-- [x] GUI 参数调节
-- [x] 能量检测 VAD
-- [x] 静音触发翻译
-
-### 进行中 🚧
-
-- [ ] 支持双语字幕显示
-- [ ] 字幕历史记录
-- [ ] 导出字幕文件（SRT）
-- [ ] 多语言支持（日语、韩语等）
-
-### 计划中 📋
-
-- [ ] 字幕样式自定义
-- [ ] 热键控制（开始/暂停/清屏）
-- [ ] 多显示器支持
-- [ ] 性能分析工具
-- [ ] Docker 容器化部署
-- [ ] Web 界面版本
-
----
-
-## 📄 许可证
+- 项目最初基于 [leik1000/realtime_subtitle](https://github.com/leik1000/realtime_subtitle)（Apache-2.0），识别管线已完全重写
+- 增量识别算法移植自 [ufal/whisper_streaming](https://github.com/ufal/whisper_streaming)（MIT）
+- [Faster-Whisper](https://github.com/SYSTRAN/faster-whisper) / [Qwen](https://github.com/QwenLM/Qwen) / [Ollama](https://ollama.com/) / [pyaudiowpatch](https://github.com/s0d3s/PyAudioWPatch)
 
 本项目采用 [Apache-2.0](LICENSE) 许可证。
-
----
-
-## 🙏 致谢
-
-### 核心技术
-
-- [Faster-Whisper](https://github.com/SYSTRAN/faster-whisper) - 高性能 Whisper 实现
-- [Qwen](https://github.com/QwenLM/Qwen) - 阿里云通义千问大语言模型
-- [Ollama](https://ollama.com/) - 本地 LLM 运行框架
-
-### 开源库
-
-- [PyQt5](https://www.riverbankcomputing.com/software/pyqt/) - GUI 框架
-- [pyaudiowpatch](https://github.com/s0d3s/pyaudiowpatch) - Windows 音频捕获
-- [librosa](https://librosa.org/) - 音频处理
-- [CTranslate2](https://github.com/OpenNMT/CTranslate2) - 推理引擎
-
-### 特别感谢
-
-- OpenAI Whisper 团队
-- Hugging Face 社区
-- 所有贡献者和使用者
-
----
-
-## 📮 联系方式
-
-- **Issues**：[GitHub Issues](https://github.com/leik1000/realtime_subtitle/issues)
-- **Discussions**：[GitHub Discussions](https://github.com/leik1000/realtime_subtitle/discussions)
-- **Email**：409239349@qq.com
-
----
-
-<div align="center">
-
-**如果这个项目对你有帮助，请给个 ⭐ Star 支持一下！**
-
-Made with ❤️ by [leik1000]
-
-</div>

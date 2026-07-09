@@ -9,12 +9,17 @@
 """
 import sys
 import html
+import math
 import time
 import json
 import os
 from PyQt5.QtWidgets import QLabel, QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSlider, QPushButton, QGroupBox, QTextEdit, QSizeGrip
 from PyQt5.QtCore import Qt, pyqtSignal, QObject
 import config
+
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
 
 # 窗口位置/大小/字号的持久化文件（重启后恢复用户调好的布局）
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "window_state.json")
@@ -25,6 +30,7 @@ class SubtitleSignals(QObject):
     status = pyqtSignal(str)  # 状态提示（如暂停/继续），不进字幕历史
     live = pyqtSignal(str, str)  # live德语行更新 (committed, unstable)
     pair = pyqtSignal(str, str)  # 一段德语翻译完成 (german, chinese)
+    draft = pyqtSignal(str)  # live德语的草稿中文（正式句对完成后被替换）
 
 
 class DraggableWidget(QWidget):
@@ -53,6 +59,55 @@ class DraggableWidget(QWidget):
         if event.button() == Qt.LeftButton:
             self.dragging = False
             event.accept()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        cb = getattr(self, "on_resize", None)
+        if cb:
+            cb()
+
+
+class ResizableFramelessWidget(DraggableWidget):
+    """无边框窗口 + Windows 原生边缘缩放。
+
+    之前唯一的缩放入口是右下角一个透明的 QSizeGrip（看不见，而且窗口
+    底边拖出屏幕后就彻底够不着了）。这里用 WM_NCHITTEST 命中测试把
+    窗口四边/四角各 RESIZE_MARGIN 物理像素交给系统处理：鼠标移到边缘
+    自动变双向箭头，拖拽即缩放，和普通窗口手感一致。
+    """
+
+    RESIZE_MARGIN = 10  # 物理像素（不受DPI缩放影响：坐标和窗口矩形都是物理值）
+
+    # WM_NCHITTEST 返回码
+    _HIT_CODES = {
+        (True, False, True, False): 13,   # HTTOPLEFT
+        (True, False, False, True): 14,   # HTTOPRIGHT
+        (False, True, True, False): 16,   # HTBOTTOMLEFT
+        (False, True, False, True): 17,   # HTBOTTOMRIGHT
+        (True, False, False, False): 12,  # HTTOP
+        (False, True, False, False): 15,  # HTBOTTOM
+        (False, False, True, False): 10,  # HTLEFT
+        (False, False, False, True): 11,  # HTRIGHT
+    }
+
+    def nativeEvent(self, eventType, message):
+        if sys.platform != "win32" or eventType not in (b"windows_generic_MSG", b"windows_dispatcher_MSG"):
+            return False, 0
+        msg = wintypes.MSG.from_address(int(message))
+        if msg.message != 0x0084:  # WM_NCHITTEST
+            return False, 0
+        # lParam 低/高16位是带符号的屏幕物理坐标（多屏/负坐标要按short解）
+        x = ctypes.c_short(msg.lParam & 0xFFFF).value
+        y = ctypes.c_short((msg.lParam >> 16) & 0xFFFF).value
+        rect = wintypes.RECT()
+        ctypes.windll.user32.GetWindowRect(int(self.winId()), ctypes.byref(rect))
+        m = self.RESIZE_MARGIN
+        edges = (y < rect.top + m, y > rect.bottom - m,
+                 x < rect.left + m, x > rect.right - m)
+        hit = self._HIT_CODES.get(edges, 0)
+        if hit:
+            return True, hit
+        return False, 0
 
 
 class SettingsWindow(DraggableWidget):
@@ -122,7 +177,7 @@ class SettingsWindow(DraggableWidget):
         )
 
         self.max_pairs_slider = self._create_slider(
-            "句对条数", 1, 5, config.MAX_SENTENCE_PAIRS, 1,
+            "句对条数上限", 1, 10, config.MAX_SENTENCE_PAIRS, 1,
             lambda v: setattr(config, 'MAX_SENTENCE_PAIRS', int(v))
         )
 
@@ -270,13 +325,17 @@ class SubtitleWindow:
         self.signals = SubtitleSignals()
         
         # 德语先行双层显示状态
-        self.sentence_pairs = []  # 已完成句对 [(german, chinese)]，最多 MAX_SENTENCE_PAIRS 条
+        # 内存里多留一些句对（HISTORY_KEEP条），实际显示条数由窗口高度自适应决定：
+        # 窗口拉大 → 自动多显示历史；拉小 → 只留最新的
+        self.HISTORY_KEEP = 50
+        self.sentence_pairs = []  # 已完成句对 [(german, chinese)]
         self.live_committed = ""  # live行：已提交未翻译的德语
         self.live_unstable = ""   # live行：未稳定尾部（灰色）
+        self.live_draft = ""      # live行的草稿中文（等正式翻译时先显示）
         self.status_line = ""     # 状态提示（暂停/切语言），下次内容更新时清掉
-        
-        # 创建主容器窗口（使用可拖动的容器）
-        self.container = DraggableWidget()
+
+        # 创建主容器窗口（可拖动 + 边缘拖拽缩放）
+        self.container = ResizableFramelessWidget()
         self.container.setWindowTitle("实时字幕")
         self.container.setWindowFlags(
             Qt.WindowStaysOnTopHint |
@@ -370,13 +429,18 @@ class SubtitleWindow:
         container_layout.addLayout(grip_row)
 
         self.container.setLayout(container_layout)
-        # 窗口几何：优先用上次退出时保存的（用户拖过/缩放过就记住），没有才用config默认
+        self.container.setMinimumSize(360, 120)
+        # 窗口大小变化时重新计算能放下几条句对
+        self.container.on_resize = self._render
+        # 窗口几何：优先用上次退出时保存的（用户拖过/缩放过就记住），没有才用config默认。
+        # 用availableGeometry（去掉任务栏）并把窗口完整钳回屏幕内——
+        # 之前底边可以停在屏幕外，唯一的缩放手柄跟着出屏，窗口就再也调不了了
         state = self._state
-        screen = self.app.primaryScreen().geometry()
-        w = min(state.get("w", config.WINDOW_WIDTH), screen.width() - 100)
-        h = min(state.get("h", config.WINDOW_HEIGHT + 40), screen.height() - 100)
-        x = max(0, min(state.get("x", config.WINDOW_X), screen.width() - w))
-        y = max(0, min(state.get("y", config.WINDOW_Y), screen.height() - h))
+        screen = self.app.primaryScreen().availableGeometry()
+        w = min(state.get("w", config.WINDOW_WIDTH), screen.width())
+        h = min(state.get("h", config.WINDOW_HEIGHT + 40), screen.height())
+        x = max(screen.left(), min(state.get("x", config.WINDOW_X), screen.right() - w))
+        y = max(screen.top(), min(state.get("y", config.WINDOW_Y), screen.bottom() - h))
         self.container.setGeometry(x, y, w, h)
         # 布局持久化：停止脚本是Stop-Process强杀，aboutToQuit不可靠，
         # 用定时器检查——布局变了才写盘（15秒一次，无变化零开销）
@@ -399,11 +463,12 @@ class SubtitleWindow:
         self.signals.status.connect(self._show_status)
         self.signals.live.connect(self._update_live)
         self.signals.pair.connect(self._add_pair)
+        self.signals.draft.connect(self._update_draft)
         
         print("✅ 字幕窗口已创建")
-        print(f"   位置: ({config.WINDOW_X}, {config.WINDOW_Y})")
-        print(f"   大小: {config.WINDOW_WIDTH}x{config.WINDOW_HEIGHT}")
+        print(f"   位置: ({x}, {y})  大小: {w}x{h}")
         print("   💡 鼠标拖动窗口可移动位置")
+        print("   💡 鼠标移到窗口边缘/四角可拖拽缩放（窗口越大显示的历史越多）")
         print("   💡 点击 ➖ 按钮可最小化字幕")
         print("   💡 点击 ⚙️ 按钮可打开参数调节面板")
         print("   💡 点击 ❌ 按钮可退出程序")
@@ -469,6 +534,10 @@ class SubtitleWindow:
         """一段德语翻译完成，加入历史句对"""
         self.signals.pair.emit(german or "", chinese or "")
 
+    def update_draft(self, chinese):
+        """live德语的草稿中文（线程安全）。正式句对完成后自动清掉"""
+        self.signals.draft.emit(chinese or "")
+
     def update_subtitle(self, text):
         """旧接口：当一条完成句对显示（兼容保留）"""
         self.signals.update.emit(text)
@@ -483,14 +552,20 @@ class SubtitleWindow:
     def _update_live(self, committed, unstable):
         self.live_committed = committed
         self.live_unstable = unstable
+        if not committed:
+            self.live_draft = ""  # live德语没了，草稿跟着失效
         self.status_line = ""
+        self._render()
+
+    def _update_draft(self, chinese):
+        self.live_draft = chinese
         self._render()
 
     def _add_pair(self, german, chinese):
         self.sentence_pairs.append((german, chinese))
-        max_pairs = getattr(config, "MAX_SENTENCE_PAIRS", 2)
-        while len(self.sentence_pairs) > max_pairs:
+        while len(self.sentence_pairs) > self.HISTORY_KEEP:
             self.sentence_pairs.pop(0)
+        self.live_draft = ""  # 正式翻译到了，草稿退场
         self.status_line = ""
         self.history_window.append_pair(german, chinese)
         self._render()
@@ -513,10 +588,47 @@ class SubtitleWindow:
             return text[:config.MAX_SUBTITLE_LENGTH] + "..."
         return text
 
+    @staticmethod
+    def _est_lines(text, usable_width):
+        """估算一段文字折行后占几行（中文按全宽、拉丁按0.55字宽估）"""
+        if not text or not text.strip():
+            return 0
+        fs = config.FONT_SIZE
+        px = sum(fs if ord(ch) > 0x2E80 else fs * 0.55 for ch in text)
+        return max(1, math.ceil(px / max(usable_width, 100)))
+
+    def _fit_pairs(self):
+        """按窗口高度决定显示几条句对：窗口拉大自动多显示历史，拉小只留最新。
+        （之前固定3条，窗口再大上面也是空黑一片）"""
+        fs = config.FONT_SIZE
+        line_h = fs * 1.6  # line-height 1.5 + 行间距余量
+        usable_w = max(200, self.window.width() - 50)   # padding 15px 20px
+        budget = (self.window.height() - 40) / line_h
+        # live行（德语+草稿中文）优先占预算
+        budget -= self._est_lines(f"{self.live_committed} {self.live_unstable}".strip(), usable_w)
+        budget -= self._est_lines(self.live_draft, usable_w)
+
+        shown = []
+        max_pairs = getattr(config, "MAX_SENTENCE_PAIRS", 10)
+        for german, chinese in reversed(self.sentence_pairs):
+            need = 0
+            if german and getattr(config, "SHOW_BILINGUAL", True):
+                need += self._est_lines(self._clip(german), usable_w)
+            if chinese:
+                need += self._est_lines(self._clip(chinese), usable_w)
+            if shown and budget - need < 0:
+                break  # 放不下更早的了（最新一条永远保底显示）
+            budget -= need
+            shown.append((german, chinese))
+            if len(shown) >= max_pairs:
+                break
+        shown.reverse()
+        return shown
+
     def _render(self):
         """把句对历史+live行渲染成富文本"""
         blocks = []
-        for german, chinese in self.sentence_pairs:
+        for german, chinese in self._fit_pairs():
             lines = []
             if german and getattr(config, "SHOW_BILINGUAL", True):
                 lines.append(html.escape(self._clip(german)))
@@ -531,8 +643,14 @@ class SubtitleWindow:
         if self.live_unstable:
             color = getattr(config, "UNSTABLE_TEXT_COLOR", "#999999")
             live_parts.append(f'<span style="color:{color}"><i>{html.escape(self._clip(self.live_unstable))}</i></span>')
-        if live_parts:
-            blocks.append(" ".join(live_parts))
+        live_block = " ".join(live_parts)
+        if self.live_draft:
+            # 草稿中文：正式翻译还没到之前先给一版（浅蓝斜体和正式中文区分）
+            draft_color = getattr(config, "DRAFT_TEXT_COLOR", "#8fb8e0")
+            live_block += ('<br>' if live_block else '') + \
+                f'<span style="color:{draft_color}"><i>{html.escape(self._clip(self.live_draft))}</i></span>'
+        if live_block:
+            blocks.append(live_block)
 
         if self.status_line:
             blocks.append(html.escape(self.status_line))

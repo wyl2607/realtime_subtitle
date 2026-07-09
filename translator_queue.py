@@ -99,6 +99,11 @@ class WhisperQueueTranslator:
             # UI回调，由main.py接线（都必须线程安全——SubtitleWindow用Qt信号保证）
             self.on_display = None  # (committed_live, unstable) -> None
             self.on_pair = None     # (german, chinese) -> None
+            self.on_draft = None    # (chinese_draft) -> None 残句的草稿中文
+
+            # 草稿翻译节流状态（残句还没凑成完整句子时先出一版灰色中文）
+            self._draft_last_time = 0.0
+            self._draft_last_text = ""
 
             # 创建复用的HTTP会话（用于Ollama）
             self.ollama_session = requests.Session()
@@ -217,7 +222,48 @@ class WhisperQueueTranslator:
             self._save_transcript(german, translation)
         if self.on_pair:
             self.on_pair(german, translation)
+        self._draft_last_text = ""  # 正式句对上屏了，残句草稿从头再来
         self._emit_display()
+
+    def _maybe_draft(self):
+        """残句草稿翻译：中文不用等"凑成完整句+正式翻译"，先出一版草稿。
+
+        德语先行显示解决了"德语第一时刻上屏"，但中文要滞后一整句
+        （长句可能5-15秒）。这里在翻译worker空闲时把当前残句先翻一版，
+        UI以灰色斜体显示；正式句对完成后自动替换。
+        只在正式翻译队列完全空闲时做，绝不和正式句对抢Ollama。"""
+        if not getattr(config, "DRAFT_TRANSLATION", False) or not self.on_draft:
+            return
+        text = self.pending_text
+        if len(text.split()) < getattr(config, "DRAFT_MIN_WORDS", 3):
+            return
+        if text == self._draft_last_text:
+            return  # 残句没变，上一版草稿还有效
+        if time.time() - self._draft_last_time < getattr(config, "DRAFT_MIN_INTERVAL", 1.5):
+            return
+        with self._tx_lock:
+            if self._tx_queue or self._tx_inflight:
+                return  # 正式翻译在忙，草稿让路
+        self._draft_last_time = time.time()
+        self._draft_last_text = text
+        try:
+            self._tx_executor.submit(self._draft_worker, text)
+        except RuntimeError:
+            pass  # 程序正在退出
+
+    def _draft_worker(self, snapshot):
+        """在翻译线程里跑草稿（和正式翻译同一个单线程池，天然串行）"""
+        with self._tx_lock:
+            if self._tx_queue:
+                return  # 等草稿排到时已经来了正式句子，草稿没意义了
+        translation = self._translate_single_sentence(snapshot, " ".join(self.context_history))
+        # 翻译失败会原样返回德语，那就不值得展示
+        if not translation or translation == snapshot:
+            return
+        # 草稿期间残句可能已经变了：还在以snapshot开头（只是变长）就照常展示，
+        # 完全变了（已成句送翻译/被清空）就丢弃
+        if self.pending_text.startswith(snapshot):
+            self.on_draft(translation)
 
     def _translate_single_sentence(self, sentence, german_context):
         """翻译一段对白（源语言 -> 中文）。失败时返回原文。"""
@@ -401,6 +447,7 @@ class WhisperQueueTranslator:
             self.pending_text = ""
 
         self._emit_display()
+        self._maybe_draft()
 
         if config.SHOW_PERFORMANCE:
             elapsed = time.time() - start_time

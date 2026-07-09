@@ -18,20 +18,29 @@ $ollamaDir = "$env:LOCALAPPDATA\Programs\Ollama"
 if (Test-Path $ollamaDir) {
     $env:Path = "$ollamaDir;$env:Path"
 }
+# Ollama 可能装在用户目录也可能装在 Program Files，动态解析
+$ollamaExe = (Get-Command ollama -ErrorAction SilentlyContinue).Source
+if (-not $ollamaExe) { $ollamaExe = "$ollamaDir\ollama.exe" }
+if (-not (Test-Path $ollamaExe)) {
+    Write-Host "❌ 找不到 Ollama。请先安装: https://ollama.com/download，或运行 install.ps1"
+    exit 1
+}
 
 Write-Host "检查 Ollama 服务..."
 try {
     Invoke-RestMethod -Uri "http://127.0.0.1:11434/api/tags" -TimeoutSec 3 | Out-Null
 } catch {
     Write-Host "正在启动 Ollama..."
-    Start-Process -FilePath "$ollamaDir\ollama.exe" -ArgumentList "serve" -WindowStyle Hidden
+    Start-Process -FilePath $ollamaExe -ArgumentList "serve" -WindowStyle Hidden
     Start-Sleep -Seconds 3
 }
 
+# 翻译模型名从 config 读（config_local.py 里可能配了小模型），不要硬编码
+$txModel = & "$PSScriptRoot\venv\Scripts\python.exe" -c "import config; print(config.OLLAMA_MODEL)"
 $models = (Invoke-RestMethod -Uri "http://127.0.0.1:11434/api/tags").models.name
-if ($models -notcontains "qwen3:8b") {
-    Write-Host "正在下载 qwen3:8b 模型（首次约 5GB）..."
-    & "$ollamaDir\ollama.exe" pull qwen3:8b
+if ($models -notcontains $txModel) {
+    Write-Host "正在下载 $txModel 模型（首次需要几分钟）..."
+    & $ollamaExe pull $txModel
 }
 
 Write-Host "启动实时字幕..."
