@@ -9,7 +9,6 @@
 """
 import sys
 import html
-import math
 import time
 import json
 import os
@@ -77,6 +76,24 @@ class ResizableFramelessWidget(DraggableWidget):
     """
 
     RESIZE_MARGIN = 10  # 物理像素（不受DPI缩放影响：坐标和窗口矩形都是物理值）
+
+    def __init__(self):
+        super().__init__()
+        # WA_TranslucentBackground 下 alpha=0 的像素鼠标会直接穿透到下层窗口：
+        # 顶部按钮行两侧、底部手柄行都是全透明的，导致上/下边缘抓不住
+        # （左右边缘因为字幕标签是不透明黑色所以能抓）。
+        # 注意：给顶层窗口本身设样式底色不生效（实测alpha=255也不上屏），
+        # 必须用一个铺满窗口的子控件当底衬——alpha=2肉眼不可见，但整个
+        # 窗口表面都能接住鼠标（test_hittest.py 有回归测试）
+        self._underlay = QWidget(self)
+        self._underlay.setObjectName("hitUnderlay")
+        self._underlay.setAttribute(Qt.WA_StyledBackground, True)
+        self._underlay.setStyleSheet("#hitUnderlay { background: rgba(0, 0, 0, 2); }")
+        self._underlay.lower()
+
+    def resizeEvent(self, event):
+        self._underlay.setGeometry(self.rect())
+        super().resizeEvent(event)  # 父类会触发 on_resize 回调（重排句对）
 
     # WM_NCHITTEST 返回码
     _HIT_CODES = {
@@ -177,7 +194,7 @@ class SettingsWindow(DraggableWidget):
         )
 
         self.max_pairs_slider = self._create_slider(
-            "句对条数上限", 1, 10, config.MAX_SENTENCE_PAIRS, 1,
+            "句对条数上限", 1, 20, config.MAX_SENTENCE_PAIRS, 1,
             lambda v: setattr(config, 'MAX_SENTENCE_PAIRS', int(v))
         )
 
@@ -588,55 +605,17 @@ class SubtitleWindow:
             return text[:config.MAX_SUBTITLE_LENGTH] + "..."
         return text
 
-    @staticmethod
-    def _est_lines(text, usable_width):
-        """估算一段文字折行后占几行（中文按全宽、拉丁按0.55字宽估）"""
-        if not text or not text.strip():
-            return 0
-        fs = config.FONT_SIZE
-        px = sum(fs if ord(ch) > 0x2E80 else fs * 0.55 for ch in text)
-        return max(1, math.ceil(px / max(usable_width, 100)))
+    def _pair_html(self, german, chinese):
+        """一条已完成句对的富文本块"""
+        lines = []
+        if german and getattr(config, "SHOW_BILINGUAL", True):
+            lines.append(html.escape(self._clip(german)))
+        if chinese:
+            lines.append(f'<span style="color:#c8c8c8">{html.escape(self._clip(chinese))}</span>')
+        return "<br>".join(lines)
 
-    def _fit_pairs(self):
-        """按窗口高度决定显示几条句对：窗口拉大自动多显示历史，拉小只留最新。
-        （之前固定3条，窗口再大上面也是空黑一片）"""
-        fs = config.FONT_SIZE
-        line_h = fs * 1.6  # line-height 1.5 + 行间距余量
-        usable_w = max(200, self.window.width() - 50)   # padding 15px 20px
-        budget = (self.window.height() - 40) / line_h
-        # live行（德语+草稿中文）优先占预算
-        budget -= self._est_lines(f"{self.live_committed} {self.live_unstable}".strip(), usable_w)
-        budget -= self._est_lines(self.live_draft, usable_w)
-
-        shown = []
-        max_pairs = getattr(config, "MAX_SENTENCE_PAIRS", 10)
-        for german, chinese in reversed(self.sentence_pairs):
-            need = 0
-            if german and getattr(config, "SHOW_BILINGUAL", True):
-                need += self._est_lines(self._clip(german), usable_w)
-            if chinese:
-                need += self._est_lines(self._clip(chinese), usable_w)
-            if shown and budget - need < 0:
-                break  # 放不下更早的了（最新一条永远保底显示）
-            budget -= need
-            shown.append((german, chinese))
-            if len(shown) >= max_pairs:
-                break
-        shown.reverse()
-        return shown
-
-    def _render(self):
-        """把句对历史+live行渲染成富文本"""
-        blocks = []
-        for german, chinese in self._fit_pairs():
-            lines = []
-            if german and getattr(config, "SHOW_BILINGUAL", True):
-                lines.append(html.escape(self._clip(german)))
-            if chinese:
-                lines.append(f'<span style="color:#c8c8c8">{html.escape(self._clip(chinese))}</span>')
-            if lines:
-                blocks.append("<br>".join(lines))
-
+    def _live_block_html(self):
+        """live行的富文本块：德语（白+灰色未稳定尾部）+ 草稿中文"""
         live_parts = []
         if self.live_committed:
             live_parts.append(html.escape(self._clip(self.live_committed)))
@@ -649,12 +628,45 @@ class SubtitleWindow:
             draft_color = getattr(config, "DRAFT_TEXT_COLOR", "#8fb8e0")
             live_block += ('<br>' if live_block else '') + \
                 f'<span style="color:{draft_color}"><i>{html.escape(self._clip(self.live_draft))}</i></span>'
-        if live_block:
-            blocks.append(live_block)
+        return live_block
 
-        if self.status_line:
-            blocks.append(html.escape(self.status_line))
+    def _render(self):
+        """把句对历史+live行渲染成富文本。
 
+        显示几条句对由真实排版高度决定：用 QTextDocument 按 QLabel 相同的
+        字体/宽度排版测高，从最新往旧塞，塞到窗口装不下为止——窗口拉多大
+        就填多满（瀑布式），不再靠折行估算（之前估得保守，顶部留大片空黑）。
+        """
+        from PyQt5.QtGui import QTextDocument, QFont
+
+        live_block = self._live_block_html()
+        status = html.escape(self.status_line) if self.status_line else ""
+        fixed = [b for b in (live_block, status) if b]
+
+        # 和 QLabel 一致的排版环境（padding 15px 20px + 2px边框）
+        doc = QTextDocument()
+        doc.setDocumentMargin(0)
+        font = QFont(config.FONT_FAMILY.split(",")[0].strip())
+        font.setPixelSize(config.FONT_SIZE)
+        doc.setDefaultFont(font)
+        doc.setTextWidth(max(100, self.window.width() - 46))
+        avail_h = self.window.height() - 40
+
+        chosen = []  # 新→旧
+        max_pairs = getattr(config, "MAX_SENTENCE_PAIRS", 20)
+        for german, chinese in reversed(self.sentence_pairs):
+            blk = self._pair_html(german, chinese)
+            if not blk:
+                continue
+            trial = list(reversed(chosen + [blk])) + fixed
+            doc.setHtml("<br>".join(trial))
+            if chosen and doc.size().height() > avail_h:
+                break  # 放不下更早的了（最新一条永远保底显示）
+            chosen.append(blk)
+            if len(chosen) >= max_pairs:
+                break
+
+        blocks = list(reversed(chosen)) + fixed
         if not blocks:
             return  # 什么都没有就保持现状（避免闪空白）
 

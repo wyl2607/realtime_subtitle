@@ -58,8 +58,8 @@ FONT_FAMILY = "Microsoft YaHei, Arial"  # 字体
 MAX_SUBTITLE_LENGTH = 400  # 字幕最大字符数（双语显示需要更多空间）
 SHOW_BILINGUAL = True  # 同时显示德语原文和中文翻译
 UNSTABLE_TEXT_COLOR = "#999999"  # live行里未稳定（还可能变）的德语尾部颜色
-MAX_SENTENCE_PAIRS = 10  # 悬浮窗句对（德+中）条数上限；实际显示条数按窗口高度自适应，
-                         # 窗口拉大自动多显示历史（更早的在📜历史窗口里）
+MAX_SENTENCE_PAIRS = 20  # 悬浮窗句对（德+中）条数上限；实际显示条数按窗口高度
+                         # 精确排版测算，窗口拉大自动填满（更早的在📜历史窗口里）
 
 # 窗口样式
 BACKGROUND_COLOR = "rgba(0, 0, 0, 255)"  # 背景色（纯黑）
