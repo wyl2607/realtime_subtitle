@@ -54,9 +54,16 @@ class DraggableWidget(QWidget):
             event.accept()
 
     def mouseMoveEvent(self, event):
-        """鼠标移动 - 拖动窗口"""
+        """鼠标移动 - 拖动窗口（钳制在屏幕可用区域内。
+        实测能把窗口拖出屏幕顶部，按钮行被切一半就再也够不着了）"""
         if self.dragging and event.buttons() == Qt.LeftButton:
-            self.move(event.globalPos() - self.drag_position)
+            target = event.globalPos() - self.drag_position
+            screen = QApplication.screenAt(event.globalPos())
+            if screen:
+                area = screen.availableGeometry()
+                target.setX(max(area.left(), min(target.x(), area.right() - self.width() + 1)))
+                target.setY(max(area.top(), min(target.y(), area.bottom() - self.height() + 1)))
+            self.move(target)
             event.accept()
 
     def mouseReleaseEvent(self, event):
@@ -729,21 +736,29 @@ class SubtitleWindow:
         doc = self._build_doc()
         avail_h = self.window.height() - 40
 
-        chosen = []  # 新→旧
-        max_pairs = getattr(config, "MAX_SENTENCE_PAIRS", 20)
-        for german, chinese in reversed(self.sentence_pairs):
-            blk = self._pair_html(german, chinese)
-            if not blk:
-                continue
-            trial = list(reversed(chosen + [blk])) + fixed
-            doc.setHtml("<br>".join(trial))
-            if chosen and doc.size().height() > avail_h:
-                break  # 放不下更早的了（最新一条永远保底显示）
-            chosen.append(blk)
-            if len(chosen) >= max_pairs:
-                break
+        pair_blocks = [b for b in (self._pair_html(g, c) for g, c in self.sentence_pairs) if b]
+        cap = min(len(pair_blocks), getattr(config, "MAX_SENTENCE_PAIRS", 20))
 
-        blocks = list(reversed(chosen)) + fixed
+        def fits(count):
+            doc.setHtml("<br>".join(pair_blocks[len(pair_blocks) - count:] + fixed))
+            return doc.size().height() <= avail_h
+
+        # 二分找能装下的最多句对数（fits随count单调递减；每次渲染最多
+        # ~5次排版测量，之前线性试装最多20次，UI线程上省一截）。
+        # 最新一条保底：窗口再小也至少显示1条
+        shown = 0
+        if cap:
+            shown = 1
+            lo, hi = 2, cap
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                if fits(mid):
+                    shown = mid
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+
+        blocks = (pair_blocks[len(pair_blocks) - shown:] if shown else []) + fixed
         if not blocks:
             return  # 什么都没有就保持现状（避免闪空白）
 
