@@ -92,6 +92,8 @@ class WhisperQueueTranslator:
             self._tx_queue = []      # 已入队待翻译
             self._tx_inflight = []   # 正在翻译中
             self._tx_executor = ThreadPoolExecutor(max_workers=1)
+            # 点词查词单独一个worker：查词典不该排在字幕翻译后面等
+            self._lookup_executor = ThreadPoolExecutor(max_workers=1)
 
             # 最近已翻译的德语句子，作为翻译上下文
             self.context_history = deque(maxlen=6)
@@ -266,6 +268,54 @@ class WhisperQueueTranslator:
             if config.SHOW_PERFORMANCE:
                 print(f"   ✏️  草稿: {translation[:50]}{'...' if len(translation) > 50 else ''}")
             self.on_draft(translation)
+
+    # ------------------------------------------------------------------
+    # 点词查词（独立worker，不占字幕翻译的队列）
+    # ------------------------------------------------------------------
+    def lookup_word(self, word, context, callback):
+        """查一个德语/英语单词的词典解释，完成后调 callback(word, text)。
+
+        callback 必须线程安全（SubtitleWindow.show_lookup_result 走Qt信号）。
+        """
+        try:
+            self._lookup_executor.submit(self._lookup_worker, word, context, callback)
+        except RuntimeError:
+            pass  # 程序正在退出
+
+    def _lookup_worker(self, word, context, callback):
+        lang_name = config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)
+        prompt = f"""/no_think 你是{lang_name}汉词典。简明解释{lang_name}单词"{word}"。
+它出现在这句话里：{context}
+
+严格按这个格式输出，不要多余内容：
+原形: （动词给不定式、名词给单数带冠词，本身是原形就重复）
+词性:
+释义: 中文释义，最多2条，分号隔开
+本句中: 一句话说明它在上面那句话里的意思
+"""
+        try:
+            t0 = time.time()
+            response = self.ollama_session.post(
+                f"{config.OLLAMA_BASE_URL}/api/generate",
+                json={
+                    "model": config.OLLAMA_MODEL,
+                    "prompt": prompt,
+                    "stream": False,
+                    "think": False,
+                    "options": {"temperature": 0.2, "num_predict": 220, "num_ctx": 2048},
+                },
+                timeout=15,
+            )
+            if response.status_code == 200:
+                text = response.json().get("response", "").strip()
+                text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+                if config.SHOW_PERFORMANCE:
+                    print(f"   📖 查词 {word} {time.time() - t0:.1f}秒")
+                callback(word, text or "（没查到）")
+            else:
+                callback(word, f"查询失败（HTTP {response.status_code}）")
+        except Exception as e:
+            callback(word, f"查询失败: {e}")
 
     def _translate_single_sentence(self, sentence, german_context):
         """翻译一段对白（源语言 -> 中文）。失败时返回原文。"""
@@ -494,6 +544,7 @@ class WhisperQueueTranslator:
         ASR关完就不会再往翻译队列塞句子"""
         self._asr_executor.shutdown(wait=True, cancel_futures=False)
         self._tx_executor.shutdown(wait=True, cancel_futures=False)
+        self._lookup_executor.shutdown(wait=False, cancel_futures=True)
 
     def __del__(self):
         """清理资源"""

@@ -30,33 +30,43 @@ class SubtitleSignals(QObject):
     live = pyqtSignal(str, str)  # live德语行更新 (committed, unstable)
     pair = pyqtSignal(str, str)  # 一段德语翻译完成 (german, chinese)
     draft = pyqtSignal(str)  # live德语的草稿中文（正式句对完成后被替换）
+    lookup = pyqtSignal(str, str)  # 点词查词结果 (word, 词典文本)
+    toggle_ct = pyqtSignal()  # 切换鼠标穿透模式（热键线程→主线程）
 
 
 class DraggableWidget(QWidget):
-    """可拖动的窗口容器"""
-    
+    """可拖动的窗口容器；支持"原地单击"回调（按下到松开位移<6px算点击，
+    拖动和点词查词互不干扰）"""
+
     def __init__(self):
         super().__init__()
         self.dragging = False
         self.drag_position = None
-    
+        self._press_global = None
+        self.on_click = None  # 原地单击回调 (widget坐标QPoint) -> None
+
     def mousePressEvent(self, event):
         """鼠标按下 - 开始拖动"""
         if event.button() == Qt.LeftButton:
             self.dragging = True
             self.drag_position = event.globalPos() - self.frameGeometry().topLeft()
+            self._press_global = event.globalPos()
             event.accept()
-    
+
     def mouseMoveEvent(self, event):
         """鼠标移动 - 拖动窗口"""
         if self.dragging and event.buttons() == Qt.LeftButton:
             self.move(event.globalPos() - self.drag_position)
             event.accept()
-    
+
     def mouseReleaseEvent(self, event):
-        """鼠标释放 - 结束拖动"""
+        """鼠标释放 - 结束拖动；没怎么动过就当作一次单击"""
         if event.button() == Qt.LeftButton:
             self.dragging = False
+            if (self.on_click and self._press_global is not None
+                    and (event.globalPos() - self._press_global).manhattanLength() < 6):
+                self.on_click(event.pos())
+            self._press_global = None
             event.accept()
 
     def resizeEvent(self, event):
@@ -324,6 +334,56 @@ class HistoryWindow(QWidget):
             sb.setValue(sb.maximum())
 
 
+class WordPopup(QWidget):
+    """点词查词的小弹窗：跟着鼠标位置出现，自动消失，点一下也消失"""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.label = QLabel()
+        self.label.setWordWrap(True)
+        self.label.setTextFormat(Qt.RichText)
+        self.label.setStyleSheet("""
+            QLabel {
+                background-color: rgba(25, 30, 40, 240);
+                color: white;
+                font-size: 16px;
+                font-family: Microsoft YaHei, Arial;
+                padding: 10px 14px;
+                border-radius: 8px;
+                border: 1px solid rgba(143, 184, 224, 0.6);
+            }
+        """)
+        layout.addWidget(self.label)
+        self.setLayout(layout)
+        self.setMaximumWidth(420)
+
+        from PyQt5.QtCore import QTimer
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self.hide)
+
+    def show_at(self, global_pos, html_text, timeout_ms=15000):
+        self.label.setText(html_text)
+        self.adjustSize()
+        # 往上偏移显示，避免挡住刚点的词；不出屏
+        screen = QApplication.primaryScreen().availableGeometry()
+        x = min(max(screen.left(), global_pos.x() - 40), screen.right() - self.width())
+        y = global_pos.y() - self.height() - 12
+        if y < screen.top():
+            y = global_pos.y() + 20
+        self.move(x, y)
+        self.show()
+        self.raise_()
+        self._hide_timer.start(timeout_ms)
+
+    def mousePressEvent(self, event):
+        self.hide()
+
+
 class SubtitleWindow:
     """字幕悬浮窗"""
     
@@ -474,13 +534,24 @@ class SubtitleWindow:
 
         # 创建历史窗口（初始隐藏）
         self.history_window = HistoryWindow()
-        
+
+        # 点词查词：单击字幕里的德语词 → 弹小窗显示词典解释
+        self.word_popup = WordPopup()
+        self.container.on_click = self._on_label_click
+        self.on_lookup = None  # (word, context) -> None，由main.py接到translator
+        self._last_html = ""   # 最近一次渲染的富文本（点击命中测试要按它重建排版）
+
+        # 鼠标穿透模式状态（Ctrl+Alt+M切换）
+        self._click_through = False
+
         # 连接信号到槽（线程安全）
         self.signals.update.connect(self._update_text)
         self.signals.status.connect(self._show_status)
         self.signals.live.connect(self._update_live)
         self.signals.pair.connect(self._add_pair)
         self.signals.draft.connect(self._update_draft)
+        self.signals.lookup.connect(self._show_lookup)
+        self.signals.toggle_ct.connect(self._toggle_click_through)
         
         print("✅ 字幕窗口已创建")
         print(f"   位置: ({x}, {y})  大小: {w}x{h}")
@@ -630,6 +701,19 @@ class SubtitleWindow:
                 f'<span style="color:{draft_color}"><i>{html.escape(self._clip(self.live_draft))}</i></span>'
         return live_block
 
+    def _build_doc(self, html_str=""):
+        """按 QLabel 相同的字体/宽度建一个 QTextDocument（测高/点击命中测试共用）"""
+        from PyQt5.QtGui import QTextDocument, QFont
+        doc = QTextDocument()
+        doc.setDocumentMargin(0)
+        font = QFont(config.FONT_FAMILY.split(",")[0].strip())
+        font.setPixelSize(config.FONT_SIZE)
+        doc.setDefaultFont(font)
+        doc.setTextWidth(max(100, self.window.width() - 46))
+        if html_str:
+            doc.setHtml(html_str)
+        return doc
+
     def _render(self):
         """把句对历史+live行渲染成富文本。
 
@@ -637,19 +721,12 @@ class SubtitleWindow:
         字体/宽度排版测高，从最新往旧塞，塞到窗口装不下为止——窗口拉多大
         就填多满（瀑布式），不再靠折行估算（之前估得保守，顶部留大片空黑）。
         """
-        from PyQt5.QtGui import QTextDocument, QFont
-
         live_block = self._live_block_html()
         status = html.escape(self.status_line) if self.status_line else ""
         fixed = [b for b in (live_block, status) if b]
 
         # 和 QLabel 一致的排版环境（padding 15px 20px + 2px边框）
-        doc = QTextDocument()
-        doc.setDocumentMargin(0)
-        font = QFont(config.FONT_FAMILY.split(",")[0].strip())
-        font.setPixelSize(config.FONT_SIZE)
-        doc.setDefaultFont(font)
-        doc.setTextWidth(max(100, self.window.width() - 46))
+        doc = self._build_doc()
         avail_h = self.window.height() - 40
 
         chosen = []  # 新→旧
@@ -670,8 +747,89 @@ class SubtitleWindow:
         if not blocks:
             return  # 什么都没有就保持现状（避免闪空白）
 
-        self.window.setText("<br>".join(blocks))
+        self._last_html = "<br>".join(blocks)
+        self.window.setText(self._last_html)
         self.window.show()
+
+    # ------------------------------------------------------------------
+    # 点词查词
+    # ------------------------------------------------------------------
+    def _on_label_click(self, pos):
+        """容器上的原地单击：命中字幕文字里的德语词就发起词典查询。
+
+        QLabel 的富文本没有词级点击API，这里用和渲染完全相同的
+        QTextDocument 重建排版，documentLayout().hitTest 找到字符位置，
+        再取词。注意 QLabel 是 AlignBottom：文档从内容区底部往上排。
+        """
+        if not self.on_lookup or not self._last_html:
+            return
+        lp = pos - self.window.pos()  # 容器坐标 → 字幕标签坐标
+        if not self.window.rect().contains(lp):
+            return
+
+        from PyQt5.QtCore import QPointF
+        from PyQt5.QtGui import QTextCursor
+        doc = self._build_doc(self._last_html)
+        # 内容区 = 标签减 padding(15px 20px) 和 2px 边框
+        content_x0, content_y0 = 22, 17
+        content_h = self.window.height() - 34
+        doc_y0 = content_y0 + max(0, content_h - doc.size().height())  # AlignBottom
+        hit = doc.documentLayout().hitTest(
+            QPointF(lp.x() - content_x0, lp.y() - doc_y0), Qt.ExactHit)
+        if hit < 0:
+            return  # 点在空白处
+
+        cursor = QTextCursor(doc)
+        cursor.setPosition(hit)
+        cursor.select(QTextCursor.WordUnderCursor)
+        word = cursor.selectedText().strip(".,!?…:;\"'«»()")
+        # 只查拉丁字母词（德语/英语）；点到中文/数字/空白不弹窗
+        if len(word) < 2 or not all(c.isalpha() and ord(c) < 0x2E80 for c in word):
+            return
+        context = cursor.block().text()  # 该词所在行做上下文
+
+        from PyQt5.QtGui import QCursor
+        self._lookup_anchor = QCursor.pos()
+        self.word_popup.show_at(self._lookup_anchor,
+                                f"🔍 <b>{html.escape(word)}</b> 查询中…", 8000)
+        self.on_lookup(word, context)
+
+    def show_lookup_result(self, word, text):
+        """词典查询完成（线程安全，从翻译线程调）"""
+        self.signals.lookup.emit(word or "", text or "")
+
+    def _show_lookup(self, word, text):
+        body = html.escape(text).replace("\n", "<br>")
+        self.word_popup.show_at(
+            getattr(self, "_lookup_anchor", self.container.pos()),
+            f"📖 <b>{html.escape(word)}</b><br>{body}")
+
+    # ------------------------------------------------------------------
+    # 鼠标穿透模式（Ctrl+Alt+M）
+    # ------------------------------------------------------------------
+    def toggle_click_through(self):
+        """切换鼠标穿透（线程安全，热键线程调用）"""
+        self.signals.toggle_ct.emit()
+
+    def _toggle_click_through(self):
+        """穿透开：字幕窗对鼠标完全隐形（点击/滚轮全落到下面的视频/游戏上），
+        适合全屏看剧不挡操作。用原生 WS_EX_TRANSPARENT——窗口本来就是
+        WS_EX_LAYERED（半透明窗），加这个标志即可，不用重建窗口"""
+        if sys.platform != "win32":
+            return
+        GWL_EXSTYLE = -20
+        WS_EX_TRANSPARENT = 0x20
+        hwnd = int(self.container.winId())
+        ex = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        self._click_through = not self._click_through
+        if self._click_through:
+            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT)
+            self.show_status("👻 鼠标穿透已开启：字幕窗点不到了（Ctrl+Alt+M 恢复）")
+            print("👻 [热键] 鼠标穿透开启")
+        else:
+            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex & ~WS_EX_TRANSPARENT)
+            self.show_status("🖱️ 鼠标穿透已关闭，字幕窗恢复可点击")
+            print("🖱️ [热键] 鼠标穿透关闭")
 
     def _minimize_window(self):
         """最小化/恢复字幕窗口（之前点一次就永久隐藏且窗口缩成一条，改成可切换）"""

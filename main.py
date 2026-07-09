@@ -57,6 +57,9 @@ class SubtitleApp:
         self.translator.on_display = self.subtitle_window.update_live
         self.translator.on_pair = self.subtitle_window.add_pair
         self.translator.on_draft = self.subtitle_window.update_draft
+        # 点词查词：窗口点击→translator查Ollama→回调线程安全地弹结果
+        self.subtitle_window.on_lookup = lambda word, ctx: self.translator.lookup_word(
+            word, ctx, self.subtitle_window.show_lookup_result)
 
         # 初始化音频捕获（传入回调函数）
         try:
@@ -139,7 +142,9 @@ class SubtitleApp:
 
         keyboard.add_hotkey("ctrl+alt+p", toggle_pause)
         keyboard.add_hotkey("ctrl+alt+l", switch_language)
-        print("⌨️  全局快捷键已注册: Ctrl+Alt+P = 暂停/继续, Ctrl+Alt+L = 切换源语言")
+        keyboard.add_hotkey("ctrl+alt+m", self.subtitle_window.toggle_click_through)
+        print("⌨️  全局快捷键已注册: Ctrl+Alt+P = 暂停/继续, Ctrl+Alt+L = 切换源语言, "
+              "Ctrl+Alt+M = 鼠标穿透")
 
     def _flush_check(self):
         """定时兜底：一段话说完后没有新音频，识别不会再被触发，
