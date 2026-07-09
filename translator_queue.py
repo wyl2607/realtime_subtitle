@@ -263,6 +263,8 @@ class WhisperQueueTranslator:
         # 草稿期间残句可能已经变了：还在以snapshot开头（只是变长）就照常展示，
         # 完全变了（已成句送翻译/被清空）就丢弃
         if self.pending_text.startswith(snapshot):
+            if config.SHOW_PERFORMANCE:
+                print(f"   ✏️  草稿: {translation[:50]}{'...' if len(translation) > 50 else ''}")
             self.on_draft(translation)
 
     def _translate_single_sentence(self, sentence, german_context):
