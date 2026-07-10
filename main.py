@@ -24,7 +24,7 @@ logging.basicConfig(level=logging.ERROR)
 # 任何PyQt5导入【之前】。先加载Qt的DLL再初始化torch的c10.dll会直接
 # OSError WinError 1114（DLL初始化例程失败），实测100%复现
 from translator_queue import WhisperQueueTranslator
-from audio_capture import AudioCapture, PAUSE_FLAG_FILE
+from audio_capture import AudioCapture, PAUSE_FLAG_FILE, STOP_FLAG_FILE
 from subtitle_window import SubtitleWindow
 from PyQt5.QtCore import QTimer
 import config
@@ -196,11 +196,30 @@ class SubtitleApp:
             return
         self.translator.request_flush()
 
+    def _stop_flag_check(self):
+        """停止脚本写 .stop 文件后，在此优雅退出（关线程池/模型，再退 Qt）"""
+        if not self.running:
+            return
+        if not os.path.exists(STOP_FLAG_FILE):
+            return
+        try:
+            os.remove(STOP_FLAG_FILE)
+        except OSError:
+            pass
+        print("\n⏹️  收到停止请求，正在优雅退出...")
+        # quit 会触发 aboutToQuit → stop()；随后事件循环结束
+        self.subtitle_window.app.quit()
 
     def start(self):
         """启动应用"""
         print("\n🚀 正在启动应用...")
         self.running = True
+        # 启动前清掉残留停止标记，避免立刻又退
+        try:
+            if os.path.exists(STOP_FLAG_FILE):
+                os.remove(STOP_FLAG_FILE)
+        except OSError:
+            pass
         
         # 启动音频捕获
         try:
@@ -220,6 +239,11 @@ class SubtitleApp:
         self._flush_timer.timeout.connect(self._flush_check)
         self._flush_timer.start(1000)
 
+        # 停止标记轮询（0.5s：停止.bat 体感更快）
+        self._stop_timer = QTimer()
+        self._stop_timer.timeout.connect(self._stop_flag_check)
+        self._stop_timer.start(500)
+
         # 运行UI事件循环（阻塞，直到窗口关闭）
         try:
             # 连接退出信号
@@ -238,9 +262,11 @@ class SubtitleApp:
         print("\n⏹️  正在停止应用...")
         self.running = False
 
-        # 停掉兜底定时器，避免向关闭中的线程池提交任务
+        # 停掉定时器，避免向关闭中的线程池提交任务
         if hasattr(self, '_flush_timer'):
             self._flush_timer.stop()
+        if hasattr(self, '_stop_timer'):
+            self._stop_timer.stop()
 
         # 让热键线程退出消息循环并注销热键（WM_QUIT = 0x0012）
         if getattr(self, '_hotkey_tid', None):
@@ -256,6 +282,13 @@ class SubtitleApp:
         # 优雅地关闭识别/翻译线程（translator内部先ASR后翻译）
         print("   - 正在关闭识别与翻译线程...")
         self.translator.shutdown()
+
+        # 清掉停止标记（若仍在）
+        try:
+            if os.path.exists(STOP_FLAG_FILE):
+                os.remove(STOP_FLAG_FILE)
+        except OSError:
+            pass
 
         print("👋 应用已关闭，再见！")
     

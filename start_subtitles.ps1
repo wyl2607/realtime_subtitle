@@ -11,8 +11,9 @@ if (Test-Path $pidFile) {
     }
 }
 
-# 清掉可能残留的暂停标记，保证每次启动都是正常运行状态
+# 清掉可能残留的暂停/停止标记，保证每次启动都是正常运行状态
 Remove-Item "$PSScriptRoot\.paused" -ErrorAction SilentlyContinue
+Remove-Item "$PSScriptRoot\.stop" -ErrorAction SilentlyContinue
 
 $ollamaDir = "$env:LOCALAPPDATA\Programs\Ollama"
 if (Test-Path $ollamaDir) {

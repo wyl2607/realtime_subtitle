@@ -1,10 +1,10 @@
-# 核心依赖
-faster-whisper>=1.0.0        # Whisper 语音识别
-ctranslate2>=4.6.2           # RTX 50系(Blackwell/sm_120)必须>=4.6.2：旧版int8路径
-                             # 直接CUBLAS_STATUS_NOT_SUPPORTED崩溃，4.6.2起自动禁用
-requests>=2.28.0              # Ollama API 调用
-torch>=2.0.0                  # CPU版即可：项目本身不用torch，但ctranslate2内部会import它
-numpy>=1.24.0                 # 数值计算
+# 核心依赖（上限防止 pip 漂到破坏 ctranslate2/CUDA 的组合）
+faster-whisper>=1.0.0,<2.0.0   # Whisper 语音识别
+ctranslate2>=4.6.2,<5.0.0      # RTX 50系(Blackwell/sm_120)必须>=4.6.2：旧版int8路径
+                               # 直接CUBLAS_STATUS_NOT_SUPPORTED崩溃，4.6.2起自动禁用
+requests>=2.28.0,<3.0.0         # Ollama API 调用
+torch>=2.0.0,<3.0.0             # CPU版即可：项目本身不用torch，但ctranslate2内部会import它
+numpy>=1.24.0,<3.0.0            # 数值计算
 
 # CUDA 运行库（缺了程序起不来！）
 # Windows下ctranslate2按名字LoadLibraryA加载cublas64_12.dll，
@@ -13,8 +13,8 @@ nvidia-cublas-cu12>=12.0
 nvidia-cudnn-cu12>=9.0
 
 # 音频处理
-pyaudiowpatch>=0.2.0          # Windows 系统音频捕获 (WASAPI Loopback)
-soxr>=0.3.0                   # 音频重采样（librosa太重，只用得到resample，底层就是soxr）
+pyaudiowpatch>=0.2.0,<1.0.0     # Windows 系统音频捕获 (WASAPI Loopback)
+soxr>=0.3.0,<1.0.0              # 音频重采样（librosa太重，只用得到resample，底层就是soxr）
 
 # 用户界面
-PyQt5>=5.15.0                 # GUI 框架
+PyQt5>=5.15.0,<5.16.0           # GUI 框架

@@ -12,7 +12,10 @@ import html
 import time
 import json
 import os
-from PyQt5.QtWidgets import QLabel, QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSlider, QPushButton, QGroupBox, QTextEdit
+from PyQt5.QtWidgets import (
+    QLabel, QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSlider,
+    QPushButton, QGroupBox, QTextEdit, QLineEdit,
+)
 from PyQt5.QtCore import Qt, pyqtSignal, QObject
 import config
 
@@ -171,7 +174,7 @@ class SettingsWindow(DraggableWidget):
         self._on_font_change = on_font_change  # 字号变了要让字幕/历史窗口重刷样式
         self.setWindowTitle("⚙️ 参数调节（可拖动）")
         self.setWindowFlags(Qt.WindowStaysOnTopHint)
-        self.setGeometry(100, 100, 500, 640)
+        self.setGeometry(100, 100, 500, 720)
 
         # 记录启动时的config默认值（用于"恢复默认值"）
         self._defaults = {
@@ -183,6 +186,7 @@ class SettingsWindow(DraggableWidget):
             'MAX_SENTENCE_PAIRS': config.MAX_SENTENCE_PAIRS,
             'FONT_SIZE': config.FONT_SIZE,
             'BACKGROUND_OPACITY': config.BACKGROUND_OPACITY,
+            'LOOPBACK_DEVICE_NAME': getattr(config, 'LOOPBACK_DEVICE_NAME', '') or '',
         }
 
         layout = QVBoxLayout()
@@ -209,9 +213,25 @@ class SettingsWindow(DraggableWidget):
         duration_layout.addWidget(self.idle_flush_slider['widget'])
         duration_group.setLayout(duration_layout)
 
-        # 能量阈值设置
-        energy_group = QGroupBox("静音门设置")
+        # 音频设备 + 静音门
+        energy_group = QGroupBox("音频捕获")
         energy_layout = QVBoxLayout()
+
+        device_row = QWidget()
+        device_layout = QHBoxLayout()
+        device_layout.setContentsMargins(0, 0, 0, 0)
+        device_label = QLabel("设备名包含:")
+        device_label.setMinimumWidth(120)
+        device_label.setToolTip("空=系统默认播放设备；填 FiiO / Speakers 等子串匹配 loopback（约5秒内热切换）")
+        self.device_name_edit = QLineEdit()
+        self.device_name_edit.setPlaceholderText("空=默认播放设备")
+        self.device_name_edit.setText(getattr(config, 'LOOPBACK_DEVICE_NAME', '') or '')
+        self.device_name_edit.setToolTip(device_label.toolTip())
+        self.device_name_edit.editingFinished.connect(self._on_device_name_changed)
+        device_layout.addWidget(device_label)
+        device_layout.addWidget(self.device_name_edit)
+        device_row.setLayout(device_layout)
+        energy_layout.addWidget(device_row)
 
         self.speech_threshold_slider = self._create_slider(
             "语音能量阈值", 0.005, 0.05, config.ENERGY_THRESHOLD_SPEECH, 0.001,
@@ -306,7 +326,13 @@ class SettingsWindow(DraggableWidget):
         widget.setLayout(layout)
         
         return {'widget': widget, 'slider': slider, 'label': value_label, 'step': step}
-    
+
+    def _on_device_name_changed(self):
+        """设备名子串写入 config；捕获线程约 5 秒内重开流"""
+        name = self.device_name_edit.text().strip()
+        config.LOOPBACK_DEVICE_NAME = name
+        print(f"📊 捕获设备名包含: {name or '（系统默认）'}")
+
     def _reset_defaults(self):
         """恢复默认值（恢复到config.py里的启动默认值）"""
         # 通过滑块setValue触发valueChanged回调，自动同步config和数值标签
@@ -322,6 +348,9 @@ class SettingsWindow(DraggableWidget):
         ]
         for slider_info, key in pairs:
             slider_info['slider'].setValue(round(self._defaults[key] / slider_info['step']))
+
+        self.device_name_edit.setText(self._defaults.get('LOOPBACK_DEVICE_NAME', ''))
+        self._on_device_name_changed()
 
         print("🔄 参数已恢复默认值")
 
@@ -560,8 +589,8 @@ class SubtitleWindow:
         x = max(screen.left(), min(state.get("x", config.WINDOW_X), screen.right() - w))
         y = max(screen.top(), min(state.get("y", config.WINDOW_Y), screen.bottom() - h))
         self.container.setGeometry(x, y, w, h)
-        # 布局持久化：停止脚本是Stop-Process强杀，aboutToQuit不可靠，
-        # 用定时器检查——布局变了才写盘（15秒一次，无变化零开销）
+        # 布局持久化：停止.bat 现已优先优雅退出（aboutToQuit 会写盘）；
+        # 仍用定时器兜底强杀/崩溃场景——布局变了才写盘（15秒一次）
         self._last_saved_state = None
         from PyQt5.QtCore import QTimer
         self._state_timer = QTimer()

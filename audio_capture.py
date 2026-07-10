@@ -18,6 +18,8 @@ import config
 
 # 暂停标志文件：存在则暂停捕获，不重启进程也能停/恢复识别与翻译
 PAUSE_FLAG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".paused")
+# 停止标志：stop_subtitles.ps1 创建后，主程序优雅退出（先关模型再退）
+STOP_FLAG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".stop")
 
 class AudioCapture:
     """系统音频捕获器"""
@@ -40,17 +42,55 @@ class AudioCapture:
         print(f"🎤 音频捕获模块已初始化（连续流式提交）")
         print(f"   提交节奏: {config.CHUNK_SUBMIT_SECONDS}秒/块")
         print(f"   静音门: 能量 < {config.ENERGY_THRESHOLD_SPEECH}")
+        pref = (getattr(config, "LOOPBACK_DEVICE_NAME", "") or "").strip()
+        if pref:
+            print(f"   指定设备名包含: {pref}")
 
     @staticmethod
-    def _current_default_device_name():
-        """用临时PyAudio实例查当前系统默认播放设备名。
+    def _resolve_loopback(p):
+        """解析要打开的 WASAPI loopback 设备。
 
-        PortAudio 的设备列表在 Pa_Initialize 时冻结——用打开着流的旧实例
-        查不到"用户切换默认设备"这件事，必须新建实例（实测每次~10-30ms，
-        5秒查一次可忽略）。"""
+        config.LOOPBACK_DEVICE_NAME 为空 → 系统默认播放设备的 loopback；
+        非空 → 设备名（不区分大小写）包含该子串的第一个 loopback。
+        找不到匹配时回退默认并打印警告。
+        """
+        preferred = (getattr(config, "LOOPBACK_DEVICE_NAME", "") or "").strip().lower()
+        default = p.get_default_wasapi_loopback()
+        if not preferred:
+            return default
+
+        matches = []
+        try:
+            for dev in p.get_loopback_device_info_generator():
+                name = dev.get("name") or ""
+                if preferred in name.lower():
+                    matches.append(dev)
+        except Exception:
+            # 旧版 pyaudiowpatch 没有 generator 时，暴力扫设备表
+            for i in range(p.get_device_count()):
+                try:
+                    dev = p.get_device_info_by_index(i)
+                except Exception:
+                    continue
+                name = (dev.get("name") or "")
+                if "loopback" in name.lower() and preferred in name.lower():
+                    matches.append(dev)
+
+        if matches:
+            return matches[0]
+        print(f"⚠️  未找到名称包含「{preferred}」的 loopback 设备，回退系统默认: {default.get('name')}")
+        return default
+
+    @staticmethod
+    def _current_desired_device_name():
+        """用临时 PyAudio 查「当前应捕获」的设备名（默认或配置的名字匹配）。
+
+        PortAudio 设备列表在 Pa_Initialize 时冻结——用打开着流的旧实例
+        查不到设备变更，必须新建实例（实测每次~10-30ms，5秒查一次可忽略）。
+        """
         p = pyaudio.PyAudio()
         try:
-            return p.get_default_wasapi_loopback().get("name")
+            return AudioCapture._resolve_loopback(p).get("name")
         finally:
             p.terminate()
 
@@ -126,9 +166,9 @@ class AudioCapture:
                 # 冻结，旧实例看不到新的默认设备
                 p = pyaudio.PyAudio()
                 try:
-                    default_speakers = p.get_default_wasapi_loopback()
+                    default_speakers = self._resolve_loopback(p)
                 except Exception as e:
-                    print(f"❌ 无法获取默认音频设备: {e}（2秒后重试）")
+                    print(f"❌ 无法获取音频设备: {e}（2秒后重试）")
                     if self.on_status:
                         self.on_status("⚠️ 找不到播放设备，等待设备可用…")
                     p.terminate()
@@ -166,13 +206,13 @@ class AudioCapture:
                 print(f"🎵 开始捕获音频... (每{config.CHUNK_SUBMIT_SECONDS}秒提交一块)")
 
                 while self.running:
-                    # 默认设备变了 → 跳出去用新设备重开
+                    # 应捕获设备变了（系统默认切换，或 LOOPBACK_DEVICE_NAME 运行时改了）→ 重开
                     if time.time() - last_device_check > DEVICE_CHECK_INTERVAL:
                         last_device_check = time.time()
                         try:
-                            current = self._current_default_device_name()
+                            current = self._current_desired_device_name()
                             if current and current != device_name:
-                                print(f"🔀 默认播放设备变更: {device_name} → {current}，重开音频流")
+                                print(f"🔀 捕获设备变更: {device_name} → {current}，重开音频流")
                                 if self.on_status:
                                     self.on_status(f"🔀 播放设备已切换: {current}")
                                 break

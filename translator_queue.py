@@ -745,5 +745,5 @@ class WhisperQueueTranslator:
                 del self.model
             if hasattr(self, 'ollama_session'):
                 self.ollama_session.close()
-        except:
+        except Exception:
             pass

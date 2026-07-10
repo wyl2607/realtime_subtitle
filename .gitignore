@@ -27,6 +27,7 @@ Thumbs.db
 # 运行时状态文件（脚本/热键管理）
 subtitle.pid
 .paused
+.stop
 transcripts/
 subtitle.err.log
 window_state.json

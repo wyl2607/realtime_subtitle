@@ -94,13 +94,31 @@ class OnlineASRProcessor:
     def init(self, offset=None):
         """启动/语言切换/长静音后重置"""
         self.audio_buffer = np.array([], dtype=np.float32)
+        self._audio_chunks = []  # 待合并块，避免每 0.5s np.append 整段拷贝
         self.transcript_buffer = HypothesisBuffer()
         self.buffer_time_offset = offset if offset is not None else 0
         self.transcript_buffer.last_commited_time = self.buffer_time_offset
         self.commited = []  # 全部已提交词（prompt 上下文用），只保留尾部若干
 
     def insert_audio_chunk(self, audio):
-        self.audio_buffer = np.append(self.audio_buffer, audio)
+        """攒块；真正拼进 audio_buffer 在 process_iter/finish 里一次 concatenate。"""
+        if audio is None or len(audio) == 0:
+            return
+        self._audio_chunks.append(np.asarray(audio, dtype=np.float32))
+
+    def _flush_audio_chunks(self):
+        """把 _audio_chunks 合并进 audio_buffer（每轮识别最多一次拷贝）"""
+        if not self._audio_chunks:
+            return
+        if len(self.audio_buffer) == 0:
+            self.audio_buffer = (
+                self._audio_chunks[0]
+                if len(self._audio_chunks) == 1
+                else np.concatenate(self._audio_chunks)
+            )
+        else:
+            self.audio_buffer = np.concatenate([self.audio_buffer] + self._audio_chunks)
+        self._audio_chunks = []
 
     def _prompt(self):
         """已提交且滚出音频缓冲的文本尾部（≤200字符）作为 initial_prompt，
@@ -143,6 +161,9 @@ class OnlineASRProcessor:
 
     def process_iter(self):
         """识别当前整个音频缓冲，返回 (新提交的文本, 未稳定尾部文本)"""
+        self._flush_audio_chunks()
+        if len(self.audio_buffer) == 0:
+            return "", ""
         prompt = self._prompt()
         segments, _info = self.model.transcribe(
             self.audio_buffer,
@@ -219,6 +240,7 @@ class OnlineASRProcessor:
             self._chunk_at(cut)
 
     def _chunk_at(self, time):
+        self._flush_audio_chunks()
         self.transcript_buffer.pop_commited(time)
         cut_seconds = time - self.buffer_time_offset
         self.audio_buffer = self.audio_buffer[int(cut_seconds * self.SAMPLING_RATE):]
@@ -226,12 +248,15 @@ class OnlineASRProcessor:
 
     def finish(self):
         """结束/长静音/暂停时冲出未提交尾部（不再等第二次一致确认）"""
+        self._flush_audio_chunks()
         o = self.transcript_buffer.complete()
         self.transcript_buffer.buffer = []
         self.buffer_time_offset += len(self.audio_buffer) / self.SAMPLING_RATE
         self.audio_buffer = np.array([], dtype=np.float32)
+        self._audio_chunks = []
         return "".join(t for _, _, t in o).strip()
 
     def buffer_seconds(self):
-        """当前音频缓冲长度（秒），性能日志用"""
-        return len(self.audio_buffer) / self.SAMPLING_RATE
+        """当前音频缓冲长度（秒），性能日志用（含尚未合并的 chunks）"""
+        pending = sum(len(c) for c in self._audio_chunks)
+        return (len(self.audio_buffer) + pending) / self.SAMPLING_RATE
