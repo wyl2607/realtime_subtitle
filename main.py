@@ -124,12 +124,14 @@ class SubtitleApp:
             idx = cycle.index(config.SOURCE_LANGUAGE)
         except ValueError:
             idx = -1  # 当前语言不在循环列表里（手改过config），切到列表第一个
-        config.SOURCE_LANGUAGE = cycle[(idx + 1) % len(cycle)]
-        name = config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)
-        # 旧语言的音频/句子上下文会污染新语言的识别和翻译，清掉（在识别线程里串行执行）
-        self.translator.request_clear_context()
-        self.subtitle_window.show_status(f"🌐 源语言已切换: {name}")
-        print(f"🌐 [热键] 源语言切换为: {name}")
+        new_lang = cycle[(idx + 1) % len(cycle)]
+        name = config.LANGUAGE_NAMES.get(new_lang, new_lang)
+        # "清上下文+改语言"作为一个任务在识别线程内串行执行。之前是这里
+        # 先改config再排清理任务——窗口期内会拿新语言参数识别缓冲里的
+        # 旧语言音频，蹦出乱词
+        self.translator.request_switch_language(new_lang)
+        self.subtitle_window.show_status(f"🌐 源语言切换中: {name}…")
+        print(f"🌐 [热键] 请求切换源语言: {name}")
 
     def _setup_hotkey(self):
         """全局快捷键：Windows 原生 RegisterHotKey。
@@ -169,7 +171,13 @@ class SubtitleApp:
             print(f"⌨️  全局快捷键已注册(系统级): "
                   f"{', '.join(handlers[h][0] for h in registered)}")
             msg = wintypes.MSG()
-            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+            while True:
+                r = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if r == 0:
+                    break  # WM_QUIT（stop()里PostThreadMessage发来）
+                if r == -1:
+                    print("⚠️  热键消息循环出错，退出（GetMessage返回-1）")
+                    break  # 出错返回-1：不能当"有消息"继续转，会死循环
                 if msg.message == WM_HOTKEY and msg.wParam in handlers:
                     try:
                         handlers[msg.wParam][2]()

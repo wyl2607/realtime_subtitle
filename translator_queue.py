@@ -92,6 +92,8 @@ class WhisperQueueTranslator:
             self._tx_lock = Lock()
             self._tx_queue = []      # 已入队待翻译
             self._tx_inflight = []   # 正在翻译中
+            self._tx_epoch = 0       # 切语言时+1：在飞的翻译完成时代数不符就丢弃
+            self.closing = False     # shutdown置True：所有worker出口不再回调UI
             self._tx_executor = ThreadPoolExecutor(max_workers=1)
             # 点词查词单独一个worker：查词典不该排在字幕翻译后面等
             self._lookup_executor = ThreadPoolExecutor(max_workers=1)
@@ -115,8 +117,10 @@ class WhisperQueueTranslator:
             self._draft_last_time = 0.0
             self._draft_last_text = ""
 
-            # 创建复用的HTTP会话（用于Ollama）
+            # 复用的HTTP会话（翻译/查词各一个：requests.Session跨线程
+            # 并发使用不保证安全，翻译线程和查词线程各自独享）
             self.ollama_session = requests.Session()
+            self.lookup_session = requests.Session()
 
             # 字幕记录（原文+译文+时间戳，每天一个文件）
             self._transcript_ok = bool(getattr(config, "SAVE_TRANSCRIPT", False))
@@ -167,15 +171,38 @@ class WhisperQueueTranslator:
     # 上下文管理
     # ------------------------------------------------------------------
     def clear_context(self):
-        """清空识别/翻译上下文（切换源语言时调用，跑在ASR线程池里保证与translate串行）"""
+        """清空识别/翻译上下文（切换源语言时调用，跑在ASR线程池里，与识别串行）。
+
+        注意翻译worker在【另一个】线程池里可能正在飞：这里递增epoch代数，
+        worker完成时发现代数变了就丢弃结果（不上屏、不写回上下文）——
+        否则切语言瞬间，旧语言的句对还会蹦出来并污染新语言的翻译上下文。
+        """
         self.processor.init()
         self.pending_text = ""
         self._last_unstable = ""
+        self._draft_last_text = ""
         with self._tx_lock:
             self._tx_queue.clear()
-        self.context_history.clear()
+            self._tx_epoch += 1  # 使在飞的翻译/草稿作废
+            self.context_history.clear()
         print("🧹 已清空识别与翻译上下文")
         self._emit_display()
+
+    def request_switch_language(self, new_lang):
+        """切换源语言：清上下文和改SOURCE_LANGUAGE作为【一个任务】在ASR线程
+        串行执行。之前是热键线程先改语言、清理任务排在后面——中间窗口期
+        会拿新语言参数去识别缓冲里的旧语言音频，蹦出乱词。"""
+        def task():
+            self.clear_context()
+            config.SOURCE_LANGUAGE = new_lang
+            name = config.LANGUAGE_NAMES.get(new_lang, new_lang)
+            print(f"🌐 源语言已切换为: {name}")
+            if self.on_status:
+                self.on_status(f"🌐 源语言已切换: {name}")
+        try:
+            self._asr_executor.submit(task)
+        except RuntimeError:
+            pass  # 程序正在退出
 
     # ------------------------------------------------------------------
     # 显示
@@ -217,6 +244,7 @@ class WhisperQueueTranslator:
         with self._tx_lock:
             if not self._tx_queue:
                 return
+            epoch = self._tx_epoch  # 完成时代数变了（切了语言）就丢弃结果
             batch = []
             total = 0
             while self._tx_queue:
@@ -227,23 +255,30 @@ class WhisperQueueTranslator:
                 batch.append(s)
                 total += len(s)
             self._tx_inflight = batch
+            context = " ".join(self.context_history)
 
         german = " ".join(batch)
-        context = " ".join(self.context_history)
+        translation = None
         try:
             if config.SHOW_PERFORMANCE:
                 t0 = time.time()
             # 流式：翻译的中文逐段推到live区的草稿行，不等整句翻完
-            translation = self._translate_single_sentence(german, context,
-                                                          on_partial=self.on_draft)
+            translation = self._translate_single_sentence(
+                german, context, on_partial=self._epoch_gated_draft(epoch))
             if config.SHOW_PERFORMANCE:
                 print(f"   🔤 翻译{len(batch)}句 {time.time() - t0:.1f}秒: {german[:50]}{'...' if len(german) > 50 else ''}")
         finally:
             with self._tx_lock:
                 self._tx_inflight = []
 
-        self.context_history.extend(batch)
-        if translation and translation != german:
+        with self._tx_lock:
+            stale = (epoch != self._tx_epoch)
+            if not stale and translation:
+                self.context_history.extend(batch)
+        if stale or self.closing or translation is None:
+            return  # 期间切了语言/正在退出：旧语言结果不上屏不写回
+
+        if translation != german:
             self._save_transcript(german, translation)
         if self.on_pair:
             # 翻译失败时 translation==german：只显示一遍德语，
@@ -287,13 +322,31 @@ class WhisperQueueTranslator:
         except RuntimeError:
             pass  # 程序正在退出
 
+    def _epoch_gated_draft(self, epoch):
+        """给流式partial套上代数/退出检查：切语言或退出后不再往屏幕推旧内容"""
+        def emit(text):
+            if self.closing or not self.on_draft:
+                return
+            with self._tx_lock:
+                if epoch != self._tx_epoch:
+                    return
+            self.on_draft(text)
+        return emit
+
     def _draft_worker(self, snapshot):
         """在翻译线程里跑草稿（和正式翻译同一个单线程池，天然串行）"""
         with self._tx_lock:
             if self._tx_queue:
                 return  # 等草稿排到时已经来了正式句子，草稿没意义了
+            epoch = self._tx_epoch
+            context = " ".join(self.context_history)
         translation = self._translate_single_sentence(
-            snapshot, " ".join(self.context_history), on_partial=self.on_draft)
+            snapshot, context, on_partial=self._epoch_gated_draft(epoch))
+        with self._tx_lock:
+            if epoch != self._tx_epoch:
+                return  # 期间切了语言，草稿作废
+        if self.closing:
+            return
         # 翻译失败会原样返回德语，那就不值得展示
         if not translation or translation == snapshot:
             return
@@ -374,7 +427,9 @@ class WhisperQueueTranslator:
 """
         try:
             t0 = time.time()
-            response = self.ollama_session.post(
+            # 用查词专属session：和翻译线程共享一个requests.Session
+            # 并发使用不保证线程安全
+            response = self.lookup_session.post(
                 f"{config.OLLAMA_BASE_URL}/api/generate",
                 json={
                     "model": config.OLLAMA_MODEL,
@@ -385,6 +440,8 @@ class WhisperQueueTranslator:
                 },
                 timeout=15,
             )
+            if self.closing:
+                return  # 程序在退出，别再回调正在拆的UI
             if response.status_code == 200:
                 text = response.json().get("response", "").strip()
                 text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
@@ -396,7 +453,8 @@ class WhisperQueueTranslator:
             else:
                 callback(word, f"查询失败（HTTP {response.status_code}）")
         except Exception as e:
-            callback(word, f"查询失败: {e}")
+            if not self.closing:
+                callback(word, f"查询失败: {e}")
 
     def _translate_single_sentence(self, sentence, german_context, on_partial=None):
         """翻译一段对白（源语言 -> 中文）。失败时返回原文。
@@ -460,29 +518,34 @@ class WhisperQueueTranslator:
                 timeout=15
             )
 
-            if response.status_code == 200:
-                parts = []
-                last_emit = 0.0
-                for line in response.iter_lines():
-                    if not line:
-                        continue
-                    try:
-                        data = json.loads(line)
-                    except ValueError:
-                        continue
-                    parts.append(data.get("response", ""))
-                    if data.get("done"):
-                        break
-                    if on_partial and time.time() - last_emit > 0.15:
-                        partial = "".join(parts).strip()
-                        if partial:
-                            last_emit = time.time()
-                            on_partial(partial)
-                translation = re.sub(r'<think>.*?</think>', '', "".join(parts), flags=re.DOTALL)
-                return translation.strip()
-            else:
-                print(f"   ⚠️  Ollama 返回错误 (HTTP {response.status_code})，显示德语原文")
-                return sentence
+            try:
+                if response.status_code == 200:
+                    parts = []
+                    last_emit = 0.0
+                    for line in response.iter_lines():
+                        if not line:
+                            continue
+                        try:
+                            data = json.loads(line)
+                        except ValueError:
+                            continue
+                        parts.append(data.get("response", ""))
+                        if data.get("done"):
+                            break
+                        if on_partial and time.time() - last_emit > 0.15:
+                            partial = "".join(parts).strip()
+                            if partial:
+                                last_emit = time.time()
+                                on_partial(partial)
+                    translation = re.sub(r'<think>.*?</think>', '', "".join(parts), flags=re.DOTALL)
+                    return translation.strip()
+                else:
+                    print(f"   ⚠️  Ollama 返回错误 (HTTP {response.status_code})，显示德语原文")
+                    return sentence
+            finally:
+                # stream=True的连接不close不会归还连接池：done后break出来、
+                # 半途超时、非200，都必须显式关，否则长session连接泄漏
+                response.close()
 
         except requests.ConnectionError as e:
             # Ollama没在运行——屏幕上给用户明确提示（60秒节流），
@@ -563,10 +626,22 @@ class WhisperQueueTranslator:
                     return
             try:
                 self._process_items(items)
+                self._asr_error_streak = 0
             except Exception as e:
                 print(f"❌ 识别错误: {e}")
                 import traceback
                 traceback.print_exc()
+                # 单次异常可能是瞬时的（CUDA打嗝）；连续异常说明
+                # HypothesisBuffer/音频缓冲已处于半更新的脏状态——
+                # 重置识别器丢弃当前缓冲，比一直错乱下去强
+                self._asr_error_streak = getattr(self, "_asr_error_streak", 0) + 1
+                if self._asr_error_streak >= 2:
+                    print("🧹 连续识别错误，重置识别器状态（丢弃当前音频缓冲）")
+                    try:
+                        self.processor.init()
+                    except Exception:
+                        pass
+                    self._asr_error_streak = 0
 
     def _process_items(self, items):
         """把一批音频块塞进识别缓冲，整批只识别一遍"""
@@ -653,9 +728,15 @@ class WhisperQueueTranslator:
     def shutdown(self):
         """关闭识别/翻译线程（main.stop调用）。先ASR后翻译：
         ASR关完就不会再往翻译队列塞句子"""
+        self.closing = True  # 在飞worker的出口检查：不再回调正在拆的UI
         self._asr_executor.shutdown(wait=True, cancel_futures=False)
         self._tx_executor.shutdown(wait=True, cancel_futures=False)
         self._lookup_executor.shutdown(wait=False, cancel_futures=True)
+        try:
+            self.ollama_session.close()
+            self.lookup_session.close()
+        except Exception:
+            pass
 
     def __del__(self):
         """清理资源"""

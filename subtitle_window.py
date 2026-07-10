@@ -920,6 +920,10 @@ class SubtitleWindow:
             ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex & ~WS_EX_TRANSPARENT)
             self.show_status("🖱️ 鼠标穿透已关闭，字幕窗恢复可点击")
             print("🖱️ [热键] 鼠标穿透关闭")
+        # 改扩展样式后通知系统重算：部分Windows/合成路径下不发
+        # SWP_FRAMECHANGED样式会延迟生效甚至不生效
+        SWP_FLAGS = 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020  # NOSIZE|NOMOVE|NOZORDER|NOACTIVATE|FRAMECHANGED
+        ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_FLAGS)
 
     def _minimize_window(self):
         """最小化/恢复字幕窗口（之前点一次就永久隐藏且窗口缩成一条，改成可切换）"""
