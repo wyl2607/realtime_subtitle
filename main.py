@@ -57,6 +57,7 @@ class SubtitleApp:
         self.translator.on_display = self.subtitle_window.update_live
         self.translator.on_pair = self.subtitle_window.add_pair
         self.translator.on_draft = self.subtitle_window.update_draft
+        self.translator.on_status = self.subtitle_window.show_status
         # 点词查词：窗口点击→translator查Ollama→回调线程安全地弹结果
         self.subtitle_window.on_lookup = lambda word, ctx: self.translator.lookup_word(
             word, ctx, self.subtitle_window.show_lookup_result)

@@ -102,6 +102,8 @@ class WhisperQueueTranslator:
             self.on_display = None  # (committed_live, unstable) -> None
             self.on_pair = None     # (german, chinese) -> None
             self.on_draft = None    # (chinese_draft) -> None 残句的草稿中文
+            self.on_status = None   # (text) -> None 状态提示（如Ollama挂了）
+            self._ollama_down_notified = 0.0  # 上次提示"翻译服务未运行"的时间（节流）
 
             # 草稿翻译节流状态（残句还没凑成完整句子时先出一版灰色中文）
             self._draft_last_time = 0.0
@@ -223,7 +225,9 @@ class WhisperQueueTranslator:
         if translation and translation != german:
             self._save_transcript(german, translation)
         if self.on_pair:
-            self.on_pair(german, translation)
+            # 翻译失败时 translation==german：只显示一遍德语，
+            # 不要"德语\n德语"重复两行（Ollama挂掉时实测很难看）
+            self.on_pair(german, "" if translation == german else translation)
         self._draft_last_text = ""  # 正式句对上屏了，残句草稿从头再来
         self._emit_display()
 
@@ -368,8 +372,10 @@ class WhisperQueueTranslator:
                         "num_gpu": 50,
                     }
                 },
-                # 翻译在独立worker里跑，超时不会堵识别，但等太久句对显示会滞后
-                timeout=10
+                # 翻译在独立worker里跑，超时不会堵识别，但等太久句对显示会滞后。
+                # 别低于15：Ollama冷加载qwen3:8b实测9.2秒，10秒超时会让
+                # 服务重启后的头几句全部降级成德语
+                timeout=15
             )
 
             if response.status_code == 200:
@@ -381,6 +387,14 @@ class WhisperQueueTranslator:
                 print(f"   ⚠️  Ollama 返回错误 (HTTP {response.status_code})，显示德语原文")
                 return sentence
 
+        except requests.ConnectionError as e:
+            # Ollama没在运行——屏幕上给用户明确提示（60秒节流），
+            # 否则只是默默全德语，用户不知道发生了什么
+            print(f"   ⚠️  翻译失败: {e}，显示德语原文")
+            if self.on_status and time.time() - self._ollama_down_notified > 60:
+                self._ollama_down_notified = time.time()
+                self.on_status("⚠️ 翻译服务(Ollama)未运行，暂时只显示德语——请运行 启动字幕.bat 或 ollama serve")
+            return sentence
         except Exception as e:
             print(f"   ⚠️  翻译失败: {e}，显示德语原文")
             return sentence

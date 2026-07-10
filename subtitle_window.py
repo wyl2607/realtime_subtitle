@@ -12,7 +12,7 @@ import html
 import time
 import json
 import os
-from PyQt5.QtWidgets import QLabel, QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSlider, QPushButton, QGroupBox, QTextEdit, QSizeGrip
+from PyQt5.QtWidgets import QLabel, QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSlider, QPushButton, QGroupBox, QTextEdit
 from PyQt5.QtCore import Qt, pyqtSignal, QObject
 import config
 
@@ -81,6 +81,18 @@ class DraggableWidget(QWidget):
         cb = getattr(self, "on_resize", None)
         if cb:
             cb()
+
+    def enterEvent(self, event):
+        cb = getattr(self, "on_hover", None)
+        if cb:
+            cb(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        cb = getattr(self, "on_hover", None)
+        if cb:
+            cb(False)
+        super().leaveEvent(event)
 
 
 class ResizableFramelessWidget(DraggableWidget):
@@ -427,12 +439,7 @@ class SubtitleWindow:
             Qt.Tool
         )
         self.container.setAttribute(Qt.WA_TranslucentBackground)
-        
-        # 创建布局
-        container_layout = QVBoxLayout()
-        container_layout.setContentsMargins(0, 0, 0, 0)
-        container_layout.setSpacing(5)
-        
+
         # 创建按钮样式
         button_style = """
             QPushButton {
@@ -486,36 +493,37 @@ class SubtitleWindow:
         self.quit_btn.clicked.connect(self._quit_application)
         self.quit_btn.setToolTip("退出程序")
         
-        # 创建字幕标签
-        self.window = QLabel()
+        # 创建字幕标签（手动铺满整个窗口，见下）
+        # ☠️ 核心修复：这个窗口不能用QLayout——wordWrap的QLabel带
+        # height-for-width，Qt会在事件循环里把顶层窗口强制弹回
+        # "当前宽度下全部文本的排版高度"（实测resize(250)瞬间生效后被弹回
+        # 731px；setSizePolicy(Ignored)也压不住hfw）。而句对自适应总把窗口
+        # 填满 → 窗口只能拉大不能缩小（棘轮）。所以标签不进布局，
+        # 在 _on_container_resize 里手动 setGeometry 铺满，窗口大小完全归用户
+        self.window = QLabel(self.container)
         self._apply_styles()
         self.window.setAlignment(Qt.AlignLeft | Qt.AlignBottom)
         self.window.setWordWrap(True)
         self.window.setTextFormat(Qt.RichText)  # live行灰色尾部/双层显示需要富文本
         self.window.setText("🎬 等待音频输入...")
-        
-        # 添加到布局
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-        btn_layout.addWidget(self.minimize_btn)
-        btn_layout.addWidget(self.history_btn)
-        btn_layout.addWidget(self.settings_btn)
-        btn_layout.addWidget(self.quit_btn)
-        container_layout.addLayout(btn_layout)
-        container_layout.addWidget(self.window)
-
-        # 右下角缩放手柄：无边框窗口没有系统边框可拖，用QSizeGrip补上
-        grip_row = QHBoxLayout()
-        grip_row.addStretch()
-        self.size_grip = QSizeGrip(self.container)
-        self.size_grip.setStyleSheet("background: transparent;")
-        grip_row.addWidget(self.size_grip)
-        container_layout.addLayout(grip_row)
-
-        self.container.setLayout(container_layout)
         self.container.setMinimumSize(360, 120)
-        # 窗口大小变化时重新计算能放下几条句对
-        self.container.on_resize = self._render
+
+        # 按钮改成悬浮工具条：平时隐藏（看剧零遮挡），鼠标移入窗口才出现。
+        # 不进布局（绝对定位在右上角），显示/隐藏不会引起文字重排
+        self.btn_bar = QWidget(self.container)
+        bar_layout = QHBoxLayout()
+        bar_layout.setContentsMargins(0, 0, 0, 0)
+        bar_layout.setSpacing(6)
+        for b in (self.minimize_btn, self.history_btn, self.settings_btn, self.quit_btn):
+            b.setParent(self.btn_bar)
+            bar_layout.addWidget(b)
+        self.btn_bar.setLayout(bar_layout)
+        self.btn_bar.adjustSize()
+
+        # 窗口大小变化：重摆工具条 + 重新计算能放下几条句对
+        self.container.on_resize = self._on_container_resize
+        # 鼠标移入显示工具条，移出隐藏
+        self.container.on_hover = self._set_controls_visible
         # 窗口几何：优先用上次退出时保存的（用户拖过/缩放过就记住），没有才用config默认。
         # 用availableGeometry（去掉任务栏）并把窗口完整钳回屏幕内——
         # 之前底边可以停在屏幕外，唯一的缩放手柄跟着出屏，窗口就再也调不了了
@@ -535,6 +543,11 @@ class SubtitleWindow:
         self._state_timer.start(15000)
         self.app.aboutToQuit.connect(self._save_state_if_changed)
         self.container.show()
+        # 工具条先亮4秒让人知道在哪，之后只在鼠标移入时出现
+        self._position_btn_bar()
+        self.btn_bar.show()
+        self.btn_bar.raise_()
+        QTimer.singleShot(4000, lambda: self._set_controls_visible(self.container.underMouse()))
         
         # 创建设置窗口（初始隐藏）；字号滑块变化时重刷字幕/历史窗口样式
         self.settings_window = SettingsWindow(on_font_change=self._apply_styles)
@@ -564,10 +577,29 @@ class SubtitleWindow:
         print(f"   位置: ({x}, {y})  大小: {w}x{h}")
         print("   💡 鼠标拖动窗口可移动位置")
         print("   💡 鼠标移到窗口边缘/四角可拖拽缩放（窗口越大显示的历史越多）")
+        print("   💡 按钮工具条平时隐藏，鼠标移入窗口右上角出现")
         print("   💡 点击 ➖ 按钮可最小化字幕")
         print("   💡 点击 ⚙️ 按钮可打开参数调节面板")
         print("   💡 点击 ❌ 按钮可退出程序")
     
+    # ------------------------------------------------------------------
+    # 悬浮工具条
+    # ------------------------------------------------------------------
+    def _position_btn_bar(self):
+        """工具条贴右上角（不进布局，避免显示/隐藏引起文字重排）"""
+        self.btn_bar.adjustSize()
+        self.btn_bar.move(self.container.width() - self.btn_bar.width() - 10, 8)
+
+    def _set_controls_visible(self, visible):
+        self.btn_bar.setVisible(visible)
+        if visible:
+            self.btn_bar.raise_()
+
+    def _on_container_resize(self):
+        self.window.setGeometry(self.container.rect())  # 标签手动铺满（无布局）
+        self._position_btn_bar()
+        self._render()
+
     # ------------------------------------------------------------------
     # 样式与布局持久化
     # ------------------------------------------------------------------
@@ -581,8 +613,7 @@ class SubtitleWindow:
                 font-family: {config.FONT_FAMILY};
                 padding: {config.PADDING};
                 border-radius: {config.BORDER_RADIUS}px;
-                border: 2px solid {config.BORDER_COLOR};
-                line-height: 1.5;
+                border: 1px solid {config.BORDER_COLOR};
             }}
         """)
         if hasattr(self, "history_window"):
