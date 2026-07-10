@@ -16,7 +16,8 @@ jobs:
       - name: Install minimal test deps
         run: |
           python -m pip install --upgrade pip
-          # Pipeline helper tests import translator_queue/streaming_asr but avoid GPU/Qt
+          # translator_queue imports requests+torch at module load; use CPU torch only
           pip install "numpy>=1.24,<3" "pytest>=8" "requests>=2.28,<3"
+          pip install --index-url https://download.pytorch.org/whl/cpu "torch"
       - name: Run non-GUI unit tests
         run: python -m pytest test_pipeline_helpers.py -q
