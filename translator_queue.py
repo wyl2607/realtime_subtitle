@@ -24,22 +24,6 @@ from collections import deque, OrderedDict
 
 import requests
 
-# torch本身在这个项目里没用（faster-whisper走ctranslate2），但venv里的
-# ctranslate2版本会在内部无条件import torch。必须在下面往PATH里注入
-# nvidia cublas目录【之前】加载torch——注入后再首次加载torch出现过
-# c10.dll初始化失败(WinError 1114)，先加载则一直稳定
-import torch
-
-# ctranslate2 在 Windows 上通过 LoadLibraryA("cublas64_12.dll") 按名加载，
-# 只认 PATH，不认 os.add_dll_directory 注册的路径，所以要直接塞进 PATH
-if sys.platform == "win32":
-    try:
-        import nvidia.cublas
-        os.environ["PATH"] = os.path.join(list(nvidia.cublas.__path__)[0], "bin") + os.pathsep + os.environ["PATH"]
-    except ImportError:
-        pass
-
-from faster_whisper import WhisperModel
 from streaming_asr import OnlineASRProcessor
 import config
 
@@ -49,6 +33,43 @@ logging.basicConfig(level=logging.ERROR)
 
 # 句子结束符：只认 .!?（旧管线按逗号切句是碎句/上下文错乱的来源之一）
 _SENTENCE_END = re.compile(r'(.*?[.!?…]["»«\']?)(\s|$)', re.DOTALL)
+
+_WhisperModel = None  # set by _ensure_ml_deps()
+
+
+def _ensure_ml_deps():
+    """Load torch + faster-whisper only when the translator is constructed.
+
+    Keeps lightweight imports (e.g. _SENTENCE_END for unit tests) free of
+    torch/ctranslate2. On Windows, torch must load before PATH cublas injection
+    and before ctranslate2 (via faster-whisper), or c10.dll can fail (WinError 1114).
+    """
+    global _WhisperModel
+    if _WhisperModel is not None:
+        return _WhisperModel
+
+    # torch本身在这个项目里没用（faster-whisper走ctranslate2），但venv里的
+    # ctranslate2版本会在内部无条件import torch。必须在下面往PATH里注入
+    # nvidia cublas目录【之前】加载torch——注入后再首次加载torch出现过
+    # c10.dll初始化失败(WinError 1114)，先加载则一直稳定
+    import torch  # noqa: F401
+
+    # ctranslate2 在 Windows 上通过 LoadLibraryA("cublas64_12.dll") 按名加载，
+    # 只认 PATH，不认 os.add_dll_directory 注册的路径，所以要直接塞进 PATH
+    if sys.platform == "win32":
+        try:
+            import nvidia.cublas
+            os.environ["PATH"] = (
+                os.path.join(list(nvidia.cublas.__path__)[0], "bin")
+                + os.pathsep
+                + os.environ["PATH"]
+            )
+        except ImportError:
+            pass
+
+    from faster_whisper import WhisperModel
+    _WhisperModel = WhisperModel
+    return _WhisperModel
 
 
 class WhisperQueueTranslator:
@@ -61,6 +82,7 @@ class WhisperQueueTranslator:
         print(f"   计算类型: {config.WHISPER_COMPUTE_TYPE}")
 
         start_time = time.time()
+        WhisperModel = _ensure_ml_deps()
 
         try:
             self.model = WhisperModel(
