@@ -18,4 +18,3 @@ soxr>=0.3.0                   # 音频重采样（librosa太重，只用得到re
 
 # 用户界面
 PyQt5>=5.15.0                 # GUI 框架
-keyboard>=0.13.0              # 全局快捷键（Ctrl+Alt+P 暂停/继续）

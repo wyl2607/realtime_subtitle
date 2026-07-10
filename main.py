@@ -102,50 +102,76 @@ class SubtitleApp:
         # 醒来一口气全塞进缓冲只识别一遍——GPU被游戏抢走时字幕只滞后不丢词
         self.translator.enqueue_audio(audio_data, capture_time)
 
-    def _setup_hotkey(self):
-        """注册全局暂停快捷键 Ctrl+Alt+P
-
-        和 暂停继续字幕.bat 完全等价：都只是切换.paused标记文件，
-        游戏全屏时不用切出来找bat。keyboard库自己起钩子线程，
-        回调里只做文件操作+发Qt信号，都是线程安全的。
-        """
+    def _toggle_pause(self):
+        """暂停/继续（和 暂停继续字幕.bat 完全等价：切换.paused标记文件）"""
         try:
-            import keyboard
-        except ImportError:
-            print("⚠️  keyboard库未安装，全局暂停快捷键不可用（pip install keyboard）")
-            return
+            if os.path.exists(PAUSE_FLAG_FILE):
+                os.remove(PAUSE_FLAG_FILE)
+                self.subtitle_window.show_status("▶️ 已继续识别翻译")
+                print("▶️ [热键] 继续识别与翻译")
+            else:
+                open(PAUSE_FLAG_FILE, "w").close()
+                self.subtitle_window.show_status("⏸️ 字幕已暂停（Ctrl+Alt+P 继续）")
+                print("⏸️ [热键] 已暂停识别与翻译")
+        except OSError as e:
+            print(f"⚠️  切换暂停状态失败: {e}")
 
-        def toggle_pause():
-            try:
-                if os.path.exists(PAUSE_FLAG_FILE):
-                    os.remove(PAUSE_FLAG_FILE)
-                    self.subtitle_window.show_status("▶️ 已继续识别翻译")
-                    print("▶️ [热键] 继续识别与翻译")
+    def _switch_language(self):
+        cycle = config.LANGUAGE_CYCLE
+        try:
+            idx = cycle.index(config.SOURCE_LANGUAGE)
+        except ValueError:
+            idx = -1  # 当前语言不在循环列表里（手改过config），切到列表第一个
+        config.SOURCE_LANGUAGE = cycle[(idx + 1) % len(cycle)]
+        name = config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)
+        # 旧语言的音频/句子上下文会污染新语言的识别和翻译，清掉（在识别线程里串行执行）
+        self.translator.request_clear_context()
+        self.subtitle_window.show_status(f"🌐 源语言已切换: {name}")
+        print(f"🌐 [热键] 源语言切换为: {name}")
+
+    def _setup_hotkey(self):
+        """全局快捷键：Windows 原生 RegisterHotKey。
+
+        ☠️ 之前用 keyboard 库的低级键盘钩子：keyboard.send 注入的测试事件
+        能触发，但用户的物理键盘（德语QWERTZ布局系统）按了完全没反应——
+        keyboard 库对非美式布局的组合键匹配不可靠是它的老毛病。
+        RegisterHotKey 按虚拟键码在系统层注册，与键盘布局无关，游戏里
+        也有效（仅管理员权限窗口在前台时无效——Windows UIPI 限制）。
+        注册和消息循环必须在同一个线程（热键投递到注册线程的消息队列）。
+        回调跑在热键线程里：文件操作+Qt信号都线程安全。
+        """
+        import threading
+        import ctypes
+        from ctypes import wintypes
+
+        MOD_ALT, MOD_CONTROL, MOD_NOREPEAT = 0x1, 0x2, 0x4000
+        WM_HOTKEY = 0x0312
+        handlers = {
+            1: ("Ctrl+Alt+P", ord('P'), self._toggle_pause),
+            2: ("Ctrl+Alt+L", ord('L'), self._switch_language),
+            3: ("Ctrl+Alt+M", ord('M'), self.subtitle_window.toggle_click_through),
+        }
+
+        def hotkey_loop():
+            user32 = ctypes.windll.user32
+            registered = []
+            for hid, (label, vk, _) in handlers.items():
+                if user32.RegisterHotKey(None, hid, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, vk):
+                    registered.append(label)
                 else:
-                    open(PAUSE_FLAG_FILE, "w").close()
-                    self.subtitle_window.show_status("⏸️ 字幕已暂停（Ctrl+Alt+P 继续）")
-                    print("⏸️ [热键] 已暂停识别与翻译")
-            except OSError as e:
-                print(f"⚠️  切换暂停状态失败: {e}")
+                    print(f"⚠️  快捷键 {label} 注册失败（可能被其它程序占用）")
+            if not registered:
+                return
+            print(f"⌨️  全局快捷键已注册(系统级): {', '.join(registered)}")
+            msg = wintypes.MSG()
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+                if msg.message == WM_HOTKEY and msg.wParam in handlers:
+                    try:
+                        handlers[msg.wParam][2]()
+                    except Exception as e:
+                        print(f"⚠️  快捷键处理错误: {e}")
 
-        def switch_language():
-            cycle = config.LANGUAGE_CYCLE
-            try:
-                idx = cycle.index(config.SOURCE_LANGUAGE)
-            except ValueError:
-                idx = -1  # 当前语言不在循环列表里（手改过config），切到列表第一个
-            config.SOURCE_LANGUAGE = cycle[(idx + 1) % len(cycle)]
-            name = config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)
-            # 旧语言的音频/句子上下文会污染新语言的识别和翻译，清掉（在识别线程里串行执行）
-            self.translator.request_clear_context()
-            self.subtitle_window.show_status(f"🌐 源语言已切换: {name}")
-            print(f"🌐 [热键] 源语言切换为: {name}")
-
-        keyboard.add_hotkey("ctrl+alt+p", toggle_pause)
-        keyboard.add_hotkey("ctrl+alt+l", switch_language)
-        keyboard.add_hotkey("ctrl+alt+m", self.subtitle_window.toggle_click_through)
-        print("⌨️  全局快捷键已注册: Ctrl+Alt+P = 暂停/继续, Ctrl+Alt+L = 切换源语言, "
-              "Ctrl+Alt+M = 鼠标穿透")
+        threading.Thread(target=hotkey_loop, name="HotkeyLoop", daemon=True).start()
 
     def _flush_check(self):
         """定时兜底：一段话说完后没有新音频，识别不会再被触发，
