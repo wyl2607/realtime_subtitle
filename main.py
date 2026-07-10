@@ -12,6 +12,25 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
+# 单实例守卫：双开会有两路音频采集互抢+热键注册冲突+两个悬浮窗叠着。
+# 必须放在重量级 import（torch/模型加载）之前——第二个实例秒退，
+# 不浪费几秒加载时间和显存。句柄存模块级变量，进程活着就一直持有。
+if sys.platform == "win32":
+    import ctypes
+    _single_instance_mutex = ctypes.windll.kernel32.CreateMutexW(
+        None, False, "realtime_subtitle_single_instance")
+    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        print("⚠️  实时字幕已经在运行了，不再启动第二个实例")
+        # 启动脚本是Hidden窗口+日志重定向，print用户看不见——弹个会自动
+        # 消失的提示框（MessageBoxTimeoutW：user32未文档化但十几年稳定存在）
+        try:
+            ctypes.windll.user32.MessageBoxTimeoutW(
+                None, "实时字幕已经在运行了，没有启动第二个。",
+                "实时字幕", 0x40 | 0x1000, 0, 8000)  # INFO | SYSTEMMODAL, 8秒自动关
+        except Exception:
+            pass
+        sys.exit(0)
+
 # 在导入其他模块前先禁用所有警告和日志
 warnings.filterwarnings("ignore")
 os.environ['PYTHONWARNINGS'] = 'ignore'
@@ -133,6 +152,36 @@ class SubtitleApp:
         self.subtitle_window.show_status(f"🌐 源语言切换中: {name}…")
         print(f"🌐 [热键] 请求切换源语言: {name}")
 
+    def _toggle_game_mode(self):
+        """游戏模式一键降配：识别频率减半+贪心解码+关草稿中文。
+
+        三个旋钮都是采集/识别/翻译循环里每轮现读 config 的，改属性即热生效
+        （提交节奏下一块生效，beam下一次识别生效）。开启时保存当前值，
+        关闭时原样恢复——用户在⚙️面板改过的值不会被覆盖成出厂默认。"""
+        saved = getattr(self, '_game_mode_saved', None)
+        if saved is None:
+            self._game_mode_saved = {
+                'CHUNK_SUBMIT_SECONDS': config.CHUNK_SUBMIT_SECONDS,
+                'WHISPER_BEAM_SIZE': config.WHISPER_BEAM_SIZE,
+                'DRAFT_TRANSLATION': getattr(config, 'DRAFT_TRANSLATION', True),
+            }
+            config.CHUNK_SUBMIT_SECONDS = config.GAME_MODE_SUBMIT_SECONDS
+            config.WHISPER_BEAM_SIZE = config.GAME_MODE_BEAM_SIZE
+            if config.GAME_MODE_DISABLE_DRAFT:
+                config.DRAFT_TRANSLATION = False
+            self.subtitle_window.show_status(
+                "🎮 游戏模式已开启：GPU降配，字幕稍慢（Ctrl+Alt+G 恢复）")
+            print(f"🎮 [热键] 游戏模式开启: 节奏{config.CHUNK_SUBMIT_SECONDS}s "
+                  f"beam{config.WHISPER_BEAM_SIZE} 草稿{'关' if not config.DRAFT_TRANSLATION else '开'}")
+        else:
+            config.CHUNK_SUBMIT_SECONDS = saved['CHUNK_SUBMIT_SECONDS']
+            config.WHISPER_BEAM_SIZE = saved['WHISPER_BEAM_SIZE']
+            config.DRAFT_TRANSLATION = saved['DRAFT_TRANSLATION']
+            self._game_mode_saved = None
+            self.subtitle_window.show_status("🎮 游戏模式已关闭，恢复正常配置")
+            print(f"🎮 [热键] 游戏模式关闭: 恢复节奏{config.CHUNK_SUBMIT_SECONDS}s "
+                  f"beam{config.WHISPER_BEAM_SIZE}")
+
     def _setup_hotkey(self):
         """全局快捷键：Windows 原生 RegisterHotKey。
 
@@ -154,6 +203,7 @@ class SubtitleApp:
             1: ("Ctrl+Alt+P", ord('P'), self._toggle_pause),
             2: ("Ctrl+Alt+L", ord('L'), self._switch_language),
             3: ("Ctrl+Alt+M", ord('M'), self.subtitle_window.toggle_click_through),
+            4: ("Ctrl+Alt+G", ord('G'), self._toggle_game_mode),
         }
 
         def hotkey_loop():
@@ -312,7 +362,8 @@ class SubtitleApp:
         print(f"   - 翻译: Qwen + Whisper (Ollama {config.OLLAMA_MODEL})")
         print(f"   - 设备: {config.WHISPER_DEVICE.upper()}")
         print(f"   - 源语言: {config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)}")
-        print(f"   - 快捷键: Ctrl+Alt+P 暂停/继续, Ctrl+Alt+L 切换源语言")
+        print(f"   - 快捷键: Ctrl+Alt+P 暂停/继续, Ctrl+Alt+L 切换源语言,")
+        print(f"             Ctrl+Alt+M 鼠标穿透, Ctrl+Alt+G 游戏模式降配")
         print("\n" + "=" * 60)
         print("🎉 开始享受实时字幕吧！")
         print("=" * 60 + "\n")
