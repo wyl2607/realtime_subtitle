@@ -12,6 +12,7 @@ Whisper 增量识别 + LLM 翻译模块（2026-07-06 重写）
 """
 import warnings
 import logging
+import json
 import sys
 import os
 import time
@@ -214,7 +215,9 @@ class WhisperQueueTranslator:
         try:
             if config.SHOW_PERFORMANCE:
                 t0 = time.time()
-            translation = self._translate_single_sentence(german, context)
+            # 流式：翻译的中文逐段推到live区的草稿行，不等整句翻完
+            translation = self._translate_single_sentence(german, context,
+                                                          on_partial=self.on_draft)
             if config.SHOW_PERFORMANCE:
                 print(f"   🔤 翻译{len(batch)}句 {time.time() - t0:.1f}秒: {german[:50]}{'...' if len(german) > 50 else ''}")
         finally:
@@ -262,7 +265,8 @@ class WhisperQueueTranslator:
         with self._tx_lock:
             if self._tx_queue:
                 return  # 等草稿排到时已经来了正式句子，草稿没意义了
-        translation = self._translate_single_sentence(snapshot, " ".join(self.context_history))
+        translation = self._translate_single_sentence(
+            snapshot, " ".join(self.context_history), on_partial=self.on_draft)
         # 翻译失败会原样返回德语，那就不值得展示
         if not translation or translation == snapshot:
             return
@@ -321,8 +325,12 @@ class WhisperQueueTranslator:
         except Exception as e:
             callback(word, f"查询失败: {e}")
 
-    def _translate_single_sentence(self, sentence, german_context):
-        """翻译一段对白（源语言 -> 中文）。失败时返回原文。"""
+    def _translate_single_sentence(self, sentence, german_context, on_partial=None):
+        """翻译一段对白（源语言 -> 中文）。失败时返回原文。
+
+        on_partial: 每~0.15秒把已生成的部分中文回调出去（流式上屏，
+        中文首字延迟从"整句翻完"降到首token到达）。回调必须线程安全。
+        """
         try:
             lang_name = config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)
 
@@ -362,7 +370,7 @@ class WhisperQueueTranslator:
                 json={
                     "model": config.OLLAMA_MODEL,
                     "prompt": prompt,
-                    "stream": False,
+                    "stream": True,  # 流式：中文逐段上屏，不等整句
                     "think": False,
                     "options": {
                         "temperature": 0.3,
@@ -372,16 +380,32 @@ class WhisperQueueTranslator:
                         "num_gpu": 50,
                     }
                 },
-                # 翻译在独立worker里跑，超时不会堵识别，但等太久句对显示会滞后。
-                # 别低于15：Ollama冷加载qwen3:8b实测9.2秒，10秒超时会让
-                # 服务重启后的头几句全部降级成德语
+                stream=True,
+                # 流式下timeout是"相邻数据块间隔"上限，不是总时长。
+                # 别低于15：Ollama冷加载qwen3:8b实测9.2秒（首token前无数据），
+                # 10秒会让服务重启后的头几句全部降级成德语
                 timeout=15
             )
 
             if response.status_code == 200:
-                result = response.json()
-                translation = result.get('response', '').strip()
-                translation = re.sub(r'<think>.*?</think>', '', translation, flags=re.DOTALL)
+                parts = []
+                last_emit = 0.0
+                for line in response.iter_lines():
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except ValueError:
+                        continue
+                    parts.append(data.get("response", ""))
+                    if data.get("done"):
+                        break
+                    if on_partial and time.time() - last_emit > 0.15:
+                        partial = "".join(parts).strip()
+                        if partial:
+                            last_emit = time.time()
+                            on_partial(partial)
+                translation = re.sub(r'<think>.*?</think>', '', "".join(parts), flags=re.DOTALL)
                 return translation.strip()
             else:
                 print(f"   ⚠️  Ollama 返回错误 (HTTP {response.status_code})，显示德语原文")

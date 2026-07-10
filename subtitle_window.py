@@ -82,6 +82,13 @@ class DraggableWidget(QWidget):
         if cb:
             cb()
 
+    def wheelEvent(self, event):
+        cb = getattr(self, "on_wheel", None)
+        if cb and cb(event):
+            event.accept()
+            return
+        super().wheelEvent(event)
+
     def enterEvent(self, event):
         cb = getattr(self, "on_hover", None)
         if cb:
@@ -175,6 +182,7 @@ class SettingsWindow(DraggableWidget):
             'MAX_SUBTITLE_LENGTH': config.MAX_SUBTITLE_LENGTH,
             'MAX_SENTENCE_PAIRS': config.MAX_SENTENCE_PAIRS,
             'FONT_SIZE': config.FONT_SIZE,
+            'BACKGROUND_OPACITY': config.BACKGROUND_OPACITY,
         }
 
         layout = QVBoxLayout()
@@ -236,9 +244,19 @@ class SettingsWindow(DraggableWidget):
             "字体大小", 14, 36, config.FONT_SIZE, 1, set_font_size
         )
 
+        def set_bg_opacity(v):
+            config.BACKGROUND_OPACITY = int(v)
+            if self._on_font_change:
+                self._on_font_change()  # 同一个回调：重刷字幕样式
+
+        self.bg_opacity_slider = self._create_slider(
+            "背景不透明度", 100, 255, config.BACKGROUND_OPACITY, 5, set_bg_opacity
+        )
+
         display_layout.addWidget(self.max_length_slider['widget'])
         display_layout.addWidget(self.max_pairs_slider['widget'])
         display_layout.addWidget(self.font_size_slider['widget'])
+        display_layout.addWidget(self.bg_opacity_slider['widget'])
         display_group.setLayout(display_layout)
         
         # 添加到主布局
@@ -300,6 +318,7 @@ class SettingsWindow(DraggableWidget):
             (self.max_length_slider, 'MAX_SUBTITLE_LENGTH'),
             (self.max_pairs_slider, 'MAX_SENTENCE_PAIRS'),
             (self.font_size_slider, 'FONT_SIZE'),
+            (self.bg_opacity_slider, 'BACKGROUND_OPACITY'),
         ]
         for slider_info, key in pairs:
             slider_info['slider'].setValue(round(self._defaults[key] / slider_info['step']))
@@ -321,6 +340,9 @@ class HistoryWindow(QWidget):
         layout = QVBoxLayout()
         self.text = QTextEdit()
         self.text.setReadOnly(True)
+        # 封顶：几小时的session能攒上千句对，QTextEdit无限增长会越来越卡。
+        # 超出自动丢最旧的（完整记录永远在 transcripts/ 里）
+        self.text.document().setMaximumBlockCount(2000)
         self.text.setStyleSheet(f"""
             QTextEdit {{
                 background-color: rgb(20, 20, 20);
@@ -412,10 +434,12 @@ class SubtitleWindow:
         self.app = QApplication(sys.argv)
         self.app.setQuitOnLastWindowClosed(False)
 
-        # 恢复上次的窗口布局（字号要在建字幕标签之前生效）
+        # 恢复上次的窗口布局（字号/不透明度要在建字幕标签之前生效）
         self._state = self._load_state()
         if "font_size" in self._state:
             config.FONT_SIZE = int(self._state["font_size"])
+        if "bg_opacity" in self._state:
+            config.BACKGROUND_OPACITY = int(self._state["bg_opacity"])
         
         # 创建信号对象
         self.signals = SubtitleSignals()
@@ -524,6 +548,8 @@ class SubtitleWindow:
         self.container.on_resize = self._on_container_resize
         # 鼠标移入显示工具条，移出隐藏
         self.container.on_hover = self._set_controls_visible
+        # Ctrl+滚轮直接调字号（不用开设置面板）
+        self.container.on_wheel = self._on_wheel
         # 窗口几何：优先用上次退出时保存的（用户拖过/缩放过就记住），没有才用config默认。
         # 用availableGeometry（去掉任务栏）并把窗口完整钳回屏幕内——
         # 之前底边可以停在屏幕外，唯一的缩放手柄跟着出屏，窗口就再也调不了了
@@ -600,6 +626,20 @@ class SubtitleWindow:
         self._position_btn_bar()
         self._render()
 
+    def _on_wheel(self, event):
+        """Ctrl+滚轮调字号（高频操作，不该每次都开设置面板拖滑块）"""
+        if not event.modifiers() & Qt.ControlModifier:
+            return False
+        step = 1 if event.angleDelta().y() > 0 else -1
+        size = max(14, min(36, config.FONT_SIZE + step))
+        if size != config.FONT_SIZE:
+            # 通过设置面板滑块走，数值标签/config/样式一次同步
+            s = self.settings_window.font_size_slider
+            s['slider'].setValue(round(size / s['step']))
+            self._render()
+            self.show_status(f"🔠 字号 {size}（Ctrl+滚轮调节）")
+        return True
+
     # ------------------------------------------------------------------
     # 样式与布局持久化
     # ------------------------------------------------------------------
@@ -607,7 +647,7 @@ class SubtitleWindow:
         """按当前config刷新字幕标签/历史窗口的样式（字号滑块实时调用）"""
         self.window.setStyleSheet(f"""
             QLabel {{
-                background-color: {config.BACKGROUND_COLOR};
+                background-color: rgba(0, 0, 0, {int(config.BACKGROUND_OPACITY)});
                 color: {config.TEXT_COLOR};
                 font-size: {config.FONT_SIZE}px;
                 font-family: {config.FONT_FAMILY};
@@ -639,7 +679,8 @@ class SubtitleWindow:
     def _save_state_if_changed(self):
         g = self.container.geometry()
         state = {"x": g.x(), "y": g.y(), "w": g.width(), "h": g.height(),
-                 "font_size": config.FONT_SIZE}
+                 "font_size": config.FONT_SIZE,
+                 "bg_opacity": config.BACKGROUND_OPACITY}
         if state == self._last_saved_state:
             return
         try:
@@ -676,6 +717,9 @@ class SubtitleWindow:
     # 主线程槽函数
     # ------------------------------------------------------------------
     def _update_live(self, committed, unstable):
+        if (committed == self.live_committed and unstable == self.live_unstable
+                and not self.status_line):
+            return  # 内容没变不重排——识别端每0.5秒来一次"无新提交"的空转
         self.live_committed = committed
         self.live_unstable = unstable
         if not committed:
