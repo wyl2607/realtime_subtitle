@@ -159,8 +159,16 @@ $batTemplate = @(
     @("暂停继续字幕.bat", "pause_subtitles.ps1")
 )
 foreach ($pair in $batTemplate) {
-    $bat = "@echo off`r`nchcp 65001 >nul`r`npowershell -NoProfile -ExecutionPolicy Bypass -File `"$PSScriptRoot\$($pair[1])`"`r`npause`r`n"
-    [System.IO.File]::WriteAllText((Join-Path $shortcutDir $pair[0]), $bat, (New-Object System.Text.UTF8Encoding $false))
+    $head = "@echo off`r`nchcp 65001 >nul`r`npowershell -NoProfile -ExecutionPolicy Bypass -File `"$PSScriptRoot\$($pair[1])`"`r`n"
+    if ($pair[0] -eq "启动字幕.bat") {
+        # 成功≈3秒自动关；失败保留窗口让人看得到报错（报错文本由ps1打印）。
+        # ⚠️ bat 必须纯 ASCII：chcp 65001 下 cmd 解析含中文的行会把下一行开头吃掉。
+        # 用 ping 当 sleep：timeout.exe 在 stdin 被重定向时直接报错
+        $tail = "if errorlevel 1 goto :err`r`nping -n 4 127.0.0.1 >nul`r`nexit /b 0`r`n:err`r`necho.`r`npause`r`n"
+    } else {
+        $tail = "ping -n 3 127.0.0.1 >nul`r`n"
+    }
+    [System.IO.File]::WriteAllText((Join-Path $shortcutDir $pair[0]), $head + $tail, (New-Object System.Text.UTF8Encoding $false))
 }
 @"
 双击"启动字幕.bat"开始（首次启动会自动下载语音识别模型，需要几分钟）。

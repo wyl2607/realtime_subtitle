@@ -54,4 +54,4 @@ $proc = Start-Process -FilePath "$PSScriptRoot\venv\Scripts\python.exe" `
     -RedirectStandardError "$PSScriptRoot\subtitle.err.log"
 $proc.Id | Out-File -FilePath $pidFile -Encoding ascii
 Write-Host "已启动 (PID $($proc.Id))，运行日志: subtitle.log"
-Write-Host "模型加载需要半分钟左右，字幕悬浮窗随后出现。现在可以放心关闭这个窗口。"
+Write-Host "模型加载需要半分钟左右，字幕悬浮窗随后出现。这个窗口马上自动关闭。"
