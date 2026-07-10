@@ -326,6 +326,23 @@ class WhisperQueueTranslator:
             while len(self._lookup_cache) > self._LOOKUP_CACHE_MAX:
                 self._lookup_cache.popitem(last=False)
 
+    def _serve_cached_lookup(self, word, cache_key, context, callback):
+        """缓存命中就直接回调，返回True。缓存值是(词典文本, 当时的句境)：
+        同一个词在【不同句子】里点，"本句中"那行是上一个句子的解释，
+        会误导学习者——剥掉它再显示（原形/词性/释义与句境无关照常秒回）"""
+        cached = self._lookup_cache_get(cache_key)
+        if cached is None:
+            return False
+        text, cached_context = cached
+        if context != cached_context:
+            text = "\n".join(
+                line for line in text.splitlines()
+                if not line.strip().startswith("本句中")).strip()
+        if config.SHOW_PERFORMANCE:
+            print(f"   📖 查词缓存命中: {word}")
+        callback(word, text)
+        return True
+
     def lookup_word(self, word, context, callback):
         """查一个德语/英语单词的词典解释，完成后调 callback(word, text)。
 
@@ -333,11 +350,7 @@ class WhisperQueueTranslator:
         缓存命中在调用线程同步返回，不进 executor、不打 Ollama。
         """
         cache_key = (word.lower(), config.SOURCE_LANGUAGE)
-        cached = self._lookup_cache_get(cache_key)
-        if cached is not None:
-            if config.SHOW_PERFORMANCE:
-                print(f"   📖 查词缓存命中: {word}")
-            callback(word, cached)
+        if self._serve_cached_lookup(word, cache_key, context, callback):
             return
         try:
             self._lookup_executor.submit(self._lookup_worker, word, context, callback)
@@ -348,11 +361,7 @@ class WhisperQueueTranslator:
         lang_name = config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)
         cache_key = (word.lower(), config.SOURCE_LANGUAGE)
         # 双检：submit 前到 worker 之间可能已被别的点击填入缓存
-        cached = self._lookup_cache_get(cache_key)
-        if cached is not None:
-            if config.SHOW_PERFORMANCE:
-                print(f"   📖 查词缓存命中: {word}")
-            callback(word, cached)
+        if self._serve_cached_lookup(word, cache_key, context, callback):
             return
         prompt = f"""/no_think 你是{lang_name}汉词典。简明解释{lang_name}单词"{word}"。
 它出现在这句话里：{context}
@@ -381,7 +390,8 @@ class WhisperQueueTranslator:
                 text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
                 if config.SHOW_PERFORMANCE:
                     print(f"   📖 查词 {word} {time.time() - t0:.1f}秒")
-                self._lookup_cache_put(cache_key, text)
+                if text:
+                    self._lookup_cache_put(cache_key, (text, context))
                 callback(word, text or "（没查到）")
             else:
                 callback(word, f"查询失败（HTTP {response.status_code}）")
