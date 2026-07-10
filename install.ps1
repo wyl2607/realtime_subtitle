@@ -6,7 +6,7 @@
 # 可选： -Mirror  使用清华 PyPI 镜像（国内网络加速）
 #
 # 做的事：
-#   1. 检查 Python 3.9-3.12
+#   1. 检查 Python 3.10-3.13（本机 3.13 实测可用）
 #   2. 检测 NVIDIA 显卡（没有就自动生成 CPU 降级配置）
 #   3. 创建 venv 并安装依赖
 #   4. 检查/引导安装 Ollama，拉取翻译模型
@@ -30,7 +30,7 @@ Write-Host "[1/5] 检查 Python..."
 $python = $null
 $candidates = @()
 if (Get-Command py -ErrorAction SilentlyContinue) {
-    $candidates += @("py -3.12", "py -3.11", "py -3.10", "py -3.9")
+    $candidates += @("py -3.13", "py -3.12", "py -3.11", "py -3.10")
 }
 if (Get-Command python -ErrorAction SilentlyContinue) {
     $candidates += "python"
@@ -39,7 +39,7 @@ foreach ($cand in $candidates) {
     try {
         $parts = $cand -split " "
         $ver = & $parts[0] $parts[1..($parts.Count-1)] -c "import sys; print('%d.%d' % sys.version_info[:2])" 2>$null
-        if ($ver -match "^3\.(9|10|11|12)$") {
+        if ($ver -match "^3\.(10|11|12|13)$") {
             $python = $cand
             Write-Host "  ✅ 找到 Python $ver ($cand)"
             break
@@ -47,8 +47,8 @@ foreach ($cand in $candidates) {
     } catch { }
 }
 if (-not $python) {
-    Write-Host "  ❌ 没有找到 Python 3.9-3.12。"
-    Write-Host "     请到 https://www.python.org/downloads/ 安装 Python 3.12，"
+    Write-Host "  ❌ 没有找到 Python 3.10-3.13。"
+    Write-Host "     请到 https://www.python.org/downloads/ 安装 Python 3.13，"
     Write-Host "     安装时勾选 'Add python.exe to PATH'，然后重新运行本脚本。"
     Start-Process "https://www.python.org/downloads/"
     exit 1

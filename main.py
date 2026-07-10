@@ -62,9 +62,11 @@ class SubtitleApp:
         self.subtitle_window.on_lookup = lambda word, ctx: self.translator.lookup_word(
             word, ctx, self.subtitle_window.show_lookup_result)
 
-        # 初始化音频捕获（传入回调函数）
+        # 初始化音频捕获（设备名/设备切换提示直接上悬浮窗）
         try:
-            self.audio_capture = AudioCapture(callback=self.on_audio_received)
+            self.audio_capture = AudioCapture(
+                callback=self.on_audio_received,
+                on_status=self.subtitle_window.show_status)
         except Exception as e:
             print(f"❌ 音频捕获初始化失败: {e}")
             sys.exit(1)
@@ -154,15 +156,18 @@ class SubtitleApp:
 
         def hotkey_loop():
             user32 = ctypes.windll.user32
+            # 记下线程id，stop()里PostThreadMessage(WM_QUIT)让循环优雅退出
+            self._hotkey_tid = ctypes.windll.kernel32.GetCurrentThreadId()
             registered = []
             for hid, (label, vk, _) in handlers.items():
                 if user32.RegisterHotKey(None, hid, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, vk):
-                    registered.append(label)
+                    registered.append(hid)
                 else:
                     print(f"⚠️  快捷键 {label} 注册失败（可能被其它程序占用）")
             if not registered:
                 return
-            print(f"⌨️  全局快捷键已注册(系统级): {', '.join(registered)}")
+            print(f"⌨️  全局快捷键已注册(系统级): "
+                  f"{', '.join(handlers[h][0] for h in registered)}")
             msg = wintypes.MSG()
             while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
                 if msg.message == WM_HOTKEY and msg.wParam in handlers:
@@ -170,7 +175,10 @@ class SubtitleApp:
                         handlers[msg.wParam][2]()
                     except Exception as e:
                         print(f"⚠️  快捷键处理错误: {e}")
+            for hid in registered:
+                user32.UnregisterHotKey(None, hid)
 
+        self._hotkey_tid = None
         threading.Thread(target=hotkey_loop, name="HotkeyLoop", daemon=True).start()
 
     def _flush_check(self):
@@ -225,6 +233,11 @@ class SubtitleApp:
         # 停掉兜底定时器，避免向关闭中的线程池提交任务
         if hasattr(self, '_flush_timer'):
             self._flush_timer.stop()
+
+        # 让热键线程退出消息循环并注销热键（WM_QUIT = 0x0012）
+        if getattr(self, '_hotkey_tid', None):
+            import ctypes
+            ctypes.windll.user32.PostThreadMessageW(self._hotkey_tid, 0x0012, 0, 0)
 
         # 先停止音频捕获，避免向已关闭的线程池提交新任务
         try:

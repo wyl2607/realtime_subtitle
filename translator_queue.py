@@ -20,7 +20,7 @@ import re
 import queue
 from threading import Lock
 from concurrent.futures import ThreadPoolExecutor
-from collections import deque
+from collections import deque, OrderedDict
 
 import requests
 
@@ -95,6 +95,11 @@ class WhisperQueueTranslator:
             self._tx_executor = ThreadPoolExecutor(max_workers=1)
             # 点词查词单独一个worker：查词典不该排在字幕翻译后面等
             self._lookup_executor = ThreadPoolExecutor(max_workers=1)
+            # 查词 LRU：重复点同一词零 Ollama 成本（精听高频）；
+            # OrderedDict + move_to_end = 真 LRU，锁保护 UI 线程与 worker 并发
+            self._lookup_cache = OrderedDict()  # (word_lower, lang) -> text
+            self._lookup_cache_lock = Lock()
+            self._LOOKUP_CACHE_MAX = int(getattr(config, "LOOKUP_CACHE_MAX", 200))
 
             # 最近已翻译的德语句子，作为翻译上下文
             self.context_history = deque(maxlen=6)
@@ -202,12 +207,25 @@ class WhisperQueueTranslator:
             pass  # 程序正在退出
 
     def _translation_worker(self):
-        """把队列里积压的句子合并成一次Ollama请求"""
+        """把队列里积压的句子合并成一次Ollama请求。
+
+        batch有字符上限：说话快时积压句子无限合并会让单次请求越来越长
+        （延迟和幻觉风险都涨），超限的留给下一轮（本轮末尾自我再调度）。
+        至少取一句（单句本身可超过上限）；已有batch时若再塞会超限则停。
+        """
+        max_chars = getattr(config, "TRANSLATE_BATCH_MAX_CHARS", 300)
         with self._tx_lock:
             if not self._tx_queue:
                 return
-            batch = list(self._tx_queue)
-            self._tx_queue.clear()
+            batch = []
+            total = 0
+            while self._tx_queue:
+                s = self._tx_queue[0]
+                if batch and total + len(s) > max_chars:
+                    break
+                self._tx_queue.pop(0)
+                batch.append(s)
+                total += len(s)
             self._tx_inflight = batch
 
         german = " ".join(batch)
@@ -233,6 +251,15 @@ class WhisperQueueTranslator:
             self.on_pair(german, "" if translation == german else translation)
         self._draft_last_text = ""  # 正式句对上屏了，残句草稿从头再来
         self._emit_display()
+
+        # 本轮因batch上限留下的句子，自我再调度（不等下一次enqueue）
+        with self._tx_lock:
+            leftover = bool(self._tx_queue)
+        if leftover:
+            try:
+                self._tx_executor.submit(self._translation_worker)
+            except RuntimeError:
+                pass
 
     def _maybe_draft(self):
         """残句草稿翻译：中文不用等"凑成完整句+正式翻译"，先出一版草稿。
@@ -280,11 +307,38 @@ class WhisperQueueTranslator:
     # ------------------------------------------------------------------
     # 点词查词（独立worker，不占字幕翻译的队列）
     # ------------------------------------------------------------------
+    def _lookup_cache_get(self, cache_key):
+        """真 LRU 读：命中则移到末尾。"""
+        with self._lookup_cache_lock:
+            text = self._lookup_cache.get(cache_key)
+            if text is not None:
+                self._lookup_cache.move_to_end(cache_key)
+            return text
+
+    def _lookup_cache_put(self, cache_key, text):
+        """真 LRU 写：已存在则刷新位置；超额弹出最久未用。"""
+        if not text:
+            return
+        with self._lookup_cache_lock:
+            if cache_key in self._lookup_cache:
+                self._lookup_cache.move_to_end(cache_key)
+            self._lookup_cache[cache_key] = text
+            while len(self._lookup_cache) > self._LOOKUP_CACHE_MAX:
+                self._lookup_cache.popitem(last=False)
+
     def lookup_word(self, word, context, callback):
         """查一个德语/英语单词的词典解释，完成后调 callback(word, text)。
 
         callback 必须线程安全（SubtitleWindow.show_lookup_result 走Qt信号）。
+        缓存命中在调用线程同步返回，不进 executor、不打 Ollama。
         """
+        cache_key = (word.lower(), config.SOURCE_LANGUAGE)
+        cached = self._lookup_cache_get(cache_key)
+        if cached is not None:
+            if config.SHOW_PERFORMANCE:
+                print(f"   📖 查词缓存命中: {word}")
+            callback(word, cached)
+            return
         try:
             self._lookup_executor.submit(self._lookup_worker, word, context, callback)
         except RuntimeError:
@@ -292,6 +346,14 @@ class WhisperQueueTranslator:
 
     def _lookup_worker(self, word, context, callback):
         lang_name = config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)
+        cache_key = (word.lower(), config.SOURCE_LANGUAGE)
+        # 双检：submit 前到 worker 之间可能已被别的点击填入缓存
+        cached = self._lookup_cache_get(cache_key)
+        if cached is not None:
+            if config.SHOW_PERFORMANCE:
+                print(f"   📖 查词缓存命中: {word}")
+            callback(word, cached)
+            return
         prompt = f"""/no_think 你是{lang_name}汉词典。简明解释{lang_name}单词"{word}"。
 它出现在这句话里：{context}
 
@@ -319,6 +381,7 @@ class WhisperQueueTranslator:
                 text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
                 if config.SHOW_PERFORMANCE:
                     print(f"   📖 查词 {word} {time.time() - t0:.1f}秒")
+                self._lookup_cache_put(cache_key, text)
                 callback(word, text or "（没查到）")
             else:
                 callback(word, f"查询失败（HTTP {response.status_code}）")
