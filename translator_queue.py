@@ -523,6 +523,8 @@ class WhisperQueueTranslator:
                     parts = []
                     last_emit = 0.0
                     for line in response.iter_lines():
+                        if self.closing:
+                            break  # 正在退出：别等整句生成完，finally会close连接
                         if not line:
                             continue
                         try:
@@ -729,8 +731,12 @@ class WhisperQueueTranslator:
         """关闭识别/翻译线程（main.stop调用）。先ASR后翻译：
         ASR关完就不会再往翻译队列塞句子"""
         self.closing = True  # 在飞worker的出口检查：不再回调正在拆的UI
-        self._asr_executor.shutdown(wait=True, cancel_futures=False)
-        self._tx_executor.shutdown(wait=True, cancel_futures=False)
+        # cancel_futures=True：队列里还没开跑的识别/翻译全部丢弃——结果没人看
+        # （窗口在关、transcript也差不了几句），翻完再退纯属浪费退出时间。
+        # 在飞的那一个任务照常等完：ASR最坏~2.5秒（GPU被抢时），流式翻译
+        # 循环里查closing、一个数据块(~0.1秒)内就break出来
+        self._asr_executor.shutdown(wait=True, cancel_futures=True)
+        self._tx_executor.shutdown(wait=True, cancel_futures=True)
         self._lookup_executor.shutdown(wait=False, cancel_futures=True)
         try:
             self.ollama_session.close()

@@ -4,16 +4,19 @@ Set-Location $PSScriptRoot
 
 $pidFile = "$PSScriptRoot\subtitle.pid"
 $stopFlag = "$PSScriptRoot\.stop"
-$graceSeconds = 15
+# 优雅退出正常1-2秒（积压任务直接丢弃、在飞流式翻译会被打断）；
+# 3秒还没退干净说明卡住了（GPU被抢时一次识别最坏~2.5秒），直接强杀无害
+$graceSeconds = 3
 $stopped = $false
 
 function Wait-ProcessExit {
     param([int]$ProcessId, [int]$Seconds)
-    for ($i = 0; $i -lt $Seconds; $i++) {
+    # 250ms 一查：程序退完立刻返回，不多等
+    for ($i = 0; $i -lt ($Seconds * 4); $i++) {
         if (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
             return $true
         }
-        Start-Sleep -Seconds 1
+        Start-Sleep -Milliseconds 250
     }
     return -not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)
 }
