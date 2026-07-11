@@ -7,7 +7,7 @@ import numpy as np
 
 import config
 from streaming_asr import HypothesisBuffer, OnlineASRProcessor
-from translator_queue import _SENTENCE_END
+from translator_queue import _SENTENCE_END, _interjection_lookup, _squash_repeats
 
 
 def _extract_sentences(pending_text):
@@ -122,6 +122,94 @@ def test_prompt_neutral_exclamations_not_flagged():
     asr.commited = _committed_words(words)
     asr.buffer_time_offset = 100.0
     assert asr._prompt() != config.LANGUAGE_SEED_PROMPTS["de"]
+
+
+def test_interjection_dictionary_hits():
+    """高频感叹词命中词典（跳过Ollama）；正常句/未收录词不命中"""
+    assert config.SOURCE_LANGUAGE == "de"
+    assert _interjection_lookup("Ja.") == "是"
+    assert _interjection_lookup("Was?") == "什么？"
+    assert _interjection_lookup("Oh mein Gott!") == "我的天哪"
+    assert _interjection_lookup("Alles klar.") == "明白了"
+    assert _interjection_lookup("Das ist gut.") is None  # 未收录的3词句
+    assert _interjection_lookup("Ich werde sterben.") is None
+    assert _interjection_lookup("") is None
+
+
+def test_interjection_disabled_for_non_german():
+    old = config.SOURCE_LANGUAGE
+    try:
+        config.SOURCE_LANGUAGE = "en"
+        assert _interjection_lookup("Ja.") is None
+    finally:
+        config.SOURCE_LANGUAGE = old
+
+
+def test_squash_repeats_word_runs():
+    """句内同词连续>3次收敛到3次（"Get. Get."×6是Whisper噪音伪影）"""
+    out = _squash_repeats(["ja ja ja ja ja ja genau"])
+    assert out == ["ja ja ja genau"]
+    # 3次以内不动（真人口语常见）
+    assert _squash_repeats(["ja ja ja"]) == ["ja ja ja"]
+
+
+def test_squash_repeats_duplicate_sentences():
+    out = _squash_repeats(["Get.", "Get.", "Get.", "Get.", "Get.", "Get."])
+    assert out == ["Get.", "Get."]
+    # 不同句子完全不受影响
+    keep = ["Hallo.", "Wie geht's?", "Hallo."]
+    assert _squash_repeats(keep) == keep
+
+
+def test_translation_worker_dict_shortcircuit_and_order():
+    """worker级：队首感叹词词典直发、其余合并一次Ollama、上屏顺序不颠倒"""
+    from collections import deque
+    from threading import Lock
+    from translator_queue import WhisperQueueTranslator
+
+    t = WhisperQueueTranslator.__new__(WhisperQueueTranslator)
+    t._tx_lock = Lock()
+    t._stats_lock = Lock()
+    t._tx_queue = ["Ja.", "Whoa!", "Das ist ein Test.", "Was?"]
+    t._tx_epoch = 0
+    t._tx_inflight = []
+    t.closing = False
+    t.context_history = deque(maxlen=6)
+    t._stat_dict = 0
+    t._stat_tx = []
+    t._stat_draft = 0
+    t._draft_last_text = ""
+    t.on_draft = None
+    t.on_display = None
+    pairs = []
+    t.on_pair = lambda g, zh: pairs.append((g, zh))
+    t._save_transcript = lambda g, zh: None
+    calls = []
+
+    def fake_translate(sentence, context, on_partial=None):
+        calls.append(sentence)
+        return "中文翻译"
+    t._translate_single_sentence = fake_translate
+
+    class NoopExecutor:
+        def submit(self, *a, **k):
+            raise AssertionError("队列应该被一轮吃完，不该有leftover再调度")
+    t._tx_executor = NoopExecutor()
+
+    t._translation_worker()
+    # 队首两个感叹词直发；"Was?"排在正常句之后 → 跟着batch合并翻，顺序不颠倒
+    assert pairs == [("Ja.", "是"), ("Whoa!", "哇哦"),
+                     ("Das ist ein Test. Was?", "中文翻译")], pairs
+    assert calls == ["Das ist ein Test. Was?"]  # 只打了一次Ollama
+    assert t._stat_dict == 2
+    assert t._tx_queue == []
+
+    # 全是感叹词：零Ollama调用
+    pairs.clear(); calls.clear()
+    t._tx_queue = ["Genau.", "Super!"]
+    t._translation_worker()
+    assert pairs == [("Genau.", "没错"), ("Super!", "太棒了")]
+    assert calls == []
 
 
 def test_glossary_substring_still_config_driven():

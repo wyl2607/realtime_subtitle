@@ -170,10 +170,30 @@ HALLUCINATION_BLACKLIST = [
 SAVE_TRANSCRIPT = True  # 把每条字幕（原文+译文+时间）存到文件，方便回看/搜索/学语言
 TRANSCRIPT_DIR = "transcripts"  # 相对仓库目录，每天一个文件 YYYY-MM-DD.txt
 
+# ============ 感叹词直译词典 ============
+# ≤3词的句子命中词典就跳过 Ollama 直接上屏（游戏/聊天场景实测21%的字幕
+# 是这类，每条单独打一次Ollama纯浪费GPU）。key=小写去首尾标点的德语。
+# 只收含义无歧义的词条；有语境依赖的（如 "gerne"）别放进来
+INTERJECTION_TRANSLATIONS = {
+    "ja": "是", "nein": "不", "gut": "好", "okay": "好的", "ok": "好的",
+    "was": "什么？", "warum": "为什么？", "wow": "哇", "whoa": "哇哦",
+    "hey": "嘿", "danke": "谢谢", "genau": "没错", "richtig": "对",
+    "super": "太棒了", "geil": "太爽了", "krass": "离谱", "scheiße": "该死",
+    "mist": "糟糕", "verdammt": "可恶", "warte": "等等", "moment": "等一下",
+    "hilfe": "救命", "vorsicht": "小心", "egal": "无所谓", "stimmt": "没错",
+    "na ja": "嗯……", "ach so": "原来如此", "alles klar": "明白了",
+    "keine ahnung": "不知道", "oh mein gott": "我的天哪", "mein gott": "天哪",
+    "oh gott": "天哪", "komm schon": "来吧", "sehr gut": "非常好",
+    "sehr lustig": "真好笑", "kein problem": "没问题", "warte mal": "等一下",
+}
+
 # ============ 日志配置 ============
 # 默认关闭：长直播时每 0.5s 刷一行会把 subtitle.log 撑很大。
 # 排障时在 config_local.py 里设 True，或临时改这里。
 SHOW_PERFORMANCE = False
+# 每隔这么多秒打一行性能概况（识别p50/p90、缓冲峰值、翻译耗时等，0=关）。
+# 这是 SHOW_PERFORMANCE=False 后仅剩的观测手段：约1行/分钟，撑不大日志
+STATS_SUMMARY_INTERVAL = 60
 
 # ============ 本机覆盖（放最后，能覆盖上面所有配置）============
 # install.ps1 在没有NVIDIA显卡的机器上会生成 config_local.py

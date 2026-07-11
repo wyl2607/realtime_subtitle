@@ -34,6 +34,44 @@ logging.basicConfig(level=logging.ERROR)
 # 句子结束符：只认 .!?（旧管线按逗号切句是碎句/上下文错乱的来源之一）
 _SENTENCE_END = re.compile(r'(.*?[.!?…]["»«\']?)(\s|$)', re.DOTALL)
 
+_PUNCT_STRIP = " \t.!?…,;:–—\"'«»„“”"
+
+
+def _interjection_lookup(sentence):
+    """≤3词的高频感叹词直接查词典，命中就不打Ollama。
+    游戏/聊天场景实测21%的字幕是"Ja." "Was?" "Whoa!"这类，
+    每条单独一次Ollama请求纯浪费GPU（还和Whisper抢卡）。"""
+    if config.SOURCE_LANGUAGE != "de":
+        return None  # 词典是德语的，其它源语言不启用
+    key = sentence.strip(_PUNCT_STRIP).lower()
+    if not key or len(key.split()) > 3:
+        return None
+    return getattr(config, "INTERJECTION_TRANSLATIONS", {}).get(key)
+
+
+def _squash_repeats(sentences, keep_words=3, keep_sents=2):
+    """压缩Whisper复读伪影（游戏噪音实测提交过"Get. Get. Get. Get. Get. Get."）：
+    句内同词连续超过 keep_words 次收敛；一批里连续相同句子超过 keep_sents 条丢弃。
+    真人口语的"ja, ja"重复不受影响（阈值3已经很宽）。"""
+    out = []
+    for s in sentences:
+        words = s.split()
+        squashed = []
+        run = 0
+        for w in words:
+            if squashed and w.lower() == squashed[-1].lower():
+                run += 1
+                if run >= keep_words:
+                    continue
+            else:
+                run = 0
+            squashed.append(w)
+        s = " ".join(squashed)
+        if len(out) >= keep_sents and all(x == s for x in out[-keep_sents:]):
+            continue
+        out.append(s)
+    return out
+
 _WhisperModel = None  # set by _ensure_ml_deps()
 
 
@@ -134,6 +172,16 @@ class WhisperQueueTranslator:
             self.on_draft = None    # (chinese_draft) -> None 残句的草稿中文
             self.on_status = None   # (text) -> None 状态提示（如Ollama挂了）
             self._ollama_down_notified = 0.0  # 上次提示"翻译服务未运行"的时间（节流）
+
+            # 分钟级性能概况（SHOW_PERFORMANCE=False 后仅剩的观测手段）
+            self._stats_lock = Lock()
+            self._stats_t0 = time.time()
+            self._stat_asr = []       # 每轮识别耗时
+            self._stat_tx = []        # 每次Ollama翻译耗时
+            self._stat_buf_max = 0.0  # 音频缓冲峰值（秒）
+            self._stat_merge = 0      # 合并多块处理的轮数（GPU落后的信号）
+            self._stat_draft = 0      # 草稿翻译次数
+            self._stat_dict = 0       # 感叹词词典直译次数（省下的Ollama请求）
 
             # 草稿翻译节流状态（残句还没凑成完整句子时先出一版灰色中文）
             self._draft_last_time = 0.0
@@ -248,6 +296,7 @@ class WhisperQueueTranslator:
         """完整句子进翻译队列，唤醒worker"""
         if not sentences:
             return
+        sentences = _squash_repeats(sentences)  # 压缩Whisper复读伪影
         with self._tx_lock:
             self._tx_queue.extend(sentences)
         try:
@@ -268,9 +317,18 @@ class WhisperQueueTranslator:
                 return
             epoch = self._tx_epoch  # 完成时代数变了（切了语言）就丢弃结果
             batch = []
+            direct = []  # (德语, 词典中文)：队首的感叹词直接上屏不进Ollama
             total = 0
             while self._tx_queue:
                 s = self._tx_queue[0]
+                if not batch:
+                    hit = _interjection_lookup(s)
+                    if hit is not None:
+                        # 只在batch还空时直发，保持上屏顺序不颠倒；
+                        # batch里已有句子时感叹词跟着batch合并翻（不多花请求）
+                        self._tx_queue.pop(0)
+                        direct.append((s, hit))
+                        continue
                 if batch and total + len(s) > max_chars:
                     break
                 self._tx_queue.pop(0)
@@ -279,16 +337,32 @@ class WhisperQueueTranslator:
             self._tx_inflight = batch
             context = " ".join(self.context_history)
 
+        if direct and not self.closing:
+            with self._tx_lock:
+                stale_direct = (epoch != self._tx_epoch)
+            if not stale_direct:
+                for g, zh in direct:
+                    self._save_transcript(g, zh)
+                    if self.on_pair:
+                        self.on_pair(g, zh)
+                with self._stats_lock:
+                    self._stat_dict += len(direct)
+
+        if not batch:
+            return  # 本轮全是词典感叹词，不用打Ollama
+
         german = " ".join(batch)
         translation = None
         try:
-            if config.SHOW_PERFORMANCE:
-                t0 = time.time()
+            t0 = time.time()
             # 流式：翻译的中文逐段推到live区的草稿行，不等整句翻完
             translation = self._translate_single_sentence(
                 german, context, on_partial=self._epoch_gated_draft(epoch))
+            tx_elapsed = time.time() - t0
+            with self._stats_lock:
+                self._stat_tx.append(tx_elapsed)
             if config.SHOW_PERFORMANCE:
-                print(f"   🔤 翻译{len(batch)}句 {time.time() - t0:.1f}秒: {german[:50]}{'...' if len(german) > 50 else ''}")
+                print(f"   🔤 翻译{len(batch)}句 {tx_elapsed:.1f}秒: {german[:50]}{'...' if len(german) > 50 else ''}")
         finally:
             with self._tx_lock:
                 self._tx_inflight = []
@@ -334,11 +408,16 @@ class WhisperQueueTranslator:
             return  # 残句没变，上一版草稿还有效
         if time.time() - self._draft_last_time < getattr(config, "DRAFT_MIN_INTERVAL", 1.5):
             return
+        with self._asr_lock:
+            if len(self._audio_inbox) >= 2:
+                return  # 识别已在攒块（GPU被抢），草稿是奢侈品，先让路
         with self._tx_lock:
             if self._tx_queue or self._tx_inflight:
                 return  # 正式翻译在忙，草稿让路
         self._draft_last_time = time.time()
         self._draft_last_text = text
+        with self._stats_lock:
+            self._stat_draft += 1
         try:
             self._tx_executor.submit(self._draft_worker, text)
         except RuntimeError:
@@ -711,13 +790,49 @@ class WhisperQueueTranslator:
         self._emit_display()
         self._maybe_draft()
 
+        elapsed = time.time() - start_time
+        self._stat_note_asr(elapsed, self.processor.buffer_seconds(), len(items))
         if config.SHOW_PERFORMANCE:
-            elapsed = time.time() - start_time
             shown = committed if committed else "(无新提交)"
             merged = f"(合并{len(items)}块)" if len(items) > 1 else ""
             print(f"   ⏱️  {elapsed:.2f}秒{merged} | 缓冲{self.processor.buffer_seconds():.1f}秒 | ✅ {shown[:60]}")
             if unstable:
                 print(f"   ⏳ 未稳定: {unstable[:60]}")
+
+    def _stat_note_asr(self, elapsed, buf_sec, n_items):
+        """记一轮识别指标；到间隔就打一行概况（跑在ASR线程，无音频时不打）"""
+        interval = getattr(config, "STATS_SUMMARY_INTERVAL", 60)
+        if interval <= 0:
+            return
+        with self._stats_lock:
+            self._stat_asr.append(elapsed)
+            self._stat_buf_max = max(self._stat_buf_max, buf_sec)
+            if n_items > 1:
+                self._stat_merge += 1
+            if time.time() - self._stats_t0 < interval:
+                return
+            asr, tx = sorted(self._stat_asr), sorted(self._stat_tx)
+            merge, buf_max = self._stat_merge, self._stat_buf_max
+            draft, dhit = self._stat_draft, self._stat_dict
+            self._stat_asr, self._stat_tx = [], []
+            self._stat_merge, self._stat_buf_max = 0, 0.0
+            self._stat_draft = self._stat_dict = 0
+            self._stats_t0 = time.time()
+
+        def pct(a, q):
+            return a[min(len(a) - 1, int(q * len(a)))] if a else 0.0
+
+        line = (f"📈 概况: 识别{len(asr)}次 p50 {pct(asr, .5):.2f}s p90 {pct(asr, .9):.2f}s"
+                f" | 缓冲峰值 {buf_max:.1f}s")
+        if merge:
+            line += f" | 合并{merge}轮"
+        if tx:
+            line += f" | 翻译{len(tx)}次 p50 {pct(tx, .5):.1f}s p90 {pct(tx, .9):.1f}s"
+        if draft:
+            line += f" | 草稿{draft}"
+        if dhit:
+            line += f" | 词典直译{dhit}"
+        print(line)
 
     def flush_pending(self):
         """空闲兜底：一段话说完后没有新音频，未提交尾部/未成句残句会一直挂着。
