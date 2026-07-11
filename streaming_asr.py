@@ -32,6 +32,9 @@ _DE_STOPWORDS = {
     "es", "den", "dem", "sich", "haben", "habe", "kann", "man",
 }
 
+# 复读判定时从词上剥掉的标点（"Geh!"和"Geh"算同一个词）
+_WORD_PUNCT = ".!?…,;:\"'«»„“”-–—"
+
 
 class HypothesisBuffer:
     """两次连续识别结果的最长公共词前缀才提交（local agreement-2）
@@ -184,6 +187,29 @@ class OnlineASRProcessor:
         lowered = text.lower()
         return any(pattern in lowered for pattern in config.HALLUCINATION_BLACKLIST)
 
+    @staticmethod
+    def _collapse_word_runs(words_ts, keep=3):
+        """同词连续超过 keep 个只留前 keep 个——Whisper 复读循环
+        （电影动作/音乐段实测 "Geh!"×50 刷满 live 行和草稿）在词流入口
+        就掐掉，下游的提交/显示/翻译全部干净。
+        规则是确定性的：相邻两次识别对同一段音频裁掉同样的词，
+        local agreement 的前缀一致判定不受干扰（保留词的时间戳即前 keep 个
+        原始时间戳，两次识别间稳定）。真人口语的"ja, ja, ja"不超过3个不受影响。"""
+        out = []
+        prev = None
+        run = 0
+        for w in words_ts:
+            key = w[2].strip().strip(_WORD_PUNCT).lower()
+            if key and key == prev:
+                run += 1
+                if run >= keep:
+                    continue
+            else:
+                run = 0
+            prev = key or None
+            out.append(w)
+        return out
+
     def _ts_words(self, segments):
         """segment 流 → [(start, end, word)]，段级过滤静音幻觉。
         注意 faster-whisper 的 word.word 自带前导空格，不能 strip（拼接时需要）"""
@@ -197,7 +223,7 @@ class OnlineASRProcessor:
                 continue
             for word in segment.words:
                 out.append((word.start, word.end, word.word))
-        return out
+        return self._collapse_word_runs(out)
 
     def process_iter(self):
         """识别当前整个音频缓冲，返回 (新提交的文本, 未稳定尾部文本)"""

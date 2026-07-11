@@ -212,6 +212,22 @@ def test_translation_worker_dict_shortcircuit_and_order():
     assert calls == []
 
 
+def test_collapse_word_runs_at_ingestion():
+    """词流入口掐复读循环：电影场景实测"Geh!"×50刷满live行和草稿。
+    保留前3个（原始时间戳），下游提交/显示/翻译全部干净"""
+    words = [(i * 0.3, i * 0.3 + 0.2, " Geh!") for i in range(20)]
+    out = OnlineASRProcessor._collapse_word_runs(words)
+    assert len(out) == 3
+    assert out == words[:3]  # 时间戳取前3个原始值（两次识别间稳定）
+    # 大小写/标点变体算同一个词
+    varied = [(0, 1, " Geh!"), (1, 2, " geh"), (2, 3, " GEH!"), (3, 4, " Geh,"), (4, 5, " weiter")]
+    out = OnlineASRProcessor._collapse_word_runs(varied)
+    assert [w[2] for w in out] == [" Geh!", " geh", " GEH!", " weiter"]
+    # 3个以内的真实口语重复不动；混合句完全不受影响
+    ok = [(0, 1, " ja"), (1, 2, " ja"), (2, 3, " ja"), (3, 4, " genau")]
+    assert OnlineASRProcessor._collapse_word_runs(ok) == ok
+
+
 def test_glossary_substring_still_config_driven():
     # 冒烟：术语表里至少有政治词条，防误删
     assert "AfD" in config.GLOSSARY

@@ -184,6 +184,7 @@ INTERJECTION_TRANSLATIONS = {
     "na ja": "嗯……", "ach so": "原来如此", "alles klar": "明白了",
     "keine ahnung": "不知道", "oh mein gott": "我的天哪", "mein gott": "天哪",
     "oh gott": "天哪", "komm schon": "来吧", "sehr gut": "非常好",
+    "geh": "走！", "lauf": "快跑！", "los": "快！", "komm": "过来",
     "sehr lustig": "真好笑", "kein problem": "没问题", "warte mal": "等一下",
 }
 
