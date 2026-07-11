@@ -13,8 +13,24 @@ Local Agreement 增量识别（移植自 ufal/whisper_streaming, MIT License）
 - vad_filter=True：faster-whisper 内置 Silero VAD（onnx 自带无新依赖），
   压制剧集里背景音乐/音效段——能量阈值对音乐无能为力，这个有。
 """
+import re
 import numpy as np
 import config
+
+# 语言误锁检测用的高频功能词（小写、整词匹配）。集合刻意窄，宁漏勿错：
+# 判定只用于"是否把已提交文本喂回 prompt"，漏判无害（下次再判），
+# 误判会丢掉正确的上下文
+_EN_STOPWORDS = {
+    "the", "and", "you", "that", "this", "what", "not", "have", "get",
+    "is", "are", "was", "were", "my", "your", "of", "to", "we", "it",
+    "i'm", "it's", "don't", "gonna", "they", "just", "back", "out",
+}
+_DE_STOPWORDS = {
+    "der", "die", "das", "und", "ich", "du", "wir", "ihr", "sie", "ist",
+    "sind", "war", "nicht", "ein", "eine", "zu", "mit", "auf", "für",
+    "von", "dass", "wie", "auch", "aber", "noch", "schon", "mal", "ja",
+    "es", "den", "dem", "sich", "haben", "habe", "kann", "man",
+}
 
 
 class HypothesisBuffer:
@@ -134,11 +150,35 @@ class OnlineASRProcessor:
             l += len(x) + 1
             prompt.append(x)
         text = "".join(prompt[::-1])
+        seed = config.LANGUAGE_SEED_PROMPTS.get(config.SOURCE_LANGUAGE, "")
+        # 冷启动（无已提交上下文）：用语言锚垫底。空prompt时开头的嘈杂/
+        # 游戏音容易被认成英文，英文经prompt自我强化能锁死几分钟
+        if not text.strip():
+            return seed
+        # 上下文已被错误语言污染：不喂回去（喂回去=继续强化），换回语言锚
+        if seed and self._prompt_language_mismatch(text):
+            if config.SHOW_PERFORMANCE:
+                print(f"   🧭 上下文疑似非{config.SOURCE_LANGUAGE}，弃用并重新锚定: {text.strip()[:40]}")
+            return seed
         # Whisper会模仿prompt的文风：嘈杂语音识别出的无标点文本进了prompt，
         # 会诱导后续继续不打标点（恶性循环，句子切分全靠标点）。补个句号打断
-        if text and text[-1] not in ".!?…":
+        if text[-1] not in ".!?…":
             text += "."
         return text
+
+    @staticmethod
+    def _prompt_language_mismatch(text):
+        """已提交上下文是否明显是"非目标语言"。只处理 de/en 这对最常见的
+        误认组合；判定保守：错误语言功能词≥3个且≥目标语言的2倍才算"""
+        words = re.findall(r"[a-zäöüß']+", text.lower())
+        en = sum(1 for w in words if w in _EN_STOPWORDS)
+        de = sum(1 for w in words if w in _DE_STOPWORDS)
+        lang = config.SOURCE_LANGUAGE
+        if lang == "de":
+            return en >= 3 and en >= 2 * max(de, 1)
+        if lang == "en":
+            return de >= 3 and de >= 2 * max(en, 1)
+        return False
 
     def _is_hallucination(self, text):
         lowered = text.lower()

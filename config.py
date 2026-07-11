@@ -14,6 +14,15 @@ WHISPER_COMPUTE_TYPE = "float16"  # float16, int8, int8_float16
 SOURCE_LANGUAGE = "de"
 LANGUAGE_CYCLE = ["de", "en"]  # 热键循环切换的语言列表，想看别的语言往里加
 LANGUAGE_NAMES = {"de": "德语", "en": "英语", "fr": "法语", "es": "西班牙语", "ja": "日语"}
+# 语言锚：initial_prompt 为空时（刚启动/切语言/长静音重置）用这句话垫底，
+# 把解码器锚在目标语言上。开头几句嘈杂/游戏音容易被认成英文，而英文一旦
+# 进了上下文 prompt 会自我强化好几分钟（2026-07-11 实测锁死近3分钟）；
+# 已提交上下文若明显是"错误语言"也会被丢弃、换回这句锚。锚只做偏置，
+# 不会出现在字幕里。加新语言时往这里补一句对应语言的自然句子。
+LANGUAGE_SEED_PROMPTS = {
+    "de": "Hallo zusammen, wir sprechen heute auf Deutsch über dieses Thema.",
+    "en": "Hello everyone, today we are talking about this topic in English.",
+}
 WHISPER_TASK = "transcribe"  # "transcribe"=转录原语言, "translate"=翻译成英文
 WHISPER_BEAM_SIZE = 3  # beam search 大小。whisper_streaming作者用5，这里用3保延迟
 # 注：whisper_streaming作者在L40上实测 int8_float16 比 float16 慢~20%且质量更差，

@@ -80,6 +80,50 @@ def test_audio_chunk_flush_no_append_growth():
     assert asr._audio_chunks == []
 
 
+def _committed_words(words, step=0.5):
+    return [(i * step, (i + 1) * step, " " + w) for i, w in enumerate(words)]
+
+
+def test_prompt_seed_on_cold_start():
+    """冷启动无已提交上下文 → prompt 用德语语言锚（防开头被英文锁死）"""
+    asr = OnlineASRProcessor.__new__(OnlineASRProcessor)
+    asr.init()
+    assert config.SOURCE_LANGUAGE == "de"
+    assert asr._prompt() == config.LANGUAGE_SEED_PROMPTS["de"]
+
+
+def test_prompt_keeps_german_context():
+    """正常德语上下文原样喂回（带补句号），不会被误判丢弃"""
+    asr = OnlineASRProcessor.__new__(OnlineASRProcessor)
+    asr.init()
+    words = "ich habe das nicht gewusst und wir sind dann einfach gegangen".split()
+    asr.commited = _committed_words(words)
+    asr.buffer_time_offset = 100.0  # 全部已滚出缓冲
+    p = asr._prompt()
+    assert "gegangen" in p
+    assert p != config.LANGUAGE_SEED_PROMPTS["de"]
+
+
+def test_prompt_discards_english_contamination():
+    """de模式下已提交文本明显是英文 → 不喂回 prompt，换语言锚打断自我强化"""
+    asr = OnlineASRProcessor.__new__(OnlineASRProcessor)
+    asr.init()
+    words = "get back to the water i'm not going to have it and you are just out".split()
+    asr.commited = _committed_words(words)
+    asr.buffer_time_offset = 100.0
+    assert asr._prompt() == config.LANGUAGE_SEED_PROMPTS["de"]
+
+
+def test_prompt_neutral_exclamations_not_flagged():
+    """中性感叹词（游戏音常见）不触发误锁判定"""
+    asr = OnlineASRProcessor.__new__(OnlineASRProcessor)
+    asr.init()
+    words = "Whoa! Ja! Okay! Los jetzt!".split()
+    asr.commited = _committed_words(words)
+    asr.buffer_time_offset = 100.0
+    assert asr._prompt() != config.LANGUAGE_SEED_PROMPTS["de"]
+
+
 def test_glossary_substring_still_config_driven():
     # 冒烟：术语表里至少有政治词条，防误删
     assert "AfD" in config.GLOSSARY
