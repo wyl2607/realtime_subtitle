@@ -72,7 +72,8 @@ LOOKUP_CACHE_MAX = 200
 DRAFT_TRANSLATION = True
 DRAFT_MIN_INTERVAL = 1.5  # 两次草稿翻译的最小间隔（秒），防止频繁打Ollama
 DRAFT_MIN_WORDS = 3       # 残句至少这么多词才值得出草稿
-DRAFT_TEXT_COLOR = "#8fb8e0"  # 草稿中文颜色（和正式中文#c8c8c8区分）
+CHINESE_TEXT_COLOR = "#c8c8c8"  # 正式中文颜色（句对里的译文行）
+DRAFT_TEXT_COLOR = "#8fb8e0"  # 草稿中文颜色（和正式中文区分）
 
 # ============ 游戏模式（Ctrl+Alt+G 一键降配）============
 # 游戏和识别抢显卡时按热键临时降配：识别频率减半+贪心解码+关草稿中文。
@@ -96,6 +97,24 @@ SHOW_BILINGUAL = True  # 同时显示德语原文和中文翻译
 UNSTABLE_TEXT_COLOR = "#999999"  # live行里未稳定（还可能变）的德语尾部颜色
 MAX_SENTENCE_PAIRS = 20  # 悬浮窗句对（德+中）条数上限；实际显示条数按窗口高度
                          # 精确排版测算，窗口拉大自动填满（更早的在📜历史窗口里）
+
+# ============ 场景预设（设置面板一键切换）============
+# 预设只动下面这 5 个键（均有面板控件）；其它面板项保持用户当前值。
+# 不碰 WHISPER_BEAM_SIZE / OLLAMA_MODEL 等热键专属项。
+PRESETS = {
+    "直播": dict(CHUNK_SUBMIT_SECONDS=0.5, IDLE_FLUSH_SEC=2.0,
+                 MAX_SENTENCE_PAIRS=20, SHOW_BILINGUAL=True,
+                 DRAFT_TRANSLATION=True),
+    "看剧": dict(CHUNK_SUBMIT_SECONDS=0.5, IDLE_FLUSH_SEC=2.0,
+                 MAX_SENTENCE_PAIRS=6, SHOW_BILINGUAL=True,
+                 DRAFT_TRANSLATION=True),
+    "游戏": dict(CHUNK_SUBMIT_SECONDS=1.0, IDLE_FLUSH_SEC=2.5,
+                 MAX_SENTENCE_PAIRS=4, SHOW_BILINGUAL=False,
+                 DRAFT_TRANSLATION=False),
+    "精听": dict(CHUNK_SUBMIT_SECONDS=0.4, IDLE_FLUSH_SEC=1.5,
+                 MAX_SENTENCE_PAIRS=20, SHOW_BILINGUAL=True,
+                 DRAFT_TRANSLATION=True),
+}
 
 # 窗口样式
 BACKGROUND_OPACITY = 235  # 背景不透明度 0-255（255=纯黑不透；设置面板有滑块，会记住）

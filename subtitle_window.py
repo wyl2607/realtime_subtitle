@@ -14,9 +14,13 @@ import json
 import os
 from PyQt5.QtWidgets import (
     QLabel, QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSlider,
-    QPushButton, QGroupBox, QTextEdit, QLineEdit,
+    QPushButton, QGroupBox, QTextEdit, QLineEdit, QGraphicsOpacityEffect,
+    QCheckBox, QColorDialog, QFontComboBox,
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QObject
+from PyQt5.QtCore import (
+    Qt, pyqtSignal, QObject, QTimer, QPropertyAnimation, QEasingCurve,
+)
+from PyQt5.QtGui import QColor, QFont
 import config
 
 if sys.platform == "win32":
@@ -25,6 +29,116 @@ if sys.platform == "win32":
 
 # 窗口位置/大小/字号的持久化文件（重启后恢复用户调好的布局）
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "window_state.json")
+
+# 面板可调参数（存 window_state.json 的 "tuning"；FONT_SIZE/BACKGROUND_OPACITY
+# 维持顶层独立键向后兼容，不进此集合）
+TUNING_KEYS = (
+    "CHUNK_SUBMIT_SECONDS",
+    "BUFFER_TRIM_SEC",
+    "IDLE_FLUSH_SEC",
+    "ENERGY_THRESHOLD_SPEECH",
+    "MAX_SUBTITLE_LENGTH",
+    "MAX_SENTENCE_PAIRS",
+    "LOOPBACK_DEVICE_NAME",
+    "SHOW_BILINGUAL",
+    "DRAFT_TRANSLATION",
+    "CHINESE_TEXT_COLOR",
+    "DRAFT_TEXT_COLOR",
+    "UNSTABLE_TEXT_COLOR",
+    "FONT_FAMILY",
+)
+
+# 游戏模式热键临时改写，保存 tuning 时需豁免（沿用上次已存值）
+_GAME_MODE_TUNING_KEYS = ("CHUNK_SUBMIT_SECONDS", "DRAFT_TRANSLATION")
+
+
+def apply_tuning(tuning):
+    """把 state['tuning'] 写回 config；坏键/类型异常跳过。"""
+    if not isinstance(tuning, dict):
+        return
+    for key in TUNING_KEYS:
+        if key not in tuning:
+            continue
+        try:
+            val = tuning[key]
+            current = getattr(config, key)
+            if isinstance(current, bool):
+                # json 可能给 0/1；bool 是 int 子类，必须先于 int 判断
+                val = bool(val)
+            elif isinstance(current, int):
+                val = int(val)
+            elif isinstance(current, float):
+                val = float(val)
+            elif isinstance(current, str):
+                val = str(val)
+            setattr(config, key, val)
+        except (TypeError, ValueError, AttributeError):
+            continue
+
+
+def collect_tuning(*, game_mode_active=False, previous_tuning=None):
+    """从 config 组装 tuning dict；游戏模式期间豁免热键接管的键。"""
+    tuning = {key: getattr(config, key) for key in TUNING_KEYS}
+    if game_mode_active:
+        prev = previous_tuning if isinstance(previous_tuning, dict) else {}
+        for key in _GAME_MODE_TUNING_KEYS:
+            if key in prev:
+                tuning[key] = prev[key]
+            else:
+                tuning.pop(key, None)
+    return tuning
+
+
+def apply_text_color(config_key, hex_color):
+    """写颜色到 config 并返回规范化 #rrggbb（可测，不弹对话框）。"""
+    color = (hex_color or "").strip()
+    if not color:
+        raise ValueError("empty color")
+    if not color.startswith("#"):
+        color = "#" + color
+    body = color[1:]
+    if len(body) not in (3, 6) or any(c not in "0123456789abcdefABCDEF" for c in body):
+        raise ValueError(f"bad color: {hex_color!r}")
+    if len(body) == 3:
+        body = "".join(c * 2 for c in body)
+    normalized = "#" + body.lower()
+    setattr(config, config_key, normalized)
+    return normalized
+
+
+def _style_color_button(button, hex_color):
+    """颜色按钮底色显示当前色。"""
+    button.setStyleSheet(
+        f"background-color: {hex_color}; color: #000; border: 1px solid #666; "
+        f"padding: 4px 10px; min-width: 72px;"
+    )
+
+
+def snapshot_defaults():
+    """config 出厂态快照（应用 state/tuning 之前调用）。含 FONT_SIZE/不透明度。"""
+    defaults = {key: getattr(config, key) for key in TUNING_KEYS}
+    defaults["FONT_SIZE"] = config.FONT_SIZE
+    defaults["BACKGROUND_OPACITY"] = config.BACKGROUND_OPACITY
+    return defaults
+
+
+# 场景预设按钮：(config.PRESETS 键, 按钮文案)
+_PRESET_BUTTONS = (
+    ("直播", "📺 直播"),
+    ("看剧", "🎬 看剧"),
+    ("游戏", "🎮 游戏"),
+    ("精听", "🎧 精听"),
+)
+
+# 预设键 → SettingsWindow 控件属性名（滑块 dict 或 QCheckBox 等）
+# 完整性测试与 apply_preset 共用，防以后加键漏接
+PRESET_CONTROL_ATTRS = {
+    "CHUNK_SUBMIT_SECONDS": "chunk_submit_slider",
+    "IDLE_FLUSH_SEC": "idle_flush_slider",
+    "MAX_SENTENCE_PAIRS": "max_pairs_slider",
+    "SHOW_BILINGUAL": "chinese_only_cb",  # 勾选 = 只显中文 = 非双语
+    "DRAFT_TRANSLATION": "draft_cb",
+}
 
 class SubtitleSignals(QObject):
     """信号对象（用于线程安全的UI更新）"""
@@ -35,6 +149,35 @@ class SubtitleSignals(QObject):
     draft = pyqtSignal(str)  # live德语的草稿中文（正式句对完成后被替换）
     lookup = pyqtSignal(str, str)  # 点词查词结果 (word, 词典文本)
     toggle_ct = pyqtSignal()  # 切换鼠标穿透模式（热键线程→主线程）
+    game_mode = pyqtSignal(bool)  # 游戏模式开关（热键线程→主线程，同步设置面板）
+
+
+def _screen_area_at(global_pos):
+    """global_pos 所在屏的 availableGeometry；screenAt 失败时退回主屏。"""
+    screen = QApplication.screenAt(global_pos)
+    if screen is None:
+        screen = QApplication.primaryScreen()
+    return screen.availableGeometry() if screen else None
+
+
+def _clamp_geo_to_area(x, y, w, h, area):
+    """把窗口几何钳进给定 QRect（availableGeometry）。"""
+    w = min(max(1, w), area.width())
+    h = min(max(1, h), area.height())
+    x = max(area.left(), min(x, area.right() - w + 1))
+    y = max(area.top(), min(y, area.bottom() - h + 1))
+    return x, y, w, h
+
+
+def _clamp_geo_to_any_screen(x, y, w, h):
+    """按窗口中心/左上角找屏，钳进该屏；无屏则原样返回。"""
+    from PyQt5.QtCore import QPoint
+    screen = (QApplication.screenAt(QPoint(x + w // 2, y + h // 2))
+              or QApplication.screenAt(QPoint(x, y))
+              or QApplication.primaryScreen())
+    if screen is None:
+        return x, y, w, h
+    return _clamp_geo_to_area(x, y, w, h, screen.availableGeometry())
 
 
 class DraggableWidget(QWidget):
@@ -211,27 +354,48 @@ class ResizableFramelessWidget(DraggableWidget):
 class SettingsWindow(DraggableWidget):
     """参数调节窗口"""
 
-    def __init__(self, on_font_change=None):
+    def __init__(self, on_font_change=None, defaults=None):
         super().__init__()
-        self._on_font_change = on_font_change  # 字号变了要让字幕/历史窗口重刷样式
+        self._on_font_change = on_font_change  # 显示相关改动 → 字幕/历史重刷样式+重渲染
         self.setWindowTitle("⚙️ 参数调节（可拖动）")
         self.setWindowFlags(Qt.WindowStaysOnTopHint)
-        self.setGeometry(100, 100, 500, 720)
+        # 场景预设 + checkbox/颜色/字体后内容变高；高度放宽，小屏仍可拖看全
+        self.setGeometry(100, 100, 520, 1060)
 
-        # 记录启动时的config默认值（用于"恢复默认值"）
-        self._defaults = {
-            'CHUNK_SUBMIT_SECONDS': config.CHUNK_SUBMIT_SECONDS,
-            'BUFFER_TRIM_SEC': config.BUFFER_TRIM_SEC,
-            'IDLE_FLUSH_SEC': config.IDLE_FLUSH_SEC,
-            'ENERGY_THRESHOLD_SPEECH': config.ENERGY_THRESHOLD_SPEECH,
-            'MAX_SUBTITLE_LENGTH': config.MAX_SUBTITLE_LENGTH,
-            'MAX_SENTENCE_PAIRS': config.MAX_SENTENCE_PAIRS,
-            'FONT_SIZE': config.FONT_SIZE,
-            'BACKGROUND_OPACITY': config.BACKGROUND_OPACITY,
-            'LOOPBACK_DEVICE_NAME': getattr(config, 'LOOPBACK_DEVICE_NAME', '') or '',
-        }
+        # 真默认快照：由 SubtitleWindow 在应用 tuning 之前拍下并传入；
+        # 单测直接 new 时回退到当前 config（等同出厂若未改过）。
+        if defaults is not None:
+            self._defaults = dict(defaults)
+        else:
+            self._defaults = snapshot_defaults()
+
+        # 场景预设状态（None=自定义）；游戏模式热键互斥见 set_game_mode
+        self._active_preset = None
+        self._applying_preset = False
+        self._game_mode_active = False
+        self._preset_buttons = {}  # name -> QPushButton
 
         layout = QVBoxLayout()
+
+        # 场景预设（面板最顶部）
+        preset_group = QGroupBox("场景预设")
+        preset_layout = QHBoxLayout()
+        for name, label in _PRESET_BUTTONS:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setToolTip(f"一键应用「{name}」场景参数（仅覆盖节奏/句对/双语/草稿）")
+            btn.setStyleSheet(
+                "QPushButton { padding: 6px 10px; }"
+                "QPushButton:checked {"
+                "  background-color: #3a6ea5; color: white; font-weight: bold;"
+                "  border: 1px solid #5a8ec5;"
+                "}"
+            )
+            btn.clicked.connect(lambda checked=False, n=name: self._on_preset_clicked(n))
+            self._preset_buttons[name] = btn
+            preset_layout.addWidget(btn)
+        preset_group.setLayout(preset_layout)
+        layout.addWidget(preset_group)
 
         # 流式识别设置
         duration_group = QGroupBox("流式识别设置")
@@ -315,69 +479,262 @@ class SettingsWindow(DraggableWidget):
             "背景不透明度", 100, 255, config.BACKGROUND_OPACITY, 5, set_bg_opacity
         )
 
+        # 只显中文：勾上 = 隐藏德语原文（SHOW_BILINGUAL=False）
+        self.chinese_only_cb = QCheckBox("只显中文（隐藏德语原文）")
+        self.chinese_only_cb.setToolTip("勾选后同窗口可多显示约一倍句对")
+        self.chinese_only_cb.setChecked(not getattr(config, "SHOW_BILINGUAL", True))
+        self.chinese_only_cb.toggled.connect(self._on_chinese_only_toggled)
+
+        # 草稿中文：游戏模式会禁用此开关
+        self.draft_cb = QCheckBox("草稿中文（残句先出浅蓝译文）")
+        self.draft_cb.setToolTip("翻译 worker 空闲时出草稿；游戏模式会强制关闭")
+        self.draft_cb.setChecked(bool(getattr(config, "DRAFT_TRANSLATION", True)))
+        self.draft_cb.toggled.connect(self._on_draft_toggled)
+
+        # 三个颜色按钮：正式中文 / 草稿中文 / 未稳定德语
+        self.color_btn_chinese = self._make_color_button(
+            "正式中文", "CHINESE_TEXT_COLOR",
+            getattr(config, "CHINESE_TEXT_COLOR", "#c8c8c8"),
+        )
+        self.color_btn_draft = self._make_color_button(
+            "草稿中文", "DRAFT_TEXT_COLOR",
+            getattr(config, "DRAFT_TEXT_COLOR", "#8fb8e0"),
+        )
+        self.color_btn_unstable = self._make_color_button(
+            "未稳定德语", "UNSTABLE_TEXT_COLOR",
+            getattr(config, "UNSTABLE_TEXT_COLOR", "#999999"),
+        )
+        color_row = QWidget()
+        color_layout = QHBoxLayout()
+        color_layout.setContentsMargins(0, 0, 0, 0)
+        color_layout.addWidget(QLabel("颜色:"))
+        color_layout.addWidget(self.color_btn_chinese)
+        color_layout.addWidget(self.color_btn_draft)
+        color_layout.addWidget(self.color_btn_unstable)
+        color_layout.addStretch()
+        color_row.setLayout(color_layout)
+
+        # 字体族：config 存 "Family, Arial"，写回时保留 Arial 兜底
+        font_row = QWidget()
+        font_layout = QHBoxLayout()
+        font_layout.setContentsMargins(0, 0, 0, 0)
+        font_label = QLabel("字体:")
+        font_label.setMinimumWidth(120)
+        self.font_combo = QFontComboBox()
+        self.font_combo.setMaxVisibleItems(20)
+        primary = (config.FONT_FAMILY or "Microsoft YaHei").split(",")[0].strip()
+        self.font_combo.setCurrentFont(QFont(primary))
+        self.font_combo.currentFontChanged.connect(self._on_font_family_changed)
+        font_layout.addWidget(font_label)
+        font_layout.addWidget(self.font_combo)
+        font_row.setLayout(font_layout)
+
         display_layout.addWidget(self.max_length_slider['widget'])
         display_layout.addWidget(self.max_pairs_slider['widget'])
         display_layout.addWidget(self.font_size_slider['widget'])
         display_layout.addWidget(self.bg_opacity_slider['widget'])
+        display_layout.addWidget(self.chinese_only_cb)
+        display_layout.addWidget(self.draft_cb)
+        display_layout.addWidget(color_row)
+        display_layout.addWidget(font_row)
         display_group.setLayout(display_layout)
-        
+
         # 添加到主布局
         layout.addWidget(duration_group)
         layout.addWidget(energy_group)
         layout.addWidget(display_group)
-        
+
         # 重置按钮
         reset_btn = QPushButton("🔄 恢复默认值")
         reset_btn.clicked.connect(self._reset_defaults)
         layout.addWidget(reset_btn)
-        
+
         layout.addStretch()
         self.setLayout(layout)
-        
+
     def _create_slider(self, label, min_val, max_val, current_val, step, callback):
         """创建滑块控件"""
         widget = QWidget()
         layout = QHBoxLayout()
-        
+
         # 标签
         label_widget = QLabel(f"{label}:")
         label_widget.setMinimumWidth(120)
-        
+
         # 滑块（用round避免浮点截断，如0.01/0.001=9.999...被int截成9）
         slider = QSlider(Qt.Horizontal)
         slider.setMinimum(round(min_val / step))
         slider.setMaximum(round(max_val / step))
         slider.setValue(round(current_val / step))
-        
+
         # 数值显示
         value_label = QLabel(f"{current_val:.3f}")
         value_label.setMinimumWidth(60)
-        
-        # 滑块变化时更新
+
+        # 滑块变化时更新；手动改动会清掉预设高亮（apply_preset 期间跳过）
         def on_change(int_value):
             value = int_value * step
             value_label.setText(f"{value:.3f}")
+            self._mark_custom()
             callback(value)
             print(f"📊 {label}: {value:.3f}")
-        
+
         slider.valueChanged.connect(on_change)
-        
+
         layout.addWidget(label_widget)
         layout.addWidget(slider)
         layout.addWidget(value_label)
         widget.setLayout(layout)
-        
+
         return {'widget': widget, 'slider': slider, 'label': value_label, 'step': step}
+
+    def _make_color_button(self, label, config_key, hex_color):
+        """颜色选择按钮：底色=当前色，点击弹 QColorDialog。"""
+        btn = QPushButton(label)
+        btn.setToolTip(f"点击选择{label}颜色")
+        _style_color_button(btn, hex_color)
+        btn.clicked.connect(lambda: self._pick_color(config_key, btn))
+        return btn
+
+    def _pick_color(self, config_key, button):
+        """弹颜色对话框；有效则写 config + 刷按钮 + 重渲染。"""
+        current = QColor(getattr(config, config_key, "#ffffff"))
+        chosen = QColorDialog.getColor(current, self, "选择颜色")
+        if not chosen.isValid():
+            return
+        self.apply_color(config_key, chosen.name(), button)
+
+    def apply_color(self, config_key, hex_color, button=None):
+        """应用颜色（可测入口，不弹对话框）。button 可选，用于刷新底色。"""
+        self._mark_custom()
+        normalized = apply_text_color(config_key, hex_color)
+        if button is not None:
+            _style_color_button(button, normalized)
+        else:
+            # 按 config_key 找对应按钮
+            mapping = {
+                "CHINESE_TEXT_COLOR": getattr(self, "color_btn_chinese", None),
+                "DRAFT_TEXT_COLOR": getattr(self, "color_btn_draft", None),
+                "UNSTABLE_TEXT_COLOR": getattr(self, "color_btn_unstable", None),
+            }
+            btn = mapping.get(config_key)
+            if btn is not None:
+                _style_color_button(btn, normalized)
+        if self._on_font_change:
+            self._on_font_change()
+        print(f"📊 {config_key}: {normalized}")
+        return normalized
+
+    def _on_chinese_only_toggled(self, checked):
+        """勾上=只显中文 → SHOW_BILINGUAL=False。"""
+        self._mark_custom()
+        config.SHOW_BILINGUAL = not bool(checked)
+        print(f"📊 只显中文: {'开' if checked else '关'} (SHOW_BILINGUAL={config.SHOW_BILINGUAL})")
+        if self._on_font_change:
+            self._on_font_change()
+
+    def _on_draft_toggled(self, checked):
+        self._mark_custom()
+        config.DRAFT_TRANSLATION = bool(checked)
+        print(f"📊 草稿中文: {'开' if checked else '关'}")
+
+    def _on_font_family_changed(self, font):
+        family = font.family().strip() if font is not None else ""
+        if not family:
+            return
+        self._mark_custom()
+        config.FONT_FAMILY = f"{family}, Arial"
+        print(f"📊 字体: {config.FONT_FAMILY}")
+        if self._on_font_change:
+            self._on_font_change()
 
     def _on_device_name_changed(self):
         """设备名子串写入 config；捕获线程约 5 秒内重开流"""
+        self._mark_custom()
         name = self.device_name_edit.text().strip()
         config.LOOPBACK_DEVICE_NAME = name
         print(f"📊 捕获设备名包含: {name or '（系统默认）'}")
 
+    # ------------------------------------------------------------------
+    # 场景预设
+    # ------------------------------------------------------------------
+    def _mark_custom(self):
+        """用户手动改控件 → 清预设高亮。apply_preset 期间跳过。"""
+        if getattr(self, "_applying_preset", False):
+            return
+        if self._active_preset is not None:
+            self._active_preset = None
+            self._sync_preset_button_highlight()
+
+    def _sync_preset_button_highlight(self):
+        """按 _active_preset 刷新按钮 checked 态（高亮）。"""
+        for name, btn in self._preset_buttons.items():
+            btn.blockSignals(True)
+            btn.setChecked(name == self._active_preset)
+            btn.blockSignals(False)
+
+    def restore_active_preset(self, name):
+        """启动时只恢复高亮，不重新 apply（tuning 已含具体值）。"""
+        presets = getattr(config, "PRESETS", {}) or {}
+        if name and name in presets:
+            self._active_preset = name
+        else:
+            self._active_preset = None
+        self._sync_preset_button_highlight()
+
+    def _on_preset_clicked(self, name):
+        """按钮 clicked 会先 toggle checked；无论成功失败都重同步高亮。"""
+        self.apply_preset(name)
+        self._sync_preset_button_highlight()
+
+    def apply_preset(self, name):
+        """经控件 setValue/setChecked 应用预设，走既有回调写 config。
+
+        游戏模式开启时不应用（热键线程状态，面板不反向关闭）。
+        成功返回 True，互斥/未知名返回 False。
+        """
+        if getattr(self, "_game_mode_active", False):
+            msg = "先按 Ctrl+Alt+G 关闭游戏模式再切预设"
+            print(f"⚠️ {msg}")
+            return False
+        presets = getattr(config, "PRESETS", {}) or {}
+        if name not in presets:
+            print(f"⚠️ 未知预设: {name}")
+            return False
+        params = presets[name]
+        self._applying_preset = True
+        try:
+            for key, val in params.items():
+                self._apply_preset_key(key, val)
+            self._active_preset = name
+            self._sync_preset_button_highlight()
+            print(f"🎬 场景预设: {name}")
+        finally:
+            self._applying_preset = False
+        return True
+
+    def _apply_preset_key(self, key, val):
+        """单键经对应控件写入（不 setattr 绕过 UI）。"""
+        if key == "CHUNK_SUBMIT_SECONDS":
+            info = self.chunk_submit_slider
+            info["slider"].setValue(round(float(val) / info["step"]))
+        elif key == "IDLE_FLUSH_SEC":
+            info = self.idle_flush_slider
+            info["slider"].setValue(round(float(val) / info["step"]))
+        elif key == "MAX_SENTENCE_PAIRS":
+            info = self.max_pairs_slider
+            info["slider"].setValue(round(float(val) / info["step"]))
+        elif key == "SHOW_BILINGUAL":
+            # 勾「只显中文」= 非双语
+            self.chinese_only_cb.setChecked(not bool(val))
+        elif key == "DRAFT_TRANSLATION":
+            self.draft_cb.setChecked(bool(val))
+        else:
+            print(f"⚠️ 预设键无面板控件，已跳过: {key}")
+
     def _reset_defaults(self):
-        """恢复默认值（恢复到config.py里的启动默认值）"""
-        # 通过滑块setValue触发valueChanged回调，自动同步config和数值标签
+        """恢复到传入的 defaults 快照（config.py + config_local 出厂态）。"""
+        # 通过滑块 setValue 触发 valueChanged，自动同步 config 和数值标签
         pairs = [
             (self.chunk_submit_slider, 'CHUNK_SUBMIT_SECONDS'),
             (self.buffer_trim_slider, 'BUFFER_TRIM_SEC'),
@@ -389,12 +746,101 @@ class SettingsWindow(DraggableWidget):
             (self.bg_opacity_slider, 'BACKGROUND_OPACITY'),
         ]
         for slider_info, key in pairs:
+            if key not in self._defaults:
+                continue
             slider_info['slider'].setValue(round(self._defaults[key] / slider_info['step']))
 
-        self.device_name_edit.setText(self._defaults.get('LOOPBACK_DEVICE_NAME', ''))
+        self.device_name_edit.setText(self._defaults.get('LOOPBACK_DEVICE_NAME', '') or '')
         self._on_device_name_changed()
 
+        # checkbox / 颜色 / 字体
+        show_bi = self._defaults.get('SHOW_BILINGUAL', True)
+        self.chinese_only_cb.setChecked(not bool(show_bi))
+
+        draft = self._defaults.get('DRAFT_TRANSLATION', True)
+        self.draft_cb.setChecked(bool(draft))
+
+        for key, btn in (
+            ("CHINESE_TEXT_COLOR", self.color_btn_chinese),
+            ("DRAFT_TEXT_COLOR", self.color_btn_draft),
+            ("UNSTABLE_TEXT_COLOR", self.color_btn_unstable),
+        ):
+            if key in self._defaults:
+                self.apply_color(key, self._defaults[key], btn)
+
+        if 'FONT_FAMILY' in self._defaults:
+            primary = (self._defaults['FONT_FAMILY'] or "Microsoft YaHei").split(",")[0].strip()
+            self.font_combo.blockSignals(True)
+            self.font_combo.setCurrentFont(QFont(primary))
+            self.font_combo.blockSignals(False)
+            config.FONT_FAMILY = self._defaults['FONT_FAMILY']
+            if self._on_font_change:
+                self._on_font_change()
+
         print("🔄 参数已恢复默认值")
+
+    def refresh_from_config(self):
+        """按当前 config 重刷所有控件（不触发写回回调）。
+
+        游戏模式热键改 config 后面板必须跟上；blockSignals 防止 setValue
+        再把值写回 config 或刷屏打印。valueChanged 被挡时数值标签手动同步。
+        """
+        pairs = [
+            (self.chunk_submit_slider, config.CHUNK_SUBMIT_SECONDS),
+            (self.buffer_trim_slider, config.BUFFER_TRIM_SEC),
+            (self.idle_flush_slider, config.IDLE_FLUSH_SEC),
+            (self.speech_threshold_slider, config.ENERGY_THRESHOLD_SPEECH),
+            (self.max_length_slider, config.MAX_SUBTITLE_LENGTH),
+            (self.max_pairs_slider, config.MAX_SENTENCE_PAIRS),
+            (self.font_size_slider, config.FONT_SIZE),
+            (self.bg_opacity_slider, config.BACKGROUND_OPACITY),
+        ]
+        for info, val in pairs:
+            slider = info['slider']
+            step = info['step']
+            slider.blockSignals(True)
+            slider.setValue(round(val / step))
+            info['label'].setText(f"{val:.3f}")
+            slider.blockSignals(False)
+
+        self.device_name_edit.blockSignals(True)
+        self.device_name_edit.setText(getattr(config, 'LOOPBACK_DEVICE_NAME', '') or '')
+        self.device_name_edit.blockSignals(False)
+
+        self.chinese_only_cb.blockSignals(True)
+        self.chinese_only_cb.setChecked(not bool(getattr(config, "SHOW_BILINGUAL", True)))
+        self.chinese_only_cb.blockSignals(False)
+
+        self.draft_cb.blockSignals(True)
+        self.draft_cb.setChecked(bool(getattr(config, "DRAFT_TRANSLATION", True)))
+        self.draft_cb.blockSignals(False)
+
+        for key, btn in (
+            ("CHINESE_TEXT_COLOR", self.color_btn_chinese),
+            ("DRAFT_TEXT_COLOR", self.color_btn_draft),
+            ("UNSTABLE_TEXT_COLOR", self.color_btn_unstable),
+        ):
+            _style_color_button(btn, getattr(config, key, "#ffffff"))
+
+        primary = (getattr(config, "FONT_FAMILY", "Microsoft YaHei") or "Microsoft YaHei").split(",")[0].strip()
+        self.font_combo.blockSignals(True)
+        self.font_combo.setCurrentFont(QFont(primary))
+        self.font_combo.blockSignals(False)
+
+    def set_game_mode(self, active: bool):
+        """游戏模式接管提交节奏 + 草稿中文：禁用控件，避免和热键互相踩。"""
+        self._game_mode_active = bool(active)
+        slider = self.chunk_submit_slider['slider']
+        if active:
+            slider.setEnabled(False)
+            slider.setToolTip("游戏模式接管中(Ctrl+Alt+G)")
+            self.draft_cb.setEnabled(False)
+            self.draft_cb.setToolTip("游戏模式接管中(Ctrl+Alt+G)")
+        else:
+            slider.setEnabled(True)
+            slider.setToolTip("")
+            self.draft_cb.setEnabled(True)
+            self.draft_cb.setToolTip("翻译 worker 空闲时出草稿；游戏模式会强制关闭")
 
 class HistoryWindow(QWidget):
     """本场字幕历史（可滚动回看，精听时往上翻错过的句子）
@@ -481,8 +927,14 @@ class WordPopup(QWidget):
     def show_at(self, global_pos, html_text, timeout_ms=15000):
         self.label.setText(html_text)
         self.adjustSize()
-        # 往上偏移显示，避免挡住刚点的词；不出屏
-        screen = QApplication.primaryScreen().availableGeometry()
+        # 往上偏移显示，避免挡住刚点的词；钳在点击位置所在屏（副屏点词不能飞到主屏）
+        screen = _screen_area_at(global_pos)
+        if screen is None:
+            self.move(global_pos.x() - 40, global_pos.y() - self.height() - 12)
+            self.show()
+            self.raise_()
+            self._hide_timer.start(timeout_ms)
+            return
         x = min(max(screen.left(), global_pos.x() - 40), screen.right() - self.width())
         y = global_pos.y() - self.height() - 12
         if y < screen.top():
@@ -501,17 +953,29 @@ class SubtitleWindow:
     
     def __init__(self):
         """初始化字幕窗口"""
-        # 创建QApplication实例
-        self.app = QApplication(sys.argv)
+        # 复用已有 QApplication（测试会先建并持模块级引用，防 GC 触发 qFatal）
+        self.app = QApplication.instance() or QApplication(sys.argv)
         self.app.setQuitOnLastWindowClosed(False)
 
-        # 恢复上次的窗口布局（字号/不透明度要在建字幕标签之前生效）
+        # 恢复上次的窗口布局（字号/不透明度/tuning 要在建字幕标签之前生效）
         self._state = self._load_state()
+        # 真默认快照必须在应用 state/tuning 之前拍下，否则"恢复默认值"会记成已持久化的值
+        self._defaults_snapshot = snapshot_defaults()
         if "font_size" in self._state:
-            config.FONT_SIZE = int(self._state["font_size"])
+            try:
+                config.FONT_SIZE = int(self._state["font_size"])
+            except (TypeError, ValueError):
+                pass
         if "bg_opacity" in self._state:
-            config.BACKGROUND_OPACITY = int(self._state["bg_opacity"])
-        
+            try:
+                config.BACKGROUND_OPACITY = int(self._state["bg_opacity"])
+            except (TypeError, ValueError):
+                pass
+        apply_tuning(self._state.get("tuning") or {})
+        # 基线：启动应用后的 tuning（游戏模式豁免用；之后每次成功保存会刷新）
+        self._state["tuning"] = collect_tuning()
+        self._game_mode_active = False
+
         # 创建信号对象
         self.signals = SubtitleSignals()
         
@@ -523,7 +987,10 @@ class SubtitleWindow:
         self.live_committed = ""  # live行：已提交未翻译的德语
         self.live_unstable = ""   # live行：未稳定尾部（灰色）
         self.live_draft = ""      # live行的草稿中文（等正式翻译时先显示）
-        self.status_line = ""     # 状态提示（暂停/切语言），下次内容更新时清掉
+        self.status_line = ""     # 状态提示（暂停/切语言），内容更新或 5s 超时后清掉
+        # _render 测高用的文档缓存（font/size/width 不变则复用；点词路径不用）
+        self._doc_cache = None
+        self._doc_cache_key = None  # (font_family, font_size, text_width)
 
         # 创建主容器窗口（可拖动 + 边缘拖拽缩放）
         self.container = ResizableFramelessWidget()
@@ -655,6 +1122,26 @@ class SubtitleWindow:
         self.btn_bar.setLayout(bar_layout)
         self.btn_bar.adjustSize()
 
+        # chrome 淡入淡出：效果/动画对象只建一次，hover 反复复用（禁每次 new）
+        self._chrome_want_visible = False
+        self._drag_opacity = QGraphicsOpacityEffect(self.drag_bar)
+        self.drag_bar.setGraphicsEffect(self._drag_opacity)
+        self._btn_opacity = QGraphicsOpacityEffect(self.btn_bar)
+        self.btn_bar.setGraphicsEffect(self._btn_opacity)
+        self._drag_opacity.setOpacity(0.0)
+        self._btn_opacity.setOpacity(0.0)
+        self._drag_fade = QPropertyAnimation(self._drag_opacity, b"opacity", self.container)
+        self._btn_fade = QPropertyAnimation(self._btn_opacity, b"opacity", self.container)
+        for anim in (self._drag_fade, self._btn_fade):
+            anim.setEasingCurve(QEasingCurve.OutCubic)
+        # 只连一条 finished：两动画时长相同，idempotent 隐藏即可
+        self._btn_fade.finished.connect(self._on_chrome_fade_finished)
+
+        # status 提示 5 秒后自动清空（单发定时器，新 status 重置）
+        self._status_clear_timer = QTimer(self.container)
+        self._status_clear_timer.setSingleShot(True)
+        self._status_clear_timer.timeout.connect(self._clear_status)
+
         # 窗口大小变化：重摆工具条 + 重新计算能放下几条句对
         self.container.on_resize = self._on_container_resize
         # 鼠标移入显示工具条，移出隐藏
@@ -662,20 +1149,18 @@ class SubtitleWindow:
         # Ctrl+滚轮直接调字号（不用开设置面板）
         self.container.on_wheel = self._on_wheel
         # 窗口几何：优先用上次退出时保存的（用户拖过/缩放过就记住），没有才用config默认。
-        # 用availableGeometry（去掉任务栏）并把窗口完整钳回屏幕内——
-        # 之前底边可以停在屏幕外，唯一的缩放手柄跟着出屏，窗口就再也调不了了
+        # 按中心点落屏钳制（多屏副屏恢复不被主屏尺寸错误约束；拔显示器也能钳回）
         state = self._state
-        screen = self.app.primaryScreen().availableGeometry()
-        w = min(state.get("w", config.WINDOW_WIDTH), screen.width())
-        h = min(state.get("h", config.WINDOW_HEIGHT + 40), screen.height())
-        x = max(screen.left(), min(state.get("x", config.WINDOW_X), screen.right() - w))
-        y = max(screen.top(), min(state.get("y", config.WINDOW_Y), screen.bottom() - h))
+        w = state.get("w", config.WINDOW_WIDTH)
+        h = state.get("h", config.WINDOW_HEIGHT + 40)
+        x = state.get("x", config.WINDOW_X)
+        y = state.get("y", config.WINDOW_Y)
+        x, y, w, h = _clamp_geo_to_any_screen(x, y, w, h)
         self.container.setGeometry(x, y, w, h)
         # 布局持久化：停止.bat 现已优先优雅退出（aboutToQuit 会写盘）；
         # 仍用定时器兜底强杀/崩溃场景——布局变了才写盘（15秒一次）
         self._last_saved_state = None
-        from PyQt5.QtCore import QTimer
-        self._state_timer = QTimer()
+        self._state_timer = QTimer(self.container)
         self._state_timer.timeout.connect(self._save_state_if_changed)
         self._state_timer.start(15000)
         self.app.aboutToQuit.connect(self._save_state_if_changed)
@@ -687,11 +1172,24 @@ class SubtitleWindow:
         self._set_controls_visible(True)
         QTimer.singleShot(4000, lambda: self._set_controls_visible(self.container.underMouse()))
         
-        # 创建设置窗口（初始隐藏）；字号滑块变化时重刷字幕/历史窗口样式
-        self.settings_window = SettingsWindow(on_font_change=self._apply_styles)
+        # 创建设置窗口（初始隐藏）；显示相关改动时重刷样式并重渲染字幕
+        self.settings_window = SettingsWindow(
+            on_font_change=self._on_display_settings_change,
+            defaults=self._defaults_snapshot,
+        )
+        # 恢复预设高亮（不重新 apply；具体值已在 tuning 里）
+        self.settings_window.restore_active_preset(self._state.get("active_preset"))
 
         # 创建历史窗口（初始隐藏）
         self.history_window = HistoryWindow()
+
+        # ⚙️/📜 几何：有持久化就恢复（钳进当前某屏）；否则首次显示时贴字幕窗所在屏
+        self._settings_ever_shown = False
+        self._history_ever_shown = False
+        self._settings_positioned = self._restore_aux_geo(
+            self.settings_window, self._state.get("settings_geo"))
+        self._history_positioned = self._restore_aux_geo(
+            self.history_window, self._state.get("history_geo"))
 
         # 点词查词：单击字幕里的德语词 → 弹小窗显示词典解释
         self.word_popup = WordPopup()
@@ -707,6 +1205,7 @@ class SubtitleWindow:
         self.signals.draft.connect(self._update_draft)
         self.signals.lookup.connect(self._show_lookup)
         self.signals.toggle_ct.connect(self._toggle_click_through)
+        self.signals.game_mode.connect(self._on_game_mode)
         
         print("✅ 字幕窗口已创建")
         print(f"   位置: ({x}, {y})  大小: {w}x{h}")
@@ -743,14 +1242,44 @@ class SubtitleWindow:
         self._position_chrome()
 
     def _set_controls_visible(self, visible):
+        """drag_bar / btn_bar 淡入淡出。ct_indicator 不走这里（穿透可靠性优先）。
+
+        HTCAPTION 门控读 drag_bar.isVisible()：淡出过程中 bar 仍 visible 可拖；
+        动画结束后才 setVisible(False) 关门控。淡入前先 setVisible(True)。
+        """
         # 穿透时窗口收不到鼠标，hover 失效；chrome 强制隐藏，只留穿透指示器
         if getattr(self, "_click_through", False):
             visible = False
-        self.drag_bar.setVisible(visible)
-        self.btn_bar.setVisible(visible)
+        self._chrome_want_visible = bool(visible)
         if visible:
+            # 淡入前先露出（opacity 可能仍是上次的中间值，从当前值继续）
+            self.drag_bar.setVisible(True)
+            self.btn_bar.setVisible(True)
             self.drag_bar.raise_()
             self.btn_bar.raise_()
+            self._animate_chrome(1.0, 150)
+        else:
+            self._animate_chrome(0.0, 250)
+
+    def _animate_chrome(self, target_opacity, duration_ms):
+        """停掉旧动画，从当前 opacity 播到目标（对象复用，不 new）。"""
+        pairs = (
+            (self._drag_fade, self._drag_opacity),
+            (self._btn_fade, self._btn_opacity),
+        )
+        for anim, effect in pairs:
+            anim.stop()
+            anim.setStartValue(effect.opacity())
+            anim.setEndValue(target_opacity)
+            anim.setDuration(duration_ms)
+            anim.start()
+
+    def _on_chrome_fade_finished(self):
+        """淡出结束才真正隐藏，避免透明控件仍 isVisible 吃掉 HTCAPTION 门控。"""
+        if self._chrome_want_visible:
+            return
+        self.drag_bar.setVisible(False)
+        self.btn_bar.setVisible(False)
 
     def _on_container_resize(self):
         self.window.setGeometry(self.container.rect())  # 标签手动铺满（无布局）
@@ -774,6 +1303,11 @@ class SubtitleWindow:
     # ------------------------------------------------------------------
     # 样式与布局持久化
     # ------------------------------------------------------------------
+    def _on_display_settings_change(self):
+        """设置面板显示相关改动：刷样式 + 重渲染（颜色/双语/字体都落到 HTML）。"""
+        self._apply_styles()
+        self._render()
+
     def _apply_styles(self):
         """按当前config刷新字幕标签/历史窗口的样式（字号滑块实时调用）"""
         self.window.setStyleSheet(f"""
@@ -807,17 +1341,82 @@ class SubtitleWindow:
         except (OSError, ValueError):
             return {}
 
+    @staticmethod
+    def _restore_aux_geo(win, geo):
+        """从 [x,y,w,h] 恢复辅助窗口几何；成功返回 True（已定位）。"""
+        if not geo or len(geo) != 4:
+            return False
+        try:
+            x, y, w, h = (int(geo[0]), int(geo[1]), int(geo[2]), int(geo[3]))
+        except (TypeError, ValueError):
+            return False
+        if w < 50 or h < 50:
+            return False
+        x, y, w, h = _clamp_geo_to_any_screen(x, y, w, h)
+        win.setGeometry(x, y, w, h)
+        return True
+
+    def _place_window_near_container(self, win):
+        """首次打开⚙️/📜：贴字幕容器所在屏，优先在其上方，整窗钳进 availableGeometry。"""
+        cg = self.container.frameGeometry()
+        area = _screen_area_at(cg.center())
+        if area is None:
+            return
+        ww = max(win.width(), 200)
+        wh = max(win.height(), 160)
+        # 优先容器正上方
+        x = cg.x()
+        y = cg.y() - wh - 12
+        if y < area.top():
+            # 上方不够 → 右侧；右侧也不够 → 左侧；再不行左上角
+            y = max(area.top(), cg.y())
+            x = cg.right() + 12
+            if x + ww > area.right():
+                x = cg.x() - ww - 12
+            if x < area.left():
+                x = area.left() + 16
+                y = area.top() + 16
+        x, y, ww, wh = _clamp_geo_to_area(x, y, ww, wh, area)
+        win.setGeometry(x, y, ww, wh)
+
     def _save_state_if_changed(self):
         g = self.container.geometry()
         state = {"x": g.x(), "y": g.y(), "w": g.width(), "h": g.height(),
                  "font_size": config.FONT_SIZE,
                  "bg_opacity": config.BACKGROUND_OPACITY}
+        # 辅助窗：本会话显示过则写当前几何；否则保留上次文件里的值（从未显示过不写新值）
+        if self._settings_ever_shown:
+            sg = self.settings_window.geometry()
+            state["settings_geo"] = [sg.x(), sg.y(), sg.width(), sg.height()]
+        elif self._state.get("settings_geo"):
+            state["settings_geo"] = self._state["settings_geo"]
+        if self._history_ever_shown:
+            hg = self.history_window.geometry()
+            state["history_geo"] = [hg.x(), hg.y(), hg.width(), hg.height()]
+        elif self._state.get("history_geo"):
+            state["history_geo"] = self._state["history_geo"]
+        # 面板参数：游戏模式期间 CHUNK_SUBMIT_SECONDS / DRAFT_TRANSLATION 是临时值，豁免
+        state["tuning"] = collect_tuning(
+            game_mode_active=bool(getattr(self, "_game_mode_active", False)),
+            previous_tuning=(self._state.get("tuning") or {}),
+        )
+        # 场景预设高亮名（None → JSON null）；仅显示态，重启不重新 apply
+        active = getattr(self.settings_window, "_active_preset", None)
+        state["active_preset"] = active if active else None
         if state == self._last_saved_state:
             return
         try:
             with open(STATE_FILE, "w", encoding="utf-8") as f:
                 json.dump(state, f)
             self._last_saved_state = state
+            # 同步内存中的上次值，便于后续「未再显示」时继续保留
+            if "settings_geo" in state:
+                self._state["settings_geo"] = state["settings_geo"]
+            if "history_geo" in state:
+                self._state["history_geo"] = state["history_geo"]
+            if "tuning" in state:
+                self._state["tuning"] = state["tuning"]
+            self._state["active_preset"] = state.get("active_preset")
         except OSError:
             pass  # 存不上就下次用默认布局，不值得报错
 
@@ -856,6 +1455,7 @@ class SubtitleWindow:
         if not committed:
             self.live_draft = ""  # live德语没了，草稿跟着失效
         self.status_line = ""
+        self._status_clear_timer.stop()
         self._render()
 
     def _update_draft(self, chinese):
@@ -868,6 +1468,7 @@ class SubtitleWindow:
             self.sentence_pairs.pop(0)
         self.live_draft = ""  # 正式翻译到了，草稿退场
         self.status_line = ""
+        self._status_clear_timer.stop()
         self.history_window.append_pair(german, chinese)
         self._render()
         if config.SHOW_PERFORMANCE:
@@ -879,9 +1480,32 @@ class SubtitleWindow:
             self._add_pair("", text)
 
     def _show_status(self, text):
-        """状态提示：追加在当前内容底部"""
+        """状态提示：追加在当前内容底部；5 秒后自动清空（新 status 重置计时）。"""
         self.status_line = text
         self._render()
+        self._status_clear_timer.start(5000)
+
+    def _clear_status(self):
+        """status 超时回调：置空并重绘（避免安静段提示挂几分钟）。
+
+        _render 在「无句对/无 live」时会 early-return 保底不闪空白；
+        若上次屏上只有 status，这里主动摘掉，避免 status_line 空了字还挂着。
+        """
+        if not self.status_line:
+            return
+        cleared = self.status_line
+        self.status_line = ""
+        self._render()
+        esc = html.escape(cleared)
+        if not esc or not self._last_html or esc not in self._last_html:
+            return  # _render 已用新内容覆盖
+        parts = [p for p in self._last_html.split("<br>") if p != esc]
+        if parts:
+            self._last_html = "<br>".join(parts)
+            self.window.setText(self._last_html)
+        else:
+            self._last_html = ""
+            self.window.setText("🎬 等待音频输入...")
 
     @staticmethod
     def _clip(text):
@@ -895,7 +1519,8 @@ class SubtitleWindow:
         if german and getattr(config, "SHOW_BILINGUAL", True):
             lines.append(html.escape(self._clip(german)))
         if chinese:
-            lines.append(f'<span style="color:#c8c8c8">{html.escape(self._clip(chinese))}</span>')
+            color = getattr(config, "CHINESE_TEXT_COLOR", "#c8c8c8")
+            lines.append(f'<span style="color:{color}">{html.escape(self._clip(chinese))}</span>')
         return "<br>".join(lines)
 
     def _live_block_html(self):
@@ -915,7 +1540,12 @@ class SubtitleWindow:
         return live_block
 
     def _build_doc(self, html_str=""):
-        """按 QLabel 相同的字体/宽度建一个 QTextDocument（测高/点击命中测试共用）"""
+        """按 QLabel 相同的字体/宽度新建 QTextDocument。
+
+        点词命中测试必须用独立文档（勿共享 _doc_cache：命中中途 _render
+        可能 setHtml 改掉内容）。排版参数（margin 0 / width-46 / pixelSize）
+        与瀑布填充、点词坐标强绑定，勿改。
+        """
         from PyQt5.QtGui import QTextDocument, QFont
         doc = QTextDocument()
         doc.setDocumentMargin(0)
@@ -925,6 +1555,25 @@ class SubtitleWindow:
         doc.setTextWidth(max(100, self.window.width() - 46))
         if html_str:
             doc.setHtml(html_str)
+        return doc
+
+    def _doc_for_render(self):
+        """_render 测高用：font/size/width 未变则复用同一 QTextDocument。"""
+        from PyQt5.QtGui import QTextDocument, QFont
+        family = config.FONT_FAMILY.split(",")[0].strip()
+        size = config.FONT_SIZE
+        text_width = max(100, self.window.width() - 46)
+        key = (family, size, text_width)
+        if self._doc_cache is not None and self._doc_cache_key == key:
+            return self._doc_cache
+        doc = QTextDocument()
+        doc.setDocumentMargin(0)
+        font = QFont(family)
+        font.setPixelSize(size)
+        doc.setDefaultFont(font)
+        doc.setTextWidth(text_width)
+        self._doc_cache = doc
+        self._doc_cache_key = key
         return doc
 
     def _render(self):
@@ -938,8 +1587,8 @@ class SubtitleWindow:
         status = html.escape(self.status_line) if self.status_line else ""
         fixed = [b for b in (live_block, status) if b]
 
-        # 和 QLabel 一致的排版环境（padding 15px 20px + 2px边框）
-        doc = self._build_doc()
+        # 和 QLabel 一致的排版环境（padding 15px 20px + 2px边框）；缓存复用
+        doc = self._doc_for_render()
         avail_h = self.window.height() - 40
 
         pair_blocks = [b for b in (self._pair_html(g, c) for g, c in self.sentence_pairs) if b]
@@ -1032,6 +1681,16 @@ class SubtitleWindow:
         """切换鼠标穿透（线程安全，热键线程调用）"""
         self.signals.toggle_ct.emit()
 
+    def notify_game_mode(self, active):
+        """游戏模式开关通知（线程安全，热键线程调用）→ 主线程同步设置面板"""
+        self.signals.game_mode.emit(bool(active))
+
+    def _on_game_mode(self, active):
+        """主线程槽：刷新滑块显示 + 禁用/恢复被游戏模式接管的控件"""
+        self._game_mode_active = bool(active)
+        self.settings_window.refresh_from_config()
+        self.settings_window.set_game_mode(bool(active))
+
     def _toggle_click_through(self):
         """穿透开：字幕窗对鼠标完全隐形（点击/滚轮全落到下面的视频/游戏上），
         适合全屏看剧不挡操作。用原生 WS_EX_TRANSPARENT——窗口本来就是
@@ -1079,6 +1738,10 @@ class SubtitleWindow:
         if self.settings_window.isVisible():
             self.settings_window.hide()
         else:
+            if not self._settings_positioned:
+                self._place_window_near_container(self.settings_window)
+                self._settings_positioned = True
+            self._settings_ever_shown = True
             self.settings_window.show()
 
     def _toggle_history(self):
@@ -1086,6 +1749,10 @@ class SubtitleWindow:
         if self.history_window.isVisible():
             self.history_window.hide()
         else:
+            if not self._history_positioned:
+                self._place_window_near_container(self.history_window)
+                self._history_positioned = True
+            self._history_ever_shown = True
             self.history_window.show()
             sb = self.history_window.text.verticalScrollBar()
             sb.setValue(sb.maximum())

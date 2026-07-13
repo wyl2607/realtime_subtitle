@@ -193,6 +193,7 @@ class SubtitleApp:
             self.subtitle_window.show_status("🎮 游戏模式已关闭，恢复正常配置")
             print(f"🎮 [热键] 游戏模式关闭: 恢复节奏{config.CHUNK_SUBMIT_SECONDS}s "
                   f"beam{config.WHISPER_BEAM_SIZE} 模型{config.OLLAMA_MODEL}")
+        self.subtitle_window.notify_game_mode(self._game_mode_saved is not None)
 
     def _setup_hotkey(self):
         """全局快捷键：Windows 原生 RegisterHotKey。

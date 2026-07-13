@@ -25,6 +25,9 @@ class _FakeWindow:
     def show_status(self, *_):
         pass
 
+    def notify_game_mode(self, *_):
+        pass  # 真窗会 emit 信号刷设置面板；单测不建 Qt
+
 
 class _FakeTranslator:
     def __init__(self):
