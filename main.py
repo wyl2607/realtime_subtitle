@@ -173,8 +173,9 @@ class SubtitleApp:
             if config.GAME_MODE_DISABLE_DRAFT:
                 config.DRAFT_TRANSLATION = False
             if game_model and game_model != config.OLLAMA_MODEL:
+                old_model = config.OLLAMA_MODEL
                 config.OLLAMA_MODEL = game_model
-                self.translator.request_warm_model()
+                self.translator.request_warm_model(old_model=old_model)
             self.subtitle_window.show_status(
                 "🎮 游戏模式已开启：GPU降配，字幕稍慢（Ctrl+Alt+G 恢复）")
             print(f"🎮 [热键] 游戏模式开启: 节奏{config.CHUNK_SUBMIT_SECONDS}s "
@@ -185,8 +186,9 @@ class SubtitleApp:
             config.WHISPER_BEAM_SIZE = saved['WHISPER_BEAM_SIZE']
             config.DRAFT_TRANSLATION = saved['DRAFT_TRANSLATION']
             if saved['OLLAMA_MODEL'] != config.OLLAMA_MODEL:
+                old_model = config.OLLAMA_MODEL
                 config.OLLAMA_MODEL = saved['OLLAMA_MODEL']
-                self.translator.request_warm_model()
+                self.translator.request_warm_model(old_model=old_model)
             self._game_mode_saved = None
             self.subtitle_window.show_status("🎮 游戏模式已关闭，恢复正常配置")
             print(f"🎮 [热键] 游戏模式关闭: 恢复节奏{config.CHUNK_SUBMIT_SECONDS}s "
