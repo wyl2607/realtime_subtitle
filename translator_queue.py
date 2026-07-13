@@ -537,6 +537,9 @@ class WhisperQueueTranslator:
                     "prompt": prompt,
                     "stream": False,
                     "think": False,
+                    # 不设的话 Ollama 默认5分钟无请求就卸载模型，
+                    # 安静段/暂停后第一句要付~9秒冷加载
+                    "keep_alive": "2h",
                     "options": {"temperature": 0.2, "num_predict": 220, "num_ctx": 2048},
                 },
                 timeout=15,
@@ -604,6 +607,7 @@ class WhisperQueueTranslator:
                     "prompt": prompt,
                     "stream": True,  # 流式：中文逐段上屏，不等整句
                     "think": False,
+                    "keep_alive": "2h",  # 默认5分钟卸载，安静段后第一句付~9秒冷加载
                     "options": {
                         "temperature": 0.3,
                         "top_p": 0.9,
@@ -717,6 +721,31 @@ class WhisperQueueTranslator:
             self._asr_executor.submit(self.clear_context)
         except RuntimeError:
             pass
+
+    def request_warm_model(self):
+        """游戏模式切翻译模型后调用：在翻译线程里预热新模型。
+
+        排进 _tx_executor 串行执行——加载期间到达的句子在它后面排队，
+        等价于它们自己付加载费，但预热通常抢在第一句之前完成。"""
+        try:
+            self._tx_executor.submit(self._warm_model_worker)
+        except RuntimeError:
+            pass  # 程序正在退出
+
+    def _warm_model_worker(self):
+        model = config.OLLAMA_MODEL
+        try:
+            t0 = time.time()
+            # prompt留空：Ollama只加载模型不生成，是官方的预热用法
+            self.ollama_session.post(
+                f"{config.OLLAMA_BASE_URL}/api/generate",
+                json={"model": model, "prompt": "", "keep_alive": "2h"},
+                timeout=60,  # 冷加载可能要十几秒
+            ).close()
+            print(f"🔥 翻译模型 {model} 预热完成 {time.time() - t0:.1f}秒")
+        except Exception as e:
+            if not self.closing:
+                print(f"   ⚠️  模型预热失败（首句翻译会稍慢）: {e}")
 
     def _process_inbox(self):
         """识别线程主循环：把收件箱里攒下的块一次性处理完，空了才睡"""

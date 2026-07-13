@@ -153,34 +153,44 @@ class SubtitleApp:
         print(f"🌐 [热键] 请求切换源语言: {name}")
 
     def _toggle_game_mode(self):
-        """游戏模式一键降配：识别频率减半+贪心解码+关草稿中文。
+        """游戏模式一键降配：识别频率减半+贪心解码+关草稿中文+切轻量翻译模型。
 
-        三个旋钮都是采集/识别/翻译循环里每轮现读 config 的，改属性即热生效
-        （提交节奏下一块生效，beam下一次识别生效）。开启时保存当前值，
-        关闭时原样恢复——用户在⚙️面板改过的值不会被覆盖成出厂默认。"""
+        四个旋钮都是采集/识别/翻译循环里每轮现读 config 的，改属性即热生效
+        （提交节奏下一块生效，beam下一次识别生效，模型下一次请求生效）。
+        开启时保存当前值，关闭时原样恢复——用户在⚙️面板改过的值不会被
+        覆盖成出厂默认。切模型后预热排进翻译线程，第一句不付冷加载费。"""
         saved = getattr(self, '_game_mode_saved', None)
+        game_model = getattr(config, 'GAME_MODE_OLLAMA_MODEL', None)
         if saved is None:
             self._game_mode_saved = {
                 'CHUNK_SUBMIT_SECONDS': config.CHUNK_SUBMIT_SECONDS,
                 'WHISPER_BEAM_SIZE': config.WHISPER_BEAM_SIZE,
                 'DRAFT_TRANSLATION': getattr(config, 'DRAFT_TRANSLATION', True),
+                'OLLAMA_MODEL': config.OLLAMA_MODEL,
             }
             config.CHUNK_SUBMIT_SECONDS = config.GAME_MODE_SUBMIT_SECONDS
             config.WHISPER_BEAM_SIZE = config.GAME_MODE_BEAM_SIZE
             if config.GAME_MODE_DISABLE_DRAFT:
                 config.DRAFT_TRANSLATION = False
+            if game_model and game_model != config.OLLAMA_MODEL:
+                config.OLLAMA_MODEL = game_model
+                self.translator.request_warm_model()
             self.subtitle_window.show_status(
                 "🎮 游戏模式已开启：GPU降配，字幕稍慢（Ctrl+Alt+G 恢复）")
             print(f"🎮 [热键] 游戏模式开启: 节奏{config.CHUNK_SUBMIT_SECONDS}s "
-                  f"beam{config.WHISPER_BEAM_SIZE} 草稿{'关' if not config.DRAFT_TRANSLATION else '开'}")
+                  f"beam{config.WHISPER_BEAM_SIZE} 草稿{'关' if not config.DRAFT_TRANSLATION else '开'} "
+                  f"模型{config.OLLAMA_MODEL}")
         else:
             config.CHUNK_SUBMIT_SECONDS = saved['CHUNK_SUBMIT_SECONDS']
             config.WHISPER_BEAM_SIZE = saved['WHISPER_BEAM_SIZE']
             config.DRAFT_TRANSLATION = saved['DRAFT_TRANSLATION']
+            if saved['OLLAMA_MODEL'] != config.OLLAMA_MODEL:
+                config.OLLAMA_MODEL = saved['OLLAMA_MODEL']
+                self.translator.request_warm_model()
             self._game_mode_saved = None
             self.subtitle_window.show_status("🎮 游戏模式已关闭，恢复正常配置")
             print(f"🎮 [热键] 游戏模式关闭: 恢复节奏{config.CHUNK_SUBMIT_SECONDS}s "
-                  f"beam{config.WHISPER_BEAM_SIZE}")
+                  f"beam{config.WHISPER_BEAM_SIZE} 模型{config.OLLAMA_MODEL}")
 
     def _setup_hotkey(self):
         """全局快捷键：Windows 原生 RegisterHotKey。
