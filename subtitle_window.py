@@ -106,15 +106,21 @@ class DraggableWidget(QWidget):
 
 
 class ResizableFramelessWidget(DraggableWidget):
-    """无边框窗口 + Windows 原生边缘缩放。
+    """无边框窗口 + Windows 原生边缘缩放 + 顶部标题条原生拖动。
 
     之前唯一的缩放入口是右下角一个透明的 QSizeGrip（看不见，而且窗口
     底边拖出屏幕后就彻底够不着了）。这里用 WM_NCHITTEST 命中测试把
     窗口四边/四角各 RESIZE_MARGIN 物理像素交给系统处理：鼠标移到边缘
     自动变双向箭头，拖拽即缩放，和普通窗口手感一致。
+
+    顶部 DRAG_BAR_HEIGHT 区域（右侧按钮区除外）返回 HTCAPTION，由
+    Windows 原生处理拖动——不依赖 Qt 子控件事件冒泡，和资源管理器
+    标题栏一样稳。字幕正文区仍走 Qt 拖动（可与点词查词共存）。
     """
 
     RESIZE_MARGIN = 10  # 物理像素（不受DPI缩放影响：坐标和窗口矩形都是物理值）
+    DRAG_BAR_HEIGHT = 30  # 顶部原生拖动条高度（物理像素，与 GetWindowRect 一致）
+    BTN_RESERVE = 160     # 右上角按钮区不抢 HTCAPTION，留给按钮点击
 
     def __init__(self):
         super().__init__()
@@ -127,6 +133,8 @@ class ResizableFramelessWidget(DraggableWidget):
         self._underlay = QWidget(self)
         self._underlay.setObjectName("hitUnderlay")
         self._underlay.setAttribute(Qt.WA_StyledBackground, True)
+        # 底衬只负责"可命中"，不抢走拖动/点击：事件交给顶层容器处理
+        self._underlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self._underlay.setStyleSheet("#hitUnderlay { background: rgba(0, 0, 0, 2); }")
         self._underlay.lower()
 
@@ -145,11 +153,41 @@ class ResizableFramelessWidget(DraggableWidget):
         (False, False, True, False): 10,  # HTLEFT
         (False, False, False, True): 11,  # HTRIGHT
     }
+    _HTCAPTION = 2  # 系统标题栏：原生拖动
+
+    def _drag_bar_is_visible(self):
+        """HTCAPTION 门控：仅 drag_bar 可见时顶部才当标题条。
+        drag_bar 挂在 SubtitleWindow.container 上；Settings/History 等
+        同继承链窗口没有此属性，getattr 防御。"""
+        bar = getattr(self, "drag_bar", None)
+        if bar is None:
+            return False
+        try:
+            return bar.isVisible()
+        except RuntimeError:
+            return False
+
+    def _in_title_bar_region(self, x, y, rect):
+        """物理像素坐标是否落在标题拖动条（非边缘缩放带、非右上按钮保留区）。"""
+        m = self.RESIZE_MARGIN
+        return (rect.top + m <= y < rect.top + self.DRAG_BAR_HEIGHT
+                and rect.left + m <= x < rect.right - self.BTN_RESERVE)
 
     def nativeEvent(self, eventType, message):
         if sys.platform != "win32" or eventType not in (b"windows_generic_MSG", b"windows_dispatcher_MSG"):
             return False, 0
         msg = wintypes.MSG.from_address(int(message))
+
+        # 无边框窗 HTCAPTION 区双击会触发最大化/还原——覆盖层绝不能被最大化
+        if msg.message == 0x00A3:  # WM_NCLBUTTONDBLCLK
+            x = ctypes.c_short(msg.lParam & 0xFFFF).value
+            y = ctypes.c_short((msg.lParam >> 16) & 0xFFFF).value
+            rect = wintypes.RECT()
+            ctypes.windll.user32.GetWindowRect(int(self.winId()), ctypes.byref(rect))
+            if self._in_title_bar_region(x, y, rect):
+                return True, 0
+            return False, 0
+
         if msg.message != 0x0084:  # WM_NCHITTEST
             return False, 0
         # lParam 低/高16位是带符号的屏幕物理坐标（多屏/负坐标要按short解）
@@ -163,6 +201,10 @@ class ResizableFramelessWidget(DraggableWidget):
         hit = self._HIT_CODES.get(edges, 0)
         if hit:
             return True, hit
+        # 顶部拖动条仅在 drag_bar 可见时返回 HTCAPTION，否则走 HTCLIENT
+        # （隐藏时不能留一条看不见的吸拖区挡住点词查词）
+        if self._drag_bar_is_visible() and self._in_title_bar_region(x, y, rect):
+            return True, self._HTCAPTION
         return False, 0
 
 
@@ -559,7 +601,47 @@ class SubtitleWindow:
         self.window.setWordWrap(True)
         self.window.setTextFormat(Qt.RichText)  # live行灰色尾部/双层显示需要富文本
         self.window.setText("🎬 等待音频输入...")
-        self.container.setMinimumSize(360, 120)
+        # 字幕标签铺满后会挡住容器的 mouse*Event → 拖动失灵。
+        # 设为鼠标穿透后：拖动/点词/滚轮都由容器统一收；点词仍用容器坐标映射回标签
+        self.window.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.container.setMinimumSize(360, 140)
+
+        # 顶部拖动条：视觉上像系统标题栏；真正拖动由 WM_NCHITTEST→HTCAPTION 完成
+        # （条本身也穿透鼠标，避免再挡一层事件）
+        # 属性同时挂到 container，供 nativeEvent 读 isVisible（HTCAPTION 门控）
+        self.drag_bar = QLabel("⠿  实时字幕  ·  拖这里移动", self.container)
+        self.container.drag_bar = self.drag_bar
+        self.drag_bar.setFixedHeight(ResizableFramelessWidget.DRAG_BAR_HEIGHT)
+        self.drag_bar.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.drag_bar.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.drag_bar.setStyleSheet("""
+            QLabel {
+                background-color: rgba(28, 28, 28, 210);
+                color: rgba(220, 220, 220, 200);
+                font-size: 12px;
+                font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+                padding-left: 12px;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+            }
+        """)
+
+        # 鼠标穿透常驻指示器：穿透时 hover 全失效，必须无条件常显（不走 _set_controls_visible）
+        self.ct_indicator = QLabel("👻 Ctrl+Alt+M 恢复", self.container)
+        self.ct_indicator.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.ct_indicator.setStyleSheet("""
+            QLabel {
+                background-color: rgba(20, 20, 20, 210);
+                color: rgba(235, 235, 235, 230);
+                font-size: 11px;
+                font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+                padding: 3px 8px;
+                border-radius: 4px;
+                border: 1px solid rgba(255, 255, 255, 0.15);
+            }
+        """)
+        self.ct_indicator.hide()
 
         # 按钮改成悬浮工具条：平时隐藏（看剧零遮挡），鼠标移入窗口才出现。
         # 不进布局（绝对定位在右上角），显示/隐藏不会引起文字重排
@@ -598,10 +680,11 @@ class SubtitleWindow:
         self._state_timer.start(15000)
         self.app.aboutToQuit.connect(self._save_state_if_changed)
         self.container.show()
-        # 工具条先亮4秒让人知道在哪，之后只在鼠标移入时出现
-        self._position_btn_bar()
-        self.btn_bar.show()
-        self.btn_bar.raise_()
+        # 鼠标穿透模式状态（Ctrl+Alt+M切换；须在 chrome 显隐之前初始化）
+        self._click_through = False
+        # 拖动条与按钮工具条同步：先亮4秒让人知道在哪，之后只在鼠标移入时出现
+        self._position_chrome()
+        self._set_controls_visible(True)
         QTimer.singleShot(4000, lambda: self._set_controls_visible(self.container.underMouse()))
         
         # 创建设置窗口（初始隐藏）；字号滑块变化时重刷字幕/历史窗口样式
@@ -616,9 +699,6 @@ class SubtitleWindow:
         self.on_lookup = None  # (word, context) -> None，由main.py接到translator
         self._last_html = ""   # 最近一次渲染的富文本（点击命中测试要按它重建排版）
 
-        # 鼠标穿透模式状态（Ctrl+Alt+M切换）
-        self._click_through = False
-
         # 连接信号到槽（线程安全）
         self.signals.update.connect(self._update_text)
         self.signals.status.connect(self._show_status)
@@ -630,29 +710,51 @@ class SubtitleWindow:
         
         print("✅ 字幕窗口已创建")
         print(f"   位置: ({x}, {y})  大小: {w}x{h}")
-        print("   💡 鼠标拖动窗口可移动位置")
+        print("   💡 鼠标移入窗口时顶部出现拖动条（和普通窗口一样拖）；字幕区按住拖也可移动")
         print("   💡 鼠标移到窗口边缘/四角可拖拽缩放（窗口越大显示的历史越多）")
-        print("   💡 按钮工具条平时隐藏，鼠标移入窗口右上角出现")
+        print("   💡 拖动条/按钮工具条平时隐藏，鼠标移入才出现（看剧零遮挡）")
+        print("   💡 若完全点不到窗口：按 Ctrl+Alt+M 关闭「鼠标穿透」（右上角会有幽灵提示）")
         print("   💡 点击 ➖ 按钮可最小化字幕")
         print("   💡 点击 ⚙️ 按钮可打开参数调节面板")
         print("   💡 点击 ❌ 按钮可退出程序")
     
     # ------------------------------------------------------------------
-    # 悬浮工具条
+    # 悬浮工具条 / 标题拖动条 / 穿透指示器
     # ------------------------------------------------------------------
-    def _position_btn_bar(self):
-        """工具条贴右上角（不进布局，避免显示/隐藏引起文字重排）"""
+    def _position_chrome(self):
+        """绝对定位标题条 + 右上角按钮 + 穿透指示器（不进布局）。"""
+        w = self.container.width()
+        h = ResizableFramelessWidget.DRAG_BAR_HEIGHT
+        self.drag_bar.setGeometry(0, 0, w, h)
         self.btn_bar.adjustSize()
-        self.btn_bar.move(self.container.width() - self.btn_bar.width() - 10, 8)
+        self.btn_bar.move(w - self.btn_bar.width() - 10, max(0, (h - self.btn_bar.height()) // 2))
+        self.ct_indicator.adjustSize()
+        # 右上角常驻；穿透时 chrome 已藏，不会和 drag_bar/btn_bar 重叠
+        self.ct_indicator.move(w - self.ct_indicator.width() - 8, 6)
+        if self.drag_bar.isVisible():
+            self.drag_bar.raise_()
+        if self.btn_bar.isVisible():
+            self.btn_bar.raise_()
+        if self.ct_indicator.isVisible():
+            self.ct_indicator.raise_()
+
+    def _position_btn_bar(self):
+        """兼容旧调用点：与 _position_chrome 等价"""
+        self._position_chrome()
 
     def _set_controls_visible(self, visible):
+        # 穿透时窗口收不到鼠标，hover 失效；chrome 强制隐藏，只留穿透指示器
+        if getattr(self, "_click_through", False):
+            visible = False
+        self.drag_bar.setVisible(visible)
         self.btn_bar.setVisible(visible)
         if visible:
+            self.drag_bar.raise_()
             self.btn_bar.raise_()
 
     def _on_container_resize(self):
         self.window.setGeometry(self.container.rect())  # 标签手动铺满（无布局）
-        self._position_btn_bar()
+        self._position_chrome()
         self._render()
 
     def _on_wheel(self, event):
@@ -943,10 +1045,17 @@ class SubtitleWindow:
         self._click_through = not self._click_through
         if self._click_through:
             ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT)
+            # 穿透后 hover 全失效：藏掉 chrome，只留右上角常驻指示器
+            self._set_controls_visible(False)
+            self.ct_indicator.show()
+            self._position_chrome()
             self.show_status("👻 鼠标穿透已开启：字幕窗点不到了（Ctrl+Alt+M 恢复）")
             print("👻 [热键] 鼠标穿透开启")
         else:
             ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex & ~WS_EX_TRANSPARENT)
+            self.ct_indicator.hide()
+            # 恢复后按当前 hover 状态决定是否显示 chrome
+            self._set_controls_visible(self.container.underMouse())
             self.show_status("🖱️ 鼠标穿透已关闭，字幕窗恢复可点击")
             print("🖱️ [热键] 鼠标穿透关闭")
         # 改扩展样式后通知系统重算：部分Windows/合成路径下不发
