@@ -92,16 +92,16 @@ Write-Host "  ✅ 依赖安装完成"
 # ---------- 4. 按硬件生成本机配置 ----------
 # config_local.py 会覆盖 config.py 的同名配置（config.py 末尾 import 它）
 $localCfg = "$PSScriptRoot\config_local.py"
-$txModel = "qwen3:8b"
+$txModel = "qwen3.5:9b"
 if (-not $hasGpu) {
-    $txModel = "qwen3:1.7b"
+    $txModel = "qwen3.5:2b"
     @"
 # 本机降级配置（install.ps1 自动生成：没有检测到 NVIDIA 显卡）
 # 如果之后加了显卡，删掉这个文件即可恢复 GPU 高配
 WHISPER_DEVICE = "cpu"
 WHISPER_COMPUTE_TYPE = "int8"
 WHISPER_MODEL = "small"        # CPU 跑不动 large-v3-turbo
-OLLAMA_MODEL = "qwen3:1.7b"    # CPU 跑 8b 太慢，用小模型保流畅
+OLLAMA_MODEL = "qwen3.5:2b"    # CPU 跑 9b 太慢，用小模型保流畅
 CHUNK_SUBMIT_SECONDS = 1.0     # 放慢识别节奏，给 CPU 留时间
 "@ | Out-File -FilePath $localCfg -Encoding utf8
     Write-Host "  ✅ 已生成 CPU 降级配置 config_local.py"
