@@ -59,6 +59,22 @@ if (-not $stopped) {
     Write-Host "没有找到正在运行的实时字幕程序"
 }
 
+# 卸载 Ollama 里常驻的翻译模型：光停 python 不会通知 Ollama，
+# 模型会按 keep_alive（默认可长达数小时）继续占着显存/内存，
+# llama-server.exe 表现就是“关了字幕但内存没释放”。
+# 只卸载模型，不杀 ollama serve 本身，下次启动还是秒开。
+$ollamaDir = "$env:LOCALAPPDATA\Programs\Ollama"
+if (Test-Path $ollamaDir) { $env:Path = "$ollamaDir;$env:Path" }
+$ollamaExe = (Get-Command ollama -ErrorAction SilentlyContinue).Source
+if (-not $ollamaExe -and (Test-Path "$ollamaDir\ollama.exe")) { $ollamaExe = "$ollamaDir\ollama.exe" }
+if ($ollamaExe) {
+    $models = & "$PSScriptRoot\venv\Scripts\python.exe" -c "import config; print(config.OLLAMA_MODEL); print(config.GAME_MODE_OLLAMA_MODEL)" 2>$null
+    foreach ($m in ($models -split "`n" | Where-Object { $_.Trim() } | Select-Object -Unique)) {
+        & $ollamaExe stop $m.Trim() 2>$null | Out-Null
+    }
+    Write-Host "已卸载 Ollama 常驻模型"
+}
+
 # 清掉暂停/停止标记，避免下次启动误判
 Remove-Item $stopFlag -ErrorAction SilentlyContinue
 Remove-Item "$PSScriptRoot\.paused" -ErrorAction SilentlyContinue
