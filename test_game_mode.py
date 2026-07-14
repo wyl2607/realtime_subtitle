@@ -33,10 +33,12 @@ class _FakeTranslator:
     def __init__(self):
         self.warm_calls = 0
         self.unloaded = []  # 每次预热要求卸载的旧模型名
+        self.warmed = []  # 每次预热要求加载的新模型名（显式传入，不现读config）
 
-    def request_warm_model(self, old_model=None):
+    def request_warm_model(self, old_model=None, new_model=None):
         self.warm_calls += 1
         self.unloaded.append(old_model)
+        self.warmed.append(new_model)
 
 
 def _make_app():
@@ -67,11 +69,16 @@ def test_game_mode_switches_and_restores_all_four_knobs():
         assert config.OLLAMA_MODEL == config.GAME_MODE_OLLAMA_MODEL
         assert app.translator.warm_calls == 1  # 切模型后预热
         assert app.translator.unloaded == [snap[3]]  # 必须要求卸载旧模型（否则keep_alive=2h赖满显存）
+        # new_model 必须显式传入调用当下的目标值，不能让worker执行时现读
+        # config.OLLAMA_MODEL——热键连按时那个全局可能已经被后续toggle改掉
+        # （压测复现过：连按6次后ollama ps里9b/4b同时常驻）
+        assert app.translator.warmed == [config.GAME_MODE_OLLAMA_MODEL]
 
         app._toggle_game_mode()  # 关
         assert _snapshot() == snap  # 四个值原样恢复
         assert app.translator.warm_calls == 2  # 切回也预热
         assert app.translator.unloaded[1] == config.GAME_MODE_OLLAMA_MODEL  # 切回时卸掉4b
+        assert app.translator.warmed[1] == snap[3]  # 切回时目标是原模型
     finally:
         _restore(snap)
 

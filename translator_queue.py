@@ -722,21 +722,28 @@ class WhisperQueueTranslator:
         except RuntimeError:
             pass
 
-    def request_warm_model(self, old_model=None):
+    def request_warm_model(self, old_model=None, new_model=None):
         """游戏模式切翻译模型后调用：在翻译线程里卸掉旧模型、预热新模型。
 
         ☠️ 必须先卸旧模型：翻译请求带 keep_alive=2h，不显式卸载旧模型会
         赖满2小时——两个模型+游戏抢显存，Ollama把放不下的搬进系统内存
         （实测RAM冲到93%、llama-server吃11GB）。
         排进 _tx_executor 串行执行——加载期间到达的句子在它后面排队，
-        等价于它们自己付加载费，但预热通常抢在第一句之前完成。"""
+        等价于它们自己付加载费，但预热通常抢在第一句之前完成。
+
+        ☠️ new_model 必须由调用方在改 config.OLLAMA_MODEL 的当下显式传入，
+        不能靠 worker 执行时现读 config.OLLAMA_MODEL——热键快速连按时，
+        提交和执行之间隔着排队延迟，config.OLLAMA_MODEL 可能已经被后续
+        toggle 改到别的值，worker 读到的就不是这次切换真正要的目标模型，
+        会导致该卸载的没卸载/该保留的被误卸载（压测复现过：连按6次后
+        ollama ps 里9b和4b同时常驻）。"""
         try:
-            self._tx_executor.submit(self._warm_model_worker, old_model)
+            self._tx_executor.submit(self._warm_model_worker, old_model, new_model)
         except RuntimeError:
             pass  # 程序正在退出
 
-    def _warm_model_worker(self, old_model=None):
-        model = config.OLLAMA_MODEL
+    def _warm_model_worker(self, old_model=None, new_model=None):
+        model = new_model if new_model is not None else config.OLLAMA_MODEL
         if old_model and old_model != model:
             try:
                 # keep_alive=0 = 立即卸载，先腾出显存再加载新模型
