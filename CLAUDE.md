@@ -119,9 +119,13 @@ install.ps1 按显存自动生成的默认档位：
 
 改代码（如果用户让你改功能）：
 
-12. 改完跑测试：`venv\Scripts\python -m pytest`（28 项）+ 仓库里 test_*.py
-    的独立脚本套件。**测试进程 import main.py 会被单实例 Mutex 直接
-    sys.exit**——参考 test_game_mode.py 顶部先打桩 CreateMutexW 的写法。
+12. 改完跑测试：`venv\Scripts\python -m pytest`（46 项）。test_hittest /
+    test_resize_freedom / test_wordclick 是**独立脚本套件**（import 即开真窗口，
+    pytest.ini 已把它们排除出收集，別删这个排除），用 `venv\Scripts\python
+    test_hittest.py` 逐个跑。test_ui_polish 的两个 fade 用例对动画计时敏感，
+    全量跑偶发挂、单独重跑即绿，别当回归追。**测试进程 import main.py 会被
+    单实例 Mutex 直接 sys.exit**——参考 test_game_mode.py 顶部先打桩
+    CreateMutexW 的写法。
 13. **Qt 测试必须持模块级 QApplication 引用**，否则被 GC 后建 QWidget 直接
     qFatal 秒退（退出码 127、无任何输出，症状像"pytest 静默死"）。参考
     test_settings_sync.py 的 `_app()` + `_APP` 写法。
