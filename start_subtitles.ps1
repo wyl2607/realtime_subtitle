@@ -28,12 +28,26 @@ if (-not (Test-Path $ollamaExe)) {
 }
 
 Write-Host "检查 Ollama 服务..."
-try {
-    Invoke-RestMethod -Uri "http://127.0.0.1:11434/api/tags" -TimeoutSec 3 | Out-Null
-} catch {
+# 轮询等就绪而不是固定睡几秒：Ollama 刚更新完/冷启动时可能十几秒才监听端口
+function Test-OllamaReady {
+    try {
+        Invoke-RestMethod -Uri "http://127.0.0.1:11434/api/tags" -TimeoutSec 3 | Out-Null
+        return $true
+    } catch { return $false }
+}
+if (-not (Test-OllamaReady)) {
     Write-Host "正在启动 Ollama..."
     Start-Process -FilePath $ollamaExe -ArgumentList "serve" -WindowStyle Hidden
-    Start-Sleep -Seconds 3
+    $deadline = (Get-Date).AddSeconds(60)
+    while (-not (Test-OllamaReady)) {
+        if ((Get-Date) -gt $deadline) {
+            Write-Host "❌ 等了 60 秒 Ollama 服务还没就绪。"
+            Write-Host "   可能它正在更新或上次更新没装好——等更新完成后再运行一次即可。"
+            Write-Host "   还不行的话，手动开个终端运行 ollama serve 看报什么错。"
+            exit 1
+        }
+        Start-Sleep -Seconds 2
+    }
 }
 
 # 翻译模型名从 config 读（config_local.py 里可能配了小模型），不要硬编码

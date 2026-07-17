@@ -90,31 +90,58 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "  ✅ 依赖安装完成"
 
 # ---------- 4. 按硬件生成本机配置 ----------
-# config_local.py 会覆盖 config.py 的同名配置（config.py 末尾 import 它）
+# config_local.py 会覆盖 config.py 的同名配置（config.py 末尾 import 它）。
+# 分档原则：Whisper + 翻译模型 + 桌面/浏览器本身的显存占用要同时放得下，
+# 宁可降翻译模型也不挤爆显存（挤爆 = Ollama 层挪 CPU，翻译显著变慢）。
+# ⚠️ 已存在的 config_local.py 一律保留（可能是人工调过的）——想按硬件重新生成就先删掉它
 $localCfg = "$PSScriptRoot\config_local.py"
-$txModel = "qwen3.5:9b"
-if (-not $hasGpu) {
-    $txModel = "qwen3.5:2b"
+if (Test-Path $localCfg) {
+    Write-Host "  ℹ️ 已有 config_local.py，保留现有本机配置（想重新按硬件生成：删掉它再重跑）"
+} elseif (-not $hasGpu) {
     @"
 # 本机降级配置（install.ps1 自动生成：没有检测到 NVIDIA 显卡）
-# 如果之后加了显卡，删掉这个文件即可恢复 GPU 高配
+# 如果之后加了显卡，删掉这个文件重跑 install.ps1 即可
 WHISPER_DEVICE = "cpu"
 WHISPER_COMPUTE_TYPE = "int8"
 WHISPER_MODEL = "small"        # CPU 跑不动 large-v3-turbo
 OLLAMA_MODEL = "qwen3.5:2b"    # CPU 跑 9b 太慢，用小模型保流畅
+GAME_MODE_OLLAMA_MODEL = None  # 主模型已是最轻档，游戏模式别再切（默认值4b反而更大）
 CHUNK_SUBMIT_SECONDS = 1.0     # 放慢识别节奏，给 CPU 留时间
 "@ | Out-File -FilePath $localCfg -Encoding utf8
     Write-Host "  ✅ 已生成 CPU 降级配置 config_local.py"
-} elseif ($gpuMemMB -gt 0 -and $gpuMemMB -lt 6000) {
+} elseif ($gpuMemMB -lt 4500) {
     @"
-# 本机降级配置（install.ps1 自动生成：显存小于 6GB）
-# Whisper 用中杯模型 + int8，给 Ollama 留显存
-WHISPER_MODEL = "medium"
+# 本机降级配置（install.ps1 自动生成：显存约 4GB）
+WHISPER_MODEL = "small"
 WHISPER_COMPUTE_TYPE = "int8"
+OLLAMA_MODEL = "qwen3.5:2b"
+GAME_MODE_OLLAMA_MODEL = None  # 主模型已是最轻档，游戏模式别再切（默认值4b反而更大）
 "@ | Out-File -FilePath $localCfg -Encoding utf8
-    Write-Host "  ✅ 显存较小，已生成 config_local.py（medium + int8）"
+    Write-Host "  ✅ 显存约4GB，已生成 config_local.py（small int8 + qwen3.5:2b）"
+} elseif ($gpuMemMB -lt 6500) {
+    @"
+# 本机降级配置（install.ps1 自动生成：显存约 6GB）
+# large-v3-turbo int8 德语准确率远好于 medium，显存差不多（~2GB）
+WHISPER_MODEL = "large-v3-turbo"
+WHISPER_COMPUTE_TYPE = "int8"   # ⚠️ RTX 50系不支持int8：ctranslate2>=4.6.2会自动退回，无需处理
+OLLAMA_MODEL = "qwen3.5:2b"     # 实测显存余量>2.5GB可手动升 "qwen3.5:4b"（翻译质量明显更好）
+GAME_MODE_OLLAMA_MODEL = None  # 主模型已是最轻档，游戏模式别再切（默认值4b反而更大）
+"@ | Out-File -FilePath $localCfg -Encoding utf8
+    Write-Host "  ✅ 显存约6GB，已生成 config_local.py（turbo int8 + qwen3.5:2b）"
+} elseif ($gpuMemMB -lt 9500) {
+    @"
+# 本机降级配置（install.ps1 自动生成：显存约 8GB，主流游戏卡档）
+# Whisper ~2.4GB + qwen3.5:4b ~3.4GB + 桌面/浏览器 ~1.5GB，留有余量。
+# 9b(5.6GB) 在 8GB 卡上会贴上限：Ollama 把放不下的层挪 CPU，翻译慢 1-2 秒。
+# 想追求翻译质量可手动改 OLLAMA_MODEL = "qwen3.5:9b" 自己实测
+WHISPER_MODEL = "large-v3-turbo"
+WHISPER_COMPUTE_TYPE = "float16"
+OLLAMA_MODEL = "qwen3.5:4b"
+GAME_MODE_OLLAMA_MODEL = None  # 主模型已是4b，游戏模式不用再切
+"@ | Out-File -FilePath $localCfg -Encoding utf8
+    Write-Host "  ✅ 显存约8GB，已生成 config_local.py（turbo float16 + qwen3.5:4b）"
 } else {
-    Write-Host "  ✅ 显卡配置充足，使用默认高配（large-v3-turbo + float16）"
+    Write-Host "  ✅ 显存充足（≥10GB），使用默认高配（large-v3-turbo float16 + qwen3.5:9b）"
 }
 
 # ---------- 5. Ollama + 翻译模型 ----------
@@ -131,20 +158,43 @@ if (-not $ollamaExe) {
     exit 1
 }
 Write-Host "  ✅ Ollama 已安装"
-try {
-    Invoke-RestMethod -Uri "http://127.0.0.1:11434/api/tags" -TimeoutSec 3 | Out-Null
-} catch {
+# 轮询等就绪而不是固定睡几秒：Ollama 刚装完/刚更新完可能十几秒才监听端口
+function Test-OllamaReady {
+    try {
+        Invoke-RestMethod -Uri "http://127.0.0.1:11434/api/tags" -TimeoutSec 3 | Out-Null
+        return $true
+    } catch { return $false }
+}
+if (-not (Test-OllamaReady)) {
     Write-Host "  正在启动 Ollama 服务..."
     Start-Process -FilePath $ollamaExe -ArgumentList "serve" -WindowStyle Hidden
-    Start-Sleep -Seconds 3
+    $deadline = (Get-Date).AddSeconds(60)
+    while (-not (Test-OllamaReady)) {
+        if ((Get-Date) -gt $deadline) {
+            Write-Host "  ❌ Ollama 服务 60 秒内没就绪（可能正在更新）。等它更新完重跑本脚本即可。"
+            exit 1
+        }
+        Start-Sleep -Seconds 2
+    }
 }
+# 模型名从「最终生效的配置」里读（config.py + 刚生成的 config_local.py），
+# 保证脚本和程序运行时用的一定是同一个模型，不会各说各话
+$txModel = (& $vpy -c "import config; print(config.OLLAMA_MODEL)").Trim()
+$gameModel = (& $vpy -c "import config; print(config.GAME_MODE_OLLAMA_MODEL or '')").Trim()
 $installed = @()
 try { $installed = (Invoke-RestMethod -Uri "http://127.0.0.1:11434/api/tags").models.name } catch { }
-if ($installed -notcontains $txModel) {
-    Write-Host "  正在下载翻译模型 $txModel（首次需要几分钟）..."
-    & $ollamaExe pull $txModel
-} else {
-    Write-Host "  ✅ 翻译模型 $txModel 已就绪"
+foreach ($m in @($txModel, $gameModel) | Where-Object { $_ } | Select-Object -Unique) {
+    if ($installed -notcontains $m) {
+        Write-Host "  正在下载翻译模型 $m（首次需要几分钟）..."
+        & $ollamaExe pull $m
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "  ❌ 拉取 $m 失败。若报模型不存在：qwen 系列命名可能已迭代，"
+            Write-Host "     到 https://ollama.com/library 查最新名字，写进 config_local.py 的 OLLAMA_MODEL 后重跑"
+            exit 1
+        }
+    } else {
+        Write-Host "  ✅ 翻译模型 $m 已就绪"
+    }
 }
 
 # ---------- 6. 桌面快捷方式 ----------
@@ -156,7 +206,8 @@ New-Item -ItemType Directory -Path $shortcutDir -Force | Out-Null
 $batTemplate = @(
     @("启动字幕.bat", "start_subtitles.ps1"),
     @("停止字幕.bat", "stop_subtitles.ps1"),
-    @("暂停继续字幕.bat", "pause_subtitles.ps1")
+    @("暂停继续字幕.bat", "pause_subtitles.ps1"),
+    @("更新字幕.bat", "update_subtitles.ps1")
 )
 foreach ($pair in $batTemplate) {
     $head = "@echo off`r`nchcp 65001 >nul`r`npowershell -NoProfile -ExecutionPolicy Bypass -File `"$PSScriptRoot\$($pair[1])`"`r`n"
@@ -165,6 +216,9 @@ foreach ($pair in $batTemplate) {
         # ⚠️ bat 必须纯 ASCII：chcp 65001 下 cmd 解析含中文的行会把下一行开头吃掉。
         # 用 ping 当 sleep：timeout.exe 在 stdin 被重定向时直接报错
         $tail = "if errorlevel 1 goto :err`r`nping -n 4 127.0.0.1 >nul`r`nexit /b 0`r`n:err`r`necho.`r`npause`r`n"
+    } elseif ($pair[0] -eq "更新字幕.bat") {
+        # 更新窗口一律保留：用户要能看到"更新了什么/是否需要重启"
+        $tail = "echo.`r`npause`r`n"
     } else {
         $tail = "ping -n 3 127.0.0.1 >nul`r`n"
     }
@@ -184,6 +238,9 @@ foreach ($pair in $batTemplate) {
 
 看完后双击"停止字幕.bat"关闭。
 字幕记录自动保存在程序目录的 transcripts\ 文件夹里。
+
+程序有新版本时（作者说修了 bug/加了功能），双击"更新字幕.bat"即可
+一键更新到最新版，个人配置(config_local.py)和字幕记录不受影响。
 "@ | Out-File -FilePath (Join-Path $shortcutDir "操作说明.txt") -Encoding utf8
 Write-Host "  ✅ 快捷方式已生成: $shortcutDir"
 
