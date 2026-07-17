@@ -274,6 +274,9 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         self._state_timer.timeout.connect(self._save_state_if_changed)
         self._state_timer.start(15000)
         self.app.aboutToQuit.connect(self._save_state_if_changed)
+        # Alt+F4 / 任务栏关闭 → 与 ❌ 相同，走 app.quit → aboutToQuit → stop()
+        # （setQuitOnLastWindowClosed=False，不接管会只关窗留僵尸进程）
+        self.container.on_system_close = self._on_system_close
         self.container.show()
         # 鼠标穿透模式状态（Ctrl+Alt+M切换；须在 chrome 显隐之前初始化）
         self._click_through = False
@@ -522,6 +525,11 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
             print("\n👋 用户点击退出按钮")
             print("   正在关闭程序...")
             self.app.quit()
+
+    def _on_system_close(self):
+        """Alt+F4 / 任务栏关闭主字幕窗：不弹确认（系统关窗手势），直接优雅退出。"""
+        print("\n👋 收到系统关窗（Alt+F4/任务栏），正在退出...")
+        self.app.quit()
     
     def run(self):
         """

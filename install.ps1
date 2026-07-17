@@ -25,6 +25,27 @@ Write-Host "   实时字幕翻译系统 - 安装程序"
 Write-Host "=========================================="
 Write-Host ""
 
+# 调用候选 Python 命令（"python" 或 "py -3.13"）。
+# ☠️ 不能用 $parts[1..($parts.Count-1)]：Count=1 时 1..0 会把自身再塞回参数，
+# 变成 `python python -c ...`，只有 python、没有 py launcher 的机器安装必挂。
+# ☠️ 参数名不要叫 Cand/Command 等能被 -c 前缀匹配的：PowerShell 会把
+# `Invoke-X -c "code"` 里的 -c 绑到 -Cand，脚本字符串被拆碎。
+function Invoke-PythonCand {
+    param(
+        [Parameter(Mandatory = $true)][string]$Spec,
+        [Parameter(Mandatory = $true)][string[]]$ArgList
+    )
+    $parts = @($Spec -split "\s+" | Where-Object { $_ })
+    if ($parts.Count -eq 0) { throw "empty python candidate" }
+    if ($parts.Count -eq 1) {
+        & $parts[0] @ArgList
+    } else {
+        $exe = $parts[0]
+        $prefix = $parts[1..($parts.Count - 1)]
+        & $exe @prefix @ArgList
+    }
+}
+
 # ---------- 1. 找 Python ----------
 Write-Host "[1/5] 检查 Python..."
 $python = $null
@@ -37,8 +58,9 @@ if (Get-Command python -ErrorAction SilentlyContinue) {
 }
 foreach ($cand in $candidates) {
     try {
-        $parts = $cand -split " "
-        $ver = & $parts[0] $parts[1..($parts.Count-1)] -c "import sys; print('%d.%d' % sys.version_info[:2])" 2>$null
+        $ver = Invoke-PythonCand -Spec $cand -ArgList @(
+            "-c", "import sys; print('%d.%d' % sys.version_info[:2])"
+        ) 2>$null
         if ($ver -match "^3\.(10|11|12|13)$") {
             $python = $cand
             Write-Host "  ✅ 找到 Python $ver ($cand)"
@@ -70,17 +92,32 @@ try {
         $gpuName = $best.Name
         $gpuMemMB = $best.Mem
         Write-Host "  ✅ $gpuName (${gpuMemMB}MB 显存)"
+        # 驱动 CUDA 运行库版本：旧版表头 "CUDA Version: 11.x"，新驱动也可能是
+        # "CUDA UMD Version: 13.x"。ctranslate2/cublas12 要求驱动侧 CUDA ≥ 12.0
+        $smiHead = (& nvidia-smi 2>$null | Select-Object -First 15) -join "`n"
+        $cudaReported = $null
+        if ($smiHead -match 'CUDA(?:\s+UMD)?\s+Version:\s*([\d.]+)') {
+            $cudaReported = [double]$Matches[1]
+        }
+        if ($null -ne $cudaReported -and $cudaReported -lt 12.0) {
+            Write-Host "  ❌ 驱动报告的 CUDA $cudaReported < 12.0，GPU 识别会在加载 cublas 时失败。"
+            Write-Host "     请先升级 NVIDIA 驱动（GeForce Experience / 官网），再重跑本脚本。"
+            Write-Host "     本次改为 CPU 模式配置，避免装完第一次启动直接崩；"
+            Write-Host "     驱动升好后：删掉 config_local.py 再跑 install.ps1 恢复 GPU 档。"
+            $hasGpu = $false
+        } elseif ($null -ne $cudaReported) {
+            Write-Host "  ✅ 驱动 CUDA $cudaReported（≥12.0，满足 cublas12）"
+        }
     }
 } catch { }
 if (-not $hasGpu) {
-    Write-Host "  ⚠️  没有检测到 NVIDIA 显卡，将使用 CPU 模式（识别速度会慢不少）"
+    Write-Host "  ⚠️  没有检测到可用的 NVIDIA GPU 路径，将使用 CPU 模式（识别速度会慢不少）"
 }
 
 # ---------- 3. venv + 依赖 ----------
 Write-Host "[3/5] 安装 Python 依赖（首次需要几分钟）..."
 if (-not (Test-Path "$PSScriptRoot\venv\Scripts\python.exe")) {
-    $parts = $python -split " "
-    & $parts[0] $parts[1..($parts.Count-1)] -m venv "$PSScriptRoot\venv"
+    Invoke-PythonCand -Spec $python -ArgList @("-m", "venv", "$PSScriptRoot\venv")
 }
 $vpy = "$PSScriptRoot\venv\Scripts\python.exe"
 $pipArgs = @("-m", "pip", "install", "--upgrade")

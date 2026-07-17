@@ -179,8 +179,11 @@ def test_translation_worker_dict_shortcircuit_and_order():
     t._stat_tx = []
     t._stat_draft = 0
     t._draft_last_text = ""
+    t.pending_text = ""
+    t._last_unstable = ""
     t.on_draft = None
-    t.on_display = None
+    displays = []
+    t.on_display = lambda c, u: displays.append((c, u))
     pairs = []
     t.on_pair = lambda g, zh: pairs.append((g, zh))
     t._save_transcript = lambda g, zh: None
@@ -204,12 +207,13 @@ def test_translation_worker_dict_shortcircuit_and_order():
     assert t._stat_dict == 2
     assert t._tx_queue == []
 
-    # 全是感叹词：零Ollama调用
-    pairs.clear(); calls.clear()
+    # 全是感叹词：零Ollama调用，且必须 emit live（否则 live 残留同一句德语）
+    pairs.clear(); calls.clear(); displays.clear()
     t._tx_queue = ["Genau.", "Super!"]
     t._translation_worker()
     assert pairs == [("Genau.", "没错"), ("Super!", "太棒了")]
     assert calls == []
+    assert len(displays) >= 1, "纯词典直译后应 _emit_display 清掉 live 残留"
 
 
 def test_collapse_word_runs_at_ingestion():
@@ -246,6 +250,71 @@ if __name__ == "__main__":
             print(f"FAIL  {fn.__name__}: {e}")
     print(f"\n{len(tests) - failed}/{len(tests)} passed")
     raise SystemExit(failed)
+
+
+def test_lang_switch_pending_preempts_before_audio_batch():
+    """语言切换标志在 inbox 每批边界抢占：即使收件箱非空也能切，不饿死。"""
+    from threading import Lock
+    from translator_queue import WhisperQueueTranslator
+
+    t = WhisperQueueTranslator.__new__(WhisperQueueTranslator)
+    t._asr_lock = Lock()
+    t._audio_inbox = [("fake_audio", 0.0)]
+    t._asr_scheduled = True
+    t._pending_lang_switch = "en"
+    t._asr_error_streak = 0
+    applied = []
+    processed = []
+
+    def apply(lang):
+        applied.append(lang)
+        # 模拟 clear 后不依赖真实 processor
+    t._apply_pending_lang_switch = apply
+    t._process_items = lambda items: processed.append(len(items))
+
+    # 第一轮：有 pending lang + 一块音频 → 先切语言再识别；inbox 空后退出
+    t._process_inbox()
+    assert applied == ["en"], applied
+    assert processed == [1], processed
+    assert t._pending_lang_switch is None
+    assert t._asr_scheduled is False
+
+    # 只有切换、无音频：也应能执行并退出
+    applied.clear()
+    t._asr_scheduled = True
+    t._pending_lang_switch = "de"
+    t._audio_inbox = []
+    t._process_inbox()
+    assert applied == ["de"]
+    assert t._asr_scheduled is False
+
+
+def test_request_switch_language_sets_flag_without_starving_submit():
+    """热键只写标志；识别已在跑则不另排队（避免排在 inbox 循环后饿死）。"""
+    from threading import Lock
+    from translator_queue import WhisperQueueTranslator
+
+    t = WhisperQueueTranslator.__new__(WhisperQueueTranslator)
+    t._asr_lock = Lock()
+    t._asr_scheduled = True
+    t._pending_lang_switch = None
+    submits = []
+
+    class FakeExec:
+        def submit(self, fn, *a, **k):
+            submits.append(fn)
+    t._asr_executor = FakeExec()
+
+    t.request_switch_language("en")
+    assert t._pending_lang_switch == "en"
+    assert submits == []  # 已 scheduled，靠边界抢占
+
+    t._asr_scheduled = False
+    t._pending_lang_switch = None
+    t.request_switch_language("de")
+    assert t._pending_lang_switch == "de"
+    assert t._asr_scheduled is True
+    assert submits == [t._process_inbox]
 
 
 def test_shutdown_unloads_only_our_loaded_models(monkeypatch):

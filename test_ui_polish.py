@@ -194,3 +194,15 @@ def test_hit_test_build_doc_is_independent():
     cached = win._doc_cache
     fresh = win._build_doc(win._last_html)
     assert fresh is not cached
+
+
+def test_container_system_close_calls_app_quit():
+    """Alt+F4 路径：container.on_system_close 必须接到 app.quit，不能只关窗。"""
+    from PyQt5.QtGui import QCloseEvent
+
+    win = _window()
+    assert win.container.on_system_close is not None
+    quits = []
+    win.app.quit = lambda: quits.append(True)  # 不真退测试进程
+    win.container.closeEvent(QCloseEvent())
+    assert quits == [True], "系统关窗应触发 app.quit 走优雅退出"

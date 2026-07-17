@@ -75,6 +75,12 @@ $models = (Invoke-RestMethod -Uri "http://127.0.0.1:11434/api/tags").models.name
 if ($models -notcontains $txModel) {
     Write-Host "正在下载 $txModel 模型（首次需要几分钟）..."
     & $ollamaExe pull $txModel
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "❌ 拉取翻译模型 $txModel 失败（网络/磁盘/模型名过期）。"
+        Write-Host "   模型名会随 qwen 迭代变化：到 https://ollama.com/library 查当前名字，"
+        Write-Host "   写进 config_local.py 的 OLLAMA_MODEL 后重试。国内网络不稳就多试一次。"
+        exit 1
+    }
 }
 
 Write-Host "启动实时字幕..."

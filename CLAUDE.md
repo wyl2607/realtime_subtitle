@@ -152,7 +152,7 @@ install.ps1 按显存自动生成的默认档位：
 
 改代码（如果用户让你改功能）：
 
-12. 改完跑测试：`venv\Scripts\python -m pytest`（48 项，以实际输出为准）。test_hittest /
+12. 改完跑测试：`venv\Scripts\python -m pytest`（50+ 项，以实际输出为准）。test_hittest /
     test_resize_freedom / test_wordclick 是**独立脚本套件**（import 即开真窗口，
     pytest.ini 已把它们排除出收集，別删这个排除），用 `venv\Scripts\python
     test_hittest.py` 逐个跑。test_ui_polish 的两个 fade 用例对动画计时敏感，

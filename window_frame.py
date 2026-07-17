@@ -97,6 +97,9 @@ class ResizableFramelessWidget(DraggableWidget):
 
     def __init__(self):
         super().__init__()
+        # 系统关窗（Alt+F4 / 任务栏关闭）回调；字幕主窗接到后应 app.quit()，
+        # 设置/历史等附属窗不设，保持默认只关自己。
+        self.on_system_close = None
         # WA_TranslucentBackground 下 alpha=0 的像素鼠标会直接穿透到下层窗口：
         # 顶部按钮行两侧、底部手柄行都是全透明的，导致上/下边缘抓不住
         # （左右边缘因为字幕标签是不透明黑色所以能抓）。
@@ -179,5 +182,22 @@ class ResizableFramelessWidget(DraggableWidget):
         if self._drag_bar_is_visible() and self._in_title_bar_region(x, y, rect):
             return True, self._HTCAPTION
         return False, 0
+
+    def closeEvent(self, event):
+        """Alt+F4 / 任务栏关闭：有 on_system_close 就走应用退出，否则只关本窗。
+
+        主字幕窗设了 setQuitOnLastWindowClosed(False)（设置/历史附属窗关了
+        不能拖垮进程），若不接管 closeEvent，Alt+F4 只会藏掉悬浮窗，进程
+        继续占 Mutex/GPU/pid——用户再启会提示已在运行。
+        """
+        cb = getattr(self, "on_system_close", None)
+        if cb is not None:
+            try:
+                cb()
+            except Exception:
+                pass
+            event.accept()
+            return
+        super().closeEvent(event)
 
 

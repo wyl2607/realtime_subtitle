@@ -22,8 +22,12 @@ function Wait-ProcessExit {
 }
 
 if (Test-Path $pidFile) {
-    $targetPid = Get-Content $pidFile
-    if (Get-Process -Id $targetPid -ErrorAction SilentlyContinue) {
+    $targetPid = (Get-Content $pidFile | Select-Object -First 1).Trim()
+    $targetProc = Get-Process -Id $targetPid -ErrorAction SilentlyContinue
+    # 与 start 对称：PID 会被系统回收复用。只对「本项目 venv 下的 python」
+    # 写 .stop / 强杀；路径对不上就当陈旧 pid，删文件后走窗口标题兜底。
+    $isOurs = $targetProc -and $targetProc.Path -like "$PSScriptRoot\venv\*"
+    if ($isOurs) {
         # 写停止标记：主程序 QTimer 看到后走 app.quit → stop() 关线程/模型
         New-Item -ItemType File -Path $stopFlag -Force | Out-Null
         Write-Host "正在请求优雅退出 (PID $targetPid，最多等 ${graceSeconds}s)..."
@@ -35,6 +39,8 @@ if (Test-Path $pidFile) {
             Write-Host "优雅退出超时，已强制停止 (PID $targetPid)"
             $stopped = $true
         }
+    } elseif ($targetProc) {
+        Write-Host "subtitle.pid 里的 PID $targetPid 不是本项目进程（可能已被系统复用），忽略并清理。"
     }
     Remove-Item $pidFile -ErrorAction SilentlyContinue
 }

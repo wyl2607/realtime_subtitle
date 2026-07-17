@@ -147,6 +147,9 @@ class WhisperQueueTranslator:
             self._asr_scheduled = False
             self._inbox_dropped = 0     # 硬顶丢块累计（正常永远是0）
             self._inbox_drop_warned = 0
+            # 待切换源语言（热键写入；ASR 每批处理前抢占执行，避免 inbox
+            # 循环不返回时 submit(task) 永远排在后面饿死）
+            self._pending_lang_switch = None
             self._asr_executor = ThreadPoolExecutor(max_workers=1)
 
             # 翻译队列：ASR线程往里放完整句子，翻译worker每次醒来把积压的全部
@@ -261,18 +264,21 @@ class WhisperQueueTranslator:
         self._emit_display()
 
     def request_switch_language(self, new_lang):
-        """切换源语言：清上下文和改SOURCE_LANGUAGE作为【一个任务】在ASR线程
-        串行执行。之前是热键线程先改语言、清理任务排在后面——中间窗口期
-        会拿新语言参数去识别缓冲里的旧语言音频，蹦出乱词。"""
-        def task():
-            self.clear_context()
-            config.SOURCE_LANGUAGE = new_lang
-            name = config.LANGUAGE_NAMES.get(new_lang, new_lang)
-            print(f"🌐 源语言已切换为: {name}")
-            if self.on_status:
-                self.on_status(f"🌐 源语言已切换: {name}")
+        """切换源语言：写入待切换标志，由 ASR 线程在每批音频边界抢占执行。
+
+        清上下文 + 改 SOURCE_LANGUAGE 必须在识别线程串行（热键线程先改语言
+        会拿新语言参数识别旧缓冲，蹦出乱词）。不能只 submit(task) 排在
+        _process_inbox 后面——收件箱持续非空时 inbox 循环不返回，切换会饿死
+        （GPU 被游戏抢占的正是这种场景）。标志在 _process_inbox 每轮取音频
+        前检查，最坏等当前这一批识别结束（~2.5s）而不是永远卡住。
+        """
+        with self._asr_lock:
+            self._pending_lang_switch = new_lang
+            if self._asr_scheduled:
+                return  # 识别线程醒着，下一批边界会看到标志
+            self._asr_scheduled = True
         try:
-            self._asr_executor.submit(task)
+            self._asr_executor.submit(self._process_inbox)
         except RuntimeError:
             pass  # 程序正在退出
 
@@ -351,6 +357,13 @@ class WhisperQueueTranslator:
                     self._stat_dict += len(direct)
 
         if not batch:
+            # 纯词典直译也要重绘 live：句对已进历史，queue/inflight 已空，
+            # 不 emit 的话 ASR 上一次画上去的同一句德语会残留在 live 行
+            if direct and not self.closing:
+                with self._tx_lock:
+                    stale_direct = (epoch != self._tx_epoch)
+                if not stale_direct:
+                    self._emit_display()
             return  # 本轮全是词典感叹词，不用打Ollama
 
         german = " ".join(batch)
@@ -786,15 +799,34 @@ class WhisperQueueTranslator:
             if not self.closing:
                 print(f"   ⚠️  模型预热失败（首句翻译会稍慢）: {e}")
 
+    def _apply_pending_lang_switch(self, new_lang):
+        """在 ASR 线程内执行：清上下文 + 改语言（与识别串行）。"""
+        self.clear_context()
+        config.SOURCE_LANGUAGE = new_lang
+        name = config.LANGUAGE_NAMES.get(new_lang, new_lang)
+        print(f"🌐 源语言已切换为: {name}")
+        if self.on_status:
+            self.on_status(f"🌐 源语言已切换: {name}")
+
     def _process_inbox(self):
-        """识别线程主循环：把收件箱里攒下的块一次性处理完，空了才睡"""
+        """识别线程主循环：每批边界先处理语言切换，再消化收件箱，空了才睡。"""
         while True:
             with self._asr_lock:
+                pending_lang = self._pending_lang_switch
+                if pending_lang is not None:
+                    self._pending_lang_switch = None
                 items = self._audio_inbox
                 self._audio_inbox = []
-                if not items:
+                if not items and pending_lang is None:
                     self._asr_scheduled = False
                     return
+            if pending_lang is not None:
+                try:
+                    self._apply_pending_lang_switch(pending_lang)
+                except Exception as e:
+                    print(f"⚠️  切换源语言失败: {e}")
+            if not items:
+                continue  # 只有切语言、没有音频：回去看有没有新标志/新块
             try:
                 self._process_items(items)
                 self._asr_error_streak = 0
