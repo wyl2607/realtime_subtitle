@@ -60,26 +60,35 @@ def _restore(snap):
 
 def test_game_mode_switches_and_restores_all_four_knobs():
     snap = _snapshot()
+    orig_game_model = config.GAME_MODE_OLLAMA_MODEL
     try:
+        # 模型名固定为假值，与本机 config_local 解耦：小显存档的 config_local 会把
+        # GAME_MODE_OLLAMA_MODEL 设 None（或主模型本来就等于游戏模型），那种机器上
+        # 直接读全局会让"切换+预热"的断言全部错位（2026-07-17 全新安装演练实测）。
+        # translator 是打桩的，假名不会真打 Ollama
+        config.OLLAMA_MODEL = "test-main-model"
+        config.GAME_MODE_OLLAMA_MODEL = "test-game-model"
+        pinned = _snapshot()
         app = _make_app()
         app._toggle_game_mode()  # 开
         assert config.CHUNK_SUBMIT_SECONDS == config.GAME_MODE_SUBMIT_SECONDS
         assert config.WHISPER_BEAM_SIZE == config.GAME_MODE_BEAM_SIZE
         assert config.DRAFT_TRANSLATION is False
-        assert config.OLLAMA_MODEL == config.GAME_MODE_OLLAMA_MODEL
+        assert config.OLLAMA_MODEL == "test-game-model"
         assert app.translator.warm_calls == 1  # 切模型后预热
-        assert app.translator.unloaded == [snap[3]]  # 必须要求卸载旧模型（否则keep_alive=2h赖满显存）
+        assert app.translator.unloaded == ["test-main-model"]  # 必须要求卸载旧模型（否则keep_alive=2h赖满显存）
         # new_model 必须显式传入调用当下的目标值，不能让worker执行时现读
         # config.OLLAMA_MODEL——热键连按时那个全局可能已经被后续toggle改掉
         # （压测复现过：连按6次后ollama ps里9b/4b同时常驻）
-        assert app.translator.warmed == [config.GAME_MODE_OLLAMA_MODEL]
+        assert app.translator.warmed == ["test-game-model"]
 
         app._toggle_game_mode()  # 关
-        assert _snapshot() == snap  # 四个值原样恢复
+        assert _snapshot() == pinned  # 四个值原样恢复
         assert app.translator.warm_calls == 2  # 切回也预热
-        assert app.translator.unloaded[1] == config.GAME_MODE_OLLAMA_MODEL  # 切回时卸掉4b
-        assert app.translator.warmed[1] == snap[3]  # 切回时目标是原模型
+        assert app.translator.unloaded[1] == "test-game-model"  # 切回时卸掉游戏模型
+        assert app.translator.warmed[1] == "test-main-model"  # 切回时目标是原模型
     finally:
+        config.GAME_MODE_OLLAMA_MODEL = orig_game_model
         _restore(snap)
 
 
