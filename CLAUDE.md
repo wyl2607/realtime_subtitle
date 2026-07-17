@@ -77,9 +77,22 @@ install.ps1 按显存自动生成的默认档位：
   里，更新永远不会碰它们。
 - **更新失败**基本都是有人直接改了仓库文件。处理：`git stash` 后重试；根治：
   把改动挪进 config_local.py 或让上游合并。
-- **本地发现 bug 改好了**想回馈上游：提交后推分支/发 PR 到
-  `wyl2607/realtime_subtitle`，或把 diff 发给原作者。不要 push 到 upstream
-  （leik1000 是最初的模板仓库，早已分道扬镳）。
+### 出了问题怎么反馈（issue / PR）
+
+先自查：`subtitle.err.log`（崩溃看这）和 `subtitle.log` 尾部 + 本文件第 4 节
+避坑清单 + README 常见问题。确认是项目 bug（而不是本机环境/显存不够）后：
+
+- **开 issue（首选）**：按 `.github/ISSUE_TEMPLATE/bug_report.md` 的格式把
+  版本 commit、系统、显卡、config_local、两个日志尾部收集齐，然后
+  `gh issue create -R wyl2607/realtime_subtitle --title "[bug] ..." --body-file 报告.md`
+  （需要 GitHub 账号且 `gh auth login` 过；网页上开也一样）。
+- **没有 GitHub 账号**：把同样内容整理成一段文字，交给用户让他直接发给作者
+  （微信/QQ），内容齐了作者那边的 AI 一样能修。
+- **自己已经修好了代码**想回馈：跑完 `venv\Scripts\python -m pytest`（46 项
+  全绿）再发 PR——`gh repo fork wyl2607/realtime_subtitle --remote=true`，
+  开分支提交，push 到自己的 fork，`gh pr create`。改动尽量小、提交信息写清
+  根因。不要 push 到 upstream（leik1000 是最初的模板仓库，早已分道扬镳）。
+- 改代码前先双击"更新字幕.bat"拉到最新，避免在旧版上修已经修过的东西。
 
 ## 4. ☠️ 避坑清单（每一条都是真实踩过的）
 
