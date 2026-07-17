@@ -37,3 +37,5 @@ config_local.py
 
 # AI 评审临时文件
 .grok_review_prompt.md
+.ai_review_prompt.md
+review_report_*.md
