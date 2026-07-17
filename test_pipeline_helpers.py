@@ -246,3 +246,58 @@ if __name__ == "__main__":
             print(f"FAIL  {fn.__name__}: {e}")
     print(f"\n{len(tests) - failed}/{len(tests)} passed")
     raise SystemExit(failed)
+
+
+def test_shutdown_unloads_only_our_loaded_models(monkeypatch):
+    """退出卸模型（_unload_our_models）：只卸/api/ps里确实加载着的本程序模型。
+    ☠️ 对未加载的模型发 keep_alive=0 会先触发一次完整加载——所以"我们的模型
+    没加载"时必须一次 post 都不发；用户自己跑的无关模型不能碰。"""
+    from translator_queue import WhisperQueueTranslator
+
+    t = WhisperQueueTranslator.__new__(WhisperQueueTranslator)
+    posts = []
+
+    class _Resp:
+        def __init__(self, payload=None):
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+        def close(self):
+            pass
+
+    class _FakeSession:
+        def __init__(self, loaded):
+            self.loaded = loaded
+
+        def get(self, url, **kw):
+            assert url.endswith("/api/ps")
+            return _Resp({"models": [{"name": n} for n in self.loaded]})
+
+        def post(self, url, json=None, **kw):
+            posts.append(json)
+            return _Resp()
+
+    monkeypatch.setattr(config, "OLLAMA_MODEL", "test-main")
+    monkeypatch.setattr(config, "GAME_MODE_OLLAMA_MODEL", "test-game", raising=False)
+
+    # 主模型+游戏模型+无关模型都加载着 → 只卸我们的两个，keep_alive=0
+    t.ollama_session = _FakeSession(["test-main", "test-game", "someone-elses-model"])
+    t._unload_our_models()
+    assert sorted(p["model"] for p in posts) == ["test-game", "test-main"], posts
+    assert all(p["keep_alive"] == 0 for p in posts)
+
+    # 我们的模型都没加载 → 零 post（发了反而触发加载）
+    posts.clear()
+    t.ollama_session = _FakeSession(["someone-elses-model"])
+    t._unload_our_models()
+    assert posts == []
+
+    # Ollama 不在 → 静默跳过不抛（不阻塞退出流程）
+    class _DeadSession:
+        def get(self, *a, **kw):
+            raise OSError("connection refused")
+
+    t.ollama_session = _DeadSession()
+    t._unload_our_models()

@@ -926,11 +926,39 @@ class WhisperQueueTranslator:
         self._asr_executor.shutdown(wait=True, cancel_futures=True)
         self._tx_executor.shutdown(wait=True, cancel_futures=True)
         self._lookup_executor.shutdown(wait=False, cancel_futures=True)
+        self._unload_our_models()
         try:
             self.ollama_session.close()
             self.lookup_session.close()
         except Exception:
             pass
+
+    def _unload_our_models(self):
+        """退出时主动卸载本程序加载的翻译模型。
+
+        翻译请求带 keep_alive=2h：stop脚本会CLI卸载，但❌按钮/Ctrl+C退出不经过
+        stop脚本，模型会在显存里赖到2小时到期（2026-07-17 实测：程序退了，
+        9b 还独占 5.6GB）。必须放在两个 executor shutdown **之后**：在飞的
+        翻译/预热任务收尾会重新加载模型，先卸就白卸了。
+        只卸"/api/ps 里确实加载着、且名字是本程序配置"的模型——对未加载的
+        模型发 keep_alive=0 会先触发一次完整加载（纯浪费退出时间），
+        用户自己跑的无关模型更不能碰。"""
+        ours = {config.OLLAMA_MODEL, getattr(config, "GAME_MODE_OLLAMA_MODEL", None)}
+        try:
+            loaded = self.ollama_session.get(
+                f"{config.OLLAMA_BASE_URL}/api/ps", timeout=2,
+            ).json().get("models", [])
+            for m in loaded:
+                name = m.get("name")
+                if name in ours:
+                    self.ollama_session.post(
+                        f"{config.OLLAMA_BASE_URL}/api/generate",
+                        json={"model": name, "prompt": "", "keep_alive": 0},
+                        timeout=3,
+                    ).close()
+                    print(f"🧹 已卸载翻译模型 {name}（释放显存）")
+        except Exception:
+            pass  # Ollama不在/超时都无所谓：模型最多赖到keep_alive到期，不阻塞退出
 
     def __del__(self):
         """清理资源"""
