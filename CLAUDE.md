@@ -108,8 +108,8 @@ install.ps1 按显存自动生成的默认档位：
   （需要 GitHub 账号且 `gh auth login` 过；网页上开也一样）。
 - **没有 GitHub 账号**：把同样内容整理成一段文字，交给用户让他直接发给作者
   （微信/QQ），内容齐了作者那边的 AI 一样能修。
-- **自己已经修好了代码**想回馈：跑完 `venv\Scripts\python -m pytest`（46 项
-  全绿）再发 PR——`gh repo fork wyl2607/realtime_subtitle --remote=true`，
+- **自己已经修好了代码**想回馈：跑完 `venv\Scripts\python -m pytest`（全绿，
+  条数以实际输出为准）再发 PR——`gh repo fork wyl2607/realtime_subtitle --remote=true`，
   开分支提交，push 到自己的 fork，`gh pr create`。改动尽量小、提交信息写清
   根因。不要 push 到 upstream（leik1000 是最初的模板仓库，早已分道扬镳）。
 - 改代码前先双击"更新字幕.bat"拉到最新，避免在旧版上修已经修过的东西。
@@ -152,7 +152,7 @@ install.ps1 按显存自动生成的默认档位：
 
 改代码（如果用户让你改功能）：
 
-12. 改完跑测试：`venv\Scripts\python -m pytest`（46 项）。test_hittest /
+12. 改完跑测试：`venv\Scripts\python -m pytest`（48 项，以实际输出为准）。test_hittest /
     test_resize_freedom / test_wordclick 是**独立脚本套件**（import 即开真窗口，
     pytest.ini 已把它们排除出收集，別删这个排除），用 `venv\Scripts\python
     test_hittest.py` 逐个跑。test_ui_polish 的两个 fade 用例对动画计时敏感，

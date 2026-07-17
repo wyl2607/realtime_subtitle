@@ -301,3 +301,37 @@ def test_shutdown_unloads_only_our_loaded_models(monkeypatch):
 
     t.ollama_session = _DeadSession()
     t._unload_our_models()
+
+
+def test_asr_inbox_hard_cap(monkeypatch):
+    """收件箱硬顶：识别线程卡死时丢最旧块保内存，正常积压不受影响"""
+    from threading import Lock
+    from translator_queue import WhisperQueueTranslator
+
+    t = WhisperQueueTranslator.__new__(WhisperQueueTranslator)
+    t._asr_lock = Lock()
+    t._audio_inbox = []
+    t._asr_scheduled = True  # 假装识别线程在跑：enqueue 只进箱不提交 executor
+    t._inbox_dropped = 0
+    t._inbox_drop_warned = 0
+    monkeypatch.setattr(config, "ASR_INBOX_MAX_BLOCKS", 50, raising=False)
+
+    for i in range(120):
+        t.enqueue_audio(np.zeros(16, dtype=np.float32), float(i))
+
+    assert len(t._audio_inbox) == 50          # 顶住上限
+    assert t._audio_inbox[0][1] == 70.0       # 丢的是最旧的，留最近50块
+    assert t._audio_inbox[-1][1] == 119.0
+    assert t._inbox_dropped == 70
+
+    # 正常小积压完全不触发
+    t2 = WhisperQueueTranslator.__new__(WhisperQueueTranslator)
+    t2._asr_lock = Lock()
+    t2._audio_inbox = []
+    t2._asr_scheduled = True
+    t2._inbox_dropped = 0
+    t2._inbox_drop_warned = 0
+    for i in range(10):
+        t2.enqueue_audio(np.zeros(16, dtype=np.float32), float(i))
+    assert len(t2._audio_inbox) == 10
+    assert t2._inbox_dropped == 0

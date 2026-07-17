@@ -5,6 +5,9 @@
 #   config_local.py（个人配置）/ window_state.json（窗口位置）/ transcripts\（字幕记录）
 # 更新后需要重启字幕（停止字幕.bat → 启动字幕.bat）才生效。
 # ============================================================
+param(
+    [switch]$Mirror  # 大陆网络：依赖同步走清华 PyPI 镜像（与 install.ps1 同参数）
+)
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
@@ -46,9 +49,11 @@ Write-Host ""
 $changed = git diff --name-only $old $new
 if ($changed -contains "requirements.txt") {
     Write-Host "依赖清单有变化，正在同步（可能需要几分钟）..."
-    & "$PSScriptRoot\venv\Scripts\python.exe" -m pip install -r "$PSScriptRoot\requirements.txt"
+    $pipArgs = @("-m", "pip", "install", "-r", "$PSScriptRoot\requirements.txt")
+    if ($Mirror) { $pipArgs += @("-i", "https://pypi.tuna.tsinghua.edu.cn/simple") }
+    & "$PSScriptRoot\venv\Scripts\python.exe" @pipArgs
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "❌ 依赖安装失败，请检查网络后重跑本脚本（国内网络可先跑 install.ps1 -Mirror）"
+        Write-Host "❌ 依赖安装失败，请检查网络后重跑本脚本（大陆网络加 -Mirror 参数）"
         exit 1
     }
 }

@@ -145,6 +145,8 @@ class WhisperQueueTranslator:
             self._asr_lock = Lock()
             self._audio_inbox = []      # [(audio, capture_time)]
             self._asr_scheduled = False
+            self._inbox_dropped = 0     # 硬顶丢块累计（正常永远是0）
+            self._inbox_drop_warned = 0
             self._asr_executor = ThreadPoolExecutor(max_workers=1)
 
             # 翻译队列：ASR线程往里放完整句子，翻译worker每次醒来把积压的全部
@@ -691,9 +693,24 @@ class WhisperQueueTranslator:
             self.pending_text = committed_text
 
     def enqueue_audio(self, audio_data, capture_time):
-        """采集线程调用：音频进收件箱，识别线程没醒着就唤醒它（永不丢块）"""
+        """采集线程调用：音频进收件箱，识别线程没醒着就唤醒它。
+
+        常规场景（GPU被抢）永不丢块、滞后自动追上；只有积压超过
+        ASR_INBOX_MAX_BLOCKS（≈2分钟，识别线程卡死级别的异常）才丢最旧
+        的块保内存。注意"不丢词"指的是这一级：采集侧 audio_capture 的
+        audio_queue(maxsize=10) 在处理线程堵死时仍会丢并打日志"""
         with self._asr_lock:
             self._audio_inbox.append((audio_data, capture_time))
+            cap = getattr(config, "ASR_INBOX_MAX_BLOCKS", 240)
+            if len(self._audio_inbox) > cap:
+                dropped = len(self._audio_inbox) - cap
+                del self._audio_inbox[:dropped]  # 丢最旧的：反正早失去实时性了
+                self._inbox_dropped += dropped
+                # 每累计100块（≈50秒音频）报一次，别刷屏
+                if self._inbox_dropped - self._inbox_drop_warned >= 100 or self._inbox_drop_warned == 0:
+                    self._inbox_drop_warned = self._inbox_dropped
+                    print(f"⚠️  识别积压超过{cap}块(≈{cap * config.CHUNK_SUBMIT_SECONDS:.0f}秒)，"
+                          f"已丢弃最旧音频保内存(累计{self._inbox_dropped}块)——识别线程可能已卡死，建议重启程序")
             n = len(self._audio_inbox)
             if self._asr_scheduled:
                 if n in (6, 12):  # GPU被抢时的提示，不丢数据

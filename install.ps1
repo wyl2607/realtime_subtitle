@@ -62,9 +62,13 @@ try {
     $smi = & nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits 2>$null
     if ($LASTEXITCODE -eq 0 -and $smi) {
         $hasGpu = $true
-        $first = ($smi | Select-Object -First 1) -split ","
-        $gpuName = $first[0].Trim()
-        $gpuMemMB = [int]$first[1].Trim()
+        # 多张N卡时取显存最大那张分档（笔记本亮机卡/旧卡枚举在前会分错档）
+        $best = $smi | ForEach-Object {
+            $p = $_ -split ","
+            [pscustomobject]@{ Name = $p[0].Trim(); Mem = [int]$p[1].Trim() }
+        } | Sort-Object Mem -Descending | Select-Object -First 1
+        $gpuName = $best.Name
+        $gpuMemMB = $best.Mem
         Write-Host "  ✅ $gpuName (${gpuMemMB}MB 显存)"
     }
 } catch { }
