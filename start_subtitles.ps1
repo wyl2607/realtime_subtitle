@@ -5,10 +5,14 @@ Set-Location $PSScriptRoot
 $pidFile = "$PSScriptRoot\subtitle.pid"
 if (Test-Path $pidFile) {
     $oldPid = Get-Content $pidFile
-    if (Get-Process -Id $oldPid -ErrorAction SilentlyContinue) {
+    $oldProc = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
+    # PID会被系统回收复用：光"这个PID有进程"不算数，还得确认真是本项目venv的
+    # python（2026-07-17实测：残留pid被别的进程占用→误判"已在运行"拒绝启动）
+    if ($oldProc -and $oldProc.Path -like "$PSScriptRoot\venv\*") {
         Write-Host "已经在运行中（PID $oldPid），不用重复启动。要重启请先运行 停止字幕.bat"
         exit
     }
+    Remove-Item $pidFile -ErrorAction SilentlyContinue  # 残留的过期pid文件
 }
 
 # 清掉可能残留的暂停/停止标记，保证每次启动都是正常运行状态

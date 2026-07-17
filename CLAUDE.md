@@ -11,15 +11,35 @@
 
 ## 1. 安装流程
 
-前置软件（缺什么装什么）：
+### 依赖清单（先逐项检查，缺什么装什么）
 
-```powershell
-winget install --id Python.Python.3.13 -e     # Python 3.10–3.13 均可
-winget install --id Git.Git -e                # 更新机制需要
-winget install --id Ollama.Ollama -e          # 本地翻译模型运行时
-```
+| 依赖 | 干什么用 | 怎么装 | 怎么验证 |
+|---|---|---|---|
+| Python 3.10–3.13 | 运行主程序 | `winget install --id Python.Python.3.13 -e` | `py -3.13 --version` |
+| Git | clone 仓库 + 一键更新 | `winget install --id Git.Git -e` | `git --version` |
+| Ollama | 本地翻译模型运行时 | `winget install --id Ollama.Ollama -e` | `ollama --version` |
+| NVIDIA 驱动 | CUDA 12 运行库要求驱动较新 | GeForce 官网/GeForce Experience 更新 | `nvidia-smi` 右上角 CUDA Version **≥ 12.0** |
+| Python 依赖包 | requirements.txt | **install.ps1 自动装进 venv**，不用手动 | 装完脚本无红字 |
+| Whisper 识别模型 | 语音识别（1-3GB） | **首次启动自动从 HuggingFace 下载** | 首启等几分钟即可 |
+| 翻译模型 | 德→中翻译 | **install.ps1 自动 `ollama pull`** | `ollama list` |
 
-然后一键安装（幂等，中断重跑即可）：
+注意事项（都踩过或可预见）：
+
+- winget 装完 Python/Git 后**要开新终端**才认识新命令（PATH 刷新）；`python`
+  命令可能被 Microsoft Store 别名劫持，用 `py` 验证——install.ps1 两种都会找。
+- **磁盘空间预留 ~12GB**：venv 约 4GB + Whisper 模型 1-3GB + 翻译模型 2-6GB。
+- 驱动太旧的症状：程序启动时 cublas/cudnn 报错或 CUDA error。先
+  `nvidia-smi` 看 CUDA Version，<12.0 就先升驱动，别急着折腾 Python 层。
+- **中国大陆网络**：pip 走镜像加 `-Mirror` 参数；首次启动下载 Whisper 模型
+  连不上 HuggingFace 的话，先设 `HF_ENDPOINT` 再启动：
+  `[Environment]::SetEnvironmentVariable("HF_ENDPOINT","https://hf-mirror.com","User")`
+  （对 huggingface_hub 生效；设完重开终端/重启程序）。Ollama 拉模型一般直连可用。
+- 杀毒软件可能拦 pyaudiowpatch 的音频捕获或误报 venv 里的 exe——现象是
+  装完启动无声音/进程被删，加白名单即可。
+
+### 一键安装
+
+前置三件套齐了之后（幂等，中断重跑即可）：
 
 ```powershell
 git clone https://github.com/wyl2607/realtime_subtitle.git

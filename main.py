@@ -353,6 +353,18 @@ class SubtitleApp:
         except OSError:
             pass
 
+        # 清掉 pid 文件：stop脚本会删，但❌按钮/.stop标记/Ctrl+C退出不经过
+        # stop脚本——残留的旧PID被系统回收复用给别的进程后，start脚本会误判
+        # "已经在运行中"拒绝启动（2026-07-17 实测撞上）。注意 pid 文件记的是
+        # venv 启动器存根的 PID（我们的父进程），不是 os.getpid()，所以只能
+        # 按路径删、不做内容比对
+        try:
+            pid_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subtitle.pid")
+            if os.path.exists(pid_file):
+                os.remove(pid_file)
+        except OSError:
+            pass
+
         print("👋 应用已关闭，再见！")
     
     def _print_usage(self):
