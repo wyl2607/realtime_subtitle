@@ -18,10 +18,12 @@ w.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
 w.setAttribute(Qt.WA_TranslucentBackground)  # 和真实字幕窗一致（曾导致鼠标穿透）
 # 放到屏幕右上角：避开可能正在运行的字幕悬浮窗（同为置顶窗口，
 # 会盖住测试窗口导致 WindowFromPoint 误判）
-w.setGeometry(1750, 30, 400, 200)
+# BTN_RESERVE=200 后 400 宽窗口的中心点正好压在保留区边界上，加宽保住
+# "标题条中心"的测试语义（真实主窗最小宽 360，拖动区仍有 150px 可用）
+w.setGeometry(1650, 30, 500, 200)
 # 挂上 drag_bar（主程序里挂在 container 上；nativeEvent 用 isVisible 门控 HTCAPTION）
 w.drag_bar = QLabel("drag", w)
-w.drag_bar.setGeometry(0, 0, 400, ResizableFramelessWidget.DRAG_BAR_HEIGHT)
+w.drag_bar.setGeometry(0, 0, 500, ResizableFramelessWidget.DRAG_BAR_HEIGHT)
 w.drag_bar.show()
 w.show()
 app.processEvents()
