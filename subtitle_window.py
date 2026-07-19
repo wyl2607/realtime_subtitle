@@ -315,6 +315,11 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         self.tv_window._apply_font()  # 恢复的字号要落到样式表
         si = tv_state.get("screen_index")
         self.tv_window.screen_index = si if isinstance(si, int) else None
+        # 开机预热首次全屏转场（opacity=0 用户看不到）：本进程第一次
+        # showFullScreen() 无论何时调用都要吃 400-500ms，挪到这里比用户点📺
+        # 时才付这笔账好得多——之后 whisper/Ollama 加载本来就要几秒，
+        # 这半秒钟混在启动过程里感觉不到。
+        self.tv_window.warm_up()
 
         # ⚙️/📜 几何：有持久化就恢复（钳进当前某屏）；否则首次显示时贴字幕窗所在屏
         self._settings_ever_shown = False

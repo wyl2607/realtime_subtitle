@@ -80,6 +80,7 @@ class TVWindow(QWidget):
         at_bottom = sb.value() >= sb.maximum() - 10
         self._remove_draft()
         self._append_block(html.escape(chinese.strip()), draft=False)
+        self._update_bottom_anchor()
         if at_bottom:
             sb.setValue(sb.maximum())
 
@@ -93,6 +94,7 @@ class TVWindow(QWidget):
         chinese = (chinese or "").strip()
         if chinese:
             self._append_block(html.escape(chinese), draft=True)
+        self._update_bottom_anchor()
         if at_bottom:
             sb.setValue(sb.maximum())
 
@@ -103,8 +105,26 @@ class TVWindow(QWidget):
         for zh in chinese_list:
             if zh and zh.strip():
                 self._append_block(html.escape(zh.strip()), draft=False)
+        self._update_bottom_anchor()
         sb = self.text.verticalScrollBar()
         sb.setValue(sb.maximum())
+
+    def _update_bottom_anchor(self):
+        """内容不够填满一屏时，把空白挪到顶部，让文字贴着屏幕底部生长
+        （用户要的"电视上从下往上滚动"观感——默认 QTextEdit 顶对齐，句子少时
+        会孤零零挤在左上角一小块，底下一片黑，没有"从下往上升起"的感觉）。
+        内容一旦超过一屏，留白归零，交给正常滚动接管。"""
+        doc = self.text.document()
+        root = doc.rootFrame()
+        fmt = root.frameFormat()
+        fmt.setTopMargin(0)
+        root.setFrameFormat(fmt)  # 先清零再测量，否则上次的留白会被计入内容高度形成正反馈
+        viewport_h = self.text.viewport().height()
+        content_h = doc.size().height()
+        pad = max(0, viewport_h - content_h)
+        if pad:
+            fmt.setTopMargin(pad)
+            root.setFrameFormat(fmt)
 
     def _append_block(self, escaped, draft):
         cursor = QTextCursor(self.text.document())
@@ -160,6 +180,7 @@ class TVWindow(QWidget):
                 padding: 24px 48px;
             }}
         """)
+        self._update_bottom_anchor()
 
     # ------------------------------------------------------------------
     # 屏幕
@@ -215,3 +236,27 @@ class TVWindow(QWidget):
         self.screen_btn.move(x - self.screen_btn.width() - 8, 12)
         self.close_btn.raise_()
         self.screen_btn.raise_()
+        self._update_bottom_anchor()
+
+    # ------------------------------------------------------------------
+    # 首次全屏预热
+    # ------------------------------------------------------------------
+    def warm_up(self):
+        """静默吃掉"进程内第一次全屏转场"的固定开销。
+
+        实测（诊断脚本）：本进程第一次 showFullScreen() 无论走哪条调用路径都要
+        400-500ms（Windows/DWM 首次进入全屏合成路径 + 本窗口大字号样式表首次
+        排版的一次性成本），此后同一窗口/其它窗口的全屏转场都只要十几毫秒。
+        开机时用 opacity=0 把这笔账提前付掉（用户全程看不到任何画面），
+        真正点📺时就落在快速区间，不会感觉"卡住"。
+        """
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        self.setWindowOpacity(0.0)
+        self.setGeometry(screen.geometry())
+        self.showFullScreen()
+        QApplication.processEvents()
+        self.hide()
+        QApplication.processEvents()
+        self.setWindowOpacity(1.0)
