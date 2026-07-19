@@ -37,6 +37,7 @@ from settings_window import (
     apply_tuning, collect_tuning, apply_text_color, snapshot_defaults,
 )
 from popups import HistoryWindow, WordPopup
+from tv_window import TVWindow
 from window_chrome import WindowChromeMixin
 from subtitle_render import LiveTextRenderMixin
 
@@ -140,6 +141,13 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         self.history_btn.clicked.connect(self._toggle_history)
         self.history_btn.setToolTip("字幕历史（可滚动回看）")
 
+        # 创建电视全屏按钮
+        self.tv_btn = QPushButton("📺")
+        self.tv_btn.setFixedSize(30, 30)
+        self.tv_btn.setStyleSheet(button_style)
+        self.tv_btn.clicked.connect(self._toggle_tv)
+        self.tv_btn.setToolTip("电视全屏模式（大字滚动，Esc 退出）")
+
         # 创建设置按钮
         self.settings_btn = QPushButton("⚙️")
         self.settings_btn.setFixedSize(30, 30)
@@ -226,7 +234,8 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         bar_layout = QHBoxLayout()
         bar_layout.setContentsMargins(0, 0, 0, 0)
         bar_layout.setSpacing(6)
-        for b in (self.minimize_btn, self.history_btn, self.settings_btn, self.quit_btn):
+        for b in (self.minimize_btn, self.history_btn, self.tv_btn,
+                  self.settings_btn, self.quit_btn):
             b.setParent(self.btn_bar)
             bar_layout.addWidget(b)
         self.btn_bar.setLayout(bar_layout)
@@ -295,6 +304,17 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
 
         # 创建历史窗口（初始隐藏）
         self.history_window = HistoryWindow()
+
+        # 电视全屏窗（初始隐藏）：字号/所在屏从 state 的 "tv" 段恢复
+        tv_state = self._state.get("tv") or {}
+        try:
+            config.TV_FONT_SIZE = int(tv_state["font_size"])
+        except (KeyError, TypeError, ValueError):
+            pass
+        self.tv_window = TVWindow()
+        self.tv_window._apply_font()  # 恢复的字号要落到样式表
+        si = tv_state.get("screen_index")
+        self.tv_window.screen_index = si if isinstance(si, int) else None
 
         # ⚙️/📜 几何：有持久化就恢复（钳进当前某屏）；否则首次显示时贴字幕窗所在屏
         self._settings_ever_shown = False
@@ -396,6 +416,8 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
             state["history_geo"] = [hg.x(), hg.y(), hg.width(), hg.height()]
         elif self._state.get("history_geo"):
             state["history_geo"] = self._state["history_geo"]
+        state["tv"] = {"font_size": int(config.TV_FONT_SIZE),
+                       "screen_index": self.tv_window.screen_index}
         # 面板参数：游戏模式期间 CHUNK_SUBMIT_SECONDS / DRAFT_TRANSLATION 是临时值，豁免
         state["tuning"] = collect_tuning(
             game_mode_active=bool(getattr(self, "_game_mode_active", False)),
@@ -507,7 +529,16 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
             self.history_window.show()
             sb = self.history_window.text.verticalScrollBar()
             sb.setValue(sb.maximum())
-    
+
+    def _toggle_tv(self):
+        """切换电视全屏窗：打开时回填最近中文，开在主字幕窗不在的屏上"""
+        if self.tv_window.isVisible():
+            self.tv_window.hide()
+        else:
+            self.tv_window.backfill([zh for _, zh in self.sentence_pairs])
+            self.tv_window.open_fullscreen(
+                avoid_center=self.container.frameGeometry().center())
+
     def _quit_application(self):
         """退出程序"""
         from PyQt5.QtWidgets import QMessageBox

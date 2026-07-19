@@ -93,7 +93,7 @@ class ResizableFramelessWidget(DraggableWidget):
 
     RESIZE_MARGIN = 10  # 物理像素（不受DPI缩放影响：坐标和窗口矩形都是物理值）
     DRAG_BAR_HEIGHT = 30  # 顶部原生拖动条高度（物理像素，与 GetWindowRect 一致）
-    BTN_RESERVE = 160     # 右上角按钮区不抢 HTCAPTION，留给按钮点击
+    BTN_RESERVE = 200     # 右上角按钮区不抢 HTCAPTION，留给按钮点击（5 个 30px 按钮+间距）
 
     def __init__(self):
         super().__init__()

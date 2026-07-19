@@ -46,6 +46,7 @@ class LiveTextRenderMixin:
 
     def _update_draft(self, chinese):
         self.live_draft = chinese
+        self.tv_window.update_draft(chinese)
         self._render()
 
     def _add_pair(self, german, chinese):
@@ -56,6 +57,7 @@ class LiveTextRenderMixin:
         self.status_line = ""
         self._status_clear_timer.stop()
         self.history_window.append_pair(german, chinese)
+        self.tv_window.append_pair(chinese)
         self._render()
         if config.SHOW_PERFORMANCE:
             print(f"💬 字幕: {chinese[:50]}{'...' if len(chinese) > 50 else ''}")

@@ -124,3 +124,70 @@ def test_clamp_screen_index():
     assert win._clamp_screen_index(-3) == 0
     assert win._clamp_screen_index(n + 5) == n - 1  # 拔了屏的持久化值钳回
     assert win._clamp_screen_index(None) == 0
+
+
+def test_subtitle_window_integration_state_and_wiring():
+    """SubtitleWindow 建出 tv_window；state 含 tv 段；_add_pair/_update_draft 接线到位。"""
+    import os
+    import json
+    import tempfile
+    import subtitle_window as sw_mod
+    from subtitle_window import SubtitleWindow
+
+    _app()
+    tmpdir = tempfile.mkdtemp()
+    orig_state = sw_mod.STATE_FILE
+    snap_font = config.TV_FONT_SIZE
+    sw_mod.STATE_FILE = os.path.join(tmpdir, "window_state.json")
+    try:
+        win = SubtitleWindow()
+        assert isinstance(win.tv_window, TVWindow)
+        assert win.tv_btn.toolTip()  # 📺 按钮存在
+
+        # 接线：句对/草稿都转发到 tv_window（tv 窗显示时）
+        win.tv_window.resize(400, 300)
+        win.tv_window.show()
+        win._add_pair("Hallo", "你好")
+        assert "你好" in win.tv_window.text.toPlainText()
+        win._update_draft("草稿")
+        assert "草稿" in win.tv_window.text.toPlainText()
+        win.tv_window.hide()
+
+        # 持久化：tv 段写进 state 文件
+        config.TV_FONT_SIZE = 72
+        win.tv_window.screen_index = 0
+        win._save_state_if_changed()
+        with open(sw_mod.STATE_FILE, encoding="utf-8") as f:
+            state = json.load(f)
+        assert state["tv"] == {"font_size": 72, "screen_index": 0}
+
+        win.container.close()
+    finally:
+        sw_mod.STATE_FILE = orig_state
+        config.TV_FONT_SIZE = snap_font
+
+
+def test_state_restore_tv_font_size():
+    """启动时 window_state.json 里的 tv.font_size 恢复进 config。"""
+    import os
+    import json
+    import tempfile
+    import subtitle_window as sw_mod
+    from subtitle_window import SubtitleWindow
+
+    _app()
+    tmpdir = tempfile.mkdtemp()
+    orig_state = sw_mod.STATE_FILE
+    snap_font = config.TV_FONT_SIZE
+    sw_mod.STATE_FILE = os.path.join(tmpdir, "window_state.json")
+    try:
+        with open(sw_mod.STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"tv": {"font_size": 96, "screen_index": 99}}, f)
+        win = SubtitleWindow()
+        assert config.TV_FONT_SIZE == 96
+        # 越界 screen_index 原样存着，_go_fullscreen 时才钳制（拔屏不崩）
+        assert win.tv_window.screen_index == 99
+        win.container.close()
+    finally:
+        sw_mod.STATE_FILE = orig_state
+        config.TV_FONT_SIZE = snap_font
