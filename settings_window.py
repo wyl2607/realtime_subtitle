@@ -238,7 +238,7 @@ class SettingsWindow(DraggableWidget):
                 self._on_font_change()
 
         self.font_size_slider = self._create_slider(
-            "字体大小", 14, 36, config.FONT_SIZE, 1, set_font_size
+            "字体大小", 14, 72, config.FONT_SIZE, 1, set_font_size
         )
 
         def set_bg_opacity(v):

@@ -191,3 +191,17 @@ def test_state_restore_tv_font_size():
     finally:
         sw_mod.STATE_FILE = orig_state
         config.TV_FONT_SIZE = snap_font
+
+
+def test_main_window_font_cap_raised_to_72():
+    """主窗字号上限放宽：滑块最大值 72（Ctrl+滚轮钳制与之共用同一上限，grep 核对）。"""
+    from settings_window import SettingsWindow
+
+    _app()
+    snap = config.FONT_SIZE
+    try:
+        win = SettingsWindow()
+        s = win.font_size_slider
+        assert round(s['slider'].maximum() * s['step']) == 72
+    finally:
+        config.FONT_SIZE = snap

@@ -81,7 +81,7 @@ class WindowChromeMixin:
         if not event.modifiers() & Qt.ControlModifier:
             return False
         step = 1 if event.angleDelta().y() > 0 else -1
-        size = max(14, min(36, config.FONT_SIZE + step))
+        size = max(14, min(72, config.FONT_SIZE + step))
         if size != config.FONT_SIZE:
             # 通过设置面板滑块走，数值标签/config/样式一次同步
             s = self.settings_window.font_size_slider
