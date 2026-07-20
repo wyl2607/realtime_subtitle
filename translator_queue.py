@@ -72,6 +72,15 @@ def _squash_repeats(sentences, keep_words=3, keep_sents=2):
         out.append(s)
     return out
 
+_warm_thread = None  # 启动预热线程句柄：_unload_our_models 退出时要等它收尾
+
+
+def _spawn_startup_warm():
+    global _warm_thread
+    _warm_thread = Thread(target=_startup_warm_ollama, daemon=True, name="OllamaWarm")
+    _warm_thread.start()
+
+
 def _startup_warm_ollama():
     """启动时后台预热翻译模型（prompt 留空 = Ollama 只加载不生成，官方用法）。
 
@@ -122,6 +131,13 @@ def _ensure_ml_deps():
         except ImportError:
             pass
 
+    # ☠️ transformers 只是 ctranslate2「模型格式转换」的可选依赖，本项目运行时
+    # 完全用不到，但只要装着（optimum 连带装的），ctranslate2 import 就会把它
+    # 整个拉起来——实测占 faster_whisper 导入 3.9 秒里的 3.2 秒。放个 None 挡住
+    # （converters/transformers.py 对 ImportError 有 try/except 守卫，安全），
+    # faster_whisper 导入降到 0.1 秒。以后若真要在本进程用 transformers，删这行
+    sys.modules.setdefault("transformers", None)
+
     from faster_whisper import WhisperModel
     _WhisperModel = WhisperModel
     return _WhisperModel
@@ -142,8 +158,10 @@ class WhisperQueueTranslator:
         # 第一句翻译都要付 5-9 秒冷加载费。趁 Whisper 加载的这十几秒让
         # Ollama 同时把模型装进显存，首句翻译就是热的。独立线程+独立请求，
         # 不碰 self（此时实例还没建完）；失败静默——Ollama 不可达时
-        # 下面的健康检查会给出明确提示，这里不重复报
-        Thread(target=_startup_warm_ollama, daemon=True, name="OllamaWarm").start()
+        # 下面的健康检查会给出明确提示，这里不重复报。
+        # 显存说明：两个模型在稳态本来就要同时驻留（各档位模型就是按这个
+        # 选的），并行加载不会推高稳态峰值，小显存档也不用禁用并行
+        _spawn_startup_warm()
 
         WhisperModel = _ensure_ml_deps()
 
@@ -158,8 +176,11 @@ class WhisperQueueTranslator:
                     compute_type=config.WHISPER_COMPUTE_TYPE,
                     local_files_only=True,
                 )
-            except Exception:
-                print("   本地没有模型缓存，从网络下载（首次需要几分钟）...")
+            except Exception as e:
+                # 不只是"没缓存"会走到这（CUDA错/缓存损坏也会），把真实原因
+                # 带上——否则驱动问题会被误报成"在下载"，排障方向全错
+                print(f"   本地缓存不可用({e.__class__.__name__}: {e})，"
+                      f"尝试从网络下载模型（首次需要几分钟）...")
                 self.model = WhisperModel(
                     config.WHISPER_MODEL,
                     device=config.WHISPER_DEVICE,
@@ -182,6 +203,8 @@ class WhisperQueueTranslator:
             self._asr_lock = Lock()
             self._audio_inbox = []      # [(audio, capture_time)]
             self._asr_scheduled = False
+            self._asr_busy = False      # process_iter 在GPU上跑的期间为True（草稿让路）
+            self._idle_flushed = False  # 本轮空闲是否已 flush 过（防每秒空跑 finish）
             self._inbox_dropped = 0     # 硬顶丢块累计（正常永远是0）
             self._inbox_drop_warned = 0
             # 待切换源语言（热键写入；ASR 每批处理前抢占执行，避免 inbox
@@ -460,6 +483,8 @@ class WhisperQueueTranslator:
             return  # 残句没变，上一版草稿还有效
         if time.time() - self._draft_last_time < getattr(config, "DRAFT_MIN_INTERVAL", 1.5):
             return
+        if self._asr_busy:
+            return  # Whisper 正在 GPU 上识别，草稿别去抢卡（p95尖刺的来源之一）
         with self._asr_lock:
             if len(self._audio_inbox) >= 2:
                 return  # 识别已在攒块（GPU被抢），草稿是奢侈品，先让路
@@ -749,6 +774,7 @@ class WhisperQueueTranslator:
         ASR_INBOX_MAX_BLOCKS（≈2分钟，识别线程卡死级别的异常）才丢最旧
         的块保内存。注意"不丢词"指的是这一级：采集侧 audio_capture 的
         audio_queue(maxsize=10) 在处理线程堵死时仍会丢并打日志"""
+        self._idle_flushed = False  # 有新音频了，空闲flush兜底重新武装
         with self._asr_lock:
             self._audio_inbox.append((audio_data, capture_time))
             cap = getattr(config, "ASR_INBOX_MAX_BLOCKS", 240)
@@ -910,7 +936,11 @@ class WhisperQueueTranslator:
 
             self.processor.insert_audio_chunk(audio_data)
 
-        committed, unstable = self.processor.process_iter()
+        self._asr_busy = True  # 草稿翻译看这个标志让路（识别在GPU上跑的期间）
+        try:
+            committed, unstable = self.processor.process_iter()
+        finally:
+            self._asr_busy = False
         self._last_unstable = unstable
 
         self._append_committed(committed)
@@ -977,6 +1007,9 @@ class WhisperQueueTranslator:
         和translate()跑在同一个单线程池里，天然串行。"""
         if time.time() - self.last_audio_time < config.IDLE_FLUSH_SEC:
             return
+        if self._idle_flushed:
+            return  # 这轮空闲已经冲干净了，没有新音频前每秒空跑 finish 纯浪费
+        self._idle_flushed = True
 
         tail = self.processor.finish()
         self._append_committed(tail)
@@ -1029,6 +1062,12 @@ class WhisperQueueTranslator:
         只卸"/api/ps 里确实加载着、且名字是本程序配置"的模型——对未加载的
         模型发 keep_alive=0 会先触发一次完整加载（纯浪费退出时间），
         用户自己跑的无关模型更不能碰。"""
+        # 启动预热若还在飞，先等它落地（有界3秒）：预热请求在卸载**之后**
+        # 完成会把模型重新留驻2小时——"加载中途退出"的窗口期正好撞上
+        t = _warm_thread
+        if t is not None and t.is_alive():
+            t.join(timeout=3)
+
         ours = {config.OLLAMA_MODEL, getattr(config, "GAME_MODE_OLLAMA_MODEL", None)}
         try:
             loaded = self.ollama_session.get(

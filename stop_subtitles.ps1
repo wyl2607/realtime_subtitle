@@ -4,9 +4,12 @@ Set-Location $PSScriptRoot
 
 $pidFile = "$PSScriptRoot\subtitle.pid"
 $stopFlag = "$PSScriptRoot\.stop"
-# 优雅退出正常1-2秒（积压任务直接丢弃、在飞流式翻译会被打断）；
-# 3秒还没退干净说明卡住了（GPU被抢时一次识别最坏~2.5秒），直接强杀无害
-$graceSeconds = 3
+# 优雅退出正常1-2秒（积压任务直接丢弃、在飞流式翻译会被打断），但
+# .stop轮询0.5s+在飞识别(GPU被抢最坏~2.5s)+Ollama卸载HTTP(~1-2s)叠加时
+# 会顶到3秒边缘（2026-07-20实测3次停止2次超时强杀）。放到5秒：退得快
+# 照样立即返回（250ms一查），超时强杀仍无害（模型卸载有下面的HTTP兜底，
+# 只丢最近15秒内的窗口位置变更）
+$graceSeconds = 5
 $stopped = $false
 
 function Wait-ProcessExit {
@@ -81,19 +84,30 @@ if ($ollamaUp) {
     # 只卸载「确实加载着」的本项目模型（/api/ps），不碰其它程序的模型；
     # 什么都没加载时连 python 都不用起，停止更快
     $loaded = @()
-    try { $loaded = @((Invoke-RestMethod -Uri "http://127.0.0.1:11434/api/ps" -TimeoutSec 3).models.name) } catch {}
-    if ($loaded) {
+    $psOk = $false
+    try {
+        $loaded = @((Invoke-RestMethod -Uri "http://127.0.0.1:11434/api/ps" -TimeoutSec 3).models.name)
+        $psOk = $true
+    } catch {
+        Write-Host "查询 Ollama 已加载模型失败，跳过卸载（显存最多占用到 keep_alive 到期）"
+    }
+    if ($psOk -and $loaded) {
         $models = & "$PSScriptRoot\venv\Scripts\python.exe" -c "import config; print(config.OLLAMA_MODEL); print(config.GAME_MODE_OLLAMA_MODEL)" 2>$null
         foreach ($m in ($models -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique)) {
-            if ($loaded -contains $m) {
+            # 名字精确匹配 + 前缀匹配：config 写 "qwen3.5" 时 /api/ps 可能报
+            # "qwen3.5:latest"，只做 -contains 会漏卸
+            $hit = $loaded | Where-Object { $_ -eq $m -or $_ -like "$m`:*" }
+            foreach ($h in $hit) {
                 try {
                     # prompt留空 + keep_alive=0 = 立即卸载（官方用法）
                     Invoke-RestMethod -Uri "http://127.0.0.1:11434/api/generate" -Method Post `
                         -ContentType "application/json" `
-                        -Body (@{ model = $m; prompt = ""; keep_alive = 0 } | ConvertTo-Json -Compress) `
-                        -TimeoutSec 15 | Out-Null
-                    Write-Host "已卸载 Ollama 常驻模型 $m"
-                } catch {}
+                        -Body (@{ model = $h; prompt = ""; keep_alive = 0 } | ConvertTo-Json -Compress) `
+                        -TimeoutSec 20 | Out-Null
+                    Write-Host "已卸载 Ollama 常驻模型 $h"
+                } catch {
+                    Write-Host "卸载 $h 失败（Ollama 正忙？显存最多占用到 keep_alive 到期）"
+                }
             }
         }
     }

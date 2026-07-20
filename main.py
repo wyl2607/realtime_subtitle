@@ -85,15 +85,20 @@ class SubtitleApp:
             msg = "⏳ 正在加载识别/翻译模型（约10-30秒）…"
             self.subtitle_window.show_status(msg)
             while not done.wait(4):
+                if self._closing:
+                    return  # 退出中别再往正在拆的窗口发信号
                 self.subtitle_window.show_status(msg)
 
         threading.Thread(target=_ticker, daemon=True, name="LoadTicker").start()
+        # 用户在加载的十几秒里随时可能点❌/跑停止脚本（stop()在主线程执行）。
+        # 屏障策略：每个"会启动新活动"的步骤前都重查 _closing；translator 的
+        # 线程池是非daemon线程，凡是建出来了就必须 shutdown，否则进程退不掉
+        # （残余毫秒级窗口由停止脚本的超时强杀+Ollama卸载兜底，不追求零竞态）
+        translator = None
         try:
             # 翻译器（Whisper 模型 + Ollama 预热，启动耗时大头）
             translator = WhisperQueueTranslator()
             if self._closing:
-                # 加载期间用户已退出：把刚建的线程池关掉（非daemon线程，
-                # 不关会拖住进程退出直到停止脚本3秒强杀）
                 translator.shutdown()
                 return
 
@@ -103,15 +108,20 @@ class SubtitleApp:
             translator.on_pair = self.subtitle_window.add_pair
             translator.on_draft = self.subtitle_window.update_draft
             translator.on_status = self.subtitle_window.show_status
-            self.translator = translator
+            self.translator = translator  # 此后 stop() 会负责 shutdown 它
             # 点词查词：窗口点击→translator查Ollama→回调线程安全地弹结果
             self.subtitle_window.on_lookup = lambda word, ctx: self.translator.lookup_word(
                 word, ctx, self.subtitle_window.show_lookup_result)
 
-            # 音频捕获（设备名/设备切换提示直接上悬浮窗）
-            self.audio_capture = AudioCapture(
+            # 音频捕获（设备名/设备切换提示直接上悬浮窗）。构造要开WASAPI流，
+            # 有几百毫秒窗口，之后再查一次 _closing 才真正启动采集/热键
+            audio_capture = AudioCapture(
                 callback=self.on_audio_received,
                 on_status=self.subtitle_window.show_status)
+            if self._closing:
+                audio_capture.stop()
+                return
+            self.audio_capture = audio_capture
 
             print("✅ 所有组件初始化完成")
             self.running = True
@@ -122,7 +132,18 @@ class SubtitleApp:
             print(f"❌ 初始化失败: {e}")
             import traceback
             traceback.print_exc()
-            self.subtitle_window.show_status(f"❌ 启动失败: {e}（详见 subtitle.log）")
+            # 失败也要把已建的线程池/模型收掉：不收的话 Whisper 白占显存、
+            # 非daemon线程拖住进程退出（shutdown 重入无害，stop()再调也没事）
+            if translator is not None:
+                try:
+                    translator.shutdown()
+                except Exception:
+                    pass
+                self.translator = None
+                self.subtitle_window.on_lookup = None
+            # status 5秒自清，失败信息要用live行持久显示（不会有识别来覆盖它）
+            self.subtitle_window.update_live(
+                f"❌ 启动失败: {e}", "详见 subtitle.err.log / subtitle.log，可发给AI排查；点❌退出")
             return
         finally:
             done.set()

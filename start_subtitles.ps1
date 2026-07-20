@@ -97,8 +97,8 @@ $proc.Id | Out-File -FilePath $pidFile -Encoding ascii
 Write-Host "已启动 (PID $($proc.Id))，运行日志: subtitle.log"
 if ($firstRun) {
     Write-Host ""
-    Write-Host "⏬ 首次启动：正在后台下载语音识别模型（1-3GB，视网速需要几分钟）。"
-    Write-Host "   下载完成前不会有任何窗口出现——这不是没启动，请耐心等待。"
+    Write-Host "⏬ 首次启动：字幕悬浮窗几秒内会先出现（带加载提示），同时在后台"
+    Write-Host "   下载语音识别模型（1-3GB，视网速需要几分钟），下载完自动就绪。"
     Write-Host "   想看进度：用记事本打开本目录的 subtitle.log。"
     Write-Host "   （中国大陆网络若长时间无进展，参见 CLAUDE.md 的 HF_ENDPOINT 镜像设置）"
     Start-Sleep -Seconds 10  # 首次启动多留几秒让人读完上面这段
