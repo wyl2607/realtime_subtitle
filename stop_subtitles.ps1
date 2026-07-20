@@ -69,16 +69,34 @@ if (-not $stopped) {
 # 模型会按 keep_alive（默认可长达数小时）继续占着显存/内存，
 # llama-server.exe 表现就是“关了字幕但内存没释放”。
 # 只卸载模型，不杀 ollama serve 本身，下次启动还是秒开。
-$ollamaDir = "$env:LOCALAPPDATA\Programs\Ollama"
-if (Test-Path $ollamaDir) { $env:Path = "$ollamaDir;$env:Path" }
-$ollamaExe = (Get-Command ollama -ErrorAction SilentlyContinue).Source
-if (-not $ollamaExe -and (Test-Path "$ollamaDir\ollama.exe")) { $ollamaExe = "$ollamaDir\ollama.exe" }
-if ($ollamaExe) {
-    $models = & "$PSScriptRoot\venv\Scripts\python.exe" -c "import config; print(config.OLLAMA_MODEL); print(config.GAME_MODE_OLLAMA_MODEL)" 2>$null
-    foreach ($m in ($models -split "`n" | Where-Object { $_.Trim() } | Select-Object -Unique)) {
-        & $ollamaExe stop $m.Trim() 2>$null | Out-Null
+# ☠️ 不能用 `ollama stop` CLI：Ollama 服务没在运行时它会自己拉起服务并
+# 无限期等待（实测挂 3 分钟不返回）——开机后程序没启动就点停止脚本，
+# 窗口就永远关不掉。改走 HTTP：服务不可达 2 秒即知、直接跳过。
+$ollamaUp = $false
+try {
+    Invoke-RestMethod -Uri "http://127.0.0.1:11434/api/version" -TimeoutSec 2 | Out-Null
+    $ollamaUp = $true
+} catch {}
+if ($ollamaUp) {
+    # 只卸载「确实加载着」的本项目模型（/api/ps），不碰其它程序的模型；
+    # 什么都没加载时连 python 都不用起，停止更快
+    $loaded = @()
+    try { $loaded = @((Invoke-RestMethod -Uri "http://127.0.0.1:11434/api/ps" -TimeoutSec 3).models.name) } catch {}
+    if ($loaded) {
+        $models = & "$PSScriptRoot\venv\Scripts\python.exe" -c "import config; print(config.OLLAMA_MODEL); print(config.GAME_MODE_OLLAMA_MODEL)" 2>$null
+        foreach ($m in ($models -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique)) {
+            if ($loaded -contains $m) {
+                try {
+                    # prompt留空 + keep_alive=0 = 立即卸载（官方用法）
+                    Invoke-RestMethod -Uri "http://127.0.0.1:11434/api/generate" -Method Post `
+                        -ContentType "application/json" `
+                        -Body (@{ model = $m; prompt = ""; keep_alive = 0 } | ConvertTo-Json -Compress) `
+                        -TimeoutSec 15 | Out-Null
+                    Write-Host "已卸载 Ollama 常驻模型 $m"
+                } catch {}
+            }
+        }
     }
-    Write-Host "已卸载 Ollama 常驻模型"
 }
 
 # 清掉暂停/停止标记，避免下次启动误判

@@ -62,12 +62,14 @@ if (-not (Test-OllamaReady)) {
     }
 }
 
-# 翻译模型名从 config 读（config_local.py 里可能配了小模型），不要硬编码
-$txModel = & "$PSScriptRoot\venv\Scripts\python.exe" -c "import config; print(config.OLLAMA_MODEL)"
+# 模型名从 config 读（config_local.py 里可能配了小模型），不要硬编码。
+# 一次 python 调用读两个值：venv python 冷启动约0.5秒，起两次纯浪费
+$cfg = @((& "$PSScriptRoot\venv\Scripts\python.exe" -c "import config; print(config.OLLAMA_MODEL); print(config.WHISPER_MODEL)") -split "`n" | ForEach-Object { $_.Trim() })
+$txModel = $cfg[0]
 
 # 首次启动检测：Whisper 模型还没下载过（HF 缓存里没有）就明确告知要等几分钟。
 # Hidden 启动 + 下载无进度条，不提示的话新用户会以为"双击没反应"
-$whisperModel = (& "$PSScriptRoot\venv\Scripts\python.exe" -c "import config; print(config.WHISPER_MODEL)").Trim()
+$whisperModel = $cfg[1]
 $hfHome = if ($env:HF_HOME) { $env:HF_HOME } else { Join-Path $env:USERPROFILE ".cache\huggingface" }
 $firstRun = -not (Get-ChildItem (Join-Path $hfHome "hub") -Directory -Filter "models--*whisper*" -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -like "*$whisperModel*" })
@@ -101,5 +103,5 @@ if ($firstRun) {
     Write-Host "   （中国大陆网络若长时间无进展，参见 CLAUDE.md 的 HF_ENDPOINT 镜像设置）"
     Start-Sleep -Seconds 10  # 首次启动多留几秒让人读完上面这段
 } else {
-    Write-Host "模型加载需要半分钟左右，字幕悬浮窗随后出现。这个窗口马上自动关闭。"
+    Write-Host "字幕悬浮窗几秒内出现，模型在后台继续加载（悬浮窗上有进度提示）。这个窗口马上自动关闭。"
 }

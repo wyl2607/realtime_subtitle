@@ -18,7 +18,7 @@ import os
 import time
 import re
 import queue
-from threading import Lock
+from threading import Lock, Thread
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque, OrderedDict
 
@@ -72,6 +72,23 @@ def _squash_repeats(sentences, keep_words=3, keep_sents=2):
         out.append(s)
     return out
 
+def _startup_warm_ollama():
+    """启动时后台预热翻译模型（prompt 留空 = Ollama 只加载不生成，官方用法）。
+
+    刻意用独立的 requests.post 而不是 self.ollama_session：这个线程和
+    __init__ 里的健康检查/后续翻译并发，requests.Session 跨线程并发不安全。"""
+    try:
+        t0 = time.time()
+        requests.post(
+            f"{config.OLLAMA_BASE_URL}/api/generate",
+            json={"model": config.OLLAMA_MODEL, "prompt": "", "keep_alive": "2h"},
+            timeout=120,  # 冷加载可能要十几秒，网络栈慢时再宽些
+        ).close()
+        print(f"🔥 翻译模型 {config.OLLAMA_MODEL} 后台预热完成 {time.time() - t0:.1f}秒")
+    except Exception:
+        pass  # Ollama 不可达由 __init__ 的健康检查负责提示
+
+
 _WhisperModel = None  # set by _ensure_ml_deps()
 
 
@@ -120,14 +137,34 @@ class WhisperQueueTranslator:
         print(f"   计算类型: {config.WHISPER_COMPUTE_TYPE}")
 
         start_time = time.time()
+
+        # 并行预热 Ollama 翻译模型：停止脚本会主动卸载模型，所以每次启动
+        # 第一句翻译都要付 5-9 秒冷加载费。趁 Whisper 加载的这十几秒让
+        # Ollama 同时把模型装进显存，首句翻译就是热的。独立线程+独立请求，
+        # 不碰 self（此时实例还没建完）；失败静默——Ollama 不可达时
+        # 下面的健康检查会给出明确提示，这里不重复报
+        Thread(target=_startup_warm_ollama, daemon=True, name="OllamaWarm").start()
+
         WhisperModel = _ensure_ml_deps()
 
         try:
-            self.model = WhisperModel(
-                config.WHISPER_MODEL,
-                device=config.WHISPER_DEVICE,
-                compute_type=config.WHISPER_COMPUTE_TYPE
-            )
+            # 先只认本地缓存：默认路径每次启动都去 HuggingFace 做一轮
+            # etag 检查（实测热缓存下多花 1.4 秒，网络差时是十几秒超时）。
+            # 只有本地没有模型（首次运行）才回落到网络下载
+            try:
+                self.model = WhisperModel(
+                    config.WHISPER_MODEL,
+                    device=config.WHISPER_DEVICE,
+                    compute_type=config.WHISPER_COMPUTE_TYPE,
+                    local_files_only=True,
+                )
+            except Exception:
+                print("   本地没有模型缓存，从网络下载（首次需要几分钟）...")
+                self.model = WhisperModel(
+                    config.WHISPER_MODEL,
+                    device=config.WHISPER_DEVICE,
+                    compute_type=config.WHISPER_COMPUTE_TYPE,
+                )
             self.processor = OnlineASRProcessor(self.model)
 
             # committed 但还没凑成完整句子的德语残句

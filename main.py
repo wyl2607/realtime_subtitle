@@ -39,9 +39,11 @@ os.environ['PYTHONWARNINGS'] = 'ignore'
 # faster-whisper的真实报错也被吞掉了，排障时什么都看不到
 logging.basicConfig(level=logging.ERROR)
 
-# ⚠️ 导入顺序是生死攸关的：translator_queue（内部加载torch）必须在
-# 任何PyQt5导入【之前】。先加载Qt的DLL再初始化torch的c10.dll会直接
-# OSError WinError 1114（DLL初始化例程失败），实测100%复现
+# ⚠️ 导入顺序是生死攸关的：torch 的 c10.dll 必须在任何 PyQt5 导入【之前】
+# 完成初始化，否则 OSError WinError 1114（DLL初始化例程失败），实测100%复现。
+# 现在窗口先显示、模型在后台线程加载（translator 构造被推迟了），所以这里
+# 显式先 import torch 固定 DLL 顺序——别把它挪到 PyQt5 之后，也别删
+import torch  # noqa: F401
 from translator_queue import WhisperQueueTranslator
 from audio_capture import AudioCapture, PAUSE_FLAG_FILE, STOP_FLAG_FILE
 from subtitle_window import SubtitleWindow
@@ -52,47 +54,79 @@ class SubtitleApp:
     """实时字幕应用主类"""
     
     def __init__(self):
-        """初始化应用"""
+        """初始化应用：只建悬浮窗（几秒内可见），模型加载推到后台线程。
+
+        之前是 翻译器(加载模型10-25秒)→窗口→音频 全串行，双击启动后半分钟
+        屏幕上什么都没有，用户以为没启动。现在窗口先出现并显示加载进度，
+        重活在 _load_models 里做完再接线。"""
         self._print_header()
-        
+
         print("🔧 正在初始化组件...")
-        
-        # 初始化翻译器（Qwen + Whisper）
-        try:
-            self.translator = WhisperQueueTranslator()
-        except Exception as e:
-            print(f"❌ 翻译器初始化失败: {e}")
-            sys.exit(1)
-        
-        # 初始化字幕窗口
+        self.running = False
+        self.translator = None
+        self.audio_capture = None
+
+        # 初始化字幕窗口（必须在主线程；QApplication 也在这里面建）
         try:
             self.subtitle_window = SubtitleWindow()
         except Exception as e:
             print(f"❌ 字幕窗口初始化失败: {e}")
             sys.exit(1)
-        
-        # 接线：识别提交的德语立即上屏（live行），翻译完成变句对
-        # 两个回调都走Qt信号，从任何线程调都安全
-        self.translator.on_display = self.subtitle_window.update_live
-        self.translator.on_pair = self.subtitle_window.add_pair
-        self.translator.on_draft = self.subtitle_window.update_draft
-        self.translator.on_status = self.subtitle_window.show_status
-        # 点词查词：窗口点击→translator查Ollama→回调线程安全地弹结果
-        self.subtitle_window.on_lookup = lambda word, ctx: self.translator.lookup_word(
-            word, ctx, self.subtitle_window.show_lookup_result)
 
-        # 初始化音频捕获（设备名/设备切换提示直接上悬浮窗）
+    def _load_models(self):
+        """后台线程：加载 Whisper/Ollama + 音频采集，完成后接线并启动。
+
+        窗口的 status 提示 5 秒自动清除，加载要十几秒，所以循环重发；
+        这里所有对窗口的调用都走 Qt 信号（show_status 等），线程安全。"""
+        import threading
+        done = threading.Event()
+
+        def _ticker():
+            msg = "⏳ 正在加载识别/翻译模型（约10-30秒）…"
+            self.subtitle_window.show_status(msg)
+            while not done.wait(4):
+                self.subtitle_window.show_status(msg)
+
+        threading.Thread(target=_ticker, daemon=True, name="LoadTicker").start()
         try:
+            # 翻译器（Whisper 模型 + Ollama 预热，启动耗时大头）
+            translator = WhisperQueueTranslator()
+            if self._closing:
+                # 加载期间用户已退出：把刚建的线程池关掉（非daemon线程，
+                # 不关会拖住进程退出直到停止脚本3秒强杀）
+                translator.shutdown()
+                return
+
+            # 接线：识别提交的德语立即上屏（live行），翻译完成变句对
+            # 两个回调都走Qt信号，从任何线程调都安全
+            translator.on_display = self.subtitle_window.update_live
+            translator.on_pair = self.subtitle_window.add_pair
+            translator.on_draft = self.subtitle_window.update_draft
+            translator.on_status = self.subtitle_window.show_status
+            self.translator = translator
+            # 点词查词：窗口点击→translator查Ollama→回调线程安全地弹结果
+            self.subtitle_window.on_lookup = lambda word, ctx: self.translator.lookup_word(
+                word, ctx, self.subtitle_window.show_lookup_result)
+
+            # 音频捕获（设备名/设备切换提示直接上悬浮窗）
             self.audio_capture = AudioCapture(
                 callback=self.on_audio_received,
                 on_status=self.subtitle_window.show_status)
+
+            print("✅ 所有组件初始化完成")
+            self.running = True
+            self.audio_capture.start()
+            self._print_usage()
+            self._setup_hotkey()
         except Exception as e:
-            print(f"❌ 音频捕获初始化失败: {e}")
-            sys.exit(1)
-        
-        # 识别/翻译线程池都由translator自己管理（收件箱合并模式，永不丢块）
-        self.running = False
-        print("✅ 所有组件初始化完成")
+            print(f"❌ 初始化失败: {e}")
+            import traceback
+            traceback.print_exc()
+            self.subtitle_window.show_status(f"❌ 启动失败: {e}（详见 subtitle.log）")
+            return
+        finally:
+            done.set()
+        self.subtitle_window.show_status("✅ 字幕已就绪，播放德语音视频即可")
     
     def _print_header(self):
         """打印启动标题"""
@@ -260,8 +294,11 @@ class SubtitleApp:
         self.translator.request_flush()
 
     def _stop_flag_check(self):
-        """停止脚本写 .stop 文件后，在此优雅退出（关线程池/模型，再退 Qt）"""
-        if not self.running:
+        """停止脚本写 .stop 文件后，在此优雅退出（关线程池/模型，再退 Qt）。
+
+        不看 self.running：模型还在后台加载时（running 还没置 True）
+        停止脚本也应该能把程序关掉，而不是干等 3 秒被强杀"""
+        if self._closing:
             return
         if not os.path.exists(STOP_FLAG_FILE):
             return
@@ -274,28 +311,20 @@ class SubtitleApp:
         self.subtitle_window.app.quit()
 
     def start(self):
-        """启动应用"""
+        """启动应用：主线程立刻进 Qt 事件循环（窗口马上可见），
+        模型/音频在后台线程加载完自行启动（_load_models）"""
         print("\n🚀 正在启动应用...")
-        self.running = True
+        self._closing = False
         # 启动前清掉残留停止标记，避免立刻又退
         try:
             if os.path.exists(STOP_FLAG_FILE):
                 os.remove(STOP_FLAG_FILE)
         except OSError:
             pass
-        
-        # 启动音频捕获
-        try:
-            self.audio_capture.start()
-        except Exception as e:
-            print(f"❌ 音频捕获启动失败: {e}")
-            sys.exit(1)
-        
-        # 打印使用提示
-        self._print_usage()
 
-        # 注册全局暂停快捷键
-        self._setup_hotkey()
+        # 后台加载模型（daemon：用户加载期间退出时不挡进程结束）
+        import threading
+        threading.Thread(target=self._load_models, daemon=True, name="ModelLoader").start()
 
         # 尾句兜底定时器（跑在Qt主线程，每秒检查一次）
         self._flush_timer = QTimer()
@@ -318,10 +347,11 @@ class SubtitleApp:
             self.stop()
     
     def stop(self):
-        """停止应用"""
-        if not self.running:
+        """停止应用（模型加载中途退出时 translator/audio 可能还是 None）"""
+        if getattr(self, '_closing', False):
             return
-        
+        self._closing = True
+
         print("\n⏹️  正在停止应用...")
         self.running = False
 
@@ -337,14 +367,16 @@ class SubtitleApp:
             ctypes.windll.user32.PostThreadMessageW(self._hotkey_tid, 0x0012, 0, 0)
 
         # 先停止音频捕获，避免向已关闭的线程池提交新任务
-        try:
-            self.audio_capture.stop()
-        except Exception as e:
-            print(f"⚠️  停止音频捕获时出错: {e}")
+        if self.audio_capture is not None:
+            try:
+                self.audio_capture.stop()
+            except Exception as e:
+                print(f"⚠️  停止音频捕获时出错: {e}")
 
         # 优雅地关闭识别/翻译线程（translator内部先ASR后翻译）
-        print("   - 正在关闭识别与翻译线程...")
-        self.translator.shutdown()
+        if self.translator is not None:
+            print("   - 正在关闭识别与翻译线程...")
+            self.translator.shutdown()
 
         # 清掉停止标记（若仍在）
         try:
