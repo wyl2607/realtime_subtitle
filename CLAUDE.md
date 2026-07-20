@@ -140,7 +140,9 @@ install.ps1 按显存自动生成的默认档位：
 
 7. **字幕全德语没中文** = Ollama 没跑或模型没拉。`ollama list` 查，
    subtitle.log 里有明确提示。翻译请求带 `keep_alive="2h"`，正常使用中模型
-   不会被卸载；停止脚本会主动 `ollama stop` 释放显存。
+   不会被卸载；优雅退出/停止脚本会通过 HTTP `keep_alive=0` 主动卸载释放
+   显存（☠️ 别改回 `ollama stop` CLI——Ollama 服务没运行时它会自己拉起
+   服务并无限期等待，停止脚本窗口永远关不掉，2026-07-20 实测）。
 8. **抓不到声音**：跟的是系统「默认播放设备」的 loopback。用户换了耳机/音箱
    约 5 秒内自动热切换；蓝牙设备偶尔注册成通信设备导致抓不到，⚙️ 面板
    「设备名包含」填设备名子串即可。
@@ -190,7 +192,8 @@ transcripts/          字幕存档（每天一个文件）
 1. `venv\Scripts\python -c "import config; print(config.WHISPER_MODEL, config.OLLAMA_MODEL)"`
    输出与硬件档位相符。
 2. `ollama list` 里有配置对应的模型。
-3. 双击"启动字幕.bat"→ 半分钟内屏幕下方出现悬浮窗。
+3. 双击"启动字幕.bat"→ 几秒内屏幕下方出现悬浮窗（带"⏳正在加载"提示），
+   10-30 秒后提示变"✅已就绪"（模型在后台加载，翻译模型同时并行预热）。
 4. 放一段德语视频（YouTube 搜 "tagesschau"）：德语白字先上屏，中文 1-3 秒
    内跟上。
 5. `nvidia-smi` 显存占用符合预期档位；`ollama ps` 显示 100% GPU（有 N 卡时）。

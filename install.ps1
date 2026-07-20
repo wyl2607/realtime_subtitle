@@ -266,8 +266,9 @@ foreach ($pair in $batTemplate) {
     [System.IO.File]::WriteAllText((Join-Path $shortcutDir $pair[0]), $head + $tail, (New-Object System.Text.UTF8Encoding $false))
 }
 @"
-双击"启动字幕.bat"开始（首次启动会自动下载语音识别模型，需要几分钟）。
-播放任何德语视频/直播，屏幕下方会出现双语字幕悬浮窗。
+双击"启动字幕.bat"开始：字幕悬浮窗几秒内出现（带加载提示），模型在
+后台加载 10-30 秒后就绪（首次启动还会自动下载语音识别模型，需要几分钟）。
+播放任何德语视频/直播，悬浮窗里就会出现双语字幕。
 
 悬浮窗操作：
   - 鼠标拖动窗口任意位置 = 移动
