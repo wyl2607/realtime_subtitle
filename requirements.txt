@@ -9,7 +9,7 @@ numpy>=1.24.0,<3.0.0            # 数值计算
 # CUDA 运行库（缺了程序起不来！）
 # Windows下ctranslate2按名字LoadLibraryA加载cublas64_12.dll，
 # translator_queue.py 会把 nvidia.cublas 包的 bin 目录塞进 PATH
-nvidia-cublas-cu12>=12.0
+nvidia-cublas-cu12>=12.9.2.10
 nvidia-cudnn-cu12>=9.0
 
 # 音频处理
