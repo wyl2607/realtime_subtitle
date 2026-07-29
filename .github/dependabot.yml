@@ -1,0 +1,36 @@
+# Dependency update policy.
+#
+# Added 2026-07-29. Before this, 22 of 24 active repos had no version-update
+# config at all — only GitHub's automatic security updates, which cover
+# published CVEs and nothing else. Routine upgrades therefore never happened,
+# and several repos drifted far enough that the first "security" bump was also
+# a major-version jump.
+#
+# Grouping is deliberate: ungrouped patch churn is what trains people to stop
+# reading dependency PRs.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(actions)"
+    groups:
+      actions:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      pip-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
