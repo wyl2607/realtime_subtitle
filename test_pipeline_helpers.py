@@ -3,6 +3,8 @@
 运行: venv\\Scripts\\python.exe -m pytest test_pipeline_helpers.py -q
   或: venv\\Scripts\\python.exe test_pipeline_helpers.py
 """
+import re
+
 import numpy as np
 
 import config
@@ -798,3 +800,45 @@ def test_asr_inbox_hard_cap(monkeypatch):
         t2.enqueue_audio(np.zeros(16, dtype=np.float32), float(i))
     assert len(t2._audio_inbox) == 10
     assert t2._inbox_dropped == 0
+
+
+def test_translator_note_is_stripped():
+    """☠️ 2026-08-02 ZDF 实测：句子被截断时模型会追加一整段"（注：建议补全
+    后半句…）"到字幕条上。prompt 里已经禁止，这里是兜底剥离。"""
+    from translator_queue import _strip_translator_note
+
+    assert _strip_translator_note(
+        "美国总统特朗普就伊朗……（注：根据上下文，此处为新闻播报风格，建议补全后半句）"
+    ) == "美国总统特朗普就伊朗……"
+    # num_predict 截断导致右括号丢失，一样要剥
+    assert _strip_translator_note("他来了。（译注：此处原文不完整") == "他来了。"
+    assert _strip_translator_note("他来了。(注: 原文如此)") == "他来了。"
+    # 正常译文一个字都不能动
+    assert _strip_translator_note("该市缺乏足够的运尸车。") == "该市缺乏足够的运尸车。"
+    assert _strip_translator_note("他说（笑），这不可能。") == "他说（笑），这不可能。"
+    # 整条都是译注：宁可原样显示，也不要给个空白字幕
+    only_note = "（注：无法翻译）"
+    assert _strip_translator_note(only_note) == only_note
+
+
+def test_prompt_forbids_translating_the_context():
+    """☠️ 2026-08-02 ZDF 实测：半句片段会让模型把整段上下文重翻一遍上屏
+    （3/3 复现，74字 vs 应有的15字）——用户看到刚读过的几句又滚一遍。
+    三条硬约束必须在 prompt 里，别在"精简 prompt"时被顺手删掉。"""
+    payloads = []
+
+    class _Session:
+        def post(self, url, json=None, stream=None, timeout=None):
+            payloads.append(json)
+            return _FakeStreamResponse([{"response": "好", "done": True}])
+
+    t = _translator_for_tx(ollama_session=_Session())
+    t._translate_single_sentence("und der Corona-Pandemie.", "Hinter der Französischen Revolution.")
+
+    prompt = payloads[-1]["prompt"]
+    assert "不要翻译上下文里的句子" in prompt
+    assert "只翻这半句" in prompt
+    assert "24小时制" in prompt
+    # 规则编号必须连续，不能出现两个"4."（语域各3条 + 通用4条 = 1..7）
+    nums = re.findall(r'^(\d+)\. ', prompt, flags=re.M)
+    assert nums == [str(i) for i in range(1, len(nums) + 1)], f"规则编号断了: {nums}"

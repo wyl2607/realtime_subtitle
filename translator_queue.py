@@ -45,6 +45,19 @@ def _ends_with_terminator(text):
     return bool(text) and text.rstrip().rstrip(_QUOTE_CHARS).endswith((".", "!", "?", "…"))
 
 
+# 模型偶尔在译文后面追加"（注：……）"——句子被截断时最容易触发（实测
+# "US-Präsident Trump hat dem Iran..." 收到一整段"建议补全后半句"的说明）。
+# prompt 里已经明说不要加，这里是兜底：字幕条上多这么一坨没人想看。
+# num_predict 截断会让右括号丢掉，所以右括号是可选的。
+_TRANSLATOR_NOTE = re.compile(r'[（(]\s*(?:译注|注|说明|备注)\s*[：:][^）)]*[）)]?\s*$')
+
+
+def _strip_translator_note(text):
+    """去掉译文末尾的译注；如果整条都是译注就原样返回（宁可多显示不可显示空白）。"""
+    cleaned = _TRANSLATOR_NOTE.sub("", text).strip()
+    return cleaned or text.strip()
+
+
 def _boundary_is_real(candidate, remainder, final):
     """这个句号/问号是真句尾，还是 Whisper 打错的？
 
@@ -829,11 +842,19 @@ class WhisperQueueTranslator:
                 style = next(iter(styles.values()), {"role": "字幕翻译", "rules": ""})
             n_rules = len([ln for ln in style["rules"].splitlines() if ln.strip()])
 
+            # 下面三条是所有语域共有的硬约束，都是实测撞出来的（2026-08-02 ZDF 实测）：
+            # 少了第一条，遇到"Dem Ersten Weltkrieg. und der Corona-Pandemie."这种
+            # 半句片段，模型会把整段上下文重翻一遍上屏（实测 3/3 复现，74字 vs 15字），
+            # 用户看到的是刚读过的几句又滚一遍；第二条挡"（注：建议补全后半句…）"这
+            # 类译注；第三条挡 24 小时制时间（22.15 Uhr 实测 3/3 被翻成"九点十五"）。
             prompt = f"""/no_think 你是{lang_name}{style['role']}。请把{lang_name}对白翻译成自然的简体中文。
 
 【要求】
 {style['rules']}
 {n_rules + 1}. 只输出中文翻译，不要解释，不要输出{lang_name}原文
+{n_rules + 2}. 【上下文】只用来帮助理解，绝对不要翻译上下文里的句子——它们已经显示过了
+{n_rules + 3}. 当前对白哪怕只是半句、不完整，也只翻这半句：不要补全、不要加括号注释或说明
+{n_rules + 4}. {lang_name}时间是24小时制、用点分隔（22.15 Uhr = 22点15分），时间和数字不要改
 {glossary_block}
 【{lang_name}上下文（此前的对白）】
 ***
@@ -929,7 +950,7 @@ class WhisperQueueTranslator:
                                     on_partial(partial)
                         translation = re.sub(r'<think>.*?</think>', '', "".join(parts), flags=re.DOTALL)
                         self._note_tx_result(ok=True)
-                        return translation.strip()
+                        return _strip_translator_note(translation)
                     else:
                         print(f"   ⚠️  Ollama 返回错误 (HTTP {response.status_code})，显示德语原文")
                         self._note_tx_result(ok=False)
