@@ -256,6 +256,10 @@ def test_turning_draft_off_clears_visible_draft():
     """关掉草稿开关：屏幕上已经挂着的那条草稿要立刻消失，
     而不是等下一次内容变化（安静段能挂好几分钟）。"""
     win = _window()
+    # 本模块为减少 Qt 启动开销而复用一个窗口；前面的用例可能已经
+    # 留下同名的历史译文（例如也叫“你好”）。清空历史，避免把历史
+    # 中的同名文本误判成当前 live 草稿没有被摘掉。
+    win.sentence_pairs.clear()
     snap = config.DRAFT_TRANSLATION
     try:
         config.DRAFT_TRANSLATION = True

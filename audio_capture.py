@@ -161,6 +161,7 @@ class AudioCapture:
         while self.running:
             p = None
             stream = None
+            resampler = None
             try:
                 # 每次(重)开都用新PyAudio实例：PortAudio设备列表在初始化时
                 # 冻结，旧实例看不到新的默认设备
@@ -202,7 +203,6 @@ class AudioCapture:
                 # ResampleStream 恢复到 90.4dB——喂给 Whisper 的每一帧音频
                 # 本来都叠着一层 -34dB 的宽带噪声。
                 # 只在源采样率≠目标时才需要（相等时下面走原样透传）
-                resampler = None
                 if source_rate != config.SAMPLE_RATE:
                     resampler = soxr.ResampleStream(
                         source_rate, config.SAMPLE_RATE, 1, dtype="float32")
@@ -245,6 +245,11 @@ class AudioCapture:
                             # 暂停期间的块没喂给重采样器，滤波器状态里留了个缺口 →
                             # 恢复时重建一个干净的（代价 μs 级）
                             if resampler is not None:
+                                try:
+                                    resampler.clear()
+                                except Exception:
+                                    pass
+                                resampler = None
                                 resampler = soxr.ResampleStream(
                                     source_rate, config.SAMPLE_RATE, 1, dtype="float32")
                             continue
@@ -308,6 +313,11 @@ class AudioCapture:
             finally:
                 # 无论如何退出/重开都释放音频资源
                 try:
+                    if resampler is not None:
+                        # ResampleStream 持有 nanobind 的 CSoxr 对象；显式
+                        # clear + 丢引用，避免解释器退出时报告 leaked instance。
+                        resampler.clear()
+                        resampler = None
                     if stream is not None:
                         stream.stop_stream()
                         stream.close()
