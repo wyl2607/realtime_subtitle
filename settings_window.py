@@ -28,10 +28,8 @@ TUNING_KEYS = (
     "DRAFT_TEXT_COLOR",
     "UNSTABLE_TEXT_COLOR",
     "FONT_FAMILY",
+    "TRANSLATION_STYLE",
 )
-
-# 游戏模式热键临时改写，保存 tuning 时需豁免（沿用上次已存值）
-_GAME_MODE_TUNING_KEYS = ("CHUNK_SUBMIT_SECONDS", "DRAFT_TRANSLATION")
 
 
 def apply_tuning(tuning):
@@ -58,17 +56,15 @@ def apply_tuning(tuning):
             continue
 
 
-def collect_tuning(*, game_mode_active=False, previous_tuning=None):
-    """从 config 组装 tuning dict；游戏模式期间豁免热键接管的键。"""
-    tuning = {key: getattr(config, key) for key in TUNING_KEYS}
-    if game_mode_active:
-        prev = previous_tuning if isinstance(previous_tuning, dict) else {}
-        for key in _GAME_MODE_TUNING_KEYS:
-            if key in prev:
-                tuning[key] = prev[key]
-            else:
-                tuning.pop(key, None)
-    return tuning
+def collect_tuning():
+    """从 config 组装 tuning dict（原样持久化当前值）。
+
+    以前这里有一套"游戏模式期间豁免 CHUNK_SUBMIT_SECONDS/DRAFT_TRANSLATION"
+    的逻辑——那是"临时开关+退出还原"语义的产物。现在四个模式平等并列、
+    模式值就是用户的当前状态，必须照常存；留着豁免反而会让重启后面板值
+    和恢复出来的模式高亮对不上。
+    """
+    return {key: getattr(config, key) for key in TUNING_KEYS}
 
 
 def apply_text_color(config_key, hex_color):
@@ -104,30 +100,19 @@ def snapshot_defaults():
     return defaults
 
 
-# 场景预设按钮：(config.PRESETS 键, 按钮文案)
-_PRESET_BUTTONS = (
-    ("直播", "📺 直播"),
-    ("看剧", "🎬 看剧"),
-    ("游戏", "🎮 游戏"),
-    ("精听", "🎧 精听"),
-)
-
-# 预设键 → SettingsWindow 控件属性名（滑块 dict 或 QCheckBox 等）
-# 完整性测试与 apply_preset 共用，防以后加键漏接
-PRESET_CONTROL_ATTRS = {
-    "CHUNK_SUBMIT_SECONDS": "chunk_submit_slider",
-    "IDLE_FLUSH_SEC": "idle_flush_slider",
-    "MAX_SENTENCE_PAIRS": "max_pairs_slider",
-    "SHOW_BILINGUAL": "chinese_only_cb",  # 勾选 = 只显中文 = 非双语
-    "DRAFT_TRANSLATION": "draft_cb",
-}
+# 模式 → 图标：面板按钮、悬浮窗常驻指示器、状态提示共用这一份
+MODE_ICONS = {"直播": "📺", "看剧": "🎬", "性能": "⚡", "精听": "🎧"}
+_PRESET_BUTTONS = tuple((name, f"{icon} {name}") for name, icon in MODE_ICONS.items())
 
 class SettingsWindow(DraggableWidget):
     """参数调节窗口"""
 
-    def __init__(self, on_font_change=None, defaults=None):
+    def __init__(self, on_font_change=None, defaults=None, on_mode_change=None):
         super().__init__()
         self._on_font_change = on_font_change  # 显示相关改动 → 字幕/历史重刷样式+重渲染
+        # 模式变更回调（main.py 构造完窗口后挂上 SubtitleApp._apply_mode）：
+        # 面板按钮和"手动改参数变自定义"都通过它走那唯一一个入口
+        self.on_mode_change = on_mode_change
         self.setWindowTitle("⚙️ 参数调节（可拖动）")
         self.setWindowFlags(Qt.WindowStaysOnTopHint)
         # 场景预设 + checkbox/颜色/字体后内容变高；高度放宽，小屏仍可拖看全
@@ -140,21 +125,20 @@ class SettingsWindow(DraggableWidget):
         else:
             self._defaults = snapshot_defaults()
 
-        # 场景预设状态（None=自定义）；游戏模式热键互斥见 set_game_mode
+        # 当前模式（None=自定义，即用户手动拨过滑块）
         self._active_preset = None
         self._applying_preset = False
-        self._game_mode_active = False
         self._preset_buttons = {}  # name -> QPushButton
 
         layout = QVBoxLayout()
 
-        # 场景预设（面板最顶部）
-        preset_group = QGroupBox("场景预设")
+        # 模式（面板最顶部）
+        preset_group = QGroupBox("模式")
         preset_layout = QHBoxLayout()
         for name, label in _PRESET_BUTTONS:
             btn = QPushButton(label)
             btn.setCheckable(True)
-            btn.setToolTip(f"一键应用「{name}」场景参数（仅覆盖节奏/句对/双语/草稿）")
+            btn.setToolTip(f"切换到「{name}」模式（整套套用：节奏/句对/双语/草稿/解码/语域）")
             btn.setStyleSheet(
                 "QPushButton { padding: 6px 10px; }"
                 "QPushButton:checked {"
@@ -408,6 +392,10 @@ class SettingsWindow(DraggableWidget):
         self._mark_custom()
         config.DRAFT_TRANSLATION = bool(checked)
         print(f"📊 草稿中文: {'开' if checked else '关'}")
+        if self._on_font_change:
+            # 关掉时要立刻把已经显示出来的那条草稿摘掉（清理在
+            # _on_display_settings_change 里），不然它会一直挂着
+            self._on_font_change()
 
     def _on_font_family_changed(self, font):
         family = font.family().strip() if font is not None else ""
@@ -430,12 +418,19 @@ class SettingsWindow(DraggableWidget):
     # 场景预设
     # ------------------------------------------------------------------
     def _mark_custom(self):
-        """用户手动改控件 → 清预设高亮。apply_preset 期间跳过。"""
+        """用户手动改控件 → 变"自定义"。应用模式期间跳过。
+
+        这里是唯一一处"主动声明变成自定义"的地方；通知 main 让悬浮窗上的
+        常驻指示器跟着改（指示器不能撒谎说还在某个模式里）。
+        已经在主线程（滑块 valueChanged 回调），直接调不用走信号。
+        """
         if getattr(self, "_applying_preset", False):
             return
         if self._active_preset is not None:
             self._active_preset = None
             self._sync_preset_button_highlight()
+            if self.on_mode_change:
+                self.on_mode_change(None)
 
     def _sync_preset_button_highlight(self):
         """按 _active_preset 刷新按钮 checked 态（高亮）。"""
@@ -454,54 +449,18 @@ class SettingsWindow(DraggableWidget):
         self._sync_preset_button_highlight()
 
     def _on_preset_clicked(self, name):
-        """按钮 clicked 会先 toggle checked；无论成功失败都重同步高亮。"""
-        self.apply_preset(name)
-        self._sync_preset_button_highlight()
+        """模式按钮：只把请求转给 main 的唯一入口 _apply_mode。
 
-    def apply_preset(self, name):
-        """经控件 setValue/setChecked 应用预设，走既有回调写 config。
-
-        游戏模式开启时不应用（热键线程状态，面板不反向关闭）。
-        成功返回 True，互斥/未知名返回 False。
+        面板不再自己动控件（以前那套 apply_preset/_apply_preset_key 的 widget
+        旁路已删）——config 由 _apply_mode 写，控件显示由它回调回来的
+        mode 信号 → _on_mode_applied → refresh_from_config 统一刷。
+        按钮 clicked 自带的 toggle 会被随后的 restore_active_preset 覆盖成正确态。
         """
-        if getattr(self, "_game_mode_active", False):
-            msg = "先按 Ctrl+Alt+G 关闭游戏模式再切预设"
-            print(f"⚠️ {msg}")
-            return False
-        presets = getattr(config, "PRESETS", {}) or {}
-        if name not in presets:
-            print(f"⚠️ 未知预设: {name}")
-            return False
-        params = presets[name]
-        self._applying_preset = True
-        try:
-            for key, val in params.items():
-                self._apply_preset_key(key, val)
-            self._active_preset = name
-            self._sync_preset_button_highlight()
-            print(f"🎬 场景预设: {name}")
-        finally:
-            self._applying_preset = False
-        return True
-
-    def _apply_preset_key(self, key, val):
-        """单键经对应控件写入（不 setattr 绕过 UI）。"""
-        if key == "CHUNK_SUBMIT_SECONDS":
-            info = self.chunk_submit_slider
-            info["slider"].setValue(round(float(val) / info["step"]))
-        elif key == "IDLE_FLUSH_SEC":
-            info = self.idle_flush_slider
-            info["slider"].setValue(round(float(val) / info["step"]))
-        elif key == "MAX_SENTENCE_PAIRS":
-            info = self.max_pairs_slider
-            info["slider"].setValue(round(float(val) / info["step"]))
-        elif key == "SHOW_BILINGUAL":
-            # 勾「只显中文」= 非双语
-            self.chinese_only_cb.setChecked(not bool(val))
-        elif key == "DRAFT_TRANSLATION":
-            self.draft_cb.setChecked(bool(val))
+        if self.on_mode_change:
+            self.on_mode_change(name)
         else:
-            print(f"⚠️ 预设键无面板控件，已跳过: {key}")
+            # 没接线（单测直接 new 的场景）：至少别让按钮高亮撒谎
+            self._sync_preset_button_highlight()
 
     def _reset_defaults(self):
         """恢复到传入的 defaults 快照（config.py + config_local 出厂态）。"""
@@ -538,6 +497,9 @@ class SettingsWindow(DraggableWidget):
         ):
             if key in self._defaults:
                 self.apply_color(key, self._defaults[key], btn)
+
+        if 'TRANSLATION_STYLE' in self._defaults:
+            config.TRANSLATION_STYLE = self._defaults['TRANSLATION_STYLE']
 
         if 'FONT_FAMILY' in self._defaults:
             primary = (self._defaults['FONT_FAMILY'] or "Microsoft YaHei").split(",")[0].strip()
@@ -598,18 +560,4 @@ class SettingsWindow(DraggableWidget):
         self.font_combo.setCurrentFont(QFont(primary))
         self.font_combo.blockSignals(False)
 
-    def set_game_mode(self, active: bool):
-        """游戏模式接管提交节奏 + 草稿中文：禁用控件，避免和热键互相踩。"""
-        self._game_mode_active = bool(active)
-        slider = self.chunk_submit_slider['slider']
-        if active:
-            slider.setEnabled(False)
-            slider.setToolTip("游戏模式接管中(Ctrl+Alt+G)")
-            self.draft_cb.setEnabled(False)
-            self.draft_cb.setToolTip("游戏模式接管中(Ctrl+Alt+G)")
-        else:
-            slider.setEnabled(True)
-            slider.setToolTip("")
-            self.draft_cb.setEnabled(True)
-            self.draft_cb.setToolTip("翻译 worker 空闲时出草稿；游戏模式会强制关闭")
 

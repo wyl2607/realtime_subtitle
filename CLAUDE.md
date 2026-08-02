@@ -151,24 +151,42 @@ install.ps1 按显存自动生成的默认档位：
 10. **main.py 有单实例 Mutex**，双开会自动退出并弹提示框，这是特性不是 bug。
 11. **别在字幕运行时 benchmark 其它 Ollama 模型**：互相把对方挤出显存，测出
     来的全是重加载时间，数据无效。
+12. **音频重采样必须保持滤波器状态**。`audio_capture.py` 用
+    `soxr.ResampleStream`，不是每块调一次无状态的 `soxr.resample()`——后者
+    多相滤波器状态每次归零，等于每 42ms 注入一次瞬变。实测（96k→16k、
+    4096帧/块、纯音频谱能量比）：一次性重采样 90.4dB，逐块无状态只有
+    **34.3dB**。喂给 Whisper 的每一帧都会叠一层噪声底。
+13. **任何"退出前卸载 Ollama 模型"的路径，都要先等在飞的请求落地**。翻译
+    /查词/预热请求都带 `keep_alive="2h"`，只要有一个在 `_unload_our_models()`
+    之后才返回，模型就被重新拉回显存留驻两小时。现在预热线程和查词线程
+    各有一个有界 3 秒的等待（`shutdown()` 里），加新的 Ollama 调用路径时
+    记得一起处理。
+14. **模式系统只有一个写入口**：`main.py::SubtitleApp._apply_mode`。⚙️面板的
+    四个按钮和 Ctrl+Alt+G 都转发到它；面板控件的显示一律靠
+    `refresh_from_config()` 读回，不要再给面板加"自己 setValue 一遍"的旁路
+    （2026-08-02 合并模式系统时删掉的就是那套）。
 
 改代码（如果用户让你改功能）：
 
-12. 改完跑测试：`venv\Scripts\python -m pytest`（50+ 项，以实际输出为准）。test_hittest /
+15. 改完跑测试：`venv\Scripts\python -m pytest`（89 项，以实际输出为准）。test_hittest /
     test_resize_freedom / test_wordclick 是**独立脚本套件**（import 即开真窗口，
     pytest.ini 已把它们排除出收集，別删这个排除），用 `venv\Scripts\python
-    test_hittest.py` 逐个跑。test_ui_polish 的两个 fade 用例对动画计时敏感，
-    全量跑偶发挂、单独重跑即绿，别当回归追。**测试进程 import main.py 会被
+    test_hittest.py` 逐个跑。**测试进程 import main.py 会被
     单实例 Mutex 直接 sys.exit**——参考 test_game_mode.py 顶部先打桩
-    CreateMutexW 的写法。
-13. **Qt 测试必须持模块级 QApplication 引用**，否则被 GC 后建 QWidget 直接
+    CreateMutexW 的写法。UI 动画用例一律用 test_ui_polish.py 的 `_pump_until`
+    等条件成立，别写"固定 pump 若干毫秒再断言"（那样在忙机器上会偶发挂，
+    以前 fade 两个用例就是这么变成"重跑即绿"的假回归的）。
+16. **Qt 测试必须持模块级 QApplication 引用**，否则被 GC 后建 QWidget 直接
     qFatal 秒退（退出码 127、无任何输出，症状像"pytest 静默死"）。参考
     test_settings_sync.py 的 `_app()` + `_APP` 写法。
-14. 悬浮窗是无 QLayout 的手动 setGeometry 布局 + WM_NCHITTEST 原生命中测试，
+17. 悬浮窗是无 QLayout 的手动 setGeometry 布局 + WM_NCHITTEST 原生命中测试，
     半透明窗口有大量反直觉行为（alpha=0 像素鼠标穿透、顶层窗口 setStyleSheet
     底色不上屏等）。动 UI 前先读 window_frame.py / window_chrome.py 的注释
     和 test_hittest.py。
-15. 用户可见文案是中文；代码注释写"为什么"而不是"做什么"，沿用现有风格。
+18. 用户可见文案是中文；代码注释写"为什么"而不是"做什么"，沿用现有风格。
+19. **桌面「操作说明.txt」不要直接改**：正文的单一真相源是
+    `docs/操作说明模板.txt`（install.ps1 用它生成，`{{INSTALL_DIR}}` 会被
+    替换成安装目录）。改说明改模板，否则下次谁跑一次 install 就被覆盖回去。
 
 ## 5. 目录地图
 

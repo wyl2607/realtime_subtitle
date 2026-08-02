@@ -7,20 +7,15 @@ import numpy as np
 
 import config
 from streaming_asr import HypothesisBuffer, OnlineASRProcessor
-from translator_queue import _SENTENCE_END, _interjection_lookup, _squash_repeats
+from translator_queue import (
+    _interjection_lookup, _split_sentences, _squash_repeats,
+)
 
 
-def _extract_sentences(pending_text):
-    """与 WhisperQueueTranslator._extract_sentences 相同逻辑（不实例化翻译器）"""
-    sentences = []
-    rest = pending_text
-    while True:
-        m = _SENTENCE_END.match(rest)
-        if not m:
-            break
-        sentences.append(m.group(1).strip())
-        rest = rest[m.end():].lstrip()
-    return sentences, rest
+def _extract_sentences(pending_text, final=True):
+    """直接调真实切分函数（以前这里复制过一份逻辑，复制必然和实现漂移）。
+    默认 final=True：这几条老用例测的是"切分规则本身"，不测句尾扣留。"""
+    return _split_sentences(pending_text, final=final)
 
 
 def test_sentence_split_on_period():
@@ -45,6 +40,48 @@ def test_sentence_ellipsis():
     sents, rest = _extract_sentences("Warte mal… Okay.")
     assert sents == ["Warte mal…", "Okay."]
     assert rest == ""
+
+
+def test_sentence_merges_lowercase_continuation():
+    """☠️ 最大的效果问题：38.5% 的翻译单元以小写词开头 = 上一句被切开了。
+    德语句首必大写，所以句号后面跟小写词 = Whisper 打错了标点。"""
+    sents, rest = _extract_sentences("Mindestens 67 sind bei dem Versuch. gestorben. Danach kam er.")
+    assert sents == ["Mindestens 67 sind bei dem Versuch. gestorben.", "Danach kam er."]
+    assert rest == ""
+    # 实测那句：否定词在下一段，切开会翻反
+    sents, _ = _extract_sentences("Demnach darf, wer schwimmend bzw. über den Seeweg eintrifft.")
+    assert len(sents) == 1
+
+
+def test_sentence_no_split_on_abbreviation():
+    """德语缩写自带句号：bzw. / z.B. / ca. 后面即使是大写词也不是句尾。"""
+    sents, rest = _extract_sentences("Er kommt bzw. Sie kommt auch. Dann gehen wir.")
+    assert sents == ["Er kommt bzw. Sie kommt auch.", "Dann gehen wir."]
+    assert rest == ""
+
+
+def test_sentence_no_split_on_ordinal_number():
+    """"am 3. Mai" —— 后面的 Mai 是大写（德语名词），只有数字规则能拦住。"""
+    sents, rest = _extract_sentences("Am 3. Mai fahren wir los. Es regnet.")
+    assert sents == ["Am 3. Mai fahren wir los.", "Es regnet."]
+    assert rest == ""
+
+
+def test_sentence_boundary_held_until_next_word():
+    """句尾正好在文本末尾时：final=False 扣留（还不知道下个词是大是小写），
+    final=True（收尾/有界放行）照常成句。"""
+    sents, rest = _split_sentences("Das ist ein Satz.", final=False)
+    assert sents == []
+    assert rest == "Das ist ein Satz."
+
+    sents, rest = _split_sentences("Das ist ein Satz.", final=True)
+    assert sents == ["Das ist ein Satz."]
+    assert rest == ""
+
+    # 已经能看见下一个词（大写）→ 不用等，立刻成句
+    sents, rest = _split_sentences("Das ist ein Satz. Und", final=False)
+    assert sents == ["Das ist ein Satz."]
+    assert rest == "Und"
 
 
 def test_hallucination_blacklist():
@@ -232,6 +269,68 @@ def test_collapse_word_runs_at_ingestion():
     assert OnlineASRProcessor._collapse_word_runs(ok) == ok
 
 
+def test_lookup_only_latest_click_wins():
+    """精听时连点多个词：单线程 worker 排队，过时结果回来会覆盖当前弹窗。
+    只有最后一次点击的结果能上屏（排在前面的连请求都不发）。"""
+    from threading import Lock
+
+    t = _translator_for_tx()
+    t._lookup_cache = __import__("collections").OrderedDict()
+    t._lookup_cache_lock = Lock()
+    t._LOOKUP_CACHE_MAX = 200
+    t._lookup_seq = 0
+    submitted = []
+
+    class _Exec:
+        def submit(self, fn, *a):
+            submitted.append(a)
+    t._lookup_executor = _Exec()
+
+    shown = []
+    cb = lambda w, txt: shown.append(w)
+    t.lookup_word("Haus", "ctx1", cb)
+    t.lookup_word("Baum", "ctx2", cb)
+    t.lookup_word("Auto", "ctx3", cb)
+    assert [a[0] for a in submitted] == ["Haus", "Baum", "Auto"]
+
+    posts = []
+
+    class _Session:
+        def post(self, *a, **kw):
+            posts.append(1)
+            raise AssertionError("过时的查词不该发请求")
+    t.lookup_session = _Session()
+
+    # 前两次已经过时（seq 1、2 < 当前 3）：直接返回，不发请求不回调
+    t._lookup_worker(*submitted[0])
+    t._lookup_worker(*submitted[1])
+    assert shown == [] and posts == []
+
+    # 最后一次是当前的：正常走下去（这里让它走异常分支，只验证会回调）
+    t._lookup_worker(*submitted[2])
+    assert shown == ["Auto"]
+
+
+def test_asr_corrections_are_deterministic(monkeypatch):
+    """专有名词纠错：保留时间戳/前导空格/尾随标点，且必须确定性——
+    相邻两次识别得到相同结果，local agreement 的前缀判定才不受扰动。"""
+    monkeypatch.setattr(config, "ASR_CORRECTIONS",
+                        {"theuta": "Ceuta", "hubschreiber": "Hubschrauber"},
+                        raising=False)
+    words = [(0.0, 0.3, " In"), (0.3, 0.8, " Theuta,"), (0.8, 1.2, " ein"),
+             (1.2, 1.9, " Hubschreiber."), (1.9, 2.2, " ok")]
+    out = OnlineASRProcessor._apply_corrections(words)
+
+    assert [w[2] for w in out] == [" In", " Ceuta,", " ein", " Hubschrauber.", " ok"]
+    assert [(w[0], w[1]) for w in out] == [(w[0], w[1]) for w in words]  # 时间戳不动
+    # 确定性：再跑一遍完全一致（已修正的词不会被二次改写）
+    assert OnlineASRProcessor._apply_corrections(out) == out
+
+    # 没有词表时原样返回
+    monkeypatch.setattr(config, "ASR_CORRECTIONS", {}, raising=False)
+    assert OnlineASRProcessor._apply_corrections(words) == words
+
+
 def test_glossary_substring_still_config_driven():
     # 冒烟：术语表里至少有政治词条，防误删
     assert "AfD" in config.GLOSSARY
@@ -272,12 +371,22 @@ def test_lang_switch_pending_preempts_before_audio_batch():
     t._apply_pending_lang_switch = apply
     t._process_items = lambda items: processed.append(len(items))
 
-    # 第一轮：有 pending lang + 一块音频 → 先切语言再识别；inbox 空后退出
+    # 第一轮：有 pending lang + 一块音频 → 切语言，并【丢弃】这批切换前的音频
+    # （用新语言参数识别旧语言音频会蹦乱词；clear_context 已经把缓冲丢了）
     t._process_inbox()
     assert applied == ["en"], applied
-    assert processed == [1], processed
+    assert processed == [], "切换前抓的旧语言音频不能用新语言识别"
     assert t._pending_lang_switch is None
     assert t._asr_scheduled is False
+
+    # 没有切换标志时，音频照常识别（别把正常路径也一起丢了）
+    applied.clear()
+    processed.clear()
+    t._asr_scheduled = True
+    t._audio_inbox = [("fake_audio", 1.0), ("fake_audio", 2.0)]
+    t._process_inbox()
+    assert applied == []
+    assert processed == [2], processed
 
     # 只有切换、无音频：也应能执行并退出
     applied.clear()
@@ -370,6 +479,271 @@ def test_shutdown_unloads_only_our_loaded_models(monkeypatch):
 
     t.ollama_session = _DeadSession()
     t._unload_our_models()
+
+
+def _translator_for_tx(**overrides):
+    """装配一个够跑 _translate_single_sentence / _enqueue_sentences 的翻译器
+    （不加载 Whisper/不连 Ollama）。
+
+    ☠️ 顺手把模块级 _warm_done 置位：_await_model_ready 在没置位时会真等
+    OLLAMA_WARM_WAIT(60秒)，不置位的话整个测试文件会挂几分钟。"""
+    from threading import Lock
+    import translator_queue as tq
+    from translator_queue import WhisperQueueTranslator
+
+    tq._warm_done.set()
+    t = WhisperQueueTranslator.__new__(WhisperQueueTranslator)
+    t._tx_lock = Lock()
+    t._tx_queue = []
+    t._tx_inflight = []
+    t._tx_epoch = 0
+    t.closing = False
+    t._ollama_hot = False
+    t._warm_notified = False
+    t._tx_fail_streak = 0
+    t._tx_circuit_until = 0.0
+    t._tx_dropped = 0
+    t._tx_drop_warned = 0
+    t._ollama_down_notified = 0.0
+    t.on_status = None
+    for k, v in overrides.items():
+        setattr(t, k, v)
+    return t
+
+
+class _FakeStreamResponse:
+    """Ollama 流式响应的最小替身（status_code / iter_lines / close）。"""
+
+    def __init__(self, chunks, status_code=200):
+        self.status_code = status_code
+        self._chunks = chunks
+        self.closed = False
+
+    def iter_lines(self):
+        import json as _json
+        for c in self._chunks:
+            yield _json.dumps(c).encode()
+
+    def close(self):
+        self.closed = True
+
+
+def test_translate_retries_once_on_read_timeout(monkeypatch):
+    """☠️ 2026-08-02 实测：开机时 Ollama 冷加载 33.8 秒，两句翻译被 15 秒超时
+    直接丢弃且永远不会有中文。现在读超时要重试一次（第二次走冷超时）。"""
+    import requests
+
+    calls = []
+    ok = _FakeStreamResponse([{"response": "你好"}, {"response": "世界", "done": True}])
+
+    class _Session:
+        def post(self, url, json=None, stream=None, timeout=None):
+            calls.append(timeout)
+            if len(calls) == 1:
+                raise requests.ReadTimeout("Read timed out. (read timeout=15)")
+            return ok
+
+    t = _translator_for_tx(ollama_session=_Session())
+    out = t._translate_single_sentence("Hallo Welt.", "")
+
+    assert out == "你好世界"
+    assert len(calls) == 2, "读超时应该重试恰好一次"
+    assert calls[1] == config.OLLAMA_TIMEOUT_COLD, "重试必须用冷超时，否则还是会被切掉"
+    assert ok.closed, "流式连接必须 close，否则不归还连接池"
+    assert t._ollama_hot is True  # 成功一次就算热
+
+
+def test_translate_does_not_retry_connection_error():
+    """☠️ Ollama 没起时绝不能重试：会把单线程翻译 worker 堵住。
+    保持既有行为——快速失败 + 上屏提示 + 降级德语原文。"""
+    import requests
+
+    calls = []
+
+    class _Session:
+        def post(self, *a, **kw):
+            calls.append(1)
+            raise requests.ConnectionError("connection refused")
+
+    notes = []
+    t = _translator_for_tx(ollama_session=_Session(),
+                           on_status=lambda s: notes.append(s))
+    out = t._translate_single_sentence("Hallo Welt.", "")
+
+    assert out == "Hallo Welt."   # 降级德语
+    assert len(calls) == 1        # 只发一次
+    assert notes and "Ollama" in notes[0]
+
+
+def test_translate_cold_then_warm_timeout():
+    """模型没进显存用冷超时(90)，热了以后回到常规超时(15)。"""
+    seen = []
+
+    class _Session:
+        def post(self, url, json=None, stream=None, timeout=None):
+            seen.append(timeout)
+            return _FakeStreamResponse([{"response": "好", "done": True}])
+
+    t = _translator_for_tx(ollama_session=_Session())
+    t._translate_single_sentence("Eins.", "")
+    t._translate_single_sentence("Zwei.", "")
+
+    assert seen == [config.OLLAMA_TIMEOUT_COLD, config.OLLAMA_TIMEOUT]
+
+
+def test_translate_circuit_breaker_stops_requests(monkeypatch):
+    """连续失败到阈值 → 熔断期间一个请求都不发（队列不会因反复超时堆积）。"""
+    import requests
+
+    monkeypatch.setattr(config, "TRANSLATE_FAIL_STREAK_OPEN", 3, raising=False)
+    monkeypatch.setattr(config, "TRANSLATE_CIRCUIT_SEC", 30, raising=False)
+
+    calls = []
+
+    class _Session:
+        def post(self, *a, **kw):
+            calls.append(1)
+            raise requests.ConnectionError("down")
+
+    t = _translator_for_tx(ollama_session=_Session())
+    for _ in range(3):
+        t._translate_single_sentence("Test.", "")
+    assert len(calls) == 3
+    assert t._circuit_open()
+
+    # 熔断中：直接降级，不再发请求
+    out = t._translate_single_sentence("Noch ein Test.", "")
+    assert out == "Noch ein Test."
+    assert len(calls) == 3, "熔断期间不应再发请求"
+
+    # 到期后恢复（下一句正常翻译本身就是探测）
+    t._tx_circuit_until = 0.0
+    t._translate_single_sentence("Wieder da.", "")
+    assert len(calls) == 4
+
+
+def test_tx_queue_hard_cap(monkeypatch):
+    """翻译队列硬顶：丢最旧的句子（它们的德语早滚过去了），保住最新的。"""
+    monkeypatch.setattr(config, "TRANSLATE_QUEUE_MAX_CHARS", 40, raising=False)
+
+    class _Exec:
+        def submit(self, *a, **k):
+            pass
+
+    notes = []
+    t = _translator_for_tx(_tx_executor=_Exec(), on_status=lambda s: notes.append(s))
+    # 每句 8 字符 → 8 句 64 字符；上限 40 → 丢最旧 3 句，留最新 5 句(40字符)
+    t._enqueue_sentences([f"Satz {i:02d}." for i in range(8)])
+
+    assert len(t._tx_queue) == 5
+    assert t._tx_queue[0] == "Satz 03."
+    assert t._tx_queue[-1] == "Satz 07."
+    assert t._tx_dropped == 3
+    assert notes and "丢弃" in notes[0]
+
+
+def test_draft_skipped_while_model_cold():
+    """冷加载期间不出草稿：那唯一一次冷加载要留给正式句子。"""
+    from threading import Lock
+
+    t = _translator_for_tx()
+    t._asr_lock = Lock()
+    t._stats_lock = Lock()
+    t._stat_draft = 0
+    t._audio_inbox = []
+    t._asr_busy = False
+    t._draft_last_text = ""
+    t._draft_last_time = 0.0
+    t.pending_text = "Das ist ein ziemlich langer Satz"
+    submitted = []
+
+    class _Exec:
+        def submit(self, *a, **k):
+            submitted.append(a)
+    t._tx_executor = _Exec()
+    t.on_draft = lambda s: None
+
+    t._ollama_hot = False
+    t._maybe_draft()
+    assert submitted == [], "模型还冷时不该提交草稿任务"
+
+    t._ollama_hot = True
+    t._maybe_draft()
+    assert len(submitted) == 1
+
+
+def test_held_boundary_released_by_flush_without_touching_audio(monkeypatch):
+    """扣留的句尾到点由 flush_pending 放行。
+    ☠️ 放行路径绝不能碰 processor.finish()——那会清掉正在用的音频缓冲，
+    而用户很可能只是句中换了口气，后面还要接着识别。"""
+    import time as _time
+
+    monkeypatch.setattr(config, "SENTENCE_HOLD_SEC", 0.05, raising=False)
+    monkeypatch.setattr(config, "IDLE_FLUSH_SEC", 999.0)  # 永远不到收尾时机
+
+    class _Processor:
+        def __init__(self):
+            self.finished = 0
+
+        def finish(self):
+            self.finished += 1
+            return ""
+
+    t = _translator_for_tx()
+    t.processor = _Processor()
+    t.pending_text = "Das ist ein Satz."
+    t.last_audio_time = _time.time()
+    t._idle_flushed = False
+    t._held_since = 0.0
+    t._last_unstable = ""
+    t.on_display = None
+    enqueued = []
+    t._enqueue_sentences = lambda s: enqueued.extend(s)
+
+    # 第一次切分：句尾在末尾 → 扣留，不出句
+    assert t._extract_sentences() == []
+    assert t._held_since > 0
+    assert t.pending_text == "Das ist ein Satz."
+
+    # 还没到扣留时限：不放行
+    t.flush_pending()
+    assert enqueued == []
+
+    # 到点后放行，且没动音频缓冲
+    _time.sleep(0.06)
+    t.flush_pending()
+    assert enqueued == ["Das ist ein Satz."]
+    assert t.pending_text == ""
+    assert t.processor.finished == 0, "有界放行不能调 processor.finish()"
+
+
+def test_shutdown_waits_for_lookup_before_unloading():
+    """☠️ 查词请求带 keep_alive=2h：卸载模型之后才落地的话会把模型重新拉回
+    显存留驻两小时。shutdown 必须先有界等查词收尾，再卸载——但不能无限等。"""
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor
+
+    order = []
+
+    class _Immediate:
+        def shutdown(self, wait=True, cancel_futures=False):
+            order.append("exec")
+
+    t = _translator_for_tx()
+    t._asr_executor = _Immediate()
+    t._tx_executor = _Immediate()
+    t._lookup_executor = ThreadPoolExecutor(max_workers=1)
+    t._lookup_executor.submit(_time.sleep, 5)  # 假装一次查词卡住了
+    t._unload_our_models = lambda: order.append("unload")
+    t.ollama_session = type("S", (), {"close": lambda self: None})()
+    t.lookup_session = type("S", (), {"close": lambda self: None})()
+
+    t0 = _time.time()
+    t.shutdown()
+    elapsed = _time.time() - t0
+
+    assert order[-1] == "unload", "卸载必须排在等待之后"
+    assert 2.5 < elapsed < 4.5, f"应有界等待约3秒，实测 {elapsed:.1f}s"
 
 
 def test_asr_inbox_hard_cap(monkeypatch):

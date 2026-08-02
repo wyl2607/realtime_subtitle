@@ -265,25 +265,30 @@ foreach ($pair in $batTemplate) {
     }
     [System.IO.File]::WriteAllText((Join-Path $shortcutDir $pair[0]), $head + $tail, (New-Object System.Text.UTF8Encoding $false))
 }
-@"
+# 操作说明从仓库模板生成（单一真相源）。以前正文内联写在这里，加了
+# Ctrl+Alt+M/G、📺电视全屏、点词查词、模式系统之后一直没同步——而且这个
+# 文件每次跑 install 都会覆盖桌面上的那份，等于把新功能说明覆盖没了
+$docTemplate = Join-Path $PSScriptRoot "docs\操作说明模板.txt"
+$docTarget = Join-Path $shortcutDir "操作说明.txt"
+if (Test-Path $docTemplate) {
+    (Get-Content $docTemplate -Raw -Encoding UTF8).Replace("{{INSTALL_DIR}}", $PSScriptRoot) |
+        Out-File -FilePath $docTarget -Encoding utf8
+} else {
+    # 老版本仓库没有模板文件时的兜底（更新到新版后会自动用上模板）
+    @"
 双击"启动字幕.bat"开始：字幕悬浮窗几秒内出现（带加载提示），模型在
 后台加载 10-30 秒后就绪（首次启动还会自动下载语音识别模型，需要几分钟）。
 播放任何德语视频/直播，悬浮窗里就会出现双语字幕。
 
-悬浮窗操作：
-  - 鼠标拖动窗口任意位置 = 移动
-  - 鼠标拖动窗口边缘/四角 = 缩放（窗口越大，显示的历史字幕越多）
-  - ➖ 最小化字幕   📜 历史回看   ⚙️ 参数调节   ❌ 退出
-全局快捷键：
-  - Ctrl+Alt+P 暂停/继续
-  - Ctrl+Alt+L 切换识别语言（德语↔英语）
+悬浮窗操作：鼠标拖动移动/边缘缩放；➖最小化 📜历史 📺电视全屏 ⚙️设置 ❌退出。
+全局快捷键：Ctrl+Alt+P 暂停/继续，Ctrl+Alt+L 切换语言，
+            Ctrl+Alt+M 鼠标穿透，Ctrl+Alt+G 切「性能」模式。
+单击字幕里的德语单词 = 查词。
 
-看完后双击"停止字幕.bat"关闭。
-字幕记录自动保存在程序目录的 transcripts\ 文件夹里。
-
-程序有新版本时（作者说修了 bug/加了功能），双击"更新字幕.bat"即可
-一键更新到最新版，个人配置(config_local.py)和字幕记录不受影响。
-"@ | Out-File -FilePath (Join-Path $shortcutDir "操作说明.txt") -Encoding utf8
+看完后双击"停止字幕.bat"关闭。字幕记录在程序目录的 transcripts\ 里。
+程序有新版本时双击"更新字幕.bat"即可，个人配置和字幕记录不受影响。
+"@ | Out-File -FilePath $docTarget -Encoding utf8
+}
 Write-Host "  ✅ 快捷方式已生成: $shortcutDir"
 
 Write-Host ""

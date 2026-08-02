@@ -67,22 +67,6 @@ def test_refresh_from_config_syncs_sliders_and_labels_without_writeback():
         config.FONT_SIZE = snap_font
 
 
-def test_set_game_mode_toggles_chunk_submit_slider_enabled():
-    _app()
-    win = SettingsWindow()
-    assert win.chunk_submit_slider['slider'].isEnabled()
-    assert win.draft_cb.isEnabled()
-
-    win.set_game_mode(True)
-    assert not win.chunk_submit_slider['slider'].isEnabled()
-    assert not win.draft_cb.isEnabled()
-    assert "游戏模式" in (win.chunk_submit_slider['slider'].toolTip() or "")
-
-    win.set_game_mode(False)
-    assert win.chunk_submit_slider['slider'].isEnabled()
-    assert win.draft_cb.isEnabled()
-
-
 def test_word_popup_show_at_stays_on_screen_near_global_pos():
     """单屏环境下弹窗落在 global_pos 所在屏 availableGeometry 内且贴近点击点。"""
     app = _app()

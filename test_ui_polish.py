@@ -62,6 +62,26 @@ def _pump(n=30, ms_each=20):
         QThread.msleep(ms_each)
 
 
+def _pump_until(pred, timeout_ms=3000):
+    """推进事件循环直到条件成立（或超时）。
+
+    以前这几个淡入淡出用例是"固定 pump 600ms 然后断言"，机器忙一点就
+    偶发挂——CLAUDE.md 里专门写了"重跑即绿别当回归追"。改成等条件成立，
+    断言的契约一点没变（终态必须正确），只是不再赌绝对时间。
+    """
+    from PyQt5.QtCore import QThread
+    app = _app()
+    waited = 0
+    while waited < timeout_ms:
+        app.processEvents()
+        if pred():
+            return True
+        QThread.msleep(10)
+        waited += 10
+    app.processEvents()
+    return pred()
+
+
 def test_chrome_fade_objects_are_reused_not_recreated():
     """动画/效果对象一次创建，反复 hover 仍是同一实例。"""
     win = _window()
@@ -88,7 +108,8 @@ def test_chrome_fade_final_visibility():
     win = _window()
 
     win._set_controls_visible(True)
-    _pump(n=20, ms_each=15)
+    _pump_until(lambda: win._drag_opacity.opacity() >= 0.99
+                and win._btn_opacity.opacity() >= 0.99)
     assert win.drag_bar.isVisible()
     assert win.btn_bar.isVisible()
     assert win._drag_opacity.opacity() >= 0.99
@@ -98,7 +119,7 @@ def test_chrome_fade_final_visibility():
     # 淡出刚开始：仍应 visible（HTCAPTION 门控语义）
     assert win.drag_bar.isVisible()
     assert win.btn_bar.isVisible()
-    _pump(n=30, ms_each=20)
+    _pump_until(lambda: not win.drag_bar.isVisible() and not win.btn_bar.isVisible())
     assert not win.drag_bar.isVisible()
     assert not win.btn_bar.isVisible()
     assert win._drag_opacity.opacity() <= 0.01
@@ -113,7 +134,7 @@ def test_chrome_rapid_toggle_no_crash():
         _app().processEvents()
     # 最后一次 i=9 → False
     win._set_controls_visible(False)
-    _pump(n=30, ms_each=20)
+    _pump_until(lambda: not win.drag_bar.isVisible() and not win.btn_bar.isVisible())
     assert not win.drag_bar.isVisible()
     assert not win.btn_bar.isVisible()
 
@@ -206,3 +227,73 @@ def test_container_system_close_calls_app_quit():
     win.app.quit = lambda: quits.append(True)  # 不真退测试进程
     win.container.closeEvent(QCloseEvent())
     assert quits == [True], "系统关窗应触发 app.quit 走优雅退出"
+
+
+def test_chinese_only_hides_live_german():
+    """勾「只显中文（隐藏德语原文）」时 live 行的德语也要藏。
+    以前只有正式句对遵守这个开关，说话过程中德语照样冒出来，和文案矛盾。"""
+    win = _window()
+    snap = config.SHOW_BILINGUAL
+    try:
+        config.SHOW_BILINGUAL = True
+        win._update_live("Guten Abend", "zusammen")
+        assert "Guten Abend" in win._last_html
+        assert "zusammen" in win._last_html
+
+        config.SHOW_BILINGUAL = False
+        win.live_draft = "晚上好"
+        win._render()
+        assert "Guten Abend" not in win._last_html
+        assert "zusammen" not in win._last_html
+        assert "晚上好" in win._last_html, "藏德语后中文草稿仍要显示，不能整行空白"
+    finally:
+        config.SHOW_BILINGUAL = snap
+        win.live_draft = ""
+        win._update_live("", "")
+
+
+def test_turning_draft_off_clears_visible_draft():
+    """关掉草稿开关：屏幕上已经挂着的那条草稿要立刻消失，
+    而不是等下一次内容变化（安静段能挂好几分钟）。"""
+    win = _window()
+    snap = config.DRAFT_TRANSLATION
+    try:
+        config.DRAFT_TRANSLATION = True
+        win._update_live("Hallo", "")
+        win._update_draft("你好")
+        assert "你好" in win._last_html
+
+        config.DRAFT_TRANSLATION = False
+        win._on_display_settings_change()   # 面板 checkbox 走的就是这个回调
+        assert win.live_draft == ""
+        assert "你好" not in win._last_html
+    finally:
+        config.DRAFT_TRANSLATION = snap
+        win._update_live("", "")
+
+
+def test_mode_indicator_is_always_visible_and_tracks_mode():
+    """模式指示器常驻左上角：hover 隐藏 chrome 时它仍在（不接淡入淡出），
+    切模式/变自定义时文字跟着变。"""
+    win = _window()
+    win._on_mode_applied("性能")
+    assert "性能" in win.mode_indicator.text()
+    assert win.mode_indicator.isVisible()
+
+    # chrome 淡出后指示器照样在（这正是它不接 _set_controls_visible 的原因）
+    win._set_controls_visible(False)
+    _pump(n=30, ms_each=20)
+    assert win.mode_indicator.isVisible()
+
+    win._on_mode_applied(None)
+    assert "自定义" in win.mode_indicator.text()
+
+
+def test_drag_bar_text_makes_room_for_mode_indicator():
+    """指示器压在拖动条上，拖动条文字要往右让位，不能叠在一起。"""
+    win = _window()
+    win._on_mode_applied("直播")
+    win._position_chrome()
+    pad = win._drag_bar_pad
+    assert pad >= win.mode_indicator.width(), "拖动条文字起点必须在指示器右边"
+    assert f"padding-left: {pad}px" in win.drag_bar.styleSheet()

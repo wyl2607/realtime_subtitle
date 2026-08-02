@@ -18,7 +18,7 @@ import os
 import time
 import re
 import queue
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque, OrderedDict
 
@@ -33,8 +33,63 @@ logging.basicConfig(level=logging.ERROR)
 
 # 句子结束符：只认 .!?（旧管线按逗号切句是碎句/上下文错乱的来源之一）
 _SENTENCE_END = re.compile(r'(.*?[.!?…]["»«\']?)(\s|$)', re.DOTALL)
+# 同一套边界，但只匹配终止符本身（切分时要按位置往后扫，不能每次都从头 match）
+_SENTENCE_TERMINATOR = re.compile(r'[.!?…]["»«\']?(?=\s|$)')
 
 _PUNCT_STRIP = " \t.!?…,;:–—\"'«»„“”"
+_QUOTE_CHARS = "\"'«»„“”"
+
+
+def _ends_with_terminator(text):
+    """文本是不是正好停在一个句子终止符上（判断"要不要扣留"用）。"""
+    return bool(text) and text.rstrip().rstrip(_QUOTE_CHARS).endswith((".", "!", "?", "…"))
+
+
+def _boundary_is_real(candidate, remainder, final):
+    """这个句号/问号是真句尾，还是 Whisper 打错的？
+
+    2026-08-02 统计 19 个转录文件共 23526 句：**38.5% 的翻译单元以小写德语词
+    开头**——德语句首必大写，所以那都是上一句在非句尾处被切开的碎片。碎片单独
+    送翻译会翻错（实测 "Demnach darf, wer schwimmend bzw." 被译成"均不得……"，
+    否定词其实在下一段）。三条否决规则：
+    """
+    tail = candidate.rstrip(_QUOTE_CHARS)
+    if tail.endswith("."):
+        words = tail[:-1].split()
+        token = words[-1] if words else ""
+        # ① 缩写否决：德语 bzw./z.B./ca. 这类缩写自带句号
+        if token.lower().strip(_QUOTE_CHARS) in config.SENTENCE_ABBREVIATIONS:
+            return False
+        # ② 数字否决：序数/年份带点（"am 3. Mai"、"1998."）——注意德语名词首字母
+        #    大写，"Mai" 是大写的，规则③抓不到这种，必须单独否决
+        if token.isdigit():
+            return False
+    if not remainder:
+        # ③b 句尾扣留：后面还没有词，看不出这个句号是真是假。
+        # final=True（收尾/有界放行）时不再等，照常成句
+        return final
+    # ③a 续行否决：下一个词是小写 = 上一句还没说完
+    return not remainder[0].islower()
+
+
+def _split_sentences(text, final=False):
+    """切出完整句子 + 剩余残句。返回 (sentences, rest)。
+
+    模块级纯函数：单测直接测它，不用在测试里复制一份切分逻辑（复制必然漂移）。
+    """
+    sentences = []
+    start = 0
+    for m in _SENTENCE_TERMINATOR.finditer(text):
+        end = m.end()
+        candidate = text[start:end].strip()
+        if not candidate:
+            continue
+        remainder = text[end:].lstrip()
+        if not _boundary_is_real(candidate, remainder, final):
+            continue  # 不是真句尾：跳过这个终止符，接着往后找
+        sentences.append(candidate)
+        start = end
+    return sentences, text[start:].strip()
 
 
 def _interjection_lookup(sentence):
@@ -73,10 +128,15 @@ def _squash_repeats(sentences, keep_words=3, keep_sents=2):
     return out
 
 _warm_thread = None  # 启动预热线程句柄：_unload_our_models 退出时要等它收尾
+# 预热落地信号：首句翻译等它，别自己另开一次冷加载还撞上 15 秒超时
+# （2026-08-02 实测：开机冷读 5.6GB 模型花了 33.8 秒，其间两句翻译被超时丢弃）
+_warm_done = Event()
+_warm_ok = False  # 预热是否真的成功（失败也要 set 事件，但不能当模型已热）
 
 
 def _spawn_startup_warm():
     global _warm_thread
+    _warm_done.clear()
     _warm_thread = Thread(target=_startup_warm_ollama, daemon=True, name="OllamaWarm")
     _warm_thread.start()
 
@@ -86,6 +146,7 @@ def _startup_warm_ollama():
 
     刻意用独立的 requests.post 而不是 self.ollama_session：这个线程和
     __init__ 里的健康检查/后续翻译并发，requests.Session 跨线程并发不安全。"""
+    global _warm_ok
     try:
         t0 = time.time()
         requests.post(
@@ -93,9 +154,13 @@ def _startup_warm_ollama():
             json={"model": config.OLLAMA_MODEL, "prompt": "", "keep_alive": "2h"},
             timeout=120,  # 冷加载可能要十几秒，网络栈慢时再宽些
         ).close()
+        _warm_ok = True
         print(f"🔥 翻译模型 {config.OLLAMA_MODEL} 后台预热完成 {time.time() - t0:.1f}秒")
     except Exception:
         pass  # Ollama 不可达由 __init__ 的健康检查负责提示
+    finally:
+        # ☠️ 成功失败都要 set：等待方（_await_model_ready）否则会白等满超时
+        _warm_done.set()
 
 
 _WhisperModel = None  # set by _ensure_ml_deps()
@@ -190,6 +255,8 @@ class WhisperQueueTranslator:
 
             # committed 但还没凑成完整句子的德语残句
             self.pending_text = ""
+            # 句尾扣留起点（0=没扣着东西）：见 _extract_sentences / _release_held_boundary
+            self._held_since = 0.0
             # 上次识别的未稳定尾部（重绘live行用）
             self._last_unstable = ""
 
@@ -226,6 +293,9 @@ class WhisperQueueTranslator:
             # OrderedDict + move_to_end = 真 LRU，锁保护 UI 线程与 worker 并发
             self._lookup_cache = OrderedDict()  # (word_lower, lang) -> text
             self._lookup_cache_lock = Lock()
+            # 查词序号：只认最后一次点击的结果。精听时连点好几个词会把请求排成
+            # 队（单线程 worker，每个最长15秒），过时的结果回来会覆盖当前弹窗
+            self._lookup_seq = 0
             self._LOOKUP_CACHE_MAX = int(getattr(config, "LOOKUP_CACHE_MAX", 200))
 
             # 最近已翻译的德语句子，作为翻译上下文
@@ -237,6 +307,16 @@ class WhisperQueueTranslator:
             self.on_draft = None    # (chinese_draft) -> None 残句的草稿中文
             self.on_status = None   # (text) -> None 状态提示（如Ollama挂了）
             self._ollama_down_notified = 0.0  # 上次提示"翻译服务未运行"的时间（节流）
+
+            # 冷启动治理（2026-08-02）：模型没进显存前，翻译请求要等预热、用长超时、
+            # 超时重试一次；否则首句直接被 15 秒超时丢掉且永远没有中文
+            self._ollama_hot = False      # 拿到过一次 200 就算热
+            self._warm_notified = False   # "翻译模型加载中"提示只发一次
+            # 熔断：Ollama 半死（每次都超时）时别再让句子堆在队列里等
+            self._tx_fail_streak = 0
+            self._tx_circuit_until = 0.0
+            self._tx_dropped = 0          # 队列硬顶丢弃的句数（正常永远是0）
+            self._tx_drop_warned = 0
 
             # 分钟级性能概况（SHOW_PERFORMANCE=False 后仅剩的观测手段）
             self._stats_lock = Lock()
@@ -314,6 +394,7 @@ class WhisperQueueTranslator:
         """
         self.processor.init()
         self.pending_text = ""
+        self._held_since = 0.0
         self._last_unstable = ""
         self._draft_last_text = ""
         with self._tx_lock:
@@ -367,10 +448,81 @@ class WhisperQueueTranslator:
         sentences = _squash_repeats(sentences)  # 压缩Whisper复读伪影
         with self._tx_lock:
             self._tx_queue.extend(sentences)
+            dropped = self._trim_tx_queue_locked()
+        if dropped:
+            self._warn_tx_dropped(dropped)
         try:
             self._tx_executor.submit(self._translation_worker)
         except RuntimeError:
             pass  # 程序正在退出
+
+    def _trim_tx_queue_locked(self):
+        """翻译队列硬顶：Ollama 半死（每句都超时重试）时排空速率远低于产出速率，
+        队列会一直涨。丢最旧的——它们的德语早就在屏幕上滚过去了，用户在看的是
+        最新几句。调用方必须持 _tx_lock。返回丢弃条数。
+
+        （照 enqueue_audio 里 ASR 收件箱硬顶的同一套写法：丢最旧 + 累计计数 +
+        节流告警。之前评估过"批量合并够用先不做"，但本轮给翻译加了超时重试，
+        排空速率进一步下降，这个上限就成了必需品。）"""
+        cap = getattr(config, "TRANSLATE_QUEUE_MAX_CHARS", 3000)
+        total = sum(len(s) for s in self._tx_queue)
+        dropped = 0
+        while total > cap and len(self._tx_queue) > 1:
+            total -= len(self._tx_queue.pop(0))
+            dropped += 1
+        self._tx_dropped += dropped
+        return dropped
+
+    def _warn_tx_dropped(self, dropped):
+        """队列丢弃告警（每累计10条报一次，别刷屏）。在锁外调，回调可能碰 UI。"""
+        print(f"⚠️  翻译积压超过 {getattr(config, 'TRANSLATE_QUEUE_MAX_CHARS', 3000)} 字符，"
+              f"已丢弃最旧 {dropped} 句（累计 {self._tx_dropped}）——翻译服务可能很慢或半死")
+        if self._tx_dropped - self._tx_drop_warned >= 10 or self._tx_drop_warned == 0:
+            self._tx_drop_warned = self._tx_dropped
+            if self.on_status:
+                self.on_status(f"⚠️ 翻译跟不上，已丢弃 {self._tx_dropped} 句的中文（德语不受影响）")
+
+    def _circuit_open(self):
+        """熔断中 = 最近连续多次翻译失败，这段时间内直接跳过 Ollama。
+
+        不另做"探测请求"：熔断到期后的下一句正常翻译本身就是探测，
+        成功即清零（失败的代价也只是一次超时，和专门发探测请求一样）。"""
+        return time.time() < self._tx_circuit_until
+
+    def _note_tx_result(self, ok):
+        """记翻译成败，连续失败到阈值就熔断一段时间。"""
+        if ok:
+            self._tx_fail_streak = 0
+            self._tx_circuit_until = 0.0
+            self._ollama_hot = True
+            return
+        self._tx_fail_streak += 1
+        if self._tx_fail_streak >= getattr(config, "TRANSLATE_FAIL_STREAK_OPEN", 3):
+            secs = getattr(config, "TRANSLATE_CIRCUIT_SEC", 30)
+            self._tx_circuit_until = time.time() + secs
+            self._tx_fail_streak = 0
+            print(f"⛔ 翻译连续失败，暂停请求 {secs} 秒（期间只显示德语原文）")
+            if self.on_status:
+                self.on_status(f"⛔ 翻译服务无响应，暂停 {secs} 秒后自动重试（先只显德语）")
+
+    def _await_model_ready(self):
+        """首句翻译前等后台预热落地（有界）。
+
+        预热和第一句翻译打的是同一个模型：并发发出去时 Ollama 那边串行加载，
+        客户端却按各自的超时计时——15 秒超时必然先到，句子被丢。等预热完成再发，
+        请求本身就是热的，15 秒够用。预热失败/超时也照常往下走（用冷超时兜底）。"""
+        if self._ollama_hot:
+            return
+        if _warm_done.is_set():
+            if _warm_ok:
+                self._ollama_hot = True
+            return
+        if self.on_status and not self._warm_notified:
+            self._warm_notified = True
+            self.on_status("✅ 识别已就绪；⏳ 翻译模型首次加载中，中文稍后跟上…")
+        _warm_done.wait(getattr(config, "OLLAMA_WARM_WAIT", 60))
+        if _warm_ok:
+            self._ollama_hot = True
 
     def _translation_worker(self):
         """把队列里积压的句子合并成一次Ollama请求。
@@ -485,6 +637,8 @@ class WhisperQueueTranslator:
             return
         if self._asr_busy:
             return  # Whisper 正在 GPU 上识别，草稿别去抢卡（p95尖刺的来源之一）
+        if not self._ollama_hot:
+            return  # 模型还没进显存：那唯一一次冷加载要留给正式句子，草稿别去排队占坑
         with self._asr_lock:
             if len(self._audio_inbox) >= 2:
                 return  # 识别已在攒块（GPU被抢），草稿是奢侈品，先让路
@@ -583,14 +737,22 @@ class WhisperQueueTranslator:
         cache_key = (word.lower(), config.SOURCE_LANGUAGE)
         if self._serve_cached_lookup(word, cache_key, context, callback):
             return
+        self._lookup_seq += 1  # 只在 UI 线程递增（点击回调），worker 只读
+        seq = self._lookup_seq
         try:
-            self._lookup_executor.submit(self._lookup_worker, word, context, callback)
+            self._lookup_executor.submit(self._lookup_worker, word, context, callback, seq)
         except RuntimeError:
             pass  # 程序正在退出
 
-    def _lookup_worker(self, word, context, callback):
+    def _lookup_stale(self, seq):
+        """有更新的点击了 → 这次的结果不要再弹（沿用 _tx_epoch 的代数门控思路）"""
+        return seq is not None and seq != self._lookup_seq
+
+    def _lookup_worker(self, word, context, callback, seq=None):
         lang_name = config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)
         cache_key = (word.lower(), config.SOURCE_LANGUAGE)
+        if self._lookup_stale(seq):
+            return  # 排队期间用户已经点了别的词，这次白跑，连请求都不用发
         # 双检：submit 前到 worker 之间可能已被别的点击填入缓存
         if self._serve_cached_lookup(word, cache_key, context, callback):
             return
@@ -624,17 +786,21 @@ class WhisperQueueTranslator:
             if self.closing:
                 return  # 程序在退出，别再回调正在拆的UI
             if response.status_code == 200:
+                self._ollama_hot = True  # 查词成功也证明模型在显存里
                 text = response.json().get("response", "").strip()
                 text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
                 if config.SHOW_PERFORMANCE:
                     print(f"   📖 查词 {word} {time.time() - t0:.1f}秒")
                 if text:
+                    # 结果过时也照样进缓存（下次点这个词就秒回），只是不弹窗
                     self._lookup_cache_put(cache_key, (text, context))
+                if self._lookup_stale(seq):
+                    return
                 callback(word, text or "（没查到）")
-            else:
+            elif not self._lookup_stale(seq):
                 callback(word, f"查询失败（HTTP {response.status_code}）")
         except Exception as e:
-            if not self.closing:
+            if not self.closing and not self._lookup_stale(seq):
                 callback(word, f"查询失败: {e}")
 
     def _translate_single_sentence(self, sentence, german_context, on_partial=None):
@@ -656,13 +822,18 @@ class WhisperQueueTranslator:
             if matched_terms:
                 glossary_block = "\n【术语表：以下人名/党派/术语必须照用这些译名】\n" + "\n".join(matched_terms[:12]) + "\n"
 
-            prompt = f"""/no_think 你是{lang_name}影视剧的字幕翻译。请把{lang_name}对白翻译成自然的简体中文。
+            # 语域跟着当前模式走（新闻/影视/精听），别再无条件按"剧集对白"翻
+            styles = getattr(config, "TRANSLATION_STYLE_PROMPTS", {}) or {}
+            style = styles.get(getattr(config, "TRANSLATION_STYLE", ""), None)
+            if style is None:
+                style = next(iter(styles.values()), {"role": "字幕翻译", "rules": ""})
+            n_rules = len([ln for ln in style["rules"].splitlines() if ln.strip()])
+
+            prompt = f"""/no_think 你是{lang_name}{style['role']}。请把{lang_name}对白翻译成自然的简体中文。
 
 【要求】
-1. 这是剧集对白：口语、俚语、粗话按中文对白的习惯翻，保持角色语气，不要书面腔
-2. 结合上下文理解句意，不要机械直译；歌词就按歌词翻
-3. 专有名词保持一致
-4. 只输出中文翻译，不要解释，不要输出{lang_name}原文
+{style['rules']}
+{n_rules + 1}. 只输出中文翻译，不要解释，不要输出{lang_name}原文
 {glossary_block}
 【{lang_name}上下文（此前的对白）】
 ***
@@ -677,59 +848,97 @@ class WhisperQueueTranslator:
 中文翻译：
 """
 
-            response = self.ollama_session.post(
-                f"{config.OLLAMA_BASE_URL}/api/generate",
-                json={
-                    "model": config.OLLAMA_MODEL,
-                    "prompt": prompt,
-                    "stream": True,  # 流式：中文逐段上屏，不等整句
-                    "think": False,
-                    "keep_alive": "2h",  # 默认5分钟卸载，安静段后第一句付~9秒冷加载
-                    "options": {
-                        "temperature": 0.3,
-                        "top_p": 0.9,
-                        "num_predict": 512,
-                        "num_ctx": 4096,  # prompt多了术语表，2048偏紧
-                        "num_gpu": 50,
-                    }
-                },
-                stream=True,
-                # 流式下timeout是"相邻数据块间隔"上限，不是总时长。
-                # 别低于15：Ollama冷加载qwen3:8b实测9.2秒（首token前无数据），
-                # 10秒会让服务重启后的头几句全部降级成德语
-                timeout=15
-            )
+            # 熔断中：直接降级成德语，一个请求都不发——Ollama 半死时每句都付
+            # 满超时，队列只会越堆越长（德语原文照常上屏，用户不是什么都看不到）
+            if self._circuit_open():
+                return sentence
 
-            try:
-                if response.status_code == 200:
-                    parts = []
-                    last_emit = 0.0
-                    for line in response.iter_lines():
-                        if self.closing:
-                            break  # 正在退出：别等整句生成完，finally会close连接
-                        if not line:
-                            continue
-                        try:
-                            data = json.loads(line)
-                        except ValueError:
-                            continue
-                        parts.append(data.get("response", ""))
-                        if data.get("done"):
-                            break
-                        if on_partial and time.time() - last_emit > 0.15:
-                            partial = "".join(parts).strip()
-                            if partial:
-                                last_emit = time.time()
-                                on_partial(partial)
-                    translation = re.sub(r'<think>.*?</think>', '', "".join(parts), flags=re.DOTALL)
-                    return translation.strip()
-                else:
-                    print(f"   ⚠️  Ollama 返回错误 (HTTP {response.status_code})，显示德语原文")
-                    return sentence
-            finally:
-                # stream=True的连接不close不会归还连接池：done后break出来、
-                # 半途超时、非200，都必须显式关，否则长session连接泄漏
-                response.close()
+            # 模型还没进显存时先等后台预热落地，并改用长超时
+            self._await_model_ready()
+
+            payload = {
+                "model": config.OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": True,  # 流式：中文逐段上屏，不等整句
+                "think": False,
+                "keep_alive": "2h",  # 默认5分钟卸载，安静段后第一句付~9秒冷加载
+                "options": {
+                    "temperature": 0.3,
+                    "top_p": 0.9,
+                    "num_predict": 512,
+                    "num_ctx": 4096,  # prompt多了术语表，2048偏紧
+                    "num_gpu": 50,
+                },
+            }
+
+            # 读超时重试一次：模型冷加载期间首句必然超时，丢掉的话那句话永远
+            # 没有中文（2026-08-02 实测撞上）。只重试 ReadTimeout——
+            # ☠️ ConnectionError（Ollama 没起）绝不能重试，那会把单线程 worker
+            # 堵住，且现有的快速失败+60秒节流提示才是对的处理
+            last_timeout = None
+            for attempt in (0, 1):
+                timeout = (getattr(config, "OLLAMA_TIMEOUT", 15) if self._ollama_hot
+                           else getattr(config, "OLLAMA_TIMEOUT_COLD", 90))
+                try:
+                    response = self.ollama_session.post(
+                        f"{config.OLLAMA_BASE_URL}/api/generate",
+                        json=payload,
+                        stream=True,
+                        # 流式下timeout是"相邻数据块间隔"上限，不是总时长
+                        timeout=timeout,
+                    )
+                except requests.ReadTimeout as e:
+                    last_timeout = e
+                    if attempt == 0 and not self.closing:
+                        self._ollama_hot = False  # 让重试走冷超时
+                        print(f"   ⏳ 翻译超时({timeout}秒)，重试一次（模型可能正在加载）")
+                        continue
+                    break
+
+                try:
+                    if response.status_code == 200:
+                        parts = []
+                        last_emit = 0.0
+                        for line in response.iter_lines():
+                            if self.closing:
+                                break  # 正在退出：别等整句生成完，finally会close连接
+                            if not line:
+                                continue
+                            try:
+                                data = json.loads(line)
+                            except ValueError:
+                                continue
+                            parts.append(data.get("response", ""))
+                            if data.get("done"):
+                                break
+                            if on_partial and time.time() - last_emit > 0.15:
+                                partial = "".join(parts).strip()
+                                if partial:
+                                    last_emit = time.time()
+                                    on_partial(partial)
+                        translation = re.sub(r'<think>.*?</think>', '', "".join(parts), flags=re.DOTALL)
+                        self._note_tx_result(ok=True)
+                        return translation.strip()
+                    else:
+                        print(f"   ⚠️  Ollama 返回错误 (HTTP {response.status_code})，显示德语原文")
+                        self._note_tx_result(ok=False)
+                        return sentence
+                except requests.ReadTimeout as e:
+                    # 流式响应中途断流也是 ReadTimeout（首token前无数据最常见）
+                    last_timeout = e
+                    if attempt == 0 and not self.closing:
+                        self._ollama_hot = False
+                        print(f"   ⏳ 翻译流中断({timeout}秒无数据)，重试一次")
+                        continue
+                    break
+                finally:
+                    # stream=True的连接不close不会归还连接池：done后break出来、
+                    # 半途超时、非200，都必须显式关，否则长session连接泄漏
+                    response.close()
+
+            print(f"   ⚠️  翻译超时: {last_timeout}，显示德语原文")
+            self._note_tx_result(ok=False)
+            return sentence
 
         except requests.ConnectionError as e:
             # Ollama没在运行——屏幕上给用户明确提示（60秒节流），
@@ -738,26 +947,49 @@ class WhisperQueueTranslator:
             if self.on_status and time.time() - self._ollama_down_notified > 60:
                 self._ollama_down_notified = time.time()
                 self.on_status("⚠️ 翻译服务(Ollama)未运行，暂时只显示德语——请运行 启动字幕.bat 或 ollama serve")
+            self._note_tx_result(ok=False)
             return sentence
         except Exception as e:
             print(f"   ⚠️  翻译失败: {e}，显示德语原文")
+            self._note_tx_result(ok=False)
             return sentence
 
     # ------------------------------------------------------------------
     # 识别（ASR线程，单线程executor保证串行）
     # ------------------------------------------------------------------
-    def _extract_sentences(self):
-        """从pending_text里切出所有完整句子（只按.!?切，逗号不切），残句留下"""
-        sentences = []
-        rest = self.pending_text
-        while True:
-            m = _SENTENCE_END.match(rest)
-            if not m:
-                break
-            sentences.append(m.group(1).strip())
-            rest = rest[m.end():].lstrip()
+    def _extract_sentences(self, final=False):
+        """从pending_text里切出完整句子（切分规则见 _split_sentences），残句留下。
+
+        final=False 时，正好落在文本末尾的句尾会被【扣留】——还看不见下一个词，
+        判断不了这个句号是不是 Whisper 在缩写/停顿处误打的。连续说话时下一块
+        音频 0.4 秒就到，自然就判定了；说完一段没有下文时由 flush_pending 的
+        有界放行兜底（最多 SENTENCE_HOLD_SEC）。
+        """
+        sentences, rest = _split_sentences(self.pending_text, final=final)
         self.pending_text = rest
+        # 记扣留起点：还有残句且它正停在终止符上 = 有句子被扣着等下文
+        if not final and rest and _ends_with_terminator(rest):
+            if not self._held_since:
+                self._held_since = time.time()
+        else:
+            self._held_since = 0.0
         return sentences
+
+    def _release_held_boundary(self):
+        """扣留的句尾到点放行。
+
+        ☠️ 只动文字，绝不碰 processor.finish()——那会清掉正在用的音频缓冲，
+        而这时候用户很可能只是句子中间换了口气，音频还要接着识别。
+        """
+        held = self._held_since
+        if not held:
+            return
+        if time.time() - held < getattr(config, "SENTENCE_HOLD_SEC", 0.6):
+            return
+        sentences = self._extract_sentences(final=True)
+        if sentences:
+            self._enqueue_sentences(sentences)
+            self._emit_display()
 
     def _append_committed(self, committed_text):
         if not committed_text:
@@ -838,6 +1070,7 @@ class WhisperQueueTranslator:
     def _warm_model_worker(self, old_model=None, new_model=None):
         model = new_model if new_model is not None else config.OLLAMA_MODEL
         if old_model and old_model != model:
+            self._ollama_hot = False  # 换了模型：新的还没进显存，回到冷超时
             try:
                 # keep_alive=0 = 立即卸载，先腾出显存再加载新模型
                 self.ollama_session.post(
@@ -857,6 +1090,7 @@ class WhisperQueueTranslator:
                 json={"model": model, "prompt": "", "keep_alive": "2h"},
                 timeout=60,  # 冷加载可能要十几秒
             ).close()
+            self._ollama_hot = True  # 新模型已进显存，翻译可以回到正常超时
             print(f"🔥 翻译模型 {model} 预热完成 {time.time() - t0:.1f}秒")
         except Exception as e:
             if not self.closing:
@@ -888,6 +1122,13 @@ class WhisperQueueTranslator:
                     self._apply_pending_lang_switch(pending_lang)
                 except Exception as e:
                     print(f"⚠️  切换源语言失败: {e}")
+                # ☠️ 这一批音频是切换【之前】抓的旧语言声音，绝不能用新语言参数
+                # 去识别（蹦出乱词）。_apply_pending_lang_switch → clear_context
+                # 本来就已经把识别缓冲整个丢掉了，再把切换前的音频塞进新缓冲
+                # 自相矛盾。用户主动按热键时丢掉不到一秒的旧语言音频是正确取舍
+                if items:
+                    print(f"🧹 切换语言，丢弃切换前的 {len(items)} 块音频")
+                    items = []
             if not items:
                 continue  # 只有切语言、没有音频：回去看有没有新标志/新块
             try:
@@ -953,6 +1194,7 @@ class WhisperQueueTranslator:
                 print(f"   ✂️  残句超{config.MAX_PENDING_WORDS}词无标点，强制送翻译")
             self._enqueue_sentences([self.pending_text])
             self.pending_text = ""
+            self._held_since = 0.0  # 连扣留的句尾一起送走了
 
         self._emit_display()
         self._maybe_draft()
@@ -1006,6 +1248,8 @@ class WhisperQueueTranslator:
         main的定时器每秒调这里：距上次音频超过IDLE_FLUSH_SEC才动手。
         和translate()跑在同一个单线程池里，天然串行。"""
         if time.time() - self.last_audio_time < config.IDLE_FLUSH_SEC:
+            # 还没到收尾时机，但被扣留的句尾到点了就先放行（只动文字不碰音频缓冲）
+            self._release_held_boundary()
             return
         if self._idle_flushed:
             return  # 这轮空闲已经冲干净了，没有新音频前每秒空跑 finish 纯浪费
@@ -1021,10 +1265,11 @@ class WhisperQueueTranslator:
                 self._emit_display()
             return
 
-        sentences = self._extract_sentences()
+        sentences = self._extract_sentences(final=True)
         if self.pending_text:
             sentences.append(self.pending_text)
             self.pending_text = ""
+        self._held_since = 0.0
 
         if sentences:
             if config.SHOW_PERFORMANCE:
@@ -1044,7 +1289,17 @@ class WhisperQueueTranslator:
         # 循环里查closing、一个数据块(~0.1秒)内就break出来
         self._asr_executor.shutdown(wait=True, cancel_futures=True)
         self._tx_executor.shutdown(wait=True, cancel_futures=True)
-        self._lookup_executor.shutdown(wait=False, cancel_futures=True)
+        # ☠️ 查词请求也带 keep_alive="2h"：在飞的那一个如果在
+        # _unload_our_models **之后**才落地，会把刚卸掉的模型重新拉回显存
+        # 留驻两小时（和 2026-07-20 修的预热线程竞态同类，当时只处理了预热）。
+        # 有界等待：正常查词 1-2 秒就回来；卡住的话最多等 3 秒放弃继续退出
+        # （宁可漏卸一次也不拖住退出——stop 脚本还有 HTTP 卸载兜底）
+        drain = Thread(
+            target=self._lookup_executor.shutdown,
+            kwargs={"wait": True, "cancel_futures": True},
+            daemon=True, name="LookupDrain")
+        drain.start()
+        drain.join(timeout=3)
         self._unload_our_models()
         try:
             self.ollama_session.close()

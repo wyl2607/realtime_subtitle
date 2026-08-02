@@ -33,7 +33,7 @@ import config
 from window_geometry import _screen_area_at, _clamp_geo_to_area, _clamp_geo_to_any_screen
 from window_frame import ResizableFramelessWidget
 from settings_window import (
-    SettingsWindow, TUNING_KEYS, PRESET_CONTROL_ATTRS,
+    SettingsWindow, TUNING_KEYS, MODE_ICONS,
     apply_tuning, collect_tuning, apply_text_color, snapshot_defaults,
 )
 from popups import HistoryWindow, WordPopup
@@ -48,6 +48,24 @@ if sys.platform == "win32":
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "window_state.json")
 
 
+def _atomic_write_json(path, data):
+    """原子写 JSON：先写 .tmp，把当前文件挪成 .bak，最后 os.replace 替换。
+
+    直接覆盖的话，强杀/崩溃正好撞上这次写入就会留下半截 JSON——下次启动
+    布局/字号/tuning 全部退回出厂值。同盘 os.replace 是原子的；替换前那一
+    瞬主文件不存在，_load_state 会读 .bak 兜底。
+    """
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    try:
+        if os.path.exists(path):
+            os.replace(path, path + ".bak")
+    except OSError:
+        pass  # 备份失败不该挡住正常保存
+    os.replace(tmp_path, path)
+
+
 class SubtitleSignals(QObject):
     """信号对象（用于线程安全的UI更新）"""
     update = pyqtSignal(str)
@@ -57,7 +75,7 @@ class SubtitleSignals(QObject):
     draft = pyqtSignal(str)  # live德语的草稿中文（正式句对完成后被替换）
     lookup = pyqtSignal(str, str)  # 点词查词结果 (word, 词典文本)
     toggle_ct = pyqtSignal()  # 切换鼠标穿透模式（热键线程→主线程）
-    game_mode = pyqtSignal(bool)  # 游戏模式开关（热键线程→主线程，同步设置面板）
+    mode = pyqtSignal(object)  # 当前模式名(str)或 None(自定义)：热键线程→主线程
 
 class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
     """字幕悬浮窗"""
@@ -83,9 +101,8 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
             except (TypeError, ValueError):
                 pass
         apply_tuning(self._state.get("tuning") or {})
-        # 基线：启动应用后的 tuning（游戏模式豁免用；之后每次成功保存会刷新）
+        # 基线：启动应用后的 tuning（之后每次成功保存会刷新）
         self._state["tuning"] = collect_tuning()
-        self._game_mode_active = False
 
         # 创建信号对象
         self.signals = SubtitleSignals()
@@ -212,6 +229,22 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
             }
         """)
 
+        # 模式常驻指示器（左上角）：不接 _set_controls_visible 的 hover 淡入淡出，
+        # 一直显示当前模式——用户要能随时一眼看出现在是哪套参数在跑
+        self.mode_indicator = QLabel("⚙️ 自定义", self.container)
+        self.mode_indicator.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.mode_indicator.setStyleSheet("""
+            QLabel {
+                background-color: rgba(20, 20, 20, 210);
+                color: rgba(235, 235, 235, 230);
+                font-size: 11px;
+                font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+                padding: 3px 8px;
+                border-radius: 4px;
+                border: 1px solid rgba(255, 255, 255, 0.15);
+            }
+        """)
+
         # 鼠标穿透常驻指示器：穿透时 hover 全失效，必须无条件常显（不走 _set_controls_visible）
         self.ct_indicator = QLabel("👻 Ctrl+Alt+M 恢复", self.container)
         self.ct_indicator.setAttribute(Qt.WA_TransparentForMouseEvents, True)
@@ -299,8 +332,10 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
             on_font_change=self._on_display_settings_change,
             defaults=self._defaults_snapshot,
         )
-        # 恢复预设高亮（不重新 apply；具体值已在 tuning 里）
+        # 恢复模式高亮（不重新 apply；具体值已在 tuning 里）。
+        # 指示器直接读刚恢复好的值，不重复读一遍 self._state（防两处数据源不同步）
         self.settings_window.restore_active_preset(self._state.get("active_preset"))
+        self._update_mode_indicator(self.settings_window._active_preset)
 
         # 创建历史窗口（初始隐藏）
         self.history_window = HistoryWindow()
@@ -343,7 +378,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         self.signals.draft.connect(self._update_draft)
         self.signals.lookup.connect(self._show_lookup)
         self.signals.toggle_ct.connect(self._toggle_click_through)
-        self.signals.game_mode.connect(self._on_game_mode)
+        self.signals.mode.connect(self._on_mode_applied)
         
         print("✅ 字幕窗口已创建")
         print(f"   位置: ({x}, {y})  大小: {w}x{h}")
@@ -361,11 +396,21 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
 
     @staticmethod
     def _load_state():
-        try:
-            with open(STATE_FILE, encoding="utf-8") as f:
-                return json.load(f)
-        except (OSError, ValueError):
-            return {}
+        """读上次的窗口布局；主文件损坏时回落 .bak。
+
+        主文件会坏是有真实路径的：停止脚本超时会强杀进程，正好撞上 15 秒
+        定时器写盘就留下半截 JSON——那时布局/字号/tuning 会全部退回出厂值。
+        """
+        for path in (STATE_FILE, STATE_FILE + ".bak"):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if path != STATE_FILE:
+                print("⚠️  window_state.json 损坏，已从 .bak 恢复上一份布局")
+            return data
+        return {}
 
     @staticmethod
     def _restore_aux_geo(win, geo):
@@ -423,19 +468,14 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
             state["history_geo"] = self._state["history_geo"]
         state["tv"] = {"font_size": int(config.TV_FONT_SIZE),
                        "screen_index": self.tv_window.screen_index}
-        # 面板参数：游戏模式期间 CHUNK_SUBMIT_SECONDS / DRAFT_TRANSLATION 是临时值，豁免
-        state["tuning"] = collect_tuning(
-            game_mode_active=bool(getattr(self, "_game_mode_active", False)),
-            previous_tuning=(self._state.get("tuning") or {}),
-        )
-        # 场景预设高亮名（None → JSON null）；仅显示态，重启不重新 apply
+        state["tuning"] = collect_tuning()
+        # 当前模式名（None → JSON null）；仅显示态，重启不重放模型/beam 副作用
         active = getattr(self.settings_window, "_active_preset", None)
         state["active_preset"] = active if active else None
         if state == self._last_saved_state:
             return
         try:
-            with open(STATE_FILE, "w", encoding="utf-8") as f:
-                json.dump(state, f)
+            _atomic_write_json(STATE_FILE, state)
             self._last_saved_state = state
             # 同步内存中的上次值，便于后续「未再显示」时继续保留
             if "settings_geo" in state:
@@ -459,15 +499,24 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         """切换鼠标穿透（线程安全，热键线程调用）"""
         self.signals.toggle_ct.emit()
 
-    def notify_game_mode(self, active):
-        """游戏模式开关通知（线程安全，热键线程调用）→ 主线程同步设置面板"""
-        self.signals.game_mode.emit(bool(active))
+    def notify_mode_applied(self, name):
+        """模式已应用（线程安全，热键线程/主线程都调这个）→ 主线程同步 UI"""
+        self.signals.mode.emit(name)
 
-    def _on_game_mode(self, active):
-        """主线程槽：刷新滑块显示 + 禁用/恢复被游戏模式接管的控件"""
-        self._game_mode_active = bool(active)
-        self.settings_window.refresh_from_config()
-        self.settings_window.set_game_mode(bool(active))
+    def _on_mode_applied(self, name):
+        """主线程槽：真实模式名才需要把面板控件从 config 重读一遍 + 刷高亮；
+        None（自定义）时 config 没变，只更新指示器文字。"""
+        if name is not None:
+            self.settings_window.refresh_from_config()
+            self.settings_window.restore_active_preset(name)
+        self._update_mode_indicator(name)
+
+    def _update_mode_indicator(self, name):
+        """悬浮窗左上角的常驻模式指示器（不随 hover 淡入淡出）。"""
+        text = f"{MODE_ICONS.get(name, '⚙️')} {name}" if name else "⚙️ 自定义"
+        self.mode_indicator.setText(text)
+        self.mode_indicator.adjustSize()
+        self._position_chrome()
 
     def _toggle_click_through(self):
         """穿透开：字幕窗对鼠标完全隐形（点击/滚轮全落到下面的视频/游戏上），

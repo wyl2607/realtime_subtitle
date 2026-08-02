@@ -188,6 +188,30 @@ class OnlineASRProcessor:
         return any(pattern in lowered for pattern in config.HALLUCINATION_BLACKLIST)
 
     @staticmethod
+    def _apply_corrections(words_ts):
+        """按 config.ASR_CORRECTIONS 修正听错的专有名词（词级 1:1）。
+
+        和 _collapse_word_runs 一样放在词流出口、且必须是确定性的：相邻两次
+        识别对同一段音频得到完全相同的替换，local agreement 的前缀一致判定
+        才不受干扰。保留原时间戳、前导空格（faster-whisper 的 word 自带）
+        和尾随标点，只换词本身。
+        """
+        table = getattr(config, "ASR_CORRECTIONS", None)
+        if not table:
+            return words_ts
+        out = []
+        for start, end, word in words_ts:
+            core = word.strip()
+            lead = word[:len(word) - len(word.lstrip())]
+            stripped = core.strip(_WORD_PUNCT)
+            fixed = table.get(stripped.lower())
+            if fixed and stripped:
+                tail = core[len(core.rstrip(_WORD_PUNCT)):]
+                word = f"{lead}{fixed}{tail}"
+            out.append((start, end, word))
+        return out
+
+    @staticmethod
     def _collapse_word_runs(words_ts, keep=3):
         """同词连续超过 keep 个只留前 keep 个——Whisper 复读循环
         （电影动作/音乐段实测 "Geh!"×50 刷满 live 行和草稿）在词流入口
@@ -223,7 +247,7 @@ class OnlineASRProcessor:
                 continue
             for word in segment.words:
                 out.append((word.start, word.end, word.word))
-        return self._collapse_word_runs(out)
+        return self._collapse_word_runs(self._apply_corrections(out))
 
     def process_iter(self):
         """识别当前整个音频缓冲，返回 (新提交的文本, 未稳定尾部文本)"""

@@ -87,7 +87,13 @@ def test_apply_tuning_skips_bad_values():
         _restore(snap)
 
 
-def test_collect_tuning_complete_and_game_mode_exempt():
+def test_collect_tuning_persists_current_values():
+    """模式值就是用户当前状态，一律照常持久化。
+
+    以前这里有"游戏模式期间豁免 CHUNK_SUBMIT_SECONDS/DRAFT_TRANSLATION"的分支，
+    那是"临时开关+退出还原"语义的产物；模式系统合并后四个模式平等并列，
+    留着豁免会让重启后面板值和恢复出来的模式高亮对不上。
+    """
     keys = list(TUNING_KEYS)
     snap = _snap_keys(*keys)
     try:
@@ -100,20 +106,12 @@ def test_collect_tuning_complete_and_game_mode_exempt():
         assert full["DRAFT_TRANSLATION"] is True
         assert full["SHOW_BILINGUAL"] is False
 
-        # 模拟游戏模式：config 被热键改成临时值
+        # 「性能」模式把值改成 1.0/False → 存的就是这个，不再豁免
         config.CHUNK_SUBMIT_SECONDS = 1.0
         config.DRAFT_TRANSLATION = False
-        prev = {"CHUNK_SUBMIT_SECONDS": 0.7, "DRAFT_TRANSLATION": True}
-        exempt = collect_tuning(game_mode_active=True, previous_tuning=prev)
-        assert exempt["CHUNK_SUBMIT_SECONDS"] == 0.7
-        assert exempt["DRAFT_TRANSLATION"] is True
-        # 其它键仍取当前 config
-        assert exempt["SHOW_BILINGUAL"] is False
-
-        # 无旧值则跳过这两个键
-        partial = collect_tuning(game_mode_active=True, previous_tuning={})
-        assert "CHUNK_SUBMIT_SECONDS" not in partial
-        assert "DRAFT_TRANSLATION" not in partial
+        after = collect_tuning()
+        assert after["CHUNK_SUBMIT_SECONDS"] == 1.0
+        assert after["DRAFT_TRANSLATION"] is False
     finally:
         _restore(snap)
 
@@ -166,6 +164,36 @@ def test_tuning_roundtrip_via_state_file(tmp_path, monkeypatch):
         _restore(snap)
 
 
+def test_state_file_atomic_write_and_bak_recovery(tmp_path, monkeypatch):
+    """强杀撞上写盘会留半截 JSON → 布局/字号/tuning 全丢。现在原子写 + .bak 兜底。
+
+    ☠️ 这里 patch 的是 subtitle_window 模块的 STATE_FILE 属性——持久化函数
+    必须留在那个模块里，搬走就会读到别的模块的全局，patch 失效（见文件头注释）。
+    """
+    import subtitle_window as sw
+
+    state_path = tmp_path / "window_state.json"
+    monkeypatch.setattr(sw, "STATE_FILE", str(state_path))
+
+    good = {"x": 1, "y": 2, "w": 300, "h": 200}
+    # 走真实写入路径（_save_state_if_changed 内部就是调这个）
+    sw._atomic_write_json(str(state_path), good)
+    sw._atomic_write_json(str(state_path), {"x": 9, "y": 9, "w": 300, "h": 200})
+    assert os.path.exists(str(state_path) + ".bak"), "上一份必须留成 .bak"
+    assert not os.path.exists(str(state_path) + ".tmp"), ".tmp 不该残留"
+
+    # 主文件被写坏（模拟强杀撞上写入）→ 从 .bak 恢复上一份
+    with open(state_path, "w", encoding="utf-8") as f:
+        f.write('{"x": 9, "y":')  # 半截 JSON
+    loaded = sw.SubtitleWindow._load_state()
+    assert loaded == good, loaded
+
+    # 主文件和 .bak 都没有 → 空 dict（退回出厂布局，不抛）
+    os.remove(str(state_path))
+    os.remove(str(state_path) + ".bak")
+    assert sw.SubtitleWindow._load_state() == {}
+
+
 # ---------------------------------------------------------------------------
 # checkbox / game mode / reset / color
 # ---------------------------------------------------------------------------
@@ -199,23 +227,6 @@ def test_chinese_only_and_draft_checkboxes_sync_config():
         assert config.DRAFT_TRANSLATION is False
     finally:
         _restore(snap)
-
-
-def test_set_game_mode_disables_draft_cb_and_chunk_slider():
-    _app()
-    win = SettingsWindow()
-    assert win.chunk_submit_slider["slider"].isEnabled()
-    assert win.draft_cb.isEnabled()
-
-    win.set_game_mode(True)
-    assert not win.chunk_submit_slider["slider"].isEnabled()
-    assert not win.draft_cb.isEnabled()
-    assert "游戏模式" in (win.chunk_submit_slider["slider"].toolTip() or "")
-    assert "游戏模式" in (win.draft_cb.toolTip() or "")
-
-    win.set_game_mode(False)
-    assert win.chunk_submit_slider["slider"].isEnabled()
-    assert win.draft_cb.isEnabled()
 
 
 def test_reset_defaults_restores_passed_snapshot():

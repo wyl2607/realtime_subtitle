@@ -112,11 +112,17 @@ class LiveTextRenderMixin:
         return "<br>".join(lines)
 
     def _live_block_html(self):
-        """live行的富文本块：德语（白+灰色未稳定尾部）+ 草稿中文"""
+        """live行的富文本块：德语（白+灰色未稳定尾部）+ 草稿中文。
+
+        勾了「只显中文（隐藏德语原文）」时 live 行的德语也要藏——之前只有正式
+        句对遵守这个开关，说话过程中德语照样往外冒，和复选框文案直接矛盾。
+        藏掉之后这段时间显示的是草稿中文，不会变成空白。
+        """
+        bilingual = getattr(config, "SHOW_BILINGUAL", True)
         live_parts = []
-        if self.live_committed:
+        if bilingual and self.live_committed:
             live_parts.append(html.escape(self._clip(self.live_committed)))
-        if self.live_unstable:
+        if bilingual and self.live_unstable:
             color = getattr(config, "UNSTABLE_TEXT_COLOR", "#999999")
             live_parts.append(f'<span style="color:{color}"><i>{html.escape(self._clip(self.live_unstable))}</i></span>')
         live_block = " ".join(live_parts)

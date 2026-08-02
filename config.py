@@ -36,6 +36,21 @@ WHISPER_BEAM_SIZE = 3  # beam search 大小。whisper_streaming作者用5，这�
 OLLAMA_MODEL = "qwen3.5:9b"  # Ollama 模型名称
 OLLAMA_BASE_URL = "http://localhost:11434"  # Ollama API 地址
 
+# 翻译请求超时（流式下是"相邻数据块间隔"上限，不是总时长）。
+# ☠️ 冷热两档不能合并成一个值：模型已在显存时 15 秒足够且能快速发现 Ollama 卡死；
+# 但开机后第一次请求要等 Ollama 从磁盘读几个 GB——2026-08-02 实测 qwen3.5:9b
+# 冷加载 33.8 秒，用 15 秒的话首句必被丢弃且永远不会有中文
+OLLAMA_TIMEOUT = 15
+OLLAMA_TIMEOUT_COLD = 90
+# 首句翻译最多等后台预热线程这么久（等它落地再发请求，避免两边各自计时）
+OLLAMA_WARM_WAIT = 60
+# 翻译队列硬顶（字符）：Ollama 半死时排空速率远低于产出，超了丢最旧的句子。
+# 德语原文不受影响，丢的只是这些句子的中文
+TRANSLATE_QUEUE_MAX_CHARS = 3000
+# 连续这么多次翻译失败 → 熔断，期间直接显示德语不再发请求
+TRANSLATE_FAIL_STREAK_OPEN = 3
+TRANSLATE_CIRCUIT_SEC = 30  # 熔断持续秒数，到期后下一句正常翻译即为探测
+
 # ============ 音频配置 ============
 SAMPLE_RATE = 16000  # 采样率（Hz）
 CHUNK_SIZE = 4096  # 每次读取的帧数（减少处理频率）
@@ -52,8 +67,23 @@ BUFFER_TRIM_SEC = 12.0  # 识别音频缓冲超过这么多秒就在已完成seg
 BUFFER_KEEP_SEC = 8.0  # segment裁剪不满足条件时的兜底：按已提交词边界裁到只剩这么多秒
 IDLE_FLUSH_SEC = 2.0  # 静音这么多秒后，把未提交尾部/未翻译残句冲出去
 # 聊天/嘈杂语音下Whisper经常整段不打标点，句子永远凑不齐 → 残句超过
-# 这么多词就不等标点直接送翻译（正常有标点的语音不会触发）
+# 这么多词就不等标点直接送翻译（正常有标点的语音不会触发）。
+# 分句合并上线后它还兼任"合并别把句子拖太长"的安全阀
 MAX_PENDING_WORDS = 24
+
+# ============ 分句边界（2026-08-02）============
+# Whisper 会在缩写/序数/口语停顿处打句号，只按 .!? 切的话 38.5% 的翻译单元
+# 是半截句（19个转录文件23526句的实测），碎片单独送翻会翻错。
+# 句号后面的词还没出来时最多扣留这么久再判定；连续说话时下一块音频 0.4 秒
+# 就到、根本等不到这个上限，一段话讲完的最后一句最多慢这么多
+SENTENCE_HOLD_SEC = 0.6
+# 自带句号的德语缩写（小写、去掉末尾的点后比较）。往里加词条很安全：
+# 只影响"这个点算不算句尾"，误收的代价是两句话合成一次翻译请求
+SENTENCE_ABBREVIATIONS = {
+    "bzw", "z.b", "zb", "ca", "usw", "u.a", "d.h", "ggf", "evtl", "inkl",
+    "bspw", "sog", "vgl", "etc", "dr", "prof", "nr", "abs", "bzgl", "ggfs",
+    "mio", "mrd", "jhd", "u.s.w", "z.t", "i.d.r", "st",
+}
 ENERGY_THRESHOLD_SPEECH = 0.01  # 静音门：整块能量低于此且上一块也静音则不提交（省GPU）
 
 # ============ ASR 收件箱硬顶 ============
@@ -81,14 +111,10 @@ DRAFT_MIN_WORDS = 3       # 残句至少这么多词才值得出草稿
 CHINESE_TEXT_COLOR = "#c8c8c8"  # 正式中文颜色（句对里的译文行）
 DRAFT_TEXT_COLOR = "#8fb8e0"  # 草稿中文颜色（和正式中文区分）
 
-# ============ 游戏模式（Ctrl+Alt+G 一键降配）============
-# 游戏和识别抢显卡时按热键临时降配：识别频率减半+贪心解码+关草稿中文。
-# 字幕定稿延迟约从1-1.5秒涨到2-3秒，但GPU占用明显下降。再按一次恢复。
-GAME_MODE_SUBMIT_SECONDS = 1.0  # 游戏模式下的提交节奏（正常0.5秒）
-GAME_MODE_BEAM_SIZE = 1         # 游戏模式下贪心解码（正常beam=3）
-GAME_MODE_DISABLE_DRAFT = True  # 游戏模式下关掉草稿中文（省Ollama请求）
-# 游戏模式切换到的轻量翻译模型：给游戏腾~3GB显存，GPU争用下tok/s也快得多。
-# qwen3.5:4b(3.4GB)基准分还略高于老qwen3:8b，质量不降级。设成 None 则不切模型
+# ============ 「性能」模式的轻量翻译模型 ============
+# 给游戏腾~3GB显存，GPU争用下tok/s也快得多。qwen3.5:4b(3.4GB)基准分还略高于
+# 老qwen3:8b，质量不降级。设成 None 则「性能」模式不切模型（小显存机器的
+# install.ps1 会这么写，防止反向升到大模型）
 GAME_MODE_OLLAMA_MODEL = "qwen3.5:4b"
 
 # ============ 字幕窗口配置 ============
@@ -109,22 +135,55 @@ UNSTABLE_TEXT_COLOR = "#999999"  # live行里未稳定（还可能变）的德�
 MAX_SENTENCE_PAIRS = 20  # 悬浮窗句对（德+中）条数上限；实际显示条数按窗口高度
                          # 精确排版测算，窗口拉大自动填满（更早的在📜历史窗口里）
 
-# ============ 场景预设（设置面板一键切换）============
-# 预设只动下面这 5 个键（均有面板控件）；其它面板项保持用户当前值。
-# 不碰 WHISPER_BEAM_SIZE / OLLAMA_MODEL 等热键专属项。
+# ============ 模式（⚙️面板四个按钮 / Ctrl+Alt+G 快捷跳「性能」）============
+# 2026-08-02 合并：以前"场景预设"（只动5个面板键）和"Ctrl+Alt+G 游戏模式"
+# （另切 beam 和翻译模型、且是"开关+还原快照"语义）是两套都叫游戏的机制，
+# 命名和行为都混。现在统一成四个平等并列的模式——点哪个就整套套用哪套值，
+# 没有"临时开关/退出时还原"这层。「性能」额外把翻译模型换成
+# GAME_MODE_OLLAMA_MODEL，其它模式切回启动时的基线模型。
 PRESETS = {
     "直播": dict(CHUNK_SUBMIT_SECONDS=0.5, IDLE_FLUSH_SEC=2.0,
                  MAX_SENTENCE_PAIRS=20, SHOW_BILINGUAL=True,
-                 DRAFT_TRANSLATION=True),
+                 DRAFT_TRANSLATION=True, WHISPER_BEAM_SIZE=3,
+                 TRANSLATION_STYLE="新闻访谈"),
     "看剧": dict(CHUNK_SUBMIT_SECONDS=0.5, IDLE_FLUSH_SEC=2.0,
                  MAX_SENTENCE_PAIRS=6, SHOW_BILINGUAL=True,
-                 DRAFT_TRANSLATION=True),
-    "游戏": dict(CHUNK_SUBMIT_SECONDS=1.0, IDLE_FLUSH_SEC=2.5,
+                 DRAFT_TRANSLATION=True, WHISPER_BEAM_SIZE=3,
+                 TRANSLATION_STYLE="影视对白"),
+    "性能": dict(CHUNK_SUBMIT_SECONDS=1.0, IDLE_FLUSH_SEC=2.5,
                  MAX_SENTENCE_PAIRS=4, SHOW_BILINGUAL=False,
-                 DRAFT_TRANSLATION=False),
+                 DRAFT_TRANSLATION=False, WHISPER_BEAM_SIZE=1,
+                 TRANSLATION_STYLE="影视对白"),
     "精听": dict(CHUNK_SUBMIT_SECONDS=0.4, IDLE_FLUSH_SEC=1.5,
                  MAX_SENTENCE_PAIRS=20, SHOW_BILINGUAL=True,
-                 DRAFT_TRANSLATION=True),
+                 DRAFT_TRANSLATION=True, WHISPER_BEAM_SIZE=3,
+                 TRANSLATION_STYLE="精听直译"),
+}
+
+# ============ 翻译语域 ============
+# 以前 prompt 里无条件写死"你是德语影视剧的字幕翻译…口语俚语粗话按中文对白
+# 习惯翻"——看新闻直播（tagesschau/党代会这类，用户的主要场景）时语域是错的，
+# 会把播报翻得过分口语。现在跟着模式走（PRESETS 里的 TRANSLATION_STYLE）。
+TRANSLATION_STYLE = "新闻访谈"
+TRANSLATION_STYLE_PROMPTS = {
+    "新闻访谈": {
+        "role": "新闻/访谈节目的字幕翻译",
+        "rules": ("1. 这是新闻播报或访谈：中文要通顺、准确、克制，不要加戏也不要过分口语化\n"
+                  "2. 机构名、职务、数字、地名必须准确；德语长句按中文习惯拆成短句\n"
+                  "3. 说话人自己的口语停顿/重复可以省略，但事实一个都不能改"),
+    },
+    "影视对白": {
+        "role": "影视剧的字幕翻译",
+        "rules": ("1. 这是剧集对白：口语、俚语、粗话按中文对白的习惯翻，保持角色语气，不要书面腔\n"
+                  "2. 结合上下文理解句意，不要机械直译；歌词就按歌词翻\n"
+                  "3. 专有名词保持一致"),
+    },
+    "精听直译": {
+        "role": "德语学习者的精听字幕翻译",
+        "rules": ("1. 学习用途：尽量贴着原文的结构和用词翻，方便对照着学，但中文仍要通顺\n"
+                  "2. 原文有的信息一个都不要漏，也不要自行补充原文没有的内容\n"
+                  "3. 专有名词保持一致"),
+    },
 }
 
 # 窗口样式
@@ -181,8 +240,24 @@ GLOSSARY = {
     "Rundfunkbeitrag": "广播电视费",
     "Verfassungsschutz": "联邦宪法保卫局",
     "Grundgesetz": "基本法",
+    # 地名（2026-08-02 实测译名在"塞乌塔/图塔"之间摇摆，标准译名是休达）
+    "Ceuta": "休达（西班牙在北非的飞地）",
+    "Melilla": "梅利利亚（西班牙在北非的飞地）",
     # 惯用语（直播实测被字面直译的）
     "Kohl nicht fett": "（惯用语 den Kohl nicht fett machen = 起不了多大作用，不是人名科尔）",
+}
+
+# ============ ASR 专有名词纠错表 ============
+# GLOSSARY 只管翻译 prompt，修不了 Whisper 本身听错的词（听成别的词之后，
+# 术语表根本匹配不上）。这里在词流入口做确定性替换：
+#   key = 小写、去标点的错词；value = 正确写法（大小写按德语规范写）
+# 2026-08-02 转录实证：Ceuta 被听成 Theuta（然后译名在"塞乌塔/图塔"之间摇摆）、
+# Hubschrauber 听成 Hubschreiber。
+# ☠️ 只放 1:1 的词级替换，且必须是"听错"而不是"同义词"——替换是确定性的
+# （相邻两次识别得到同样结果），local agreement 的前缀一致判定才不会被扰动
+ASR_CORRECTIONS = {
+    "theuta": "Ceuta",
+    "hubschreiber": "Hubschrauber",
 }
 
 # ============ 幻觉字幕黑名单 ============

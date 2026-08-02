@@ -116,3 +116,17 @@ if ($ollamaUp) {
 # 清掉暂停/停止标记，避免下次启动误判
 Remove-Item $stopFlag -ErrorAction SilentlyContinue
 Remove-Item "$PSScriptRoot\.paused" -ErrorAction SilentlyContinue
+
+# 验收：确认本项目 venv 下没有残留的 python 进程。
+# subtitle.pid 记的是 venv 启动器存根，真正的程序是它的子进程——2026-07-17
+# 实验确认过强杀存根时子进程会随 CPython 启动器自带的 Job 一起消亡，所以这里
+# 只观测不自动杀（按未经验证的假设去杀进程反而危险）。真出现残留就说明那条
+# 结论在某个 Windows/Python 版本上不成立，需要重新做实验。
+$leftover = Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith("$PSScriptRoot\venv") }
+if ($leftover) {
+    Write-Host ""
+    Write-Host "⚠️  停止后仍有本项目的 python 进程残留（PID: $($leftover.ProcessId -join ', ')）。"
+    Write-Host "   这不该发生。请把这行连同 subtitle.log 发给 AI（可能占着显存/音频设备，"
+    Write-Host "   下次启动会提示「已经在运行」）。手动结束: Stop-Process -Id $($leftover.ProcessId -join ',') -Force"
+}

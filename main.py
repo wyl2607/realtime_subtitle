@@ -47,6 +47,7 @@ import torch  # noqa: F401
 from translator_queue import WhisperQueueTranslator
 from audio_capture import AudioCapture, PAUSE_FLAG_FILE, STOP_FLAG_FILE
 from subtitle_window import SubtitleWindow
+from settings_window import MODE_ICONS as _MODE_ICON
 from PyQt5.QtCore import QTimer
 import config
 
@@ -66,12 +67,24 @@ class SubtitleApp:
         self.translator = None
         self.audio_capture = None
 
+        # 这台机器的"正常档位"翻译模型：必须在任何模式切换之前拍快照
+        # （此时 config_local 的显存分档已经生效）。非性能模式统一切回它
+        self._baseline_ollama_model = config.OLLAMA_MODEL
+
         # 初始化字幕窗口（必须在主线程；QApplication 也在这里面建）
         try:
             self.subtitle_window = SubtitleWindow()
         except Exception as e:
             print(f"❌ 字幕窗口初始化失败: {e}")
             sys.exit(1)
+
+        # 模式记账：窗口构造时已经从持久化状态恢复了面板高亮，这里必须读那个
+        # 值而不是无条件置 None——否则重启后第一次按 Ctrl+Alt+G，"之前的模式"
+        # 会被记成兜底的「直播」而不是屏幕上实际高亮的那个
+        self._current_mode = self.subtitle_window.settings_window._active_preset
+        self._mode_before_perf = None
+        # 面板四个按钮 / 手动拨滑块 → 都回到 _apply_mode 这唯一入口
+        self.subtitle_window.settings_window.on_mode_change = self._apply_mode
 
     def _load_models(self):
         """后台线程：加载 Whisper/Ollama + 音频采集，完成后接线并启动。
@@ -207,48 +220,57 @@ class SubtitleApp:
         self.subtitle_window.show_status(f"🌐 源语言切换中: {name}…")
         print(f"🌐 [热键] 请求切换源语言: {name}")
 
-    def _toggle_game_mode(self):
-        """游戏模式一键降配：识别频率减半+贪心解码+关草稿中文+切轻量翻译模型。
+    def _apply_mode(self, name):
+        """唯一的"应用模式"入口（⚙️面板按钮和 Ctrl+Alt+G 都走这里）。
 
-        四个旋钮都是采集/识别/翻译循环里每轮现读 config 的，改属性即热生效
-        （提交节奏下一块生效，beam下一次识别生效，模型下一次请求生效）。
-        开启时保存当前值，关闭时原样恢复——用户在⚙️面板改过的值不会被
-        覆盖成出厂默认。切模型后预热排进翻译线程，第一句不付冷加载费。"""
-        saved = getattr(self, '_game_mode_saved', None)
-        game_model = getattr(config, 'GAME_MODE_OLLAMA_MODEL', None)
-        if saved is None:
-            self._game_mode_saved = {
-                'CHUNK_SUBMIT_SECONDS': config.CHUNK_SUBMIT_SECONDS,
-                'WHISPER_BEAM_SIZE': config.WHISPER_BEAM_SIZE,
-                'DRAFT_TRANSLATION': getattr(config, 'DRAFT_TRANSLATION', True),
-                'OLLAMA_MODEL': config.OLLAMA_MODEL,
-            }
-            config.CHUNK_SUBMIT_SECONDS = config.GAME_MODE_SUBMIT_SECONDS
-            config.WHISPER_BEAM_SIZE = config.GAME_MODE_BEAM_SIZE
-            if config.GAME_MODE_DISABLE_DRAFT:
-                config.DRAFT_TRANSLATION = False
-            if game_model and game_model != config.OLLAMA_MODEL:
-                old_model = config.OLLAMA_MODEL
-                config.OLLAMA_MODEL = game_model
-                self.translator.request_warm_model(old_model=old_model, new_model=game_model)
-            self.subtitle_window.show_status(
-                "🎮 游戏模式已开启：GPU降配，字幕稍慢（Ctrl+Alt+G 恢复）")
-            print(f"🎮 [热键] 游戏模式开启: 节奏{config.CHUNK_SUBMIT_SECONDS}s "
-                  f"beam{config.WHISPER_BEAM_SIZE} 草稿{'关' if not config.DRAFT_TRANSLATION else '开'} "
-                  f"模型{config.OLLAMA_MODEL}")
+        纯 setattr 赋值，不碰任何 Qt widget，所以热键线程和主线程都能直接调
+        （widget 的同步由下面那句 notify_mode_applied 走信号 marshal 到主线程）。
+        模式里的值全是各循环每轮现读 config 的，改属性即热生效：提交节奏下一块
+        生效、beam 下一次识别生效、语域和模型下一次请求生效。
+
+        name=None 表示"用户手动拨了滑块，现在是自定义"——只更新记账和指示器，
+        一个 config 值都不动。未知模式名返回 False 且不改任何东西。
+        """
+        if name is None:
+            self._current_mode = None
+            self.subtitle_window.notify_mode_applied(None)
+            return True
+        presets = getattr(config, "PRESETS", {}) or {}
+        if name not in presets:
+            print(f"⚠️ 未知模式: {name}")
+            return False
+        for key, val in presets[name].items():
+            setattr(config, key, val)
+        # 「性能」换轻量翻译模型；其它模式切回启动时的基线（不是写死的值——
+        # 不同机器 config_local 里的 OLLAMA_MODEL 不一样，写死会覆盖显存分档）
+        target_model = (getattr(config, "GAME_MODE_OLLAMA_MODEL", None) if name == "性能"
+                        else self._baseline_ollama_model)
+        if target_model and target_model != config.OLLAMA_MODEL:
+            old_model = config.OLLAMA_MODEL
+            config.OLLAMA_MODEL = target_model
+            # ☠️ 模型还在后台加载时（窗口先显示的那十几秒）translator 是 None，
+            # 这时只改 config 就够了：翻译器构造后自然用新名字，退出时的
+            # _unload_our_models 也会把两个模型名都覆盖到，不会漏显存
+            if self.translator is not None:
+                self.translator.request_warm_model(old_model=old_model, new_model=target_model)
+        self._current_mode = name
+        self.subtitle_window.notify_mode_applied(name)
+        self.subtitle_window.show_status(f"{_MODE_ICON.get(name, '⚙️')} 已切换到「{name}」模式")
+        print(f"🎬 [模式] {name}: 节奏{config.CHUNK_SUBMIT_SECONDS}s "
+              f"beam{config.WHISPER_BEAM_SIZE} "
+              f"草稿{'开' if config.DRAFT_TRANSLATION else '关'} "
+              f"语域{config.TRANSLATION_STYLE} 模型{config.OLLAMA_MODEL}")
+        return True
+
+    def _toggle_perf_hotkey(self):
+        """Ctrl+Alt+G：跳到「性能」模式；已经在性能模式则跳回进入前那个模式
+        （没记录过就回默认「直播」）。"""
+        if self._current_mode == "性能":
+            target = self._mode_before_perf or "直播"
         else:
-            config.CHUNK_SUBMIT_SECONDS = saved['CHUNK_SUBMIT_SECONDS']
-            config.WHISPER_BEAM_SIZE = saved['WHISPER_BEAM_SIZE']
-            config.DRAFT_TRANSLATION = saved['DRAFT_TRANSLATION']
-            if saved['OLLAMA_MODEL'] != config.OLLAMA_MODEL:
-                old_model = config.OLLAMA_MODEL
-                config.OLLAMA_MODEL = saved['OLLAMA_MODEL']
-                self.translator.request_warm_model(old_model=old_model, new_model=saved['OLLAMA_MODEL'])
-            self._game_mode_saved = None
-            self.subtitle_window.show_status("🎮 游戏模式已关闭，恢复正常配置")
-            print(f"🎮 [热键] 游戏模式关闭: 恢复节奏{config.CHUNK_SUBMIT_SECONDS}s "
-                  f"beam{config.WHISPER_BEAM_SIZE} 模型{config.OLLAMA_MODEL}")
-        self.subtitle_window.notify_game_mode(self._game_mode_saved is not None)
+            self._mode_before_perf = self._current_mode or "直播"
+            target = "性能"
+        self._apply_mode(target)
 
     def _setup_hotkey(self):
         """全局快捷键：Windows 原生 RegisterHotKey。
@@ -271,7 +293,7 @@ class SubtitleApp:
             1: ("Ctrl+Alt+P", ord('P'), self._toggle_pause),
             2: ("Ctrl+Alt+L", ord('L'), self._switch_language),
             3: ("Ctrl+Alt+M", ord('M'), self.subtitle_window.toggle_click_through),
-            4: ("Ctrl+Alt+G", ord('G'), self._toggle_game_mode),
+            4: ("Ctrl+Alt+G", ord('G'), self._toggle_perf_hotkey),
         }
 
         def hotkey_loop():
@@ -347,10 +369,12 @@ class SubtitleApp:
         import threading
         threading.Thread(target=self._load_models, daemon=True, name="ModelLoader").start()
 
-        # 尾句兜底定时器（跑在Qt主线程，每秒检查一次）
+        # 尾句兜底定时器（跑在Qt主线程）。0.5秒一次：除了收尾 flush，它还负责
+        # 放行"被扣留等下文"的句尾（config.SENTENCE_HOLD_SEC），粒度太粗会让
+        # 一段话的最后一句多等半秒。忙的时候 request_flush 只是一次 early-return
         self._flush_timer = QTimer()
         self._flush_timer.timeout.connect(self._flush_check)
-        self._flush_timer.start(1000)
+        self._flush_timer.start(500)
 
         # 停止标记轮询（0.5s：停止.bat 体感更快）
         self._stop_timer = QTimer()

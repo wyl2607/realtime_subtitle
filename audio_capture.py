@@ -195,6 +195,18 @@ class AudioCapture:
                 source_rate = int(default_speakers['defaultSampleRate'])
                 channels = default_speakers['maxInputChannels']
 
+                # ☠️ 重采样必须保持滤波器状态：以前每块都调一次无状态的
+                # soxr.resample()，多相滤波器状态每次归零，等于在每个 42ms
+                # 块的边界注入一次瞬变。离线实测（96k→16k，4096帧/块，纯音
+                # 频谱能量比）：一次性重采样 90.4dB，逐块无状态只有 34.3dB，
+                # ResampleStream 恢复到 90.4dB——喂给 Whisper 的每一帧音频
+                # 本来都叠着一层 -34dB 的宽带噪声。
+                # 只在源采样率≠目标时才需要（相等时下面走原样透传）
+                resampler = None
+                if source_rate != config.SAMPLE_RATE:
+                    resampler = soxr.ResampleStream(
+                        source_rate, config.SAMPLE_RATE, 1, dtype="float32")
+
                 # 连续提交缓冲（numpy数组列表，避免逐样本extend的开销）
                 chunk_buffer = []       # 当前积累的音频块
                 chunk_samples = 0       # 累计样本数（16kHz重采样后）
@@ -230,6 +242,11 @@ class AudioCapture:
                             chunk_samples = 0
                             buffer_has_speech = False
                             prev_had_speech = False
+                            # 暂停期间的块没喂给重采样器，滤波器状态里留了个缺口 →
+                            # 恢复时重建一个干净的（代价 μs 级）
+                            if resampler is not None:
+                                resampler = soxr.ResampleStream(
+                                    source_rate, config.SAMPLE_RATE, 1, dtype="float32")
                             continue
 
                         # 转换为float32并归一化到[-1, 1]
@@ -241,10 +258,10 @@ class AudioCapture:
 
                         # 重采样到目标采样率（如果需要）
                         # 直接用soxr（librosa底层也是它，但librosa整包import要好几秒）
-                        if source_rate != config.SAMPLE_RATE:
-                            audio_chunk = soxr.resample(
-                                audio_chunk, source_rate, config.SAMPLE_RATE
-                            )
+                        if resampler is not None:
+                            audio_chunk = resampler.resample_chunk(audio_chunk)
+                            if len(audio_chunk) == 0:
+                                continue  # 流式重采样首块可能没有输出（滤波器还在填充）
 
                         # 计算当前块的能量（RMS），只做静音门用
                         energy = np.sqrt(np.mean(audio_chunk ** 2))

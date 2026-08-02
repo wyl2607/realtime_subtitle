@@ -11,10 +11,20 @@ from window_frame import ResizableFramelessWidget
 class WindowChromeMixin:
 
     def _position_chrome(self):
-        """绝对定位标题条 + 右上角按钮 + 穿透指示器（不进布局）。"""
+        """绝对定位标题条 + 右上角按钮 + 模式/穿透指示器（不进布局）。"""
         w = self.container.width()
         h = ResizableFramelessWidget.DRAG_BAR_HEIGHT
         self.drag_bar.setGeometry(0, 0, w, h)
+        # 模式指示器常驻左上角，正好压在 drag_bar 的位置上 → 把 bar 的文字
+        # 起点右移到它后面，两者不重叠。指示器是鼠标穿透的，WM_NCHITTEST 仍
+        # 返回 HTCAPTION，压着它照样能拖窗口
+        mode_ind = getattr(self, "mode_indicator", None)
+        if mode_ind is not None:
+            mode_ind.adjustSize()
+            mode_ind.move(6, max(0, (h - mode_ind.height()) // 2))
+            mode_ind.show()
+            mode_ind.raise_()
+            self._set_drag_bar_text_offset(mode_ind.width() + 14)
         self.btn_bar.adjustSize()
         self.btn_bar.move(w - self.btn_bar.width() - 10, max(0, (h - self.btn_bar.height()) // 2))
         self.ct_indicator.adjustSize()
@@ -26,6 +36,24 @@ class WindowChromeMixin:
             self.btn_bar.raise_()
         if self.ct_indicator.isVisible():
             self.ct_indicator.raise_()
+
+    def _set_drag_bar_text_offset(self, left_px):
+        """把拖动条文字往右推，给左上角的模式指示器让位（只改 padding-left）。"""
+        if getattr(self, "_drag_bar_pad", None) == left_px:
+            return  # 样式表重设会触发重排，宽度没变就别动
+        self._drag_bar_pad = left_px
+        self.drag_bar.setStyleSheet("""
+            QLabel {
+                background-color: rgba(28, 28, 28, 210);
+                color: rgba(220, 220, 220, 200);
+                font-size: 12px;
+                font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+                padding-left: %dpx;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+            }
+        """ % int(left_px))
 
     def _position_btn_bar(self):
         """兼容旧调用点：与 _position_chrome 等价"""
@@ -95,6 +123,11 @@ class WindowChromeMixin:
     # ------------------------------------------------------------------
     def _on_display_settings_change(self):
         """设置面板显示相关改动：刷样式 + 重渲染（颜色/双语/字体都落到 HTML）。"""
+        if not getattr(config, "DRAFT_TRANSLATION", True) and getattr(self, "live_draft", ""):
+            # 关掉草稿开关时，屏幕上和电视窗里已经挂着的那条草稿要立刻消失。
+            # 不清的话它会一直挂到下一次内容变化——安静段能挂好几分钟
+            self.live_draft = ""
+            self.tv_window.update_draft("")
         self._apply_styles()
         self._render()
 

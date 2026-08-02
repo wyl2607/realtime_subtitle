@@ -1,7 +1,20 @@
 # 统一模式系统（场景预设 + 游戏模式合并）设计
 
 日期：2026-07-20
-状态：用户已确认（架构方向/config schema/指示器/热键语义/测试迁移范围均已过）
+状态：**已于 2026-08-02 实现**（原状态：用户已确认，架构方向/config schema/
+指示器/热键语义/测试迁移范围均已过）
+
+实现时补了四点规格里没写到的（详见桌面 AI_README.md 的 2026-08-02 记录）：
+
+1. `_apply_mode` 必须防 `self.translator is None`——规格和"窗口先显示、模型
+   后台加载"是同一天写的，但没覆盖加载中的那十几秒（点模式按钮会
+   AttributeError）。translator 还没建时只改 config 即可。
+2. `collect_tuning` 的游戏模式豁免（`_GAME_MODE_TUNING_KEYS`）要一并删除，
+   否则重启后面板值和恢复的模式高亮对不上。
+3. 常驻指示器会和 hover 出现的拖动条重叠 → `_set_drag_bar_text_offset()` 把
+   拖动条文字的 padding-left 推到指示器右边。
+4. 顺带把"翻译语域"并进模式（`PRESETS` 的 `TRANSLATION_STYLE` +
+   `config.TRANSLATION_STYLE_PROMPTS`），不再另开一套风格开关 UI。
 
 ## 背景与目标
 
