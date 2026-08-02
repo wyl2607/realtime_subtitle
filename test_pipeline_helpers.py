@@ -591,6 +591,26 @@ def test_translate_cold_then_warm_timeout():
     assert seen == [config.OLLAMA_TIMEOUT_COLD, config.OLLAMA_TIMEOUT]
 
 
+def test_translate_num_gpu_is_optional_and_configurable(monkeypatch):
+    """不把某台机器的 num_gpu=50 硬编码进所有设备；默认自动分配，
+    config_local.py 需要时仍可明确限制层数。"""
+    payloads = []
+
+    class _Session:
+        def post(self, url, json=None, stream=None, timeout=None):
+            payloads.append(json)
+            return _FakeStreamResponse([{"response": "好", "done": True}])
+
+    monkeypatch.setattr(config, "OLLAMA_NUM_GPU", None, raising=False)
+    t = _translator_for_tx(ollama_session=_Session())
+    t._translate_single_sentence("Eins.", "")
+    assert "num_gpu" not in payloads[-1]["options"]
+
+    monkeypatch.setattr(config, "OLLAMA_NUM_GPU", 12, raising=False)
+    t._translate_single_sentence("Zwei.", "")
+    assert payloads[-1]["options"]["num_gpu"] == 12
+
+
 def test_translate_circuit_breaker_stops_requests(monkeypatch):
     """连续失败到阈值 → 熔断期间一个请求都不发（队列不会因反复超时堆积）。"""
     import requests

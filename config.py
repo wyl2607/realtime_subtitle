@@ -35,6 +35,10 @@ WHISPER_BEAM_SIZE = 3  # beam search 大小。whisper_streaming作者用5，这�
 # OLLAMA_MODEL="qwen3:8b"。qwen3:14b 精听选项已被 9b 事实取代（也已删）。
 OLLAMA_MODEL = "qwen3.5:9b"  # Ollama 模型名称
 OLLAMA_BASE_URL = "http://localhost:11434"  # Ollama API 地址
+# Ollama GPU offload layers：None = 让 Ollama 按当前显存自动决定。
+# 不要把某台机器测出的固定层数写死；小显存设备会因此把模型挤进系统内存，
+# 而不同模型的总层数也不一样。需要手动限制时可在 config_local.py 覆盖为整数。
+OLLAMA_NUM_GPU = None
 
 # 翻译请求超时（流式下是"相邻数据块间隔"上限，不是总时长）。
 # ☠️ 冷热两档不能合并成一个值：模型已在显存时 15 秒足够且能快速发现 Ollama 卡死；

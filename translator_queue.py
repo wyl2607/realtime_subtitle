@@ -856,19 +856,30 @@ class WhisperQueueTranslator:
             # 模型还没进显存时先等后台预热落地，并改用长超时
             self._await_model_ready()
 
+            ollama_options = {
+                "temperature": 0.3,
+                "top_p": 0.9,
+                "num_predict": 512,
+                "num_ctx": 4096,  # prompt多了术语表，2048偏紧
+            }
+            # 不把某台机器/某个模型的层数硬编码成 50：qwen 版本的总层数
+            # 不同，小显存机器固定 offload 层数还会把剩余层挤到系统内存。
+            # None 交给 Ollama 自动按显存决定；高级用户可在 config_local.py
+            # 写整数覆盖。
+            num_gpu = getattr(config, "OLLAMA_NUM_GPU", None)
+            if num_gpu is not None:
+                try:
+                    ollama_options["num_gpu"] = max(0, int(num_gpu))
+                except (TypeError, ValueError):
+                    print(f"   ⚠️  OLLAMA_NUM_GPU 无效({num_gpu!r})，改用自动分配")
+
             payload = {
                 "model": config.OLLAMA_MODEL,
                 "prompt": prompt,
                 "stream": True,  # 流式：中文逐段上屏，不等整句
                 "think": False,
                 "keep_alive": "2h",  # 默认5分钟卸载，安静段后第一句付~9秒冷加载
-                "options": {
-                    "temperature": 0.3,
-                    "top_p": 0.9,
-                    "num_predict": 512,
-                    "num_ctx": 4096,  # prompt多了术语表，2048偏紧
-                    "num_gpu": 50,
-                },
+                "options": ollama_options,
             }
 
             # 读超时重试一次：模型冷加载期间首句必然超时，丢掉的话那句话永远
