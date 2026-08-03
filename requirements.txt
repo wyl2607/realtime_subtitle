@@ -14,7 +14,7 @@ nvidia-cudnn-cu12>=9.24.0.43
 
 # 音频处理
 pyaudiowpatch>=0.2.12.8,<1.0.0     # Windows 系统音频捕获 (WASAPI Loopback)
-soxr>=0.3.0,<1.0.0              # 音频重采样（librosa太重，只用得到resample，底层就是soxr）
+soxr>=1.1.0,<2.0.0              # 音频重采样（librosa太重，只用得到resample，底层就是soxr）
 
 # 用户界面
 PyQt5>=5.15.11,<5.16.0           # GUI 框架
