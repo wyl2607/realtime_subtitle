@@ -937,7 +937,7 @@ class WhisperQueueTranslator:
     def _analyze_background_worker(self, german_text, callback):
         prompt = build_background_summary_prompt(german_text)
         self._run_ai_analysis_request(
-            prompt, callback, num_predict=400, label="背景总结")
+            prompt, callback, num_predict=300, label="背景总结")
 
     def deep_explain(self, sentence, callback):
         """整句深度解释（比查词更展开）。callback(text) 必须线程安全。"""
@@ -950,7 +950,7 @@ class WhisperQueueTranslator:
     def _deep_explain_worker(self, sentence, callback):
         prompt = build_deep_explain_prompt(sentence)
         self._run_ai_analysis_request(
-            prompt, callback, num_predict=600, label="深度解释")
+            prompt, callback, num_predict=400, label="深度解释")
 
     def _run_ai_analysis_request(self, prompt, callback, num_predict=400, label="分析"):
         """共用 Ollama /api/generate 路径：失败只改弹窗文案，不重试、不打扰主链路。"""

@@ -111,7 +111,7 @@ LOOKUP_CACHE_MAX = 200
 # "https://chatgpt.com/?q={query}&hints=search"）。
 AI_ANALYSIS_WEB_URL_TEMPLATE = "https://grok.com/?q={query}"
 AI_CONTEXT_WINDOW_MINUTES = 5      # 🤖 分析最近几分钟的句对
-AI_CONTEXT_MAX_CHARS = 2000        # 喂给本地模型的德文上限；超了从最旧丢
+AI_CONTEXT_MAX_CHARS = 1400        # 喂给本地模型的德文上限；超了从最旧丢
 
 # ============ 草稿翻译（中文第一时间上屏）============
 # 德语先行显示解决了德语的即时性，但中文要等句子凑齐(.!?)+正式翻译，

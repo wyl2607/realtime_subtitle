@@ -74,8 +74,8 @@ class SubtitleSignals(QObject):
     pair = pyqtSignal(str, str)  # 一段德语翻译完成 (german, chinese)
     draft = pyqtSignal(str)  # live德语的草稿中文（正式句对完成后被替换）
     lookup = pyqtSignal(str, str)  # 点词查词结果 (word, 词典文本)
-    ai_analysis = pyqtSignal(str)  # 🤖 背景总结结果
-    deep_explain = pyqtSignal(str)  # 点词「深度解释」结果
+    ai_analysis = pyqtSignal(str, int)  # 🤖 背景总结结果 (text, seq)
+    deep_explain = pyqtSignal(str, int)  # 点词「深度解释」结果 (text, seq)
     toggle_ct = pyqtSignal()  # 切换鼠标穿透模式（热键线程→主线程）
     mode = pyqtSignal(object)  # 当前模式名(str)或 None(自定义)：热键线程→主线程
 
@@ -383,6 +383,9 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         self.on_deep_explain = None  # (sentence, callback) -> None
         self._last_html = ""   # 最近一次渲染的富文本（点击命中测试要按它重建排版）
         self._ai_context_text = ""  # 最近一次 🤖 请求的德文，给"问更强的AI"拼问句
+        # 代数门控：连点 🤖 / 深度解释时只认最后一次结果（各自计数，弹窗不互相覆盖）
+        self._ai_analysis_seq = 0
+        self._deep_explain_seq = 0
         self.word_popup.on_deep_explain = self._on_word_deep_explain
         self.word_popup.on_open_web = self._open_ai_web
         self.ai_analysis_popup.on_open_web = self._open_ai_web
@@ -632,25 +635,38 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
                 show_web=False,
             )
             return
+        # 连点只认最后一次：旧请求回来时 _show_ai_analysis 按 seq 丢弃
+        self._ai_analysis_seq += 1
+        seq = self._ai_analysis_seq
         self._ai_context_text = german_text
+        web_q = build_web_query_for_background(german_text)
         self.ai_analysis_popup.show_at(
             anchor,
             "🤖 <b>正在分析最近内容…</b>",
             timeout_ms=60000,  # 分析可能比查词慢，等结果期间别提前关
             show_deep=False,
-            show_web=False,
-            web_query=build_web_query_for_background(german_text),
+            # 等本地结果时也能提前跳网页，不必干等到 30s 超时
+            show_web=True,
+            web_query=web_q,
         )
         if self.on_ai_analysis:
-            self.on_ai_analysis(german_text, self.show_ai_analysis_result)
+            self.on_ai_analysis(
+                german_text,
+                lambda text, s=seq: self.show_ai_analysis_result(text, s),
+            )
         else:
-            self.show_ai_analysis_result("分析功能未接线（translator 未就绪）")
+            self.show_ai_analysis_result("分析功能未接线（translator 未就绪）", seq)
 
-    def show_ai_analysis_result(self, text):
-        """背景总结完成（线程安全）"""
-        self.signals.ai_analysis.emit(text or "")
+    def show_ai_analysis_result(self, text, seq=None):
+        """背景总结完成（线程安全）。seq 缺省时用当前代数（兼容旧接线）。"""
+        if seq is None:
+            seq = self._ai_analysis_seq
+        self.signals.ai_analysis.emit(text or "", int(seq))
 
-    def _show_ai_analysis(self, text):
+    def _show_ai_analysis(self, text, seq):
+        # 过时请求：用户已发起更新的分析/上下文，别盖掉当前弹窗
+        if seq != self._ai_analysis_seq:
+            return
         import html as _html
         from translator_queue import build_web_query_for_background
         body = _html.escape(text).replace("\n", "<br>")
@@ -666,31 +682,45 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
     def _on_word_deep_explain(self, context):
         """WordPopup「深度解释」按钮：先改成加载态，再丢给 translator。"""
         import html as _html
+        from translator_queue import build_web_query_for_sentence
         ctx = (context or "").strip()
         if not ctx:
             self.word_popup.update_content(
                 "🔍 没有整句上下文，无法深度解释",
                 show_deep=False, show_web=False, timeout_ms=8000)
             return
+        # 连点 / 换词后再点深度解释：旧结果按 seq 丢弃
+        self._deep_explain_seq += 1
+        seq = self._deep_explain_seq
+        web_q = build_web_query_for_sentence(ctx)
         self.word_popup.update_content(
             f"🔍 <b>深度解释中…</b><br>"
             f"<span style='color:#aaa'>{_html.escape(ctx[:120])}"
             f"{'…' if len(ctx) > 120 else ''}</span>",
             show_deep=False,
-            show_web=False,
+            # 等本地结果时也能提前跳网页
+            show_web=True,
             context=ctx,
+            web_query=web_q,
             timeout_ms=60000,
         )
         if self.on_deep_explain:
-            self.on_deep_explain(ctx, self.show_deep_explain_result)
+            self.on_deep_explain(
+                ctx,
+                lambda text, s=seq: self.show_deep_explain_result(text, s),
+            )
         else:
-            self.show_deep_explain_result("深度解释未接线（translator 未就绪）")
+            self.show_deep_explain_result("深度解释未接线（translator 未就绪）", seq)
 
-    def show_deep_explain_result(self, text):
-        """深度解释完成（线程安全）"""
-        self.signals.deep_explain.emit(text or "")
+    def show_deep_explain_result(self, text, seq=None):
+        """深度解释完成（线程安全）。seq 缺省时用当前代数（兼容旧接线）。"""
+        if seq is None:
+            seq = self._deep_explain_seq
+        self.signals.deep_explain.emit(text or "", int(seq))
 
-    def _show_deep_explain(self, text):
+    def _show_deep_explain(self, text, seq):
+        if seq != self._deep_explain_seq:
+            return
         import html as _html
         from translator_queue import build_web_query_for_sentence
         body = _html.escape(text).replace("\n", "<br>")

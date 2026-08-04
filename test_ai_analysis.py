@@ -227,14 +227,19 @@ def test_word_popup_button_click_does_not_hide_blank_does():
 
 
 def test_update_content_restarts_hide_timer():
-    """内容从「分析中」变成结果时必须重新 start 计时器（间接：update 后仍可见）。"""
+    """内容从「分析中」变成结果时必须重新 start 计时器（间接：update 后仍可见）。
+
+    「分析中」态已 show_web=True（用户可提前跳网页），update 后仍保持可见。
+    """
     app = _app()
     popup = AIAnalysisPopup()
     screen = QApplication.primaryScreen().availableGeometry()
     pos = QPoint(screen.center().x(), screen.center().y())
-    popup.show_at(pos, "分析中…", timeout_ms=60000, show_web=False)
+    popup.show_at(
+        pos, "分析中…", timeout_ms=60000, show_web=True, web_query="q")
     app.processEvents()
     assert popup.isVisible()
+    assert popup.web_btn.isVisible(), "分析中就该能点「问更强的AI」"
     popup.update_content(
         "最终结果", show_web=True, web_query="q", timeout_ms=60000)
     app.processEvents()
@@ -392,3 +397,190 @@ def test_run_ai_analysis_request_sets_and_clears_inflight_flag_even_on_failure()
 
     assert t._lookup_inflight is False, "异常路径也必须清 flag（finally块）"
     assert results and "失败" in results[0]
+
+
+# ---------------------------------------------------------------------------
+# 代数门控：背景总结 / 深度解释只认最新一次请求
+#
+# 与查词 _lookup_seq 同思路，但计数器在 UI 侧（subtitle_window）：
+# 连点 🤖 / 深度解释时递增；_show_* 发现 seq 过时则丢弃，不更新弹窗。
+# ---------------------------------------------------------------------------
+
+def _ai_gate_stub():
+    """轻量 stub：绑定真实 _show_* / show_*_result，假 popup 记更新。"""
+    from subtitle_window import SubtitleWindow, SubtitleSignals
+
+    class _Popup:
+        def __init__(self):
+            self.texts = []
+            self._context = ""
+            self.kwargs = []
+
+        def update_content(self, html_text, **kwargs):
+            self.texts.append(html_text)
+            self.kwargs.append(kwargs)
+            if kwargs.get("context") is not None:
+                self._context = kwargs["context"]
+
+        def show_at(self, _pos, html_text, **kwargs):
+            self.texts.append(html_text)
+            self.kwargs.append(kwargs)
+
+    w = object.__new__(SubtitleWindow)
+    w._ai_analysis_seq = 0
+    w._deep_explain_seq = 0
+    w._ai_context_text = "Hallo Welt"
+    w.ai_analysis_popup = _Popup()
+    w.word_popup = _Popup()
+    w.signals = SubtitleSignals()
+    w._show_ai_analysis = SubtitleWindow._show_ai_analysis.__get__(w)
+    w._show_deep_explain = SubtitleWindow._show_deep_explain.__get__(w)
+    w.show_ai_analysis_result = SubtitleWindow.show_ai_analysis_result.__get__(w)
+    w.show_deep_explain_result = SubtitleWindow.show_deep_explain_result.__get__(w)
+    w.signals.ai_analysis.connect(w._show_ai_analysis)
+    w.signals.deep_explain.connect(w._show_deep_explain)
+    return w
+
+
+def test_show_ai_analysis_discards_stale_seq():
+    """旧代数结果不更新弹窗；当前代数正常写入。"""
+    app = _app()
+    w = _ai_gate_stub()
+    w._ai_analysis_seq = 2
+
+    w._show_ai_analysis("过时总结", 1)
+    assert w.ai_analysis_popup.texts == [], "旧 seq 必须丢弃"
+
+    w._show_ai_analysis("最新总结", 2)
+    assert len(w.ai_analysis_popup.texts) == 1
+    assert "最新总结" in w.ai_analysis_popup.texts[0]
+
+
+def test_show_deep_explain_discards_stale_seq():
+    app = _app()
+    w = _ai_gate_stub()
+    w._deep_explain_seq = 3
+    w.word_popup._context = "Das ist ein Satz."
+
+    w._show_deep_explain("旧解释", 1)
+    assert w.word_popup.texts == []
+
+    w._show_deep_explain("新解释", 3)
+    assert len(w.word_popup.texts) == 1
+    assert "新解释" in w.word_popup.texts[0]
+
+
+def test_result_callbacks_carry_seq_through_signal():
+    """worker 经 show_*_result → 信号 → _show_* 整条链保留 seq。"""
+    app = _app()
+    w = _ai_gate_stub()
+    w._ai_analysis_seq = 5
+    w._deep_explain_seq = 7
+
+    # 模拟过时回调（用户已连点，seq 落后）
+    w.show_ai_analysis_result("旧背景", 4)
+    app.processEvents()
+    assert w.ai_analysis_popup.texts == []
+
+    w.show_ai_analysis_result("新背景", 5)
+    app.processEvents()
+    assert len(w.ai_analysis_popup.texts) == 1
+    assert "新背景" in w.ai_analysis_popup.texts[0]
+
+    w.show_deep_explain_result("旧深度", 6)
+    app.processEvents()
+    assert w.word_popup.texts == []
+
+    w.show_deep_explain_result("新深度", 7)
+    app.processEvents()
+    assert len(w.word_popup.texts) == 1
+    assert "新深度" in w.word_popup.texts[0]
+
+
+def test_on_ai_analysis_clicked_bumps_seq_and_shows_web_while_loading():
+    """发起背景总结：seq+1、分析中 show_web=True、回调带捕获的 seq。"""
+    import time
+    from PyQt5.QtCore import QRect, QPoint
+    from subtitle_window import SubtitleWindow
+
+    app = _app()
+    w = _ai_gate_stub()
+    w.sentence_pairs = [
+        ("Das ist ein laengerer Satz.", "这是一句较长的话。", time.time()),
+    ]
+
+    class _Container:
+        def frameGeometry(self):
+            return QRect(100, 100, 400, 200)
+
+    w.container = _Container()
+    w._on_ai_analysis_clicked = SubtitleWindow._on_ai_analysis_clicked.__get__(w)
+
+    captured = []
+
+    def _fake_analyze(text, cb):
+        captured.append((text, cb))
+
+    w.on_ai_analysis = _fake_analyze
+    w._on_ai_analysis_clicked()
+    app.processEvents()
+
+    assert w._ai_analysis_seq == 1
+    assert captured, "应提交分析请求"
+    assert w.ai_analysis_popup.texts, "应显示分析中"
+    assert "分析" in w.ai_analysis_popup.texts[-1]
+    last_kw = w.ai_analysis_popup.kwargs[-1]
+    assert last_kw.get("show_web") is True, "分析中就该露出网页链接"
+    assert last_kw.get("web_query"), "web_query 应已算好"
+
+    # 回调应绑定 seq=1；若期间又点一次，旧回调不生效
+    w._ai_analysis_seq = 2
+    captured[0][1]("不该显示的旧结果")
+    app.processEvents()
+    assert all("不该显示" not in t for t in w.ai_analysis_popup.texts)
+
+
+def test_on_word_deep_explain_bumps_seq_and_shows_web_while_loading():
+    from subtitle_window import SubtitleWindow
+
+    app = _app()
+    w = _ai_gate_stub()
+    w._on_word_deep_explain = SubtitleWindow._on_word_deep_explain.__get__(w)
+
+    captured = []
+    w.on_deep_explain = lambda sentence, cb: captured.append((sentence, cb))
+
+    w._on_word_deep_explain("Das ist der absolute Wahnsinn!")
+    app.processEvents()
+
+    assert w._deep_explain_seq == 1
+    assert captured and captured[0][0].startswith("Das ist")
+    last_kw = w.word_popup.kwargs[-1]
+    assert last_kw.get("show_web") is True
+    assert last_kw.get("web_query")
+
+    w._deep_explain_seq = 9  # 模拟又点了别的词 / 新深度解释
+    captured[0][1]("过时深度")
+    app.processEvents()
+    assert all("过时深度" not in t for t in w.word_popup.texts)
+
+
+def test_ai_workers_use_reduced_num_predict():
+    """算力收敛：背景总结 300、深度解释 400（不再用 400/600）。"""
+    from translator_queue import WhisperQueueTranslator
+
+    t = object.__new__(WhisperQueueTranslator)
+    t.closing = False
+    seen = []
+
+    def _fake_run(prompt, callback, num_predict=400, label="分析"):
+        seen.append((label, num_predict))
+
+    t._run_ai_analysis_request = _fake_run
+    WhisperQueueTranslator._analyze_background_worker(t, "de", lambda *a: None)
+    WhisperQueueTranslator._deep_explain_worker(t, "satz", lambda *a: None)
+    assert seen == [("背景总结", 300), ("深度解释", 400)]
+
+
+def test_config_ai_context_max_chars_reduced():
+    assert config.AI_CONTEXT_MAX_CHARS == 1400

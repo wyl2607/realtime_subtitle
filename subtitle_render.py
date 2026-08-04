@@ -257,10 +257,13 @@ class LiveTextRenderMixin:
         from PyQt5.QtGui import QCursor
         self._lookup_anchor = QCursor.pos()
         self._lookup_context = context  # 深度解释用整句，不靠弹窗事后再猜
+        # 点新词会使进行中的深度解释过时（共享 WordPopup，旧结果回来别盖查词）
+        self._deep_explain_seq = getattr(self, "_deep_explain_seq", 0) + 1
+        # HTTP 超时 15s；弹窗要比它多留一点余量，避免 8-15s 区间先消失再闪回
         self.word_popup.show_at(
             self._lookup_anchor,
             f"🔍 <b>{html.escape(word)}</b> 查询中…",
-            8000,
+            16000,
             show_deep=False,
             show_web=False,
         )
