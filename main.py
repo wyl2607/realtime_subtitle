@@ -125,6 +125,11 @@ class SubtitleApp:
             # 点词查词：窗口点击→translator查Ollama→回调线程安全地弹结果
             self.subtitle_window.on_lookup = lambda word, ctx: self.translator.lookup_word(
                 word, ctx, self.subtitle_window.show_lookup_result)
+            # 🤖 背景总结 / 点词深度解释：同样走 _lookup_executor，不占翻译队列
+            self.subtitle_window.on_ai_analysis = (
+                lambda text, cb: self.translator.analyze_background(text, cb))
+            self.subtitle_window.on_deep_explain = (
+                lambda sentence, cb: self.translator.deep_explain(sentence, cb))
 
             # 音频捕获（设备名/设备切换提示直接上悬浮窗）。构造要开WASAPI流，
             # 有几百毫秒窗口，之后再查一次 _closing 才真正启动采集/热键
@@ -154,6 +159,8 @@ class SubtitleApp:
                     pass
                 self.translator = None
                 self.subtitle_window.on_lookup = None
+                self.subtitle_window.on_ai_analysis = None
+                self.subtitle_window.on_deep_explain = None
             # status 5秒自清，失败信息要用live行持久显示（不会有识别来覆盖它）
             self.subtitle_window.update_live(
                 f"❌ 启动失败: {e}", "详见 subtitle.err.log / subtitle.log，可发给AI排查；点❌退出")

@@ -1,13 +1,48 @@
 """
-轻量弹窗：字幕历史回看窗 + 点词查词小窗。
+轻量弹窗：字幕历史回看窗 + 点词查词小窗 + AI 分析弹窗。
 """
 import html
 import time
-from PyQt5.QtWidgets import QLabel, QWidget, QVBoxLayout, QTextEdit
+from PyQt5.QtWidgets import QLabel, QWidget, QVBoxLayout, QTextEdit, QPushButton
 from PyQt5.QtCore import Qt
 import config
 
 from window_geometry import _screen_area_at
+
+
+# 弹窗内操作按钮共用样式（深色半透明，压在圆角框里不抢戏）
+_POPUP_BTN_STYLE = """
+    QPushButton {
+        background-color: rgba(45, 55, 70, 230);
+        color: #d0e4ff;
+        font-size: 13px;
+        font-family: Microsoft YaHei, Arial;
+        padding: 6px 10px;
+        border-radius: 6px;
+        border: 1px solid rgba(143, 184, 224, 0.45);
+        text-align: left;
+    }
+    QPushButton:hover {
+        background-color: rgba(60, 75, 95, 240);
+        border: 1px solid rgba(143, 184, 224, 0.8);
+    }
+    QPushButton:disabled {
+        color: #888;
+        border: 1px solid rgba(120, 120, 120, 0.4);
+    }
+"""
+
+_POPUP_LABEL_STYLE = """
+    QLabel {
+        background-color: rgba(25, 30, 40, 240);
+        color: white;
+        font-size: 16px;
+        font-family: Microsoft YaHei, Arial;
+        padding: 10px 14px;
+        border-radius: 8px;
+        border: 1px solid rgba(143, 184, 224, 0.6);
+    }
+"""
 
 
 class HistoryWindow(QWidget):
@@ -60,48 +95,69 @@ class HistoryWindow(QWidget):
             sb.setValue(sb.maximum())
 
 
-class WordPopup(QWidget):
-    """点词查词的小弹窗：跟着鼠标位置出现，自动消失，点一下也消失"""
+class _AnalysisPopupBase(QWidget):
+    """WordPopup / AIAnalysisPopup 共用：深色圆角框 + 自动隐藏计时器 + 可选操作按钮。
 
-    def __init__(self):
+    子控件 QPushButton 会自己吃掉点击，不会冒泡触发本窗 mousePressEvent——
+    所以点按钮不会误关；点标签/空白仍关闭。
+    """
+
+    def __init__(self, max_width=420):
         super().__init__()
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
         self.label = QLabel()
         self.label.setWordWrap(True)
         self.label.setTextFormat(Qt.RichText)
-        self.label.setStyleSheet("""
-            QLabel {
-                background-color: rgba(25, 30, 40, 240);
-                color: white;
-                font-size: 16px;
-                font-family: Microsoft YaHei, Arial;
-                padding: 10px 14px;
-                border-radius: 8px;
-                border: 1px solid rgba(143, 184, 224, 0.6);
-            }
-        """)
+        self.label.setStyleSheet(_POPUP_LABEL_STYLE)
         layout.addWidget(self.label)
+
+        self.deep_btn = QPushButton("🔍 深度解释")
+        self.deep_btn.setStyleSheet(_POPUP_BTN_STYLE)
+        self.deep_btn.setCursor(Qt.PointingHandCursor)
+        self.deep_btn.hide()
+        self.deep_btn.clicked.connect(self._on_deep_clicked)
+        layout.addWidget(self.deep_btn)
+
+        self.web_btn = QPushButton("🌐 问更强的AI")
+        self.web_btn.setStyleSheet(_POPUP_BTN_STYLE)
+        self.web_btn.setCursor(Qt.PointingHandCursor)
+        self.web_btn.hide()
+        self.web_btn.clicked.connect(self._on_web_clicked)
+        layout.addWidget(self.web_btn)
+
         self.setLayout(layout)
-        self.setMaximumWidth(420)
+        self.setMaximumWidth(max_width)
 
         from PyQt5.QtCore import QTimer
         self._hide_timer = QTimer(self)
         self._hide_timer.setSingleShot(True)
         self._hide_timer.timeout.connect(self.hide)
+        self._default_timeout_ms = 15000
 
-    def show_at(self, global_pos, html_text, timeout_ms=15000):
-        self.label.setText(html_text)
+        # 回调由 SubtitleWindow 接线；弹窗自己不碰 translator / webbrowser
+        self.on_deep_explain = None   # () -> None，用弹窗已记住的 context
+        self.on_open_web = None       # () -> None，用弹窗已记住的 web 问句
+        self._context = ""            # 点词时的整句，给深度解释
+        self._web_query = ""          # 跳网页用的自然语言问题
+
+    def _restart_hide_timer(self, timeout_ms=None):
+        """内容变化或用户点了操作按钮时重置——防止分析还在跑弹窗先被关掉。"""
+        ms = self._default_timeout_ms if timeout_ms is None else timeout_ms
+        self._hide_timer.stop()
+        self._hide_timer.start(ms)
+
+    def _place_and_show(self, global_pos, timeout_ms):
         self.adjustSize()
-        # 往上偏移显示，避免挡住刚点的词；钳在点击位置所在屏（副屏点词不能飞到主屏）
         screen = _screen_area_at(global_pos)
         if screen is None:
             self.move(global_pos.x() - 40, global_pos.y() - self.height() - 12)
             self.show()
             self.raise_()
-            self._hide_timer.start(timeout_ms)
+            self._restart_hide_timer(timeout_ms)
             return
         x = min(max(screen.left(), global_pos.x() - 40), screen.right() - self.width())
         y = global_pos.y() - self.height() - 12
@@ -110,9 +166,69 @@ class WordPopup(QWidget):
         self.move(x, y)
         self.show()
         self.raise_()
-        self._hide_timer.start(timeout_ms)
+        self._restart_hide_timer(timeout_ms)
+
+    def show_at(self, global_pos, html_text, timeout_ms=15000,
+                show_deep=False, show_web=False, context="", web_query=""):
+        """通用显示。show_deep/show_web 控制底部操作按钮；content 变了会重置计时器。"""
+        self._context = context or ""
+        self._web_query = web_query or ""
+        self.label.setText(html_text)
+        self.deep_btn.setVisible(bool(show_deep))
+        self.deep_btn.setEnabled(True)
+        self.web_btn.setVisible(bool(show_web))
+        self._default_timeout_ms = timeout_ms
+        self._place_and_show(global_pos, timeout_ms)
+
+    def update_content(self, html_text, show_deep=False, show_web=False,
+                       context=None, web_query=None, timeout_ms=None):
+        """已显示时只换内容/按钮（不挪位置），并重置隐藏计时器。"""
+        if context is not None:
+            self._context = context
+        if web_query is not None:
+            self._web_query = web_query
+        self.label.setText(html_text)
+        self.deep_btn.setVisible(bool(show_deep))
+        self.deep_btn.setEnabled(True)
+        self.web_btn.setVisible(bool(show_web))
+        self.adjustSize()
+        ms = self._default_timeout_ms if timeout_ms is None else timeout_ms
+        self._default_timeout_ms = ms
+        self._restart_hide_timer(ms)
+        if not self.isVisible():
+            self.show()
+        self.raise_()
+
+    def _on_deep_clicked(self):
+        # 按钮自己吃事件，不会走到 mousePressEvent；这里重置计时器等分析结果
+        self._restart_hide_timer()
+        self.deep_btn.setEnabled(False)
+        if self.on_deep_explain:
+            self.on_deep_explain(self._context)
+
+    def _on_web_clicked(self):
+        self._restart_hide_timer()
+        if self.on_open_web:
+            self.on_open_web(self._web_query)
 
     def mousePressEvent(self, event):
+        # 点标签/空白关闭；子按钮不会冒泡到这里
         self.hide()
 
 
+class WordPopup(_AnalysisPopupBase):
+    """点词查词的小弹窗：跟着鼠标位置出现，自动消失，点空白也消失。
+
+    查词结果出来后底部多一个「深度解释」；深度解释完成后再出「问更强的AI」。
+    """
+
+    def __init__(self):
+        super().__init__(max_width=420)
+
+
+class AIAnalysisPopup(_AnalysisPopupBase):
+    """🤖 背景总结弹窗：样式与 WordPopup 一致，底部固定「问更强的AI」。"""
+
+    def __init__(self):
+        super().__init__(max_width=480)
+        self.web_btn.setText("🌐 问更强的AI")

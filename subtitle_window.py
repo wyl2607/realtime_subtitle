@@ -36,7 +36,7 @@ from settings_window import (
     SettingsWindow, TUNING_KEYS, MODE_ICONS,
     apply_tuning, collect_tuning, apply_text_color, snapshot_defaults,
 )
-from popups import HistoryWindow, WordPopup
+from popups import HistoryWindow, WordPopup, AIAnalysisPopup
 from tv_window import TVWindow
 from window_chrome import WindowChromeMixin
 from subtitle_render import LiveTextRenderMixin
@@ -74,6 +74,8 @@ class SubtitleSignals(QObject):
     pair = pyqtSignal(str, str)  # 一段德语翻译完成 (german, chinese)
     draft = pyqtSignal(str)  # live德语的草稿中文（正式句对完成后被替换）
     lookup = pyqtSignal(str, str)  # 点词查词结果 (word, 词典文本)
+    ai_analysis = pyqtSignal(str)  # 🤖 背景总结结果
+    deep_explain = pyqtSignal(str)  # 点词「深度解释」结果
     toggle_ct = pyqtSignal()  # 切换鼠标穿透模式（热键线程→主线程）
     mode = pyqtSignal(object)  # 当前模式名(str)或 None(自定义)：热键线程→主线程
 
@@ -111,7 +113,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         # 内存里多留一些句对（HISTORY_KEEP条），实际显示条数由窗口高度自适应决定：
         # 窗口拉大 → 自动多显示历史；拉小 → 只留最新的
         self.HISTORY_KEEP = 50
-        self.sentence_pairs = []  # 已完成句对 [(german, chinese)]
+        self.sentence_pairs = []  # 已完成句对 [(german, chinese, timestamp)]
         self.live_committed = ""  # live行：已提交未翻译的德语
         self.live_unstable = ""   # live行：未稳定尾部（灰色）
         self.live_draft = ""      # live行的草稿中文（等正式翻译时先显示）
@@ -164,6 +166,13 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         self.tv_btn.setStyleSheet(button_style)
         self.tv_btn.clicked.connect(self._toggle_tv)
         self.tv_btn.setToolTip("电视全屏模式（大字滚动，Esc 退出）")
+
+        # AI 分析：最近几分钟背景总结（本地 Ollama → 可跳网页版追问）
+        self.ai_btn = QPushButton("🤖")
+        self.ai_btn.setFixedSize(30, 30)
+        self.ai_btn.setStyleSheet(button_style)
+        self.ai_btn.clicked.connect(self._on_ai_analysis_clicked)
+        self.ai_btn.setToolTip("AI 分析最近几分钟内容（本地模型 + 可跳网页版）")
 
         # 创建设置按钮
         self.settings_btn = QPushButton("⚙️")
@@ -268,7 +277,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         bar_layout.setContentsMargins(0, 0, 0, 0)
         bar_layout.setSpacing(6)
         for b in (self.minimize_btn, self.history_btn, self.tv_btn,
-                  self.settings_btn, self.quit_btn):
+                  self.ai_btn, self.settings_btn, self.quit_btn):
             b.setParent(self.btn_bar)
             bar_layout.addWidget(b)
         self.btn_bar.setLayout(bar_layout)
@@ -366,9 +375,17 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
 
         # 点词查词：单击字幕里的德语词 → 弹小窗显示词典解释
         self.word_popup = WordPopup()
+        self.ai_analysis_popup = AIAnalysisPopup()
         self.container.on_click = self._on_label_click
         self.on_lookup = None  # (word, context) -> None，由main.py接到translator
+        # AI 分析/深度解释：同样由 main 接到 translator 的 _lookup_executor 路径
+        self.on_ai_analysis = None   # (german_text, callback) -> None
+        self.on_deep_explain = None  # (sentence, callback) -> None
         self._last_html = ""   # 最近一次渲染的富文本（点击命中测试要按它重建排版）
+        self._ai_context_text = ""  # 最近一次 🤖 请求的德文，给"问更强的AI"拼问句
+        self.word_popup.on_deep_explain = self._on_word_deep_explain
+        self.word_popup.on_open_web = self._open_ai_web
+        self.ai_analysis_popup.on_open_web = self._open_ai_web
 
         # 连接信号到槽（线程安全）
         self.signals.update.connect(self._update_text)
@@ -377,6 +394,8 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         self.signals.pair.connect(self._add_pair)
         self.signals.draft.connect(self._update_draft)
         self.signals.lookup.connect(self._show_lookup)
+        self.signals.ai_analysis.connect(self._show_ai_analysis)
+        self.signals.deep_explain.connect(self._show_deep_explain)
         self.signals.toggle_ct.connect(self._toggle_click_through)
         self.signals.mode.connect(self._on_mode_applied)
         
@@ -589,9 +608,113 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         if self.tv_window.isVisible():
             self.tv_window.hide()
         else:
-            self.tv_window.backfill([zh for _, zh in self.sentence_pairs])
+            self.tv_window.backfill([zh for _, zh, _ in self.sentence_pairs])
             self.tv_window.open_fullscreen(
                 avoid_center=self.container.frameGeometry().center())
+
+    def _on_ai_analysis_clicked(self):
+        """🤖：过滤最近 N 分钟德文 → 本地总结；空内容直接提示不打 Ollama。"""
+        from translator_queue import (
+            filter_recent_german_context,
+            build_web_query_for_background,
+        )
+        german_text = filter_recent_german_context(self.sentence_pairs)
+        # 弹窗锚在主字幕窗中心偏上，避免挡死最新字幕
+        anchor = self.container.frameGeometry().center()
+        from PyQt5.QtCore import QPoint
+        anchor = QPoint(anchor.x(), self.container.frameGeometry().top() + 40)
+        if not german_text:
+            self.ai_analysis_popup.show_at(
+                anchor,
+                "🤖 最近没有足够内容可分析",
+                timeout_ms=8000,
+                show_deep=False,
+                show_web=False,
+            )
+            return
+        self._ai_context_text = german_text
+        self.ai_analysis_popup.show_at(
+            anchor,
+            "🤖 <b>正在分析最近内容…</b>",
+            timeout_ms=60000,  # 分析可能比查词慢，等结果期间别提前关
+            show_deep=False,
+            show_web=False,
+            web_query=build_web_query_for_background(german_text),
+        )
+        if self.on_ai_analysis:
+            self.on_ai_analysis(german_text, self.show_ai_analysis_result)
+        else:
+            self.show_ai_analysis_result("分析功能未接线（translator 未就绪）")
+
+    def show_ai_analysis_result(self, text):
+        """背景总结完成（线程安全）"""
+        self.signals.ai_analysis.emit(text or "")
+
+    def _show_ai_analysis(self, text):
+        import html as _html
+        from translator_queue import build_web_query_for_background
+        body = _html.escape(text).replace("\n", "<br>")
+        web_q = build_web_query_for_background(self._ai_context_text)
+        self.ai_analysis_popup.update_content(
+            f"🤖 <b>背景总结</b><br>{body}",
+            show_deep=False,
+            show_web=True,
+            web_query=web_q,
+            timeout_ms=30000,
+        )
+
+    def _on_word_deep_explain(self, context):
+        """WordPopup「深度解释」按钮：先改成加载态，再丢给 translator。"""
+        import html as _html
+        ctx = (context or "").strip()
+        if not ctx:
+            self.word_popup.update_content(
+                "🔍 没有整句上下文，无法深度解释",
+                show_deep=False, show_web=False, timeout_ms=8000)
+            return
+        self.word_popup.update_content(
+            f"🔍 <b>深度解释中…</b><br>"
+            f"<span style='color:#aaa'>{_html.escape(ctx[:120])}"
+            f"{'…' if len(ctx) > 120 else ''}</span>",
+            show_deep=False,
+            show_web=False,
+            context=ctx,
+            timeout_ms=60000,
+        )
+        if self.on_deep_explain:
+            self.on_deep_explain(ctx, self.show_deep_explain_result)
+        else:
+            self.show_deep_explain_result("深度解释未接线（translator 未就绪）")
+
+    def show_deep_explain_result(self, text):
+        """深度解释完成（线程安全）"""
+        self.signals.deep_explain.emit(text or "")
+
+    def _show_deep_explain(self, text):
+        import html as _html
+        from translator_queue import build_web_query_for_sentence
+        body = _html.escape(text).replace("\n", "<br>")
+        ctx = getattr(self.word_popup, "_context", "") or ""
+        self.word_popup.update_content(
+            f"🔍 <b>深度解释</b><br>{body}",
+            show_deep=False,
+            show_web=True,
+            web_query=build_web_query_for_sentence(ctx),
+            timeout_ms=30000,
+        )
+
+    def _open_ai_web(self, prompt_text):
+        """跳网页版更强 AI；失败只 status 提一句，不弹阻塞框。"""
+        import webbrowser
+        from translator_queue import build_ai_web_url
+        q = (prompt_text or "").strip()
+        if not q:
+            self.show_status("没有可追问的内容")
+            return
+        try:
+            webbrowser.open(build_ai_web_url(q))
+        except Exception as e:
+            self.show_status(f"无法打开网页: {e}")
 
     def _quit_application(self):
         """退出程序"""

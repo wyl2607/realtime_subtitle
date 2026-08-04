@@ -42,3 +42,4 @@ config_local.py
 .ai_review_prompt.md
 review_report_*.md
 .ai_review_prompt_*.md
+.grok_implement_*.md

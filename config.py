@@ -105,6 +105,14 @@ TRANSLATE_BATCH_MAX_CHARS = 300
 # 点词查词 LRU 容量（词×语言）。重复点同一词不打 Ollama
 LOOKUP_CACHE_MAX = 200
 
+# ============ AI 分析（🤖按钮 / 点词深度解释）============
+# 本地 Ollama 先出结果，弹窗里"问更强的AI"再跳网页版追问。
+# {query} 会被 URL-encode 后替换；可改成 ChatGPT 等（如
+# "https://chatgpt.com/?q={query}&hints=search"）。
+AI_ANALYSIS_WEB_URL_TEMPLATE = "https://grok.com/?q={query}"
+AI_CONTEXT_WINDOW_MINUTES = 5      # 🤖 分析最近几分钟的句对
+AI_CONTEXT_MAX_CHARS = 2000        # 喂给本地模型的德文上限；超了从最旧丢
+
 # ============ 草稿翻译（中文第一时间上屏）============
 # 德语先行显示解决了德语的即时性，但中文要等句子凑齐(.!?)+正式翻译，
 # 长句能滞后5-15秒。开启后：残句在翻译worker空闲时先翻一版"草稿中文"

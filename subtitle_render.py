@@ -3,6 +3,7 @@
 HTML/QTextDocument构建 + 点词查词命中测试。以mixin形式并入 SubtitleWindow。
 """
 import html
+import time
 from PyQt5.QtCore import Qt
 import config
 
@@ -50,7 +51,8 @@ class LiveTextRenderMixin:
         self._render()
 
     def _add_pair(self, german, chinese):
-        self.sentence_pairs.append((german, chinese))
+        # 第三元是墙钟时间：🤖 按"最近 N 分钟"过滤时用（二元组没法做时间窗）
+        self.sentence_pairs.append((german, chinese, time.time()))
         while len(self.sentence_pairs) > self.HISTORY_KEEP:
             self.sentence_pairs.pop(0)
         self.live_draft = ""  # 正式翻译到了，草稿退场
@@ -185,7 +187,7 @@ class LiveTextRenderMixin:
         doc = self._doc_for_render()
         avail_h = self.window.height() - 40
 
-        pair_blocks = [b for b in (self._pair_html(g, c) for g, c in self.sentence_pairs) if b]
+        pair_blocks = [b for b in (self._pair_html(g, c) for g, c, _ in self.sentence_pairs) if b]
         cap = min(len(pair_blocks), getattr(config, "MAX_SENTENCE_PAIRS", 20))
 
         def fits(count):
@@ -254,8 +256,14 @@ class LiveTextRenderMixin:
 
         from PyQt5.QtGui import QCursor
         self._lookup_anchor = QCursor.pos()
-        self.word_popup.show_at(self._lookup_anchor,
-                                f"🔍 <b>{html.escape(word)}</b> 查询中…", 8000)
+        self._lookup_context = context  # 深度解释用整句，不靠弹窗事后再猜
+        self.word_popup.show_at(
+            self._lookup_anchor,
+            f"🔍 <b>{html.escape(word)}</b> 查询中…",
+            8000,
+            show_deep=False,
+            show_web=False,
+        )
         self.on_lookup(word, context)
 
     def show_lookup_result(self, word, text):
@@ -264,6 +272,12 @@ class LiveTextRenderMixin:
 
     def _show_lookup(self, word, text):
         body = html.escape(text).replace("\n", "<br>")
+        context = getattr(self, "_lookup_context", "") or ""
+        # 查词完成后露出「深度解释」；web 按钮等深度解释结果再出
         self.word_popup.show_at(
             getattr(self, "_lookup_anchor", self.container.pos()),
-            f"📖 <b>{html.escape(word)}</b><br>{body}")
+            f"📖 <b>{html.escape(word)}</b><br>{body}",
+            show_deep=bool(context.strip()),
+            show_web=False,
+            context=context,
+        )

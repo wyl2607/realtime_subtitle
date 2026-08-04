@@ -117,6 +117,103 @@ def _interjection_lookup(sentence):
     return getattr(config, "INTERJECTION_TRANSLATIONS", {}).get(key)
 
 
+# ------------------------------------------------------------------
+# AI 分析纯函数（时间窗过滤 / prompt / URL）——无副作用，单测直接 import
+# ------------------------------------------------------------------
+
+# 跳网页时德语原文片段封顶，避免整段上下文把 URL 撑爆（某些浏览器/系统有上限）
+AI_WEB_FRAGMENT_MAX_CHARS = 300
+
+
+def filter_recent_german_context(sentence_pairs, now=None, window_minutes=None,
+                                 max_chars=None):
+    """从 sentence_pairs [(german, chinese, ts), ...] 取最近 N 分钟德文，
+    按时间顺序拼接；超 max_chars 从最旧开始丢，保留最近内容。无命中返回 ""。"""
+    if now is None:
+        now = time.time()
+    if window_minutes is None:
+        window_minutes = getattr(config, "AI_CONTEXT_WINDOW_MINUTES", 5)
+    if max_chars is None:
+        max_chars = getattr(config, "AI_CONTEXT_MAX_CHARS", 2000)
+    cutoff = now - float(window_minutes) * 60.0
+    # 保持原列表顺序（时间升序 append）；只取窗口内有德文的
+    pieces = []
+    for item in sentence_pairs:
+        if len(item) < 3:
+            continue
+        german, _chinese, ts = item[0], item[1], item[2]
+        if ts is None or ts < cutoff:
+            continue
+        g = (german or "").strip()
+        if g:
+            pieces.append(g)
+    if not pieces:
+        return ""
+    # 从最旧往最新拼；超限时丢最旧
+    text = " ".join(pieces)
+    if len(text) <= max_chars:
+        return text
+    # 从尾部保留：丢掉最旧的 piece 直到塞得下
+    kept = []
+    total = 0
+    for g in reversed(pieces):
+        add = len(g) + (1 if kept else 0)
+        if total + add > max_chars and kept:
+            break
+        if total + add > max_chars and not kept:
+            # 单句就超上限：硬截最近一句的尾部（保留"最近"）
+            kept.append(g[-max_chars:])
+            break
+        kept.append(g)
+        total += add
+    kept.reverse()
+    return " ".join(kept)
+
+
+def build_background_summary_prompt(german_text):
+    """🤖 背景总结：3-5 句中文讲最近在聊什么。"""
+    lang_name = config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)
+    return (
+        f"/no_think 你在帮一位正在看{lang_name}直播/视频的中文用户快速跟上背景。"
+        f"下面是最近几分钟的{lang_name}字幕原文（可能有识别误差）。\n\n"
+        f"{german_text}\n\n"
+        "请用中文写 3-5 句话：这段时间在讲什么主题、关键人物/事件、"
+        "需要知道的背景。不要逐句翻译，不要列表，不要开场白。"
+    )
+
+
+def build_deep_explain_prompt(sentence):
+    """点词升级：整句背景/含义/俚语双关，比单词释义更展开。"""
+    lang_name = config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)
+    return (
+        f"/no_think 你在帮一位中文用户理解一句{lang_name}对白的深层含义。\n"
+        f"原句：{sentence}\n\n"
+        "请用中文解释：\n"
+        "1) 这句话在说什么（自然通顺的释义）\n"
+        "2) 背景/语境上可能指什么（人物、事件、文化）\n"
+        "3) 若有俚语、双关、讽刺、固定搭配，单独点出\n"
+        "控制在 6-10 句以内，不要逐词拆解成词典条目，不要开场白。"
+    )
+
+
+def build_web_query_for_background(german_text, max_fragment_chars=AI_WEB_FRAGMENT_MAX_CHARS):
+    frag = (german_text or "")[:max_fragment_chars]
+    return f"请帮我总结并解释这段德语直播内容的背景：「{frag}」"
+
+
+def build_web_query_for_sentence(sentence, max_fragment_chars=AI_WEB_FRAGMENT_MAX_CHARS):
+    frag = (sentence or "")[:max_fragment_chars]
+    return f"请帮我解释这句德语的背景：「{frag}」"
+
+
+def build_ai_web_url(prompt_text):
+    """把自然语言问题填进 AI_ANALYSIS_WEB_URL_TEMPLATE（{query} 已 URL-encode）。"""
+    from urllib.parse import quote
+    template = getattr(
+        config, "AI_ANALYSIS_WEB_URL_TEMPLATE", "https://grok.com/?q={query}")
+    return template.format(query=quote(prompt_text or "", safe=""))
+
+
 def _squash_repeats(sentences, keep_words=3, keep_sents=2):
     """压缩Whisper复读伪影（游戏噪音实测提交过"Get. Get. Get. Get. Get. Get."）：
     句内同词连续超过 keep_words 次收敛；一批里连续相同句子超过 keep_sents 条丢弃。
@@ -815,6 +912,70 @@ class WhisperQueueTranslator:
         except Exception as e:
             if not self.closing and not self._lookup_stale(seq):
                 callback(word, f"查询失败: {e}")
+
+    # ------------------------------------------------------------------
+    # AI 分析（背景总结 / 整句深度解释）——复用 _lookup_executor，不占翻译队列
+    # ------------------------------------------------------------------
+    def analyze_background(self, german_text, callback):
+        """最近 N 分钟内容的背景总结。callback(text) 必须线程安全。"""
+        try:
+            self._lookup_executor.submit(
+                self._analyze_background_worker, german_text, callback)
+        except RuntimeError:
+            pass  # 程序正在退出
+
+    def _analyze_background_worker(self, german_text, callback):
+        prompt = build_background_summary_prompt(german_text)
+        self._run_ai_analysis_request(
+            prompt, callback, num_predict=400, label="背景总结")
+
+    def deep_explain(self, sentence, callback):
+        """整句深度解释（比查词更展开）。callback(text) 必须线程安全。"""
+        try:
+            self._lookup_executor.submit(
+                self._deep_explain_worker, sentence, callback)
+        except RuntimeError:
+            pass
+
+    def _deep_explain_worker(self, sentence, callback):
+        prompt = build_deep_explain_prompt(sentence)
+        self._run_ai_analysis_request(
+            prompt, callback, num_predict=600, label="深度解释")
+
+    def _run_ai_analysis_request(self, prompt, callback, num_predict=400, label="分析"):
+        """共用 Ollama /api/generate 路径：失败只改弹窗文案，不重试、不打扰主链路。"""
+        try:
+            t0 = time.time()
+            response = self.lookup_session.post(
+                f"{config.OLLAMA_BASE_URL}/api/generate",
+                json={
+                    "model": config.OLLAMA_MODEL,
+                    "prompt": prompt,
+                    "stream": False,
+                    "think": False,
+                    "keep_alive": "2h",
+                    "options": {
+                        "temperature": 0.3,
+                        "num_predict": int(num_predict),
+                        "num_ctx": 4096,
+                    },
+                },
+                timeout=30,
+            )
+            if self.closing:
+                return
+            if response.status_code == 200:
+                self._ollama_hot = True
+                text = response.json().get("response", "").strip()
+                text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+                if config.SHOW_PERFORMANCE:
+                    print(f"   🤖 {label} {time.time() - t0:.1f}秒")
+                callback(text or "（没有分析结果）")
+            else:
+                callback(f"分析失败（HTTP {response.status_code}）")
+        except Exception as e:
+            if not self.closing:
+                callback(f"分析失败: {e}")
 
     def _translate_single_sentence(self, sentence, german_context, on_partial=None):
         """翻译一段对白（源语言 -> 中文）。失败时返回原文。
