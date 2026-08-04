@@ -49,3 +49,4 @@ review_report_*.md
 .grok_perf_err.txt
 .grok_perf_lookup_prompt.md
 .grok_r2_*.md
+logs/

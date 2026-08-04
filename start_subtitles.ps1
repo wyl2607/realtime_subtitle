@@ -86,6 +86,25 @@ if ($models -notcontains $txModel) {
 }
 
 Write-Host "启动实时字幕..."
+
+# ☠️ -RedirectStandardOutput 会把 subtitle.log 整个截断。日志里有"概况"诊断行
+# （识别/翻译分位数、缓冲分桶、扣留放行与切早计数），要靠跨天累积的数据来判断
+# 该不该调参数——每次启动清空的话，重启一次或关一次机就前功尽弃。
+# 所以启动前先把上一份挪进 logs\ 存档，只保留最近 30 份（一份约几十 KB）。
+$logDir = Join-Path $PSScriptRoot "logs"
+if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
+foreach ($name in @("subtitle.log", "subtitle.err.log")) {
+    $cur = Join-Path $PSScriptRoot $name
+    if ((Test-Path $cur) -and ((Get-Item $cur).Length -gt 0)) {
+        $stamp = (Get-Item $cur).LastWriteTime.ToString("yyyyMMdd-HHmmss")
+        $base = [IO.Path]::GetFileNameWithoutExtension($name)
+        Move-Item $cur (Join-Path $logDir "$base-$stamp.log") -Force -ErrorAction SilentlyContinue
+    }
+}
+Get-ChildItem $logDir -Filter "subtitle-*.log" -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending | Select-Object -Skip 30 |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+
 # 隐藏窗口启动+输出写进日志文件。之前用-NoNewWindow让python挂在这个控制台上，
 # 用户手动关窗口时python会被一起杀掉，跟提示语说的"关窗不停止"正好相反
 $proc = Start-Process -FilePath "$PSScriptRoot\venv\Scripts\python.exe" `
