@@ -249,19 +249,31 @@ def test_update_content_restarts_hide_timer():
     popup.hide()
 
 
-def test_analyze_background_and_deep_explain_use_lookup_executor():
-    """两个新方法必须 submit 到 _lookup_executor，不新建池、不碰 _tx_executor。"""
+def test_analyze_background_and_deep_explain_use_separate_executor():
+    """☠️ AI 分析必须走 _analysis_executor，绝不能和查词共用一个池。
+
+    根因（2026-08-04）：两者曾共用一个 max_workers=1 的 _lookup_executor，
+    而 AI 分析的 HTTP 超时是 30 秒、查词只有 15 秒。用户"点了深度解释再点个
+    词"时，查词会在线程池队列里干等最多 30 秒才发得出去——_lookup_stale 只能
+    让排队中的请求最后不发，取消不了队头阻塞。
+    """
     from translator_queue import WhisperQueueTranslator
     # 不真正构造完整 translator（会加载模型）；只测方法绑定 + submit 目标
     t = object.__new__(WhisperQueueTranslator)
     t.closing = False
     submitted = []
+    lookup_submitted = []
 
     class _Exec:
         def submit(self, fn, *a):
             submitted.append((fn, a))
 
-    t._lookup_executor = _Exec()
+    class _LookupExec:
+        def submit(self, fn, *a):
+            lookup_submitted.append((fn, a))
+
+    t._analysis_executor = _Exec()
+    t._lookup_executor = _LookupExec()
     t.analyze_background = WhisperQueueTranslator.analyze_background.__get__(t)
     t.deep_explain = WhisperQueueTranslator.deep_explain.__get__(t)
     t._analyze_background_worker = (
@@ -277,6 +289,7 @@ def test_analyze_background_and_deep_explain_use_lookup_executor():
     assert submitted[1][0] == t._deep_explain_worker
     assert submitted[0][1][0] == "de text"
     assert submitted[1][1][0] == "ein satz"
+    assert lookup_submitted == [], "AI 分析不能占用查词的池（否则查词队头阻塞）"
 
 
 # ---------------------------------------------------------------------------
@@ -345,28 +358,52 @@ def test_maybe_draft_runs_when_lookup_not_inflight(monkeypatch):
     assert len(t._submitted) == 1
 
 
+class _FakeStreamResponse:
+    """假的 Ollama 流式响应：一块一个 token，最后一块 done=True"""
+
+    status_code = 200
+
+    def __init__(self, pieces):
+        self._pieces = list(pieces)
+        self.closed = False
+
+    def iter_lines(self):
+        import json as _json
+        for i, piece in enumerate(self._pieces):
+            yield _json.dumps(
+                {"response": piece, "done": i == len(self._pieces) - 1}
+            ).encode("utf-8")
+
+    def close(self):
+        self.closed = True
+
+
+def _lookup_translator():
+    """够 _lookup_worker 跑起来的最小假 translator"""
+    from translator_queue import WhisperQueueTranslator
+    t = object.__new__(WhisperQueueTranslator)
+    t.closing = False
+    t._lookup_inflight = False
+    t._ollama_hot = False
+    t._lookup_seq = 1
+    t._lookup_cache = __import__("collections").OrderedDict()
+    t._lookup_cache_lock = __import__("threading").Lock()
+    t._LOOKUP_CACHE_MAX = 200
+    return t
+
+
 def test_lookup_worker_sets_and_clears_inflight_flag():
     """_lookup_worker 请求期间 _lookup_inflight 应为 True，结束后必须清回 False。"""
     from translator_queue import WhisperQueueTranslator
 
-    t = object.__new__(WhisperQueueTranslator)
-    t.closing = False
-    t._lookup_inflight = False
-    t._lookup_seq = 1
-    t._lookup_cache = {}
-    t._lookup_cache_lock = __import__("threading").Lock()
-    t._LOOKUP_CACHE_MAX = 200
+    t = _lookup_translator()
     seen_inflight_during_call = []
-
-    class _FakeResponse:
-        status_code = 200
-        def json(self):
-            return {"response": "结果"}
+    response = _FakeStreamResponse(["结", "果"])
 
     class _FakeSession:
         def post(self, *a, **k):
             seen_inflight_during_call.append(t._lookup_inflight)
-            return _FakeResponse()
+            return response
 
     t.lookup_session = _FakeSession()
     results = []
@@ -376,36 +413,152 @@ def test_lookup_worker_sets_and_clears_inflight_flag():
     assert seen_inflight_during_call == [True], "请求发出时 _lookup_inflight 应为 True"
     assert t._lookup_inflight is False, "请求结束后必须清回 False，否则草稿永远让路"
     assert results == [("Wort", "结果")]
+    assert response.closed, "stream=True 的连接必须 close，否则连接池泄漏"
 
 
 def test_lookup_worker_uses_reduced_num_predict():
     """算力收敛（2026-08-04实测）：查词 num_predict 220→170。"""
     from translator_queue import WhisperQueueTranslator
 
-    t = object.__new__(WhisperQueueTranslator)
-    t.closing = False
-    t._lookup_inflight = False
-    t._lookup_seq = 1
-    t._lookup_cache = {}
-    t._lookup_cache_lock = __import__("threading").Lock()
-    t._LOOKUP_CACHE_MAX = 200
+    t = _lookup_translator()
     posted = []
 
-    class _FakeResponse:
-        status_code = 200
-        def json(self):
-            return {"response": "结果"}
-
     class _FakeSession:
-        def post(self, url, json, timeout):
+        def post(self, url, json, stream=False, timeout=None):
             posted.append(json)
-            return _FakeResponse()
+            return _FakeStreamResponse(["结果"])
 
     t.lookup_session = _FakeSession()
     WhisperQueueTranslator._lookup_worker(
         t, "Wort", "ein Kontext", lambda w, txt: None, seq=1)
 
     assert posted[0]["options"]["num_predict"] == 170
+
+
+def test_lookup_worker_shares_num_ctx_with_translation():
+    """☠️ 查词的 num_ctx 必须和翻译请求一致，否则每次点词都重装模型。
+
+    根因（2026-08-04 实测，字幕程序在跑、翻译流持续占用 Ollama）：Ollama 的
+    runner 按 (模型, 上下文长度) 缓存，查词曾写死 num_ctx=2048 而翻译是 4096，
+    于是每次点词都把 5.6GB 模型整个重装一遍——load_duration 6.9~8.7 秒、
+    单次查词 10.4~12.5 秒。统一成 config.OLLAMA_NUM_CTX 之后 load_duration
+    0.27 秒、单次查词 3.3~4.0 秒。
+    """
+    from translator_queue import WhisperQueueTranslator
+
+    t = _lookup_translator()
+    posted = []
+
+    class _FakeSession:
+        def post(self, url, json, stream=False, timeout=None):
+            posted.append(json)
+            return _FakeStreamResponse(["结果"])
+
+    t.lookup_session = _FakeSession()
+    WhisperQueueTranslator._lookup_worker(
+        t, "Wort", "ein Kontext", lambda w, txt: None, seq=1)
+
+    assert posted[0]["options"]["num_ctx"] == config.OLLAMA_NUM_CTX
+    assert posted[0]["stream"] is True, "查词要流式，首行才能先上屏"
+
+
+def test_lookup_worker_streams_partial_lines_only():
+    """流式 partial 按【整行】推：查词是四行固定格式，按 token 推弹窗会抖。"""
+    from translator_queue import WhisperQueueTranslator
+
+    t = _lookup_translator()
+    # 每块之间插足够的时间间隔，绕过 0.15 秒节流
+    pieces = ["原形: Haus", "\n词性: 名词", "\n释义: 房子", "\n本句中: 指住处"]
+
+    class _FakeSession:
+        def post(self, *a, **k):
+            return _FakeStreamResponse(pieces)
+
+    t.lookup_session = _FakeSession()
+    partials = []
+    finals = []
+
+    # 每次读时钟就前进 1 秒：稳定绕过 0.15 秒节流，让每一块都有机会推 partial
+    # （用真实时间的话这个测试跑得比节流窗还快，partials 会是空的——
+    #   空列表会让下面的循环断言全部真空通过）
+    import translator_queue as tq
+    clock = [0.0]
+
+    def _fake_now():
+        clock[0] += 1.0
+        return clock[0]
+
+    orig_time = tq.time.time
+    tq.time.time = _fake_now
+    try:
+        WhisperQueueTranslator._lookup_worker(
+            t, "Haus", "ctx", lambda w, txt: finals.append(txt),
+            seq=1, on_partial=lambda word, text: partials.append(text))
+    finally:
+        tq.time.time = orig_time
+
+    full = "原形: Haus\n词性: 名词\n释义: 房子\n本句中: 指住处"
+    assert finals == [full]
+    assert partials, "应该推出中间态，否则这个测试什么都没验证"
+    # 每个 partial 都必须是"整行数"的前缀，不能停在半行上
+    lines = full.split("\n")
+    for p in partials:
+        n = len(p.split("\n"))
+        assert p == "\n".join(lines[:n]), f"partial 停在半行上: {p!r}"
+    assert partials[-1] != full, "最后一整块由 done 分支收尾，不重复推 partial"
+
+
+def test_lookup_cache_roundtrips_through_disk(tmp_path, monkeypatch):
+    """查词缓存跨会话持久化：写盘再读回内容和 LRU 顺序都要一致。"""
+    from translator_queue import WhisperQueueTranslator
+
+    monkeypatch.setattr(config, "LOOKUP_CACHE_FILE", "lookup_cache.json",
+                        raising=False)
+    monkeypatch.setattr(
+        WhisperQueueTranslator, "_lookup_cache_path",
+        lambda self: str(tmp_path / "lookup_cache.json"))
+
+    t = _lookup_translator()
+    t._lookup_cache_put(("haus", "de"), ("原形: das Haus", "ctx1"))
+    t._lookup_cache_put(("baum", "de"), ("原形: der Baum", "ctx2"))
+    t._save_lookup_cache()
+
+    t2 = _lookup_translator()
+    t2._load_lookup_cache()
+    assert t2._lookup_cache == t._lookup_cache
+    assert list(t2._lookup_cache) == list(t._lookup_cache), "LRU 顺序要保住"
+
+
+def test_lookup_cache_survives_corrupt_file(tmp_path, monkeypatch):
+    """☠️ 缓存是纯加速件，文件坏了只能当空缓存，绝不能挡住启动。"""
+    from translator_queue import WhisperQueueTranslator
+
+    path = tmp_path / "lookup_cache.json"
+    path.write_text("{ 这不是合法 JSON", encoding="utf-8")
+    monkeypatch.setattr(
+        WhisperQueueTranslator, "_lookup_cache_path", lambda self: str(path))
+
+    t = _lookup_translator()
+    t._load_lookup_cache()  # 不抛异常
+    assert len(t._lookup_cache) == 0
+
+
+def test_lookup_cache_respects_max_on_load(tmp_path, monkeypatch):
+    """旧文件比现在的容量大时，读回来也要裁到上限（丢最旧的）。"""
+    import json as _json
+    from translator_queue import WhisperQueueTranslator
+
+    path = tmp_path / "lookup_cache.json"
+    rows = [[f"wort{i}", "de", f"释义{i}", "ctx"] for i in range(10)]
+    path.write_text(_json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(
+        WhisperQueueTranslator, "_lookup_cache_path", lambda self: str(path))
+
+    t = _lookup_translator()
+    t._LOOKUP_CACHE_MAX = 4
+    t._load_lookup_cache()
+    assert len(t._lookup_cache) == 4
+    assert list(t._lookup_cache)[0] == ("wort6", "de"), "该丢的是最旧的那批"
 
 
 def test_run_ai_analysis_request_sets_and_clears_inflight_flag_even_on_failure():

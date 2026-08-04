@@ -123,9 +123,12 @@ class SubtitleApp:
             translator.on_status = self.subtitle_window.show_status
             self.translator = translator  # 此后 stop() 会负责 shutdown 它
             # 点词查词：窗口点击→translator查Ollama→回调线程安全地弹结果
+            # on_partial：流式生成中整行地先上屏，不用干等整段
             self.subtitle_window.on_lookup = lambda word, ctx: self.translator.lookup_word(
-                word, ctx, self.subtitle_window.show_lookup_result)
-            # 🤖 背景总结 / 点词深度解释：同样走 _lookup_executor，不占翻译队列
+                word, ctx, self.subtitle_window.show_lookup_result,
+                on_partial=self.subtitle_window.show_lookup_partial)
+            # 🤖 背景总结 / 点词深度解释：走独立的 _analysis_executor，
+            # 既不占翻译队列，也不挡查词
             self.subtitle_window.on_ai_analysis = (
                 lambda text, cb: self.translator.analyze_background(text, cb))
             self.subtitle_window.on_deep_explain = (

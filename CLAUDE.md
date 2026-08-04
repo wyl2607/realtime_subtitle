@@ -168,7 +168,7 @@ install.ps1 按显存自动生成的默认档位：
 
 改代码（如果用户让你改功能）：
 
-15. 改完跑测试：`venv\Scripts\python -m pytest`（92 项，以实际输出为准）。test_hittest /
+15. 改完跑测试：`venv\Scripts\python -m pytest`（123 项，以实际输出为准）。test_hittest /
     test_resize_freedom / test_wordclick 是**独立脚本套件**（import 即开真窗口，
     pytest.ini 已把它们排除出收集，別删这个排除），用 `venv\Scripts\python
     test_hittest.py` 逐个跑。**测试进程 import main.py 会被
@@ -194,6 +194,21 @@ install.ps1 按显存自动生成的默认档位：
       幻觉 "Untertitelung des ZDF, 2020"。它是防幻觉主力，不是负担。
     - `_render` 的二分测高不是 UI 卡顿源：20 句对满屏 p50 **1.2ms**、max 1.6ms
       （每秒只调几次）。真卡顿要往别处找（GPU 抢占、翻译阻塞）。
+21. **☠️ 所有打 Ollama 的请求必须共用一个 `num_ctx`**（`config.OLLAMA_NUM_CTX`）。
+    Ollama 的 runner 按 **(模型, 上下文长度)** 缓存：换一个 num_ctx 就等于换一个
+    runner，会把 5.6GB 模型整个重装一遍。2026-08-04 实测（字幕程序在跑、翻译流
+    持续占用）——查词曾写死 `num_ctx=2048` 而翻译是 4096，于是**每次点词都触发
+    重载**：`load_duration` 6.9~8.7 秒、单次查词 10.4~12.5 秒；更糟的是
+    **紧接着的那次字幕翻译还要再付 ~2.2 秒把 4096 的 runner 装回来**，
+    所以这个 bug 不只拖慢查词，还拖慢主字幕链路。统一成 4096 之后
+    `load_duration` 0.27 秒、单次查词 3.3~4.0 秒。加新的 Ollama 调用路径时
+    别写 num_ctx 字面量，`test_lookup_worker_shares_num_ctx_with_translation`
+    会盯着查词这一条。
+22. **量 Ollama 延迟一定要看 `load_duration`**，别只看墙钟。上一条那个 bug
+    藏了两个多月，就是因为之前只量了墙钟总时长、把 7 秒重载当成了"prompt
+    处理+固定开销"，还据此去砍 `num_predict`（砍了没用，生成本来就只占 1 秒）。
+    `/api/generate` 的响应里 `load_duration` / `prompt_eval_duration` /
+    `eval_duration` 三个字段是分开的，一眼就能看出时间花在哪。
 
 ## 5. 目录地图
 

@@ -270,12 +270,30 @@ class LiveTextRenderMixin:
         self.on_lookup(word, context)
 
     def show_lookup_result(self, word, text):
-        """词典查询完成（线程安全，从翻译线程调）"""
-        self.signals.lookup.emit(word or "", text or "")
+        """词典查询完成（线程安全，从查词线程调）"""
+        self.signals.lookup.emit(word or "", text or "", False)
 
-    def _show_lookup(self, word, text):
+    def show_lookup_partial(self, word, text):
+        """流式生成中的半成品（线程安全）：已经成行的部分先上屏"""
+        self.signals.lookup.emit(word or "", text or "", True)
+
+    def _show_lookup(self, word, text, partial=False):
         body = html.escape(text).replace("\n", "<br>")
         context = getattr(self, "_lookup_context", "") or ""
+        if partial:
+            # 中间态：不给按钮（还没查完，点「深度解释」会和在飞的查词抢
+            # Ollama），末尾一个省略号提示还在写。仍走 show_at 而不是
+            # update_content——弹窗是"锚在鼠标上方向上长"的，只 adjustSize
+            # 不重新定位的话每多一行就往下压一点，最后定稿时再跳回去
+            self.word_popup.show_at(
+                getattr(self, "_lookup_anchor", self.container.pos()),
+                f"📖 <b>{html.escape(word)}</b><br>{body}…",
+                16000,
+                show_deep=False,
+                show_web=False,
+                context=context,
+            )
+            return
         # 查词完成后露出「深度解释」；web 按钮等深度解释结果再出
         self.word_popup.show_at(
             getattr(self, "_lookup_anchor", self.container.pos()),

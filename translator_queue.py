@@ -399,6 +399,12 @@ class WhisperQueueTranslator:
             self._tx_executor = ThreadPoolExecutor(max_workers=1)
             # 点词查词单独一个worker：查词典不该排在字幕翻译后面等
             self._lookup_executor = ThreadPoolExecutor(max_workers=1)
+            # 🤖 背景总结/深度解释再单独一个：它们和查词曾共用一个
+            # max_workers=1 的池，而 AI 分析的 HTTP 超时是 30 秒（查词 15 秒）。
+            # 后果是"点了深度解释再点个词"，查词要在队列里干等最多 30 秒才发出
+            # ——_lookup_stale 只能让排队中的请求最后不发，取消不了队头阻塞。
+            # 拆开之后两者互不排队（Ollama 侧仍串行生成，但那是秒级不是 30 秒）
+            self._analysis_executor = ThreadPoolExecutor(max_workers=1)
             # 查词 LRU：重复点同一词零 Ollama 成本（精听高频）；
             # OrderedDict + move_to_end = 真 LRU，锁保护 UI 线程与 worker 并发
             self._lookup_cache = OrderedDict()  # (word_lower, lang) -> text
@@ -407,6 +413,7 @@ class WhisperQueueTranslator:
             # 队（单线程 worker，每个最长15秒），过时的结果回来会覆盖当前弹窗
             self._lookup_seq = 0
             self._LOOKUP_CACHE_MAX = int(getattr(config, "LOOKUP_CACHE_MAX", 200))
+            self._load_lookup_cache()  # 跨会话复用；文件坏了只是当空缓存
             # 查词/AI分析请求在GPU上跑的期间为True：草稿翻译看这个让路，
             # 别跟用户主动点的请求抢卡（2026-08-04实测：直播翻译流从不真正
             # 闲着，查词/分析这类一次性人工请求跟它抢GPU会从<1秒拖到8-15秒）
@@ -809,6 +816,64 @@ class WhisperQueueTranslator:
     # ------------------------------------------------------------------
     # 点词查词（独立worker，不占字幕翻译的队列）
     # ------------------------------------------------------------------
+    def _lookup_cache_path(self):
+        """查词缓存落盘路径；config 里设成空/None 就是关闭持久化"""
+        name = getattr(config, "LOOKUP_CACHE_FILE", None)
+        if not name:
+            return None
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+
+    def _load_lookup_cache(self):
+        """启动时读回上次的查词缓存（学德语时高频词跨会话继续秒回）。
+
+        文件坏了/格式变了一律当没有——这是纯加速缓存，绝不能让它挡住启动。
+        JSON 没有元组键，落盘格式是 [[词, 语言, 释义, 当时的句境], ...]，
+        按 LRU 顺序（最旧在前）写，读回来 insert 顺序天然就是原来的 LRU。
+        """
+        path = self._lookup_cache_path()
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                rows = json.load(f)
+            loaded = 0
+            for row in rows:
+                if not isinstance(row, (list, tuple)) or len(row) != 4:
+                    continue
+                word, lang, text, ctx = row
+                if not (isinstance(word, str) and isinstance(lang, str)
+                        and isinstance(text, str) and isinstance(ctx, str)):
+                    continue
+                self._lookup_cache[(word, lang)] = (text, ctx)
+                loaded += 1
+            while len(self._lookup_cache) > self._LOOKUP_CACHE_MAX:
+                self._lookup_cache.popitem(last=False)
+            if loaded and config.SHOW_PERFORMANCE:
+                print(f"   📖 查词缓存已载入 {len(self._lookup_cache)} 条")
+        except Exception as e:
+            print(f"   ⚠️  查词缓存读取失败（忽略，当作空缓存）: {e}")
+            self._lookup_cache.clear()
+
+    def _save_lookup_cache(self):
+        """退出时写回。先写临时文件再替换：中途断电不会留下半个坏 JSON。"""
+        path = self._lookup_cache_path()
+        if not path:
+            return
+        try:
+            with self._lookup_cache_lock:
+                rows = [[w, lang, text, ctx]
+                        for (w, lang), (text, ctx) in self._lookup_cache.items()]
+            if not rows:
+                return
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(rows, f, ensure_ascii=False)
+            os.replace(tmp, path)
+            if config.SHOW_PERFORMANCE:
+                print(f"   📖 查词缓存已保存 {len(rows)} 条")
+        except Exception as e:
+            print(f"   ⚠️  查词缓存保存失败（不影响退出）: {e}")
+
     def _lookup_cache_get(self, cache_key):
         """真 LRU 读：命中则移到末尾。"""
         with self._lookup_cache_lock:
@@ -845,8 +910,11 @@ class WhisperQueueTranslator:
         callback(word, text)
         return True
 
-    def lookup_word(self, word, context, callback):
+    def lookup_word(self, word, context, callback, on_partial=None):
         """查一个德语/英语单词的词典解释，完成后调 callback(word, text)。
+
+        on_partial(word, text)（可选）：流式生成期间**整行**地把已出的内容
+        推给弹窗，让"原形/词性"先上屏，不用干等整段。同样必须线程安全。
 
         callback 必须线程安全（SubtitleWindow.show_lookup_result 走Qt信号）。
         缓存命中在调用线程同步返回，不进 executor、不打 Ollama。
@@ -857,7 +925,8 @@ class WhisperQueueTranslator:
         self._lookup_seq += 1  # 只在 UI 线程递增（点击回调），worker 只读
         seq = self._lookup_seq
         try:
-            self._lookup_executor.submit(self._lookup_worker, word, context, callback, seq)
+            self._lookup_executor.submit(
+                self._lookup_worker, word, context, callback, seq, on_partial)
         except RuntimeError:
             pass  # 程序正在退出
 
@@ -865,7 +934,49 @@ class WhisperQueueTranslator:
         """有更新的点击了 → 这次的结果不要再弹（沿用 _tx_epoch 的代数门控思路）"""
         return seq is not None and seq != self._lookup_seq
 
-    def _lookup_worker(self, word, context, callback, seq=None):
+    def _stream_lookup(self, response, word, seq, on_partial):
+        """读查词的流式响应，返回最终文本；退出中/已过时返回 None。
+
+        partial 只按【整行】推：查词结果是"原形/词性/释义/本句中"四行的固定
+        格式，按 token 推会让弹窗在半个词上抖，按行推则是一行一行长出来。
+        """
+        parts = []
+        emitted_chars = 0  # 已经推给弹窗的字符数（都落在换行边界上）
+        last_emit = 0.0
+        for line in response.iter_lines():
+            if self.closing:
+                return None  # 正在退出：别等生成完，外层 finally 会 close 连接
+            if self._lookup_stale(seq):
+                # 用户已经点了别的词。这里**中途放弃**是有意的行为改变：
+                # 非流式时代拿到的是完整文本，过时了也照样进缓存（下次秒回）；
+                # 流式下半截文本进缓存只会污染词典，不如立刻断连——close 会让
+                # Ollama 停止生成，把 GPU 让给用户真正在等的那个词
+                return None
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except ValueError:
+                continue
+            parts.append(data.get("response", ""))
+            if data.get("done"):
+                break
+            if not on_partial or time.time() - last_emit <= 0.15:
+                continue
+            grown = "".join(parts)
+            cut = grown.rfind("\n")
+            if cut <= emitted_chars:
+                continue  # 还没长出新的一整行
+            emitted_chars = cut
+            partial = re.sub(r'<think>.*?</think>', '', grown[:cut],
+                             flags=re.DOTALL).strip()
+            if partial:
+                last_emit = time.time()
+                on_partial(word, partial)
+        text = "".join(parts)
+        return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+
+    def _lookup_worker(self, word, context, callback, seq=None, on_partial=None):
         lang_name = config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)
         cache_key = (word.lower(), config.SOURCE_LANGUAGE)
         if self._lookup_stale(seq):
@@ -892,35 +1003,52 @@ class WhisperQueueTranslator:
                 json={
                     "model": config.OLLAMA_MODEL,
                     "prompt": prompt,
-                    "stream": False,
+                    # 流式：整行整行地往弹窗推，"原形/词性"先上屏。
+                    # 2026-08-04 实测（直播翻译流在跑）：首行可见 2.4 秒，
+                    # 整段落地 3.3~4.0 秒——省掉最后那 1 秒多的空白等待
+                    "stream": True,
                     "think": False,
                     # 不设的话 Ollama 默认5分钟无请求就卸载模型，
                     # 安静段/暂停后第一句要付~9秒冷加载
                     "keep_alive": "2h",
-                    # num_predict 220→170（2026-08-04实测）：安静状态下220 token
-                    # 查词耗时和170差异很小（瓶颈是prompt处理+固定开销，不是生成
-                    # token数），但170能省一点最坏情况下的生成时间，格式（原形/
-                    # 词性/释义最多2条/本句中一句话）仍够用，不至于被截断
-                    "options": {"temperature": 0.2, "num_predict": 170, "num_ctx": 2048},
+                    # num_predict 220→170（2026-08-04实测）：220 和 170 的查词
+                    # 耗时差异很小，170 只省一点最坏情况下的生成时间，格式
+                    # （原形/词性/释义最多2条/本句中一句话）仍够用不至于截断。
+                    # ⚠️ 当初记的"瓶颈是prompt处理+固定开销"归因是错的——那个
+                    # "固定开销"其实是下面 num_ctx 不一致导致的 7 秒模型重载，
+                    # 实测生成本身只占 ~1 秒（40~60 token）。别再来砍这个值了
+                    "options": {
+                        "temperature": 0.2,
+                        "num_predict": 170,
+                        # ☠️ 必须和翻译请求用同一个值，见 config.OLLAMA_NUM_CTX：
+                        # 这里曾写死 2048（翻译是 4096），每次点词都让 Ollama
+                        # 重装 5.6GB 模型，实测每次多付 6.9~8.7 秒
+                        "num_ctx": getattr(config, "OLLAMA_NUM_CTX", 4096),
+                    },
                 },
+                stream=True,
+                # 流式下 timeout 是"相邻数据块间隔"上限，不是总时长
                 timeout=15,
             )
-            if self.closing:
-                return  # 程序在退出，别再回调正在拆的UI
-            if response.status_code == 200:
-                self._ollama_hot = True  # 查词成功也证明模型在显存里
-                text = response.json().get("response", "").strip()
-                text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
-                if config.SHOW_PERFORMANCE:
-                    print(f"   📖 查词 {word} {time.time() - t0:.1f}秒")
-                if text:
-                    # 结果过时也照样进缓存（下次点这个词就秒回），只是不弹窗
-                    self._lookup_cache_put(cache_key, (text, context))
-                if self._lookup_stale(seq):
-                    return
-                callback(word, text or "（没查到）")
-            elif not self._lookup_stale(seq):
-                callback(word, f"查询失败（HTTP {response.status_code}）")
+            try:
+                if response.status_code == 200:
+                    self._ollama_hot = True  # 查词成功也证明模型在显存里
+                    text = self._stream_lookup(response, word, seq, on_partial)
+                    if text is None:
+                        return  # 退出中/已过时，_stream_lookup 里已经短路
+                    if config.SHOW_PERFORMANCE:
+                        print(f"   📖 查词 {word} {time.time() - t0:.1f}秒")
+                    if text:
+                        # 结果过时也照样进缓存（下次点这个词就秒回），只是不弹窗
+                        self._lookup_cache_put(cache_key, (text, context))
+                    if self._lookup_stale(seq):
+                        return
+                    callback(word, text or "（没查到）")
+                elif not self._lookup_stale(seq):
+                    callback(word, f"查询失败（HTTP {response.status_code}）")
+            finally:
+                # stream=True 的连接不 close 不会归还连接池（和翻译侧同一个坑）
+                response.close()
         except Exception as e:
             if not self.closing and not self._lookup_stale(seq):
                 callback(word, f"查询失败: {e}")
@@ -928,12 +1056,13 @@ class WhisperQueueTranslator:
             self._lookup_inflight = False
 
     # ------------------------------------------------------------------
-    # AI 分析（背景总结 / 整句深度解释）——复用 _lookup_executor，不占翻译队列
+    # AI 分析（背景总结 / 整句深度解释）——独立 executor，既不占翻译队列，
+    # 也不挡查词（30秒超时的分析卡在查词前面是实打实的队头阻塞）
     # ------------------------------------------------------------------
     def analyze_background(self, german_text, callback):
         """最近 N 分钟内容的背景总结。callback(text) 必须线程安全。"""
         try:
-            self._lookup_executor.submit(
+            self._analysis_executor.submit(
                 self._analyze_background_worker, german_text, callback)
         except RuntimeError:
             pass  # 程序正在退出
@@ -946,7 +1075,7 @@ class WhisperQueueTranslator:
     def deep_explain(self, sentence, callback):
         """整句深度解释（比查词更展开）。callback(text) 必须线程安全。"""
         try:
-            self._lookup_executor.submit(
+            self._analysis_executor.submit(
                 self._deep_explain_worker, sentence, callback)
         except RuntimeError:
             pass
@@ -972,7 +1101,7 @@ class WhisperQueueTranslator:
                     "options": {
                         "temperature": 0.3,
                         "num_predict": int(num_predict),
-                        "num_ctx": 4096,
+                        "num_ctx": getattr(config, "OLLAMA_NUM_CTX", 4096),
                     },
                 },
                 timeout=30,
@@ -1059,7 +1188,8 @@ class WhisperQueueTranslator:
                 "temperature": 0.3,
                 "top_p": 0.9,
                 "num_predict": 512,
-                "num_ctx": 4096,  # prompt多了术语表，2048偏紧
+                # 全程序共用一个 num_ctx，换值会让 Ollama 重装模型，见 config
+                "num_ctx": getattr(config, "OLLAMA_NUM_CTX", 4096),
             }
             # 不把某台机器/某个模型的层数硬编码成 50：qwen 版本的总层数
             # 不同，小显存机器固定 offload 层数还会把剩余层挤到系统内存。
@@ -1504,12 +1634,20 @@ class WhisperQueueTranslator:
         # 留驻两小时（和 2026-07-20 修的预热线程竞态同类，当时只处理了预热）。
         # 有界等待：正常查词 1-2 秒就回来；卡住的话最多等 3 秒放弃继续退出
         # （宁可漏卸一次也不拖住退出——stop 脚本还有 HTTP 卸载兜底）
-        drain = Thread(
-            target=self._lookup_executor.shutdown,
-            kwargs={"wait": True, "cancel_futures": True},
-            daemon=True, name="LookupDrain")
-        drain.start()
-        drain.join(timeout=3)
+        # AI 分析走的是另一个池（同样带 keep_alive="2h"），一起有界排干
+        drains = []
+        for executor, name in ((self._lookup_executor, "LookupDrain"),
+                               (self._analysis_executor, "AnalysisDrain")):
+            t = Thread(
+                target=executor.shutdown,
+                kwargs={"wait": True, "cancel_futures": True},
+                daemon=True, name=name)
+            t.start()
+            drains.append(t)
+        deadline = time.time() + 3
+        for t in drains:
+            t.join(timeout=max(0.0, deadline - time.time()))
+        self._save_lookup_cache()
         self._unload_our_models()
         try:
             self.ollama_session.close()

@@ -33,6 +33,8 @@ subtitle.err.log
 window_state.json
 window_state.json.tmp
 window_state.json.bak
+lookup_cache.json
+lookup_cache.json.tmp
 
 # 本机降级/个人配置（install.ps1 生成）
 config_local.py
@@ -43,3 +45,6 @@ config_local.py
 review_report_*.md
 .ai_review_prompt_*.md
 .grok_implement_*.md
+.grok_perf_report.md
+.grok_perf_err.txt
+.grok_perf_lookup_prompt.md

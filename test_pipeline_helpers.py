@@ -757,6 +757,11 @@ def test_shutdown_waits_for_lookup_before_unloading():
     t._tx_executor = _Immediate()
     t._lookup_executor = ThreadPoolExecutor(max_workers=1)
     t._lookup_executor.submit(_time.sleep, 5)  # 假装一次查词卡住了
+    # AI 分析是另一个池（也带 keep_alive=2h），两个一起有界排干：
+    # 总等待仍是约3秒，不是每个池各等3秒
+    t._analysis_executor = ThreadPoolExecutor(max_workers=1)
+    t._analysis_executor.submit(_time.sleep, 5)
+    t._save_lookup_cache = lambda: None
     t._unload_our_models = lambda: order.append("unload")
     t.ollama_session = type("S", (), {"close": lambda self: None})()
     t.lookup_session = type("S", (), {"close": lambda self: None})()

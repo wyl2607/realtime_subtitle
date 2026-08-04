@@ -73,7 +73,7 @@ class SubtitleSignals(QObject):
     live = pyqtSignal(str, str)  # live德语行更新 (committed, unstable)
     pair = pyqtSignal(str, str)  # 一段德语翻译完成 (german, chinese)
     draft = pyqtSignal(str)  # live德语的草稿中文（正式句对完成后被替换）
-    lookup = pyqtSignal(str, str)  # 点词查词结果 (word, 词典文本)
+    lookup = pyqtSignal(str, str, bool)  # 点词查词结果 (word, 词典文本, 是否流式中间态)
     ai_analysis = pyqtSignal(str, int)  # 🤖 背景总结结果 (text, seq)
     deep_explain = pyqtSignal(str, int)  # 点词「深度解释」结果 (text, seq)
     toggle_ct = pyqtSignal()  # 切换鼠标穿透模式（热键线程→主线程）
