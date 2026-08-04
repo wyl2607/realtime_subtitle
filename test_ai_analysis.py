@@ -508,6 +508,46 @@ def test_lookup_worker_streams_partial_lines_only():
     assert partials[-1] != full, "最后一整块由 done 分支收尾，不重复推 partial"
 
 
+def test_ollama_base_url_is_ipv4_literal():
+    """☠️ OLLAMA_BASE_URL 必须是 IPv4 字面量，写 localhost 每个请求白付 2 秒。
+
+    根因（2026-08-04 实测）：Ollama 只监听 IPv4 127.0.0.1:11434（netstat 可验），
+    而 Windows 上 getaddrinfo("localhost") 返回 ::1 在前。IPv6 环回不会快速
+    失败——实测 2021ms 才拒绝，之后才回退 IPv4。加上流式响应 done 后 break +
+    close 让连接无法复用，于是**每一句字幕都要重连一次、每次都付满 2 秒**：
+        翻译 p50 2.88秒 → 0.60秒     查词 p50 3.11秒 → 0.87秒
+    """
+    import ipaddress
+    from urllib.parse import urlparse
+
+    host = urlparse(config.OLLAMA_BASE_URL).hostname
+    # 允许 IPv4/IPv6 字面量；禁止走 DNS 的主机名
+    ipaddress.ip_address(host)  # 不是字面量就直接抛 ValueError
+
+
+def test_warn_if_ipv6_first_host_flags_localhost(monkeypatch):
+    """兜底告警：有人在 config_local.py 写回 localhost 时要吼一声。"""
+    import socket as _socket
+    from translator_queue import _warn_if_ipv6_first_host
+
+    def fake_getaddrinfo(host, *a, **kw):
+        if host == "localhost":  # Windows 上的真实顺序：IPv6 在前
+            return [(_socket.AF_INET6, None, None, "", ("::1", 0, 0, 0)),
+                    (_socket.AF_INET, None, None, "", ("127.0.0.1", 0))]
+        if host == "ipv6only.example":
+            return [(_socket.AF_INET6, None, None, "", ("::1", 0, 0, 0))]
+        return [(_socket.AF_INET, None, None, "", ("127.0.0.1", 0))]
+
+    monkeypatch.setattr(_socket, "getaddrinfo", fake_getaddrinfo)
+
+    assert _warn_if_ipv6_first_host("http://localhost:11434") is True
+    assert _warn_if_ipv6_first_host("http://127.0.0.1:11434") is False
+    # 只有 IPv6 的主机：服务大概真在 IPv6 上，别乱报
+    assert _warn_if_ipv6_first_host("http://ipv6only.example:11434") is False
+    # 解析不了/URL 畸形一律静默，交给后面的连通性检查报
+    assert _warn_if_ipv6_first_host("not a url") is False
+
+
 def test_lookup_cache_roundtrips_through_disk(tmp_path, monkeypatch):
     """查词缓存跨会话持久化：写盘再读回内容和 LRU 顺序都要一致。"""
     from translator_queue import WhisperQueueTranslator

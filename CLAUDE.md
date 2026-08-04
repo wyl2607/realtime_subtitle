@@ -168,7 +168,7 @@ install.ps1 按显存自动生成的默认档位：
 
 改代码（如果用户让你改功能）：
 
-15. 改完跑测试：`venv\Scripts\python -m pytest`（123 项，以实际输出为准）。test_hittest /
+15. 改完跑测试：`venv\Scripts\python -m pytest`（125 项，以实际输出为准）。test_hittest /
     test_resize_freedom / test_wordclick 是**独立脚本套件**（import 即开真窗口，
     pytest.ini 已把它们排除出收集，別删这个排除），用 `venv\Scripts\python
     test_hittest.py` 逐个跑。**测试进程 import main.py 会被
@@ -204,11 +204,33 @@ install.ps1 按显存自动生成的默认档位：
     `load_duration` 0.27 秒、单次查词 3.3~4.0 秒。加新的 Ollama 调用路径时
     别写 num_ctx 字面量，`test_lookup_worker_shares_num_ctx_with_translation`
     会盯着查词这一条。
-22. **量 Ollama 延迟一定要看 `load_duration`**，别只看墙钟。上一条那个 bug
+22. **☠️ `OLLAMA_BASE_URL` 必须写 `http://127.0.0.1:11434`，不能写 `localhost`。**
+    Ollama 只监听 IPv4（`netstat -ano | findstr 11434` 看得到只有
+    `127.0.0.1:11434` 一条），而 Windows 上 `getaddrinfo("localhost")` 返回
+    **`::1` 在前**、`127.0.0.1` 在后。IPv6 环回**不会快速失败**——实测要
+    **2021ms** 才拒绝，之后才回退 IPv4。再加上流式响应 `done` 后 `break` +
+    `close()` 让连接无法复用（试过排干剩余字节，没用），**每一句字幕都要重连
+    一次、每次都付满这 2 秒**。2026-08-04 实测（GPU 空闲、模型已驻留）：
+
+    | | localhost | 127.0.0.1 |
+    |---|---|---|
+    | 翻译 p50 | 2.88 秒 | **0.60 秒** |
+    | 查词 p50 | 3.11 秒 | **0.87 秒** |
+
+    这 2.04 秒和显卡、模型、prompt 一概无关，纯粹是 DNS。仓库里所有 .ps1
+    脚本一直用的就是 127.0.0.1，只有 config.py 那一行是 localhost，所以
+    "脚本很快、字幕很慢"看着像 GPU 问题。启动时有 `_warn_if_ipv6_first_host()`
+    兜底告警（防 config_local.py 写回主机名），`test_ollama_base_url_is_ipv4_literal`
+    盯着默认值。
+23. **量 Ollama 延迟一定要看 `load_duration`**，别只看墙钟。上一条那个 bug
     藏了两个多月，就是因为之前只量了墙钟总时长、把 7 秒重载当成了"prompt
     处理+固定开销"，还据此去砍 `num_predict`（砍了没用，生成本来就只占 1 秒）。
     `/api/generate` 的响应里 `load_duration` / `prompt_eval_duration` /
     `eval_duration` 三个字段是分开的，一眼就能看出时间花在哪。
+    **还要拿 `total_duration` 和客户端墙钟对一下**：上一条那个 2 秒的 DNS 税
+    就是这么揪出来的——Ollama 自报 `total_duration` 只有 385ms，客户端墙钟却是
+    2437ms，差值 2052ms 稳如磐石，一看就不在 GPU 上。判据：
+    `wall - total_duration` 应该是个位数毫秒，明显大于它就说明卡在传输层。
 
 ## 5. 目录地图
 

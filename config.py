@@ -34,7 +34,18 @@ WHISPER_BEAM_SIZE = 3  # beam search 大小。whisper_streaming作者用5，这�
 # 回退：先 `ollama pull qwen3:8b`（本地已删），再 config_local.py 写
 # OLLAMA_MODEL="qwen3:8b"。qwen3:14b 精听选项已被 9b 事实取代（也已删）。
 OLLAMA_MODEL = "qwen3.5:9b"  # Ollama 模型名称
-OLLAMA_BASE_URL = "http://localhost:11434"  # Ollama API 地址
+# ☠️ 必须写 127.0.0.1，不要写 localhost。Ollama 只监听 IPv4 127.0.0.1:11434
+# （`netstat -ano | findstr 11434` 可验证，没有 IPv6 监听），而 Windows 上
+# getaddrinfo("localhost") 返回 ::1 在前、127.0.0.1 在后，于是每次新建连接都要
+# 先往 ::1 捅一刀——Windows 的 IPv6 环回**不会快速失败**，实测要 2021ms 才拒绝，
+# 之后才回退到 IPv4。2026-08-04 实测（GPU 空闲、模型已驻留）：
+#     翻译 p50 2.88秒 → 0.60秒     查词 p50 3.11秒 → 0.87秒
+# 这 2.04 秒是每个请求都付的固定税，和显卡、模型、prompt 一概无关。
+# 而且流式响应 done 后 break + close 会让连接无法复用（排干也没用，实测过），
+# 所以每一句字幕都要重连一次、每一句都付满 2 秒。
+# 仓库里的 .ps1 脚本一直用的就是 127.0.0.1，只有这一行是 localhost，
+# 所以"脚本很快、字幕很慢"看着像 GPU 问题，其实是 DNS。
+OLLAMA_BASE_URL = "http://127.0.0.1:11434"  # Ollama API 地址
 # Ollama GPU offload layers：None = 让 Ollama 按当前显存自动决定。
 # 不要把某台机器测出的固定层数写死；小显存设备会因此把模型挤进系统内存，
 # 而不同模型的总层数也不一样。需要手动限制时可在 config_local.py 覆盖为整数。

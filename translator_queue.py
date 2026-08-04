@@ -18,6 +18,8 @@ import os
 import time
 import re
 import queue
+import socket
+from urllib.parse import urlparse
 from threading import Event, Lock, Thread
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque, OrderedDict
@@ -242,6 +244,33 @@ _warm_thread = None  # 启动预热线程句柄：_unload_our_models 退出时�
 # （2026-08-02 实测：开机冷读 5.6GB 模型花了 33.8 秒，其间两句翻译被超时丢弃）
 _warm_done = Event()
 _warm_ok = False  # 预热是否真的成功（失败也要 set 事件，但不能当模型已热）
+
+
+def _warn_if_ipv6_first_host(base_url):
+    """☠️ 主机名解析成 IPv6 在前、IPv4 在后 ⇒ 每个请求白付约 2 秒。
+
+    Ollama 默认只监听 IPv4 127.0.0.1:11434，而 Windows 上 "localhost" 解析出
+    ::1 在前。IPv6 环回**不会快速失败**（实测 2021ms 才拒绝），之后才回退到
+    IPv4——这 2 秒是每个请求的固定税。config.py 的默认值已经是 127.0.0.1，
+    这个检查是为了兜住在 config_local.py 里写回主机名的情况。
+    返回 True 表示发了警告（给测试用）。纯观测，不改用户配置。
+    """
+    try:
+        host = urlparse(base_url).hostname
+        if not host:
+            return False
+        infos = socket.getaddrinfo(host, None, 0, socket.SOCK_STREAM)
+        families = [i[0] for i in infos]
+        if not families or families[0] != socket.AF_INET6:
+            return False
+        if socket.AF_INET not in families:
+            return False  # 只有 IPv6：服务大概真在 IPv6 上，别乱报
+    except Exception:
+        return False  # 解析不了是别的问题，交给下面的连通性检查报
+    print(f"⚠️  OLLAMA_BASE_URL 用的是主机名 {host}，它解析出 IPv6(::1) 在前。")
+    print(f"   Ollama 只监听 IPv4，Windows 的 IPv6 环回要约 2 秒才拒绝——")
+    print(f"   每个翻译/查词请求都会白等这 2 秒。改成 http://127.0.0.1:11434")
+    return True
 
 
 def _spawn_startup_warm():
@@ -470,6 +499,7 @@ class WhisperQueueTranslator:
                     print(f"⚠️  字幕记录目录创建失败，记录功能关闭: {e}")
                     self._transcript_ok = False
 
+            _warn_if_ipv6_first_host(config.OLLAMA_BASE_URL)
             # 启动时检查Ollama是否可达（不可达只警告，不中断启动）
             try:
                 self.ollama_session.get(f"{config.OLLAMA_BASE_URL}/api/version", timeout=2)
