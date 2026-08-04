@@ -378,6 +378,36 @@ def test_lookup_worker_sets_and_clears_inflight_flag():
     assert results == [("Wort", "结果")]
 
 
+def test_lookup_worker_uses_reduced_num_predict():
+    """算力收敛（2026-08-04实测）：查词 num_predict 220→170。"""
+    from translator_queue import WhisperQueueTranslator
+
+    t = object.__new__(WhisperQueueTranslator)
+    t.closing = False
+    t._lookup_inflight = False
+    t._lookup_seq = 1
+    t._lookup_cache = {}
+    t._lookup_cache_lock = __import__("threading").Lock()
+    t._LOOKUP_CACHE_MAX = 200
+    posted = []
+
+    class _FakeResponse:
+        status_code = 200
+        def json(self):
+            return {"response": "结果"}
+
+    class _FakeSession:
+        def post(self, url, json, timeout):
+            posted.append(json)
+            return _FakeResponse()
+
+    t.lookup_session = _FakeSession()
+    WhisperQueueTranslator._lookup_worker(
+        t, "Wort", "ein Kontext", lambda w, txt: None, seq=1)
+
+    assert posted[0]["options"]["num_predict"] == 170
+
+
 def test_run_ai_analysis_request_sets_and_clears_inflight_flag_even_on_failure():
     """failure 路径（HTTP非200/异常）也必须清 flag，否则一次失败就把草稿卡死。"""
     from translator_queue import WhisperQueueTranslator

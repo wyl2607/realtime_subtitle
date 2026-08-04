@@ -897,7 +897,11 @@ class WhisperQueueTranslator:
                     # 不设的话 Ollama 默认5分钟无请求就卸载模型，
                     # 安静段/暂停后第一句要付~9秒冷加载
                     "keep_alive": "2h",
-                    "options": {"temperature": 0.2, "num_predict": 220, "num_ctx": 2048},
+                    # num_predict 220→170（2026-08-04实测）：安静状态下220 token
+                    # 查词耗时和170差异很小（瓶颈是prompt处理+固定开销，不是生成
+                    # token数），但170能省一点最坏情况下的生成时间，格式（原形/
+                    # 词性/释义最多2条/本句中一句话）仍够用，不至于被截断
+                    "options": {"temperature": 0.2, "num_predict": 170, "num_ctx": 2048},
                 },
                 timeout=15,
             )
