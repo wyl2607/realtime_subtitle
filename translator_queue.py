@@ -507,7 +507,9 @@ class WhisperQueueTranslator:
             self._stat_merge = 0      # 合并多块处理的轮数（GPU落后的信号）
             self._stat_draft = 0      # 草稿翻译次数
             self._stat_dict = 0       # 感叹词词典直译次数（省下的Ollama请求）
-            self._stat_held_release = 0  # 句尾扣留到点放行的次数（SENTENCE_HOLD_SEC 是否够长）
+            self._stat_held_release = 0  # 句尾扣留到点放行的次数
+            self._stat_held_misfire = 0  # 其中放行后接了小写词的（=切在句中，切早了）
+            self._release_pending = False
             # ASR 耗时分桶诊断（2026-08-04）：短/长缓冲、独占/与翻译并发
             self._stat_asr_shortbuf = []
             self._stat_asr_longbuf = []
@@ -1438,12 +1440,23 @@ class WhisperQueueTranslator:
             # 时间戳是"存盘时刻"不是"停顿时长"，只能在运行时数）
             with self._stats_lock:
                 self._stat_held_release += 1
+            # 标记"刚放行过"：下一段提交的文本如果以小写词开头，说明这句话其实
+            # 还没说完，0.6 秒是切在了说话人的换气上（德语句首必大写）。
+            # 光看放行次数区分不出"说完了停顿"和"句中换气"，这个标志才能
+            self._release_pending = True
             self._enqueue_sentences(sentences)
             self._emit_display()
 
     def _append_committed(self, committed_text):
         if not committed_text:
             return
+        if getattr(self, "_release_pending", False):
+            self._release_pending = False
+            # 刚有过扣留放行，而接上来的第一个词是小写 ⇒ 上一句被切在句中了
+            head = committed_text.lstrip()
+            if head and head[0].isalpha() and head[0].islower() and ord(head[0]) < 0x2E80:
+                with self._stats_lock:
+                    self._stat_held_misfire += 1
         if self.pending_text:
             self.pending_text += " " + committed_text
         else:
@@ -1701,13 +1714,13 @@ class WhisperQueueTranslator:
             asr, tx = sorted(self._stat_asr), sorted(self._stat_tx)
             merge, buf_max = self._stat_merge, self._stat_buf_max
             draft, dhit = self._stat_draft, self._stat_dict
-            held = self._stat_held_release
+            held, misfire = self._stat_held_release, self._stat_held_misfire
             shortb, longb = sorted(self._stat_asr_shortbuf), sorted(self._stat_asr_longbuf)
             solo, overlap = sorted(self._stat_asr_solo), sorted(self._stat_asr_overlap)
             self._stat_asr, self._stat_tx = [], []
             self._stat_merge, self._stat_buf_max = 0, 0.0
             self._stat_draft = self._stat_dict = 0
-            self._stat_held_release = 0
+            self._stat_held_release = self._stat_held_misfire = 0
             self._stat_asr_shortbuf, self._stat_asr_longbuf = [], []
             self._stat_asr_solo, self._stat_asr_overlap = [], []
             self._stats_t0 = time.time()
@@ -1727,6 +1740,8 @@ class WhisperQueueTranslator:
             line += f" | 词典直译{dhit}"
         if held:
             line += f" | 扣留放行{held}"
+            if misfire:
+                line += f"(切早{misfire})"
         # 诊断项：只在两桶都有样本时打，否则是噪声
         if shortb and longb:
             line += (f" | 缓冲短{pct(shortb, .5):.2f}s({len(shortb)})"

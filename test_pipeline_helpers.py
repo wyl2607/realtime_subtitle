@@ -894,3 +894,39 @@ def test_prompt_forbids_translating_the_context():
     # 规则编号必须连续，不能出现两个"4."（语域各3条 + 通用4条 = 1..7）
     nums = re.findall(r'^(\d+)\. ', prompt, flags=re.M)
     assert nums == [str(i) for i in range(1, len(nums) + 1)], f"规则编号断了: {nums}"
+
+
+def test_held_release_misfire_counter(monkeypatch):
+    """扣留放行后接小写词 = 切在了说话人换气上（德语句首必大写）。
+
+    光数放行次数区分不出"说完了停顿"和"句中换气"——实测 43% 的成句都走放行
+    路径，但那里面哪些是切早了，只有这个计数器能回答。它决定要不要调大
+    SENTENCE_HOLD_SEC（transcripts 的时间戳是存盘时刻，推不出停顿时长）。
+    """
+    t = _translator_for_tx()
+    t.pending_text = ""
+    t._stat_held_release = 0
+    t._stat_held_misfire = 0
+    t._release_pending = True
+
+    # 放行后接小写德语词 → 记一次切早
+    t._append_committed("über den Seeweg eintrifft.")
+    assert t._stat_held_misfire == 1
+    assert t._release_pending is False, "标志用完必须清，否则后面每次提交都误记"
+
+    # 放行后接大写词（正常新句）→ 不记
+    t.pending_text = ""
+    t._release_pending = True
+    t._append_committed("Danach kam er.")
+    assert t._stat_held_misfire == 1
+
+    # 没有放行过的普通提交 → 不记
+    t.pending_text = ""
+    t._append_committed("und weiter geht es.")
+    assert t._stat_held_misfire == 1
+
+    # 中文/非拉丁开头不参与判定
+    t.pending_text = ""
+    t._release_pending = True
+    t._append_committed("中文开头")
+    assert t._stat_held_misfire == 1
