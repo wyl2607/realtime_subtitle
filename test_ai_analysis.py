@@ -312,6 +312,7 @@ def _draft_ready_translator():
     t._draft_last_time = 0.0  # 足够久之前，不会被 DRAFT_MIN_INTERVAL 拦
     t._asr_busy = False
     t._lookup_inflight = False
+    t._inflight_lock = __import__('threading').Lock()
     t._ollama_hot = True
     t._asr_lock = Lock()
     t._audio_inbox = []
@@ -384,6 +385,7 @@ def _lookup_translator():
     t = object.__new__(WhisperQueueTranslator)
     t.closing = False
     t._lookup_inflight = False
+    t._inflight_lock = __import__('threading').Lock()
     t._ollama_hot = False
     t._lookup_seq = 1
     t._lookup_cache = __import__("collections").OrderedDict()
@@ -508,6 +510,105 @@ def test_lookup_worker_streams_partial_lines_only():
     assert partials[-1] != full, "最后一整块由 done 分支收尾，不重复推 partial"
 
 
+def test_cache_hit_still_bumps_seq_so_inflight_lookup_expires():
+    """☠️ 命中缓存也必须递增 seq，否则在飞的上一次查词会盖掉新词的结果。
+
+    时序（2026-08-04 grok 审查发现，流式化之后变严重）：
+      1. 点生词 A（未命中）→ seq=1，worker A 开始流式
+      2. 点查过的词 B（命中缓存）→ 同步回调，弹窗显示 B
+      3. 若此时 seq 仍是 1，A 的 partial/final 全判定"没过期"
+      4. A 一行行把 B 盖掉，用户看到刚点的 B 变回了 A
+    缓存现在是 800 条且跨会话持久化，这条路径只会更常走。
+    """
+    from translator_queue import WhisperQueueTranslator
+
+    t = _lookup_translator()
+    t._lookup_seq = 0  # _lookup_translator 默认给 1，这里从 0 数更好读
+    submitted = []
+
+    class _Exec:
+        def submit(self, fn, *a):
+            submitted.append(a)
+    t._lookup_executor = _Exec()
+
+    shown = []
+    cb = lambda w, txt: shown.append(w)
+
+    # A：未命中 → 入队，seq 变 1
+    t.lookup_word("Apfel", "ctx1", cb)
+    assert t._lookup_seq == 1
+    assert [a[0] for a in submitted] == ["Apfel"]
+
+    # B：预先塞进缓存 → 命中，同步回调
+    t._lookup_cache_put(("birne", "de"), ("原形: die Birne", "ctx2"))
+    t.lookup_word("Birne", "ctx2", cb)
+    assert shown == ["Birne"], "缓存命中要立刻回调"
+    assert t._lookup_seq == 2, "命中缓存也必须涨 seq"
+
+    # 现在 A 的 worker（seq=1）必须判定为已过期
+    assert t._lookup_stale(1) is True
+
+
+def test_lookup_and_analysis_use_separate_http_sessions():
+    """☠️ requests.Session 不是线程安全的，能并发的线程必须各用各的。
+
+    查词和 AI 分析拆成两个 executor 之后就能真并发了（之前共用一个
+    max_workers=1 的池所以天然串行）。共用 lookup_session 是拆池带来的回归。
+    """
+    from translator_queue import WhisperQueueTranslator
+
+    t = object.__new__(WhisperQueueTranslator)
+    t.closing = False
+    t._enter_inflight = lambda: None
+    t._exit_inflight = lambda: None
+    used = []
+
+    class _S:
+        def __init__(self, name): self.name = name
+        def post(self, *a, **k):
+            used.append(self.name)
+            raise RuntimeError("stop here")
+
+    t.lookup_session = _S("lookup")
+    t.analysis_session = _S("analysis")
+    t._lookup_seq = 1
+    t._lookup_cache = __import__("collections").OrderedDict()
+    t._lookup_cache_lock = __import__("threading").Lock()
+    t._LOOKUP_CACHE_MAX = 200
+    t._ollama_hot = False
+
+    WhisperQueueTranslator._lookup_worker(t, "Wort", "ctx", lambda w, x: None, seq=1)
+    WhisperQueueTranslator._run_ai_analysis_request(t, "p", lambda x: None)
+
+    assert used == ["lookup", "analysis"], f"两条路径必须各用各的 session: {used}"
+
+
+def test_inflight_is_a_counter_not_a_bool():
+    """☠️ 查词和 AI 分析能并发，裸 bool 会被先结束的那个提前清掉。
+
+    交错：分析开始(True) → 查词开始(True) → 查词结束(False)
+    → 分析还在飞，草稿却已经恢复抢卡。必须用计数器。
+    """
+    from translator_queue import WhisperQueueTranslator
+    from threading import Lock
+
+    t = object.__new__(WhisperQueueTranslator)
+    t._lookup_inflight_n = 0
+    t._inflight_lock = Lock()
+
+    assert t._lookup_inflight is False
+    t._enter_inflight()                      # 分析开始
+    t._enter_inflight()                      # 查词开始
+    assert t._lookup_inflight is True
+    t._exit_inflight()                       # 查词结束
+    assert t._lookup_inflight is True, "分析还在飞，草稿不能恢复"
+    t._exit_inflight()                       # 分析结束
+    assert t._lookup_inflight is False
+    # 多减不能减成负数（异常路径可能重复调 finally）
+    t._exit_inflight()
+    assert t._lookup_inflight_n == 0
+
+
 def test_ollama_base_url_is_ipv4_literal():
     """☠️ OLLAMA_BASE_URL 必须是 IPv4 字面量，写 localhost 每个请求白付 2 秒。
 
@@ -608,6 +709,7 @@ def test_run_ai_analysis_request_sets_and_clears_inflight_flag_even_on_failure()
     t = object.__new__(WhisperQueueTranslator)
     t.closing = False
     t._lookup_inflight = False
+    t._inflight_lock = __import__('threading').Lock()
 
     class _FakeSession:
         def post(self, *a, **k):

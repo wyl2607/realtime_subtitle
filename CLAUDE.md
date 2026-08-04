@@ -168,7 +168,7 @@ install.ps1 按显存自动生成的默认档位：
 
 改代码（如果用户让你改功能）：
 
-15. 改完跑测试：`venv\Scripts\python -m pytest`（125 项，以实际输出为准）。test_hittest /
+15. 改完跑测试：`venv\Scripts\python -m pytest`（130 项，以实际输出为准）。test_hittest /
     test_resize_freedom / test_wordclick 是**独立脚本套件**（import 即开真窗口，
     pytest.ini 已把它们排除出收集，別删这个排除），用 `venv\Scripts\python
     test_hittest.py` 逐个跑。**测试进程 import main.py 会被
@@ -194,6 +194,17 @@ install.ps1 按显存自动生成的默认档位：
       幻觉 "Untertitelung des ZDF, 2020"。它是防幻觉主力，不是负担。
     - `_render` 的二分测高不是 UI 卡顿源：20 句对满屏 p50 **1.2ms**、max 1.6ms
       （每秒只调几次）。真卡顿要往别处找（GPU 抢占、翻译阻塞）。
+    - **调小 `BUFFER_TRIM_SEC` 省不了编码开销**（2026-08-04 查证）。
+      faster-whisper 每段进编码器前都 `pad_or_trim` 补到固定 30 秒
+      （`transcribe.py:1180` + `feature_extractor.py` `nb_max_frames=3000`），
+      所以 6 秒缓冲和 12 秒缓冲的**编码代价完全一样**，只有解码随 token 数变。
+      "缓冲短一点识别就快一点"是错的直觉。概况行里的
+      `缓冲短x.xxs(n)/长x.xxs(n)` 分桶就是给这条结论收实测数据的——
+      两桶 p50 基本持平即证实，不要再去做那个 A/B。
+    - **ASR 的 GPU 占空比约 50%，且基本不可压**：概况实测 116 次/60 秒
+      × p50 0.26 秒 ≈ 30 秒，即一半墙钟。次数由 `CHUNK_SUBMIT_SECONDS=0.5`
+      决定（每块一次），单次耗时由上一条锁死。要降只能拉长分块间隔，
+      代价是德语上屏更晚——「⚡性能」模式（1.0）就是这个取舍，别改默认值。
 21. **☠️ 所有打 Ollama 的请求必须共用一个 `num_ctx`**（`config.OLLAMA_NUM_CTX`）。
     Ollama 的 runner 按 **(模型, 上下文长度)** 缓存：换一个 num_ctx 就等于换一个
     runner，会把 5.6GB 模型整个重装一遍。2026-08-04 实测（字幕程序在跑、翻译流

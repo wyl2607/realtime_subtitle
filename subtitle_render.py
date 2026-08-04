@@ -257,6 +257,10 @@ class LiveTextRenderMixin:
         from PyQt5.QtGui import QCursor
         self._lookup_anchor = QCursor.pos()
         self._lookup_context = context  # 深度解释用整句，不靠弹窗事后再猜
+        # ☠️ UI 侧也要记"当前在等哪个词"：translator 的 seq 门控挡不住
+        # "worker 判定没过期 → emit 进 Qt 队列 → 用户点了新词 → 旧 emit 才被
+        # 主线程执行"这段窗口期。按词名对一下最省事，也够用
+        self._lookup_pending_word = word
         # 点新词会使进行中的深度解释过时（共享 WordPopup，旧结果回来别盖查词）
         self._deep_explain_seq = getattr(self, "_deep_explain_seq", 0) + 1
         # HTTP 超时 15s；弹窗要比它多留一点余量，避免 8-15s 区间先消失再闪回
@@ -278,6 +282,9 @@ class LiveTextRenderMixin:
         self.signals.lookup.emit(word or "", text or "", True)
 
     def _show_lookup(self, word, text, partial=False):
+        pending = getattr(self, "_lookup_pending_word", None)
+        if pending is not None and word and word != pending:
+            return  # 排在 Qt 队列里的旧词结果，用户已经点别的了，别盖上去
         body = html.escape(text).replace("\n", "<br>")
         context = getattr(self, "_lookup_context", "") or ""
         if partial:

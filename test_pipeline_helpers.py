@@ -86,6 +86,49 @@ def test_sentence_boundary_held_until_next_word():
     assert rest == "Und"
 
 
+def test_normalize_clock_times():
+    """德语 'HH.MM Uhr' 的点会被模型当小数点/序数点读歪，送翻译前归一化成冒号。
+
+    2026-08-04 复核 23157 条真实句对实测到的三种错法：
+      19.10 Uhr → "晚上九点"（小时算错）
+      23.30 Uhr → "十一点"（丢了分钟）
+      21 .43 Uhr → "0点43分"（ASR 在数字间插空格，模型彻底读歪）
+    """
+    from translator_queue import _normalize_clock_times as n
+    assert n("Sonntag, 19.10 Uhr.") == "Sonntag, 19:10 Uhr."
+    assert n("Heute 19 .25 Uhr im ZDF.") == "Heute 19:25 Uhr im ZDF."
+    assert n("Und der andere war am 21 .43 Uhr.") == "Und der andere war am 21:43 Uhr."
+    assert n("am 21. .31 Uhr") == "am 21:31 Uhr"      # ASR 多打一个点
+    assert n("Donnerstag, 20.15 Uhr im ZDF.") == "Donnerstag, 20:15 Uhr im ZDF."
+    assert n("Morgen früh, 6.30 Uhr.") == "Morgen früh, 6:30 Uhr."
+    # 不是时间的点不能动
+    assert n("Am 3. Mai fahren wir los.") == "Am 3. Mai fahren wir los."
+    assert n("ab 1914 europa und die welt.") == "ab 1914 europa und die welt."
+    assert n("Das kostet 8.50 Euro.") == "Das kostet 8.50 Euro."   # 后面不是 Uhr
+    assert n("25.99 Uhr") == "25.99 Uhr"   # 25 点不存在，不当时间处理
+    assert n("") == "" and n(None) is None
+
+
+def test_strip_translator_note_inline_and_trailing():
+    """译注不只出现在末尾：真实数据里有夹在句子中间的。
+
+    实测例（2026-07 转录）：「多特蒙德（注：此处应为杜塞尔多夫）住过、干过活儿」
+    """
+    from translator_queue import _strip_translator_note as s
+    # 中间的（括号闭合）
+    assert s("多特蒙德（注：此处应为杜塞尔多夫）住过、干过活儿") == "多特蒙德住过、干过活儿"
+    # 末尾的，右括号被 num_predict 截断
+    assert s("美国总统对伊朗……（注：建议补全后半句") == "美国总统对伊朗……"
+    # 末尾的，完整
+    assert s("估价在90到120欧元之间。（译注：此处保留人名）") == "估价在90到120欧元之间。"
+    # 一条里两种都有
+    assert s("甲（注：a）乙（说明：b）") == "甲乙"
+    # 整条都是译注 → 原样返回，宁可多显示不可显示空白
+    assert s("（注：这整条都是注）") == "（注：这整条都是注）"
+    # 正常括号不能误伤
+    assert s("他（35岁）来自科隆。") == "他（35岁）来自科隆。"
+
+
 def test_hallucination_blacklist():
     asr = OnlineASRProcessor.__new__(OnlineASRProcessor)
     assert asr._is_hallucination("Untertitelung des ZDF, 2020")
@@ -502,6 +545,8 @@ def _translator_for_tx(**overrides):
     t.closing = False
     t._ollama_hot = False
     t._lookup_inflight = False
+    t._inflight_lock = __import__('threading').Lock()
+    t._stats_lock = Lock()
     t._warm_notified = False
     t._tx_fail_streak = 0
     t._tx_circuit_until = 0.0
@@ -720,6 +765,7 @@ def test_held_boundary_released_by_flush_without_touching_audio(monkeypatch):
     t._held_since = 0.0
     t._last_unstable = ""
     t.on_display = None
+    t._stat_held_release = 0  # 放行计数进概况（SENTENCE_HOLD_SEC 够不够长）
     enqueued = []
     t._enqueue_sentences = lambda s: enqueued.extend(s)
 

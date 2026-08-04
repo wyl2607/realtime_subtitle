@@ -52,12 +52,37 @@ def _ends_with_terminator(text):
 # prompt 里已经明说不要加，这里是兜底：字幕条上多这么一坨没人想看。
 # num_predict 截断会让右括号丢掉，所以右括号是可选的。
 _TRANSLATOR_NOTE = re.compile(r'[（(]\s*(?:译注|注|说明|备注)\s*[：:][^）)]*[）)]?\s*$')
+# 译注不只出现在末尾：2026-08-04 复核 23157 条真实句对，实测有"多特蒙德（注：
+# 此处应为杜塞尔多夫）住过、干过活儿"这种夹在句子中间的。中间的那种右括号一定
+# 在（没被 num_predict 截断），所以这条要求右括号闭合，不会误吃掉正文
+_TRANSLATOR_NOTE_INLINE = re.compile(r'[（(]\s*(?:译注|注|说明|备注)\s*[：:][^）)]*[）)]')
 
 
 def _strip_translator_note(text):
-    """去掉译文末尾的译注；如果整条都是译注就原样返回（宁可多显示不可显示空白）。"""
-    cleaned = _TRANSLATOR_NOTE.sub("", text).strip()
+    """去掉译文里的译注；如果整条都是译注就原样返回（宁可多显示不可显示空白）。
+
+    先去中间的（要求括号闭合），再去末尾的（右括号可选——生成被
+    num_predict 截断时右括号会丢）。
+    """
+    cleaned = _TRANSLATOR_NOTE_INLINE.sub("", text)
+    cleaned = _TRANSLATOR_NOTE.sub("", cleaned).strip()
     return cleaned or text.strip()
+
+
+# 德语时间是"点"分隔（19.10 Uhr = 19:10），模型经常把这个点当小数点或序数点，
+# 实测错法有三种：19.10→"晚上九点"（小时算错）、23.30→"十一点"（丢了分钟）、
+# 21 .43→"0点43分"（ASR 在数字间插了空格，模型彻底读歪）。
+# prompt 里那条"时间是24小时制不要改"的硬约束挡不住，因为歧义在输入端。
+# 送去翻译前先归一化成 19:10 Uhr——冒号在任何语言里都只可能是时间，
+# 模型没有可误读的余地。只动喂给模型的文本，屏幕上和存档里的德语原文不变。
+_DE_CLOCK = re.compile(r'\b([01]?\d|2[0-3])\s*\.\s*\.?\s*([0-5]\d)(?=\s*Uhr\b)')
+
+
+def _normalize_clock_times(text):
+    """德语 'HH.MM Uhr' / 'HH .MM Uhr' → 'HH:MM Uhr'。非德语时间格式不动。"""
+    if not text:
+        return text
+    return _DE_CLOCK.sub(lambda m: f"{m.group(1)}:{m.group(2)}", text)
 
 
 def _boundary_is_real(candidate, remainder, final):
@@ -443,10 +468,15 @@ class WhisperQueueTranslator:
             self._lookup_seq = 0
             self._LOOKUP_CACHE_MAX = int(getattr(config, "LOOKUP_CACHE_MAX", 200))
             self._load_lookup_cache()  # 跨会话复用；文件坏了只是当空缓存
-            # 查词/AI分析请求在GPU上跑的期间为True：草稿翻译看这个让路，
-            # 别跟用户主动点的请求抢卡（2026-08-04实测：直播翻译流从不真正
-            # 闲着，查词/分析这类一次性人工请求跟它抢GPU会从<1秒拖到8-15秒）
-            self._lookup_inflight = False
+            # 查词/AI分析请求在GPU上跑的期间 >0：草稿翻译看这个让路，
+            # 别跟用户主动点的请求抢卡（2026-08-04实测：查词/分析这类一次性
+            # 人工请求跟直播翻译流抢GPU会明显变慢）。
+            # ☠️ 必须是**计数器**不是裸 bool：查词和 AI 分析在两个 executor 上，
+            # 可以真并发。裸 bool 下"分析开始(True) → 查词开始(True) →
+            # 查词结束(False)"会在分析还在飞的时候就把标志清掉，草稿提前恢复
+            # 抢卡。用 _inflight_lock 保护，读侧只看 >0
+            self._lookup_inflight_n = 0
+            self._inflight_lock = Lock()
 
             # 最近已翻译的德语句子，作为翻译上下文
             self.context_history = deque(maxlen=6)
@@ -477,15 +507,24 @@ class WhisperQueueTranslator:
             self._stat_merge = 0      # 合并多块处理的轮数（GPU落后的信号）
             self._stat_draft = 0      # 草稿翻译次数
             self._stat_dict = 0       # 感叹词词典直译次数（省下的Ollama请求）
+            self._stat_held_release = 0  # 句尾扣留到点放行的次数（SENTENCE_HOLD_SEC 是否够长）
+            # ASR 耗时分桶诊断（2026-08-04）：短/长缓冲、独占/与翻译并发
+            self._stat_asr_shortbuf = []
+            self._stat_asr_longbuf = []
+            self._stat_asr_solo = []
+            self._stat_asr_overlap = []
 
             # 草稿翻译节流状态（残句还没凑成完整句子时先出一版灰色中文）
             self._draft_last_time = 0.0
             self._draft_last_text = ""
 
-            # 复用的HTTP会话（翻译/查词各一个：requests.Session跨线程
-            # 并发使用不保证安全，翻译线程和查词线程各自独享）
-            self.ollama_session = requests.Session()
-            self.lookup_session = requests.Session()
+            # 复用的HTTP会话：**每个 executor 独享一个**。requests.Session
+            # 跨线程并发使用不保证安全，所以有几个能同时发请求的线程就要有几个
+            # session。☠️ 查词和 AI 分析拆成两个 executor 之后就能并发了，
+            # 再共用 lookup_session 就是真并发了——必须一起拆
+            self.ollama_session = requests.Session()   # 翻译 + 草稿（同一个池，串行）
+            self.lookup_session = requests.Session()   # 查词
+            self.analysis_session = requests.Session()  # 🤖 背景总结 / 深度解释
 
             # 字幕记录（原文+译文+时间戳，每天一个文件）
             self._transcript_ok = bool(getattr(config, "SAVE_TRANSCRIPT", False))
@@ -846,6 +885,27 @@ class WhisperQueueTranslator:
     # ------------------------------------------------------------------
     # 点词查词（独立worker，不占字幕翻译的队列）
     # ------------------------------------------------------------------
+    def _enter_inflight(self):
+        """标记一个"用户主动发起的 Ollama 请求"开始（查词/AI分析）。"""
+        with self._inflight_lock:
+            self._lookup_inflight_n += 1
+
+    def _exit_inflight(self):
+        """结束。计数归零才算真的没人在等——见 _maybe_draft 的让路条件。"""
+        with self._inflight_lock:
+            self._lookup_inflight_n = max(0, self._lookup_inflight_n - 1)
+
+    @property
+    def _lookup_inflight(self):
+        """有任意一个用户请求在飞就是 True（_maybe_draft 读这个让路）。"""
+        return getattr(self, "_lookup_inflight_n", 0) > 0
+
+    @_lookup_inflight.setter
+    def _lookup_inflight(self, value):
+        """只给测试摆初始状态用。生产代码一律走 _enter/_exit_inflight——
+        直接赋 False 会把并发中的另一个请求也一并清掉，正是要防的那个 bug。"""
+        self._lookup_inflight_n = 1 if value else 0
+
     def _lookup_cache_path(self):
         """查词缓存落盘路径；config 里设成空/None 就是关闭持久化"""
         name = getattr(config, "LOOKUP_CACHE_FILE", None)
@@ -949,11 +1009,15 @@ class WhisperQueueTranslator:
         callback 必须线程安全（SubtitleWindow.show_lookup_result 走Qt信号）。
         缓存命中在调用线程同步返回，不进 executor、不打 Ollama。
         """
+        # ☠️ seq 必须在**查缓存之前**递增：命中缓存时也要让在飞的上一次查词过期。
+        # 否则「点生词A(慢，流式在跑) → 点查过的词B(缓存秒回)」时 seq 不涨，
+        # A 的 partial/final 全部判定为"没过期"，会一行行把 B 的结果盖掉，
+        # 用户看到刚点的 B 变回 A。缓存越大越持久，这条路径越常走。
+        self._lookup_seq += 1  # 只在 UI 线程递增（点击回调），worker 只读
+        seq = self._lookup_seq
         cache_key = (word.lower(), config.SOURCE_LANGUAGE)
         if self._serve_cached_lookup(word, cache_key, context, callback):
             return
-        self._lookup_seq += 1  # 只在 UI 线程递增（点击回调），worker 只读
-        seq = self._lookup_seq
         try:
             self._lookup_executor.submit(
                 self._lookup_worker, word, context, callback, seq, on_partial)
@@ -1023,7 +1087,7 @@ class WhisperQueueTranslator:
 释义: 中文释义，最多2条，分号隔开
 本句中: 一句话说明它在上面那句话里的意思
 """
-        self._lookup_inflight = True  # 草稿翻译看这个让路，见 _maybe_draft
+        self._enter_inflight()  # 草稿翻译看这个让路，见 _maybe_draft
         try:
             t0 = time.time()
             # 用查词专属session：和翻译线程共享一个requests.Session
@@ -1083,7 +1147,7 @@ class WhisperQueueTranslator:
             if not self.closing and not self._lookup_stale(seq):
                 callback(word, f"查询失败: {e}")
         finally:
-            self._lookup_inflight = False
+            self._exit_inflight()
 
     # ------------------------------------------------------------------
     # AI 分析（背景总结 / 整句深度解释）——独立 executor，既不占翻译队列，
@@ -1117,10 +1181,10 @@ class WhisperQueueTranslator:
 
     def _run_ai_analysis_request(self, prompt, callback, num_predict=400, label="分析"):
         """共用 Ollama /api/generate 路径：失败只改弹窗文案，不重试、不打扰主链路。"""
-        self._lookup_inflight = True  # 草稿翻译看这个让路，见 _maybe_draft
+        self._enter_inflight()  # 草稿翻译看这个让路，见 _maybe_draft
         try:
             t0 = time.time()
-            response = self.lookup_session.post(
+            response = self.analysis_session.post(
                 f"{config.OLLAMA_BASE_URL}/api/generate",
                 json={
                     "model": config.OLLAMA_MODEL,
@@ -1151,7 +1215,7 @@ class WhisperQueueTranslator:
             if not self.closing:
                 callback(f"分析失败: {e}")
         finally:
-            self._lookup_inflight = False
+            self._exit_inflight()
 
     def _translate_single_sentence(self, sentence, german_context, on_partial=None):
         """翻译一段对白（源语言 -> 中文）。失败时返回原文。
@@ -1162,8 +1226,19 @@ class WhisperQueueTranslator:
         try:
             lang_name = config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)
 
+            # 时间归一化只作用于**喂给模型的副本**：屏幕上的德语行、transcripts
+            # 存档、context_history 存的都还是 ASR 原样输出。
+            # ☠️ 绝不能就地覆盖 sentence——失败路径 `return sentence` 的返回值
+            # 会和 _translation_worker 里未归一化的 german 做相等判断，
+            # 不等就会把德语显示两遍（2026-07-04 修过的那个"德语\n德语"）
+            if config.SOURCE_LANGUAGE == "de":
+                prompt_sentence = _normalize_clock_times(sentence)
+                prompt_context = _normalize_clock_times(german_context)
+            else:
+                prompt_sentence, prompt_context = sentence, german_context
+
             # 术语表只注入当前句子/上下文里真出现的词条，prompt保持精简
-            haystack = f"{german_context} {sentence}".lower()
+            haystack = f"{prompt_context} {prompt_sentence}".lower()
             matched_terms = [
                 f"{de} → {zh}" for de, zh in config.GLOSSARY.items()
                 if de.lower() in haystack
@@ -1191,16 +1266,16 @@ class WhisperQueueTranslator:
 {n_rules + 1}. 只输出中文翻译，不要解释，不要输出{lang_name}原文
 {n_rules + 2}. 【上下文】只用来帮助理解，绝对不要翻译上下文里的句子——它们已经显示过了
 {n_rules + 3}. 当前对白哪怕只是半句、不完整，也只翻这半句：不要补全、不要加括号注释或说明
-{n_rules + 4}. {lang_name}时间是24小时制、用点分隔（22.15 Uhr = 22点15分），时间和数字不要改
+{n_rules + 4}. 时间是24小时制（22:15 Uhr = 22点15分，19:10 Uhr = 19点10分），照抄小时和分钟，不要换算成上午/下午，数字一律不改
 {glossary_block}
 【{lang_name}上下文（此前的对白）】
 ***
-{german_context if german_context else "（无上下文）"}
+{prompt_context if prompt_context else "（无上下文）"}
 ***
 
 【当前对白】
 ***
-{sentence}
+{prompt_sentence}
 ***
 
 中文翻译：
@@ -1358,6 +1433,11 @@ class WhisperQueueTranslator:
             return
         sentences = self._extract_sentences(final=True)
         if sentences:
+            # 计数进概况：放行次数高 = SENTENCE_HOLD_SEC 太短，很多是说话人
+            # 句中换气就被切了（这个问题在 transcripts 里看不出来，
+            # 时间戳是"存盘时刻"不是"停顿时长"，只能在运行时数）
+            with self._stats_lock:
+                self._stat_held_release += 1
             self._enqueue_sentences(sentences)
             self._emit_display()
 
@@ -1547,6 +1627,13 @@ class WhisperQueueTranslator:
 
             self.processor.insert_audio_chunk(audio_data)
 
+        # 推理**开始前**的缓冲长度 + 此刻 Ollama 是否也在跑。
+        # 这两个是回答"ASR 耗时到底受什么影响"的关键自变量，之前只记了推理
+        # 结束、裁剪之后的缓冲长度（那个恒等于裁剪阈值，什么也说明不了）
+        buf_before = self.processor.buffer_seconds()
+        with self._tx_lock:
+            overlapped = bool(self._tx_inflight)
+
         self._asr_busy = True  # 草稿翻译看这个标志让路（识别在GPU上跑的期间）
         try:
             committed, unstable = self.processor.process_iter()
@@ -1570,7 +1657,8 @@ class WhisperQueueTranslator:
         self._maybe_draft()
 
         elapsed = time.time() - start_time
-        self._stat_note_asr(elapsed, self.processor.buffer_seconds(), len(items))
+        self._stat_note_asr(elapsed, self.processor.buffer_seconds(), len(items),
+                            buf_before=buf_before, overlapped=overlapped)
         if config.SHOW_PERFORMANCE:
             shown = committed if committed else "(无新提交)"
             merged = f"(合并{len(items)}块)" if len(items) > 1 else ""
@@ -1578,14 +1666,34 @@ class WhisperQueueTranslator:
             if unstable:
                 print(f"   ⏳ 未稳定: {unstable[:60]}")
 
-    def _stat_note_asr(self, elapsed, buf_sec, n_items):
-        """记一轮识别指标；到间隔就打一行概况（跑在ASR线程，无音频时不打）"""
+    def _stat_note_asr(self, elapsed, buf_sec, n_items,
+                       buf_before=None, overlapped=False):
+        """记一轮识别指标；到间隔就打一行概况（跑在ASR线程，无音频时不打）
+
+        buf_before/overlapped 是 2026-08-04 加的诊断项，用来回答两个之前
+        answer 不了的问题（都需要真实使用数据，读代码得不出来）：
+        1. **ASR 耗时到底受不受缓冲长度影响？** 分短/长缓冲两桶记 p50。
+           faster-whisper 的 `pad_or_trim` 会把每段都补到固定 30 秒再进编码器
+           （transcribe.py:1180 + feature_extractor nb_max_frames=3000），
+           所以理论上编码开销与缓冲长度无关、只有解码随 token 数变。
+           两桶 p50 若基本持平，就证实了这一点，`BUFFER_TRIM_SEC` 也就没有
+           调小的价值——省得以后再有人去做那个 A/B。
+        2. **翻译和识别同时跑会不会互相拖慢？** 按"推理开始时 Ollama 是否
+           在飞"分桶记 p50，直接看差值。
+        """
         interval = getattr(config, "STATS_SUMMARY_INTERVAL", 60)
         if interval <= 0:
             return
         with self._stats_lock:
             self._stat_asr.append(elapsed)
             self._stat_buf_max = max(self._stat_buf_max, buf_sec)
+            if buf_before is not None:
+                # 分桶阈值取 BUFFER_KEEP_SEC：裁剪后停在它附近，涨到 TRIM 再裁，
+                # 所以它天然就是"短缓冲/长缓冲"的分界
+                bucket = (self._stat_asr_longbuf if buf_before >= config.BUFFER_KEEP_SEC
+                          else self._stat_asr_shortbuf)
+                bucket.append(elapsed)
+            (self._stat_asr_overlap if overlapped else self._stat_asr_solo).append(elapsed)
             if n_items > 1:
                 self._stat_merge += 1
             if time.time() - self._stats_t0 < interval:
@@ -1593,9 +1701,15 @@ class WhisperQueueTranslator:
             asr, tx = sorted(self._stat_asr), sorted(self._stat_tx)
             merge, buf_max = self._stat_merge, self._stat_buf_max
             draft, dhit = self._stat_draft, self._stat_dict
+            held = self._stat_held_release
+            shortb, longb = sorted(self._stat_asr_shortbuf), sorted(self._stat_asr_longbuf)
+            solo, overlap = sorted(self._stat_asr_solo), sorted(self._stat_asr_overlap)
             self._stat_asr, self._stat_tx = [], []
             self._stat_merge, self._stat_buf_max = 0, 0.0
             self._stat_draft = self._stat_dict = 0
+            self._stat_held_release = 0
+            self._stat_asr_shortbuf, self._stat_asr_longbuf = [], []
+            self._stat_asr_solo, self._stat_asr_overlap = [], []
             self._stats_t0 = time.time()
 
         def pct(a, q):
@@ -1611,6 +1725,15 @@ class WhisperQueueTranslator:
             line += f" | 草稿{draft}"
         if dhit:
             line += f" | 词典直译{dhit}"
+        if held:
+            line += f" | 扣留放行{held}"
+        # 诊断项：只在两桶都有样本时打，否则是噪声
+        if shortb and longb:
+            line += (f" | 缓冲短{pct(shortb, .5):.2f}s({len(shortb)})"
+                     f"/长{pct(longb, .5):.2f}s({len(longb)})")
+        if solo and overlap:
+            line += (f" | 独占{pct(solo, .5):.2f}s({len(solo)})"
+                     f"/与翻译并发{pct(overlap, .5):.2f}s({len(overlap)})")
         print(line)
 
     def flush_pending(self):
@@ -1682,6 +1805,7 @@ class WhisperQueueTranslator:
         try:
             self.ollama_session.close()
             self.lookup_session.close()
+            self.analysis_session.close()
         except Exception:
             pass
 
