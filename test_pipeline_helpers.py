@@ -501,6 +501,7 @@ def _translator_for_tx(**overrides):
     t._tx_epoch = 0
     t.closing = False
     t._ollama_hot = False
+    t._lookup_inflight = False
     t._warm_notified = False
     t._tx_fail_streak = 0
     t._tx_circuit_until = 0.0

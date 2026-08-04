@@ -272,3 +272,123 @@ def test_analyze_background_and_deep_explain_use_lookup_executor():
     assert submitted[1][0] == t._deep_explain_worker
     assert submitted[0][1][0] == "de text"
     assert submitted[1][1][0] == "ein satz"
+
+
+# ---------------------------------------------------------------------------
+# GPU 让路：查词/AI分析在飞时草稿翻译应跳过
+#
+# 根因（2026-08-04 实测）：直播翻译流从不真正闲着，查词/AI分析这类一次性
+# 人工请求跟它抢同一张卡的 Ollama 推理算力，会从 <1 秒拖到 8-15 秒。
+# _lookup_inflight 标志让 _maybe_draft 在查词/分析请求飞行期间跳过草稿，
+# 把 GPU 让给用户主动发起的请求。
+# ---------------------------------------------------------------------------
+
+def _draft_ready_translator():
+    """构造一个满足 _maybe_draft 除 _lookup_inflight 外全部"应该出草稿"条件的假 translator。"""
+    from translator_queue import WhisperQueueTranslator
+    from threading import Lock
+    t = object.__new__(WhisperQueueTranslator)
+    t.on_draft = lambda *a: None
+    t.pending_text = "Das ist ein laengerer Satz mit genug Woertern"
+    t._draft_last_text = ""  # 和 pending_text 不同，不会因"没变"提前 return
+    t._draft_last_time = 0.0  # 足够久之前，不会被 DRAFT_MIN_INTERVAL 拦
+    t._asr_busy = False
+    t._lookup_inflight = False
+    t._ollama_hot = True
+    t._asr_lock = Lock()
+    t._audio_inbox = []
+    t._tx_lock = Lock()
+    t._tx_queue = []
+    t._tx_inflight = []
+    t._stats_lock = Lock()
+    t._stat_draft = 0
+
+    submitted = []
+
+    class _Exec:
+        def submit(self, fn, *a):
+            submitted.append((fn, a))
+
+    t._tx_executor = _Exec()
+    t._submitted = submitted
+    return t
+
+
+def test_maybe_draft_skips_when_lookup_inflight(monkeypatch):
+    import config
+    monkeypatch.setattr(config, "DRAFT_TRANSLATION", True)
+    from translator_queue import WhisperQueueTranslator
+
+    t = _draft_ready_translator()
+    t._lookup_inflight = True
+    WhisperQueueTranslator._maybe_draft(t)
+    assert t._submitted == [], "查词/分析在飞时草稿不该提交，会跟它抢GPU"
+
+
+def test_maybe_draft_runs_when_lookup_not_inflight(monkeypatch):
+    """对照组：其它条件不变，只把 _lookup_inflight 改成 False，草稿应该正常提交。
+
+    证明上一个测试真的是被 _lookup_inflight 挡住的，不是被其它前置条件挡住的。
+    """
+    import config
+    monkeypatch.setattr(config, "DRAFT_TRANSLATION", True)
+    from translator_queue import WhisperQueueTranslator
+
+    t = _draft_ready_translator()
+    assert t._lookup_inflight is False
+    WhisperQueueTranslator._maybe_draft(t)
+    assert len(t._submitted) == 1
+
+
+def test_lookup_worker_sets_and_clears_inflight_flag():
+    """_lookup_worker 请求期间 _lookup_inflight 应为 True，结束后必须清回 False。"""
+    from translator_queue import WhisperQueueTranslator
+
+    t = object.__new__(WhisperQueueTranslator)
+    t.closing = False
+    t._lookup_inflight = False
+    t._lookup_seq = 1
+    t._lookup_cache = {}
+    t._lookup_cache_lock = __import__("threading").Lock()
+    t._LOOKUP_CACHE_MAX = 200
+    seen_inflight_during_call = []
+
+    class _FakeResponse:
+        status_code = 200
+        def json(self):
+            return {"response": "结果"}
+
+    class _FakeSession:
+        def post(self, *a, **k):
+            seen_inflight_during_call.append(t._lookup_inflight)
+            return _FakeResponse()
+
+    t.lookup_session = _FakeSession()
+    results = []
+    WhisperQueueTranslator._lookup_worker(
+        t, "Wort", "ein Kontext", lambda w, txt: results.append((w, txt)), seq=1)
+
+    assert seen_inflight_during_call == [True], "请求发出时 _lookup_inflight 应为 True"
+    assert t._lookup_inflight is False, "请求结束后必须清回 False，否则草稿永远让路"
+    assert results == [("Wort", "结果")]
+
+
+def test_run_ai_analysis_request_sets_and_clears_inflight_flag_even_on_failure():
+    """failure 路径（HTTP非200/异常）也必须清 flag，否则一次失败就把草稿卡死。"""
+    from translator_queue import WhisperQueueTranslator
+
+    t = object.__new__(WhisperQueueTranslator)
+    t.closing = False
+    t._lookup_inflight = False
+
+    class _FakeSession:
+        def post(self, *a, **k):
+            raise RuntimeError("网络挂了")
+
+    t.lookup_session = _FakeSession()
+    results = []
+    WhisperQueueTranslator._run_ai_analysis_request(
+        t, "prompt", lambda txt: results.append(txt), num_predict=400, label="测试")
+
+    assert t._lookup_inflight is False, "异常路径也必须清 flag（finally块）"
+    assert results and "失败" in results[0]

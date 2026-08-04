@@ -407,6 +407,10 @@ class WhisperQueueTranslator:
             # 队（单线程 worker，每个最长15秒），过时的结果回来会覆盖当前弹窗
             self._lookup_seq = 0
             self._LOOKUP_CACHE_MAX = int(getattr(config, "LOOKUP_CACHE_MAX", 200))
+            # 查词/AI分析请求在GPU上跑的期间为True：草稿翻译看这个让路，
+            # 别跟用户主动点的请求抢卡（2026-08-04实测：直播翻译流从不真正
+            # 闲着，查词/分析这类一次性人工请求跟它抢GPU会从<1秒拖到8-15秒）
+            self._lookup_inflight = False
 
             # 最近已翻译的德语句子，作为翻译上下文
             self.context_history = deque(maxlen=6)
@@ -747,6 +751,9 @@ class WhisperQueueTranslator:
             return
         if self._asr_busy:
             return  # Whisper 正在 GPU 上识别，草稿别去抢卡（p95尖刺的来源之一）
+        if self._lookup_inflight:
+            return  # 用户点了查词/AI分析在等结果，草稿让路（这类是一次性人工
+                     # 请求，比"每1.5秒一次"的草稿更该优先拿到GPU）
         if not self._ollama_hot:
             return  # 模型还没进显存：那唯一一次冷加载要留给正式句子，草稿别去排队占坑
         with self._asr_lock:
@@ -875,6 +882,7 @@ class WhisperQueueTranslator:
 释义: 中文释义，最多2条，分号隔开
 本句中: 一句话说明它在上面那句话里的意思
 """
+        self._lookup_inflight = True  # 草稿翻译看这个让路，见 _maybe_draft
         try:
             t0 = time.time()
             # 用查词专属session：和翻译线程共享一个requests.Session
@@ -912,6 +920,8 @@ class WhisperQueueTranslator:
         except Exception as e:
             if not self.closing and not self._lookup_stale(seq):
                 callback(word, f"查询失败: {e}")
+        finally:
+            self._lookup_inflight = False
 
     # ------------------------------------------------------------------
     # AI 分析（背景总结 / 整句深度解释）——复用 _lookup_executor，不占翻译队列
@@ -944,6 +954,7 @@ class WhisperQueueTranslator:
 
     def _run_ai_analysis_request(self, prompt, callback, num_predict=400, label="分析"):
         """共用 Ollama /api/generate 路径：失败只改弹窗文案，不重试、不打扰主链路。"""
+        self._lookup_inflight = True  # 草稿翻译看这个让路，见 _maybe_draft
         try:
             t0 = time.time()
             response = self.lookup_session.post(
@@ -976,6 +987,8 @@ class WhisperQueueTranslator:
         except Exception as e:
             if not self.closing:
                 callback(f"分析失败: {e}")
+        finally:
+            self._lookup_inflight = False
 
     def _translate_single_sentence(self, sentence, german_context, on_partial=None):
         """翻译一段对白（源语言 -> 中文）。失败时返回原文。
