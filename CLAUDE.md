@@ -39,6 +39,10 @@
 
 ### 一键安装
 
+**☠️ 克隆到纯英文路径**（`C:\realtime_subtitle` 这种）。中文 Windows 用户名
+（`C:\Users\张三\...`）会让生成的启动 bat 直接损坏，根因见第 4 节第 4 条；
+install.ps1 开头会拦住并让你换路径，但你先选对能省一趟。
+
 前置三件套齐了之后（幂等，中断重跑即可）：
 
 ```powershell
@@ -47,6 +51,10 @@ cd realtime_subtitle
 powershell -ExecutionPolicy Bypass -File install.ps1
 # 中国大陆网络：加 -Mirror 参数走清华 PyPI 镜像
 ```
+
+install.ps1 最后一步会自检（import torch/PyQt5/pyaudiowpatch/soxr + 走一遍
+`translator_queue._ensure_ml_deps()`）。自检不过就别急着让用户双击启动，
+先按它打印的报错和第 4 节对。
 
 install.ps1 会：找 Python → nvidia-smi 检测显卡 → 建 venv 装依赖 → 按显存
 生成 `config_local.py` 降级配置 → 启动 Ollama 并拉取配置对应的翻译模型 →
@@ -168,7 +176,7 @@ install.ps1 按显存自动生成的默认档位：
 
 改代码（如果用户让你改功能）：
 
-15. 改完跑测试：`venv\Scripts\python -m pytest`（130 项，以实际输出为准）。test_hittest /
+15. 改完跑测试：`venv\Scripts\python -m pytest`（137 项，以实际输出为准）。test_hittest /
     test_resize_freedom / test_wordclick 是**独立脚本套件**（import 即开真窗口，
     pytest.ini 已把它们排除出收集，別删这个排除），用 `venv\Scripts\python
     test_hittest.py` 逐个跑。**测试进程 import main.py 会被
@@ -242,6 +250,20 @@ install.ps1 按显存自动生成的默认档位：
     就是这么揪出来的——Ollama 自报 `total_duration` 只有 385ms，客户端墙钟却是
     2437ms，差值 2052ms 稳如磐石，一看就不在 GPU 上。判据：
     `wall - total_duration` 应该是个位数毫秒，明显大于它就说明卡在传输层。
+24. **显示缩放（高DPI）只做了首次运行的默认值，没有全局开 Qt 缩放。**
+    本项目所有字号都是像素单位（`setPixelSize` / 样式表 `font-size: Npx`），
+    而 Qt5 的 `AA_EnableHighDpiScaling` 默认关闭。笔记本几乎都是 125%/150%
+    缩放，直接跑字会小三分之一。**不要顺手去开那个全局开关**——悬浮窗是无
+    QLayout 的手动 setGeometry + WM_NCHITTEST 原生命中测试（第 17 条），
+    开缩放会改坐标空间、动到命中测试，得连 test_hittest 一起重做。
+    现在的折中：`window_geometry.screen_scale_factor()` 读主屏逻辑 DPI，
+    **只在首次运行**（还没有 window_state.json）按倍率放大默认字号和默认
+    窗口尺寸，用户 Ctrl+滚轮调过之后一律以保存值为准。**按钮条/设置面板等
+    chrome 的字号仍然没跟着缩放**，高DPI 屏上偏小是已知的、还没解决。
+    同一处还修了另一个换机器才暴露的问题：config 里的 `WINDOW_X/Y` 是按
+    开发机屏幕写死的绝对坐标，1366x768 的小笔记本上 y=750 整窗掉出屏幕，
+    只能靠钳制拽回屏幕正中间；首次运行现在改走 `default_geometry()`
+    按实际屏幕算贴底居中。
 
 ## 5. 目录地图
 

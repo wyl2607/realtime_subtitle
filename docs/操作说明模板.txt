@@ -88,4 +88,4 @@
   {{INSTALL_DIR}}\config_local.py 里的 WHISPER_MODEL 和 OLLAMA_MODEL
   （写 config_local.py 不写 config.py，以后 git 更新才不会冲突）。
 
-技术细节和给AI的备注见仓库里的 CLAUDE.md 和 AI_README.md。
+技术细节和给AI的备注见仓库里的 CLAUDE.md（{{INSTALL_DIR}}\CLAUDE.md）。

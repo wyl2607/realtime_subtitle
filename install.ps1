@@ -6,11 +6,13 @@
 # 可选： -Mirror  使用清华 PyPI 镜像（国内网络加速）
 #
 # 做的事：
+#   0. 拦住非英文安装路径（会把生成的 .bat 弄坏）
 #   1. 检查 Python 3.10-3.13（本机 3.13 实测可用）
 #   2. 检测 NVIDIA 显卡（没有就自动生成 CPU 降级配置）
-#   3. 创建 venv 并安装依赖
+#   3. 创建 venv 并安装依赖（无 N 卡时跳过 CUDA 运行库）
 #   4. 检查/引导安装 Ollama，拉取翻译模型
 #   5. 在桌面生成快捷方式文件夹（启动/停止/暂停）
+#   6. 自检：把最容易坏的依赖当场 import 一遍
 # 全程可重复运行（幂等），中断后重跑即可。
 # ============================================================
 param(
@@ -24,6 +26,21 @@ Write-Host "=========================================="
 Write-Host "   实时字幕翻译系统 - 安装程序"
 Write-Host "=========================================="
 Write-Host ""
+
+# ---------- 0. 安装路径必须是纯 ASCII ----------
+# ☠️ 桌面那四个 .bat 里会内嵌本目录的绝对路径，而 bat 在 chcp 65001 下解析
+# 含非 ASCII 的行会把下一行开头吃掉（避坑清单第 4 条），启动脚本直接损坏。
+# 中文 Windows 用户名（C:\Users\张三\...）是最常见的触发方式，而且症状
+# 完全看不出跟路径有关，所以这里直接拦住，不让人装完再踩。
+if ($PSScriptRoot -match '[^\x20-\x7E]') {
+    Write-Host "  ❌ 安装路径里有非英文字符，装了也起不来："
+    Write-Host "     $PSScriptRoot"
+    Write-Host ""
+    Write-Host "     原因：桌面快捷方式 .bat 会内嵌这个路径，cmd 在 UTF-8 代码页下"
+    Write-Host "     解析含中文的行会啃掉下一行，启动脚本必坏（中文用户名最常踩）。"
+    Write-Host "     解决：把整个仓库挪到纯英文路径再重跑，例如 C:\realtime_subtitle"
+    exit 1
+}
 
 # 调用候选 Python 命令（"python" 或 "py -3.13"）。
 # ☠️ 不能用 $parts[1..($parts.Count-1)]：Count=1 时 1..0 会把自身再塞回参数，
@@ -47,7 +64,7 @@ function Invoke-PythonCand {
 }
 
 # ---------- 1. 找 Python ----------
-Write-Host "[1/5] 检查 Python..."
+Write-Host "[1/6] 检查 Python..."
 $python = $null
 $candidates = @()
 if (Get-Command py -ErrorAction SilentlyContinue) {
@@ -77,7 +94,7 @@ if (-not $python) {
 }
 
 # ---------- 2. 检测显卡 ----------
-Write-Host "[2/5] 检测 NVIDIA 显卡..."
+Write-Host "[2/6] 检测 NVIDIA 显卡..."
 $hasGpu = $false
 $gpuMemMB = 0
 try {
@@ -115,7 +132,7 @@ if (-not $hasGpu) {
 }
 
 # ---------- 3. venv + 依赖 ----------
-Write-Host "[3/5] 安装 Python 依赖（首次需要几分钟）..."
+Write-Host "[3/6] 安装 Python 依赖（首次需要几分钟）..."
 if (-not (Test-Path "$PSScriptRoot\venv\Scripts\python.exe")) {
     Invoke-PythonCand -Spec $python -ArgList @("-m", "venv", "$PSScriptRoot\venv")
 }
@@ -123,7 +140,20 @@ $vpy = "$PSScriptRoot\venv\Scripts\python.exe"
 $pipArgs = @("-m", "pip", "install", "--upgrade")
 if ($Mirror) { $pipArgs += @("-i", "https://pypi.tuna.tsinghua.edu.cn/simple") }
 & $vpy @pipArgs pip | Out-Null
-& $vpy @pipArgs -r "$PSScriptRoot\requirements.txt"
+
+# 没有 N 卡就别装那两个 CUDA 运行库（nvidia-cublas-cu12 + nvidia-cudnn-cu12
+# 加起来 1GB 出头，CPU 档位一个字节都用不到；translator_queue 里的 PATH 注入
+# 对 ImportError 有守卫，缺了不影响启动）。requirements.txt 本身保持完整——
+# README 里写的手动装法是给有卡的机器用的，不能因为这个优化而失效。
+$reqFile = "$PSScriptRoot\requirements.txt"
+if (-not $hasGpu) {
+    $reqFile = Join-Path $env:TEMP "rt_subtitle_requirements_cpu.txt"
+    Get-Content "$PSScriptRoot\requirements.txt" |
+        Where-Object { $_ -notmatch '^\s*nvidia-' } |
+        Set-Content -Path $reqFile -Encoding UTF8
+    Write-Host "  ℹ️ CPU 模式：跳过 CUDA 运行库（省约 1GB 下载）"
+}
+& $vpy @pipArgs -r $reqFile
 if ($LASTEXITCODE -ne 0) {
     Write-Host "  ❌ 依赖安装失败，请检查网络后重跑（国内网络可加 -Mirror 参数）"
     exit 1
@@ -186,7 +216,7 @@ GAME_MODE_OLLAMA_MODEL = None  # 主模型已是4b，游戏模式不用再切
 }
 
 # ---------- 5. Ollama + 翻译模型 ----------
-Write-Host "[4/5] 检查 Ollama（本地翻译模型运行时）..."
+Write-Host "[4/6] 检查 Ollama（本地翻译模型运行时）..."
 $ollamaExe = (Get-Command ollama -ErrorAction SilentlyContinue).Source
 if (-not $ollamaExe) {
     $guess = "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe"
@@ -239,7 +269,7 @@ foreach ($m in @($txModel, $gameModel) | Where-Object { $_ } | Select-Object -Un
 }
 
 # ---------- 6. 桌面快捷方式 ----------
-Write-Host "[5/5] 生成桌面快捷方式..."
+Write-Host "[5/6] 生成桌面快捷方式..."
 $desktop = [Environment]::GetFolderPath("Desktop")
 $shortcutDir = Join-Path $desktop "德语直播实时字幕"
 New-Item -ItemType Directory -Path $shortcutDir -Force | Out-Null
@@ -290,6 +320,30 @@ if (Test-Path $docTemplate) {
 "@ | Out-File -FilePath $docTarget -Encoding utf8
 }
 Write-Host "  ✅ 快捷方式已生成: $shortcutDir"
+
+# ---------- 7. 装完自检 ----------
+# 装完不验一下的话，环境问题要等用户双击启动、悬浮窗不出来、再去翻
+# subtitle.err.log 才暴露。这里当场把最容易坏的四类依赖走一遍：
+# torch(c10.dll) / PyQt5 / 音频捕获 / 重采样，再走一次 translator_queue
+# 自己的 _ensure_ml_deps()——☠️ 必须走它，不能直接 import faster_whisper：
+# cublas 目录是那个函数往 PATH 里注入的（避坑清单第 2 条），绕过去测会在
+# 装得好好的机器上误报失败。
+Write-Host "[6/6] 验证安装..."
+$smokeCode = @"
+import config, torch, PyQt5.QtWidgets, pyaudiowpatch, soxr
+import translator_queue
+translator_queue._ensure_ml_deps()
+print('SMOKE_OK', config.WHISPER_MODEL, config.WHISPER_COMPUTE_TYPE, config.OLLAMA_MODEL)
+"@
+$smoke = & $vpy -c $smokeCode 2>&1
+if ($LASTEXITCODE -eq 0 -and ($smoke -join "`n") -match "SMOKE_OK\s+(\S+)\s+(\S+)\s+(\S+)") {
+    Write-Host "  ✅ 依赖自检通过：识别 $($Matches[1]) / $($Matches[2])，翻译 $($Matches[3])"
+} else {
+    Write-Host "  ⚠️  依赖自检没通过，程序大概率起不来。报错如下："
+    $smoke | Select-Object -Last 12 | ForEach-Object { Write-Host "     $_" }
+    Write-Host "     常见原因：显卡驱动 CUDA <12.0、杀毒软件删了 venv 里的文件、"
+    Write-Host "     依赖没装全（重跑本脚本即可）。对照 CLAUDE.md 第 4 节避坑清单。"
+}
 
 Write-Host ""
 Write-Host "=========================================="

@@ -30,7 +30,10 @@ from PyQt5.QtCore import (
 from PyQt5.QtGui import QFont
 import config
 
-from window_geometry import _screen_area_at, _clamp_geo_to_area, _clamp_geo_to_any_screen
+from window_geometry import (
+    _screen_area_at, _clamp_geo_to_area, _clamp_geo_to_any_screen,
+    default_geometry, screen_scale_factor,
+)
 from window_frame import ResizableFramelessWidget
 from settings_window import (
     SettingsWindow, TUNING_KEYS, MODE_ICONS,
@@ -97,6 +100,14 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
                 config.FONT_SIZE = int(self._state["font_size"])
             except (TypeError, ValueError):
                 pass
+        else:
+            # 首次运行：按屏幕缩放倍率放大默认字号（笔记本几乎都是 125%/150%，
+            # 像素单位的字号在那上面会小一大截，见 screen_scale_factor 的注释）
+            scale = screen_scale_factor()
+            if scale > 1.0:
+                config.FONT_SIZE = int(config.FONT_SIZE * scale)
+                config.TV_FONT_SIZE = min(int(config.TV_FONT_SIZE * scale),
+                                          config.TV_FONT_SIZE_MAX)
         if "bg_opacity" in self._state:
             try:
                 config.BACKGROUND_OPACITY = int(self._state["bg_opacity"])
@@ -312,10 +323,23 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         # 窗口几何：优先用上次退出时保存的（用户拖过/缩放过就记住），没有才用config默认。
         # 按中心点落屏钳制（多屏副屏恢复不被主屏尺寸错误约束；拔显示器也能钳回）
         state = self._state
-        w = state.get("w", config.WINDOW_WIDTH)
-        h = state.get("h", config.WINDOW_HEIGHT + 40)
-        x = state.get("x", config.WINDOW_X)
-        y = state.get("y", config.WINDOW_Y)
+        # 首次运行没有任何保存的坐标：config 里那组绝对坐标是按开发机屏幕写的，
+        # 换台机器（尤其小屏笔记本）会落到屏幕外，改成按当前屏幕现算贴底居中
+        if not all(k in state for k in ("x", "y", "w", "h")):
+            screen = QApplication.primaryScreen()
+            area = screen.availableGeometry() if screen else None
+            if area is not None:
+                x, y, w, h = default_geometry(area.x(), area.y(),
+                                              area.width(), area.height(),
+                                              screen_scale_factor())
+            else:
+                x, y = config.WINDOW_X, config.WINDOW_Y
+                w, h = config.WINDOW_WIDTH, config.WINDOW_HEIGHT + 40
+        else:
+            w = state.get("w", config.WINDOW_WIDTH)
+            h = state.get("h", config.WINDOW_HEIGHT + 40)
+            x = state.get("x", config.WINDOW_X)
+            y = state.get("y", config.WINDOW_Y)
         x, y, w, h = _clamp_geo_to_any_screen(x, y, w, h)
         self.container.setGeometry(x, y, w, h)
         # 布局持久化：停止.bat 现已优先优雅退出（aboutToQuit 会写盘）；

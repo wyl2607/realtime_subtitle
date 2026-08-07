@@ -42,6 +42,10 @@ Netflix / 语音聊天……），实时识别德语并翻译成中文，以置�
 
 ## 🚀 安装（一键脚本）
 
+⚠️ **克隆到纯英文路径**（例如 `C:\realtime_subtitle`）。桌面快捷方式 `.bat`
+里会内嵌安装目录的绝对路径，cmd 解析含中文的路径会把脚本啃坏——Windows
+用户名是中文的话尤其注意。install.ps1 检测到会直接拦下来。
+
 ```powershell
 git clone https://github.com/wyl2607/realtime_subtitle.git
 cd realtime_subtitle
@@ -49,9 +53,10 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 # 国内网络加速：powershell -ExecutionPolicy Bypass -File install.ps1 -Mirror
 ```
 
-脚本会自动：检查 Python → 检测显卡（按显存生成对应档位的本机配置，无 N 卡
-自动 CPU 模式）→ 建 venv 装依赖 → 引导安装 Ollama 并拉取翻译模型 → 在桌面
-生成**「德语直播实时字幕」快捷方式文件夹**（启动/停止/暂停/更新 + 操作说明）。
+脚本会自动：检查安装路径 → 检查 Python → 检测显卡（按显存生成对应档位的本机
+配置，无 N 卡自动 CPU 模式并跳过 1GB 的 CUDA 运行库）→ 建 venv 装依赖 →
+引导安装 Ollama 并拉取翻译模型 → 在桌面生成**「德语直播实时字幕」快捷方式
+文件夹**（启动/停止/暂停/更新 + 操作说明）→ 自检一遍依赖能不能 import。
 
 之后每次使用：双击桌面的 `启动字幕.bat`，播放德语视频即可。
 启动后字幕悬浮窗几秒内出现（带加载提示），模型在后台加载 10-30 秒后就绪。
@@ -128,6 +133,10 @@ GLOSSARY = {...}                   # 德→中术语表，遇到翻错的专名�
 
 **没有 N 卡的电脑能用吗** — 能，install.ps1 会自动生成 CPU 降级配置
 （small 模型 + qwen3.5:2b），但延迟会从 1-2 秒涨到 5-10 秒。
+
+**笔记本上字幕字太小 / 按钮很小** — Windows 显示缩放（125%/150%）导致的。
+字幕正文的默认字号首次运行时会按缩放比例自动放大，之后随时 `Ctrl+滚轮`
+再调（会记住）。悬浮窗按钮和设置面板的字号目前还没跟随缩放，是已知限制。
 
 **抓不到声音 / 换了耳机没字幕** — 默认跟系统「默认播放设备」。
 可在 ⚙️ 里填「设备名包含」（如 `FiiO`），或在 `config_local.py` 写
