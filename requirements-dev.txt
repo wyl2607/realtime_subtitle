@@ -1,0 +1,10 @@
+# 开发/测试依赖（跑测试才需要，普通用户装不装都行）
+#
+# 为什么单独一个文件：requirements.txt 是 install.ps1 给最终用户装的，
+# 里面每一项都是程序跑起来必需的；pytest 只有改代码的人用得到，
+# 塞进去会让每台用户机器白装一份。
+#
+# 用法：venv\Scripts\python -m pip install -r requirements-dev.txt
+
+pytest>=8      # CLAUDE.md 第 4 节第 15 条要求改完跑全量套件；pytest.ini 里
+               # 已经把三个独立脚本套件排除出收集，直接 pytest 即可
