@@ -278,7 +278,8 @@ $batTemplate = @(
     @("启动字幕.bat", "start_subtitles.ps1"),
     @("停止字幕.bat", "stop_subtitles.ps1"),
     @("暂停继续字幕.bat", "pause_subtitles.ps1"),
-    @("更新字幕.bat", "update_subtitles.ps1")
+    @("更新字幕.bat", "update_subtitles.ps1"),
+    @("卸载字幕.bat", "uninstall.ps1")
 )
 foreach ($pair in $batTemplate) {
     $head = "@echo off`r`nchcp 65001 >nul`r`npowershell -NoProfile -ExecutionPolicy Bypass -File `"$PSScriptRoot\$($pair[1])`"`r`n"
@@ -287,8 +288,8 @@ foreach ($pair in $batTemplate) {
         # ⚠️ bat 必须纯 ASCII：chcp 65001 下 cmd 解析含中文的行会把下一行开头吃掉。
         # 用 ping 当 sleep：timeout.exe 在 stdin 被重定向时直接报错
         $tail = "if errorlevel 1 goto :err`r`nping -n 4 127.0.0.1 >nul`r`nexit /b 0`r`n:err`r`necho.`r`npause`r`n"
-    } elseif ($pair[0] -eq "更新字幕.bat") {
-        # 更新窗口一律保留：用户要能看到"更新了什么/是否需要重启"
+    } elseif ($pair[0] -eq "更新字幕.bat" -or $pair[0] -eq "卸载字幕.bat") {
+        # 这两个窗口一律保留：更新要看到"更新了什么"，卸载要看到"删了什么/剩什么"
         $tail = "echo.`r`npause`r`n"
     } else {
         $tail = "ping -n 3 127.0.0.1 >nul`r`n"

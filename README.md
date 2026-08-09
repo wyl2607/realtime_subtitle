@@ -77,6 +77,23 @@ AI 会自己检测硬件、装依赖、选合适的模型档位并验收。
 （内部是 `git pull` + 按需同步依赖）。个人配置 `config_local.py`、窗口位置、
 字幕记录都不在 git 里，更新永远不会覆盖它们。更新后重启字幕生效。
 
+## 🧹 卸载 / 腾空间
+
+整套装完约 **14.4GB**，摊在四个位置，其中三个在仓库目录之外
+（Whisper 模型缓存、Ollama 模型、Ollama 程序本体）——所以**只删仓库目录
+收不回大头**。双击桌面的 `卸载字幕.bat`（= `uninstall.ps1`）：它会逐项列出
+各部分占多大、一项一项问你删不删，**默认都是不删**，回车即跳过。
+字幕存档和 `config_local.py` 一律保留。
+
+还想继续用、只是想腾点空间：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File uninstall.ps1 -CleanCache
+```
+
+只清中断下载留下的 `.incomplete` 残file和没下完的空壳模型目录
+（实测在一台机器上回收过 2.94GB），不碰任何能用的东西。
+
 <details>
 <summary>手动安装（不用脚本）</summary>
 
@@ -125,8 +142,17 @@ GLOSSARY = {...}                   # 德→中术语表，遇到翻错的专名�
 **启动报 `cublas64_12.dll` 找不到** — venv 里要装 `nvidia-cublas-cu12`
 和 `nvidia-cudnn-cu12`（requirements.txt 已包含；重装 faster-whisper 后需重装）。
 
-**字幕全是德语没有中文** — Ollama 没在运行或模型没拉。`ollama list` 检查，
-`ollama pull qwen3.5:9b` 拉取。启动日志 `subtitle.log` 里会有明确提示。
+**字幕全是德语没有中文** — Ollama 没在运行或模型没拉。注意**你要拉的模型名
+取决于你的显存档位**（install.ps1 按显存生成，2b/4b/9b 都可能），别照抄别人的：
+
+```powershell
+venv\Scripts\python -c "import config; print(config.OLLAMA_MODEL)"   # 看程序实际用哪个
+ollama list                                                          # 对比已拉取的
+ollama pull <上面第一条输出的模型名>
+```
+
+启动日志 `subtitle.log` 里会有明确提示。另外**首次启动的头一两分钟**模型还在
+加载、GPU 在消化启动积压，这段时间只有德语是正常的，等一会儿中文会跟上。
 
 **识别速度跟不上（日志里"GPU繁忙"频繁出现）** — ⚙️ 面板把"提交节奏"调大到
 1.0 秒，或 `config_local.py` 里换小模型。

@@ -27,7 +27,10 @@
 
 - winget 装完 Python/Git 后**要开新终端**才认识新命令（PATH 刷新）；`python`
   命令可能被 Microsoft Store 别名劫持，用 `py` 验证——install.ps1 两种都会找。
-- **磁盘空间预留 ~12GB**：venv 约 4GB + Whisper 模型 1-3GB + 翻译模型 2-6GB。
+- **磁盘空间预留 ~15GB**：venv 约 3-4GB + Whisper 模型 1-3GB + 翻译模型 2-6GB
+  + **Ollama 程序本体约 2.8GB**（以前漏算了这项）。8GB 档实测合计 14.4GB，
+  分散在四个位置、其中三个在仓库目录外，所以卸载要用 `uninstall.ps1`，
+  光删仓库目录只能收回 venv 那部分。
 - 驱动太旧的症状：程序启动时 cublas/cudnn 报错或 CUDA error。先
   `nvidia-smi` 看 CUDA Version，<12.0 就先升驱动，别急着折腾 Python 层。
 - **中国大陆网络**：pip 走镜像加 `-Mirror` 参数；首次启动下载 Whisper 模型
@@ -116,8 +119,10 @@ install.ps1 按显存自动生成的默认档位：
   （需要 GitHub 账号且 `gh auth login` 过；网页上开也一样）。
 - **没有 GitHub 账号**：把同样内容整理成一段文字，交给用户让他直接发给作者
   （微信/QQ），内容齐了作者那边的 AI 一样能修。
-- **自己已经修好了代码**想回馈：跑完 `venv\Scripts\python -m pytest`（全绿，
-  条数以实际输出为准）再发 PR——`gh repo fork wyl2607/realtime_subtitle --remote=true`，
+- **自己已经修好了代码**想回馈：先装测试依赖
+  `venv\Scripts\python -m pip install -r requirements-dev.txt`（pytest 不在
+  requirements.txt 里，那份是给最终用户的），跑完 `venv\Scripts\python -m pytest`
+  （全绿，条数以实际输出为准）再发 PR——`gh repo fork wyl2607/realtime_subtitle --remote=true`，
   开分支提交，push 到自己的 fork，`gh pr create`。改动尽量小、提交信息写清
   根因。不要 push 到 upstream（leik1000 是最初的模板仓库，早已分道扬镳）。
 - 改代码前先双击"更新字幕.bat"拉到最新，避免在旧版上修已经修过的东西。
@@ -176,7 +181,10 @@ install.ps1 按显存自动生成的默认档位：
 
 改代码（如果用户让你改功能）：
 
-15. 改完跑测试：`venv\Scripts\python -m pytest`（137 项，以实际输出为准）。test_hittest /
+15. 改完跑测试：`venv\Scripts\python -m pytest`（137 项，以实际输出为准）。
+    ☠️ **pytest 不在 requirements.txt 里**（那份是给最终用户装的，install.ps1
+    不会装 pytest），新环境上第一次跑会报 `No module named pytest`，先装：
+    `venv\Scripts\python -m pip install -r requirements-dev.txt`。test_hittest /
     test_resize_freedom / test_wordclick 是**独立脚本套件**（import 即开真窗口，
     pytest.ini 已把它们排除出收集，別删这个排除），用 `venv\Scripts\python
     test_hittest.py` 逐个跑。**测试进程 import main.py 会被
@@ -278,6 +286,8 @@ config.py             全部默认参数（仓库文件，别为单机改它）
 config_local.py       本机覆盖（gitignore，install.ps1 生成，机器适配都写这）
 install.ps1           一键安装 + 硬件检测 + 桌面快捷方式
 update_subtitles.ps1  一键更新（git pull + 按需装依赖）
+uninstall.ps1         卸载（逐项问 Y/N，默认不删）；-CleanCache 只清下载残file
+requirements-dev.txt  测试依赖（pytest），只有改代码的人要装
 start/stop/pause_subtitles.ps1   启动（PID 管理/Ollama 保活）/停止/暂停
 transcripts/          字幕存档（每天一个文件）
 ```

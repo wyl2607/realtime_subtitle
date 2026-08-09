@@ -18,6 +18,7 @@ jobs:
           python -m pip install --upgrade pip
           # test_pipeline_helpers only needs numpy + stdlib helpers;
           # translator_queue lazy-loads torch/faster-whisper on construct
-          pip install "numpy>=1.24,<3" "pytest>=8" "requests>=2.28,<3"
+          # pytest comes from requirements-dev.txt so its version lives in one place
+          pip install "numpy>=1.24,<3" "requests>=2.28,<3" -r requirements-dev.txt
       - name: Run non-GUI unit tests
         run: python -m pytest test_pipeline_helpers.py -q
