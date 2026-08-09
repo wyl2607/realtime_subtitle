@@ -105,6 +105,42 @@ install.ps1 按显存自动生成的默认档位：
   里，更新永远不会碰它们。
 - **更新失败**基本都是有人直接改了仓库文件。处理：`git stash` 后重试；根治：
   把改动挪进 config_local.py 或让上游合并。
+
+### 版本号怎么改
+
+**单一真相源是 `version.py` 的 `__version__`**，启动横幅、更新脚本、issue 模板
+都读它。以前版本号写死在 main.py 横幅里（"实时字幕软件 v2.0"），既没有 tag
+对得上、改了也没人知道，用户报 bug 只能贴 commit hash。
+
+用语义化版本 `主.次.修`（当前 2.0.0，沿用横幅上一直写着的 v2）：
+
+| 位 | 什么时候进位 | 例子 |
+|---|---|---|
+| **主** | 用户得动手才能继续用 | 配置项改名/删除、依赖大版本跳、装法变了 |
+| **次** | 加了功能，老配置照跑 | 新增模式、新增脚本（如 uninstall.ps1）、新热键 |
+| **修** | 只修 bug / 调文档 | 超时逻辑修正、README 更正、避坑清单补充 |
+
+判据是**用户视角**，不是改动量：改了 800 行但用户什么都不用做 = 修补位；
+改一行配置名把老 config_local.py 弄失效 = 主版本位。
+
+发布步骤（合 PR 之后在 master 上做）：
+
+```powershell
+# 1. 改 version.py 的 __version__ 和 __version_date__
+# 2. 提交
+git commit -am "chore: 发布 v2.1.0"
+# 3. 打 tag 并推送（tag 名带 v 前缀，和 __version__ 差一个 v）
+git tag -a v2.1.0 -m "v2.1.0：一句话说清这版给用户带来什么"
+git push origin master --tags
+```
+
+☠️ **`version.py` 必须保持纯常量、零 import**——`update_subtitles.ps1` 和
+issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建时也能读到版本），
+往里加 import 会把那条路径弄坏。
+
+用户是 `git pull` 到 master 而不是下 release 的，所以 tag 主要用途是：
+让 issue 里的版本号能对上一段确定的代码，以及 `git log v2.0.0..HEAD` 一眼看清
+这版改了什么。**版本号不进位也可以发**（修补更新），更新脚本会提示"版本号未变"。
 ### 出了问题怎么反馈（issue / PR）
 
 先自查：`subtitle.err.log`（崩溃看这）和 `subtitle.log` 尾部 + 本文件第 4 节

@@ -23,7 +23,19 @@ if (-not (Test-Path "$PSScriptRoot\.git")) {
     exit 1
 }
 
+# 版本号从 version.py 里正则抠出来。刻意不调 venv 的 python：更新脚本要能在
+# venv 坏掉/还没建的时候照跑，多拉一个依赖不划算（version.py 保证是纯常量）
+function Read-LocalVersion {
+    $f = Join-Path $PSScriptRoot "version.py"
+    if (-not (Test-Path $f)) { return "?" }
+    $m = Select-String -Path $f -Pattern '^__version__\s*=\s*"([^"]+)"' | Select-Object -First 1
+    if ($m) { return $m.Matches[0].Groups[1].Value }
+    return "?"
+}
+
+$oldVer = Read-LocalVersion
 $old = (git rev-parse HEAD).Trim()
+Write-Host "当前版本：v$oldVer ($($old.Substring(0,7)))"
 Write-Host "正在检查更新..."
 git pull --ff-only
 if ($LASTEXITCODE -ne 0) {
@@ -40,7 +52,13 @@ if ($old -eq $new) {
     exit 0
 }
 
+$newVer = Read-LocalVersion
 Write-Host ""
+if ($newVer -ne $oldVer) {
+    Write-Host "版本：v$oldVer → v$newVer"
+} else {
+    Write-Host "版本：v$newVer（版本号未变，是修补更新）"
+}
 Write-Host "本次更新内容："
 git log --oneline --no-decorate "$old..$new"
 Write-Host ""
