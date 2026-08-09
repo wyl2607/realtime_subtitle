@@ -453,6 +453,14 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
                     data = json.load(f)
             except (OSError, ValueError):
                 continue
+            # ☠️ 只有 dict 才算数：null / [] / "x" / 123 都是【合法】JSON，
+            # json.load 不会抛 ValueError，上面那个 except 接不住。以前会把
+            # 非 dict 原样返回，__init__ 紧接着 self._state.get(...) 就抛
+            # AttributeError，main.py 捕获后 sys.exit(1) —— 悬浮窗根本不出现，
+            # 而且【绕过了 .bak 兜底】（这套兜底的全部意义就是扛住 state 损坏）。
+            # 当成损坏继续找下一份即可。
+            if not isinstance(data, dict):
+                continue
             if path != STATE_FILE:
                 print("⚠️  window_state.json 损坏，已从 .bak 恢复上一份布局")
             return data

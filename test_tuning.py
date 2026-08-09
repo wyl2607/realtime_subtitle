@@ -194,6 +194,38 @@ def test_state_file_atomic_write_and_bak_recovery(tmp_path, monkeypatch):
     assert sw.SubtitleWindow._load_state() == {}
 
 
+def test_state_file_non_dict_json_falls_back_to_bak(tmp_path, monkeypatch):
+    """☠️ null / [] / "x" / 123 都是【合法】JSON，json.load 不抛 ValueError。
+
+    以前 _load_state 会把它们原样返回，__init__ 紧接着 self._state.get(...)
+    就抛 AttributeError，main.py 捕获后 sys.exit(1)——悬浮窗根本不出现。
+    更要命的是这类损坏【绕过了 .bak 兜底】，而那套兜底的全部意义就是扛住
+    state 文件损坏。现在非 dict 一律当损坏，继续找下一份。
+    """
+    import subtitle_window as sw
+
+    state_path = tmp_path / "window_state.json"
+    monkeypatch.setattr(sw, "STATE_FILE", str(state_path))
+
+    good = {"x": 1, "y": 2, "w": 300, "h": 200}
+    sw._atomic_write_json(str(state_path), good)
+    sw._atomic_write_json(str(state_path), {"x": 9, "y": 9, "w": 300, "h": 200})
+
+    for bad in ("null", "[]", '"hello"', "123", "true"):
+        with open(state_path, "w", encoding="utf-8") as f:
+            f.write(bad)
+        loaded = sw.SubtitleWindow._load_state()
+        assert isinstance(loaded, dict), f"{bad} 应该被当成损坏，实际返回 {loaded!r}"
+        assert loaded == good, f"{bad} 时应从 .bak 恢复，实际 {loaded!r}"
+
+    # 主文件和 .bak 都是非 dict → 空 dict，绝不能抛
+    with open(state_path, "w", encoding="utf-8") as f:
+        f.write("null")
+    with open(str(state_path) + ".bak", "w", encoding="utf-8") as f:
+        f.write("[]")
+    assert sw.SubtitleWindow._load_state() == {}
+
+
 # ---------------------------------------------------------------------------
 # checkbox / game mode / reset / color
 # ---------------------------------------------------------------------------

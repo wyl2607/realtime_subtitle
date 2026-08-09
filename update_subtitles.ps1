@@ -66,10 +66,23 @@ Write-Host ""
 # requirements.txt 变了才重装依赖（没变就不浪费时间）
 $changed = git diff --name-only $old $new
 if ($changed -contains "requirements.txt") {
+    # ☠️ venv 不一定存在：还没跑过 install.ps1，或者被杀毒软件删了文件
+    # （CLAUDE.md 第 1 节明确记着这个现象）。以前这里直接 & 一个不存在的
+    # exe，PowerShell 抛 CommandNotFoundException 原始异常栈——代码其实
+    # 已经拉下来了，用户却只看到一屏红字，以为整个更新失败了。
+    $vpy = "$PSScriptRoot\venv\Scripts\python.exe"
+    if (-not (Test-Path $vpy)) {
+        Write-Host "⚠️ 代码已经更新好了，但没找到 venv："
+        Write-Host "   $vpy"
+        Write-Host "   本次更新改了 requirements.txt，依赖必须同步才能跑起来。"
+        Write-Host "   跑一次安装脚本即可（幂等，会自动把缺的补上）："
+        Write-Host "   powershell -ExecutionPolicy Bypass -File `"$PSScriptRoot\install.ps1`""
+        exit 1
+    }
     Write-Host "依赖清单有变化，正在同步（可能需要几分钟）..."
     $pipArgs = @("-m", "pip", "install", "-r", "$PSScriptRoot\requirements.txt")
     if ($Mirror) { $pipArgs += @("-i", "https://pypi.tuna.tsinghua.edu.cn/simple") }
-    & "$PSScriptRoot\venv\Scripts\python.exe" @pipArgs
+    & $vpy @pipArgs
     if ($LASTEXITCODE -ne 0) {
         Write-Host "❌ 依赖安装失败，请检查网络后重跑本脚本（大陆网络加 -Mirror 参数）"
         exit 1
