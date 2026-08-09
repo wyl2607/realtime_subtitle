@@ -1,5 +1,5 @@
 # 核心依赖（上限防止 pip 漂到破坏 ctranslate2/CUDA 的组合）
-faster-whisper>=1.0.0,<2.0.0   # Whisper 语音识别
+faster-whisper>=1.2.1,<2.0.0   # Whisper 语音识别
 ctranslate2>=4.8.1,<5.0.0      # RTX 50系(Blackwell/sm_120)必须>=4.6.2：旧版int8路径
                                # 直接CUBLAS_STATUS_NOT_SUPPORTED崩溃，4.6.2起自动禁用
 requests>=2.34.2,<3.0.0         # Ollama API 调用
