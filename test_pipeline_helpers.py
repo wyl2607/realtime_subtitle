@@ -553,6 +553,9 @@ def _translator_for_tx(**overrides):
     t._tx_dropped = 0
     t._tx_drop_warned = 0
     t._ollama_down_notified = 0.0
+    # _translate_timeout 要用：ASR 积压快照 + 超时降级的粘性截止时刻
+    t._asr_backlog_n = 0
+    t._tx_slow_until = 0.0
     t.on_status = None
     for k, v in overrides.items():
         setattr(t, k, v)
@@ -637,6 +640,128 @@ def test_translate_cold_then_warm_timeout():
     t._translate_single_sentence("Zwei.", "")
 
     assert seen == [config.OLLAMA_TIMEOUT_COLD, config.OLLAMA_TIMEOUT]
+
+
+def test_translate_uses_long_timeout_while_asr_backlogged():
+    """☠️ issue #16：模型热着不等于 15 秒够用。
+
+    首启时 Whisper 刚加载完、正在集中消化启动积压，GPU 被 ASR 占满，
+    翻译排在后面拿不到卡——旧逻辑只看 `_ollama_hot`，于是每句都先白烧
+    满 15 秒才重试。ASR 收件箱有积压时必须直接用长超时。"""
+    seen = []
+
+    class _Session:
+        def post(self, url, json=None, stream=None, timeout=None):
+            seen.append(timeout)
+            return _FakeStreamResponse([{"response": "好", "done": True}])
+
+    t = _translator_for_tx(ollama_session=_Session())
+    t._ollama_hot = True          # 模型确实在显存里（预热早就成功了）
+    t._asr_backlog_n = config.TRANSLATE_SLOW_BACKLOG_BLOCKS  # 但 GPU 被识别占着
+    t._translate_single_sentence("Eins.", "")
+
+    assert seen == [config.OLLAMA_TIMEOUT_COLD], \
+        "ASR 积压时翻译必须走长超时，否则每句先白烧一次短超时"
+
+
+def test_translate_backlog_below_threshold_keeps_short_timeout():
+    """积压没到阈值就别乱降级：短超时才能快速发现 Ollama 卡死。"""
+    seen = []
+
+    class _Session:
+        def post(self, url, json=None, stream=None, timeout=None):
+            seen.append(timeout)
+            return _FakeStreamResponse([{"response": "好", "done": True}])
+
+    t = _translator_for_tx(ollama_session=_Session())
+    t._ollama_hot = True
+    t._asr_backlog_n = max(0, config.TRANSLATE_SLOW_BACKLOG_BLOCKS - 1)
+    t._translate_single_sentence("Eins.", "")
+
+    assert seen == [config.OLLAMA_TIMEOUT]
+
+
+def test_translate_timeout_degradation_is_sticky():
+    """☠️ issue #16 的震荡：超时→重试(长超时)→成功→_note_tx_result 把
+    _ollama_hot 翻回 True→下一句又从短超时开始→再超一次。
+
+    降级必须有粘性：超时之后一段时间内后续句子都用长超时。"""
+    import requests
+
+    seen = []
+
+    class _Session:
+        def __init__(self):
+            # ☠️ 别用 len(seen) 当"第几次请求"：下面要 seen.clear() 才能单独看
+            # 第二句用了什么超时，清完这个条件会重新成立、把第二句也打成超时
+            self.n = 0
+
+        def post(self, url, json=None, stream=None, timeout=None):
+            self.n += 1
+            seen.append(timeout)
+            if self.n == 1:
+                raise requests.ReadTimeout("Read timed out. (read timeout=15)")
+            return _FakeStreamResponse([{"response": "好", "done": True}])
+
+    t = _translator_for_tx(ollama_session=_Session())
+    t._ollama_hot = True          # 热的：旧逻辑第一句就会用短超时
+    t._translate_single_sentence("Eins.", "")
+    assert seen == [config.OLLAMA_TIMEOUT, config.OLLAMA_TIMEOUT_COLD], \
+        "第一句：短超时撞上超时，重试走长超时"
+    assert t._ollama_hot is True  # 重试成功了，模型确实是热的
+
+    seen.clear()
+    t._translate_single_sentence("Zwei.", "")
+    assert seen == [config.OLLAMA_TIMEOUT_COLD], \
+        "刚超时过就该维持长超时，不能一次成功就翻回短超时再超一次"
+
+
+def test_translate_backlog_rule_can_be_disabled():
+    """TRANSLATE_SLOW_BACKLOG_BLOCKS=0 关掉这条规则（给想自己调的人留口子）。"""
+    seen = []
+
+    class _Session:
+        def post(self, url, json=None, stream=None, timeout=None):
+            seen.append(timeout)
+            return _FakeStreamResponse([{"response": "好", "done": True}])
+
+    t = _translator_for_tx(ollama_session=_Session())
+    t._ollama_hot = True
+    t._asr_backlog_n = 999
+    old = config.TRANSLATE_SLOW_BACKLOG_BLOCKS
+    config.TRANSLATE_SLOW_BACKLOG_BLOCKS = 0
+    try:
+        t._translate_single_sentence("Eins.", "")
+    finally:
+        config.TRANSLATE_SLOW_BACKLOG_BLOCKS = old
+
+    assert seen == [config.OLLAMA_TIMEOUT]
+
+
+def test_asr_backlog_snapshot_tracks_inbox():
+    """积压快照要跟着收件箱走：进队递增、被识别线程取走后清零。
+    翻译线程无锁读这个 int，值不对 _translate_timeout 就会误判。"""
+    from threading import Lock
+    from translator_queue import WhisperQueueTranslator
+
+    t = WhisperQueueTranslator.__new__(WhisperQueueTranslator)
+    t._asr_lock = Lock()
+    t._audio_inbox = []
+    t._asr_backlog_n = 0
+    t._asr_scheduled = True      # 已排程：enqueue 只入队不 submit，正好隔离
+    t._inbox_dropped = 0
+    t._inbox_drop_warned = 0
+    t._idle_flushed = False
+
+    for i in range(3):
+        t.enqueue_audio(f"audio{i}", 1000.0 + i)
+    assert t._asr_backlog_n == 3
+
+    # 模拟识别线程取走整批（_process_inbox 里那段）
+    with t._asr_lock:
+        t._audio_inbox = []
+        t._asr_backlog_n = 0
+    assert t._asr_backlog_n == 0
 
 
 def test_translate_num_gpu_is_optional_and_configurable(monkeypatch):
