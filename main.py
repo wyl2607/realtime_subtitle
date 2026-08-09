@@ -50,6 +50,8 @@ from subtitle_window import SubtitleWindow
 from settings_window import MODE_ICONS as _MODE_ICON
 from PyQt5.QtCore import QTimer
 import config
+# 纯常量模块，没有任何 import，放这里不影响上面那条 torch/PyQt5 的顺序约束
+from version import version_string
 
 class SubtitleApp:
     """实时字幕应用主类"""
@@ -175,7 +177,9 @@ class SubtitleApp:
     def _print_header(self):
         """打印启动标题"""
         print("\n" + "=" * 60)
-        print(" " * 15 + "🎬 实时字幕软件 v2.0")
+        # 版本号读 version.py（单一真相源）——以前这里写死 "v2.0"，
+        # 和 git tag 对不上，用户报 bug 只能贴 commit hash
+        print(" " * 15 + f"🎬 实时字幕软件 {version_string()}")
         print(" " * 12 + "基于 Faster-Whisper")
         print("=" * 60)
         print()
