@@ -91,8 +91,9 @@ install.ps1 按显存自动生成的默认档位：
 - **识别质量优先序**：large-v3-turbo（int8 也行）≫ medium > small。德语场景
   turbo 的准确率提升非常明显，显存够 ~2GB 就尽量用它。
 - **RTX 50 系（Blackwell）**：ctranslate2 <4.6.2 的 int8 路径会直接
-  CUBLAS_STATUS_NOT_SUPPORTED 崩溃。requirements.txt 已锁 >=4.6.2（会自动
-  禁用 int8 回退），别手动降版本。
+  CUBLAS_STATUS_NOT_SUPPORTED 崩溃（4.6.2 起自动禁用 int8 回退）。
+  requirements.txt 现在锁的是 **>=4.8.1**（下限被 dependabot 抬过，
+  RTX 5060 上实测可用），别手动降版本。
 - **模型名会过时**：qwen 系列迭代很快，如果 `ollama pull` 报模型不存在，去
   https://ollama.com/library 找当前的同级替代（选 instruct 类、体积相近的），
   写进 config_local.py 即可，代码不用改。

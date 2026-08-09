@@ -1,7 +1,8 @@
 # 核心依赖（上限防止 pip 漂到破坏 ctranslate2/CUDA 的组合）
 faster-whisper>=1.2.1,<2.0.0   # Whisper 语音识别
-ctranslate2>=4.8.1,<5.0.0      # RTX 50系(Blackwell/sm_120)必须>=4.6.2：旧版int8路径
-                               # 直接CUBLAS_STATUS_NOT_SUPPORTED崩溃，4.6.2起自动禁用
+ctranslate2>=4.8.1,<5.0.0      # RTX 50系(Blackwell/sm_120)最低要 4.6.2：旧版int8路径
+                               # 直接CUBLAS_STATUS_NOT_SUPPORTED崩溃，4.6.2起自动禁用。
+                               # 下限现在是 4.8.1（dependabot 提的，RTX 5060 实测过）
 requests>=2.34.2,<3.0.0         # Ollama API 调用
 torch>=2.13.0,<3.0.0             # CPU版即可：项目本身不用torch，但ctranslate2内部会import它
 numpy>=2.5.1,<3.0.0            # 数值计算
@@ -15,6 +16,9 @@ nvidia-cudnn-cu12>=9.24.0.43
 # 音频处理
 pyaudiowpatch>=0.2.12.8,<1.0.0     # Windows 系统音频捕获 (WASAPI Loopback)
 soxr>=1.1.0,<2.0.0              # 音频重采样（librosa太重，只用得到resample，底层就是soxr）
+                                # 0.5→1.1 是大版本跳但对本项目无感：ResampleStream
+                                # 的构造签名/resample_chunk/clear 都没变，96k→16k
+                                # 纯音实测两版信噪比完全一致（见避坑清单第 12 条）
 
 # 用户界面
 PyQt5>=5.15.11,<5.16.0           # GUI 框架
