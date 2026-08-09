@@ -325,21 +325,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         state = self._state
         # 首次运行没有任何保存的坐标：config 里那组绝对坐标是按开发机屏幕写的，
         # 换台机器（尤其小屏笔记本）会落到屏幕外，改成按当前屏幕现算贴底居中
-        if not all(k in state for k in ("x", "y", "w", "h")):
-            screen = QApplication.primaryScreen()
-            area = screen.availableGeometry() if screen else None
-            if area is not None:
-                x, y, w, h = default_geometry(area.x(), area.y(),
-                                              area.width(), area.height(),
-                                              screen_scale_factor())
-            else:
-                x, y = config.WINDOW_X, config.WINDOW_Y
-                w, h = config.WINDOW_WIDTH, config.WINDOW_HEIGHT + 40
-        else:
-            w = state.get("w", config.WINDOW_WIDTH)
-            h = state.get("h", config.WINDOW_HEIGHT + 40)
-            x = state.get("x", config.WINDOW_X)
-            y = state.get("y", config.WINDOW_Y)
+        x, y, w, h = self._restore_main_geo(state)
         x, y, w, h = _clamp_geo_to_any_screen(x, y, w, h)
         self.container.setGeometry(x, y, w, h)
         # 布局持久化：停止.bat 现已优先优雅退出（aboutToQuit 会写盘）；
@@ -465,6 +451,44 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
                 print("⚠️  window_state.json 损坏，已从 .bak 恢复上一份布局")
             return data
         return {}
+
+    @staticmethod
+    def _default_main_geo():
+        """首次运行/状态损坏时的兜底几何：按当前屏幕现算。
+
+        不用 config 里那组 WINDOW_X/Y——它们是按开发机屏幕写死的绝对坐标，
+        1366x768 的小笔记本上 y=750 整窗掉出屏幕（避坑清单第 24 条）。
+        拿不到屏幕信息时才退回 config（无头/异常环境，聊胜于无）。
+        """
+        screen = QApplication.primaryScreen()
+        area = screen.availableGeometry() if screen else None
+        if area is not None:
+            return default_geometry(area.x(), area.y(),
+                                    area.width(), area.height(),
+                                    screen_scale_factor())
+        return (config.WINDOW_X, config.WINDOW_Y,
+                config.WINDOW_WIDTH, config.WINDOW_HEIGHT + 40)
+
+    @classmethod
+    def _restore_main_geo(cls, state):
+        """从持久化状态恢复主窗口几何，坏值一律退回默认布局。
+
+        ☠️ 这四个值必须 int() 容错：同函数里的 font_size / bg_opacity 一直都有
+        这层保护，唯独窗口坐标没有——window_state.json 被手改坏（用户或 AI
+        助手改配置时顺手动到它）时，"abc" / null / 甚至浮点数都会让
+        _clamp_geo_to_any_screen 抛 TypeError，__init__ 直接失败，main.py
+        捕获后 sys.exit(1)，悬浮窗根本不出现。
+        注意 .bak 兜底在这里帮不上忙：文件本身是合法 dict，_load_state 正常
+        返回，坏的是里面某一个值。
+        """
+        if not all(k in state for k in ("x", "y", "w", "h")):
+            return cls._default_main_geo()
+        try:
+            return (int(state["x"]), int(state["y"]),
+                    int(state["w"]), int(state["h"]))
+        except (TypeError, ValueError):
+            print("⚠️  window_state.json 里的窗口坐标不可用，改用默认布局")
+            return cls._default_main_geo()
 
     @staticmethod
     def _restore_aux_geo(win, geo):

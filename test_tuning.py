@@ -194,6 +194,37 @@ def test_state_file_atomic_write_and_bak_recovery(tmp_path, monkeypatch):
     assert sw.SubtitleWindow._load_state() == {}
 
 
+def test_main_geo_restore_rejects_bad_values():
+    """☠️ window_state.json 里的窗口坐标必须 int() 容错。
+
+    以前这四个值直接取原值（同函数里的 font_size/bg_opacity 一直都有 int()
+    保护，唯独坐标没有）。"abc" / null / 浮点数都会让
+    _clamp_geo_to_any_screen 抛 TypeError，__init__ 失败，main.py 捕获后
+    sys.exit(1)——悬浮窗根本不出现。.bak 兜底在这里帮不上忙：文件本身是
+    合法 dict，坏的只是里面某个值。
+    """
+    import subtitle_window as sw
+
+    good = {"x": 120, "y": 240, "w": 800, "h": 300}
+    assert sw.SubtitleWindow._restore_main_geo(good) == (120, 240, 800, 300)
+    # 字符串数字照收（JSON 手改后常见）
+    assert sw.SubtitleWindow._restore_main_geo(
+        {"x": "10", "y": "20", "w": "600", "h": "200"}) == (10, 20, 600, 200)
+
+    fallback = sw.SubtitleWindow._default_main_geo()
+    for bad in ({"x": "abc", "y": 0, "w": 600, "h": 200},
+                {"x": None, "y": 0, "w": 600, "h": 200},
+                {"x": 0, "y": 0, "w": [], "h": 200},
+                {"x": 0, "y": 0, "w": 600}):            # 缺键
+        got = sw.SubtitleWindow._restore_main_geo(bad)
+        assert got == fallback, f"{bad} 应退回默认布局，实际 {got}"
+        assert all(isinstance(v, int) for v in got), got
+
+    # 浮点：_clamp_geo_to_any_screen 里 QPoint(float) 会抛，必须先截成 int
+    assert sw.SubtitleWindow._restore_main_geo(
+        {"x": 10.5, "y": 20.9, "w": 600.1, "h": 200.7}) == (10, 20, 600, 200)
+
+
 def test_state_file_non_dict_json_falls_back_to_bak(tmp_path, monkeypatch):
     """☠️ null / [] / "x" / 123 都是【合法】JSON，json.load 不抛 ValueError。
 
