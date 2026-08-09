@@ -65,6 +65,16 @@ OLLAMA_NUM_CTX = 4096
 # 冷加载 33.8 秒，用 15 秒的话首句必被丢弃且永远不会有中文
 OLLAMA_TIMEOUT = 15
 OLLAMA_TIMEOUT_COLD = 90
+# 冷热之外的两个"该给长超时"的信号（都只影响超时选择，不改模型/不改画面）。
+# 起因：15 秒够不够用其实取决于这一刻 GPU 排不排得上队，而不只是模型在不在
+# 显存里。首启时 Whisper 刚加载完、在集中消化启动积压，模型是热的但翻译排在
+# ASR 后面拿不到卡，于是每句都先白烧满 15 秒（详见 translator_queue
+# ._translate_timeout 的注释）。
+# 1) ASR 收件箱攒够这么多块 = 识别正占着 GPU，翻译直接用长超时。
+#    默认 4 块（CHUNK_SUBMIT_SECONDS=0.5 时约 2 秒音频）；设 0 关闭这条规则
+TRANSLATE_SLOW_BACKLOG_BLOCKS = 4
+# 2) 超时之后维持长超时多久。没有它的话重试一成功就翻回短超时，下一句再超一次
+TRANSLATE_SLOW_STICKY_SEC = 60
 # 首句翻译最多等后台预热线程这么久（等它落地再发请求，避免两边各自计时）
 OLLAMA_WARM_WAIT = 60
 # 翻译队列硬顶（字符）：Ollama 半死时排空速率远低于产出，超了丢最旧的句子。

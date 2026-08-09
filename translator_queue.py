@@ -438,6 +438,11 @@ class WhisperQueueTranslator:
             self._idle_flushed = False  # 本轮空闲是否已 flush 过（防每秒空跑 finish）
             self._inbox_dropped = 0     # 硬顶丢块累计（正常永远是0）
             self._inbox_drop_warned = 0
+            # 收件箱长度的无锁快照：翻译线程要用它判断"GPU 正被 ASR 占着"。
+            # 单独存一个 int 而不是让翻译线程去拿 _asr_lock——那会引入
+            # _tx_lock/_asr_lock 的锁序问题，而这里只需要一个近似值
+            # （CPython 里 int 读写本身是原子的，读到旧一拍无所谓）
+            self._asr_backlog_n = 0
             # 待切换源语言（热键写入；ASR 每批处理前抢占执行，避免 inbox
             # 循环不返回时 submit(task) 永远排在后面饿死）
             self._pending_lang_switch = None
@@ -449,6 +454,8 @@ class WhisperQueueTranslator:
             self._tx_queue = []      # 已入队待翻译
             self._tx_inflight = []   # 正在翻译中
             self._tx_epoch = 0       # 切语言时+1：在飞的翻译完成时代数不符就丢弃
+            # 最近一次翻译超时后，"慢"状态保持到这个时刻为止（见 _translate_timeout）
+            self._tx_slow_until = 0.0
             self.closing = False     # shutdown置True：所有worker出口不再回调UI
             self._tx_executor = ThreadPoolExecutor(max_workers=1)
             # 点词查词单独一个worker：查词典不该排在字幕翻译后面等
@@ -715,6 +722,32 @@ class WhisperQueueTranslator:
         _warm_done.wait(getattr(config, "OLLAMA_WARM_WAIT", 60))
         if _warm_ok:
             self._ollama_hot = True
+
+    def _translate_timeout(self):
+        """选这次翻译请求的读超时（秒）。
+
+        ☠️ 不能只看 `_ollama_hot`：它的语义是"模型在显存里"（`:493` 注释原话
+        「拿到过一次 200 就算热」），而 15 秒够不够用取决于**这一刻 GPU 排不
+        排得上队**，两者不是一回事。首启时 Whisper 刚加载完、正在集中消化
+        启动积压，模型明明是热的，翻译却排在 ASR 后面拿不到 GPU，15 秒必然
+        不够；更糟的是超时重试成功后 `_note_tx_result(True)` 立刻把
+        `_ollama_hot` 置回 True，下一句又从 15 秒重新开始——日志里连着三次
+        「翻译超时(15秒)」就是这么来的，不是同一次重试的回显。
+
+        所以除了"模型热不热"，再看两个信号：
+        - **降级粘性**：刚超时过就维持长超时一段时间，掐掉来回震荡；
+        - **ASR 积压**：收件箱里攒着块 = 识别正占着 GPU，翻译肯定排在后面。
+        """
+        hot = getattr(config, "OLLAMA_TIMEOUT", 15)
+        cold = getattr(config, "OLLAMA_TIMEOUT_COLD", 90)
+        if not self._ollama_hot:
+            return cold
+        if time.time() < self._tx_slow_until:
+            return cold
+        threshold = getattr(config, "TRANSLATE_SLOW_BACKLOG_BLOCKS", 4)
+        if threshold > 0 and self._asr_backlog_n >= threshold:
+            return cold
+        return hot
 
     def _translation_worker(self):
         """把队列里积压的句子合并成一次Ollama请求。
@@ -1324,8 +1357,7 @@ class WhisperQueueTranslator:
             # 堵住，且现有的快速失败+60秒节流提示才是对的处理
             last_timeout = None
             for attempt in (0, 1):
-                timeout = (getattr(config, "OLLAMA_TIMEOUT", 15) if self._ollama_hot
-                           else getattr(config, "OLLAMA_TIMEOUT_COLD", 90))
+                timeout = self._translate_timeout()
                 try:
                     response = self.ollama_session.post(
                         f"{config.OLLAMA_BASE_URL}/api/generate",
@@ -1336,9 +1368,15 @@ class WhisperQueueTranslator:
                     )
                 except requests.ReadTimeout as e:
                     last_timeout = e
+                    # ☠️ 降级必须有粘性：只置 _ollama_hot=False 的话，重试一成功
+                    # _note_tx_result 就把它翻回 True，下一句又从短超时开始，
+                    # 每句白烧一次满超时（issue #16）
+                    self._tx_slow_until = time.time() + getattr(
+                        config, "TRANSLATE_SLOW_STICKY_SEC", 60)
                     if attempt == 0 and not self.closing:
                         self._ollama_hot = False  # 让重试走冷超时
-                        print(f"   ⏳ 翻译超时({timeout}秒)，重试一次（模型可能正在加载）")
+                        print(f"   ⏳ 翻译超时({timeout}秒)，重试一次"
+                              f"（GPU 可能正忙于识别，或模型在加载）")
                         continue
                     break
 
@@ -1483,6 +1521,7 @@ class WhisperQueueTranslator:
                     print(f"⚠️  识别积压超过{cap}块(≈{cap * config.CHUNK_SUBMIT_SECONDS:.0f}秒)，"
                           f"已丢弃最旧音频保内存(累计{self._inbox_dropped}块)——识别线程可能已卡死，建议重启程序")
             n = len(self._audio_inbox)
+            self._asr_backlog_n = n  # 给翻译线程看的无锁快照
             if self._asr_scheduled:
                 if n in (6, 12):  # GPU被抢时的提示，不丢数据
                     print(f"⚠️  GPU繁忙，字幕滞后约{n * config.CHUNK_SUBMIT_SECONDS:.0f}秒（攒了{n}块待识别，会自动追上）")
@@ -1577,6 +1616,7 @@ class WhisperQueueTranslator:
                     self._pending_lang_switch = None
                 items = self._audio_inbox
                 self._audio_inbox = []
+                self._asr_backlog_n = 0  # 已全部取走，积压清零
                 if not items and pending_lang is None:
                     self._asr_scheduled = False
                     return
