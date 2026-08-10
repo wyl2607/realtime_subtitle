@@ -156,6 +156,11 @@ class AudioCapture:
         """
         DEVICE_CHECK_INTERVAL = 5.0   # 每几秒查一次默认设备有没有变
         MAX_READ_ERRORS = 10          # 连续读失败这么多次就重开流
+        # 连续这么久一个块都没过静音门 → 提示一次。
+        # 现象和"抓不到声音"完全一样（屏幕上什么都不出），但根因不同：设备是对的、
+        # 流是活的，只是播放音量太低 / 抓到了一路没在响的设备。用户照 README 的
+        # 「抓不到声音」FAQ 去查设备只会白费功夫，所以这里得说清楚往哪调。
+        SILENT_HINT_SEC = 60.0
 
         while self.running:
             p = None
@@ -213,6 +218,8 @@ class AudioCapture:
                 prev_had_speech = False     # 上一个提交周期有没有语音（保住词尾）
                 read_errors = 0
                 last_device_check = time.time()
+                silent_periods = 0          # 连续多少个提交周期一个块都没过静音门
+                low_volume_warned = False   # 这一轮静默只提示一次
 
                 print(f"🎵 开始捕获音频... (每{config.CHUNK_SUBMIT_SECONDS}秒提交一块)")
 
@@ -241,6 +248,10 @@ class AudioCapture:
                             chunk_samples = 0
                             buffer_has_speech = False
                             prev_had_speech = False
+                            # 暂停不算"没声音"：清掉低音量计数，恢复后重新从零算，
+                            # 免得暂停一会儿再恢复就弹一条莫名其妙的提示
+                            silent_periods = 0
+                            low_volume_warned = False
                             # 暂停期间的块没喂给重采样器，滤波器状态里留了个缺口 →
                             # 恢复时重建一个干净的（代价 μs 级）
                             if resampler is not None:
@@ -281,6 +292,19 @@ class AudioCapture:
                             # 纯静音块直接丢，识别端的flush定时器会处理收尾
                             if buffer_has_speech or prev_had_speech:
                                 self._submit_audio(chunk_buffer)
+                                silent_periods = 0
+                                low_volume_warned = False
+                            else:
+                                silent_periods += 1
+                                quiet_sec = silent_periods * config.CHUNK_SUBMIT_SECONDS
+                                if not low_volume_warned and quiet_sec >= SILENT_HINT_SEC:
+                                    low_volume_warned = True
+                                    print(f"🔇 已连续 {quiet_sec:.0f} 秒没有超过静音门"
+                                          f"(能量 > {config.ENERGY_THRESHOLD_SPEECH})的声音")
+                                    if self.on_status:
+                                        self.on_status(
+                                            "🔇 一直没听到声音：确认正在播放且音量不是最小，"
+                                            "或到 ⚙️ 调低「语音能量阈值」/填「设备名包含」")
                             prev_had_speech = buffer_has_speech
                             chunk_buffer = []
                             chunk_samples = 0
