@@ -132,7 +132,7 @@ def test_strip_translator_note_inline_and_trailing():
 def test_version_is_semver_and_string_helper_matches():
     """版本号格式固定成 主.次.修，version_string() 只在前面加个 v。
     update_subtitles.ps1 和 issue 模板都按这个格式正则匹配。"""
-    import version
+    from realtime_subtitle import version
     assert re.fullmatch(r"\d+\.\d+\.\d+", version.__version__), \
         f"版本号要用语义化版本 主.次.修，现在是 {version.__version__!r}"
     assert version.version_string() == "v" + version.__version__
@@ -148,7 +148,11 @@ def test_version_module_stays_import_free():
     真相源"这件事悄悄依赖上一个能跑的 venv。
     """
     import pathlib
-    src = pathlib.Path(__file__).with_name("version.py").read_text(encoding="utf-8")
+    # 重构把 version.py 挪进了包目录，测试文件也挪进了 tests/：
+    # with_name("version.py") 会指到 tests\version.py（不存在）。按包定位，
+    # 别写死相对层级——update_subtitles.ps1 / issue 模板读的就是这个文件
+    src = (pathlib.Path(__file__).resolve().parents[1]
+           / "realtime_subtitle" / "version.py").read_text(encoding="utf-8")
     code_lines = []
     in_doc = False
     for raw in src.splitlines():
@@ -574,7 +578,7 @@ def _translator_for_tx(**overrides):
     ☠️ 顺手把模块级 _warm_done 置位：_await_model_ready 在没置位时会真等
     OLLAMA_WARM_WAIT(60秒)，不置位的话整个测试文件会挂几分钟。"""
     from threading import Lock
-    import translator_queue as tq
+    import realtime_subtitle.translate.translator_queue as tq
     from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 
     tq._warm_done.set()
