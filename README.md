@@ -4,6 +4,13 @@
 
 No audio or transcript is sent to the cloud. Recognition and translation run on your machine.
 
+> **One exception, and only if you click it:** the `🌐 Ask a stronger AI` button in the
+> popups opens your system browser with a question built from the last few minutes of
+> recognized source text (≤300 chars), sent to a web AI (grok.com by default,
+> `config.AI_ANALYSIS_WEB_URL_TEMPLATE`). Nothing leaves the machine unless you press it.
+> Set that template to an empty string to remove the button entirely. Note this app
+> captures **all system audio**, which may include voice calls.
+
 [Deutsch](README.de.md) · [中文](README.zh.md) · [Repository layout](docs/STRUCTURE.md) · [Windows runbook](docs/WINDOWS-RUNBOOK.md)
 
 ```text

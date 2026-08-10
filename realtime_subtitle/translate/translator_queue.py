@@ -232,11 +232,29 @@ def build_web_query_for_sentence(sentence, max_fragment_chars=AI_WEB_FRAGMENT_MA
     return f"请帮我解释这句德语的背景：「{frag}」"
 
 
+def ai_web_enabled():
+    """「🌐 问更强的AI」是否可用。
+
+    这是整个程序唯一会把内容送出本机的路径，所以要能一键关掉：
+    config_local.py 里把 AI_ANALYSIS_WEB_URL_TEMPLATE 设成空串/None 即可，
+    按钮不再出现（以前设空串会变成 webbrowser.open("")，只是打开浏览器主页，
+    等于"关不掉"）。
+    """
+    return bool((getattr(
+        config, "AI_ANALYSIS_WEB_URL_TEMPLATE", "") or "").strip())
+
+
 def build_ai_web_url(prompt_text):
-    """把自然语言问题填进 AI_ANALYSIS_WEB_URL_TEMPLATE（{query} 已 URL-encode）。"""
+    """把自然语言问题填进 AI_ANALYSIS_WEB_URL_TEMPLATE（{query} 已 URL-encode）。
+
+    模板为空 = 用户关掉了这个功能，返回空串，调用方不要打开浏览器。
+    """
     from urllib.parse import quote
     template = getattr(
         config, "AI_ANALYSIS_WEB_URL_TEMPLATE", "https://grok.com/?q={query}")
+    template = (template or "").strip()
+    if not template:
+        return ""
     return template.format(query=quote(prompt_text or "", safe=""))
 
 

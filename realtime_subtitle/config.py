@@ -144,6 +144,9 @@ LOOKUP_CACHE_FILE = "lookup_cache.json"
 # 本地 Ollama 先出结果，弹窗里"问更强的AI"再跳网页版追问。
 # {query} 会被 URL-encode 后替换；可改成 ChatGPT 等（如
 # "https://chatgpt.com/?q={query}&hints=search"）。
+# ⚠️ 这是整个程序**唯一**会把内容送出本机的路径（而且必须用户点那个按钮）：
+# 最近几分钟的德语原文截 300 字拼成问句，交给系统浏览器打开。本程序抓的是
+# 系统全部声音，可能含语音通话内容。不想要这个按钮就把模板设成空串。
 AI_ANALYSIS_WEB_URL_TEMPLATE = "https://grok.com/?q={query}"
 AI_CONTEXT_WINDOW_MINUTES = 5      # 🤖 分析最近几分钟的句对
 AI_CONTEXT_MAX_CHARS = 1400        # 喂给本地模型的德文上限；超了从最旧丢
@@ -353,6 +356,10 @@ INTERJECTION_TRANSLATIONS = {
 # ============ 日志配置 ============
 # 默认关闭：长直播时每 0.5s 刷一行会把 subtitle.log 撑很大。
 # 排障时在 config_local.py 里设 True，或临时改这里。
+# ⚠️ 隐私：打开它之后 subtitle.log 里会有**识别出的原文和译文正文**
+# （识别结果、草稿、查词、收尾翻译都会打）。而 README 的常见问题和
+# .github/ISSUE_TEMPLATE 都会让你把日志尾部贴到 issue 里——排障完记得关掉，
+# 贴之前也扫一眼有没有你不想公开的内容（本程序抓的是系统全部声音）。
 SHOW_PERFORMANCE = False
 # 每隔这么多秒打一行性能概况（识别p50/p90、缓冲峰值、翻译耗时等，0=关）。
 # 这是 SHOW_PERFORMANCE=False 后仅剩的观测手段：约1行/分钟，撑不大日志

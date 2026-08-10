@@ -35,6 +35,10 @@ Get-Content config_local.py -ErrorAction SilentlyContinue
 
 ## 日志（必带，没有日志基本没法排查）
 
+> ⚠️ 贴之前扫一眼：如果你为了排障打开过 `SHOW_PERFORMANCE = True`，
+> subtitle.log 里会有**识别出的字幕正文**（本程序抓的是系统全部声音，
+> 可能包含语音通话内容）。不想公开的段落直接删掉再贴，不影响排查。
+
 ```powershell
 Get-Content subtitle.err.log -Tail 50
 Get-Content subtitle.log -Tail 80
