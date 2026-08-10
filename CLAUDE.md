@@ -336,6 +336,51 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     一个近似值。加新的 Ollama 调用路径时超时一律问 `_translate_timeout()`，
     别再写 `if self._ollama_hot else` 那个二选一。
 
+26. **☠️ 挪模块时最容易漏的是函数体里的延迟 import**（2026-08-10，包化重构
+    当天）。把运行时代码挪进 `realtime_subtitle/` 包时，各测试文件**顶部**的
+    import 都改了，但函数体里那 30 多处延迟 import 一个都没动：
+
+    ```python
+    def test_xxx():
+        from translator_queue import WhisperQueueTranslator   # 已不在顶层
+        import subtitle_window as sw
+    ```
+
+    本项目到处都是这种延迟 import，而且是有意为之（避免在导入期把
+    torch/PyQt5 整条链拉起来、绕开单实例 Mutex），所以数量远多于普通项目。
+    结果是 master 的 CI 连红 6 次：ubuntu 18 failed、windows 一堆
+    `ModuleNotFoundError`。
+
+    **搜索时别只 grep 顶格的 `^import` / `^from`**，要连带缩进的一起搜：
+
+    ```powershell
+    Select-String -Path *.py,tests\*.py -Pattern '^\s+(import|from) (translator_queue|subtitle_window|config|version)\b'
+    ```
+
+    同一类还有两处不走 import 的引用，一样会漏：
+    `pathlib.Path(__file__).with_name("version.py")` 这种按相对位置找文件的
+    （测试挪进 `tests/` 之后它指向 `tests\version.py`），以及 .ps1 脚本里的
+    `python -c "import config; ..."`。
+
+27. **☠️ pytest `exit 127 + 零输出` 不止一种成因**（2026-08-10）。第 16 条记的是
+    "QApplication 被 GC → 建 QWidget 时 qFatal"，但**延迟 import 路径写错也是
+    同样的现象**：
+
+    ```
+    ..............................FF
+    ##[error]Process completed with exit code 127
+    ```
+
+    一行 traceback 都没有。当时真因是 `subtitle_window._ai_web_enabled()` 里
+    写了重构前的 `from translator_queue import ...`，被 `_show_ai_analysis`
+    调到时炸在 import 上。
+
+    **区分办法**：`python -m pytest tests/xxx.py -x --tb=short` 单文件跑一遍，
+    第一个真实失败的 traceback 就会出来（整套跑时它被后面的 qFatal 盖掉了）。
+    没有 Qt 环境时，本机 `pip install PyQt5` + `QT_QPA_PLATFORM=offscreen`
+    就能复现（torch 只要能 import，临时放个空的 `torch.py` 在 PYTHONPATH 里
+    即可，不用真下几百 MB）。
+
 ## 5. 目录地图
 
 ```
@@ -348,16 +393,21 @@ realtime_subtitle/ui/subtitle_window.py    悬浮窗主类（+ window_frame/wind
 config.py             全部默认参数（仓库文件，别为单机改它）
 config_local.py       本机覆盖（gitignore，install.ps1 生成，机器适配都写这）
 scripts/windows/install.ps1  一键安装 + 硬件检测 + 桌面快捷方式（根目录 install.ps1 为兼容转发）
-update_subtitles.ps1  一键更新（git pull + 按需装依赖）
+scripts/windows/update_subtitles.ps1  一键更新（git pull + 按需装依赖）
 scripts/windows/uninstall.ps1  卸载（逐项问 Y/N，默认不删）；-CleanCache 只清下载残file
+scripts/windows/{start,stop,pause}_subtitles.ps1  启动（PID 管理/Ollama 保活）/停止/暂停
+tests/                所有 pytest 用例（三个独立 GUI 脚本套件见第 4 节第 15 条）
 requirements-dev.txt  测试依赖（pytest），只有改代码的人要装
-start/stop/pause_subtitles.ps1   启动（PID 管理/Ollama 保活）/停止/暂停
 transcripts/          字幕存档（每天一个文件）
 ```
 
+☠️ **包化之后 `import config` 不再可用**，一律写 `from realtime_subtitle import config`。
+仓库里的 .ps1 脚本已经全改过了，写新命令/新文档时别照抄旧写法（第 4 节第 26 条）。
+`config_local.py` 仍在**仓库根目录**（和 main.py 并排），不在包里面。
+
 ## 6. 装完的验收清单
 
-1. `venv\Scripts\python -c "import config; print(config.WHISPER_MODEL, config.OLLAMA_MODEL)"`
+1. `venv\Scripts\python -c "from realtime_subtitle import config; print(config.WHISPER_MODEL, config.OLLAMA_MODEL)"`
    输出与硬件档位相符。
 2. `ollama list` 里有配置对应的模型。
 3. 双击"启动字幕.bat"→ 几秒内屏幕下方出现悬浮窗（带"⏳正在加载"提示），
