@@ -132,7 +132,7 @@ def test_strip_translator_note_inline_and_trailing():
 def test_version_is_semver_and_string_helper_matches():
     """版本号格式固定成 主.次.修，version_string() 只在前面加个 v。
     update_subtitles.ps1 和 issue 模板都按这个格式正则匹配。"""
-    import version
+    from realtime_subtitle import version
     assert re.fullmatch(r"\d+\.\d+\.\d+", version.__version__), \
         f"版本号要用语义化版本 主.次.修，现在是 {version.__version__!r}"
     assert version.version_string() == "v" + version.__version__
@@ -574,7 +574,7 @@ def _translator_for_tx(**overrides):
     ☠️ 顺手把模块级 _warm_done 置位：_await_model_ready 在没置位时会真等
     OLLAMA_WARM_WAIT(60秒)，不置位的话整个测试文件会挂几分钟。"""
     from threading import Lock
-    import translator_queue as tq
+    import realtime_subtitle.translate.translator_queue as tq
     from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 
     tq._warm_done.set()
@@ -1018,6 +1018,80 @@ def test_asr_inbox_hard_cap(monkeypatch):
         t2.enqueue_audio(np.zeros(16, dtype=np.float32), float(i))
     assert len(t2._audio_inbox) == 10
     assert t2._inbox_dropped == 0
+
+
+def test_startup_warm_records_model_it_actually_loaded(monkeypatch):
+    """☠️ 预热装的是哪个模型必须记下来，不能事后现读 config.OLLAMA_MODEL。
+
+    窗口是秒开的，⚙️面板在 Whisper 加载的十几秒里就能点。用户点「⚡性能」时
+    translator 还是 None，main._apply_mode 只能改 config.OLLAMA_MODEL——而预热
+    线程早就按旧名字把大模型往显存里装了。两个模型同时驻留正是 8GB 卡的显存
+    分档刻意要避免的情况。
+    """
+    import realtime_subtitle.translate.translator_queue as tq
+
+    posted = []
+
+    class _Resp:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tq.requests, "post",
+                        lambda url, json=None, timeout=None: (posted.append(json), _Resp())[1])
+    monkeypatch.setattr(config, "OLLAMA_MODEL", "qwen3.5:9b")
+
+    tq._spawn_startup_warm()
+    tq._warm_thread.join(timeout=5)
+    assert posted and posted[0]["model"] == "qwen3.5:9b"
+    assert tq._warm_model == "qwen3.5:9b"
+
+    # 用户在加载期间切了「性能」→ config 变了，但 _warm_model 记的仍是真正
+    # 被装进显存的那个，退出/对账才卸得对
+    monkeypatch.setattr(config, "OLLAMA_MODEL", "qwen3.5:4b")
+    assert tq._warm_model == "qwen3.5:9b"
+
+
+def test_warm_model_worker_waits_for_startup_warm_before_unload(monkeypatch):
+    """☠️ 卸旧模型前必须等启动预热落地。
+
+    预热请求带 keep_alive="2h"：卸载先到、预热后到的话模型会被重新拉回显存
+    留驻两小时（CLAUDE.md 第 13 条那类竞态，当时只处理了退出路径）。
+    """
+    import threading
+    import time as _time
+    import realtime_subtitle.translate.translator_queue as tq
+
+    order = []
+    warm_running = threading.Event()
+
+    def _slow_warm():
+        warm_running.set()
+        _time.sleep(0.4)
+        order.append("startup-warm-done")
+
+    monkeypatch.setattr(tq, "_warm_thread",
+                        threading.Thread(target=_slow_warm, daemon=True),
+                        raising=False)
+    tq._warm_thread.start()
+    warm_running.wait(2)
+
+    class _Resp:
+        def close(self):
+            pass
+
+    class _Session:
+        def post(self, url, json=None, timeout=None):
+            order.append("unload" if json.get("keep_alive") == 0 else "warm-new")
+            return _Resp()
+
+    t = tq.WhisperQueueTranslator.__new__(tq.WhisperQueueTranslator)
+    t.ollama_session = _Session()
+    t.closing = False
+    t._ollama_hot = True
+    t._warm_model_worker(old_model="qwen3.5:9b", new_model="qwen3.5:4b")
+
+    assert order[0] == "startup-warm-done", f"卸载抢在预热前面了：{order}"
+    assert order[1:] == ["unload", "warm-new"], order
 
 
 def test_translator_note_is_stripped():
