@@ -656,6 +656,57 @@ def test_shutdown_unloads_only_our_loaded_models(monkeypatch):
     t._unload_our_models()
 
 
+def test_unload_matches_model_name_without_tag(monkeypatch):
+    """☠️ config 里写不带 tag 的名字时，/api/ps 报的是 "name:latest"。
+
+    stop_subtitles.ps1 一直做的是 `-eq $m -or -like "$m`:*"` 前缀匹配，
+    Python 侧以前只做集合精确比较 —— 点 ❌ / Alt+F4 退出（不经过停止脚本）
+    时漏卸模型，5.6GB 显存按 keep_alive="2h" 白占两小时。两边必须一致。
+    """
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator as W
+
+    assert W._model_name_matches("qwen3.5:latest", "qwen3.5")
+    assert W._model_name_matches("qwen3.5:9b", "qwen3.5:9b")
+    # 不能反向误伤：config 写全名时，别的 tag 不是我们的
+    assert not W._model_name_matches("qwen3.5:4b", "qwen3.5:9b")
+    # 更不能前缀误伤到别人的模型
+    assert not W._model_name_matches("qwen3.5-coder:9b", "qwen3.5")
+    assert not W._model_name_matches("", "qwen3.5")
+    assert not W._model_name_matches("qwen3.5:latest", None)
+
+    posts = []
+
+    class _Resp:
+        def __init__(self, payload=None):
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+        def close(self):
+            pass
+
+    class _FakeSession:
+        def __init__(self, loaded):
+            self.loaded = loaded
+
+        def get(self, url, **kw):
+            return _Resp({"models": [{"name": n} for n in self.loaded]})
+
+        def post(self, url, json=None, **kw):
+            posts.append(json)
+            return _Resp()
+
+    monkeypatch.setattr(config, "OLLAMA_MODEL", "qwen3.5")
+    monkeypatch.setattr(config, "GAME_MODE_OLLAMA_MODEL", None, raising=False)
+
+    t = W.__new__(W)
+    t.ollama_session = _FakeSession(["qwen3.5:latest", "someone-elses:7b"])
+    t._unload_our_models()
+    assert [p["model"] for p in posts] == ["qwen3.5:latest"], posts
+    assert posts[0]["keep_alive"] == 0
+
+
 def _translator_for_tx(**overrides):
     """装配一个够跑 _translate_single_sentence / _enqueue_sentences 的翻译器
     （不加载 Whisper/不连 Ollama）。

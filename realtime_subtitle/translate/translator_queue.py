@@ -1881,6 +1881,21 @@ class WhisperQueueTranslator:
         except Exception:
             pass
 
+    @staticmethod
+    def _model_name_matches(loaded_name, configured):
+        """/api/ps 报的名字和 config 里写的是不是同一个模型。
+
+        ☠️ 必须做前缀匹配，不能只 `==`：config_local.py 里写不带 tag 的名字
+        （"qwen3.5"）是 README 明确鼓励的用法，而 /api/ps 报回来的是
+        "qwen3.5:latest"。stop_subtitles.ps1 从一开始就做的是
+        `-eq $m -or -like "$m`:*"`，Python 侧却只做集合精确比较——于是点 ❌ /
+        Alt+F4 退出（不经过停止脚本）时漏卸模型，5.6GB 显存按 keep_alive="2h"
+        白占两小时。同一个坑当时只修了 PowerShell 那一半。
+        """
+        if not loaded_name or not configured:
+            return False
+        return loaded_name == configured or loaded_name.startswith(configured + ":")
+
     def _unload_our_models(self):
         """退出时主动卸载本程序加载的翻译模型。
 
@@ -1897,14 +1912,15 @@ class WhisperQueueTranslator:
         if t is not None and t.is_alive():
             t.join(timeout=3)
 
-        ours = {config.OLLAMA_MODEL, getattr(config, "GAME_MODE_OLLAMA_MODEL", None)}
+        ours = [m for m in (config.OLLAMA_MODEL,
+                            getattr(config, "GAME_MODE_OLLAMA_MODEL", None)) if m]
         try:
             loaded = self.ollama_session.get(
                 f"{config.OLLAMA_BASE_URL}/api/ps", timeout=2,
             ).json().get("models", [])
             for m in loaded:
                 name = m.get("name")
-                if name in ours:
+                if any(self._model_name_matches(name, ours_name) for ours_name in ours):
                     self.ollama_session.post(
                         f"{config.OLLAMA_BASE_URL}/api/generate",
                         json={"model": name, "prompt": "", "keep_alive": 0},
