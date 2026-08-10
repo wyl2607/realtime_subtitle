@@ -68,6 +68,16 @@ def _atomic_write_json(path, data):
     os.replace(tmp_path, path)
 
 
+def _ai_web_enabled():
+    """「🌐 问更强的AI」按钮是否显示（config 里模板设空 = 关掉这个出网入口）。
+
+    延迟 import translator_queue，沿用本模块其它 AI 相关调用点的惯例
+    （UI 模块不在导入期把翻译侧整条依赖链拉起来）。
+    """
+    from realtime_subtitle.translate.translator_queue import ai_web_enabled
+    return ai_web_enabled()
+
+
 class SubtitleSignals(QObject):
     """信号对象（用于线程安全的UI更新）"""
     update = pyqtSignal(str)
@@ -701,7 +711,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
             timeout_ms=60000,  # 分析可能比查词慢，等结果期间别提前关
             show_deep=False,
             # 等本地结果时也能提前跳网页，不必干等到 30s 超时
-            show_web=True,
+            show_web=_ai_web_enabled(),
             web_query=web_q,
         )
         if self.on_ai_analysis:
@@ -729,7 +739,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         self.ai_analysis_popup.update_content(
             f"🤖 <b>背景总结</b><br>{body}",
             show_deep=False,
-            show_web=True,
+            show_web=_ai_web_enabled(),
             web_query=web_q,
             timeout_ms=30000,
         )
@@ -754,7 +764,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
             f"{'…' if len(ctx) > 120 else ''}</span>",
             show_deep=False,
             # 等本地结果时也能提前跳网页
-            show_web=True,
+            show_web=_ai_web_enabled(),
             context=ctx,
             web_query=web_q,
             timeout_ms=60000,
@@ -783,7 +793,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         self.word_popup.update_content(
             f"🔍 <b>深度解释</b><br>{body}",
             show_deep=False,
-            show_web=True,
+            show_web=_ai_web_enabled(),
             web_query=build_web_query_for_sentence(ctx),
             timeout_ms=30000,
         )
@@ -796,8 +806,13 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         if not q:
             self.show_status("没有可追问的内容")
             return
+        url = build_ai_web_url(q)
+        if not url:
+            # 模板被清空 = 用户主动关掉了这个唯一的出网入口，别打开浏览器主页
+            self.show_status("「问更强的AI」已在 config 里关闭")
+            return
         try:
-            webbrowser.open(build_ai_web_url(q))
+            webbrowser.open(url)
         except Exception as e:
             self.show_status(f"无法打开网页: {e}")
 

@@ -2,7 +2,14 @@
 
 **Offline-Live-Untertitel für Windows (Deutsch / Englisch)** — Systemton aufnehmen, Sprache lokal erkennen, lokal übersetzen und als zweisprachiges Always-on-Top-Overlay anzeigen.
 
-Audio und Transkripte verlassen den Rechner nicht. Erkennung und Übersetzung laufen offline.
+Erkennung und Übersetzung laufen offline; Audio und Transkripte verlassen den Rechner nicht.
+
+> **Eine Ausnahme, und nur wenn du sie anklickst:** Der Button `🌐 Stärkere KI fragen`
+> öffnet den Systembrowser mit einer Frage aus den letzten Minuten des erkannten Textes
+> (≤300 Zeichen) an eine Web-KI (standardmäßig grok.com,
+> `config.AI_ANALYSIS_WEB_URL_TEMPLATE`). Ohne Klick wird nichts gesendet. Template auf
+> einen leeren String setzen entfernt den Button. Achtung: Das Programm nimmt **den
+> gesamten Systemton** auf, also ggf. auch Sprachanrufe.
 
 [English](README.md) · [中文](README.zh.md) · [Repository-Struktur](docs/STRUCTURE.md) · [Windows-Anleitung](docs/WINDOWS-RUNBOOK.md)
 

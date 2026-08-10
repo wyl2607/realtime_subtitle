@@ -140,6 +140,30 @@ def test_build_ai_web_url_encodes_and_fills_template(monkeypatch):
     assert quote(prompt, safe="") in url
 
 
+def test_ai_web_can_be_disabled_by_emptying_template(monkeypatch):
+    """☠️「问更强的AI」是整个程序唯一把内容送出本机的路径，必须能一键关掉。
+
+    以前把 AI_ANALYSIS_WEB_URL_TEMPLATE 设成空串并不能关掉它：
+    `"".format(...)` 得到空串，webbrowser.open("") 只是打开浏览器主页，
+    看起来像"关了但还是弹浏览器"。现在空模板 = 按钮不显示、URL 为空串，
+    _open_ai_web 直接给一条状态提示。
+    """
+    from realtime_subtitle.translate.translator_queue import ai_web_enabled
+
+    monkeypatch.setattr(config, "AI_ANALYSIS_WEB_URL_TEMPLATE", "")
+    assert ai_web_enabled() is False
+    assert build_ai_web_url("随便问点什么") == ""
+
+    monkeypatch.setattr(config, "AI_ANALYSIS_WEB_URL_TEMPLATE", None)
+    assert ai_web_enabled() is False
+    assert build_ai_web_url("随便问点什么") == ""
+
+    monkeypatch.setattr(config, "AI_ANALYSIS_WEB_URL_TEMPLATE",
+                        "https://example.test/ai?q={query}")
+    assert ai_web_enabled() is True
+    assert build_ai_web_url("x").startswith("https://example.test/")
+
+
 def test_build_web_query_for_background_mentions_live():
     q = build_web_query_for_background("Guten Tag zusammen")
     assert "Guten Tag zusammen" in q
