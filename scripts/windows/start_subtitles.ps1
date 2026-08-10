@@ -1,14 +1,16 @@
-﻿# 启动德语实时双语字幕（YouTube 等系统音频）
+# 启动德语实时双语字幕（YouTube 等系统音频）
 $ErrorActionPreference = "Stop"
-Set-Location $PSScriptRoot
+# Repo root (this file lives in scripts/windows/)
+$RepoRoot = (Get-Item $PSScriptRoot).Parent.Parent.FullName
+Set-Location $RepoRoot
 
-$pidFile = "$PSScriptRoot\subtitle.pid"
+$pidFile = "$RepoRoot\subtitle.pid"
 if (Test-Path $pidFile) {
     $oldPid = Get-Content $pidFile
     $oldProc = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
     # PID会被系统回收复用：光"这个PID有进程"不算数，还得确认真是本项目venv的
     # python（2026-07-17实测：残留pid被别的进程占用→误判"已在运行"拒绝启动）
-    if ($oldProc -and $oldProc.Path -like "$PSScriptRoot\venv\*") {
+    if ($oldProc -and $oldProc.Path -like "$RepoRoot\venv\*") {
         Write-Host "已经在运行中（PID $oldPid），不用重复启动。要重启请先运行 停止字幕.bat"
         exit
     }
@@ -16,7 +18,7 @@ if (Test-Path $pidFile) {
 }
 
 # venv 没建 = 还没跑安装（zip拷贝/只clone就双击）。给人话别给红字堆栈
-if (-not (Test-Path "$PSScriptRoot\venv\Scripts\python.exe")) {
+if (-not (Test-Path "$RepoRoot\venv\Scripts\python.exe")) {
     Write-Host "❌ 还没有安装运行环境（venv 不存在）。"
     Write-Host "   请先运行本目录的 install.ps1（右键 → 使用 PowerShell 运行），"
     Write-Host "   或让你的 AI 助手按仓库里的 CLAUDE.md 完成安装。"
@@ -24,8 +26,8 @@ if (-not (Test-Path "$PSScriptRoot\venv\Scripts\python.exe")) {
 }
 
 # 清掉可能残留的暂停/停止标记，保证每次启动都是正常运行状态
-Remove-Item "$PSScriptRoot\.paused" -ErrorAction SilentlyContinue
-Remove-Item "$PSScriptRoot\.stop" -ErrorAction SilentlyContinue
+Remove-Item "$RepoRoot\.paused" -ErrorAction SilentlyContinue
+Remove-Item "$RepoRoot\.stop" -ErrorAction SilentlyContinue
 
 $ollamaDir = "$env:LOCALAPPDATA\Programs\Ollama"
 if (Test-Path $ollamaDir) {
@@ -64,7 +66,7 @@ if (-not (Test-OllamaReady)) {
 
 # 模型名从 config 读（config_local.py 里可能配了小模型），不要硬编码。
 # 一次 python 调用读两个值：venv python 冷启动约0.5秒，起两次纯浪费
-$cfg = @((& "$PSScriptRoot\venv\Scripts\python.exe" -c "import config; print(config.OLLAMA_MODEL); print(config.WHISPER_MODEL)") -split "`n" | ForEach-Object { $_.Trim() })
+$cfg = @((& "$RepoRoot\venv\Scripts\python.exe" -c "import config; print(config.OLLAMA_MODEL); print(config.WHISPER_MODEL)") -split "`n" | ForEach-Object { $_.Trim() })
 $txModel = $cfg[0]
 
 # 首次启动检测：Whisper 模型还没下载过（HF 缓存里没有）就明确告知要等几分钟。
@@ -91,10 +93,10 @@ Write-Host "启动实时字幕..."
 # （识别/翻译分位数、缓冲分桶、扣留放行与切早计数），要靠跨天累积的数据来判断
 # 该不该调参数——每次启动清空的话，重启一次或关一次机就前功尽弃。
 # 所以启动前先把上一份挪进 logs\ 存档，只保留最近 30 份（一份约几十 KB）。
-$logDir = Join-Path $PSScriptRoot "logs"
+$logDir = Join-Path $RepoRoot "logs"
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
 foreach ($name in @("subtitle.log", "subtitle.err.log")) {
-    $cur = Join-Path $PSScriptRoot $name
+    $cur = Join-Path $RepoRoot $name
     if ((Test-Path $cur) -and ((Get-Item $cur).Length -gt 0)) {
         $stamp = (Get-Item $cur).LastWriteTime.ToString("yyyyMMdd-HHmmss")
         $base = [IO.Path]::GetFileNameWithoutExtension($name)
@@ -107,11 +109,11 @@ Get-ChildItem $logDir -Filter "subtitle-*.log" -ErrorAction SilentlyContinue |
 
 # 隐藏窗口启动+输出写进日志文件。之前用-NoNewWindow让python挂在这个控制台上，
 # 用户手动关窗口时python会被一起杀掉，跟提示语说的"关窗不停止"正好相反
-$proc = Start-Process -FilePath "$PSScriptRoot\venv\Scripts\python.exe" `
+$proc = Start-Process -FilePath "$RepoRoot\venv\Scripts\python.exe" `
     -ArgumentList "-u", "main.py" `
-    -WorkingDirectory $PSScriptRoot -PassThru -WindowStyle Hidden `
-    -RedirectStandardOutput "$PSScriptRoot\subtitle.log" `
-    -RedirectStandardError "$PSScriptRoot\subtitle.err.log"
+    -WorkingDirectory $RepoRoot -PassThru -WindowStyle Hidden `
+    -RedirectStandardOutput "$RepoRoot\subtitle.log" `
+    -RedirectStandardError "$RepoRoot\subtitle.err.log"
 $proc.Id | Out-File -FilePath $pidFile -Encoding ascii
 Write-Host "已启动 (PID $($proc.Id))，运行日志: subtitle.log"
 if ($firstRun) {

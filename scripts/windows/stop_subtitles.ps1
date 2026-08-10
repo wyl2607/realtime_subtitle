@@ -1,9 +1,11 @@
-﻿# 停止德语实时字幕程序（优先优雅退出，超时再强杀）
+# 停止德语实时字幕程序（优先优雅退出，超时再强杀）
 $ErrorActionPreference = "SilentlyContinue"
-Set-Location $PSScriptRoot
+# Repo root (this file lives in scripts/windows/)
+$RepoRoot = (Get-Item $PSScriptRoot).Parent.Parent.FullName
+Set-Location $RepoRoot
 
-$pidFile = "$PSScriptRoot\subtitle.pid"
-$stopFlag = "$PSScriptRoot\.stop"
+$pidFile = "$RepoRoot\subtitle.pid"
+$stopFlag = "$RepoRoot\.stop"
 # 优雅退出正常1-2秒（积压任务直接丢弃、在飞流式翻译会被打断），但
 # .stop轮询0.5s+在飞识别(GPU被抢最坏~2.5s)+Ollama卸载HTTP(~1-2s)叠加时
 # 会顶到3秒边缘（2026-07-20实测3次停止2次超时强杀）。放到5秒：退得快
@@ -29,7 +31,7 @@ if (Test-Path $pidFile) {
     $targetProc = Get-Process -Id $targetPid -ErrorAction SilentlyContinue
     # 与 start 对称：PID 会被系统回收复用。只对「本项目 venv 下的 python」
     # 写 .stop / 强杀；路径对不上就当陈旧 pid，删文件后走窗口标题兜底。
-    $isOurs = $targetProc -and $targetProc.Path -like "$PSScriptRoot\venv\*"
+    $isOurs = $targetProc -and $targetProc.Path -like "$RepoRoot\venv\*"
     if ($isOurs) {
         # 写停止标记：主程序 QTimer 看到后走 app.quit → stop() 关线程/模型
         New-Item -ItemType File -Path $stopFlag -Force | Out-Null
@@ -92,7 +94,7 @@ if ($ollamaUp) {
         Write-Host "查询 Ollama 已加载模型失败，跳过卸载（显存最多占用到 keep_alive 到期）"
     }
     if ($psOk -and $loaded) {
-        $models = & "$PSScriptRoot\venv\Scripts\python.exe" -c "import config; print(config.OLLAMA_MODEL); print(config.GAME_MODE_OLLAMA_MODEL)" 2>$null
+        $models = & "$RepoRoot\venv\Scripts\python.exe" -c "import config; print(config.OLLAMA_MODEL); print(config.GAME_MODE_OLLAMA_MODEL)" 2>$null
         foreach ($m in ($models -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique)) {
             # 名字精确匹配 + 前缀匹配：config 写 "qwen3.5" 时 /api/ps 可能报
             # "qwen3.5:latest"，只做 -contains 会漏卸
@@ -115,7 +117,7 @@ if ($ollamaUp) {
 
 # 清掉暂停/停止标记，避免下次启动误判
 Remove-Item $stopFlag -ErrorAction SilentlyContinue
-Remove-Item "$PSScriptRoot\.paused" -ErrorAction SilentlyContinue
+Remove-Item "$RepoRoot\.paused" -ErrorAction SilentlyContinue
 
 # 验收：确认本项目 venv 下没有残留的 python 进程。
 # subtitle.pid 记的是 venv 启动器存根，真正的程序是它的子进程——2026-07-17
@@ -123,7 +125,7 @@ Remove-Item "$PSScriptRoot\.paused" -ErrorAction SilentlyContinue
 # 只观测不自动杀（按未经验证的假设去杀进程反而危险）。真出现残留就说明那条
 # 结论在某个 Windows/Python 版本上不成立，需要重新做实验。
 $leftover = Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith("$PSScriptRoot\venv") }
+    Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith("$RepoRoot\venv") }
 if ($leftover) {
     Write-Host ""
     Write-Host "⚠️  停止后仍有本项目的 python 进程残留（PID: $($leftover.ProcessId -join ', ')）。"

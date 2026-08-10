@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  pipeline-helpers:
+  unit-tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -16,9 +16,8 @@ jobs:
       - name: Install minimal test deps
         run: |
           python -m pip install --upgrade pip
-          # test_pipeline_helpers only needs numpy + stdlib helpers;
-          # translator_queue lazy-loads torch/faster-whisper on construct
-          # pytest comes from requirements-dev.txt so its version lives in one place
+          # Non-GUI unit tests only need numpy + requests + pytest.
+          # translator_queue lazy-loads torch/faster-whisper on construct.
           pip install "numpy>=1.24,<3" "requests>=2.28,<3" -r requirements-dev.txt
       - name: Run non-GUI unit tests
-        run: python -m pytest test_pipeline_helpers.py -q
+        run: python -m pytest tests/test_pipeline_helpers.py -q

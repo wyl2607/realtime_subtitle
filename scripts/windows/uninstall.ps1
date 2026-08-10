@@ -1,8 +1,8 @@
-﻿# ============================================================
+# ============================================================
 # 实时字幕翻译系统 卸载 / 清理脚本（Windows）
 #
-# 用法：powershell -ExecutionPolicy Bypass -File uninstall.ps1
-#   或： powershell -ExecutionPolicy Bypass -File uninstall.ps1 -CleanCache
+# 用法：powershell -ExecutionPolicy Bypass -File scripts\windows\uninstall.ps1
+#   或： powershell -ExecutionPolicy Bypass -File scripts\windows\uninstall.ps1 -CleanCache
 #
 # 为什么需要这个脚本：这套系统装完摊在四个位置，其中三个在仓库目录之外
 # （HuggingFace 模型缓存、Ollama 模型、Ollama 程序本体）。只删仓库目录的话
@@ -20,7 +20,9 @@ param(
     [switch]$CleanCache
 )
 $ErrorActionPreference = "Stop"
-Set-Location $PSScriptRoot
+# Repo root (this file lives in scripts/windows/)
+$RepoRoot = (Get-Item $PSScriptRoot).Parent.Parent.FullName
+Set-Location $RepoRoot
 
 # 体积按量级选单位：残file经常只有几百 KB，一律按 GB 显示会变成一串"0 GB"，
 # 看着像脚本坏了
@@ -134,7 +136,7 @@ if ($CleanCache) {
 # ---------- 卸载模式 ----------
 # ☠️ 模型名必须在删 venv 之前读：venv 一没，import config 就跑不了了
 $txModel = $null
-$vpy = "$PSScriptRoot\venv\Scripts\python.exe"
+$vpy = "$RepoRoot\venv\Scripts\python.exe"
 if (Test-Path $vpy) {
     try { $txModel = (& $vpy -c "import config; print(config.OLLAMA_MODEL)" 2>$null).Trim() } catch { }
 }
@@ -146,7 +148,7 @@ Write-Host "先看看各部分占多少地方："
 Write-Host ""
 $desktop = [Environment]::GetFolderPath("Desktop")
 $shortcutDir = Join-Path $desktop "德语直播实时字幕"
-$venvDir = "$PSScriptRoot\venv"
+$venvDir = "$RepoRoot\venv"
 
 $venvBytes = Get-SizeBytes $venvDir
 $whisperBytes = 0
@@ -166,7 +168,7 @@ Write-Host ""
 
 # 1. 先停掉在跑的程序，否则 venv 里的文件删不掉
 Write-Host "[1/6] 停止正在运行的字幕..."
-if (Test-Path "$PSScriptRoot\subtitle.pid") {
+if (Test-Path "$RepoRoot\subtitle.pid") {
     try {
         & powershell -NoProfile -ExecutionPolicy Bypass -File "$PSScriptRoot\stop_subtitles.ps1" | Out-Null
         Write-Host "  ✅ 已停止"
@@ -246,12 +248,12 @@ if (Test-Path -LiteralPath $ollamaProgDir) {
 Write-Host ""
 Write-Host "------------------------------------------"
 Write-Host "以下是你的数据，本脚本一律不动，要删自己删："
-Write-Host "   字幕存档   $PSScriptRoot\transcripts\"
-Write-Host "   个人配置   $PSScriptRoot\config_local.py"
-Write-Host "   窗口位置   $PSScriptRoot\window_state.json"
-Write-Host "   运行日志   $PSScriptRoot\subtitle.log / subtitle.err.log / logs\"
+Write-Host "   字幕存档   $RepoRoot\transcripts\"
+Write-Host "   个人配置   $RepoRoot\config_local.py"
+Write-Host "   窗口位置   $RepoRoot\window_state.json"
+Write-Host "   运行日志   $RepoRoot\subtitle.log / subtitle.err.log / logs\"
 Write-Host ""
 Write-Host "整个仓库目录（含以上数据）在："
-Write-Host "   $PSScriptRoot"
+Write-Host "   $RepoRoot"
 Write-Host "确认都不要了，把它整个删掉即可。"
 Write-Host "=========================================="

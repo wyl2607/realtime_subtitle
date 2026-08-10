@@ -1,4 +1,4 @@
-﻿# ============================================================
+# ============================================================
 # 一键更新：从 GitHub 拉最新版 + 按需同步依赖
 #
 # 不会动的东西（都不在 git 里）：
@@ -9,14 +9,16 @@ param(
     [switch]$Mirror  # 大陆网络：依赖同步走清华 PyPI 镜像（与 install.ps1 同参数）
 )
 $ErrorActionPreference = "Stop"
-Set-Location $PSScriptRoot
+# Repo root (this file lives in scripts/windows/)
+$RepoRoot = (Get-Item $PSScriptRoot).Parent.Parent.FullName
+Set-Location $RepoRoot
 
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
     Write-Host "❌ 没有安装 git，无法自动更新。"
     Write-Host "   安装：winget install --id Git.Git -e   （或 https://git-scm.com/download/win）"
     exit 1
 }
-if (-not (Test-Path "$PSScriptRoot\.git")) {
+if (-not (Test-Path "$RepoRoot\.git")) {
     Write-Host "❌ 本目录不是 git 克隆（可能当初是解压 zip 装的），无法增量更新。"
     Write-Host "   建议重装：git clone https://github.com/wyl2607/realtime_subtitle.git"
     Write-Host "   然后运行 install.ps1（个人配置 config_local.py 可以直接拷过去）"
@@ -26,7 +28,7 @@ if (-not (Test-Path "$PSScriptRoot\.git")) {
 # 版本号从 version.py 里正则抠出来。刻意不调 venv 的 python：更新脚本要能在
 # venv 坏掉/还没建的时候照跑，多拉一个依赖不划算（version.py 保证是纯常量）
 function Read-LocalVersion {
-    $f = Join-Path $PSScriptRoot "version.py"
+    $f = Join-Path $RepoRoot "version.py"
     if (-not (Test-Path $f)) { return "?" }
     $m = Select-String -Path $f -Pattern '^__version__\s*=\s*"([^"]+)"' | Select-Object -First 1
     if ($m) { return $m.Matches[0].Groups[1].Value }
@@ -70,7 +72,7 @@ if ($changed -contains "requirements.txt") {
     # （CLAUDE.md 第 1 节明确记着这个现象）。以前这里直接 & 一个不存在的
     # exe，PowerShell 抛 CommandNotFoundException 原始异常栈——代码其实
     # 已经拉下来了，用户却只看到一屏红字，以为整个更新失败了。
-    $vpy = "$PSScriptRoot\venv\Scripts\python.exe"
+    $vpy = "$RepoRoot\venv\Scripts\python.exe"
     if (-not (Test-Path $vpy)) {
         Write-Host "⚠️ 代码已经更新好了，但没找到 venv："
         Write-Host "   $vpy"
@@ -80,7 +82,7 @@ if ($changed -contains "requirements.txt") {
         exit 1
     }
     Write-Host "依赖清单有变化，正在同步（可能需要几分钟）..."
-    $pipArgs = @("-m", "pip", "install", "-r", "$PSScriptRoot\requirements.txt")
+    $pipArgs = @("-m", "pip", "install", "-r", "$RepoRoot\requirements.txt")
     if ($Mirror) { $pipArgs += @("-i", "https://pypi.tuna.tsinghua.edu.cn/simple") }
     & $vpy @pipArgs
     if ($LASTEXITCODE -ne 0) {
@@ -93,7 +95,7 @@ if ($changed -contains "install.ps1") {
 }
 
 # 字幕正在运行的话提醒重启
-$pidFile = "$PSScriptRoot\subtitle.pid"
+$pidFile = "$RepoRoot\subtitle.pid"
 if (Test-Path $pidFile) {
     $runPid = Get-Content $pidFile
     if (Get-Process -Id $runPid -ErrorAction SilentlyContinue) {

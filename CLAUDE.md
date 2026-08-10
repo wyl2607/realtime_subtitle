@@ -1,4 +1,7 @@
-# CLAUDE.md — 给接手这台电脑的 AI 助手（Claude Code 等）
+# CLAUDE.md
+
+> 目录分级见 [docs/STRUCTURE.md](docs/STRUCTURE.md)；Windows 脚本在 `scripts/windows/`。
+ — 给接手这台电脑的 AI 助手（Claude Code 等）
 
 这是一个**完全本地运行**的实时字幕系统：捕获 Windows 正在播放的声音（直播/视频/
 语音聊天），Faster-Whisper 实时识别德语，Ollama 本地大模型翻译成中文，PyQt5
@@ -51,7 +54,7 @@ install.ps1 开头会拦住并让你换路径，但你先选对能省一趟。
 ```powershell
 git clone https://github.com/wyl2607/realtime_subtitle.git
 cd realtime_subtitle
-powershell -ExecutionPolicy Bypass -File install.ps1
+powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
 # 中国大陆网络：加 -Mirror 参数走清华 PyPI 镜像
 ```
 
@@ -238,7 +241,7 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     和 test_hittest.py。
 18. 用户可见文案是中文；代码注释写"为什么"而不是"做什么"，沿用现有风格。
 19. **桌面「操作说明.txt」不要直接改**：正文的单一真相源是
-    `docs/操作说明模板.txt`（install.ps1 用它生成，`{{INSTALL_DIR}}` 会被
+    `docs/zh/user-guide-template.txt`（install.ps1 用它生成，`{{INSTALL_DIR}}` 会被
     替换成安装目录）。改说明改模板，否则下次谁跑一次 install 就被覆盖回去。
 20. **这两处看着像可优化点，实测都不是**（2026-08-02 量过，别再翻）：
     - `streaming_asr.py` 的 `vad_filter=True` 不是"每 0.5 秒重复跑一遍的冗余
@@ -341,9 +344,9 @@ subtitle_window.py    悬浮窗主类（+ window_frame/window_chrome/subtitle_re
                       window_geometry/settings_window/popups 拆分模块）
 config.py             全部默认参数（仓库文件，别为单机改它）
 config_local.py       本机覆盖（gitignore，install.ps1 生成，机器适配都写这）
-install.ps1           一键安装 + 硬件检测 + 桌面快捷方式
+scripts/windows/install.ps1  一键安装 + 硬件检测 + 桌面快捷方式（根目录 install.ps1 为兼容转发）
 update_subtitles.ps1  一键更新（git pull + 按需装依赖）
-uninstall.ps1         卸载（逐项问 Y/N，默认不删）；-CleanCache 只清下载残file
+scripts/windows/uninstall.ps1  卸载（逐项问 Y/N，默认不删）；-CleanCache 只清下载残file
 requirements-dev.txt  测试依赖（pytest），只有改代码的人要装
 start/stop/pause_subtitles.ps1   启动（PID 管理/Ollama 保活）/停止/暂停
 transcripts/          字幕存档（每天一个文件）
