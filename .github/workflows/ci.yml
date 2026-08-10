@@ -5,6 +5,11 @@ on:
     branches: [master, main]
   pull_request:
 
+# 默认的 GITHUB_TOKEN 权限跟着仓库设置走，可能是可写的。这两个 job 只需要
+# 读代码，显式收到最小权限（供应链硬化的标准做法，不改变任何现有行为）
+permissions:
+  contents: read
+
 # Coverage map (see issue #23):
 # - ubuntu: pure pipeline helpers (no torch/PyQt/WASAPI)
 # - windows: full pytest suite except standalone GUI harness scripts
