@@ -118,7 +118,7 @@ def test_collect_tuning_persists_current_values():
 
 def test_tuning_roundtrip_via_state_file(tmp_path, monkeypatch):
     """伪造 state → 应用；改 config → 组装 state → 断言完整。绝不写真实 window_state.json。"""
-    import subtitle_window as sw
+    import realtime_subtitle.ui.subtitle_window as sw
 
     state_path = tmp_path / "window_state.json"
     monkeypatch.setattr(sw, "STATE_FILE", str(state_path))
@@ -170,7 +170,7 @@ def test_state_file_atomic_write_and_bak_recovery(tmp_path, monkeypatch):
     ☠️ 这里 patch 的是 subtitle_window 模块的 STATE_FILE 属性——持久化函数
     必须留在那个模块里，搬走就会读到别的模块的全局，patch 失效（见文件头注释）。
     """
-    import subtitle_window as sw
+    import realtime_subtitle.ui.subtitle_window as sw
 
     state_path = tmp_path / "window_state.json"
     monkeypatch.setattr(sw, "STATE_FILE", str(state_path))
@@ -203,7 +203,7 @@ def test_main_geo_restore_rejects_bad_values():
     sys.exit(1)——悬浮窗根本不出现。.bak 兜底在这里帮不上忙：文件本身是
     合法 dict，坏的只是里面某个值。
     """
-    import subtitle_window as sw
+    import realtime_subtitle.ui.subtitle_window as sw
 
     good = {"x": 120, "y": 240, "w": 800, "h": 300}
     assert sw.SubtitleWindow._restore_main_geo(good) == (120, 240, 800, 300)
@@ -233,7 +233,7 @@ def test_state_file_non_dict_json_falls_back_to_bak(tmp_path, monkeypatch):
     更要命的是这类损坏【绕过了 .bak 兜底】，而那套兜底的全部意义就是扛住
     state 文件损坏。现在非 dict 一律当损坏，继续找下一份。
     """
-    import subtitle_window as sw
+    import realtime_subtitle.ui.subtitle_window as sw
 
     state_path = tmp_path / "window_state.json"
     monkeypatch.setattr(sw, "STATE_FILE", str(state_path))
