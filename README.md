@@ -149,7 +149,7 @@ venv\Scripts\python -m pytest tests\test_pipeline_helpers.py -q
 | Symptom | What to try |
 |---|---|
 | `cublas64_12.dll` missing | Reinstall `nvidia-cublas-cu12` / `nvidia-cudnn-cu12` from `requirements.txt` |
-| Source only, no translation | Start Ollama; `ollama pull` the model printed by `import config; print(config.OLLAMA_MODEL)` |
+| Source only, no translation | Start Ollama; `ollama pull` the model printed by `from realtime_subtitle import config; print(config.OLLAMA_MODEL)` |
 | Frequent “GPU busy” | Settings → slower commit interval, or smaller Whisper model in `config_local.py` |
 | No audio after headset change | Settings → device name contains… or `LOOPBACK_DEVICE_NAME` in `config_local.py` |
 | Tiny UI on laptop | Windows display scaling; `Ctrl+scroll` for subtitle font size |
