@@ -205,6 +205,31 @@ def test_hallucination_blacklist():
     assert not asr._is_hallucination("Meta kann das bis zu 12 Milliarden")
 
 
+def test_hallucination_blacklist_does_not_eat_real_speech():
+    """☠️ 命中即整段丢弃，所以只做子串匹配会误杀真人说话。
+
+    "Copyright" 在德语媒体报道里是常见外来词，"Untertitel" 在讨论无障碍/
+    流媒体的节目里也会正常出现。以前只要段里出现这些子串，整个 segment
+    （可能好几秒的话）就被静默丢掉——屏幕上只是缺了一句，用户完全无感，
+    日志里也只有 SHOW_PERFORMANCE 打开时才看得见。
+
+    幻觉本身都是短固定套话，所以加长度门；短句照杀，长句放行。
+    """
+    asr = OnlineASRProcessor.__new__(OnlineASRProcessor)
+    # 真人在讲版权/字幕话题的长句：必须放行
+    assert not asr._is_hallucination(
+        "Der Streit um das Copyright bei generativen Modellen beschäftigt "
+        "inzwischen mehrere Gerichte in Europa.")
+    assert not asr._is_hallucination(
+        "Die Mediathek bietet inzwischen für fast alle Sendungen Untertitel "
+        "an, auch bei Live-Übertragungen im Ersten.")
+    # 经典幻觉套话（短）：照杀不误
+    assert asr._is_hallucination("Untertitelung des ZDF, 2020")
+    assert asr._is_hallucination("Copyright WDR 2021")
+    assert asr._is_hallucination("Untertitel von Amara.org")
+    assert not asr._is_hallucination("")
+
+
 def test_hypothesis_local_agreement_commits_common_prefix():
     buf = HypothesisBuffer()
     # 第一次识别

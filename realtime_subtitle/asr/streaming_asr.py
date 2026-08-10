@@ -182,8 +182,26 @@ class OnlineASRProcessor:
             return de >= 3 and de >= 2 * max(en, 1)
         return False
 
+    # 命中黑名单后还要满足的长度门：幻觉字幕都是"Untertitelung des ZDF, 2020"
+    # 这种短固定句，真人讲话里出现同样的词（新闻里 "Copyright"、讨论字幕时的
+    # "Untertitel"）一般是长句里的一个词。
+    HALLUCINATION_MAX_CHARS = 60
+
     def _is_hallucination(self, text):
-        lowered = text.lower()
+        """整段丢弃的判定，所以宁可漏杀不可误杀。
+
+        ☠️ 只有子串匹配是不够的：黑名单里的 "copyright"/"untertitel" 在德语
+        媒体报道里是正常词汇（"Copyright" 是常见外来词），一命中就把**整个
+        segment**（可能好几秒的话）静默丢掉，用户完全无感——屏幕上就是缺了
+        一句，日志里也只有 SHOW_PERFORMANCE 打开时才看得到。
+
+        加一道长度门：幻觉都是短的固定套话，超过 HALLUCINATION_MAX_CHARS 的
+        段落里出现这些词，压倒性可能是真人在说话。
+        """
+        stripped = (text or "").strip()
+        if len(stripped) > self.HALLUCINATION_MAX_CHARS:
+            return False
+        lowered = stripped.lower()
         return any(pattern in lowered for pattern in config.HALLUCINATION_BLACKLIST)
 
     @staticmethod
