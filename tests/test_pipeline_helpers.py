@@ -1187,6 +1187,37 @@ def test_shutdown_waits_for_lookup_before_unloading():
     assert 2.5 < elapsed < 4.5, f"应有界等待约3秒，实测 {elapsed:.1f}s"
 
 
+def test_translate_stream_has_size_fuse(monkeypatch):
+    """☠️ 流式响应必须有累计字符硬顶。
+
+    num_predict 只是**请求**参数，服务端听不听是另一回事：模型钻进复读循环、
+    或者 11434 端口被别的本地进程占了（Ollama 没起时谁都能占），iter_lines()
+    会一直往 parts 里堆，内存跟着涨、翻译 worker 也永远不返回——单线程池一堵，
+    整条字幕链路的中文就停了。
+    """
+    import realtime_subtitle.translate.translator_queue as tq
+
+    class _NeverEndingResponse:
+        status_code = 200
+
+        def iter_lines(self):
+            import json as _json
+            while True:  # 永不 done 的恶意/异常服务端
+                yield _json.dumps({"response": "啊" * 500}).encode()
+
+        def close(self):
+            pass
+
+    class _Session:
+        def post(self, *a, **kw):
+            return _NeverEndingResponse()
+
+    t = _translator_for_tx(ollama_session=_Session())
+    t._ollama_hot = True
+    out = t._translate_single_sentence("Test.", "")
+    assert len(out) <= tq._MAX_STREAM_CHARS + 1000, f"没有截断，收了 {len(out)} 字符"
+
+
 def test_asr_inbox_hard_cap(monkeypatch):
     """收件箱硬顶：识别线程卡死时丢最旧块保内存，正常积压不受影响"""
     from threading import Lock
