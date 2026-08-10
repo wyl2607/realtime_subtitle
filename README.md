@@ -4,7 +4,7 @@
 
 No audio or transcript is sent to the cloud. Recognition and translation run on your machine.
 
-[Deutsch](README.de.md) · [中文](README.zh.md) · [Repository layout](docs/STRUCTURE.md)
+[Deutsch](README.de.md) · [中文](README.zh.md) · [Repository layout](docs/STRUCTURE.md) · [Windows runbook](docs/WINDOWS-RUNBOOK.md)
 
 ```text
 System audio ──WASAPI loopback──▶ Faster-Whisper (CUDA or CPU)

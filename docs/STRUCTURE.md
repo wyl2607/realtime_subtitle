@@ -51,3 +51,7 @@ venv\Scripts\python -u main.py
 ## Multi-language READMEs
 
 See [README-i18n.md](README-i18n.md).
+
+## Windows operators
+
+See [WINDOWS-RUNBOOK.md](WINDOWS-RUNBOOK.md).

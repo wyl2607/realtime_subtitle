@@ -4,7 +4,7 @@
 
 不向任何云端发送音频或文本。识别与翻译均在本机完成。
 
-[English](README.md) · [Deutsch](README.de.md) · [目录结构](docs/STRUCTURE.md)
+[English](README.md) · [Deutsch](README.de.md) · [目录结构](docs/STRUCTURE.md) · [Windows 操作清单](docs/WINDOWS-RUNBOOK.md)
 
 ```text
 系统声音 ──WASAPI Loopback──▶ Faster-Whisper (large-v3-turbo, CUDA/CPU)

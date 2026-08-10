@@ -4,7 +4,7 @@
 
 Audio und Transkripte verlassen den Rechner nicht. Erkennung und Übersetzung laufen offline.
 
-[English](README.md) · [中文](README.zh.md) · [Repository-Struktur](docs/STRUCTURE.md)
+[English](README.md) · [中文](README.zh.md) · [Repository-Struktur](docs/STRUCTURE.md) · [Windows-Anleitung](docs/WINDOWS-RUNBOOK.md)
 
 ```text
 Systemton ──WASAPI-Loopback──▶ Faster-Whisper (CUDA oder CPU)
