@@ -483,7 +483,7 @@ def test_lookup_worker_streams_partial_lines_only():
     # 每次读时钟就前进 1 秒：稳定绕过 0.15 秒节流，让每一块都有机会推 partial
     # （用真实时间的话这个测试跑得比节流窗还快，partials 会是空的——
     #   空列表会让下面的循环断言全部真空通过）
-    import translator_queue as tq
+    import realtime_subtitle.translate.translator_queue as tq
     clock = [0.0]
 
     def _fake_now():

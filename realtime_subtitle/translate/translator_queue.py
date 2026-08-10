@@ -40,6 +40,13 @@ _SENTENCE_TERMINATOR = re.compile(r'[.!?…]["»«\']?(?=\s|$)')
 _PUNCT_STRIP = " \t.!?…,;:–—\"'«»„“”"
 _QUOTE_CHARS = "\"'«»„“”"
 
+# 单次流式响应累计的字符硬顶。
+# ☠️ num_predict 只是**请求**参数，服务端愿不愿意听是另一回事：模型钻进复读
+# 循环、或者 11434 端口被别的进程占了（Ollama 没起来时任何本地程序都能占），
+# iter_lines() 就会一直把内容往 parts 里堆，内存跟着涨、翻译 worker 也永远
+# 不返回。一条字幕的中文再长也就几百字，20000 是留足余量的保险丝。
+_MAX_STREAM_CHARS = 20000
+
 
 def _ends_with_terminator(text):
     """文本是不是正好停在一个句子终止符上（判断"要不要扣留"用）。"""
@@ -1070,6 +1077,7 @@ class WhisperQueueTranslator:
         """
         parts = []
         emitted_chars = 0  # 已经推给弹窗的字符数（都落在换行边界上）
+        total_chars = 0    # 累计收到的字符数（保险丝，见 _MAX_STREAM_CHARS）
         last_emit = 0.0
         for line in response.iter_lines():
             if self.closing:
@@ -1087,7 +1095,11 @@ class WhisperQueueTranslator:
             except ValueError:
                 continue
             parts.append(data.get("response", ""))
+            total_chars += len(parts[-1])
             if data.get("done"):
+                break
+            if total_chars > _MAX_STREAM_CHARS:
+                print(f"   ⚠️  查词响应超过 {_MAX_STREAM_CHARS} 字符，提前截断")
                 break
             if not on_partial or time.time() - last_emit <= 0.15:
                 continue
@@ -1382,6 +1394,7 @@ class WhisperQueueTranslator:
                 try:
                     if response.status_code == 200:
                         parts = []
+                        grown = 0
                         last_emit = 0.0
                         for line in response.iter_lines():
                             if self.closing:
@@ -1393,7 +1406,13 @@ class WhisperQueueTranslator:
                             except ValueError:
                                 continue
                             parts.append(data.get("response", ""))
+                            grown += len(parts[-1])
                             if data.get("done"):
+                                break
+                            if grown > _MAX_STREAM_CHARS:
+                                # 见 _MAX_STREAM_CHARS：模型复读或服务端异常，
+                                # 已经拿到的部分照常用，别再无限收下去
+                                print(f"   ⚠️  翻译响应超过 {_MAX_STREAM_CHARS} 字符，提前截断")
                                 break
                             if on_partial and time.time() - last_emit > 0.15:
                                 partial = "".join(parts).strip()

@@ -132,7 +132,7 @@ def test_strip_translator_note_inline_and_trailing():
 def test_version_is_semver_and_string_helper_matches():
     """版本号格式固定成 主.次.修，version_string() 只在前面加个 v。
     update_subtitles.ps1 和 issue 模板都按这个格式正则匹配。"""
-    import version
+    from realtime_subtitle import version
     assert re.fullmatch(r"\d+\.\d+\.\d+", version.__version__), \
         f"版本号要用语义化版本 主.次.修，现在是 {version.__version__!r}"
     assert version.version_string() == "v" + version.__version__
@@ -574,7 +574,7 @@ def _translator_for_tx(**overrides):
     ☠️ 顺手把模块级 _warm_done 置位：_await_model_ready 在没置位时会真等
     OLLAMA_WARM_WAIT(60秒)，不置位的话整个测试文件会挂几分钟。"""
     from threading import Lock
-    import translator_queue as tq
+    import realtime_subtitle.translate.translator_queue as tq
     from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 
     tq._warm_done.set()
@@ -984,6 +984,37 @@ def test_shutdown_waits_for_lookup_before_unloading():
 
     assert order[-1] == "unload", "卸载必须排在等待之后"
     assert 2.5 < elapsed < 4.5, f"应有界等待约3秒，实测 {elapsed:.1f}s"
+
+
+def test_translate_stream_has_size_fuse(monkeypatch):
+    """☠️ 流式响应必须有累计字符硬顶。
+
+    num_predict 只是**请求**参数，服务端听不听是另一回事：模型钻进复读循环、
+    或者 11434 端口被别的本地进程占了（Ollama 没起时谁都能占），iter_lines()
+    会一直往 parts 里堆，内存跟着涨、翻译 worker 也永远不返回——单线程池一堵，
+    整条字幕链路的中文就停了。
+    """
+    import realtime_subtitle.translate.translator_queue as tq
+
+    class _NeverEndingResponse:
+        status_code = 200
+
+        def iter_lines(self):
+            import json as _json
+            while True:  # 永不 done 的恶意/异常服务端
+                yield _json.dumps({"response": "啊" * 500}).encode()
+
+        def close(self):
+            pass
+
+    class _Session:
+        def post(self, *a, **kw):
+            return _NeverEndingResponse()
+
+    t = _translator_for_tx(ollama_session=_Session())
+    t._ollama_hot = True
+    out = t._translate_single_sentence("Test.", "")
+    assert len(out) <= tq._MAX_STREAM_CHARS + 1000, f"没有截断，收了 {len(out)} 字符"
 
 
 def test_asr_inbox_hard_cap(monkeypatch):
