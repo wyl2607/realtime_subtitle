@@ -1,4 +1,4 @@
-# 启动德语实时双语字幕（YouTube 等系统音频）
+﻿# 启动德语实时双语字幕（YouTube 等系统音频）
 $ErrorActionPreference = "Stop"
 # Repo root (this file lives in scripts/windows/)
 $RepoRoot = (Get-Item $PSScriptRoot).Parent.Parent.FullName

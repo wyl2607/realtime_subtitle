@@ -1,4 +1,4 @@
-# 暂停/继续 实时字幕的识别与翻译（不重启进程，Whisper模型继续留在显存里，切回来不用重新加载）
+﻿# 暂停/继续 实时字幕的识别与翻译（不重启进程，Whisper模型继续留在显存里，切回来不用重新加载）
 # Repo root (this file lives in scripts/windows/)
 $RepoRoot = (Get-Item $PSScriptRoot).Parent.Parent.FullName
 Set-Location $RepoRoot

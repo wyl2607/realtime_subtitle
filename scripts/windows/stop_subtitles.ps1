@@ -1,4 +1,4 @@
-# 停止德语实时字幕程序（优先优雅退出，超时再强杀）
+﻿# 停止德语实时字幕程序（优先优雅退出，超时再强杀）
 $ErrorActionPreference = "SilentlyContinue"
 # Repo root (this file lives in scripts/windows/)
 $RepoRoot = (Get-Item $PSScriptRoot).Parent.Parent.FullName
