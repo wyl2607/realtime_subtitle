@@ -6,5 +6,5 @@
 #
 # 用法：venv\Scripts\python -m pip install -r requirements-dev.txt
 
-pytest>=8      # CLAUDE.md 第 4 节第 15 条要求改完跑全量套件；pytest.ini 里
+pytest>=9.1.1      # CLAUDE.md 第 4 节第 15 条要求改完跑全量套件；pytest.ini 里
                # 已经把三个独立脚本套件排除出收集，直接 pytest 即可
