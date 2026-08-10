@@ -965,6 +965,42 @@ def test_translate_num_gpu_is_optional_and_configurable(monkeypatch):
     assert payloads[-1]["options"]["num_gpu"] == 12
 
 
+def test_await_model_ready_is_interruptible_by_shutdown(monkeypatch):
+    """☠️ 模型还在加载时点停止，优雅退出不能被预热等待拖住。
+
+    shutdown() 对 _tx_executor 是 wait=True，打断不了正在 _await_model_ready
+    里等的 worker；以前那是一发 `_warm_done.wait(60)` 的干等，于是退出会挂到
+    60 秒，而 stop_subtitles.ps1 只给 5 秒宽限就强杀——被强杀掉的正好是
+    shutdown() 里排在后面的 _save_lookup_cache() 和 _unload_our_models()
+    （查词缓存丢一份、显存按 keep_alive="2h" 继续占着）。
+    """
+    import time as _time
+    import threading
+    import realtime_subtitle.translate.translator_queue as tq
+
+    monkeypatch.setattr(config, "OLLAMA_WARM_WAIT", 30, raising=False)
+    tq._warm_done.clear()
+    monkeypatch.setattr(tq, "_warm_ok", False, raising=False)
+    try:
+        t = tq.WhisperQueueTranslator.__new__(tq.WhisperQueueTranslator)
+        t._ollama_hot = False
+        t._warm_notified = False
+        t.closing = False
+        t.on_status = None
+
+        def _stop_soon():
+            _time.sleep(0.3)
+            t.closing = True
+
+        threading.Thread(target=_stop_soon, daemon=True).start()
+        t0 = _time.time()
+        t._await_model_ready()
+        elapsed = _time.time() - t0
+        assert elapsed < 5, f"退出时不该继续等预热，实际等了 {elapsed:.1f} 秒"
+    finally:
+        tq._warm_done.set()  # 别把状态留给后面的用例
+
+
 def test_translate_circuit_breaker_stops_requests(monkeypatch):
     """连续失败到阈值 → 熔断期间一个请求都不发（队列不会因反复超时堆积）。"""
     import requests

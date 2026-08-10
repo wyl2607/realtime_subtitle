@@ -722,7 +722,16 @@ class WhisperQueueTranslator:
 
         预热和第一句翻译打的是同一个模型：并发发出去时 Ollama 那边串行加载，
         客户端却按各自的超时计时——15 秒超时必然先到，句子被丢。等预热完成再发，
-        请求本身就是热的，15 秒够用。预热失败/超时也照常往下走（用冷超时兜底）。"""
+        请求本身就是热的，15 秒够用。预热失败/超时也照常往下走（用冷超时兜底）。
+
+        ☠️ 这个等待必须能被退出打断。以前是一发 `_warm_done.wait(60)` 干等：
+        shutdown() 对 _tx_executor 是 wait=True，打断不了正在等的 worker，
+        于是"模型还在加载时点停止"会让优雅退出挂到 60 秒——而
+        stop_subtitles.ps1 只给 5 秒宽限，到点强杀。强杀掉的正是
+        shutdown() 里排在后面的 _save_lookup_cache() 和 _unload_our_models()：
+        查词缓存丢一份，显存还按 keep_alive="2h" 占着。分片轮询 closing 之后，
+        退出路径最多多等 0.25 秒。
+        """
         if self._ollama_hot:
             return
         if _warm_done.is_set():
@@ -732,7 +741,10 @@ class WhisperQueueTranslator:
         if self.on_status and not self._warm_notified:
             self._warm_notified = True
             self.on_status("✅ 识别已就绪；⏳ 翻译模型首次加载中，中文稍后跟上…")
-        _warm_done.wait(getattr(config, "OLLAMA_WARM_WAIT", 60))
+        deadline = time.time() + getattr(config, "OLLAMA_WARM_WAIT", 60)
+        while not _warm_done.wait(min(0.25, max(0.0, deadline - time.time()))):
+            if self.closing or time.time() >= deadline:
+                return  # 退出中/等够了：不再把 shutdown 堵在这
         if _warm_ok:
             self._ollama_hot = True
 
@@ -1340,6 +1352,8 @@ class WhisperQueueTranslator:
 
             # 模型还没进显存时先等后台预热落地，并改用长超时
             self._await_model_ready()
+            if self.closing:
+                return sentence  # 等预热期间用户点了退出：别再发这个请求
 
             ollama_options = {
                 "temperature": 0.3,
