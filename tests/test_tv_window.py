@@ -137,6 +137,33 @@ def test_bottom_anchor_clears_once_content_fills_viewport():
         win.hide()
 
 
+def test_bottom_anchor_stays_stable_across_repeated_updates():
+    """稳态（内容早就超过一屏）反复调用必须幂等：留白恒为 0。
+
+    _update_bottom_anchor 现在会在"当前留白已经是 0"时走短路——直接测、
+    直接判，不再做"清零→测量→回填"那两次 setFrameFormat（每次都让整篇文档
+    布局失效，而流式草稿期间这函数约每 0.15 秒被调一次，文档最多 2000 block、
+    字号最大 160px）。这条用例锁住短路之后行为不变。
+    """
+    win = _shown_tv()
+    try:
+        win.resize(400, 200)
+        for i in range(20):
+            win.append_pair(f"第{i}行足够长的中文字幕内容撑满窗口宽度测试用")
+        for _ in range(5):
+            win.update_draft("草稿中文在流式生成中")
+            win.update_draft("")
+        pad = win.text.document().rootFrame().frameFormat().topMargin()
+        assert pad == 0
+
+        # 反向：内容清空回到稀疏态，留白要能重新长出来（短路不能把这条路堵死）
+        win.backfill(["只有一行"])
+        pad = win.text.document().rootFrame().frameFormat().topMargin()
+        assert pad > 0
+    finally:
+        win.hide()
+
+
 def test_adjust_font_clamps_and_syncs_config():
     _app()
     snap = config.TV_FONT_SIZE
