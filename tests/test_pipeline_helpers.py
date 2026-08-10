@@ -132,7 +132,7 @@ def test_strip_translator_note_inline_and_trailing():
 def test_version_is_semver_and_string_helper_matches():
     """版本号格式固定成 主.次.修，version_string() 只在前面加个 v。
     update_subtitles.ps1 和 issue 模板都按这个格式正则匹配。"""
-    import version
+    from realtime_subtitle import version
     assert re.fullmatch(r"\d+\.\d+\.\d+", version.__version__), \
         f"版本号要用语义化版本 主.次.修，现在是 {version.__version__!r}"
     assert version.version_string() == "v" + version.__version__
@@ -337,6 +337,68 @@ def test_translation_worker_dict_shortcircuit_and_order():
     assert pairs == [("Genau.", "没错"), ("Super!", "太棒了")]
     assert calls == []
     assert len(displays) >= 1, "纯词典直译后应 _emit_display 清掉 live 残留"
+
+
+def test_transcript_keeps_source_when_translation_failed():
+    """☠️ 翻译失败（返回原文）时德语原文必须照常入档。
+
+    以前是 `if translation != german: _save_transcript(...)`，于是 Ollama
+    挂掉/熔断的那几分钟里 transcripts\\ 一条都不写——而存档的用途正是事后
+    回看和学德语，用户完全无从知道那段说了什么。屏幕上只显示一遍德语
+    （不重复两行）是另一回事，两者不能共用同一个判断。
+    """
+    from collections import deque
+    from threading import Lock
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
+
+    t = WhisperQueueTranslator.__new__(WhisperQueueTranslator)
+    t._tx_lock = Lock()
+    t._stats_lock = Lock()
+    t._tx_queue = ["Der Bundestag debattiert heute."]
+    t._tx_epoch = 0
+    t._tx_inflight = []
+    t.closing = False
+    t.context_history = deque(maxlen=6)
+    t._stat_dict = 0
+    t._stat_tx = []
+    t._draft_last_text = ""
+    t.pending_text = ""
+    t._last_unstable = ""
+    t.on_draft = None
+    t.on_display = lambda c, u: None
+    pairs = []
+    t.on_pair = lambda g, zh: pairs.append((g, zh))
+    saved = []
+    t._save_transcript = lambda g, zh: saved.append((g, zh))
+    # 翻译失败：_translate_single_sentence 的约定是原样返回原文
+    t._translate_single_sentence = lambda s, ctx, on_partial=None: s
+
+    class NoopExecutor:
+        def submit(self, *a, **k):
+            pass
+    t._tx_executor = NoopExecutor()
+
+    t._translation_worker()
+    assert saved == [("Der Bundestag debattiert heute.", "")], saved
+    # 屏幕上仍然只显示一遍德语（中文为空），不能变成"德语\n德语"
+    assert pairs == [("Der Bundestag debattiert heute.", "")], pairs
+
+
+def test_save_transcript_omits_empty_translation_line(tmp_path):
+    """中文为空时只写原文行，不留一行空白译文（回看时看得出"当时没翻出来"）。"""
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
+
+    t = WhisperQueueTranslator.__new__(WhisperQueueTranslator)
+    t._transcript_ok = True
+    t._transcript_dir = str(tmp_path)
+    t._save_transcript("Hallo Welt.", "你好世界")
+    t._save_transcript("Nur Deutsch.", "")
+
+    written = next(tmp_path.iterdir()).read_text(encoding="utf-8")
+    assert "你好世界" in written
+    assert "Nur Deutsch." in written
+    # 空译文不该留下只有空格的一行
+    assert not any(line.strip() == "" and line != "" for line in written.splitlines())
 
 
 def test_collapse_word_runs_at_ingestion():
@@ -574,7 +636,7 @@ def _translator_for_tx(**overrides):
     ☠️ 顺手把模块级 _warm_done 置位：_await_model_ready 在没置位时会真等
     OLLAMA_WARM_WAIT(60秒)，不置位的话整个测试文件会挂几分钟。"""
     from threading import Lock
-    import translator_queue as tq
+    import realtime_subtitle.translate.translator_queue as tq
     from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 
     tq._warm_done.set()

@@ -568,14 +568,20 @@ class WhisperQueueTranslator:
     # 字幕记录
     # ------------------------------------------------------------------
     def _save_transcript(self, source_text, translation):
-        """把一条字幕追加到当天的记录文件（失败一次就关闭，不刷屏）"""
+        """把一条字幕追加到当天的记录文件（失败一次就关闭，不刷屏）。
+
+        translation 为空 = 这句没翻出来（Ollama 挂了/熔断中）。原文照写，
+        只是不留那行空的译文——回看时能看出"这句当时没有中文"，而不是整句消失。
+        """
         if not self._transcript_ok:
             return
         try:
             path = os.path.join(self._transcript_dir, time.strftime("%Y-%m-%d") + ".txt")
             with open(path, "a", encoding="utf-8") as f:
                 f.write(f"[{time.strftime('%H:%M:%S')}] {source_text}\n")
-                f.write(f"           {translation}\n\n")
+                if translation:
+                    f.write(f"           {translation}\n")
+                f.write("\n")
         except OSError as e:
             print(f"⚠️  字幕记录写入失败，记录功能关闭: {e}")
             self._transcript_ok = False
@@ -825,8 +831,12 @@ class WhisperQueueTranslator:
         if stale or self.closing or translation is None:
             return  # 期间切了语言/正在退出：旧语言结果不上屏不写回
 
-        if translation != german:
-            self._save_transcript(german, translation)
+        # ☠️ 翻译失败时 translation==german（原样返回）。屏幕上只显示一遍德语是
+        # 对的，但**存档必须照常写**：以前这里是 `if translation != german`，
+        # Ollama 挂掉/熔断的那几分钟里德语原文一条都不入档，而 transcripts/
+        # 的用途正是回看和学德语——用户事后完全无从知道那段说了什么。
+        # 中文留空，格式和"只有原文"的行一致
+        self._save_transcript(german, "" if translation == german else translation)
         if self.on_pair:
             # 翻译失败时 translation==german：只显示一遍德语，
             # 不要"德语\n德语"重复两行（Ollama挂掉时实测很难看）
