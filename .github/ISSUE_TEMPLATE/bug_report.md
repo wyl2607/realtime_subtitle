@@ -20,7 +20,7 @@ labels: bug
 ## 环境信息（在仓库目录跑，粘贴输出）
 
 ```powershell
-Select-String -Path version.py -Pattern '__version__'
+Select-String -Path realtime_subtitle\version.py -Pattern '__version__'
 git rev-parse --short HEAD
 (Get-CimInstance Win32_OperatingSystem).Caption
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
