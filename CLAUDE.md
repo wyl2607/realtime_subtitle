@@ -1,4 +1,10 @@
-# CLAUDE.md — 给接手这台电脑的 AI 助手（Claude Code 等）
+# CLAUDE.md
+
+> 运行时代码在包 `realtime_subtitle/`（capture / asr / translate / ui）。入口仍是根目录 `main.py`。
+
+
+> 目录分级见 [docs/STRUCTURE.md](docs/STRUCTURE.md)；Windows 脚本在 `scripts/windows/`。
+ — 给接手这台电脑的 AI 助手（Claude Code 等）
 
 这是一个**完全本地运行**的实时字幕系统：捕获 Windows 正在播放的声音（直播/视频/
 语音聊天），Faster-Whisper 实时识别德语，Ollama 本地大模型翻译成中文，PyQt5
@@ -51,7 +57,7 @@ install.ps1 开头会拦住并让你换路径，但你先选对能省一趟。
 ```powershell
 git clone https://github.com/wyl2607/realtime_subtitle.git
 cd realtime_subtitle
-powershell -ExecutionPolicy Bypass -File install.ps1
+powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
 # 中国大陆网络：加 -Mirror 参数走清华 PyPI 镜像
 ```
 
@@ -171,7 +177,7 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
 1. **PyQt5 必须在 torch 之后导入**。main.py 的 import 顺序是生死攸关的：先
    PyQt5 后 torch = `WinError 1114 (c10.dll)` 100% 复现。不要"整理 imports"。
 2. **cublas64_12.dll 只认 PATH**。Windows 上 ctranslate2 按名字 LoadLibraryA
-   加载，`os.add_dll_directory()` 无效。translator_queue.py 顶部把
+   加载，`os.add_dll_directory()` 无效。realtime_subtitle/translate/translator_queue.py 顶部把
    `nvidia.cublas` pip 包的 bin 目录拼进 `os.environ["PATH"]`——这段代码
    看着像 hack，删了程序就起不来。重装 faster-whisper/ctranslate2 后若报
    找不到 dll，重装 `nvidia-cublas-cu12 nvidia-cudnn-cu12`。
@@ -201,7 +207,7 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
 10. **main.py 有单实例 Mutex**，双开会自动退出并弹提示框，这是特性不是 bug。
 11. **别在字幕运行时 benchmark 其它 Ollama 模型**：互相把对方挤出显存，测出
     来的全是重加载时间，数据无效。
-12. **音频重采样必须保持滤波器状态**。`audio_capture.py` 用
+12. **音频重采样必须保持滤波器状态**。`realtime_subtitle/capture/audio_capture.py` 用
     `soxr.ResampleStream`，不是每块调一次无状态的 `soxr.resample()`——后者
     多相滤波器状态每次归零，等于每 42ms 注入一次瞬变。实测（96k→16k、
     4096帧/块、纯音频谱能量比）：一次性重采样 90.4dB，逐块无状态只有
@@ -238,10 +244,10 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     和 test_hittest.py。
 18. 用户可见文案是中文；代码注释写"为什么"而不是"做什么"，沿用现有风格。
 19. **桌面「操作说明.txt」不要直接改**：正文的单一真相源是
-    `docs/操作说明模板.txt`（install.ps1 用它生成，`{{INSTALL_DIR}}` 会被
+    `docs/zh/user-guide-template.txt`（install.ps1 用它生成，`{{INSTALL_DIR}}` 会被
     替换成安装目录）。改说明改模板，否则下次谁跑一次 install 就被覆盖回去。
 20. **这两处看着像可优化点，实测都不是**（2026-08-02 量过，别再翻）：
-    - `streaming_asr.py` 的 `vad_filter=True` 不是"每 0.5 秒重复跑一遍的冗余
+    - `realtime_subtitle/asr/streaming_asr.py` 的 `vad_filter=True` 不是"每 0.5 秒重复跑一遍的冗余
       开销"。有语音的缓冲上它只差 ±10%（12 秒缓冲 360ms vs 328ms，文本一致）；
       12 秒纯静音缓冲上是 **17ms vs 255ms**，而且关掉后 Whisper 会吐经典德语
       幻觉 "Untertitelung des ZDF, 2020"。它是防幻觉主力，不是负担。
@@ -330,28 +336,78 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     一个近似值。加新的 Ollama 调用路径时超时一律问 `_translate_timeout()`，
     别再写 `if self._ollama_hot else` 那个二选一。
 
+26. **☠️ 挪模块时最容易漏的是函数体里的延迟 import**（2026-08-10，包化重构
+    当天）。把运行时代码挪进 `realtime_subtitle/` 包时，各测试文件**顶部**的
+    import 都改了，但函数体里那 30 多处延迟 import 一个都没动：
+
+    ```python
+    def test_xxx():
+        from translator_queue import WhisperQueueTranslator   # 已不在顶层
+        import subtitle_window as sw
+    ```
+
+    本项目到处都是这种延迟 import，而且是有意为之（避免在导入期把
+    torch/PyQt5 整条链拉起来、绕开单实例 Mutex），所以数量远多于普通项目。
+    结果是 master 的 CI 连红 6 次：ubuntu 18 failed、windows 一堆
+    `ModuleNotFoundError`。
+
+    **搜索时别只 grep 顶格的 `^import` / `^from`**，要连带缩进的一起搜：
+
+    ```powershell
+    Select-String -Path *.py,tests\*.py -Pattern '^\s+(import|from) (translator_queue|subtitle_window|config|version)\b'
+    ```
+
+    同一类还有两处不走 import 的引用，一样会漏：
+    `pathlib.Path(__file__).with_name("version.py")` 这种按相对位置找文件的
+    （测试挪进 `tests/` 之后它指向 `tests\version.py`），以及 .ps1 脚本里的
+    `python -c "import config; ..."`。
+
+27. **☠️ pytest `exit 127 + 零输出` 不止一种成因**（2026-08-10）。第 16 条记的是
+    "QApplication 被 GC → 建 QWidget 时 qFatal"，但**延迟 import 路径写错也是
+    同样的现象**：
+
+    ```
+    ..............................FF
+    ##[error]Process completed with exit code 127
+    ```
+
+    一行 traceback 都没有。当时真因是 `subtitle_window._ai_web_enabled()` 里
+    写了重构前的 `from translator_queue import ...`，被 `_show_ai_analysis`
+    调到时炸在 import 上。
+
+    **区分办法**：`python -m pytest tests/xxx.py -x --tb=short` 单文件跑一遍，
+    第一个真实失败的 traceback 就会出来（整套跑时它被后面的 qFatal 盖掉了）。
+    没有 Qt 环境时，本机 `pip install PyQt5` + `QT_QPA_PLATFORM=offscreen`
+    就能复现（torch 只要能 import，临时放个空的 `torch.py` 在 PYTHONPATH 里
+    即可，不用真下几百 MB）。
+
 ## 5. 目录地图
 
 ```
 main.py               入口：接线各模块、热键注册、单实例守卫（import 顺序敏感！）
-audio_capture.py      WASAPI Loopback 采集 + 设备热切换
-streaming_asr.py      local agreement 增量识别（词级前缀提交）
-translator_queue.py   Whisper/Ollama 持有者：切句、翻译队列、草稿、查词、术语表
-subtitle_window.py    悬浮窗主类（+ window_frame/window_chrome/subtitle_render/
+realtime_subtitle/capture/audio_capture.py      WASAPI Loopback 采集 + 设备热切换
+realtime_subtitle/asr/streaming_asr.py      local agreement 增量识别（词级前缀提交）
+realtime_subtitle/translate/translator_queue.py   Whisper/Ollama 持有者：切句、翻译队列、草稿、查词、术语表
+realtime_subtitle/ui/subtitle_window.py    悬浮窗主类（+ window_frame/window_chrome/subtitle_render/
                       window_geometry/settings_window/popups 拆分模块）
 config.py             全部默认参数（仓库文件，别为单机改它）
 config_local.py       本机覆盖（gitignore，install.ps1 生成，机器适配都写这）
-install.ps1           一键安装 + 硬件检测 + 桌面快捷方式
-update_subtitles.ps1  一键更新（git pull + 按需装依赖）
-uninstall.ps1         卸载（逐项问 Y/N，默认不删）；-CleanCache 只清下载残file
+scripts/windows/install.ps1  一键安装 + 硬件检测 + 桌面快捷方式（根目录 install.ps1 为兼容转发）
+scripts/windows/update_subtitles.ps1  一键更新（git pull + 按需装依赖）
+scripts/windows/uninstall.ps1  卸载（逐项问 Y/N，默认不删）；-CleanCache 只清下载残file
+scripts/windows/{start,stop,pause}_subtitles.ps1  启动（PID 管理/Ollama 保活）/停止/暂停
+tests/                所有 pytest 用例（三个独立 GUI 脚本套件见第 4 节第 15 条）
 requirements-dev.txt  测试依赖（pytest），只有改代码的人要装
-start/stop/pause_subtitles.ps1   启动（PID 管理/Ollama 保活）/停止/暂停
 transcripts/          字幕存档（每天一个文件）
 ```
 
+☠️ **包化之后 `import config` 不再可用**，一律写 `from realtime_subtitle import config`。
+仓库里的 .ps1 脚本已经全改过了，写新命令/新文档时别照抄旧写法（第 4 节第 26 条）。
+`config_local.py` 仍在**仓库根目录**（和 main.py 并排），不在包里面。
+
 ## 6. 装完的验收清单
 
-1. `venv\Scripts\python -c "import config; print(config.WHISPER_MODEL, config.OLLAMA_MODEL)"`
+1. `venv\Scripts\python -c "from realtime_subtitle import config; print(config.WHISPER_MODEL, config.OLLAMA_MODEL)"`
    输出与硬件档位相符。
 2. `ollama list` 里有配置对应的模型。
 3. 双击"启动字幕.bat"→ 几秒内屏幕下方出现悬浮窗（带"⏳正在加载"提示），
