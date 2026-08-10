@@ -13,8 +13,8 @@ sys.stdout.reconfigure(encoding="utf-8")
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtCore import QPoint
 
-import config
-from subtitle_window import SettingsWindow, WordPopup, _screen_area_at
+import realtime_subtitle.config as config
+from realtime_subtitle.ui.subtitle_window import SettingsWindow, WordPopup, _screen_area_at
 
 
 _APP = None  # 必须持有引用：QApplication 没引用会被立即GC，后续建QWidget触发qFatal秒退

@@ -7,9 +7,9 @@ import re
 
 import numpy as np
 
-import config
-from streaming_asr import HypothesisBuffer, OnlineASRProcessor
-from translator_queue import (
+import realtime_subtitle.config as config
+from realtime_subtitle.asr.streaming_asr import HypothesisBuffer, OnlineASRProcessor
+from realtime_subtitle.translate.translator_queue import (
     _interjection_lookup, _split_sentences, _squash_repeats,
 )
 
@@ -94,7 +94,7 @@ def test_normalize_clock_times():
       23.30 Uhr → "十一点"（丢了分钟）
       21 .43 Uhr → "0点43分"（ASR 在数字间插空格，模型彻底读歪）
     """
-    from translator_queue import _normalize_clock_times as n
+    from realtime_subtitle.translate.translator_queue import _normalize_clock_times as n
     assert n("Sonntag, 19.10 Uhr.") == "Sonntag, 19:10 Uhr."
     assert n("Heute 19 .25 Uhr im ZDF.") == "Heute 19:25 Uhr im ZDF."
     assert n("Und der andere war am 21 .43 Uhr.") == "Und der andere war am 21:43 Uhr."
@@ -114,7 +114,7 @@ def test_strip_translator_note_inline_and_trailing():
 
     实测例（2026-07 转录）：「多特蒙德（注：此处应为杜塞尔多夫）住过、干过活儿」
     """
-    from translator_queue import _strip_translator_note as s
+    from realtime_subtitle.translate.translator_queue import _strip_translator_note as s
     # 中间的（括号闭合）
     assert s("多特蒙德（注：此处应为杜塞尔多夫）住过、干过活儿") == "多特蒙德住过、干过活儿"
     # 末尾的，右括号被 num_predict 截断
@@ -288,7 +288,7 @@ def test_translation_worker_dict_shortcircuit_and_order():
     """worker级：队首感叹词词典直发、其余合并一次Ollama、上屏顺序不颠倒"""
     from collections import deque
     from threading import Lock
-    from translator_queue import WhisperQueueTranslator
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 
     t = WhisperQueueTranslator.__new__(WhisperQueueTranslator)
     t._tx_lock = Lock()
@@ -440,7 +440,7 @@ if __name__ == "__main__":
 def test_lang_switch_pending_preempts_before_audio_batch():
     """语言切换标志在 inbox 每批边界抢占：即使收件箱非空也能切，不饿死。"""
     from threading import Lock
-    from translator_queue import WhisperQueueTranslator
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 
     t = WhisperQueueTranslator.__new__(WhisperQueueTranslator)
     t._asr_lock = Lock()
@@ -487,7 +487,7 @@ def test_lang_switch_pending_preempts_before_audio_batch():
 def test_request_switch_language_sets_flag_without_starving_submit():
     """热键只写标志；识别已在跑则不另排队（避免排在 inbox 循环后饿死）。"""
     from threading import Lock
-    from translator_queue import WhisperQueueTranslator
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 
     t = WhisperQueueTranslator.__new__(WhisperQueueTranslator)
     t._asr_lock = Lock()
@@ -516,7 +516,7 @@ def test_shutdown_unloads_only_our_loaded_models(monkeypatch):
     """退出卸模型（_unload_our_models）：只卸/api/ps里确实加载着的本程序模型。
     ☠️ 对未加载的模型发 keep_alive=0 会先触发一次完整加载——所以"我们的模型
     没加载"时必须一次 post 都不发；用户自己跑的无关模型不能碰。"""
-    from translator_queue import WhisperQueueTranslator
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 
     t = WhisperQueueTranslator.__new__(WhisperQueueTranslator)
     posts = []
@@ -575,7 +575,7 @@ def _translator_for_tx(**overrides):
     OLLAMA_WARM_WAIT(60秒)，不置位的话整个测试文件会挂几分钟。"""
     from threading import Lock
     import translator_queue as tq
-    from translator_queue import WhisperQueueTranslator
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 
     tq._warm_done.set()
     t = WhisperQueueTranslator.__new__(WhisperQueueTranslator)
@@ -783,7 +783,7 @@ def test_asr_backlog_snapshot_tracks_inbox():
     """积压快照要跟着收件箱走：进队递增、被识别线程取走后清零。
     翻译线程无锁读这个 int，值不对 _translate_timeout 就会误判。"""
     from threading import Lock
-    from translator_queue import WhisperQueueTranslator
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 
     t = WhisperQueueTranslator.__new__(WhisperQueueTranslator)
     t._asr_lock = Lock()
@@ -989,7 +989,7 @@ def test_shutdown_waits_for_lookup_before_unloading():
 def test_asr_inbox_hard_cap(monkeypatch):
     """收件箱硬顶：识别线程卡死时丢最旧块保内存，正常积压不受影响"""
     from threading import Lock
-    from translator_queue import WhisperQueueTranslator
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 
     t = WhisperQueueTranslator.__new__(WhisperQueueTranslator)
     t._asr_lock = Lock()
@@ -1023,7 +1023,7 @@ def test_asr_inbox_hard_cap(monkeypatch):
 def test_translator_note_is_stripped():
     """☠️ 2026-08-02 ZDF 实测：句子被截断时模型会追加一整段"（注：建议补全
     后半句…）"到字幕条上。prompt 里已经禁止，这里是兜底剥离。"""
-    from translator_queue import _strip_translator_note
+    from realtime_subtitle.translate.translator_queue import _strip_translator_note
 
     assert _strip_translator_note(
         "美国总统特朗普就伊朗……（注：根据上下文，此处为新闻播报风格，建议补全后半句）"

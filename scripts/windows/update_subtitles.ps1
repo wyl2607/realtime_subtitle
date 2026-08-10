@@ -28,7 +28,7 @@ if (-not (Test-Path "$RepoRoot\.git")) {
 # 版本号从 version.py 里正则抠出来。刻意不调 venv 的 python：更新脚本要能在
 # venv 坏掉/还没建的时候照跑，多拉一个依赖不划算（version.py 保证是纯常量）
 function Read-LocalVersion {
-    $f = Join-Path $RepoRoot "version.py"
+    $f = Join-Path $RepoRoot "realtime_subtitle\version.py"
     if (-not (Test-Path $f)) { return "?" }
     $m = Select-String -Path $f -Pattern '^__version__\s*=\s*"([^"]+)"' | Select-Object -First 1
     if ($m) { return $m.Matches[0].Groups[1].Value }

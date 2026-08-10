@@ -13,8 +13,8 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 from PyQt5.QtWidgets import QApplication
 
-import config
-from tv_window import TVWindow
+import realtime_subtitle.config as config
+from realtime_subtitle.ui.tv_window import TVWindow
 
 
 _APP = None  # 必须持有引用：QApplication 没引用会被立即GC，后续建QWidget触发qFatal秒退
@@ -172,7 +172,7 @@ def test_subtitle_window_warms_up_tv_window_at_startup():
     import os
     import tempfile
     import subtitle_window as sw_mod
-    from subtitle_window import SubtitleWindow
+    from realtime_subtitle.ui.subtitle_window import SubtitleWindow
 
     _app()
     tmpdir = tempfile.mkdtemp()
@@ -196,7 +196,7 @@ def test_subtitle_window_integration_state_and_wiring():
     import json
     import tempfile
     import subtitle_window as sw_mod
-    from subtitle_window import SubtitleWindow
+    from realtime_subtitle.ui.subtitle_window import SubtitleWindow
 
     _app()
     tmpdir = tempfile.mkdtemp()
@@ -237,7 +237,7 @@ def test_state_restore_tv_font_size():
     import json
     import tempfile
     import subtitle_window as sw_mod
-    from subtitle_window import SubtitleWindow
+    from realtime_subtitle.ui.subtitle_window import SubtitleWindow
 
     _app()
     tmpdir = tempfile.mkdtemp()
@@ -259,7 +259,7 @@ def test_state_restore_tv_font_size():
 
 def test_main_window_font_cap_raised_to_72():
     """主窗字号上限放宽：滑块最大值 72（Ctrl+滚轮钳制与之共用同一上限，grep 核对）。"""
-    from settings_window import SettingsWindow
+    from realtime_subtitle.ui.settings_window import SettingsWindow
 
     _app()
     snap = config.FONT_SIZE

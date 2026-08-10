@@ -18,8 +18,8 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 from PyQt5.QtWidgets import QApplication
 
-import config
-from subtitle_window import SettingsWindow, TUNING_KEYS, MODE_ICONS
+import realtime_subtitle.config as config
+from realtime_subtitle.ui.subtitle_window import SettingsWindow, TUNING_KEYS, MODE_ICONS
 
 
 _APP = None  # 必须持有引用：QApplication 没引用会被立即GC，后续建QWidget触发qFatal秒退

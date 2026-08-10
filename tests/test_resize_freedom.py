@@ -9,9 +9,9 @@ import sys
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-import config
+import realtime_subtitle.config as config
 config.SHOW_PERFORMANCE = False
-from subtitle_window import SubtitleWindow
+from realtime_subtitle.ui.subtitle_window import SubtitleWindow
 
 win = SubtitleWindow()
 win.container.setGeometry(1750, 30, 700, 800)

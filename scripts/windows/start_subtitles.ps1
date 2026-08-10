@@ -66,7 +66,7 @@ if (-not (Test-OllamaReady)) {
 
 # 模型名从 config 读（config_local.py 里可能配了小模型），不要硬编码。
 # 一次 python 调用读两个值：venv python 冷启动约0.5秒，起两次纯浪费
-$cfg = @((& "$RepoRoot\venv\Scripts\python.exe" -c "import config; print(config.OLLAMA_MODEL); print(config.WHISPER_MODEL)") -split "`n" | ForEach-Object { $_.Trim() })
+$cfg = @((& "$RepoRoot\venv\Scripts\python.exe" -c "from realtime_subtitle import config; print(config.OLLAMA_MODEL); print(config.WHISPER_MODEL)") -split "`n" | ForEach-Object { $_.Trim() })
 $txModel = $cfg[0]
 
 # 首次启动检测：Whisper 模型还没下载过（HF 缓存里没有）就明确告知要等几分钟。

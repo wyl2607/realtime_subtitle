@@ -12,9 +12,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QEvent, QTimer
 from PyQt5.QtGui import QTextCursor, QTextBlockFormat, QKeySequence
-import config
-
-
+import realtime_subtitle.config as config
 class TVWindow(QWidget):
     """全屏滚动大字窗：新句从底部进入自动上滚；上翻回看时不打扰。"""
 

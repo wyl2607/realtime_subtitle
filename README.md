@@ -120,7 +120,8 @@ VRAM tiers and model picks are documented in [CLAUDE.md](CLAUDE.md).
 
 | Path | Role |
 |---|---|
-| Root `*.py` | Runtime core (capture, ASR, translate, UI) |
+| `main.py` | Thin entrypoint (`python -u main.py`) |
+| `realtime_subtitle/` | Package: `capture/`, `asr/`, `translate/`, `ui/`, `app.py` |
 | `scripts/windows/` | Install, start, stop, pause, update, uninstall |
 | `tests/` | Pytest + standalone GUI harnesses |
 | `docs/` | Design specs, Chinese notes, structure guide |

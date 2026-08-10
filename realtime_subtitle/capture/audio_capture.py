@@ -14,8 +14,7 @@ import queue
 import time
 import os
 from threading import Thread
-import config
-
+import realtime_subtitle.config as config
 # 暂停标志文件：存在则暂停捕获，不重启进程也能停/恢复识别与翻译
 PAUSE_FLAG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".paused")
 # 停止标志：stop_subtitles.ps1 创建后，主程序优雅退出（先关模型再退）

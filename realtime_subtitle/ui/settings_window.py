@@ -7,9 +7,8 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor, QFont
-import config
-
-from window_frame import DraggableWidget
+import realtime_subtitle.config as config
+from realtime_subtitle.ui.window_frame import DraggableWidget
 
 
 # 面板可调参数（存 window_state.json 的 "tuning"；FONT_SIZE/BACKGROUND_OPACITY

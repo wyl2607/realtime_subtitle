@@ -26,9 +26,8 @@ from collections import deque, OrderedDict
 
 import requests
 
-from streaming_asr import OnlineASRProcessor
-import config
-
+from realtime_subtitle.asr.streaming_asr import OnlineASRProcessor
+import realtime_subtitle.config as config
 # 过滤所有警告信息
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)

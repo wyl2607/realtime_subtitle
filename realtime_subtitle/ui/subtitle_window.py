@@ -28,21 +28,20 @@ from PyQt5.QtCore import (
     Qt, pyqtSignal, QObject, QTimer, QPropertyAnimation, QEasingCurve,
 )
 from PyQt5.QtGui import QFont
-import config
-
-from window_geometry import (
+import realtime_subtitle.config as config
+from realtime_subtitle.ui.window_geometry import (
     _screen_area_at, _clamp_geo_to_area, _clamp_geo_to_any_screen,
     default_geometry, screen_scale_factor,
 )
-from window_frame import ResizableFramelessWidget
-from settings_window import (
+from realtime_subtitle.ui.window_frame import ResizableFramelessWidget
+from realtime_subtitle.ui.settings_window import (
     SettingsWindow, TUNING_KEYS, MODE_ICONS,
     apply_tuning, collect_tuning, apply_text_color, snapshot_defaults,
 )
-from popups import HistoryWindow, WordPopup, AIAnalysisPopup
-from tv_window import TVWindow
-from window_chrome import WindowChromeMixin
-from subtitle_render import LiveTextRenderMixin
+from realtime_subtitle.ui.popups import HistoryWindow, WordPopup, AIAnalysisPopup
+from realtime_subtitle.ui.tv_window import TVWindow
+from realtime_subtitle.ui.window_chrome import WindowChromeMixin
+from realtime_subtitle.ui.subtitle_render import LiveTextRenderMixin
 
 if sys.platform == "win32":
     import ctypes
@@ -673,7 +672,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
 
     def _on_ai_analysis_clicked(self):
         """🤖：过滤最近 N 分钟德文 → 本地总结；空内容直接提示不打 Ollama。"""
-        from translator_queue import (
+        from realtime_subtitle.translate.translator_queue import (
             filter_recent_german_context,
             build_web_query_for_background,
         )
@@ -724,7 +723,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         if seq != self._ai_analysis_seq:
             return
         import html as _html
-        from translator_queue import build_web_query_for_background
+        from realtime_subtitle.translate.translator_queue import build_web_query_for_background
         body = _html.escape(text).replace("\n", "<br>")
         web_q = build_web_query_for_background(self._ai_context_text)
         self.ai_analysis_popup.update_content(
@@ -738,7 +737,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
     def _on_word_deep_explain(self, context):
         """WordPopup「深度解释」按钮：先改成加载态，再丢给 translator。"""
         import html as _html
-        from translator_queue import build_web_query_for_sentence
+        from realtime_subtitle.translate.translator_queue import build_web_query_for_sentence
         ctx = (context or "").strip()
         if not ctx:
             self.word_popup.update_content(
@@ -778,7 +777,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         if seq != self._deep_explain_seq:
             return
         import html as _html
-        from translator_queue import build_web_query_for_sentence
+        from realtime_subtitle.translate.translator_queue import build_web_query_for_sentence
         body = _html.escape(text).replace("\n", "<br>")
         ctx = getattr(self.word_popup, "_context", "") or ""
         self.word_popup.update_content(
@@ -792,7 +791,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
     def _open_ai_web(self, prompt_text):
         """跳网页版更强 AI；失败只 status 提一句，不弹阻塞框。"""
         import webbrowser
-        from translator_queue import build_ai_web_url
+        from realtime_subtitle.translate.translator_queue import build_ai_web_url
         q = (prompt_text or "").strip()
         if not q:
             self.show_status("没有可追问的内容")

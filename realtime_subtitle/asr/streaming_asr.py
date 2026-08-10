@@ -15,8 +15,7 @@ Local Agreement 增量识别（移植自 ufal/whisper_streaming, MIT License）
 """
 import re
 import numpy as np
-import config
-
+import realtime_subtitle.config as config
 # 语言误锁检测用的高频功能词（小写、整词匹配）。集合刻意窄，宁漏勿错：
 # 判定只用于"是否把已提交文本喂回 prompt"，漏判无害（下次再判），
 # 误判会丢掉正确的上下文

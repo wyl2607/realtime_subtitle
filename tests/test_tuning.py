@@ -15,8 +15,8 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 from PyQt5.QtWidgets import QApplication
 
-import config
-from subtitle_window import (
+import realtime_subtitle.config as config
+from realtime_subtitle.ui.subtitle_window import (
     SettingsWindow,
     TUNING_KEYS,
     apply_tuning,
@@ -348,7 +348,7 @@ def test_apply_color_writes_config_without_dialog():
 def test_pair_html_uses_chinese_text_color():
     """_pair_html 读 config.CHINESE_TEXT_COLOR，不再硬编码 #c8c8c8。"""
     _app()
-    from subtitle_window import SubtitleWindow
+    from realtime_subtitle.ui.subtitle_window import SubtitleWindow
 
     snap = _snap_keys("CHINESE_TEXT_COLOR", "SHOW_BILINGUAL")
     try:

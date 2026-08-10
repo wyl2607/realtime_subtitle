@@ -138,7 +138,7 @@ if ($CleanCache) {
 $txModel = $null
 $vpy = "$RepoRoot\venv\Scripts\python.exe"
 if (Test-Path $vpy) {
-    try { $txModel = (& $vpy -c "import config; print(config.OLLAMA_MODEL)" 2>$null).Trim() } catch { }
+    try { $txModel = (& $vpy -c "from realtime_subtitle import config; print(config.OLLAMA_MODEL)" 2>$null).Trim() } catch { }
 }
 if (-not $txModel) {
     Write-Host "  ℹ️ 读不到配置里的翻译模型名（venv 可能已删），到时候手动选"

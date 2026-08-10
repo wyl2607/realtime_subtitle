@@ -120,7 +120,8 @@ VRAM-Stufen und Modellwahl: [CLAUDE.md](CLAUDE.md).
 
 | Pfad | Rolle |
 |---|---|
-| Root-`*.py` | Laufzeitkern (Capture, ASR, Translate, UI) |
+| `main.py` | Einstieg (`python -u main.py`) |
+| `realtime_subtitle/` | Paket: `capture/`, `asr/`, `translate/`, `ui/`, `app.py` |
 | `scripts/windows/` | Install, Start, Stop, Pause, Update, Uninstall |
 | `tests/` | Pytest + manuelle GUI-Suites |
 | `docs/` | Design, chinesische Notizen, Struktur |

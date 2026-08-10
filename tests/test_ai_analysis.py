@@ -15,8 +15,8 @@ from PyQt5.QtWidgets import QApplication
 from PyQt5.QtCore import QPoint, Qt
 from PyQt5.QtTest import QTest
 
-import config
-from translator_queue import (
+import realtime_subtitle.config as config
+from realtime_subtitle.translate.translator_queue import (
     filter_recent_german_context,
     build_background_summary_prompt,
     build_deep_explain_prompt,
@@ -25,7 +25,7 @@ from translator_queue import (
     build_ai_web_url,
     AI_WEB_FRAGMENT_MAX_CHARS,
 )
-from popups import WordPopup, AIAnalysisPopup
+from realtime_subtitle.ui.popups import WordPopup, AIAnalysisPopup
 
 
 _APP = None  # 必须持有引用：QApplication 没引用会被立即GC，后续建QWidget触发qFatal秒退
@@ -257,7 +257,7 @@ def test_analyze_background_and_deep_explain_use_separate_executor():
     词"时，查词会在线程池队列里干等最多 30 秒才发得出去——_lookup_stale 只能
     让排队中的请求最后不发，取消不了队头阻塞。
     """
-    from translator_queue import WhisperQueueTranslator
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
     # 不真正构造完整 translator（会加载模型）；只测方法绑定 + submit 目标
     t = object.__new__(WhisperQueueTranslator)
     t.closing = False
@@ -303,7 +303,7 @@ def test_analyze_background_and_deep_explain_use_separate_executor():
 
 def _draft_ready_translator():
     """构造一个满足 _maybe_draft 除 _lookup_inflight 外全部"应该出草稿"条件的假 translator。"""
-    from translator_queue import WhisperQueueTranslator
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
     from threading import Lock
     t = object.__new__(WhisperQueueTranslator)
     t.on_draft = lambda *a: None
@@ -334,9 +334,9 @@ def _draft_ready_translator():
 
 
 def test_maybe_draft_skips_when_lookup_inflight(monkeypatch):
-    import config
+    import realtime_subtitle.config as config
     monkeypatch.setattr(config, "DRAFT_TRANSLATION", True)
-    from translator_queue import WhisperQueueTranslator
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 
     t = _draft_ready_translator()
     t._lookup_inflight = True
@@ -349,9 +349,9 @@ def test_maybe_draft_runs_when_lookup_not_inflight(monkeypatch):
 
     证明上一个测试真的是被 _lookup_inflight 挡住的，不是被其它前置条件挡住的。
     """
-    import config
+    import realtime_subtitle.config as config
     monkeypatch.setattr(config, "DRAFT_TRANSLATION", True)
-    from translator_queue import WhisperQueueTranslator
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 
     t = _draft_ready_translator()
     assert t._lookup_inflight is False
@@ -381,7 +381,7 @@ class _FakeStreamResponse:
 
 def _lookup_translator():
     """够 _lookup_worker 跑起来的最小假 translator"""
-    from translator_queue import WhisperQueueTranslator
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
     t = object.__new__(WhisperQueueTranslator)
     t.closing = False
     t._lookup_inflight = False
@@ -396,7 +396,7 @@ def _lookup_translator():
 
 def test_lookup_worker_sets_and_clears_inflight_flag():
     """_lookup_worker 请求期间 _lookup_inflight 应为 True，结束后必须清回 False。"""
-    from translator_queue import WhisperQueueTranslator
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 
     t = _lookup_translator()
     seen_inflight_during_call = []
@@ -420,7 +420,7 @@ def test_lookup_worker_sets_and_clears_inflight_flag():
 
 def test_lookup_worker_uses_reduced_num_predict():
     """算力收敛（2026-08-04实测）：查词 num_predict 220→170。"""
-    from translator_queue import WhisperQueueTranslator
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 
     t = _lookup_translator()
     posted = []
@@ -446,7 +446,7 @@ def test_lookup_worker_shares_num_ctx_with_translation():
     单次查词 10.4~12.5 秒。统一成 config.OLLAMA_NUM_CTX 之后 load_duration
     0.27 秒、单次查词 3.3~4.0 秒。
     """
-    from translator_queue import WhisperQueueTranslator
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 
     t = _lookup_translator()
     posted = []
@@ -466,7 +466,7 @@ def test_lookup_worker_shares_num_ctx_with_translation():
 
 def test_lookup_worker_streams_partial_lines_only():
     """流式 partial 按【整行】推：查词是四行固定格式，按 token 推弹窗会抖。"""
-    from translator_queue import WhisperQueueTranslator
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 
     t = _lookup_translator()
     # 每块之间插足够的时间间隔，绕过 0.15 秒节流
@@ -520,7 +520,7 @@ def test_cache_hit_still_bumps_seq_so_inflight_lookup_expires():
       4. A 一行行把 B 盖掉，用户看到刚点的 B 变回了 A
     缓存现在是 800 条且跨会话持久化，这条路径只会更常走。
     """
-    from translator_queue import WhisperQueueTranslator
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 
     t = _lookup_translator()
     t._lookup_seq = 0  # _lookup_translator 默认给 1，这里从 0 数更好读
@@ -555,7 +555,7 @@ def test_lookup_and_analysis_use_separate_http_sessions():
     查词和 AI 分析拆成两个 executor 之后就能真并发了（之前共用一个
     max_workers=1 的池所以天然串行）。共用 lookup_session 是拆池带来的回归。
     """
-    from translator_queue import WhisperQueueTranslator
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 
     t = object.__new__(WhisperQueueTranslator)
     t.closing = False
@@ -589,7 +589,7 @@ def test_inflight_is_a_counter_not_a_bool():
     交错：分析开始(True) → 查词开始(True) → 查词结束(False)
     → 分析还在飞，草稿却已经恢复抢卡。必须用计数器。
     """
-    from translator_queue import WhisperQueueTranslator
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
     from threading import Lock
 
     t = object.__new__(WhisperQueueTranslator)
@@ -629,7 +629,7 @@ def test_ollama_base_url_is_ipv4_literal():
 def test_warn_if_ipv6_first_host_flags_localhost(monkeypatch):
     """兜底告警：有人在 config_local.py 写回 localhost 时要吼一声。"""
     import socket as _socket
-    from translator_queue import _warn_if_ipv6_first_host
+    from realtime_subtitle.translate.translator_queue import _warn_if_ipv6_first_host
 
     def fake_getaddrinfo(host, *a, **kw):
         if host == "localhost":  # Windows 上的真实顺序：IPv6 在前
@@ -651,7 +651,7 @@ def test_warn_if_ipv6_first_host_flags_localhost(monkeypatch):
 
 def test_lookup_cache_roundtrips_through_disk(tmp_path, monkeypatch):
     """查词缓存跨会话持久化：写盘再读回内容和 LRU 顺序都要一致。"""
-    from translator_queue import WhisperQueueTranslator
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 
     monkeypatch.setattr(config, "LOOKUP_CACHE_FILE", "lookup_cache.json",
                         raising=False)
@@ -672,7 +672,7 @@ def test_lookup_cache_roundtrips_through_disk(tmp_path, monkeypatch):
 
 def test_lookup_cache_survives_corrupt_file(tmp_path, monkeypatch):
     """☠️ 缓存是纯加速件，文件坏了只能当空缓存，绝不能挡住启动。"""
-    from translator_queue import WhisperQueueTranslator
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 
     path = tmp_path / "lookup_cache.json"
     path.write_text("{ 这不是合法 JSON", encoding="utf-8")
@@ -687,7 +687,7 @@ def test_lookup_cache_survives_corrupt_file(tmp_path, monkeypatch):
 def test_lookup_cache_respects_max_on_load(tmp_path, monkeypatch):
     """旧文件比现在的容量大时，读回来也要裁到上限（丢最旧的）。"""
     import json as _json
-    from translator_queue import WhisperQueueTranslator
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 
     path = tmp_path / "lookup_cache.json"
     rows = [[f"wort{i}", "de", f"释义{i}", "ctx"] for i in range(10)]
@@ -704,7 +704,7 @@ def test_lookup_cache_respects_max_on_load(tmp_path, monkeypatch):
 
 def test_run_ai_analysis_request_sets_and_clears_inflight_flag_even_on_failure():
     """failure 路径（HTTP非200/异常）也必须清 flag，否则一次失败就把草稿卡死。"""
-    from translator_queue import WhisperQueueTranslator
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 
     t = object.__new__(WhisperQueueTranslator)
     t.closing = False
@@ -733,7 +733,7 @@ def test_run_ai_analysis_request_sets_and_clears_inflight_flag_even_on_failure()
 
 def _ai_gate_stub():
     """轻量 stub：绑定真实 _show_* / show_*_result，假 popup 记更新。"""
-    from subtitle_window import SubtitleWindow, SubtitleSignals
+    from realtime_subtitle.ui.subtitle_window import SubtitleWindow, SubtitleSignals
 
     class _Popup:
         def __init__(self):
@@ -826,7 +826,7 @@ def test_on_ai_analysis_clicked_bumps_seq_and_shows_web_while_loading():
     """发起背景总结：seq+1、分析中 show_web=True、回调带捕获的 seq。"""
     import time
     from PyQt5.QtCore import QRect, QPoint
-    from subtitle_window import SubtitleWindow
+    from realtime_subtitle.ui.subtitle_window import SubtitleWindow
 
     app = _app()
     w = _ai_gate_stub()
@@ -866,7 +866,7 @@ def test_on_ai_analysis_clicked_bumps_seq_and_shows_web_while_loading():
 
 
 def test_on_word_deep_explain_bumps_seq_and_shows_web_while_loading():
-    from subtitle_window import SubtitleWindow
+    from realtime_subtitle.ui.subtitle_window import SubtitleWindow
 
     app = _app()
     w = _ai_gate_stub()
@@ -892,7 +892,7 @@ def test_on_word_deep_explain_bumps_seq_and_shows_web_while_loading():
 
 def test_ai_workers_use_reduced_num_predict():
     """算力收敛：背景总结 300、深度解释 400（不再用 400/600）。"""
-    from translator_queue import WhisperQueueTranslator
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 
     t = object.__new__(WhisperQueueTranslator)
     t.closing = False

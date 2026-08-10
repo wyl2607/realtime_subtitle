@@ -94,7 +94,7 @@ if ($ollamaUp) {
         Write-Host "查询 Ollama 已加载模型失败，跳过卸载（显存最多占用到 keep_alive 到期）"
     }
     if ($psOk -and $loaded) {
-        $models = & "$RepoRoot\venv\Scripts\python.exe" -c "import config; print(config.OLLAMA_MODEL); print(config.GAME_MODE_OLLAMA_MODEL)" 2>$null
+        $models = & "$RepoRoot\venv\Scripts\python.exe" -c "from realtime_subtitle import config; print(config.OLLAMA_MODEL); print(config.GAME_MODE_OLLAMA_MODEL)" 2>$null
         foreach ($m in ($models -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique)) {
             # 名字精确匹配 + 前缀匹配：config 写 "qwen3.5" 时 /api/ps 可能报
             # "qwen3.5:latest"，只做 -contains 会漏卸

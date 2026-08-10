@@ -1,62 +1,53 @@
 # Repository layout
 
-Graded layout (2026-08). Runtime Python modules stay at the **repository root** so the Windows install path, `main.py` entrypoint, and import graph stay simple (`import config`, `from audio_capture import …`). Ops scripts and tests are separated by responsibility.
+Graded layout (2026-08). Runtime code lives in the **`realtime_subtitle/` package** by domain. Root only keeps the Windows entrypoint `main.py` and personal/runtime artifacts.
 
 ```text
-realtime_subtitle/
-├── main.py                 # Application entry (keep at root)
-├── config.py, version.py   # Config + version single source of truth
-├── audio_capture.py        # WASAPI loopback capture
-├── streaming_asr.py        # Local-agreement streaming ASR
-├── translator_queue.py     # Whisper + Ollama pipeline
-├── subtitle_*.py, window_*, tv_window.py, popups.py, settings_window.py
-├── install.ps1             # Thin shim → scripts/windows/install.ps1
-├── scripts/
-│   └── windows/            # Install / start / stop / pause / update / uninstall
-├── tests/                  # Pytest + standalone GUI script suites
+realtime_subtitle/                 # install root (clone path)
+├── main.py                        # thin entry → realtime_subtitle.app:main
+├── realtime_subtitle/             # Python package
+│   ├── config.py, version.py
+│   ├── app.py                     # SubtitleApp orchestration
+│   ├── capture/audio_capture.py   # WASAPI loopback
+│   ├── asr/streaming_asr.py       # local-agreement streaming ASR
+│   ├── translate/translator_queue.py
+│   └── ui/                        # overlay, settings, popups, TV, chrome
+├── scripts/windows/               # install / start / stop / pause / update / uninstall
+├── tests/
 ├── docs/
-│   ├── STRUCTURE.md        # This file
-│   ├── zh/                 # Chinese notes & user templates
-│   ├── design/             # Design specs / plans
-│   ├── en/                 # English extra docs (optional)
-│   └── de/                 # German extra docs (optional)
-├── README.md               # English (primary public README)
-├── README.de.md            # German
-├── README.zh.md            # Chinese
-└── CLAUDE.md               # AI install / ops playbook
+├── README.md · README.de.md · README.zh.md
+└── CLAUDE.md
 ```
 
 ## Grades
 
 | Grade | Path | Purpose |
 |-------|------|---------|
-| **A – Runtime core** | Root `*.py` | Required to run the subtitle app |
-| **B – Windows ops** | `scripts/windows/` | Install, update, lifecycle on Windows |
-| **C – Quality** | `tests/` | Unit tests + manual GUI harnesses |
+| **A – Runtime core** | `realtime_subtitle/` package | Required to run the app |
+| **B – Windows ops** | `scripts/windows/` | Install and lifecycle |
+| **C – Quality** | `tests/` | Pytest + GUI harnesses |
 | **D – Docs** | `docs/`, `README*.md` | Human + AI documentation |
 
-## Why core stays at root
+## Imports
 
-Moving Python modules into `src/` would force a large import rewrite and break:
+```python
+from realtime_subtitle import config
+from realtime_subtitle.capture import AudioCapture
+from realtime_subtitle.translate import WhisperQueueTranslator
+from realtime_subtitle.ui.subtitle_window import SubtitleWindow
+```
 
-- desktop shortcuts that run `python main.py` from the install directory
-- `install.ps1` import smoke tests
-- the critical **torch-before-PyQt5** import order documented in `main.py`
-
-A future package layout is tracked as a separate issue.
+Personal overrides stay at **repo root**: `config_local.py` (loaded by `realtime_subtitle.config`).
 
 ## Script entrypoints
 
 ```powershell
-# Preferred (after clone)
 powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
-
-# Still works (root shim)
+# root shim still works:
 powershell -ExecutionPolicy Bypass -File install.ps1
+venv\Scripts\python -u main.py
 ```
-
-Inside `scripts/windows/*.ps1`, `$RepoRoot` is the repository root (`Parent.Parent` of the script directory).
 
 ## Multi-language READMEs
 
-See [README-i18n.md](README-i18n.md) (EN / DE / ZH sync policy).
+See [README-i18n.md](README-i18n.md).

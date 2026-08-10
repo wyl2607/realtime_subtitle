@@ -15,8 +15,8 @@ import sys
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-import config
-from window_geometry import default_geometry
+import realtime_subtitle.config as config
+from realtime_subtitle.ui.window_geometry import default_geometry
 
 
 # 真实机型的可用区（availableGeometry，已排除任务栏）

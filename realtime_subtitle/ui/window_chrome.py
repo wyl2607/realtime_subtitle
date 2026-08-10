@@ -3,9 +3,8 @@
 Ctrl+滚轮调字号、样式表刷新。以mixin形式并入 SubtitleWindow。
 """
 from PyQt5.QtCore import Qt
-import config
-
-from window_frame import ResizableFramelessWidget
+import realtime_subtitle.config as config
+from realtime_subtitle.ui.window_frame import ResizableFramelessWidget
 
 
 class WindowChromeMixin:

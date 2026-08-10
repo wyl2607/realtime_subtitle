@@ -363,6 +363,16 @@ STATS_SUMMARY_INTERVAL = 60
 # （WHISPER_DEVICE="cpu" 等降级配置）；个人调参也可以写在那里，
 # 不污染仓库文件（config_local.py 在 .gitignore 里）
 try:
-    from config_local import *  # noqa: F401,F403
-except ImportError:
+    # config_local.py lives at the repo root (next to main.py), not inside the package
+    import importlib.util
+    from pathlib import Path as _Path
+    _root = _Path(__file__).resolve().parents[1]
+    _local = _root / "config_local.py"
+    if _local.is_file():
+        _spec = importlib.util.spec_from_file_location("config_local", _local)
+        _mod = importlib.util.module_from_spec(_spec)
+        assert _spec.loader is not None
+        _spec.loader.exec_module(_mod)
+        globals().update({k: v for k, v in vars(_mod).items() if not k.startswith("_")})
+except Exception:
     pass

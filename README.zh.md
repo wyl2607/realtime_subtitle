@@ -120,7 +120,8 @@ GLOSSARY = {...}
 
 | 路径 | 职责 |
 |---|---|
-| 根目录 `*.py` | 运行时核心（采集 / 识别 / 翻译 / UI） |
+| `main.py` | 入口（`python -u main.py`） |
+| `realtime_subtitle/` | 包：`capture/` `asr/` `translate/` `ui/` `app.py` |
 | `scripts/windows/` | 安装、启动、停止、暂停、更新、卸载 |
 | `tests/` | 单元测试 + 独立 GUI 脚本套件 |
 | `docs/` | 设计文档、中文笔记 |

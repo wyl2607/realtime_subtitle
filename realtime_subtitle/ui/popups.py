@@ -5,9 +5,8 @@ import html
 import time
 from PyQt5.QtWidgets import QLabel, QWidget, QVBoxLayout, QTextEdit, QPushButton
 from PyQt5.QtCore import Qt
-import config
-
-from window_geometry import _screen_area_at
+import realtime_subtitle.config as config
+from realtime_subtitle.ui.window_geometry import _screen_area_at
 
 
 # 弹窗内操作按钮共用样式（深色半透明，压在圆角框里不抢戏）

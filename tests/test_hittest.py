@@ -9,7 +9,7 @@ from ctypes import wintypes
 
 sys.stdout.reconfigure(encoding="utf-8")
 from PyQt5.QtWidgets import QApplication, QLabel
-from subtitle_window import ResizableFramelessWidget
+from realtime_subtitle.ui.subtitle_window import ResizableFramelessWidget
 from PyQt5.QtCore import Qt
 
 app = QApplication(sys.argv)

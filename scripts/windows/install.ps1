@@ -289,8 +289,8 @@ if (-not (Test-OllamaReady)) {
 }
 # 模型名从「最终生效的配置」里读（config.py + 刚生成的 config_local.py），
 # 保证脚本和程序运行时用的一定是同一个模型，不会各说各话
-$txModel = (& $vpy -c "import config; print(config.OLLAMA_MODEL)").Trim()
-$gameModel = (& $vpy -c "import config; print(config.GAME_MODE_OLLAMA_MODEL or '')").Trim()
+$txModel = (& $vpy -c "from realtime_subtitle import config; print(config.OLLAMA_MODEL)").Trim()
+$gameModel = (& $vpy -c "from realtime_subtitle import config; print(config.GAME_MODE_OLLAMA_MODEL or '')").Trim()
 $installed = @()
 try { $installed = (Invoke-RestMethod -Uri "http://127.0.0.1:11434/api/tags").models.name } catch { }
 foreach ($m in @($txModel, $gameModel) | Where-Object { $_ } | Select-Object -Unique) {
@@ -370,8 +370,10 @@ Write-Host "  ✅ 快捷方式已生成: $shortcutDir"
 # 装得好好的机器上误报失败。
 Write-Host "[6/6] 验证安装..."
 $smokeCode = @"
-import config, torch, PyQt5.QtWidgets, pyaudiowpatch, soxr
-import translator_queue
+import torch
+from realtime_subtitle import config
+import PyQt5.QtWidgets, pyaudiowpatch, soxr
+from realtime_subtitle.translate import translator_queue
 translator_queue._ensure_ml_deps()
 print('SMOKE_OK', config.WHISPER_MODEL, config.WHISPER_COMPUTE_TYPE, config.OLLAMA_MODEL)
 "@

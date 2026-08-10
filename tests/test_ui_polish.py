@@ -16,9 +16,9 @@ sys.stdout.reconfigure(encoding="utf-8")
 from PyQt5.QtWidgets import QApplication, QGraphicsOpacityEffect
 from PyQt5.QtCore import QPropertyAnimation
 
-import config
-import subtitle_window
-from subtitle_window import SubtitleWindow
+import realtime_subtitle.config as config
+import realtime_subtitle.ui.subtitle_window as subtitle_window
+from realtime_subtitle.ui.subtitle_window import SubtitleWindow
 
 
 _APP = None  # 必须持有引用：QApplication 没引用会被立即GC，后续建QWidget触发qFatal秒退

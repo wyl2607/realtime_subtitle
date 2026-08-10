@@ -14,12 +14,12 @@ _orig_getlast = ctypes.windll.kernel32.GetLastError
 ctypes.windll.kernel32.CreateMutexW = lambda *a: 1
 ctypes.windll.kernel32.GetLastError = lambda: 0
 try:
-    import main  # noqa: E402  重量级但只 import 模块，不实例化
+    import realtime_subtitle.app as main  # noqa: E402  重量级但只 import 模块，不实例化
 finally:
     ctypes.windll.kernel32.CreateMutexW = _orig_create
     ctypes.windll.kernel32.GetLastError = _orig_getlast
 
-import config  # noqa: E402
+import realtime_subtitle.config as config  # noqa: E402
 
 
 class _FakeWindow:

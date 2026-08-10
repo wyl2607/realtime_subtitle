@@ -4,9 +4,7 @@
 """
 from PyQt5.QtWidgets import QApplication
 
-import config
-
-
+import realtime_subtitle.config as config
 def _screen_area_at(global_pos):
     """global_pos 所在屏的 availableGeometry；screenAt 失败时退回主屏。"""
     screen = QApplication.screenAt(global_pos)

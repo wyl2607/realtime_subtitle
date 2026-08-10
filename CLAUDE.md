@@ -1,5 +1,8 @@
 # CLAUDE.md
 
+> 运行时代码在包 `realtime_subtitle/`（capture / asr / translate / ui）。入口仍是根目录 `main.py`。
+
+
 > 目录分级见 [docs/STRUCTURE.md](docs/STRUCTURE.md)；Windows 脚本在 `scripts/windows/`。
  — 给接手这台电脑的 AI 助手（Claude Code 等）
 
@@ -174,7 +177,7 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
 1. **PyQt5 必须在 torch 之后导入**。main.py 的 import 顺序是生死攸关的：先
    PyQt5 后 torch = `WinError 1114 (c10.dll)` 100% 复现。不要"整理 imports"。
 2. **cublas64_12.dll 只认 PATH**。Windows 上 ctranslate2 按名字 LoadLibraryA
-   加载，`os.add_dll_directory()` 无效。translator_queue.py 顶部把
+   加载，`os.add_dll_directory()` 无效。realtime_subtitle/translate/translator_queue.py 顶部把
    `nvidia.cublas` pip 包的 bin 目录拼进 `os.environ["PATH"]`——这段代码
    看着像 hack，删了程序就起不来。重装 faster-whisper/ctranslate2 后若报
    找不到 dll，重装 `nvidia-cublas-cu12 nvidia-cudnn-cu12`。
@@ -204,7 +207,7 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
 10. **main.py 有单实例 Mutex**，双开会自动退出并弹提示框，这是特性不是 bug。
 11. **别在字幕运行时 benchmark 其它 Ollama 模型**：互相把对方挤出显存，测出
     来的全是重加载时间，数据无效。
-12. **音频重采样必须保持滤波器状态**。`audio_capture.py` 用
+12. **音频重采样必须保持滤波器状态**。`realtime_subtitle/capture/audio_capture.py` 用
     `soxr.ResampleStream`，不是每块调一次无状态的 `soxr.resample()`——后者
     多相滤波器状态每次归零，等于每 42ms 注入一次瞬变。实测（96k→16k、
     4096帧/块、纯音频谱能量比）：一次性重采样 90.4dB，逐块无状态只有
@@ -244,7 +247,7 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     `docs/zh/user-guide-template.txt`（install.ps1 用它生成，`{{INSTALL_DIR}}` 会被
     替换成安装目录）。改说明改模板，否则下次谁跑一次 install 就被覆盖回去。
 20. **这两处看着像可优化点，实测都不是**（2026-08-02 量过，别再翻）：
-    - `streaming_asr.py` 的 `vad_filter=True` 不是"每 0.5 秒重复跑一遍的冗余
+    - `realtime_subtitle/asr/streaming_asr.py` 的 `vad_filter=True` 不是"每 0.5 秒重复跑一遍的冗余
       开销"。有语音的缓冲上它只差 ±10%（12 秒缓冲 360ms vs 328ms，文本一致）；
       12 秒纯静音缓冲上是 **17ms vs 255ms**，而且关掉后 Whisper 会吐经典德语
       幻觉 "Untertitelung des ZDF, 2020"。它是防幻觉主力，不是负担。
@@ -337,10 +340,10 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
 
 ```
 main.py               入口：接线各模块、热键注册、单实例守卫（import 顺序敏感！）
-audio_capture.py      WASAPI Loopback 采集 + 设备热切换
-streaming_asr.py      local agreement 增量识别（词级前缀提交）
-translator_queue.py   Whisper/Ollama 持有者：切句、翻译队列、草稿、查词、术语表
-subtitle_window.py    悬浮窗主类（+ window_frame/window_chrome/subtitle_render/
+realtime_subtitle/capture/audio_capture.py      WASAPI Loopback 采集 + 设备热切换
+realtime_subtitle/asr/streaming_asr.py      local agreement 增量识别（词级前缀提交）
+realtime_subtitle/translate/translator_queue.py   Whisper/Ollama 持有者：切句、翻译队列、草稿、查词、术语表
+realtime_subtitle/ui/subtitle_window.py    悬浮窗主类（+ window_frame/window_chrome/subtitle_render/
                       window_geometry/settings_window/popups 拆分模块）
 config.py             全部默认参数（仓库文件，别为单机改它）
 config_local.py       本机覆盖（gitignore，install.ps1 生成，机器适配都写这）

@@ -5,9 +5,7 @@ HTML/QTextDocument构建 + 点词查词命中测试。以mixin形式并入 Subti
 import html
 import time
 from PyQt5.QtCore import Qt
-import config
-
-
+import realtime_subtitle.config as config
 class LiveTextRenderMixin:
 
     def update_live(self, committed, unstable):
