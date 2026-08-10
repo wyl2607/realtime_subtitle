@@ -111,15 +111,32 @@ class TVWindow(QWidget):
         """内容不够填满一屏时，把空白挪到顶部，让文字贴着屏幕底部生长
         （用户要的"电视上从下往上滚动"观感——默认 QTextEdit 顶对齐，句子少时
         会孤零零挤在左上角一小块，底下一片黑，没有"从下往上升起"的感觉）。
-        内容一旦超过一屏，留白归零，交给正常滚动接管。"""
+        内容一旦超过一屏，留白归零，交给正常滚动接管。
+
+        ☠️ setFrameFormat 会让整篇文档的布局失效。本函数在流式草稿期间约每
+        0.15 秒被调一次（update_draft），文档最多 2000 个 block、字号最大
+        160px——而稳态（看了一会儿之后内容早就超过一屏）留白**恒为 0**，
+        原来那套无条件"清零→测量→回填"等于每次白白让整篇文档重排两遍。
+        当前留白已经是 0 时，文档高度就是真实内容高度，可以直接测、直接判，
+        稳态下一次 setFrameFormat 都不用做。
+        """
         doc = self.text.document()
         root = doc.rootFrame()
         fmt = root.frameFormat()
-        fmt.setTopMargin(0)
-        root.setFrameFormat(fmt)  # 先清零再测量，否则上次的留白会被计入内容高度形成正反馈
         viewport_h = self.text.viewport().height()
-        content_h = doc.size().height()
-        pad = max(0, viewport_h - content_h)
+
+        if not fmt.topMargin():
+            # 没有留白：doc.size() 就是真实内容高度，不用先清零
+            pad = max(0, viewport_h - doc.size().height())
+            if pad:
+                fmt.setTopMargin(pad)
+                root.setFrameFormat(fmt)
+            return
+
+        # 有留白：必须先清零再测量，否则上次的留白会被计入内容高度形成正反馈
+        fmt.setTopMargin(0)
+        root.setFrameFormat(fmt)
+        pad = max(0, viewport_h - doc.size().height())
         if pad:
             fmt.setTopMargin(pad)
             root.setFrameFormat(fmt)
