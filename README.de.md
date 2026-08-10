@@ -57,6 +57,8 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
 
 Das Setup prüft Pfad und Python, erkennt NVIDIA-VRAM (sonst CPU-Profil), legt ein venv an, installiert Abhängigkeiten, führt durch Ollama und legt Desktop-Shortcuts an.
 
+Fehlt Ollama, bietet das Setup **`winget install --id Ollama.Ollama -e`** an (Suche über übliche Installationspfade). Ablehnen öffnet die Download-Seite.
+
 Beim ersten Start wird das Whisper-Modell geladen (~1,6 GB).
 
 **KI-gestützte Installation:** Agent anweisen, dieses Repo zu klonen und [CLAUDE.md](CLAUDE.md) (Hardware-Stufen, Fallstricke) zu folgen.

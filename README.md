@@ -57,6 +57,8 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
 
 The installer checks the path and Python, detects NVIDIA VRAM (or falls back to CPU), creates a venv, installs dependencies, guides Ollama setup, and writes desktop shortcuts under **“德语直播实时字幕”** (start / stop / pause / update / uninstall).
 
+If Ollama is missing, the installer offers **`winget install --id Ollama.Ollama -e`** (finds the binary via common paths; PATH need not refresh). Decline to open the download page instead.
+
 First launch downloads the Whisper model (~1.6 GB).
 
 **AI-assisted install:** ask an agent to clone this repo and follow [CLAUDE.md](CLAUDE.md) for hardware tiers and known pitfalls.
