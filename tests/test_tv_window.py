@@ -171,7 +171,7 @@ def test_subtitle_window_warms_up_tv_window_at_startup():
     进程内首次全屏转场的 400-500ms 卡顿（见 warm_up 的调试记录）。"""
     import os
     import tempfile
-    import subtitle_window as sw_mod
+    import realtime_subtitle.ui.subtitle_window as sw_mod
     from realtime_subtitle.ui.subtitle_window import SubtitleWindow
 
     _app()
@@ -195,7 +195,7 @@ def test_subtitle_window_integration_state_and_wiring():
     import os
     import json
     import tempfile
-    import subtitle_window as sw_mod
+    import realtime_subtitle.ui.subtitle_window as sw_mod
     from realtime_subtitle.ui.subtitle_window import SubtitleWindow
 
     _app()
@@ -236,7 +236,7 @@ def test_state_restore_tv_font_size():
     import os
     import json
     import tempfile
-    import subtitle_window as sw_mod
+    import realtime_subtitle.ui.subtitle_window as sw_mod
     from realtime_subtitle.ui.subtitle_window import SubtitleWindow
 
     _app()
