@@ -1096,3 +1096,40 @@ def test_held_release_misfire_counter(monkeypatch):
     t._release_pending = True
     t._append_committed("中文开头")
     assert t._stat_held_misfire == 1
+
+
+def test_soxr_resamplestream_keeps_filter_state():
+    """soxr major bumps must not break stateful ResampleStream (issue #23 / pitfall #12)."""
+    import numpy as np
+    try:
+        import soxr
+    except ImportError:
+        import pytest
+        pytest.skip("soxr not installed")
+
+    def _stream():
+        # soxr 0.5+ uses num_channels=; older used positional channels
+        try:
+            return soxr.ResampleStream(48000, 16000, num_channels=1, dtype="float32")
+        except TypeError:
+            return soxr.ResampleStream(48000, 16000, 1, dtype="float32")
+
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal(48000).astype(np.float32)
+
+    y1 = np.asarray(_stream().resample_chunk(x, last=True)).reshape(-1)
+    y2 = np.asarray(_stream().resample_chunk(x, last=True)).reshape(-1)
+    assert y1.shape == y2.shape
+    assert np.allclose(y1, y2, atol=1e-5)
+
+    full = _stream()
+    y_full = np.asarray(full.resample_chunk(x, last=True)).reshape(-1)
+    st = _stream()
+    mid = len(x) // 2
+    y_a = np.asarray(st.resample_chunk(x[:mid], last=False)).reshape(-1)
+    y_b = np.asarray(st.resample_chunk(x[mid:], last=True)).reshape(-1)
+    y_stream = np.concatenate([y_a, y_b])
+    n = min(len(y_full), len(y_stream))
+    assert n > 1000
+    corr = float(np.corrcoef(y_full[:n], y_stream[:n])[0, 1])
+    assert corr > 0.99, f"soxr stream correlation too low: {corr}"

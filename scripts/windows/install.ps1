@@ -225,12 +225,49 @@ if (-not $ollamaExe) {
     if (Test-Path $guess) { $ollamaExe = $guess }
 }
 if (-not $ollamaExe) {
-    Write-Host "  ⚠️  没有安装 Ollama。已打开下载页面，请安装后重新运行本脚本"
-    Write-Host "     （Ollama 用来在本地跑翻译模型，全程离线，不上传任何数据）"
-    Start-Process "https://ollama.com/download"
-    exit 1
+    Write-Host "  ⚠️  没有安装 Ollama（本地跑翻译模型，全程离线，不上传任何数据）"
+    $installedViaWinget = $false
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        $ans = Read-Host "  现在用 winget 自动安装 Ollama？[Y/n]"
+        if ($ans -eq "" -or $ans -eq "y" -or $ans -eq "Y") {
+            Write-Host "  正在 winget install Ollama.Ollama ..."
+            # 与 CLAUDE.md 依赖表一致；同意协议避免交互卡住
+            winget install --id Ollama.Ollama -e --accept-package-agreements --accept-source-agreements
+            if ($LASTEXITCODE -eq 0) {
+                $installedViaWinget = $true
+            } else {
+                Write-Host "  ⚠️  winget 安装返回非零退出码 ($LASTEXITCODE)，尝试在常见路径查找..."
+            }
+            # 装完当前进程 PATH 不会刷新——不能只靠 Get-Command
+            $guesses = @(
+                "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe",
+                "$env:ProgramFiles\Ollama\ollama.exe",
+                "${env:ProgramFiles(x86)}\Ollama\ollama.exe"
+            )
+            foreach ($g in $guesses) {
+                if (Test-Path -LiteralPath $g) {
+                    $ollamaExe = $g
+                    # 让后续 & ollama 类调用也能找到
+                    $env:Path = "$(Split-Path $g -Parent);$env:Path"
+                    break
+                }
+            }
+            if (-not $ollamaExe) {
+                $ollamaExe = (Get-Command ollama -ErrorAction SilentlyContinue).Source
+            }
+        }
+    }
+    if (-not $ollamaExe) {
+        Write-Host "  ⚠️  仍未找到 Ollama。已打开下载页面，请安装后重新运行本脚本"
+        Write-Host "     或手动: winget install --id Ollama.Ollama -e"
+        try { Start-Process "https://ollama.com/download" } catch { }
+        exit 1
+    }
+    if ($installedViaWinget) {
+        Write-Host "  ✅ Ollama 已通过 winget 安装: $ollamaExe"
+    }
 }
-Write-Host "  ✅ Ollama 已安装"
+Write-Host "  ✅ Ollama 已安装 ($ollamaExe)"
 # 轮询等就绪而不是固定睡几秒：Ollama 刚装完/刚更新完可能十几秒才监听端口
 function Test-OllamaReady {
     try {

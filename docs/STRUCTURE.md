@@ -55,4 +55,8 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-Inside `scripts/windows/*.ps1`, `$RepoRoot` is resolved as two levels above the script directory.
+Inside `scripts/windows/*.ps1`, `$RepoRoot` is the repository root (`Parent.Parent` of the script directory).
+
+## Multi-language READMEs
+
+See [README-i18n.md](README-i18n.md) (EN / DE / ZH sync policy).
