@@ -69,6 +69,29 @@ def test_sentence_no_split_on_ordinal_number():
     assert rest == ""
 
 
+def test_sentence_splits_after_year():
+    """☠️ 四位年份结尾必须能成句。
+
+    以前数字否决是无条件的（`token.isdigit()`），"…bis 2030." 这类句子
+    **永远**不成句：那条 return 在 `if not remainder: return final` 之前，
+    连收尾放行都救不回来，只能等 IDLE_FLUSH_SEC 或和下一句合并，中文晚一句。
+    新闻场景（本项目主场景）年份/金额结尾极常见。
+    """
+    sents, rest = _extract_sentences("Der Vertrag läuft bis 2030. Alles andere ist offen.")
+    assert sents == ["Der Vertrag läuft bis 2030.", "Alles andere ist offen."]
+    assert rest == ""
+
+    # 句尾正好在文本末尾时也要能被 final=True 放行（扣留兜底那条路径）
+    sents, rest = _split_sentences("Das war im Jahr 1998.", final=True)
+    assert sents == ["Das war im Jahr 1998."]
+    assert rest == ""
+
+    # final=False 仍照常扣留（看不到下一个词，规则③还没法判）
+    sents, rest = _split_sentences("Das war im Jahr 1998.", final=False)
+    assert sents == []
+    assert rest == "Das war im Jahr 1998."
+
+
 def test_sentence_boundary_held_until_next_word():
     """句尾正好在文本末尾时：final=False 扣留（还不知道下个词是大是小写），
     final=True（收尾/有界放行）照常成句。"""
