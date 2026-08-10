@@ -132,7 +132,7 @@ def test_strip_translator_note_inline_and_trailing():
 def test_version_is_semver_and_string_helper_matches():
     """版本号格式固定成 主.次.修，version_string() 只在前面加个 v。
     update_subtitles.ps1 和 issue 模板都按这个格式正则匹配。"""
-    import version
+    from realtime_subtitle import version
     assert re.fullmatch(r"\d+\.\d+\.\d+", version.__version__), \
         f"版本号要用语义化版本 主.次.修，现在是 {version.__version__!r}"
     assert version.version_string() == "v" + version.__version__
@@ -574,7 +574,7 @@ def _translator_for_tx(**overrides):
     ☠️ 顺手把模块级 _warm_done 置位：_await_model_ready 在没置位时会真等
     OLLAMA_WARM_WAIT(60秒)，不置位的话整个测试文件会挂几分钟。"""
     from threading import Lock
-    import translator_queue as tq
+    import realtime_subtitle.translate.translator_queue as tq
     from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 
     tq._warm_done.set()
@@ -854,6 +854,44 @@ def test_translate_circuit_breaker_stops_requests(monkeypatch):
     t._tx_circuit_until = 0.0
     t._translate_single_sentence("Wieder da.", "")
     assert len(calls) == 4
+
+
+def test_circuit_opens_immediately_after_cold_timeout(monkeypatch):
+    """☠️ 连冷超时都没等到数据 = Ollama 半死，一次就该熔断。
+
+    翻译 worker 是单线程的，一句最坏串着烧 OLLAMA_TIMEOUT + OLLAMA_TIMEOUT_COLD
+    （默认 15+90=105 秒）。以前要攒够 TRANSLATE_FAIL_STREAK_OPEN=3 次才熔断，
+    也就是 **5 分多钟**里每句都去烧满一遍；这期间队列按 TRANSLATE_QUEUE_MAX_CHARS
+    一直丢最旧的句子，用户看到的是"中文时有时无"，而不是熔断本该给的那种干净
+    降级（只显德语 + 一条状态提示）。
+
+    ConnectionError（Ollama 根本没起）是另一回事：它快速失败、不烧时间，
+    仍然走原来的连续 3 次计数，不受这条影响。
+    """
+    import requests
+
+    monkeypatch.setattr(config, "TRANSLATE_FAIL_STREAK_OPEN", 3, raising=False)
+    monkeypatch.setattr(config, "TRANSLATE_CIRCUIT_SEC", 30, raising=False)
+
+    calls = []
+
+    class _Session:
+        def post(self, url, json=None, stream=None, timeout=None):
+            calls.append(timeout)
+            raise requests.ReadTimeout("Read timed out.")
+
+    t = _translator_for_tx(ollama_session=_Session())
+    t._ollama_hot = True  # 模型是热的，走短超时那条路
+
+    out = t._translate_single_sentence("Test.", "")
+    assert out == "Test."                     # 降级成德语原文
+    assert len(calls) == 2, "应该短超时一次 + 冷超时重试一次"
+    assert t._circuit_open(), "两次都超时之后必须立刻熔断，不能再攒 3 次"
+
+    # 熔断中：后面的句子一个请求都不发（不再一句烧 105 秒）
+    calls.clear()
+    assert t._translate_single_sentence("Noch einer.", "") == "Noch einer."
+    assert calls == []
 
 
 def test_tx_queue_hard_cap(monkeypatch):
