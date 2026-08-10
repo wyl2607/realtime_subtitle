@@ -297,6 +297,10 @@ def _squash_repeats(sentences, keep_words=3, keep_sents=2):
     return out
 
 _warm_thread = None  # 启动预热线程句柄：_unload_our_models 退出时要等它收尾
+# 预热线程实际装进显存的那个模型名。☠️ 不能事后现读 config.OLLAMA_MODEL：
+# 窗口是秒开的、⚙️面板在模型加载的十几秒里就能点，用户切「性能」模式会把
+# config.OLLAMA_MODEL 改掉，而预热早就按旧名字发出去了（见 __init__ 末尾的对账）
+_warm_model = None
 # 预热落地信号：首句翻译等它，别自己另开一次冷加载还撞上 15 秒超时
 # （2026-08-02 实测：开机冷读 5.6GB 模型花了 33.8 秒，其间两句翻译被超时丢弃）
 _warm_done = Event()
@@ -331,27 +335,35 @@ def _warn_if_ipv6_first_host(base_url):
 
 
 def _spawn_startup_warm():
-    global _warm_thread
+    global _warm_thread, _warm_model
     _warm_done.clear()
-    _warm_thread = Thread(target=_startup_warm_ollama, daemon=True, name="OllamaWarm")
+    # 在 spawn 的这一刻定下预热哪个模型，并记下来供后面对账
+    _warm_model = config.OLLAMA_MODEL
+    _warm_thread = Thread(target=_startup_warm_ollama, args=(_warm_model,),
+                          daemon=True, name="OllamaWarm")
     _warm_thread.start()
 
 
-def _startup_warm_ollama():
+def _startup_warm_ollama(model=None):
     """启动时后台预热翻译模型（prompt 留空 = Ollama 只加载不生成，官方用法）。
 
     刻意用独立的 requests.post 而不是 self.ollama_session：这个线程和
-    __init__ 里的健康检查/后续翻译并发，requests.Session 跨线程并发不安全。"""
+    __init__ 里的健康检查/后续翻译并发，requests.Session 跨线程并发不安全。
+
+    model 由 _spawn_startup_warm 在 spawn 时定死并传进来，不在这里现读
+    config.OLLAMA_MODEL——否则"预热到底装了哪个模型"这件事会随用户在加载
+    期间切模式而变，退出对账就对不上了。"""
     global _warm_ok
+    model = model or config.OLLAMA_MODEL
     try:
         t0 = time.time()
         requests.post(
             f"{config.OLLAMA_BASE_URL}/api/generate",
-            json={"model": config.OLLAMA_MODEL, "prompt": "", "keep_alive": "2h"},
+            json={"model": model, "prompt": "", "keep_alive": "2h"},
             timeout=120,  # 冷加载可能要十几秒，网络栈慢时再宽些
         ).close()
         _warm_ok = True
-        print(f"🔥 翻译模型 {config.OLLAMA_MODEL} 后台预热完成 {time.time() - t0:.1f}秒")
+        print(f"🔥 翻译模型 {model} 后台预热完成 {time.time() - t0:.1f}秒")
     except Exception:
         pass  # Ollama 不可达由 __init__ 的健康检查负责提示
     finally:
@@ -587,6 +599,17 @@ class WhisperQueueTranslator:
             except requests.RequestException:
                 print(f"⚠️  无法连接 Ollama ({config.OLLAMA_BASE_URL})，字幕将只显示德语原文")
                 print(f"   请确认 Ollama 已启动: ollama serve")
+
+            # ☠️ 和启动预热对账：窗口是秒开的，⚙️面板在 Whisper 加载的这十几秒
+            # 里就能点。用户点「⚡性能」时 translator 还是 None，main._apply_mode
+            # 只能改 config.OLLAMA_MODEL——而预热线程早在本函数开头就按**旧**
+            # 名字把大模型往显存里装了。不对账的话两个模型同时驻留（8GB 卡上
+            # 正是这套显存分档刻意要避免的情况），要等退出才卸。
+            if _warm_model and _warm_model != config.OLLAMA_MODEL:
+                print(f"   ℹ️ 加载期间翻译模型已切换 {_warm_model} → {config.OLLAMA_MODEL}，"
+                      f"卸掉预热的那个")
+                self.request_warm_model(old_model=_warm_model,
+                                        new_model=config.OLLAMA_MODEL)
 
             elapsed = time.time() - start_time
             print(f"✅ Whisper 模型加载完成！({elapsed:.1f}秒)")
@@ -1654,6 +1677,13 @@ class WhisperQueueTranslator:
 
     def _warm_model_worker(self, old_model=None, new_model=None):
         model = new_model if new_model is not None else config.OLLAMA_MODEL
+        # ☠️ 启动预热若还在飞，必须先等它落地再卸旧模型：卸载先到、预热后到的话
+        # 模型又被 keep_alive="2h" 拉回显存留驻两小时（和 CLAUDE.md 第 13 条
+        # 同一类竞态，当时只处理了退出路径）。有界等待，卡住就放弃继续走。
+        if old_model:
+            t = _warm_thread
+            if t is not None and t.is_alive():
+                t.join(timeout=10)
         if old_model and old_model != model:
             self._ollama_hot = False  # 换了模型：新的还没进显存，回到冷超时
             try:
