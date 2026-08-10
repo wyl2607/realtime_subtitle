@@ -32,9 +32,9 @@ import realtime_subtitle.config as config
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
 
-# 句子结束符：只认 .!?（旧管线按逗号切句是碎句/上下文错乱的来源之一）
-_SENTENCE_END = re.compile(r'(.*?[.!?…]["»«\']?)(\s|$)', re.DOTALL)
-# 同一套边界，但只匹配终止符本身（切分时要按位置往后扫，不能每次都从头 match）
+# 句子结束符：只认 .!?（旧管线按逗号切句是碎句/上下文错乱的来源之一）。
+# 切分时要按位置往后扫，不能每次都从头 match，所以只留匹配终止符本身的这一条
+# （成对的 _SENTENCE_END 在改成 finditer 之后就没有调用点了，已删）
 _SENTENCE_TERMINATOR = re.compile(r'[.!?…]["»«\']?(?=\s|$)')
 
 _PUNCT_STRIP = " \t.!?…,;:–—\"'«»„“”"
@@ -99,9 +99,17 @@ def _boundary_is_real(candidate, remainder, final):
         # ① 缩写否决：德语 bzw./z.B./ca. 这类缩写自带句号
         if token.lower().strip(_QUOTE_CHARS) in config.SENTENCE_ABBREVIATIONS:
             return False
-        # ② 数字否决：序数/年份带点（"am 3. Mai"、"1998."）——注意德语名词首字母
-        #    大写，"Mai" 是大写的，规则③抓不到这种，必须单独否决
-        if token.isdigit():
+        # ② 序数否决："am 3. Mai" 这种日期序数自带句号——注意德语名词首字母
+        #    大写，"Mai" 是大写的，规则③抓不到这种，必须单独否决。
+        #    ☠️ 只否决 1-2 位数（能当序数/日期的范围）。以前这里是无条件
+        #    `token.isdigit()`，于是**四位年份/大数结尾的句子永远不成句**：
+        #    "Der Vertrag läuft bis 2030." 连 final=True 都放不出来（这条
+        #    return 在 `if not remainder: return final` 之前），只能等
+        #    IDLE_FLUSH_SEC 兜底，或者和下一句合并成一个翻译单元——中文因此
+        #    整整晚一句。新闻直播是主场景，年份/金额结尾极常见。
+        #    四位数几乎不可能是序数，两位数（"Es waren genau 20."）仍按老规则
+        #    保守合并，代价只是两句合成一次请求。
+        if token.isdigit() and len(token) <= 2:
             return False
     if not remainder:
         # ③b 句尾扣留：后面还没有词，看不出这个句号是真是假。
