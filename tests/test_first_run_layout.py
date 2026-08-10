@@ -84,7 +84,7 @@ def test_default_geometry_matches_config_on_a_big_screen():
 def test_screen_scale_factor_is_bounded():
     """没有屏幕/拿不到 DPI 时必须安全退回 1.0，且不会放大到离谱。"""
     from PyQt5.QtWidgets import QApplication  # noqa: F401  确认导入顺序没问题
-    import window_geometry
+    import realtime_subtitle.ui.window_geometry as window_geometry
 
     class _FakeScreen:
         def __init__(self, dpi):
