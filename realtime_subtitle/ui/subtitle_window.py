@@ -74,7 +74,7 @@ def _ai_web_enabled():
     延迟 import translator_queue，沿用本模块其它 AI 相关调用点的惯例
     （UI 模块不在导入期把翻译侧整条依赖链拉起来）。
     """
-    from translator_queue import ai_web_enabled
+    from realtime_subtitle.translate.translator_queue import ai_web_enabled
     return ai_web_enabled()
 
 
