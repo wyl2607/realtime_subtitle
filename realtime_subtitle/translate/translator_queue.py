@@ -726,14 +726,27 @@ class WhisperQueueTranslator:
         成功即清零（失败的代价也只是一次超时，和专门发探测请求一样）。"""
         return time.time() < self._tx_circuit_until
 
-    def _note_tx_result(self, ok):
-        """记翻译成败，连续失败到阈值就熔断一段时间。"""
+    def _note_tx_result(self, ok, hard=False):
+        """记翻译成败，连续失败到阈值就熔断一段时间。
+
+        hard=True 表示"连冷超时（OLLAMA_TIMEOUT_COLD，默认 90 秒）都没等到第一个
+        数据块"——这不是"这次赶巧慢了"，是 Ollama 侧真的半死。
+        ☠️ 这种失败一次就该熔断，不能再攒够 TRANSLATE_FAIL_STREAK_OPEN 次：
+        翻译 worker 是单线程的，一句最坏要串着烧 OLLAMA_TIMEOUT + 冷超时
+        （15+90=105 秒），攒 3 次就是 **5 分多钟**。这期间队列按
+        TRANSLATE_QUEUE_MAX_CHARS 一直丢最旧的句子，用户看到的是"中文时有时
+        无"，而不是熔断本来要给的那种干净降级（整段只显德语 + 一条状态提示）。
+        """
         if ok:
             self._tx_fail_streak = 0
             self._tx_circuit_until = 0.0
             self._ollama_hot = True
             return
         self._tx_fail_streak += 1
+        if hard:
+            self._tx_fail_streak = max(
+                self._tx_fail_streak,
+                getattr(config, "TRANSLATE_FAIL_STREAK_OPEN", 3))
         if self._tx_fail_streak >= getattr(config, "TRANSLATE_FAIL_STREAK_OPEN", 3):
             secs = getattr(config, "TRANSLATE_CIRCUIT_SEC", 30)
             self._tx_circuit_until = time.time() + secs
@@ -1489,8 +1502,10 @@ class WhisperQueueTranslator:
                     # 半途超时、非200，都必须显式关，否则长session连接泄漏
                     response.close()
 
+            # 走到这 = 短超时和随后的冷超时都没等到数据。hard=True 让熔断立刻
+            # 打开，别再让后面的句子一句一句去烧满 105 秒（见 _note_tx_result）
             print(f"   ⚠️  翻译超时: {last_timeout}，显示德语原文")
-            self._note_tx_result(ok=False)
+            self._note_tx_result(ok=False, hard=True)
             return sentence
 
         except requests.ConnectionError as e:
