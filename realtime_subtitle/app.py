@@ -54,6 +54,7 @@ import realtime_subtitle.config as config
 from realtime_subtitle.version import version_string
 # 同样是纯 stdlib（pathlib），不影响 DLL 顺序
 from realtime_subtitle.paths import repo_path
+from realtime_subtitle.migrate_legacy import migrate_legacy_runtime_files
 
 class SubtitleApp:
     """实时字幕应用主类"""
@@ -65,6 +66,10 @@ class SubtitleApp:
         屏幕上什么都没有，用户以为没启动。现在窗口先出现并显示加载进度，
         重活在 _load_models 里做完再接线。"""
         self._print_header()
+
+        # ☠️ 必须在 SubtitleWindow 之前：窗口 __init__ 就会读 window_state.json，
+        # 晚一步就读到空的、把用户调好的布局重置成默认值。见 migrate_legacy 的注释
+        migrate_legacy_runtime_files()
 
         print("🔧 正在初始化组件...")
         self.running = False
