@@ -15,13 +15,18 @@ import time
 import os
 from threading import Thread
 import realtime_subtitle.config as config
+from realtime_subtitle.paths import repo_path
+# ☠️ 这两个是**和 .ps1 脚本的跨进程约定**，必须落在仓库根（见 paths.py）：
+# pause_subtitles.ps1 写 <root>\.paused，stop_subtitles.ps1 写 <root>\.stop。
 # 暂停标志文件：存在则暂停捕获，不重启进程也能停/恢复识别与翻译
-PAUSE_FLAG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".paused")
+PAUSE_FLAG_FILE = repo_path(".paused")
 # 停止标志：stop_subtitles.ps1 创建后，主程序优雅退出（先关模型再退）
-STOP_FLAG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".stop")
+STOP_FLAG_FILE = repo_path(".stop")
 
 class AudioCapture:
     """系统音频捕获器"""
+
+    DEVICE_CHECK_INTERVAL = 5.0   # 探测线程每几秒查一次「应该抓哪个设备」
 
     def __init__(self, callback, on_status=None):
         """
@@ -37,6 +42,10 @@ class AudioCapture:
         self.audio_queue = queue.Queue(maxsize=10)  # 限制队列大小
         self.capture_thread = None
         self.process_thread = None
+        # 「当前应捕获的设备名」由独立的探测线程写、采集线程读（见 _probe_loop）。
+        # None = 还没探到过，采集线程按"没变化"处理
+        self._desired_device_name = None
+        self.probe_thread = None
 
         print(f"🎤 音频捕获模块已初始化（连续流式提交）")
         print(f"   提交节奏: {config.CHUNK_SUBMIT_SECONDS}秒/块")
@@ -85,13 +94,41 @@ class AudioCapture:
         """用临时 PyAudio 查「当前应捕获」的设备名（默认或配置的名字匹配）。
 
         PortAudio 设备列表在 Pa_Initialize 时冻结——用打开着流的旧实例
-        查不到设备变更，必须新建实例（实测每次~10-30ms，5秒查一次可忽略）。
+        查不到设备变更，必须新建实例（实测每次~10-30ms）。
         """
         p = pyaudio.PyAudio()
         try:
             return AudioCapture._resolve_loopback(p).get("name")
         finally:
             p.terminate()
+
+    def _probe_loop(self):
+        """独立线程：每 DEVICE_CHECK_INTERVAL 秒探一次「应该抓哪个设备」。
+
+        ☠️ 以前这段是**同步跑在采集循环里**的，而它每次都要新建再销毁一个完整
+        的 PyAudio（Pa_Initialize 会枚举全部 WASAPI 设备）。
+
+        2026-08-11 实测（Win11 + CX31993 声卡，8 次）：**p50 46ms、冷调用
+        143ms**——不是老注释写的"10-30ms"。对照一个 `stream.read()` 周期
+        （CHUNK_SIZE 4096 @48kHz = 85ms）：常态的 46ms 还塞得下，但冷调用
+        已经超了，蓝牙/虚拟声卡更慢。超出的那部分时间 `stream.read()` 停止
+        排空，WASAPI 环形缓冲溢出，而 `exception_on_overflow=False` 会把溢出
+        **静默吞掉**——症状是"偶尔吞词"，日志里一个字都没有，完全无从追查。
+
+        挪到独立线程后，探测再慢也只是设备切换发现得晚一点，采集循环一帧都
+        不会停（同日实测：探测端人为卡 2 秒，采集侧照常空转 1690 圈）。
+        """
+        while self.running:
+            try:
+                name = self._current_desired_device_name()
+                if name:
+                    self._desired_device_name = name  # 单个 str 赋值，读侧无需加锁
+            except Exception:
+                pass  # 查询失败不影响正常捕获，下一轮再试
+            # 碎片化 sleep：stop() 时最多多等 0.25 秒，而不是整个探测间隔
+            deadline = time.time() + self.DEVICE_CHECK_INTERVAL
+            while self.running and time.time() < deadline:
+                time.sleep(0.25)
 
     def start(self):
         """启动音频捕获"""
@@ -117,6 +154,14 @@ class AudioCapture:
         )
         self.process_thread.start()
 
+        # 设备探测线程：枚举可能很慢，绝不能占着采集线程（见 _probe_loop）
+        self.probe_thread = Thread(
+            target=self._probe_loop,
+            name="AudioDeviceProbe",
+            daemon=True
+        )
+        self.probe_thread.start()
+
         print("✅ 音频捕获已启动")
 
     def stop(self):
@@ -131,6 +176,8 @@ class AudioCapture:
             self.capture_thread.join(timeout=2)
         if self.process_thread:
             self.process_thread.join(timeout=2)
+        if self.probe_thread:
+            self.probe_thread.join(timeout=2)
 
         print("✅ 音频捕获已停止")
 
@@ -154,7 +201,6 @@ class AudioCapture:
         连续读流失败（设备拔了），就关掉旧流用新的默认设备重开——
         之前换设备后 loopback 悄悄失效，用户只看到"完全没字幕"。
         """
-        DEVICE_CHECK_INTERVAL = 5.0   # 每几秒查一次默认设备有没有变
         MAX_READ_ERRORS = 10          # 连续读失败这么多次就重开流
         # 连续这么久一个块都没过静音门 → 提示一次。
         # 现象和"抓不到声音"完全一样（屏幕上什么都不出），但根因不同：设备是对的、
@@ -217,25 +263,24 @@ class AudioCapture:
                 buffer_has_speech = False   # 当前缓冲里有没有超过能量门的块
                 prev_had_speech = False     # 上一个提交周期有没有语音（保住词尾）
                 read_errors = 0
-                last_device_check = time.time()
+                # 探测线程可能还带着上一个流的设备名，先对齐再进循环，
+                # 免得刚开流就被判定为"设备变了"又重开一次
+                self._desired_device_name = device_name
                 silent_periods = 0          # 连续多少个提交周期一个块都没过静音门
                 low_volume_warned = False   # 这一轮静默只提示一次
 
                 print(f"🎵 开始捕获音频... (每{config.CHUNK_SUBMIT_SECONDS}秒提交一块)")
 
                 while self.running:
-                    # 应捕获设备变了（系统默认切换，或 LOOPBACK_DEVICE_NAME 运行时改了）→ 重开
-                    if time.time() - last_device_check > DEVICE_CHECK_INTERVAL:
-                        last_device_check = time.time()
-                        try:
-                            current = self._current_desired_device_name()
-                            if current and current != device_name:
-                                print(f"🔀 捕获设备变更: {device_name} → {current}，重开音频流")
-                                if self.on_status:
-                                    self.on_status(f"🔀 播放设备已切换: {current}")
-                                break
-                        except Exception:
-                            pass  # 查询失败不影响正常捕获
+                    # 应捕获设备变了（系统默认切换，或 LOOPBACK_DEVICE_NAME 运行时改了）→ 重开。
+                    # 只读探测线程写好的字符串，不在这里做枚举——枚举可能卡住几百毫秒，
+                    # 期间 WASAPI 缓冲会静默溢出丢音频（见 _probe_loop）
+                    current = self._desired_device_name
+                    if current and current != device_name:
+                        print(f"🔀 捕获设备变更: {device_name} → {current}，重开音频流")
+                        if self.on_status:
+                            self.on_status(f"🔀 播放设备已切换: {current}")
+                        break
 
                     try:
                         # 读取音频块（必须持续读，否则WASAPI缓冲区会溢出）

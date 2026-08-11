@@ -20,10 +20,6 @@ class LiveTextRenderMixin:
         """live德语的草稿中文（线程安全）。正式句对完成后自动清掉"""
         self.signals.draft.emit(chinese or "")
 
-    def update_subtitle(self, text):
-        """旧接口：当一条完成句对显示（兼容保留）"""
-        self.signals.update.emit(text)
-
     def show_status(self, text):
         """显示一条状态提示（线程安全）。不进句对历史，下次内容更新时自然消失"""
         self.signals.status.emit(text)
@@ -61,11 +57,6 @@ class LiveTextRenderMixin:
         self._render()
         if config.SHOW_PERFORMANCE:
             print(f"💬 字幕: {chinese[:50]}{'...' if len(chinese) > 50 else ''}")
-
-    def _update_text(self, text):
-        """旧接口的槽：当作一条无原文的句对处理"""
-        if text and text.strip():
-            self._add_pair("", text)
 
     def _show_status(self, text):
         """状态提示：追加在当前内容底部；5 秒后自动清空（新 status 重置计时）。"""

@@ -6,6 +6,7 @@
 import re
 
 import numpy as np
+import pytest
 
 import realtime_subtitle.config as config
 from realtime_subtitle.asr.streaming_asr import HypothesisBuffer, OnlineASRProcessor
@@ -759,8 +760,9 @@ def _translator_for_tx(**overrides):
     t._tx_dropped = 0
     t._tx_drop_warned = 0
     t._ollama_down_notified = 0.0
-    # _translate_timeout 要用：ASR 积压快照 + 超时降级的粘性截止时刻
+    # _translate_timeout 要用：ASR 积压快照 + 识别是否正占着 GPU + 降级粘性
     t._asr_backlog_n = 0
+    t._asr_busy = False
     t._tx_slow_until = 0.0
     t.on_status = None
     for k, v in overrides.items():
@@ -1477,3 +1479,154 @@ def test_soxr_resamplestream_keeps_filter_state():
     assert n > 1000
     corr = float(np.corrcoef(y_full[:n], y_stream[:n])[0, 1])
     assert corr > 0.99, f"soxr stream correlation too low: {corr}"
+
+
+# ======================================================================
+# 2026-08-11 修的一批"防护写了但没生效"（详见各函数注释里的 ☠️）
+# ======================================================================
+
+def test_translate_timeout_is_long_while_asr_holds_the_gpu():
+    """识别正占着 GPU 时必须用长超时。
+
+    ☠️ 这条不能只靠 _asr_backlog_n：_process_inbox 是先把收件箱整个取走、
+    把快照清零，**然后**才跑 process_iter。也就是说 ASR 真正霸着 GPU 的那
+    0.26~2.5 秒里 _asr_backlog_n 恰好是 0，规则整个失效——而那正是最需要
+    长超时的时刻（issue #16 的 15 秒震荡）。_asr_busy 补的就是这一段。
+    """
+    from realtime_subtitle import config
+
+    t = _translator_for_tx()
+    t._ollama_hot = True          # 模型在显存里 → 默认该走短超时
+    t._asr_backlog_n = 0          # 收件箱已被取空，快照读不出积压
+    t._asr_busy = False
+    assert t._translate_timeout() == config.OLLAMA_TIMEOUT
+
+    t._asr_busy = True            # 但 process_iter 正在 GPU 上跑
+    assert t._translate_timeout() == config.OLLAMA_TIMEOUT_COLD, \
+        "ASR 占着 GPU 时还用短超时，每句都会先白烧满 OLLAMA_TIMEOUT"
+
+
+def test_draft_worker_yields_to_asr_at_request_time():
+    """草稿的"给 ASR 让路"必须发生在真要发请求的时刻。
+
+    ☠️ 这个检查以前在 _maybe_draft 里，是死代码：那边跑在 ASR 线程上、且
+    刚好在 process_iter 的 finally 之后，_asr_busy 恒为 False。而且即使不恒
+    为 False 也拦不住——草稿是 submit 到 _tx_executor 异步跑的。
+    """
+    from threading import Lock
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
+
+    t = _translator_for_tx()
+    t.context_history = []
+    t.pending_text = "Das ist ein Satz"
+    t.on_draft = lambda s: None
+    calls = []
+    t._translate_single_sentence = lambda *a, **k: calls.append(a) or "译文"
+
+    t._asr_busy = True
+    WhisperQueueTranslator._draft_worker(t, "Das ist ein Satz")
+    assert calls == [], "ASR 正在 GPU 上跑时不该发草稿请求"
+
+    t._asr_busy = False
+    WhisperQueueTranslator._draft_worker(t, "Das ist ein Satz")
+    assert len(calls) == 1, "ASR 空闲时草稿应该正常发出"
+
+
+def test_tx_stats_do_not_accumulate_when_summary_disabled(monkeypatch):
+    """关掉概况后翻译耗时样本一个都不该留在内存里。
+
+    ☠️ 排空点只有 _stat_note_asr 里那个到点打印的分支，而它在
+    STATS_SUMMARY_INTERVAL<=0 时直接 return。以前 _stat_tx 是在
+    _translation_worker 里无条件 append 的，于是用户按 config 注释把概况
+    关掉之后，这个 list 就再也没有出口了（一句一条，长跑只涨不消）。
+    """
+    from realtime_subtitle import config
+
+    t = _translator_for_tx()
+    t._stat_tx = []
+
+    monkeypatch.setattr(config, "STATS_SUMMARY_INTERVAL", 0, raising=False)
+    for _ in range(500):
+        t._stat_note_tx(1.23)
+    assert t._stat_tx == [], "概况关掉后仍在累积翻译耗时样本"
+
+    monkeypatch.setattr(config, "STATS_SUMMARY_INTERVAL", 60, raising=False)
+    t._stat_note_tx(1.23)
+    assert t._stat_tx == [1.23], "概况开着时应该照常采样"
+
+
+@pytest.mark.parametrize("bad_template", [
+    "https://example.com/?q={query}&x={oops}",   # 多了一个占位符
+    "https://example.com/?q={query}&brace={",    # 不成对的左括号
+    "https://example.com/?q={0}",                # 位置占位符
+])
+def test_build_ai_web_url_survives_a_broken_template(monkeypatch, bad_template):
+    """模板写坏了只能降级成"功能关闭"，不能抛异常。
+
+    ☠️ 调用点在 Qt 槽函数里（SubtitleWindow._open_ai_web），异常会直接冒到
+    事件循环，按钮表现为"点了没反应"，用户根本不会去看 stderr。而 config
+    的注释本来就鼓励用户把模板换成 ChatGPT 等。
+    """
+    from realtime_subtitle import config
+    from realtime_subtitle.translate.translator_queue import build_ai_web_url
+
+    monkeypatch.setattr(config, "AI_ANALYSIS_WEB_URL_TEMPLATE", bad_template,
+                        raising=False)
+    assert build_ai_web_url("测试问题") == ""
+
+
+def test_build_ai_web_url_still_works_for_valid_templates(monkeypatch):
+    from realtime_subtitle import config
+    from realtime_subtitle.translate.translator_queue import build_ai_web_url
+
+    monkeypatch.setattr(config, "AI_ANALYSIS_WEB_URL_TEMPLATE",
+                        "https://chatgpt.com/?q={query}&hints=search", raising=False)
+    url = build_ai_web_url("Hallo Welt")
+    assert url.startswith("https://chatgpt.com/?q=Hallo%20Welt")
+    assert url.endswith("&hints=search")
+
+
+def test_transcripts_are_kept_forever_by_default():
+    """默认必须是"永久保留"——自动删用户攒的语料不该是默认行为。
+
+    transcripts 是拿来回看和学德语的（README 就是这么推的），保留期是给
+    介意隐私的人**主动**在 config_local.py 里开的。这条用例盯着这个决定，
+    免得以后有人顺手把默认值改成某个天数、把别人的语料悄悄删了。
+    """
+    from realtime_subtitle import config
+
+    assert getattr(config, "TRANSCRIPT_KEEP_DAYS", 0) == 0
+
+
+def test_prune_old_transcripts_respects_keep_days(tmp_path, monkeypatch):
+    """字幕存档保留期：按文件名日期删，认不出的文件一律不碰。
+
+    ⚠️ 这是隐私措施：本程序抓的是系统全部声音（可能含语音通话），存档是
+    明文、按天一个文件、SAVE_TRANSCRIPT 默认开着，以前没有任何保留期。
+    """
+    import time as _time
+    from realtime_subtitle import config
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
+
+    day = 86400
+    now = _time.time()
+    old = _time.strftime("%Y-%m-%d", _time.localtime(now - 40 * day))
+    recent = _time.strftime("%Y-%m-%d", _time.localtime(now - 3 * day))
+    for name in (f"{old}.txt", f"{recent}.txt", "我的笔记.txt", "readme.md"):
+        (tmp_path / name).write_text("x", encoding="utf-8")
+
+    t = object.__new__(WhisperQueueTranslator)
+    t._transcript_dir = str(tmp_path)
+
+    monkeypatch.setattr(config, "TRANSCRIPT_KEEP_DAYS", 30, raising=False)
+    t._prune_old_transcripts()
+    names = {p.name for p in tmp_path.iterdir()}
+    assert f"{old}.txt" not in names, "超过保留期的存档没被清掉"
+    assert f"{recent}.txt" in names
+    assert "我的笔记.txt" in names, "非日期命名的文件不该被动"
+    assert "readme.md" in names
+
+    # 0 = 永久保留（老行为），一个都不能删
+    monkeypatch.setattr(config, "TRANSCRIPT_KEEP_DAYS", 0, raising=False)
+    t._prune_old_transcripts()
+    assert {p.name for p in tmp_path.iterdir()} == names

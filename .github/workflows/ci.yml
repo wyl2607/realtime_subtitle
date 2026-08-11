@@ -19,8 +19,8 @@ jobs:
   pipeline-helpers-ubuntu:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:
           python-version: "3.12"
       - name: Install minimal test deps
@@ -29,13 +29,15 @@ jobs:
           # translator_queue lazy-loads torch/faster-whisper on construct
           pip install "numpy>=1.24,<3" "requests>=2.28,<3" "soxr>=0.5,<2" -r requirements-dev.txt
       - name: Run pure pipeline unit tests
-        run: python -m pytest tests/test_pipeline_helpers.py -q
+        # test_runtime_paths 必须在这里跑（不只 windows）：它盯的是运行时文件
+        # 有没有掉出仓库根，纯 pathlib + 静态扫描，不需要 Qt/torch/WASAPI
+        run: python -m pytest tests/test_pipeline_helpers.py tests/test_runtime_paths.py -q
 
   pytest-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:
           python-version: "3.12"
       - name: Install Windows unit-test deps

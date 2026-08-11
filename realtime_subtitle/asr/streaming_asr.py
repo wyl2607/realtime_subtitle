@@ -47,7 +47,8 @@ class HypothesisBuffer:
         self.buffer = []  # 上一次识别的未提交尾部
         self.new = []  # 本次识别的新词
         self.last_commited_time = 0
-        self.last_commited_word = None
+        # 注：上游 whisper_streaming 还带一个 last_commited_word，本项目从未读过
+        # （去重走的是 insert() 里的 1-5 gram 比对），已删
 
     def insert(self, new, offset):
         """插入本次识别结果。只保留大致位于已提交时间之后的词；
@@ -78,7 +79,6 @@ class HypothesisBuffer:
                 break
             if nt == self.buffer[0][2]:
                 commit.append((na, nb, nt))
-                self.last_commited_word = nt
                 self.last_commited_time = nb
                 self.buffer.pop(0)
                 self.new.pop(0)

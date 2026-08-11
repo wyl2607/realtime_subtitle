@@ -29,6 +29,7 @@ from PyQt5.QtCore import (
 )
 from PyQt5.QtGui import QFont
 import realtime_subtitle.config as config
+from realtime_subtitle.paths import repo_path
 from realtime_subtitle.ui.window_geometry import (
     _screen_area_at, _clamp_geo_to_area, _clamp_geo_to_any_screen,
     default_geometry, screen_scale_factor,
@@ -46,8 +47,9 @@ from realtime_subtitle.ui.subtitle_render import LiveTextRenderMixin
 if sys.platform == "win32":
     import ctypes
 
-# 窗口位置/大小/字号的持久化文件（重启后恢复用户调好的布局）
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "window_state.json")
+# 窗口位置/大小/字号的持久化文件（重启后恢复用户调好的布局）。
+# 仓库根：uninstall.ps1 / update_subtitles.ps1 都按这个位置跟用户讲
+STATE_FILE = repo_path("window_state.json")
 
 
 def _atomic_write_json(path, data):
@@ -80,7 +82,8 @@ def _ai_web_enabled():
 
 class SubtitleSignals(QObject):
     """信号对象（用于线程安全的UI更新）"""
-    update = pyqtSignal(str)
+    # 注：曾有一个 update = pyqtSignal(str) + update_subtitle()/_update_text()，
+    # 是 2026-07-06 双层显示重写之前的旧接口，此后零调用方，已删
     status = pyqtSignal(str)  # 状态提示（如暂停/继续），不进字幕历史
     live = pyqtSignal(str, str)  # live德语行更新 (committed, unstable)
     pair = pyqtSignal(str, str)  # 一段德语翻译完成 (german, chinese)
@@ -410,7 +413,6 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         self.ai_analysis_popup.on_open_web = self._open_ai_web
 
         # 连接信号到槽（线程安全）
-        self.signals.update.connect(self._update_text)
         self.signals.status.connect(self._show_status)
         self.signals.live.connect(self._update_live)
         self.signals.pair.connect(self._add_pair)
@@ -808,8 +810,9 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
             return
         url = build_ai_web_url(q)
         if not url:
-            # 模板被清空 = 用户主动关掉了这个唯一的出网入口，别打开浏览器主页
-            self.show_status("「问更强的AI」已在 config 里关闭")
+            # 模板被清空 = 用户主动关掉了这个唯一的出网入口，别打开浏览器主页；
+            # 模板写坏了也走这条（build_ai_web_url 会在日志里说清是哪种）
+            self.show_status("「问更强的AI」不可用：config 里的模板为空或格式不对（详见 subtitle.log）")
             return
         try:
             webbrowser.open(url)

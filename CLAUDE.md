@@ -381,10 +381,39 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     就能复现（torch 只要能 import，临时放个空的 `torch.py` 在 PYTHONPATH 里
     即可，不用真下几百 MB）。
 
+28. **☠️ 运行时文件的路径一律走 `realtime_subtitle/paths.py`，别再用 `__file__` 推**
+    （2026-08-11，上一条的直接后果，隔了一天才发现）。第 26 条只修了 import，
+    **按 `__file__` 算落点的代码一处都没改**，于是包化之后：
+
+    | 文件 | 实际落到 | .ps1 / README 说的 |
+    |---|---|---|
+    | `.paused` / `.stop` | `realtime_subtitle\capture\` | `<仓库根>\` |
+    | `transcripts\` | `realtime_subtitle\translate\` | `<仓库根>\` |
+    | `window_state.json` | `realtime_subtitle\ui\` | `<仓库根>\` |
+
+    这类 bug **单看每一处都是对的**，只有把 Python 和 .ps1 两边对起来才暴露，
+    所以症状极其难归因：
+
+    - **「暂停继续字幕.bat」完全失效**——脚本在根目录建 `.paused`，程序在
+      `capture\` 查，还照常打印"已暂停"。Ctrl+Alt+P 反而是好的（同一个常量）。
+    - **停止脚本的优雅退出路径从此再没被触发过**——`.stop` 同理收不到，每次
+      都走满 5 秒宽限再强杀。强杀掉的正是 `shutdown()` 里排在后面的
+      `_save_lookup_cache()` 和 `_unload_our_models()`：**查词缓存每次退出都丢、
+      显存卸载只剩 stop_subtitles.ps1 那条 HTTP 兜底**。第 13 条花大力气防的
+      竞态，从另一个方向复活了。
+
+    现在唯一真相源是 `realtime_subtitle/paths.py` 的 `REPO_ROOT` / `repo_path()`
+    （零项目内 import，config.py 也用它）。`tests/test_runtime_paths.py` 盯着这件事，
+    而且第一条用例是**静态扫描**——它拦的是整个类别（禁止
+    `os.path.dirname(os.path.abspath(__file__))`），以后新增运行时文件照样会被拦下，
+    不用记住今天这六个位置。加新的运行时文件时：写 `repo_path("xxx")`，
+    并去 test_runtime_paths.py 的 parametrize 里补一行。
+
 ## 5. 目录地图
 
 ```
 main.py               入口：接线各模块、热键注册、单实例守卫（import 顺序敏感！）
+realtime_subtitle/paths.py    运行时文件落点的唯一真相源（REPO_ROOT/repo_path，见第4节第28条）
 realtime_subtitle/capture/audio_capture.py      WASAPI Loopback 采集 + 设备热切换
 realtime_subtitle/asr/streaming_asr.py      local agreement 增量识别（词级前缀提交）
 realtime_subtitle/translate/translator_queue.py   Whisper/Ollama 持有者：切句、翻译队列、草稿、查词、术语表

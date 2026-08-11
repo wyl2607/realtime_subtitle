@@ -52,6 +52,8 @@ from PyQt5.QtCore import QTimer
 import realtime_subtitle.config as config
 # 纯常量模块，没有任何 import，放这里不影响上面那条 torch/PyQt5 的顺序约束
 from realtime_subtitle.version import version_string
+# 同样是纯 stdlib（pathlib），不影响 DLL 顺序
+from realtime_subtitle.paths import repo_path
 
 class SubtitleApp:
     """实时字幕应用主类"""
@@ -450,7 +452,7 @@ class SubtitleApp:
         # venv 启动器存根的 PID（我们的父进程），不是 os.getpid()，所以只能
         # 按路径删、不做内容比对
         try:
-            pid_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subtitle.pid")
+            pid_file = repo_path("subtitle.pid")
             if os.path.exists(pid_file):
                 os.remove(pid_file)
         except OSError:

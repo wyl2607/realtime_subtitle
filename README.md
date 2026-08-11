@@ -34,7 +34,9 @@ System audio ──WASAPI loopback──▶ Faster-Whisper (CUDA or CPU)
 - **Resizable overlay** — drag edges/corners; size and position persist across restarts
 - **Word lookup** — click a German word for lemma / POS / meaning (local LLM)
 - **Click-through mode** — `Ctrl+Alt+M` so the overlay ignores mouse hits over video/games
-- **Daily transcript archive** — `transcripts/` (timestamp + source + translation)
+- **Daily transcript archive** — `transcripts/` (timestamp + source + translation), kept
+  forever by default. Plain text, and this app captures **all** system audio: set
+  `TRANSCRIPT_KEEP_DAYS = 30` to auto-prune, or `SAVE_TRANSCRIPT = False` to record nothing.
 - **Hotkeys** — pause, language cycle, performance mode (see Usage)
 
 ## Requirements
