@@ -85,8 +85,16 @@ def test_pause_and_stop_flags_match_the_powershell_contract():
     import sys
     import types
 
+    # ☠️ 只在**真的装不上**时才打桩。无条件 setdefault 会把假模块留在
+    # sys.modules 里，污染后面那条真跑 PortAudio 并发的用例（它 importorskip
+    # 到的就是这个桩，于是静默跳过——正是这种"测试其实没跑"让段错误溜到了真机）
     for name in ("pyaudiowpatch", "soxr"):
-        sys.modules.setdefault(name, types.ModuleType(name))
+        if name in sys.modules:
+            continue
+        try:
+            __import__(name)
+        except ImportError:
+            sys.modules[name] = types.ModuleType(name)
 
     from realtime_subtitle.capture import audio_capture
 
@@ -114,3 +122,45 @@ def test_lookup_cache_and_transcripts_land_at_root():
     assert Path(cache).parent == REPO_ROOT
 
     assert Path(config.TRANSCRIPT_DIR).is_absolute() is False  # 配置里是相对名
+
+
+def test_pyaudio_lifecycle_is_serialized_across_threads():
+    """☠️ 并发 Pa_Initialize/Pa_Terminate 会**段错误**（不是异常，是进程没了）。
+
+    2026-08-11 端到端实测撞上：设备探测挪到独立线程后，它每 5 秒建一个临时
+    PyAudio，而采集线程开流时也要建自己那个——启动瞬间正好撞上，先报一句
+    「`info_dict` must represent an output device」（设备表被并发改坏），
+    紧接着进程静默死亡（exit 139，err log 全空）。实测对照：
+
+        并发 2 线程 x 25 轮 init/terminate -> Segmentation fault
+        单线程    50 轮                    -> 正常
+        加 _PYAUDIO_LOCK 后 3 线程 x 25 轮 -> 正常
+
+    ☠️ 这条**故意不打桩** pyaudiowpatch：上一版单测正是因为把
+    _current_desired_device_name 打了桩，从没碰过真实 PortAudio，才让这个
+    段错误一路溜到真机上。没有真实 pyaudiowpatch 的环境（ubuntu CI）直接跳过。
+    """
+    pa = pytest.importorskip("pyaudiowpatch")
+    if not hasattr(pa, "PyAudio"):
+        pytest.skip("pyaudiowpatch 是个桩（非 Windows 环境），并发测试没有意义")
+    import threading
+    from realtime_subtitle.capture import audio_capture as ac
+
+    # 锁必须存在，且 _current_desired_device_name 真的在用它
+    assert isinstance(ac._PYAUDIO_LOCK, type(threading.Lock()))
+
+    errors = []
+    def hammer():
+        for _ in range(15):
+            try:
+                ac.AudioCapture._current_desired_device_name()
+            except Exception as e:      # 没有默认播放设备的机器会抛，可接受
+                errors.append(e)
+                return
+    threads = [threading.Thread(target=hammer) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    # 能走到这一行就说明没段错误（段错误会直接带走整个 pytest 进程）
+    assert not any(t.is_alive() for t in threads), "探测线程卡死"

@@ -13,7 +13,7 @@ import soxr
 import queue
 import time
 import os
-from threading import Thread
+from threading import Thread, Lock
 import realtime_subtitle.config as config
 from realtime_subtitle.paths import repo_path
 # ☠️ 这两个是**和 .ps1 脚本的跨进程约定**，必须落在仓库根（见 paths.py）：
@@ -22,6 +22,21 @@ from realtime_subtitle.paths import repo_path
 PAUSE_FLAG_FILE = repo_path(".paused")
 # 停止标志：stop_subtitles.ps1 创建后，主程序优雅退出（先关模型再退）
 STOP_FLAG_FILE = repo_path(".stop")
+
+# ☠️ PortAudio 的 Pa_Initialize/Pa_Terminate 不是线程安全的：两个线程同时
+# 建/销 PyAudio 实例会**直接段错误**（2026-08-11 实测，exit 139，没有
+# traceback、没有 stderr，进程凭空消失）。
+#     并发 2 线程 x 25 轮 init/terminate -> Segmentation fault
+#     单线程    50 轮                    -> 正常
+#     加这把锁后 3 线程 x 25 轮          -> 正常
+# 设备探测挪到独立线程（_probe_loop）之后就出现了这个并发：探测线程每 5 秒
+# 建一个临时实例，而采集线程开流时也要建自己那个，启动瞬间正好撞上——实测
+# 现场是先报一句「`info_dict` must represent an output device」（设备表被
+# 并发改坏），紧接着进程静默死亡。
+# 注意只有 **init/terminate** 需要互斥：一边开着流 read、另一边并发探测是
+# 安全的（同日实测 4 秒 51 块无异常），所以锁的粒度就到"建实例→查→销毁"，
+# 不会拖慢采集循环。
+_PYAUDIO_LOCK = Lock()
 
 class AudioCapture:
     """系统音频捕获器"""
@@ -95,12 +110,15 @@ class AudioCapture:
 
         PortAudio 设备列表在 Pa_Initialize 时冻结——用打开着流的旧实例
         查不到设备变更，必须新建实例（实测每次~10-30ms）。
+
+        ☠️ 整段必须持 _PYAUDIO_LOCK：和采集线程建自己那个实例撞上会段错误。
         """
-        p = pyaudio.PyAudio()
-        try:
-            return AudioCapture._resolve_loopback(p).get("name")
-        finally:
-            p.terminate()
+        with _PYAUDIO_LOCK:
+            p = pyaudio.PyAudio()
+            try:
+                return AudioCapture._resolve_loopback(p).get("name")
+            finally:
+                p.terminate()
 
     def _probe_loop(self):
         """独立线程：每 DEVICE_CHECK_INTERVAL 秒探一次「应该抓哪个设备」。
@@ -214,16 +232,21 @@ class AudioCapture:
             resampler = None
             try:
                 # 每次(重)开都用新PyAudio实例：PortAudio设备列表在初始化时
-                # 冻结，旧实例看不到新的默认设备
-                p = pyaudio.PyAudio()
-                try:
-                    default_speakers = self._resolve_loopback(p)
-                except Exception as e:
-                    print(f"❌ 无法获取音频设备: {e}（2秒后重试）")
-                    if self.on_status:
-                        self.on_status("⚠️ 找不到播放设备，等待设备可用…")
-                    p.terminate()
-                    p = None
+                # 冻结，旧实例看不到新的默认设备。
+                # ☠️ 建实例 + 查设备必须持 _PYAUDIO_LOCK：探测线程每 5 秒也在
+                # 建/销自己那个临时实例，并发 Pa_Initialize 会段错误（见锁的注释）
+                with _PYAUDIO_LOCK:
+                    p = pyaudio.PyAudio()
+                    try:
+                        default_speakers = self._resolve_loopback(p)
+                    except Exception as e:
+                        print(f"❌ 无法获取音频设备: {e}（2秒后重试）")
+                        if self.on_status:
+                            self.on_status("⚠️ 找不到播放设备，等待设备可用…")
+                        p.terminate()
+                        p = None
+                        default_speakers = None
+                if default_speakers is None:
                     time.sleep(2)
                     continue
 
@@ -390,7 +413,10 @@ class AudioCapture:
                         stream.stop_stream()
                         stream.close()
                     if p is not None:
-                        p.terminate()
+                        # ☠️ 同样要持锁：Pa_Terminate 和探测线程的 Pa_Initialize
+                        # 并发一样会段错误（重开流/退出时正好是高发时刻）
+                        with _PYAUDIO_LOCK:
+                            p.terminate()
                 except Exception:
                     pass
 
