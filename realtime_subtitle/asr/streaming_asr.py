@@ -354,11 +354,25 @@ class OnlineASRProcessor:
         self.buffer_time_offset = time
 
     def finish(self):
-        """结束/长静音/暂停时冲出未提交尾部（不再等第二次一致确认）"""
+        """结束/长静音/暂停时冲出未提交尾部（不再等第二次一致确认）
+
+        ☠️ 冲完必须 pop_commited：`commited_in_buffer` 的语义是"已提交、且对应
+        音频**还在缓冲里**的词"，而这里刚把整个音频缓冲丢掉，那批词按定义就
+        全过期了。以前这一句不在，于是它唯一的排空点只剩 `_chunk_at()`——而
+        `_chunk_at` 只在缓冲涨过 BUFFER_TRIM_SEC(12秒) 时才会被调到。
+
+        看剧/聊天/游戏语音正好是"短促片段 + 中间有静音"，缓冲根本涨不到 12 秒，
+        每段说完都走 finish()，于是这个 list 整场只涨不消（实测：每轮 4 个词
+        的合成负载跑 300 轮，commited_in_buffer 涨到 1200，而同函数里的
+        `self.commited` 一直被 process_iter 截在 200——两者不一致本身就说明
+        这是漏改）。按真人语速看一整天剧能攒几万条元组，几 MB 量级：不会 OOM，
+        但是纯粹的死数据（insert() 的去重只回看最后 5 条）。
+        """
         self._flush_audio_chunks()
         o = self.transcript_buffer.complete()
         self.transcript_buffer.buffer = []
         self.buffer_time_offset += len(self.audio_buffer) / self.SAMPLING_RATE
+        self.transcript_buffer.pop_commited(self.buffer_time_offset)
         self.audio_buffer = np.array([], dtype=np.float32)
         self._audio_chunks = []
         return "".join(t for _, _, t in o).strip()

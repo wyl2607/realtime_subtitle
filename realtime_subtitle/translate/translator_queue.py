@@ -903,13 +903,23 @@ class WhisperQueueTranslator:
         return dropped
 
     def _warn_tx_dropped(self, dropped):
-        """队列丢弃告警（每累计10条报一次，别刷屏）。在锁外调，回调可能碰 UI。"""
+        """队列丢弃告警（每累计10条报一次，别刷屏）。在锁外调，回调可能碰 UI。
+
+        ☠️ print 必须和 on_status 一起被节流住。以前它在 if 外面，于是被节流的
+        只有屏幕提示，日志是**每次丢弃都打一行**——而这个函数触发的场景恰恰是
+        "Ollama 半死、每句都超时"，也就是它会以每句一行的频率刷 subtitle.log。
+        对照组就在本文件的 enqueue_audio 里：收件箱那条告警的 print 是放在节流
+        条件内部的，两边不一致本身就说明这是漏改。
+        （SHOW_PERFORMANCE 默认关掉的理由就是"别把 subtitle.log 撑大"，
+        start_subtitles.ps1 还专门为跨天累积的概况行做了日志归档。）
+        """
+        if not (self._tx_dropped - self._tx_drop_warned >= 10 or self._tx_drop_warned == 0):
+            return
+        self._tx_drop_warned = self._tx_dropped
         print(f"⚠️  翻译积压超过 {getattr(config, 'TRANSLATE_QUEUE_MAX_CHARS', 3000)} 字符，"
               f"已丢弃最旧 {dropped} 句（累计 {self._tx_dropped}）——翻译服务可能很慢或半死")
-        if self._tx_dropped - self._tx_drop_warned >= 10 or self._tx_drop_warned == 0:
-            self._tx_drop_warned = self._tx_dropped
-            if self.on_status:
-                self.on_status(f"⚠️ 翻译跟不上，已丢弃 {self._tx_dropped} 句的中文（德语不受影响）")
+        if self.on_status:
+            self.on_status(f"⚠️ 翻译跟不上，已丢弃 {self._tx_dropped} 句的中文（德语不受影响）")
 
     def _circuit_open(self):
         """熔断中 = 最近连续多次翻译失败，这段时间内直接跳过 Ollama。
@@ -1761,7 +1771,12 @@ class WhisperQueueTranslator:
                                     last_emit = time.time()
                                     on_partial(partial)
                         translation = re.sub(r'<think>.*?</think>', '', "".join(parts), flags=re.DOTALL)
-                        self._note_tx_result(ok=True)
+                        # ☠️ 拿到 200 但一个字都没生成时不能算成功（撞上模型卸载
+                        # 边界、或整段被 <think> 吃掉都会这样）。算成功的话
+                        # _note_tx_result 会把 _ollama_hot 置真、熔断计数清零、
+                        # 超时从冷档翻回 15 秒——而这一句其实根本没有中文，
+                        # 等于用一次空响应把所有降级保护都解除了
+                        self._note_tx_result(ok=bool(translation.strip()))
                         return _strip_translator_note(translation)
                     else:
                         print(f"   ⚠️  Ollama 返回错误 (HTTP {response.status_code})，显示德语原文")

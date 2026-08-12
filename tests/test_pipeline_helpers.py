@@ -1792,3 +1792,53 @@ def test_save_transcript_prunes_on_day_rollover(tmp_path, monkeypatch):
     assert calls == [1], "跨天时必须重跑一次保留期清理"
     t._save_transcript("Noch was.", "还有")
     assert calls == [1], "同一天内不该反复清理"
+
+
+def test_finish_prunes_committed_words_out_of_buffer():
+    """☠️ commited_in_buffer 的语义是"已提交、且音频还在缓冲里"的词，而
+    finish() 刚把整个音频缓冲丢掉——那批词按定义就全过期了。
+
+    以前 finish() 不 pop，于是唯一的排空点只剩 _chunk_at()，而它只在缓冲涨过
+    BUFFER_TRIM_SEC(12秒) 时才触发。看剧/聊天/游戏语音正好是"短促片段 + 中间
+    有静音"，缓冲根本涨不到 12 秒，每段说完都走 finish()——这个 list 于是整场
+    只涨不消（修复前本用例跑出 1200 条，而同类的 self.commited 一直被截在 200）。
+    """
+    buf = HypothesisBuffer()
+    buf.commited_in_buffer = [(0.0, 1.0, "a"), (1.0, 2.0, "b")]
+    buf.buffer = [(2.0, 3.0, "c")]
+
+    class _P(OnlineASRProcessor):
+        def __init__(self):
+            self.model = None
+            self.init()
+
+    p = _P()
+    p.transcript_buffer = buf
+    p.audio_buffer = np.zeros(16000 * 3, dtype=np.float32)
+
+    assert p.finish() == "c"
+    assert buf.commited_in_buffer == [], "音频缓冲已清空，已提交词必须一起过期"
+
+
+def test_tx_drop_warning_is_throttled(capsys):
+    """队列丢弃告警的 print 必须和 on_status 一起被节流。
+
+    以前 print 在 if 外面，于是被节流的只有屏幕提示——而这个函数触发的场景
+    恰恰是"Ollama 半死、每句都超时"，也就是它会以每句一行的频率刷
+    subtitle.log。对照组是 enqueue_audio 里收件箱那条告警（print 在节流内）。
+    """
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
+
+    t = object.__new__(WhisperQueueTranslator)
+    t._tx_dropped = 0
+    t._tx_drop_warned = 0
+    t.on_status = None
+
+    for _ in range(25):
+        t._tx_dropped += 1
+        t._warn_tx_dropped(1)
+
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if "翻译积压" in ln]
+    # 25 次丢弃：首次 + 每累计 10 条一次 = 3 行，绝不该是 25 行
+    assert len(lines) <= 4, f"告警没被节流，打了 {len(lines)} 行"
+    assert lines, "节流过头了，一条都没报"
