@@ -31,6 +31,8 @@ from realtime_subtitle.asr.streaming_asr import OnlineASRProcessor
 # 路径共用这个保险丝，而 import 方向只能是 translator_queue → lookup
 # （反过来就是循环 import）。改它去那边改。
 from realtime_subtitle.translate.lookup import LookupMixin, _MAX_STREAM_CHARS
+from realtime_subtitle.translate.transcript import TranscriptMixin
+from realtime_subtitle.translate.runtime_stats import StatsMixin
 from realtime_subtitle.paths import repo_path
 import realtime_subtitle.config as config
 # 过滤所有警告信息
@@ -357,19 +359,21 @@ def _ensure_ml_deps():
     return _WhisperModel
 
 
-class WhisperQueueTranslator(LookupMixin):
+class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
     """local agreement 增量识别 + 异步 Ollama 翻译
 
-    点词查词 / 🤖 AI 分析在 translate/lookup.py 的 LookupMixin 里——它只和
-    主链路共享一个 `_lookup_inflight_n`（草稿翻译看它让路），其余状态都是
-    自己的。本类的 __init__ 负责把 mixin 要用的那些字段建出来，见那边的
-    模块 docstring。
+    本类剩下的是**主链路**：ASR 编排（收件箱→缓冲→提交）、切句、翻译队列与
+    worker、以及 Ollama 的连接/模型生命周期。三个和主链路不共享任何锁的旁支
+    已经拆成 mixin 了：
+
+        translate/lookup.py         LookupMixin      点词查词 + 🤖AI分析
+        translate/transcript.py     TranscriptMixin  字幕存档 + 保留期清理
+        translate/runtime_stats.py  StatsMixin       分钟级性能概况
+
+    ☠️ 三个 mixin 都**不自己 __init__**，它们要用的字段全由本类的 __init__
+    建出来——契约分别写在各自的模块 docstring 里，加字段/改名时两边一起改。
     """
 
-    # 上一条存档写在哪一天（跨天要重跑保留期清理，见 _save_transcript）。
-    # 放类属性而不是只在 __init__ 里赋值：单测习惯用 __new__ 造个壳只塞它关心的
-    # 几个字段，__init__ 中途失败时也一样是半成品——存档路径不该因此炸
-    _transcript_day = None
     # 11434 后面确实是 Ollama 吗（见 _check_ollama_identity）。同样放类属性。
     # 默认是"已验证、无需重验"，所以正常路径一次额外请求都不会发
     _ollama_impostor = False         # 上次校验的结论是"有回应但不是 Ollama"
@@ -592,85 +596,9 @@ class WhisperQueueTranslator(LookupMixin):
             print(f"❌ 模型加载失败: {e}")
             raise
 
-    # ------------------------------------------------------------------
-    # 字幕记录
-    # ------------------------------------------------------------------
-    def _prune_old_transcripts(self):
-        """启动时清掉超过 TRANSCRIPT_KEEP_DAYS 天的存档（0 = 永久保留）。
-
-        ⚠️ 这是隐私措施，不是省磁盘：本程序抓的是系统全部声音，存档是明文，
-        而且 SAVE_TRANSCRIPT 默认开着。以前没有任何保留期，装多久就攒多久。
-
-        按**文件名**里的日期判断而不是 mtime：文件名就是 YYYY-MM-DD.txt
-        （_save_transcript 的格式），而 mtime 会被同步网盘/备份工具刷新。
-        认不出日期的文件一律不碰（可能是用户自己放进去的）。
-        """
-        # ☠️ 配置值必须容错。这个函数现在也从 _save_transcript 的跨天分支调，
-        # 而那条路径在 _translation_worker 里、外面没有 try——config_local.py
-        # 里写成 TRANSCRIPT_KEEP_DAYS = "30" 之类的话，一个 ValueError 就会把
-        # 整个翻译 worker 打断（句对不上屏），症状和"配置写错"毫无关联
-        try:
-            days = int(getattr(config, "TRANSCRIPT_KEEP_DAYS", 0) or 0)
-        except (TypeError, ValueError):
-            print("⚠️  TRANSCRIPT_KEEP_DAYS 不是整数，本次不清理存档"
-                  f"（当前值 {getattr(config, 'TRANSCRIPT_KEEP_DAYS', None)!r}）")
-            return
-        if days <= 0:
-            return
-        cutoff = time.time() - days * 86400
-        removed = 0
-        try:
-            names = os.listdir(self._transcript_dir)
-        except OSError:
-            return
-        for name in names:
-            stem, ext = os.path.splitext(name)
-            if ext.lower() != ".txt":
-                continue
-            try:
-                ts = time.mktime(time.strptime(stem, "%Y-%m-%d"))
-            except ValueError:
-                continue  # 不是当天存档的命名，别动
-            if ts >= cutoff:
-                continue
-            try:
-                os.remove(os.path.join(self._transcript_dir, name))
-                removed += 1
-            except OSError:
-                pass  # 被占用/只读：跳过，下次启动再试
-        if removed:
-            print(f"🧹 已清理 {removed} 个超过 {days} 天的字幕存档"
-                  f"（保留期在 config.TRANSCRIPT_KEEP_DAYS，设 0 可关闭）")
-
-    def _save_transcript(self, source_text, translation):
-        """把一条字幕追加到当天的记录文件（失败一次就关闭，不刷屏）。
-
-        translation 为空 = 这句没翻出来（Ollama 挂了/熔断中）。原文照写，
-        只是不留那行空的译文——回看时能看出"这句当时没有中文"，而不是整句消失。
-
-        ☠️ 跨天时要再跑一次 _prune_old_transcripts。以前它只在 __init__ 里调
-        一次，而字幕程序的典型用法是**开机挂着不关**——也就是说设了
-        TRANSCRIPT_KEEP_DAYS 的用户，只要不重启就永远不会真的清理，配置看着
-        生效实际没生效。这是隐私措施不是省磁盘（存档是明文、抓的是系统全部
-        声音），"以为在删其实没删"比不提供这个选项更糟。
-        本函数只在 _tx_executor 这一个线程里被调，_transcript_day 不用加锁。
-        """
-        if not self._transcript_ok:
-            return
-        try:
-            day = time.strftime("%Y-%m-%d")
-            if day != self._transcript_day:
-                self._transcript_day = day
-                self._prune_old_transcripts()
-            path = os.path.join(self._transcript_dir, day + ".txt")
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(f"[{time.strftime('%H:%M:%S')}] {source_text}\n")
-                if translation:
-                    f.write(f"           {translation}\n")
-                f.write("\n")
-        except OSError as e:
-            print(f"⚠️  字幕记录写入失败，记录功能关闭: {e}")
-            self._transcript_ok = False
+    # 注：字幕存档（_prune_old_transcripts / _save_transcript）已搬到
+    # translate/transcript.py 的 TranscriptMixin，本类的 __init__ 仍负责建
+    # _transcript_ok / _transcript_dir 两个字段。
 
     # ------------------------------------------------------------------
     # 上下文管理
@@ -1626,96 +1554,9 @@ class WhisperQueueTranslator(LookupMixin):
             if unstable:
                 print(f"   ⏳ 未稳定: {unstable[:60]}")
 
-    @staticmethod
-    def _stats_enabled():
-        """概况关掉时（STATS_SUMMARY_INTERVAL<=0）一个样本都不该再收。
-
-        ☠️ 排空点只有 _stat_note_asr 里那个到点打印的分支，而它在
-        `interval <= 0` 时直接 return。翻译耗时以前是在 _translation_worker
-        里【无条件】 append 的，于是用户一旦按 config 注释把概况关掉，
-        _stat_tx 就再也没有出口了——一条一句、长跑几小时只涨不消。
-        采样入口统一走这个门。
-        """
-        return getattr(config, "STATS_SUMMARY_INTERVAL", 60) > 0
-
-    def _stat_note_tx(self, elapsed):
-        """记一次翻译耗时（概况关掉时直接丢弃，不进内存）。"""
-        if not self._stats_enabled():
-            return
-        with self._stats_lock:
-            self._stat_tx.append(elapsed)
-
-    def _stat_note_asr(self, elapsed, buf_sec, n_items,
-                       buf_before=None, overlapped=False):
-        """记一轮识别指标；到间隔就打一行概况（跑在ASR线程，无音频时不打）
-
-        buf_before/overlapped 是 2026-08-04 加的诊断项，用来回答两个之前
-        answer 不了的问题（都需要真实使用数据，读代码得不出来）：
-        1. **ASR 耗时到底受不受缓冲长度影响？** 分短/长缓冲两桶记 p50。
-           faster-whisper 的 `pad_or_trim` 会把每段都补到固定 30 秒再进编码器
-           （transcribe.py:1180 + feature_extractor nb_max_frames=3000），
-           所以理论上编码开销与缓冲长度无关、只有解码随 token 数变。
-           两桶 p50 若基本持平，就证实了这一点，`BUFFER_TRIM_SEC` 也就没有
-           调小的价值——省得以后再有人去做那个 A/B。
-        2. **翻译和识别同时跑会不会互相拖慢？** 按"推理开始时 Ollama 是否
-           在飞"分桶记 p50，直接看差值。
-        """
-        interval = getattr(config, "STATS_SUMMARY_INTERVAL", 60)
-        if not self._stats_enabled():
-            return
-        with self._stats_lock:
-            self._stat_asr.append(elapsed)
-            self._stat_buf_max = max(self._stat_buf_max, buf_sec)
-            if buf_before is not None:
-                # 分桶阈值取 BUFFER_KEEP_SEC：裁剪后停在它附近，涨到 TRIM 再裁，
-                # 所以它天然就是"短缓冲/长缓冲"的分界
-                bucket = (self._stat_asr_longbuf if buf_before >= config.BUFFER_KEEP_SEC
-                          else self._stat_asr_shortbuf)
-                bucket.append(elapsed)
-            (self._stat_asr_overlap if overlapped else self._stat_asr_solo).append(elapsed)
-            if n_items > 1:
-                self._stat_merge += 1
-            if time.time() - self._stats_t0 < interval:
-                return
-            asr, tx = sorted(self._stat_asr), sorted(self._stat_tx)
-            merge, buf_max = self._stat_merge, self._stat_buf_max
-            draft, dhit = self._stat_draft, self._stat_dict
-            held, misfire = self._stat_held_release, self._stat_held_misfire
-            shortb, longb = sorted(self._stat_asr_shortbuf), sorted(self._stat_asr_longbuf)
-            solo, overlap = sorted(self._stat_asr_solo), sorted(self._stat_asr_overlap)
-            self._stat_asr, self._stat_tx = [], []
-            self._stat_merge, self._stat_buf_max = 0, 0.0
-            self._stat_draft = self._stat_dict = 0
-            self._stat_held_release = self._stat_held_misfire = 0
-            self._stat_asr_shortbuf, self._stat_asr_longbuf = [], []
-            self._stat_asr_solo, self._stat_asr_overlap = [], []
-            self._stats_t0 = time.time()
-
-        def pct(a, q):
-            return a[min(len(a) - 1, int(q * len(a)))] if a else 0.0
-
-        line = (f"📈 概况: 识别{len(asr)}次 p50 {pct(asr, .5):.2f}s p90 {pct(asr, .9):.2f}s"
-                f" | 缓冲峰值 {buf_max:.1f}s")
-        if merge:
-            line += f" | 合并{merge}轮"
-        if tx:
-            line += f" | 翻译{len(tx)}次 p50 {pct(tx, .5):.1f}s p90 {pct(tx, .9):.1f}s"
-        if draft:
-            line += f" | 草稿{draft}"
-        if dhit:
-            line += f" | 词典直译{dhit}"
-        if held:
-            line += f" | 扣留放行{held}"
-            if misfire:
-                line += f"(切早{misfire})"
-        # 诊断项：只在两桶都有样本时打，否则是噪声
-        if shortb and longb:
-            line += (f" | 缓冲短{pct(shortb, .5):.2f}s({len(shortb)})"
-                     f"/长{pct(longb, .5):.2f}s({len(longb)})")
-        if solo and overlap:
-            line += (f" | 独占{pct(solo, .5):.2f}s({len(solo)})"
-                     f"/与翻译并发{pct(overlap, .5):.2f}s({len(overlap)})")
-        print(line)
+    # 注：分钟级性能概况（_stats_enabled / _stat_note_tx / _stat_note_asr）
+    # 已搬到 translate/runtime_stats.py 的 StatsMixin，本类的 __init__ 仍负责
+    # 建 _stats_lock / _stats_t0 / 那一堆 _stat_* 字段。
 
     def flush_pending(self):
         """空闲兜底：一段话说完后没有新音频，未提交尾部/未成句残句会一直挂着。
