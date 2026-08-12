@@ -9,11 +9,47 @@
 WHISPER_MODEL = "large-v3-turbo"  # tiny, base, small, medium, large-v3, large-v3-turbo
 WHISPER_DEVICE = "cuda"  # cuda 或 cpu
 WHISPER_COMPUTE_TYPE = "float16"  # float16, int8, int8_float16
-# 源语言（Whisper语言代码）。运行中可用 Ctrl+Alt+L 在 LANGUAGE_CYCLE 里循环切换，
+# 源语言（Whisper语言代码）。运行中可用 Ctrl+Alt+L 在 LANGUAGE_PAIRS 里循环切换，
 # 不需要重启：语言只是识别参数，模型本身是多语言的
 SOURCE_LANGUAGE = "de"
-LANGUAGE_CYCLE = ["de", "en"]  # 热键循环切换的语言列表，想看别的语言往里加
-LANGUAGE_NAMES = {"de": "德语", "en": "英语", "fr": "法语", "es": "西班牙语", "ja": "日语"}
+# 翻译目标语言。以前"简体中文"是写死在 prompt 里的，加中→德之后必须参数化
+TARGET_LANGUAGE = "zh"
+# ☠️ Ctrl+Alt+L 循环的是**语言对**，不是单个源语言——切源语言而不切目标语言的话，
+# 放中文视频会得到"中文→中文"。这个列表同时兼任 源语言→目标语言 的映射表，
+# 自动检测（AUTO_DETECT_LANGUAGE）也只会在这里出现过的源语言之间切。
+LANGUAGE_PAIRS = [("de", "zh"), ("zh", "de"), ("en", "zh")]
+# 兼容：老的 config_local.py 里可能写着 LANGUAGE_CYCLE = ["de","en"]（只列源语言）。
+# 仍然生效，目标语言按 LANGUAGE_PAIRS 查、查不到就用 TARGET_LANGUAGE。
+LANGUAGE_CYCLE = None
+LANGUAGE_NAMES = {"de": "德语", "en": "英语", "fr": "法语", "es": "西班牙语",
+                  "ja": "日语", "zh": "中文"}
+# 目标语言在 prompt 里的叫法（只在这里不一样时才需要写）。
+# ☠️ zh 必须是"简体中文"而不是"中文"：不点明简体，模型有概率输出繁体。
+# 参数化目标语言之前 prompt 里写死的就是"简体中文"，这里是在保持原行为。
+TRANSLATION_TARGET_NAMES = {"zh": "简体中文"}
+
+# ============ 自动语言检测（放中文视频自动切成中→德）============
+# ☠️ **默认关**。不是因为没做好，是因为切错的代价很高：切语言会
+# clear_context() 丢掉识别缓冲，而且新语言会通过 initial_prompt 自我强化——
+# 避坑清单第 4 节记着"英文一旦被误认能锁死近 3 分钟"，LANGUAGE_SEED_PROMPTS
+# 这套东西就是为此存在的。自动切换等于把那个风险交给一个概率判断。
+# 想开就在 config_local.py 里写 AUTO_DETECT_LANGUAGE = True。
+# 开了之后如果发现乱切：先把 LANGUAGE_SWITCH_STREAK 调大（最有效），
+# 再考虑抬 LANGUAGE_SWITCH_MIN_PROB。
+AUTO_DETECT_LANGUAGE = False
+# 每隔这么多秒做一次检测。检测要跑一遍 Whisper 编码器（约等于一次识别的
+# 开销），6 秒一次约合 5% 的额外 GPU；设 0 等于关掉自动检测
+LANGUAGE_DETECT_INTERVAL = 6.0
+# 缓冲里至少攒够这么多秒音频才值得检测——太短的片段检测极不可靠
+LANGUAGE_DETECT_MIN_SEC = 3.0
+# 置信度门槛：低于它的检测结果直接丢弃（不计入连击）
+LANGUAGE_SWITCH_MIN_PROB = 0.85
+# 连续这么多次检测到**同一个**新语言才真的切。这是防误切的主力旋钮：
+# 3 次 × 6 秒 = 说话人得持续讲另一种语言约 18 秒才会触发，一句外语引用
+# 或一段外语歌不会把整场切走
+LANGUAGE_SWITCH_STREAK = 3
+# 刚切过之后这么多秒内不再检测，掐掉来回横跳
+LANGUAGE_SWITCH_COOLDOWN = 20.0
 # 语言锚：initial_prompt 为空时（刚启动/切语言/长静音重置）用这句话垫底，
 # 把解码器锚在目标语言上。开头几句嘈杂/游戏音容易被认成英文，而英文一旦
 # 进了上下文 prompt 会自我强化好几分钟（2026-07-11 实测锁死近3分钟）；
@@ -22,6 +58,7 @@ LANGUAGE_NAMES = {"de": "德语", "en": "英语", "fr": "法语", "es": "西班�
 LANGUAGE_SEED_PROMPTS = {
     "de": "Hallo zusammen, wir sprechen heute auf Deutsch über dieses Thema.",
     "en": "Hello everyone, today we are talking about this topic in English.",
+    "zh": "大家好，我们今天用中文来聊一聊这个话题。",
 }
 WHISPER_TASK = "transcribe"  # "transcribe"=转录原语言, "translate"=翻译成英文
 WHISPER_BEAM_SIZE = 3  # beam search 大小。whisper_streaming作者用5，这里用3保延迟
@@ -110,6 +147,13 @@ IDLE_FLUSH_SEC = 2.0  # 静音这么多秒后，把未提交尾部/未翻译残�
 # 这么多词就不等标点直接送翻译（正常有标点的语音不会触发）。
 # 分句合并上线后它还兼任"合并别把句子拖太长"的安全阀
 MAX_PENDING_WORDS = 24
+# 无空格语言（中文/日文）用这个：上面那条按 .split() 数词，而中文整段永远
+# 等于 1 个"词"，那道兜底对中文是死的。60 字约等于德语 24 词的信息量
+MAX_PENDING_CHARS = 60
+# ☠️ 不用空格分词的书写系统。切句终止符、残句长度兜底、复读压缩三处的规则
+# 都是按"空格分词的拉丁语系"写的，这些语言必须走另一套（见 translator_queue
+# 的 _no_space_language）。加韩语/泰语等往这里补即可。
+NO_SPACE_LANGUAGES = ("zh", "ja")
 
 # ============ 分句边界（2026-08-02）============
 # Whisper 会在缩写/序数/口语停顿处打句号，只按 .!? 切的话 38.5% 的翻译单元
@@ -227,23 +271,28 @@ PRESETS = {
 # 以前 prompt 里无条件写死"你是德语影视剧的字幕翻译…口语俚语粗话按中文对白
 # 习惯翻"——看新闻直播（tagesschau/党代会这类，用户的主要场景）时语域是错的，
 # 会把播报翻得过分口语。现在跟着模式走（PRESETS 里的 TRANSLATION_STYLE）。
+#
+# ☠️ {source} / {target} 是占位符，发请求前按当前语言对替换（中→德时
+# {target} 就是"德语"）。**别把它们换回写死的"中文"**——那样中→德会变成
+# 一边让模型输出德语、一边让它"中文要通顺"，模型会照着规则输出中文。
+# 替换用的是字符串 replace 不是 .format()，所以规则里出现 { } 不会炸。
 TRANSLATION_STYLE = "新闻访谈"
 TRANSLATION_STYLE_PROMPTS = {
     "新闻访谈": {
         "role": "新闻/访谈节目的字幕翻译",
-        "rules": ("1. 这是新闻播报或访谈：中文要通顺、准确、克制，不要加戏也不要过分口语化\n"
-                  "2. 机构名、职务、数字、地名必须准确；德语长句按中文习惯拆成短句\n"
+        "rules": ("1. 这是新闻播报或访谈：{target}要通顺、准确、克制，不要加戏也不要过分口语化\n"
+                  "2. 机构名、职务、数字、地名必须准确；{source}长句按{target}习惯拆成短句\n"
                   "3. 说话人自己的口语停顿/重复可以省略，但事实一个都不能改"),
     },
     "影视对白": {
         "role": "影视剧的字幕翻译",
-        "rules": ("1. 这是剧集对白：口语、俚语、粗话按中文对白的习惯翻，保持角色语气，不要书面腔\n"
+        "rules": ("1. 这是剧集对白：口语、俚语、粗话按{target}对白的习惯翻，保持角色语气，不要书面腔\n"
                   "2. 结合上下文理解句意，不要机械直译；歌词就按歌词翻\n"
                   "3. 专有名词保持一致"),
     },
     "精听直译": {
-        "role": "德语学习者的精听字幕翻译",
-        "rules": ("1. 学习用途：尽量贴着原文的结构和用词翻，方便对照着学，但中文仍要通顺\n"
+        "role": "{source}学习者的精听字幕翻译",
+        "rules": ("1. 学习用途：尽量贴着原文的结构和用词翻，方便对照着学，但{target}仍要通顺\n"
                   "2. 原文有的信息一个都不要漏，也不要自行补充原文没有的内容\n"
                   "3. 专有名词保持一致"),
     },

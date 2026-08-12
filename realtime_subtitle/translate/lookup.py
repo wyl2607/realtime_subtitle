@@ -47,6 +47,30 @@ import realtime_subtitle.config as config
 # 不返回。一条字幕的中文再长也就几百字，20000 是留足余量的保险丝。
 _MAX_STREAM_CHARS = 20000
 
+
+def lookup_language_for(word):
+    """点了这个词，该按哪个语言去查词典。
+
+    ☠️ 不能一律用 `config.SOURCE_LANGUAGE`。加了中→德之后，源语言是中文时
+    **德语出现在译文行**——点它本来是想查德语单词，可 SOURCE_LANGUAGE 是 zh，
+    prompt 就成了"你是中文汉词典。简明解释中文单词 Kameraqualität"，模型只能
+    瞎编；缓存键也会记成 zh，把两种语言的同形词混进同一格。
+
+    判据用字符集而不是"点在第几行"：UI 那边本来就只放行纯拉丁字母的词
+    （subtitle_render._on_label_click），所以这里只需回答"当前语言对里哪个是
+    拉丁语言"。源语言不是无空格书写系统时就返回它自己——德/英→中的老行为
+    一字不变。
+    """
+    from realtime_subtitle.translate.translator_queue import (
+        _no_space_language, current_target_language,
+    )
+    src = config.SOURCE_LANGUAGE
+    if not _no_space_language(src):
+        return src
+    is_latin = bool(word) and all(ord(c) < 0x2E80 for c in word)
+    return current_target_language() if is_latin else src
+
+
 # ------------------------------------------------------------------
 # AI 分析纯函数（时间窗过滤 / prompt / URL）——无副作用，单测直接 import
 # ------------------------------------------------------------------
@@ -326,7 +350,7 @@ class LookupMixin:
         # 用户看到刚点的 B 变回 A。缓存越大越持久，这条路径越常走。
         self._lookup_seq += 1  # 只在 UI 线程递增（点击回调），worker 只读
         seq = self._lookup_seq
-        cache_key = (word.lower(), config.SOURCE_LANGUAGE)
+        cache_key = (word.lower(), lookup_language_for(word))
         if self._serve_cached_lookup(word, cache_key, context, callback):
             return
         try:
@@ -387,8 +411,12 @@ class LookupMixin:
         return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
 
     def _lookup_worker(self, word, context, callback, seq=None, on_partial=None):
-        lang_name = config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)
-        cache_key = (word.lower(), config.SOURCE_LANGUAGE)
+        # ☠️ 查的是**被点那个词**的语言，不一定是 SOURCE_LANGUAGE：中→德时
+        # 德语在译文行上，见 lookup_language_for。两处 cache_key 必须同源，
+        # 否则 lookup_word 存的和这里查的对不上，缓存等于永不命中
+        word_lang = lookup_language_for(word)
+        lang_name = config.LANGUAGE_NAMES.get(word_lang, word_lang)
+        cache_key = (word.lower(), word_lang)
         if self._lookup_stale(seq):
             return  # 排队期间用户已经点了别的词，这次白跑，连请求都不用发
         # 双检：submit 前到 worker 之间可能已被别的点击填入缓存

@@ -44,14 +44,43 @@ logging.basicConfig(level=logging.ERROR)
 # （成对的 _SENTENCE_END 在改成 finditer 之后就没有调用点了，已删）
 _SENTENCE_TERMINATOR = re.compile(r'[.!?…]["»«\']?(?=\s|$)')
 
+# ☠️ 中文/日文必须用另一套规则，否则**一句都切不出来**（2026-08-12 实测）：
+#   "这是第一句。然后还有一句？对的。"  →  上面那条正则切出 0 句
+# 两个原因，缺一不可：
+#   1. 全角 。！？ 不在 [.!?…] 里；
+#   2. 就算加进去，`(?=\s|$)` 也永远不成立——中文 Whisper 输出没有空格。
+# 而当时的兜底 MAX_PENDING_WORDS 用的是 `.split()`，中文整段恒等于 1 个"词"，
+# 于是第二道闸也是死的：中文语音只能靠 IDLE_FLUSH_SEC（说话人停满 2 秒）
+# 才冲得出来一次字幕，完全谈不上实时。
+#
+# 全角终止符**不要求后面跟空白**：它们本身就无歧义，不像半角 . 可能是小数点
+# 或缩写点。半角那半条仍保留 (?=\s|$)，这样中文里夹的 "3.5" 不会被切开。
+_SENTENCE_TERMINATOR_CJK = re.compile(r'[。！？…]["»«\'』」）)]?|[.!?](?=\s|$)')
+
 _PUNCT_STRIP = " \t.!?…,;:–—\"'«»„“”"
 _QUOTE_CHARS = "\"'«»„“”"
+_TERMINATOR_CHARS = (".", "!", "?", "…")
+_TERMINATOR_CHARS_CJK = ("。", "！", "？", "…", ".", "!", "?")
 
 
+def _no_space_language(lang=None):
+    """这个源语言是不是"不用空格分词"的书写系统（中文/日文）。
 
-def _ends_with_terminator(text):
+    切句、残句长度兜底、复读压缩三处的规则都要跟着变——它们原本全是按
+    "空格分词的拉丁语系"写的。语言集合放 config 里，方便加韩语/泰语等。
+    """
+    lang = lang if lang is not None else config.SOURCE_LANGUAGE
+    return lang in getattr(config, "NO_SPACE_LANGUAGES", ("zh", "ja"))
+
+
+def _terminator_re(lang=None):
+    return _SENTENCE_TERMINATOR_CJK if _no_space_language(lang) else _SENTENCE_TERMINATOR
+
+
+def _ends_with_terminator(text, lang=None):
     """文本是不是正好停在一个句子终止符上（判断"要不要扣留"用）。"""
-    return bool(text) and text.rstrip().rstrip(_QUOTE_CHARS).endswith((".", "!", "?", "…"))
+    chars = _TERMINATOR_CHARS_CJK if _no_space_language(lang) else _TERMINATOR_CHARS
+    return bool(text) and text.rstrip().rstrip(_QUOTE_CHARS).endswith(chars)
 
 
 # 模型偶尔在译文后面追加"（注：……）"——句子被截断时最容易触发（实测
@@ -92,7 +121,7 @@ def _normalize_clock_times(text):
     return _DE_CLOCK.sub(lambda m: f"{m.group(1)}:{m.group(2)}", text)
 
 
-def _boundary_is_real(candidate, remainder, final):
+def _boundary_is_real(candidate, remainder, final, lang=None):
     """这个句号/问号是真句尾，还是 Whisper 打错的？
 
     2026-08-02 统计 19 个转录文件共 23526 句：**38.5% 的翻译单元以小写德语词
@@ -100,6 +129,15 @@ def _boundary_is_real(candidate, remainder, final):
     送翻译会翻错（实测 "Demnach darf, wer schwimmend bzw." 被译成"均不得……"，
     否定词其实在下一段）。三条否决规则：
     """
+    # ☠️ 下面三条否决规则全都是**拉丁语系专属**的，对中文一条都不成立：
+    #   ① 缩写表是德语的（bzw./z.B.）；
+    #   ② 序数否决针对 "am 3. Mai" 这种写法；
+    #   ③ 续行否决靠"下一个词小写 = 没说完"，而中文没有大小写——`islower()`
+    #      对汉字恒为 False，等于这条规则恒判"是真句尾"，纯属瞎蒙对。
+    # 全角 。！？ 本身无歧义，直接判真即可；连"句尾扣留等下一个词"都不用做，
+    # 中文字幕因此比德语还快一拍（德语要等 SENTENCE_HOLD_SEC 才能确认）。
+    if _no_space_language(lang):
+        return True
     tail = candidate.rstrip(_QUOTE_CHARS)
     if tail.endswith("."):
         words = tail[:-1].split()
@@ -127,32 +165,141 @@ def _boundary_is_real(candidate, remainder, final):
     return not remainder[0].islower()
 
 
-def _split_sentences(text, final=False):
+def _split_sentences(text, final=False, lang=None):
     """切出完整句子 + 剩余残句。返回 (sentences, rest)。
 
     模块级纯函数：单测直接测它，不用在测试里复制一份切分逻辑（复制必然漂移）。
+    lang 缺省读 config.SOURCE_LANGUAGE；中文/日文走另一套终止符，见
+    _SENTENCE_TERMINATOR_CJK 的注释。
     """
     sentences = []
     start = 0
-    for m in _SENTENCE_TERMINATOR.finditer(text):
+    for m in _terminator_re(lang).finditer(text):
         end = m.end()
         candidate = text[start:end].strip()
         if not candidate:
             continue
         remainder = text[end:].lstrip()
-        if not _boundary_is_real(candidate, remainder, final):
+        if not _boundary_is_real(candidate, remainder, final, lang):
             continue  # 不是真句尾：跳过这个终止符，接着往后找
         sentences.append(candidate)
         start = end
     return sentences, text[start:].strip()
 
 
+def _pending_too_long(text, lang=None):
+    """残句是不是长到该不等标点直接送翻译了（MAX_PENDING_WORDS 的入口）。
+
+    ☠️ 不能一律用 `len(text.split())`：中文没有空格，整段永远等于 1 个"词"，
+    这道兜底对中文是**死的**。无空格语言改按字符数（MAX_PENDING_CHARS）。
+    """
+    if _no_space_language(lang):
+        return len(text) > getattr(config, "MAX_PENDING_CHARS", 60)
+    return len(text.split()) > config.MAX_PENDING_WORDS
+
+
+def language_pairs():
+    """当前生效的「源语言→目标语言」列表，也是 Ctrl+Alt+L 的循环顺序。
+
+    兼容老配置：config_local.py 里可能还写着 LANGUAGE_CYCLE = ["de","en"]
+    （只列源语言，那时候目标语言是写死的中文）。那种情况下按 TARGET_LANGUAGE
+    补齐成对，不让老配置失效。
+    """
+    pairs = getattr(config, "LANGUAGE_PAIRS", None)
+    if pairs:
+        return [(s, t) for s, t in pairs]
+    legacy = getattr(config, "LANGUAGE_CYCLE", None)
+    if legacy:
+        default_target = getattr(config, "TARGET_LANGUAGE", "zh")
+        return [(s, default_target) for s in legacy]
+    return [(config.SOURCE_LANGUAGE, getattr(config, "TARGET_LANGUAGE", "zh"))]
+
+
+def target_for(source_lang):
+    """这个源语言配的目标语言是哪个（查不到就用 TARGET_LANGUAGE）。"""
+    for src, tgt in language_pairs():
+        if src == source_lang:
+            return tgt
+    return getattr(config, "TARGET_LANGUAGE", "zh")
+
+
+def current_target_language():
+    """当前该翻成哪个语言。
+
+    ☠️ 以目标语言配置项为准、而不是每次都按源语言现查：切语言对时两个值是
+    一起写的（_apply_pending_lang_switch），现查会在两次赋值之间出现
+    "源已经变了、目标还没变"的窗口，而翻译 worker 是另一个线程。
+    """
+    return getattr(config, "TARGET_LANGUAGE", "zh")
+
+
+def language_name(lang):
+    return config.LANGUAGE_NAMES.get(lang, lang)
+
+
+def target_language_name(lang):
+    """目标语言在 prompt 里的叫法。zh 要说"简体中文"，见 config 里的注释。"""
+    names = getattr(config, "TRANSLATION_TARGET_NAMES", None) or {}
+    return names.get(lang) or language_name(lang)
+
+
+class LanguageVote:
+    """自动语言切换的滞回投票。纯状态机，不碰模型也不碰线程，单测直接跑。
+
+    ☠️ 为什么非要滞回：切语言会 clear_context() 丢掉识别缓冲，而新语言还会
+    通过 initial_prompt 自我强化（避坑清单记着"英文一旦被误认能锁死近 3 分钟"）。
+    也就是说**误切一次的代价远大于晚切几秒**，所以判据一律往保守调：
+      - 置信度不够 → 不算数
+      - 不在 LANGUAGE_PAIRS 里的语言 → 不算数（一段意大利语歌不该把整场切走）
+      - 只要中间断了一次，连击清零重来
+    默认 3 连击 × 6 秒检测间隔 ≈ 说话人得持续讲另一种语言 18 秒才会触发。
+    """
+
+    def __init__(self):
+        self.lang = None      # 正在攒连击的候选语言
+        self.streak = 0
+
+    def reset(self):
+        self.lang = None
+        self.streak = 0
+
+    def feed(self, lang, prob, current, allowed, min_prob, need_streak):
+        """喂一次检测结果。返回该切换到的语言，或 None（不切）。"""
+        if not lang or lang == current:
+            self.reset()          # 检测结果就是当前语言：本来就没事
+            return None
+        if lang not in allowed:
+            self.reset()          # 不在配置的语言对里，当噪声
+            return None
+        if prob is None or prob < min_prob:
+            self.reset()          # 置信度不够：不仅不切，还要打断连击
+            return None
+        if lang == self.lang:
+            self.streak += 1
+        else:
+            self.lang = lang
+            self.streak = 1
+        if self.streak >= max(1, int(need_streak)):
+            self.reset()
+            return lang
+        return None
+
+
+def _glossary_applies():
+    """GLOSSARY 是德→中的对照表，只有这个方向上注入才有意义。"""
+    return (config.SOURCE_LANGUAGE == "de"
+            and current_target_language() == "zh"
+            and getattr(config, "GLOSSARY", None))
+
+
 def _interjection_lookup(sentence):
     """≤3词的高频感叹词直接查词典，命中就不打Ollama。
     游戏/聊天场景实测21%的字幕是"Ja." "Was?" "Whoa!"这类，
     每条单独一次Ollama请求纯浪费GPU（还和Whisper抢卡）。"""
-    if config.SOURCE_LANGUAGE != "de":
-        return None  # 词典是德语的，其它源语言不启用
+    # ☠️ 词典是**德→中**的，两端都要对：中→德时命中它会直接把中文上屏，
+    # 而这次要的是德语输出（源语言判定漏了目标语言这一半，加语言对时补上）
+    if config.SOURCE_LANGUAGE != "de" or current_target_language() != "zh":
+        return None
     key = sentence.strip(_PUNCT_STRIP).lower()
     if not key or len(key.split()) > 3:
         return None
@@ -456,6 +603,10 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
             # 待切换源语言（热键写入；ASR 每批处理前抢占执行，避免 inbox
             # 循环不返回时 submit(task) 永远排在后面饿死）
             self._pending_lang_switch = None
+            # 自动语言检测（默认关，见 config.AUTO_DETECT_LANGUAGE）：
+            # 下次允许检测的时刻 + 滞回投票状态。都只在 ASR 线程里读写
+            self._lang_detect_next = 0.0
+            self._lang_vote = LanguageVote()
             self._asr_executor = ThreadPoolExecutor(max_workers=1)
 
             # 翻译队列：ASR线程往里放完整句子，翻译worker每次醒来把积压的全部
@@ -1065,7 +1216,8 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
         中文首字延迟从"整句翻完"降到首token到达）。回调必须线程安全。
         """
         try:
-            lang_name = config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)
+            lang_name = language_name(config.SOURCE_LANGUAGE)
+            target_name = target_language_name(current_target_language())
 
             # 时间归一化只作用于**喂给模型的副本**：屏幕上的德语行、transcripts
             # 存档、context_history 存的都还是 ASR 原样输出。
@@ -1078,36 +1230,46 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
             else:
                 prompt_sentence, prompt_context = sentence, german_context
 
-            # 术语表只注入当前句子/上下文里真出现的词条，prompt保持精简
-            haystack = f"{prompt_context} {prompt_sentence}".lower()
-            matched_terms = [
-                f"{de} → {zh}" for de, zh in config.GLOSSARY.items()
-                if de.lower() in haystack
-            ]
+            # 术语表只注入当前句子/上下文里真出现的词条，prompt保持精简。
+            # ☠️ GLOSSARY 是**德→中**的对照表，只在这个方向上有意义：中→德时
+            # 注进去等于告诉模型"把 Merz 翻成 梅尔茨"，而这次要的是德语输出
             glossary_block = ""
-            if matched_terms:
-                glossary_block = "\n【术语表：以下人名/党派/术语必须照用这些译名】\n" + "\n".join(matched_terms[:12]) + "\n"
+            if _glossary_applies():
+                haystack = f"{prompt_context} {prompt_sentence}".lower()
+                matched_terms = [
+                    f"{de} → {zh}" for de, zh in config.GLOSSARY.items()
+                    if de.lower() in haystack
+                ]
+                if matched_terms:
+                    glossary_block = "\n【术语表：以下人名/党派/术语必须照用这些译名】\n" + "\n".join(matched_terms[:12]) + "\n"
 
             # 语域跟着当前模式走（新闻/影视/精听），别再无条件按"剧集对白"翻
             styles = getattr(config, "TRANSLATION_STYLE_PROMPTS", {}) or {}
             style = styles.get(getattr(config, "TRANSLATION_STYLE", ""), None)
             if style is None:
                 style = next(iter(styles.values()), {"role": "字幕翻译", "rules": ""})
-            n_rules = len([ln for ln in style["rules"].splitlines() if ln.strip()])
+            # {source}/{target} 占位符按当前语言对替换（见 config 里那段注释）。
+            # 用 replace 不用 .format：语域文案是用户可改的，出现裸 { } 不该炸
+            def _fill(s):
+                return (s or "").replace("{source}", lang_name).replace("{target}", target_name)
+
+            style_role = _fill(style.get("role", "字幕翻译"))
+            style_rules = _fill(style.get("rules", ""))
+            n_rules = len([ln for ln in style_rules.splitlines() if ln.strip()])
 
             # 下面三条是所有语域共有的硬约束，都是实测撞出来的（2026-08-02 ZDF 实测）：
             # 少了第一条，遇到"Dem Ersten Weltkrieg. und der Corona-Pandemie."这种
             # 半句片段，模型会把整段上下文重翻一遍上屏（实测 3/3 复现，74字 vs 15字），
             # 用户看到的是刚读过的几句又滚一遍；第二条挡"（注：建议补全后半句…）"这
             # 类译注；第三条挡 24 小时制时间（22.15 Uhr 实测 3/3 被翻成"九点十五"）。
-            prompt = f"""/no_think 你是{lang_name}{style['role']}。请把{lang_name}对白翻译成自然的简体中文。
+            prompt = f"""/no_think 你是{lang_name}{style_role}。请把{lang_name}对白翻译成自然的{target_name}。
 
 【要求】
-{style['rules']}
-{n_rules + 1}. 只输出中文翻译，不要解释，不要输出{lang_name}原文
+{style_rules}
+{n_rules + 1}. 只输出{target_name}翻译，不要解释，不要输出{lang_name}原文
 {n_rules + 2}. 【上下文】只用来帮助理解，绝对不要翻译上下文里的句子——它们已经显示过了
 {n_rules + 3}. 当前对白哪怕只是半句、不完整，也只翻这半句：不要补全、不要加括号注释或说明
-{n_rules + 4}. 时间是24小时制（22:15 Uhr = 22点15分，19:10 Uhr = 19点10分），照抄小时和分钟，不要换算成上午/下午，数字一律不改
+{n_rules + 4}. 时间是24小时制（22:15 = 22点15分，19:10 = 19点10分），照抄小时和分钟，不要换算成上午/下午，数字一律不改
 {glossary_block}
 【{lang_name}上下文（此前的对白）】
 ***
@@ -1119,7 +1281,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
 {prompt_sentence}
 ***
 
-中文翻译：
+{target_name}翻译：
 """
 
             # 熔断中：直接降级成德语，一个请求都不发——Ollama 半死时每句都付
@@ -1433,14 +1595,81 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
             if not self.closing:
                 print(f"   ⚠️  模型预热失败（首句翻译会稍慢）: {e}")
 
-    def _apply_pending_lang_switch(self, new_lang):
-        """在 ASR 线程内执行：清上下文 + 改语言（与识别串行）。"""
-        self.clear_context()
-        config.SOURCE_LANGUAGE = new_lang
-        name = config.LANGUAGE_NAMES.get(new_lang, new_lang)
-        print(f"🌐 源语言已切换为: {name}")
+    def _maybe_detect_language(self):
+        """到点就做一次语言检测，够连击就请求切换语言对（跑在 ASR 线程）。
+
+        整个功能默认关（config.AUTO_DETECT_LANGUAGE），理由写在 config 那边：
+        误切一次的代价（丢缓冲 + 新语言经 prompt 自我强化）远大于晚切几秒。
+
+        切换本身仍然走 request_switch_language——那条路已经处理好了
+        "在每批音频边界串行执行 + clear_context + 递增 epoch 作废在飞的翻译"，
+        这里绝不能自己去改 config.SOURCE_LANGUAGE。
+        """
+        if not getattr(config, "AUTO_DETECT_LANGUAGE", False):
+            return
+        interval = getattr(config, "LANGUAGE_DETECT_INTERVAL", 6.0)
+        if interval <= 0:
+            return
+        now = time.time()
+        if now < self._lang_detect_next:
+            return
+        self._lang_detect_next = now + interval
+
+        allowed = {src for src, _ in language_pairs()}
+        if len(allowed) < 2:
+            return  # 只配了一个语言对，没什么可切的
+
+        try:
+            got = self.processor.detect_language(
+                min_seconds=getattr(config, "LANGUAGE_DETECT_MIN_SEC", 3.0))
+        except Exception as e:
+            # 检测失败绝不能影响识别主链路——它只是个锦上添花的功能
+            print(f"⚠️  语言检测失败（不影响字幕）: {e.__class__.__name__}: {e}")
+            return
+        if got is None:
+            return  # 缓冲里音频还不够，下一轮再说
+        lang, prob = got
+        if config.SHOW_PERFORMANCE:
+            print(f"   🌐 语言检测: {lang} ({prob:.2f})")
+
+        new_lang = self._lang_vote.feed(
+            lang, prob, config.SOURCE_LANGUAGE, allowed,
+            getattr(config, "LANGUAGE_SWITCH_MIN_PROB", 0.85),
+            getattr(config, "LANGUAGE_SWITCH_STREAK", 3))
+        if not new_lang:
+            return
+
+        # 刚切过就静默一段时间，掐掉来回横跳
+        self._lang_detect_next = now + getattr(config, "LANGUAGE_SWITCH_COOLDOWN", 20.0)
+        name = language_name(new_lang)
+        tname = language_name(target_for(new_lang))
+        print(f"🌐 自动检测到{name}（{prob:.2f}），切换语言对: {name} → {tname}")
         if self.on_status:
-            self.on_status(f"🌐 源语言已切换: {name}")
+            self.on_status(f"🌐 检测到{name}，自动切换: {name} → {tname}")
+        self.request_switch_language(new_lang)
+
+    def _apply_pending_lang_switch(self, new_lang):
+        """在 ASR 线程内执行：清上下文 + 改语言对（与识别串行）。
+
+        ☠️ 源语言和目标语言必须**一起改**。只改源语言的话，放中文视频会变成
+        "中文→中文"：识别对了，翻译 prompt 还在要求输出中文，模型于是把原句
+        抄一遍。目标语言从 LANGUAGE_PAIRS 查（见 target_for）。
+        """
+        self.clear_context()
+        new_target = target_for(new_lang)
+        config.SOURCE_LANGUAGE = new_lang
+        config.TARGET_LANGUAGE = new_target
+        # 手动切（Ctrl+Alt+L）之后也要清投票：否则切换前攒的那点连击会跨过
+        # 这次切换继续累加，可能刚切完就被自动检测又切回去
+        if getattr(self, "_lang_vote", None) is not None:
+            self._lang_vote.reset()
+            self._lang_detect_next = time.time() + getattr(
+                config, "LANGUAGE_SWITCH_COOLDOWN", 20.0)
+        name = language_name(new_lang)
+        tname = language_name(new_target)
+        print(f"🌐 语言对已切换为: {name} → {tname}")
+        if self.on_status:
+            self.on_status(f"🌐 已切换: {name} → {tname}")
 
     def _process_inbox(self):
         """识别线程主循环：每批边界先处理语言切换，再消化收件箱，空了才睡。"""
@@ -1533,16 +1762,20 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
         self._enqueue_sentences(self._extract_sentences())
 
         # 聊天/嘈杂语音下Whisper经常整段不打标点，残句永远凑不成句 →
-        # 超长就不等标点直接翻（实测聊天时德语堆在live行、中文迟迟不出）
-        if len(self.pending_text.split()) > config.MAX_PENDING_WORDS:
+        # 超长就不等标点直接翻（实测聊天时德语堆在live行、中文迟迟不出）。
+        # 无空格语言按字符数算，见 _pending_too_long
+        if _pending_too_long(self.pending_text):
             if config.SHOW_PERFORMANCE:
-                print(f"   ✂️  残句超{config.MAX_PENDING_WORDS}词无标点，强制送翻译")
+                print(f"   ✂️  残句过长无标点，强制送翻译")
             self._enqueue_sentences([self.pending_text])
             self.pending_text = ""
             self._held_since = 0.0  # 连扣留的句尾一起送走了
 
         self._emit_display()
         self._maybe_draft()
+        # ☠️ 语言检测必须在这里（ASR 线程内、识别刚跑完）：WhisperModel 不是
+        # 线程安全的，见 streaming_asr.detect_language 的注释
+        self._maybe_detect_language()
 
         elapsed = time.time() - start_time
         self._stat_note_asr(elapsed, self.processor.buffer_seconds(), len(items),

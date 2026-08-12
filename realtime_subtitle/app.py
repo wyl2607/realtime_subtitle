@@ -240,19 +240,29 @@ class SubtitleApp:
             print(f"⚠️  切换暂停状态失败: {e}")
 
     def _switch_language(self):
-        cycle = config.LANGUAGE_CYCLE
+        """Ctrl+Alt+L：在 LANGUAGE_PAIRS 里循环下一个**语言对**。
+
+        ☠️ 循环的是对不是单个源语言：只切源语言的话，切到中文会变成
+        "中文→中文"（识别对了但 prompt 还在要求输出中文）。见 config 里
+        LANGUAGE_PAIRS 的注释。
+        """
+        from realtime_subtitle.translate.translator_queue import (
+            language_pairs, language_name,
+        )
+        pairs = language_pairs()
         try:
-            idx = cycle.index(config.SOURCE_LANGUAGE)
+            idx = [s for s, _ in pairs].index(config.SOURCE_LANGUAGE)
         except ValueError:
-            idx = -1  # 当前语言不在循环列表里（手改过config），切到列表第一个
-        new_lang = cycle[(idx + 1) % len(cycle)]
-        name = config.LANGUAGE_NAMES.get(new_lang, new_lang)
+            idx = -1  # 当前语言不在列表里（手改过config），切到列表第一个
+        new_lang, new_target = pairs[(idx + 1) % len(pairs)]
+        name = language_name(new_lang)
+        tname = language_name(new_target)
         # "清上下文+改语言"作为一个任务在识别线程内串行执行。之前是这里
         # 先改config再排清理任务——窗口期内会拿新语言参数识别缓冲里的
         # 旧语言音频，蹦出乱词
         self.translator.request_switch_language(new_lang)
-        self.subtitle_window.show_status(f"🌐 源语言切换中: {name}…")
-        print(f"🌐 [热键] 请求切换源语言: {name}")
+        self.subtitle_window.show_status(f"🌐 切换中: {name} → {tname}…")
+        print(f"🌐 [热键] 请求切换语言对: {name} → {tname}")
 
     def _apply_mode(self, name):
         """唯一的"应用模式"入口（⚙️面板按钮和 Ctrl+Alt+G 都走这里）。

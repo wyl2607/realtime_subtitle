@@ -381,3 +381,23 @@ class OnlineASRProcessor:
         """当前音频缓冲长度（秒），性能日志用（含尚未合并的 chunks）"""
         pending = sum(len(c) for c in self._audio_chunks)
         return (len(self.audio_buffer) + pending) / self.SAMPLING_RATE
+
+    def detect_language(self, min_seconds=3.0):
+        """对当前音频缓冲做一次语言检测。返回 (语言码, 置信度)；样本不够返回 None。
+
+        ☠️ 必须在**识别线程内**调用。faster-whisper 的 WhisperModel 不是线程
+        安全的——另起线程和 process_iter 并发跑会同时进同一个 ctranslate2
+        推理器，症状不是干脆报错而是结果错乱甚至崩在底层。
+
+        只取缓冲末尾 30 秒：Whisper 编码器的窗口本来就是 30 秒，喂更多会被
+        pad_or_trim 截掉（避坑清单第 4 节第 20 条），纯浪费。
+        vad_filter=True 与 process_iter 保持一致——不过滤的话，一段静音里的
+        底噪足以把检测结果带到任意语言上去。
+        """
+        self._flush_audio_chunks()
+        if len(self.audio_buffer) / self.SAMPLING_RATE < min_seconds:
+            return None
+        audio = self.audio_buffer[-self.SAMPLING_RATE * 30:]
+        lang, prob, _all_probs = self.model.detect_language(
+            audio=audio, vad_filter=True)
+        return lang, prob

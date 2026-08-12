@@ -1841,3 +1841,168 @@ def test_tx_drop_warning_is_throttled(capsys):
     # 25 次丢弃：首次 + 每累计 10 条一次 = 3 行，绝不该是 25 行
     assert len(lines) <= 4, f"告警没被节流，打了 {len(lines)} 行"
     assert lines, "节流过头了，一条都没报"
+
+
+# ======================================================================
+# 2026-08-12 中德双向 + 自动语言切换
+# ======================================================================
+
+
+def test_cjk_sentence_split_actually_splits():
+    """☠️ 加中→德之前，中文输入下这条管线是**完全不出字幕**的。
+
+    实测：`_split_sentences("这是第一句。然后还有一句？对的。")` 切出 0 句。
+    两个原因缺一不可——全角 。！？ 不在 [.!?…] 里；就算加进去，原正则的
+    `(?=\s|$)` 也永远不成立（中文 Whisper 输出没有空格）。而当时的兜底
+    MAX_PENDING_WORDS 用 `.split()` 数词，中文整段恒等于 1，第二道闸同样是死的。
+    结果是中文只能靠 IDLE_FLUSH_SEC（说话人停满 2 秒）冲出来一次。
+    """
+    from realtime_subtitle.translate.translator_queue import _split_sentences
+
+    sents, rest = _split_sentences("这是第一句。然后还有一句？对的。", final=True, lang="zh")
+    assert sents == ["这是第一句。", "然后还有一句？", "对的。"], sents
+    assert rest == ""
+
+    sents, rest = _split_sentences("这是第一句。还有半截", final=True, lang="zh")
+    assert sents == ["这是第一句。"]
+    assert rest == "还有半截"
+
+
+def test_cjk_split_does_not_break_decimals():
+    """全角终止符不要求后跟空白，但半角 . 仍然要求——否则中文里的
+    "3.5 元" 会被切成两半。"""
+    from realtime_subtitle.translate.translator_queue import _split_sentences
+
+    sents, _ = _split_sentences("价格是 3.5 元。就这样。", final=True, lang="zh")
+    assert sents == ["价格是 3.5 元。", "就这样。"], sents
+
+
+def test_latin_split_unchanged_by_cjk_support():
+    """德语那条路一个字都不能变（缩写否决/序数否决/续行否决全在）。"""
+    from realtime_subtitle.translate.translator_queue import _split_sentences
+
+    assert _split_sentences("Das ist ein Satz. Und noch einer? Ja.",
+                            final=True, lang="de")[0] == \
+        ["Das ist ein Satz.", "Und noch einer?", "Ja."]
+    # bzw. 是缩写，不是句尾
+    assert _split_sentences("Das ist bzw. kein Satzende. Und hier schon.",
+                            final=True, lang="de")[0] == \
+        ["Das ist bzw. kein Satzende.", "Und hier schon."]
+
+
+def test_pending_too_long_counts_chars_for_cjk():
+    """残句兜底：拉丁按词数，无空格语言按字符数。"""
+    from realtime_subtitle.translate.translator_queue import _pending_too_long
+
+    assert _pending_too_long(" ".join(["wort"] * 30), lang="de") is True
+    assert _pending_too_long(" ".join(["wort"] * 10), lang="de") is False
+    # 同样一段中文，按 .split() 数永远是 1 个"词"——这正是修复前的死角
+    long_zh = "字" * 80
+    assert len(long_zh.split()) == 1
+    assert _pending_too_long(long_zh, lang="zh") is True
+    assert _pending_too_long("字" * 20, lang="zh") is False
+
+
+def test_language_pairs_switch_both_ends(monkeypatch):
+    """☠️ Ctrl+Alt+L 切的必须是**语言对**。只切源语言的话，切到中文会变成
+    "中文→中文"：识别对了，但 prompt 还在要求输出中文，模型把原句抄一遍。"""
+    from realtime_subtitle.translate.translator_queue import language_pairs, target_for
+
+    monkeypatch.setattr(config, "LANGUAGE_PAIRS",
+                        [("de", "zh"), ("zh", "de")], raising=False)
+    assert language_pairs() == [("de", "zh"), ("zh", "de")]
+    assert target_for("de") == "zh"
+    assert target_for("zh") == "de"
+
+
+def test_legacy_language_cycle_still_works(monkeypatch):
+    """老 config_local.py 里可能只写了 LANGUAGE_CYCLE = ["de","en"]（那时候
+    目标语言是写死的中文）。不能让它们升级后失效。"""
+    from realtime_subtitle.translate.translator_queue import language_pairs
+
+    monkeypatch.setattr(config, "LANGUAGE_PAIRS", None, raising=False)
+    monkeypatch.setattr(config, "LANGUAGE_CYCLE", ["de", "en"], raising=False)
+    monkeypatch.setattr(config, "TARGET_LANGUAGE", "zh", raising=False)
+    assert language_pairs() == [("de", "zh"), ("en", "zh")]
+
+
+def test_german_only_tables_are_gated_by_direction(monkeypatch):
+    """☠️ GLOSSARY 和感叹词表都是**德→中**的，两端都要对。
+
+    以前感叹词表只判 `SOURCE_LANGUAGE != "de"`，漏了目标语言那一半——
+    中→德时 "Ja." 会命中词典直接把"是"上屏，而这次要的是德语输出。
+    """
+    from realtime_subtitle.translate.translator_queue import (
+        _interjection_lookup, _glossary_applies,
+    )
+
+    monkeypatch.setattr(config, "SOURCE_LANGUAGE", "de", raising=False)
+    monkeypatch.setattr(config, "TARGET_LANGUAGE", "zh", raising=False)
+    assert _interjection_lookup("Ja.") == "是"
+    assert _glossary_applies()
+
+    monkeypatch.setattr(config, "SOURCE_LANGUAGE", "zh", raising=False)
+    monkeypatch.setattr(config, "TARGET_LANGUAGE", "de", raising=False)
+    assert _interjection_lookup("Ja.") is None
+    assert not _glossary_applies()
+
+
+def test_translation_prompt_flips_direction(monkeypatch):
+    """目标语言以前写死在 prompt 里（"翻译成自然的简体中文"）。参数化之后
+    两个方向都要对，而且 zh 必须说"简体中文"——不点明简体，模型有概率出繁体。"""
+    from realtime_subtitle.translate.translator_queue import (
+        target_language_name, current_target_language,
+    )
+
+    monkeypatch.setattr(config, "TARGET_LANGUAGE", "zh", raising=False)
+    assert target_language_name(current_target_language()) == "简体中文"
+    monkeypatch.setattr(config, "TARGET_LANGUAGE", "de", raising=False)
+    assert target_language_name(current_target_language()) == "德语"
+
+
+def test_lookup_follows_clicked_word_language(monkeypatch):
+    """☠️ 中→德时德语在**译文行**上，点它要查德语而不是 SOURCE_LANGUAGE(zh)。
+
+    不修的话 prompt 会变成"你是中文汉词典。简明解释中文单词 Kameraqualität"，
+    模型只能瞎编；缓存键也会记成 zh，把两种语言的同形词混进同一格。
+    """
+    from realtime_subtitle.translate.lookup import lookup_language_for
+
+    monkeypatch.setattr(config, "SOURCE_LANGUAGE", "de", raising=False)
+    monkeypatch.setattr(config, "TARGET_LANGUAGE", "zh", raising=False)
+    assert lookup_language_for("Kameraqualität") == "de"   # 老行为不变
+
+    monkeypatch.setattr(config, "SOURCE_LANGUAGE", "zh", raising=False)
+    monkeypatch.setattr(config, "TARGET_LANGUAGE", "de", raising=False)
+    assert lookup_language_for("Kameraqualität") == "de"   # 拉丁词 → 目标语言
+    assert lookup_language_for("摄像头") == "zh"            # 汉字 → 源语言
+
+
+def test_language_vote_needs_a_streak():
+    """☠️ 误切一次的代价远大于晚切几秒：切语言会 clear_context() 丢掉识别
+    缓冲，新语言还会经 initial_prompt 自我强化（避坑清单：英文被误认能锁死
+    近 3 分钟）。所以判据一律往保守调。"""
+    from realtime_subtitle.translate.translator_queue import LanguageVote
+
+    allowed = {"de", "zh"}
+
+    def run(seq, need=3, minp=0.85, current="de"):
+        v = LanguageVote()
+        return [v.feed(lang, p, current, allowed, minp, need) for lang, p in seq]
+
+    # 连够 3 次才切，且切完清零
+    assert run([("zh", .95)] * 3) == [None, None, "zh"]
+    # 中间一次置信度不够 → 连击清零
+    assert run([("zh", .95), ("zh", .50), ("zh", .95), ("zh", .95)]) == [None] * 4
+    # 中间检测回当前语言 → 清零
+    assert run([("zh", .95), ("de", .99), ("zh", .95), ("zh", .95)]) == [None] * 4
+    # 不在 LANGUAGE_PAIRS 里的语言（比如一段意大利语歌）永远不切
+    assert run([("it", .99)] * 5) == [None] * 5
+    # 两种新语言交替，谁也攒不满
+    assert run([("zh", .95), ("en", .95), ("zh", .95), ("en", .95)]) == [None] * 4
+
+
+def test_auto_detect_is_off_by_default():
+    """默认必须是关的。开着等于把'误切'的风险默认加给所有用户，
+    而这个功能的收益是场景性的（同时看中文和德语内容的人才需要）。"""
+    assert getattr(config, "AUTO_DETECT_LANGUAGE", False) is False
