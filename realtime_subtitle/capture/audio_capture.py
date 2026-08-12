@@ -42,6 +42,13 @@ class AudioCapture:
     """系统音频捕获器"""
 
     DEVICE_CHECK_INTERVAL = 5.0   # 探测线程每几秒查一次「应该抓哪个设备」
+    # ☠️ 暂停标记（.paused）是**文件**，不能每读一块就 stat 一次。
+    # 48kHz / CHUNK_SIZE=4096 下那是约 12 次 os.path.exists/秒，每一次都要穿过
+    # Windows 的杀软文件过滤驱动，而且是在必须持续排空 WASAPI 环形缓冲的那个
+    # 循环里（_probe_loop 的注释记着：这个循环里多花的时间会让缓冲静默溢出，
+    # 症状是"偶尔吞词"且日志里一个字都没有）。
+    # 暂停的响应粒度只需要一个提交周期就够——反正恢复/暂停本来就有秒级延迟。
+    PAUSE_CHECK_INTERVAL = 0.5
 
     def __init__(self, callback, on_status=None):
         """
@@ -291,6 +298,8 @@ class AudioCapture:
                 self._desired_device_name = device_name
                 silent_periods = 0          # 连续多少个提交周期一个块都没过静音门
                 low_volume_warned = False   # 这一轮静默只提示一次
+                paused = False              # 上次查到的暂停状态（见 PAUSE_CHECK_INTERVAL）
+                last_pause_check = 0.0
 
                 print(f"🎵 开始捕获音频... (每{config.CHUNK_SUBMIT_SECONDS}秒提交一块)")
 
@@ -310,8 +319,13 @@ class AudioCapture:
                         data = stream.read(config.CHUNK_SIZE, exception_on_overflow=False)
                         read_errors = 0
 
-                        # 暂停：丢弃这一块，不做识别，保持流健康但不占用GPU
-                        if os.path.exists(PAUSE_FLAG_FILE):
+                        # 暂停：丢弃这一块，不做识别，保持流健康但不占用GPU。
+                        # 标记文件最多每 PAUSE_CHECK_INTERVAL 秒查一次，不是每块
+                        now = time.time()
+                        if now - last_pause_check >= self.PAUSE_CHECK_INTERVAL:
+                            last_pause_check = now
+                            paused = os.path.exists(PAUSE_FLAG_FILE)
+                        if paused:
                             chunk_buffer = []
                             chunk_samples = 0
                             buffer_has_speech = False

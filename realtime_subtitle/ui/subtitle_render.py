@@ -176,8 +176,23 @@ class LiveTextRenderMixin:
         doc = self._doc_for_render()
         avail_h = self.window.height() - 40
 
-        pair_blocks = [b for b in (self._pair_html(g, c) for g, c, _ in self.sentence_pairs) if b]
-        cap = min(len(pair_blocks), getattr(config, "MAX_SENTENCE_PAIRS", 20))
+        # 从最新往回只构造到 MAX_SENTENCE_PAIRS 条为止。sentence_pairs 内存里
+        # 留着 HISTORY_KEEP(50) 条，而上屏的最多 MAX_SENTENCE_PAIRS 条（「⚡性能」
+        # 模式只有 4 条）——以前是把 50 条全部 escape+_clip+拼接一遍再切，
+        # 其中绝大多数永远不会被显示。这段正好落在草稿流式那条 0.15 秒一次的
+        # 热路径上（on_partial → _update_draft → _render）。
+        # 结果与"全构造再取末尾 MAX 条非空"完全等价：这里同样跳过空块继续往回找
+        keep = max(1, int(getattr(config, "MAX_SENTENCE_PAIRS", 20)))
+        pair_blocks = []
+        for g, c, _ in reversed(self.sentence_pairs):
+            block = self._pair_html(g, c)
+            if not block:
+                continue
+            pair_blocks.append(block)
+            if len(pair_blocks) >= keep:
+                break
+        pair_blocks.reverse()
+        cap = len(pair_blocks)
 
         def fits(count):
             doc.setHtml("<br>".join(pair_blocks[len(pair_blocks) - count:] + fixed))
