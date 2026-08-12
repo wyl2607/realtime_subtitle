@@ -11,11 +11,34 @@ permissions:
   contents: read
 
 # Coverage map (see issue #23):
-# - ubuntu: pure pipeline helpers (no torch/PyQt/WASAPI)
+# - lint:    ruff（E9 + F，规则集为什么这么窄见 ruff.toml）
+# - ubuntu:  pure pipeline helpers (no torch/PyQt/WASAPI)
 # - windows: full pytest suite except standalone GUI harness scripts
 #   (those open real windows and sys.exit; still manual / optional)
 
 jobs:
+  # 静态检查单独一个 job：十几秒出结果，不用等 windows 那边装完 torch 才知道
+  # 有没有把某个名字打错。它盯的是 CLAUDE.md 第 4 节第 26/28 条那一类
+  # "挪模块时的漏改"——那次包化重构漏了 30 多处函数体里的延迟 import，
+  # master 的 CI 连红 6 次，而 F821/F811/F401 本来能在 PR 阶段就拦下来。
+  #
+  # ☠️ 用 pip 装而不是用第三方 action：本 workflow 的 action 全部按 commit SHA
+  # 钉死（供应链硬化），引入一个新 action 就是多一个信任根；ruff 是单文件
+  # 二进制、pip 装一秒装完，按精确版本钉住即可。**版本必须写死**——ruff 每个
+  # 小版本都可能给已有规则加新检查，浮动版本会让 CI 在没人改代码的日子变红。
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: pip install ruff==0.16.2
+      - name: ruff check
+        # --output-format github 让告警直接标在 PR 的对应行上
+        run: ruff check --output-format github .
+
   pipeline-helpers-ubuntu:
     runs-on: ubuntu-latest
     steps:

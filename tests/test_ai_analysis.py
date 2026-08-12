@@ -544,8 +544,6 @@ def test_cache_hit_still_bumps_seq_so_inflight_lookup_expires():
       4. A 一行行把 B 盖掉，用户看到刚点的 B 变回了 A
     缓存现在是 800 条且跨会话持久化，这条路径只会更常走。
     """
-    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
-
     t = _lookup_translator()
     t._lookup_seq = 0  # _lookup_translator 默认给 1，这里从 0 数更好读
     submitted = []
@@ -793,7 +791,7 @@ def _ai_gate_stub():
 
 def test_show_ai_analysis_discards_stale_seq():
     """旧代数结果不更新弹窗；当前代数正常写入。"""
-    app = _app()
+    _app()  # 引用由模块级 _APP 持有，见文件顶部注释
     w = _ai_gate_stub()
     w._ai_analysis_seq = 2
 
@@ -806,7 +804,7 @@ def test_show_ai_analysis_discards_stale_seq():
 
 
 def test_show_deep_explain_discards_stale_seq():
-    app = _app()
+    _app()  # 引用由模块级 _APP 持有，见文件顶部注释
     w = _ai_gate_stub()
     w._deep_explain_seq = 3
     w.word_popup._context = "Das ist ein Satz."
@@ -849,7 +847,7 @@ def test_result_callbacks_carry_seq_through_signal():
 def test_on_ai_analysis_clicked_bumps_seq_and_shows_web_while_loading():
     """发起背景总结：seq+1、分析中 show_web=True、回调带捕获的 seq。"""
     import time
-    from PyQt5.QtCore import QRect, QPoint
+    from PyQt5.QtCore import QRect
     from realtime_subtitle.ui.subtitle_window import SubtitleWindow
 
     app = _app()

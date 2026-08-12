@@ -1,0 +1,31 @@
+# Ruff 配置。
+#
+# 为什么只开这么窄的一档：这个项目 11.5k 行、39 处 except Exception、21 处
+# except: pass，全靠人眼。但它的代码风格是**有意为之**的（到处是延迟 import、
+# 多行 print 的续行统一带 f 前缀、注释写"为什么"不写"做什么"），所以这里
+# 不追求"符合某种通用风格"，只追求**拦住真错误**。
+#
+# 选 E9 + F 的理由，是 CLAUDE.md 第 4 节第 26/28 条那次事故：包化重构时函数体
+# 里 30 多处延迟 import 一个都没改，master 的 CI 连红 6 次、ubuntu 18 failed、
+# windows 一堆 ModuleNotFoundError。那一类问题里的 F821(undefined-name)、
+# F811(重复定义)、F401(挪走之后没人用的残留 import) ruff 都能在 PR 阶段白捡。
+#
+# ☠️ 别顺手把规则集调宽。开了 SIM/PLR/RUF 之类之后本仓库会冒出 189 条告警，
+# 全是风格分歧（try-except-pass 是这里的有意设计，manual-from-import 26 处也是），
+# 那种噪音的唯一效果是训练人忽略 CI。
+target-version = "py310"
+line-length = 120
+
+[lint]
+select = ["E9", "F"]
+# F541 = f-string 里没有占位符。本仓库 8 处全是**多行 print 的续行**，作者为了
+# 整块视觉一致才都带上 f 前缀（例如 _warn_if_ipv6_first_host 里那三行提示）。
+# 这是风格不是缺陷，修它只会制造 diff 噪音。
+ignore = ["F541"]
+
+[lint.per-file-ignores]
+# 独立 GUI 脚本套件（pytest.ini 已把它们排除出收集）：import 即开真窗口，
+# 顶部要在 import 之前塞 config 赋值，E402 那类顺序规则对它们没意义
+"tests/test_hittest.py" = ["E402"]
+"tests/test_resize_freedom.py" = ["E402"]
+"tests/test_wordclick.py" = ["E402"]

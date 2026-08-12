@@ -21,13 +21,12 @@ import sys
 import json
 import os
 from PyQt5.QtWidgets import (
-    QLabel, QApplication, QWidget, QHBoxLayout, QPushButton, QTextEdit,
+    QLabel, QApplication, QWidget, QHBoxLayout, QPushButton,
     QGraphicsOpacityEffect,
 )
 from PyQt5.QtCore import (
     Qt, pyqtSignal, QObject, QTimer, QPropertyAnimation, QEasingCurve,
 )
-from PyQt5.QtGui import QFont
 import realtime_subtitle.config as config
 from realtime_subtitle.paths import repo_path
 from realtime_subtitle.ui.window_geometry import (
@@ -36,8 +35,16 @@ from realtime_subtitle.ui.window_geometry import (
 )
 from realtime_subtitle.ui.window_frame import ResizableFramelessWidget
 from realtime_subtitle.ui.settings_window import (
-    SettingsWindow, TUNING_KEYS, MODE_ICONS,
-    apply_tuning, collect_tuning, apply_text_color, snapshot_defaults,
+    SettingsWindow, MODE_ICONS,
+    apply_tuning, collect_tuning, snapshot_defaults,
+)
+# ☠️ 这两个本模块自己不用，但 tests/test_presets.py 和 tests/test_tuning.py
+# 是从**这里**拿的——有意的 re-export，别当成「没用的 import」删掉。
+# ruff 的 F401 分不出 re-export 和死 import，所以要显式 noqa 标注意图；
+# 判断一个名字是不是 re-export 别用 grep（跨行 import 会漏，实测栽过），
+# 用 ast 扫 ImportFrom。
+from realtime_subtitle.ui.settings_window import (  # noqa: F401
+    TUNING_KEYS, apply_text_color,
 )
 from realtime_subtitle.ui.popups import HistoryWindow, WordPopup, AIAnalysisPopup
 from realtime_subtitle.ui.tv_window import TVWindow

@@ -43,8 +43,11 @@ def make_msg(message, wparam, lparam):
     msg.message = message
     msg.wParam = wparam
     msg.lParam = lparam
-    # 保持引用，避免地址失效
-    make_msg._keep = msg  # noqa: store last
+    # 保持引用，避免地址失效（挂在函数对象上持有最后一个 msg）
+    # 注：这行原来带一个写坏的 noqa 指令（冒号后面跟的是散文而不是规则码），
+    # ruff 会为它打一条 warning。本行本来就不需要豁免任何规则，直接去掉。
+    # ☠️ 别在注释里写 noqa 的字面例子——ruff 照样会把它当成真指令去解析
+    make_msg._keep = msg
     return ctypes.addressof(msg)
 
 cx, cy = (rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2

@@ -17,7 +17,6 @@ import sys
 import os
 import time
 import re
-import queue
 import socket
 import ipaddress
 from urllib.parse import urlparse

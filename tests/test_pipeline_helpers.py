@@ -1517,7 +1517,6 @@ def test_draft_worker_yields_to_asr_at_request_time():
     刚好在 process_iter 的 finally 之后，_asr_busy 恒为 False。而且即使不恒
     为 False 也拦不住——草稿是 submit 到 _tx_executor 异步跑的。
     """
-    from threading import Lock
     from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 
     t = _translator_for_tx()

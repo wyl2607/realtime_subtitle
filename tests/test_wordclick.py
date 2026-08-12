@@ -9,7 +9,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 import realtime_subtitle.config as config
 config.SHOW_PERFORMANCE = False
 from realtime_subtitle.ui.subtitle_window import SubtitleWindow
-from PyQt5.QtCore import QPoint, QPointF, Qt
+from PyQt5.QtCore import QPoint
 from PyQt5.QtGui import QTextCursor
 
 win = SubtitleWindow()
