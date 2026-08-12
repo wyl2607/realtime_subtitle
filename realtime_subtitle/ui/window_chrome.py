@@ -54,10 +54,6 @@ class WindowChromeMixin:
             }
         """ % int(left_px))
 
-    def _position_btn_bar(self):
-        """兼容旧调用点：与 _position_chrome 等价"""
-        self._position_chrome()
-
     def _set_controls_visible(self, visible):
         """drag_bar / btn_bar 淡入淡出。ct_indicator 不走这里（穿透可靠性优先）。
 

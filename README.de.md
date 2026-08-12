@@ -34,7 +34,7 @@ Systemton ──WASAPI-Loopback──▶ Faster-Whisper (CUDA oder CPU)
 - **Skalierbares Overlay** — Kanten/Ecken ziehen; Position und Größe bleiben erhalten
 - **Wortklick** — Lemma / Wortart / Bedeutung per lokalem LLM
 - **Klick-durchlässig** — `Ctrl+Alt+M` für Vollbild-Video/Spiele
-- **Tages-Archiv** — Ordner `transcripts/`
+- **Tages-Archiv** — Ordner `transcripts/`, standardmäßig unbegrenzt aufbewahrt. Klartext, und diese App nimmt **sämtlichen** System-Ton auf: `TRANSCRIPT_KEEP_DAYS = 30` löscht Älteres automatisch, `SAVE_TRANSCRIPT = False` zeichnet gar nichts auf
 - **Hotkeys** — Pause, Sprache, Leistungsmodus (siehe Nutzung)
 
 ## Systemvoraussetzungen

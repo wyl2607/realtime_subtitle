@@ -27,6 +27,7 @@ from collections import deque, OrderedDict
 import requests
 
 from realtime_subtitle.asr.streaming_asr import OnlineASRProcessor
+from realtime_subtitle.paths import repo_path
 import realtime_subtitle.config as config
 # 过滤所有警告信息
 warnings.filterwarnings("ignore")
@@ -263,6 +264,13 @@ def build_ai_web_url(prompt_text):
     """把自然语言问题填进 AI_ANALYSIS_WEB_URL_TEMPLATE（{query} 已 URL-encode）。
 
     模板为空 = 用户关掉了这个功能，返回空串，调用方不要打开浏览器。
+
+    ☠️ 模板是用户在 config_local.py 里随手改的（config 注释就鼓励换成
+    ChatGPT 等）。只要里面出现一个不成对的 `{`、或者别的占位符名，
+    `.format()` 就抛 KeyError/IndexError/ValueError——而调用点在 Qt 槽函数
+    里，异常会直接冒到事件循环，按钮表现为"点了没反应"，用户根本不会去看
+    stderr。坏模板一律降级成"功能关闭"（返回空串），调用方已经有对应的
+    提示文案。
     """
     from urllib.parse import quote
     template = getattr(
@@ -270,7 +278,12 @@ def build_ai_web_url(prompt_text):
     template = (template or "").strip()
     if not template:
         return ""
-    return template.format(query=quote(prompt_text or "", safe=""))
+    try:
+        return template.format(query=quote(prompt_text or "", safe=""))
+    except (KeyError, IndexError, ValueError) as e:
+        print(f"   ⚠️  AI_ANALYSIS_WEB_URL_TEMPLATE 格式不对（只支持 {{query}} 一个占位符）"
+              f"，「问更强的AI」已禁用: {e.__class__.__name__}: {e}")
+        return ""
 
 
 def _squash_repeats(sentences, keep_words=3, keep_sents=2):
@@ -582,20 +595,40 @@ class WhisperQueueTranslator:
             # 字幕记录（原文+译文+时间戳，每天一个文件）
             self._transcript_ok = bool(getattr(config, "SAVE_TRANSCRIPT", False))
             if self._transcript_ok:
-                self._transcript_dir = os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)), config.TRANSCRIPT_DIR)
+                # 仓库根下的 transcripts\：README / uninstall.ps1 都按这个位置
+                # 告诉用户，别再用 __file__ 推（会掉进 translate\ 里）
+                self._transcript_dir = repo_path(config.TRANSCRIPT_DIR)
                 try:
                     os.makedirs(self._transcript_dir, exist_ok=True)
                     print(f"📝 字幕记录已开启: {config.TRANSCRIPT_DIR}\\日期.txt")
+                    self._prune_old_transcripts()
                 except OSError as e:
                     print(f"⚠️  字幕记录目录创建失败，记录功能关闭: {e}")
                     self._transcript_ok = False
 
             _warn_if_ipv6_first_host(config.OLLAMA_BASE_URL)
-            # 启动时检查Ollama是否可达（不可达只警告，不中断启动）
+            # 启动时检查Ollama是否可达（不可达只警告，不中断启动）。
+            # ☠️ 光看"没抛异常"不够：11434 没被 Ollama 占着时，本机任何进程都能
+            # 抢先 bind 它（_MAX_STREAM_CHARS 的注释里已经提过这个前提）。那样
+            # 我们会把**系统全部声音的转录**连同上下文一路 POST 给它，再把它
+            # 返回的任意文本当字幕上屏并写进 transcripts。校验一下响应体里确实
+            # 有 version 字段，成本一次 JSON 解析，能把"端口被别的东西占了"
+            # 和"Ollama 正常"区分开。
             try:
-                self.ollama_session.get(f"{config.OLLAMA_BASE_URL}/api/version", timeout=2)
-                print(f"✅ Ollama 连接正常 ({config.OLLAMA_MODEL})")
+                resp = self.ollama_session.get(
+                    f"{config.OLLAMA_BASE_URL}/api/version", timeout=2)
+                version = ""
+                try:
+                    version = (resp.json() or {}).get("version", "")
+                except ValueError:
+                    pass
+                if version:
+                    print(f"✅ Ollama 连接正常 (v{version}, {config.OLLAMA_MODEL})")
+                else:
+                    print(f"⚠️  {config.OLLAMA_BASE_URL} 有回应，但它不像是 Ollama"
+                          f"（/api/version 没返回 version 字段）。")
+                    print(f"   这个端口可能被别的程序占了——本程序会把识别出的原文发到"
+                          f"这个地址，请先确认它确实是 Ollama。")
             except requests.RequestException:
                 print(f"⚠️  无法连接 Ollama ({config.OLLAMA_BASE_URL})，字幕将只显示德语原文")
                 print(f"   请确认 Ollama 已启动: ollama serve")
@@ -623,6 +656,44 @@ class WhisperQueueTranslator:
     # ------------------------------------------------------------------
     # 字幕记录
     # ------------------------------------------------------------------
+    def _prune_old_transcripts(self):
+        """启动时清掉超过 TRANSCRIPT_KEEP_DAYS 天的存档（0 = 永久保留）。
+
+        ⚠️ 这是隐私措施，不是省磁盘：本程序抓的是系统全部声音，存档是明文，
+        而且 SAVE_TRANSCRIPT 默认开着。以前没有任何保留期，装多久就攒多久。
+
+        按**文件名**里的日期判断而不是 mtime：文件名就是 YYYY-MM-DD.txt
+        （_save_transcript 的格式），而 mtime 会被同步网盘/备份工具刷新。
+        认不出日期的文件一律不碰（可能是用户自己放进去的）。
+        """
+        days = int(getattr(config, "TRANSCRIPT_KEEP_DAYS", 0) or 0)
+        if days <= 0:
+            return
+        cutoff = time.time() - days * 86400
+        removed = 0
+        try:
+            names = os.listdir(self._transcript_dir)
+        except OSError:
+            return
+        for name in names:
+            stem, ext = os.path.splitext(name)
+            if ext.lower() != ".txt":
+                continue
+            try:
+                ts = time.mktime(time.strptime(stem, "%Y-%m-%d"))
+            except ValueError:
+                continue  # 不是当天存档的命名，别动
+            if ts >= cutoff:
+                continue
+            try:
+                os.remove(os.path.join(self._transcript_dir, name))
+                removed += 1
+            except OSError:
+                pass  # 被占用/只读：跳过，下次启动再试
+        if removed:
+            print(f"🧹 已清理 {removed} 个超过 {days} 天的字幕存档"
+                  f"（保留期在 config.TRANSCRIPT_KEEP_DAYS，设 0 可关闭）")
+
     def _save_transcript(self, source_text, translation):
         """把一条字幕追加到当天的记录文件（失败一次就关闭，不刷屏）。
 
@@ -830,6 +901,14 @@ class WhisperQueueTranslator:
             return cold
         if time.time() < self._tx_slow_until:
             return cold
+        # ☠️ 光看 _asr_backlog_n 会在**最该长超时的那一刻**读到 0：
+        # _process_inbox 是先把整个收件箱取走、把快照清零，**然后**才去跑
+        # process_iter。也就是说 ASR 真正霸着 GPU 的那 0.26~2.5 秒里，积压
+        # 计数恰好是 0，这条规则整个失效（issue #16 的震荡正是靠它兜底的）。
+        # _asr_busy 补的就是这一段：它在 process_iter 前后置位，和
+        # _asr_backlog_n 一样是无锁快照，不引入 _tx_lock/_asr_lock 的锁序问题。
+        if self._asr_busy:
+            return cold
         threshold = getattr(config, "TRANSLATE_SLOW_BACKLOG_BLOCKS", 4)
         if threshold > 0 and self._asr_backlog_n >= threshold:
             return cold
@@ -897,8 +976,7 @@ class WhisperQueueTranslator:
             translation = self._translate_single_sentence(
                 german, context, on_partial=self._epoch_gated_draft(epoch))
             tx_elapsed = time.time() - t0
-            with self._stats_lock:
-                self._stat_tx.append(tx_elapsed)
+            self._stat_note_tx(tx_elapsed)
             if config.SHOW_PERFORMANCE:
                 print(f"   🔤 翻译{len(batch)}句 {tx_elapsed:.1f}秒: {german[:50]}{'...' if len(german) > 50 else ''}")
         finally:
@@ -950,8 +1028,13 @@ class WhisperQueueTranslator:
             return  # 残句没变，上一版草稿还有效
         if time.time() - self._draft_last_time < getattr(config, "DRAFT_MIN_INTERVAL", 1.5):
             return
-        if self._asr_busy:
-            return  # Whisper 正在 GPU 上识别，草稿别去抢卡（p95尖刺的来源之一）
+        # ☠️ 这里曾经有一条 `if self._asr_busy: return`，它是**死代码**：
+        # _maybe_draft 的唯一调用点是 _process_items 末尾，而 _asr_busy 在同
+        # 函数的 finally 里刚被置回 False，且 _asr_executor 是单线程——检查
+        # 执行时它恒为 False。而且即使不恒为 False 也拦不住：草稿是 submit 到
+        # _tx_executor 异步跑的，真正打 Ollama 的时刻 ASR 早就开始下一轮
+        # process_iter 了。所以让路检查搬进 _draft_worker（跑在 tx 线程，
+        # 那里 _asr_busy 才可能真是 True），见那里的注释。
         if self._lookup_inflight:
             return  # 用户点了查词/AI分析在等结果，草稿让路（这类是一次性人工
                      # 请求，比"每1.5秒一次"的草稿更该优先拿到GPU）
@@ -990,6 +1073,12 @@ class WhisperQueueTranslator:
                 return  # 等草稿排到时已经来了正式句子，草稿没意义了
             epoch = self._tx_epoch
             context = " ".join(self.context_history)
+        # ☠️ 让路检查必须在**这里**，不能在 _maybe_draft 里：那边跑在 ASR 线程
+        # 上、且刚好在 process_iter 结束之后，_asr_busy 恒为 False（这个判断在
+        # 那边当了很久的死代码）。到了这一刻才是真的要发请求，ASR 也确实可能
+        # 正占着 GPU——草稿是奢侈品，让给识别。
+        if self._asr_busy:
+            return
         translation = self._translate_single_sentence(
             snapshot, context, on_partial=self._epoch_gated_draft(epoch))
         with self._tx_lock:
@@ -1036,7 +1125,7 @@ class WhisperQueueTranslator:
         name = getattr(config, "LOOKUP_CACHE_FILE", None)
         if not name:
             return None
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+        return repo_path(name)  # 仓库根，和 .gitignore/uninstall.ps1 一致
 
     def _load_lookup_cache(self):
         """启动时读回上次的查词缓存（学德语时高频词跨会话继续秒回）。
@@ -1648,12 +1737,10 @@ class WhisperQueueTranslator:
         except RuntimeError:
             pass
 
-    def request_clear_context(self):
-        """切换语言时调用：清上下文任务排进识别线程保证串行"""
-        try:
-            self._asr_executor.submit(self.clear_context)
-        except RuntimeError:
-            pass
+    # 注：曾有一个 request_clear_context()（submit(clear_context) 到 ASR 池），
+    # 是 request_switch_language 的前身。后者改成"写标志 + 每批边界抢占执行"
+    # 正是因为收件箱持续非空时 submit 的任务会被饿死（见 request_switch_language
+    # 的注释），旧的那个从此零调用方，已删——留着只会让人以为还有第二条切换路径。
 
     def request_warm_model(self, old_model=None, new_model=None):
         """游戏模式切翻译模型后调用：在翻译线程里卸掉旧模型、预热新模型。
@@ -1832,6 +1919,25 @@ class WhisperQueueTranslator:
             if unstable:
                 print(f"   ⏳ 未稳定: {unstable[:60]}")
 
+    @staticmethod
+    def _stats_enabled():
+        """概况关掉时（STATS_SUMMARY_INTERVAL<=0）一个样本都不该再收。
+
+        ☠️ 排空点只有 _stat_note_asr 里那个到点打印的分支，而它在
+        `interval <= 0` 时直接 return。翻译耗时以前是在 _translation_worker
+        里【无条件】 append 的，于是用户一旦按 config 注释把概况关掉，
+        _stat_tx 就再也没有出口了——一条一句、长跑几小时只涨不消。
+        采样入口统一走这个门。
+        """
+        return getattr(config, "STATS_SUMMARY_INTERVAL", 60) > 0
+
+    def _stat_note_tx(self, elapsed):
+        """记一次翻译耗时（概况关掉时直接丢弃，不进内存）。"""
+        if not self._stats_enabled():
+            return
+        with self._stats_lock:
+            self._stat_tx.append(elapsed)
+
     def _stat_note_asr(self, elapsed, buf_sec, n_items,
                        buf_before=None, overlapped=False):
         """记一轮识别指标；到间隔就打一行概况（跑在ASR线程，无音频时不打）
@@ -1848,7 +1954,7 @@ class WhisperQueueTranslator:
            在飞"分桶记 p50，直接看差值。
         """
         interval = getattr(config, "STATS_SUMMARY_INTERVAL", 60)
-        if interval <= 0:
+        if not self._stats_enabled():
             return
         with self._stats_lock:
             self._stat_asr.append(elapsed)

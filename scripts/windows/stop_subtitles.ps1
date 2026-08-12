@@ -124,8 +124,19 @@ Remove-Item "$RepoRoot\.paused" -ErrorAction SilentlyContinue
 # 实验确认过强杀存根时子进程会随 CPython 启动器自带的 Job 一起消亡，所以这里
 # 只观测不自动杀（按未经验证的假设去杀进程反而危险）。真出现残留就说明那条
 # 结论在某个 Windows/Python 版本上不成立，需要重新做实验。
-$leftover = Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith("$RepoRoot\venv") }
+# ☠️ 要给宽限期，不能查一次就报。优雅退出真正生效之后（2026-08-11 修好
+# .stop 路径之前这条路径从没被走到过），存根 1.5 秒就退出，而真正的子进程还要
+# 再几百毫秒才收完尾——查一次必然撞上，于是每次正常停止都打一条「这不该发生」
+# 吓用户。2026-08-11 实测 4 次停止：2 次 1.2~1.6 秒干净退出，2 次报了残留、
+# 而那两个 PID 都在几秒内自行消失（其中一次超过 3 秒）。轮询 8 秒兜住这个抖动；
+# 退干净就立刻返回，所以这 8 秒只有**真残留**时才会付。
+$leftover = $null
+for ($i = 0; $i -lt 32; $i++) {
+    $leftover = Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith("$RepoRoot\venv") }
+    if (-not $leftover) { break }
+    Start-Sleep -Milliseconds 250
+}
 if ($leftover) {
     Write-Host ""
     Write-Host "⚠️  停止后仍有本项目的 python 进程残留（PID: $($leftover.ProcessId -join ', ')）。"

@@ -334,6 +334,13 @@ HALLUCINATION_BLACKLIST = [
 # ============ 字幕记录 ============
 SAVE_TRANSCRIPT = True  # 把每条字幕（原文+译文+时间）存到文件，方便回看/搜索/学语言
 TRANSCRIPT_DIR = "transcripts"  # 相对仓库目录，每天一个文件 YYYY-MM-DD.txt
+# 启动时清理超过这么多天的存档文件。**默认 0 = 永久保留**，和一直以来的行为
+# 一致——transcripts 是拿来回看和学德语的，自动删掉用户攒的语料不该是默认。
+# ⚠️ 但要知道它的另一面：本程序抓的是**系统全部声音**（可能含语音通话），
+# 存档是明文、按天一个文件、SAVE_TRANSCRIPT 默认开着，所以装多久就攒多久。
+# 介意的话在 config_local.py 里写个天数（如 TRANSCRIPT_KEEP_DAYS = 30），
+# 完全不想留就 SAVE_TRANSCRIPT = False。
+TRANSCRIPT_KEEP_DAYS = 0
 
 # ============ 感叹词直译词典 ============
 # ≤3词的句子命中词典就跳过 Ollama 直接上屏（游戏/聊天场景实测21%的字幕
@@ -369,11 +376,15 @@ STATS_SUMMARY_INTERVAL = 60
 # install.ps1 在没有NVIDIA显卡的机器上会生成 config_local.py
 # （WHISPER_DEVICE="cpu" 等降级配置）；个人调参也可以写在那里，
 # 不污染仓库文件（config_local.py 在 .gitignore 里）
+# ☠️ 加载失败**必须出声**。以前这里是裸 `except Exception: pass`：
+# config_local.py 里打错一个字（或 install.ps1 生成的降级配置语法有问题），
+# 结果是静默退回全部默认值——没显卡的机器于是拿着 WHISPER_DEVICE="cuda"
+# 去跑，然后在加载 cublas 时崩，而日志里一个字都不会提到 config_local，
+# 排障方向全错。捕获照旧（坏配置不该挡住启动），但要把原因打出来。
 try:
     # config_local.py lives at the repo root (next to main.py), not inside the package
     import importlib.util
-    from pathlib import Path as _Path
-    _root = _Path(__file__).resolve().parents[1]
+    from realtime_subtitle.paths import REPO_ROOT as _root
     _local = _root / "config_local.py"
     if _local.is_file():
         _spec = importlib.util.spec_from_file_location("config_local", _local)
@@ -381,5 +392,7 @@ try:
         assert _spec.loader is not None
         _spec.loader.exec_module(_mod)
         globals().update({k: v for k, v in vars(_mod).items() if not k.startswith("_")})
-except Exception:
-    pass
+except Exception as _e:
+    print(f"⚠️  config_local.py 加载失败，本机配置【未生效】，正在使用 config.py 默认值: "
+          f"{_e.__class__.__name__}: {_e}")
+    print("   （没有显卡的机器会因此按 CUDA 档启动并在加载模型时报错——先修这个文件）")
