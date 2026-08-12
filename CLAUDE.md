@@ -230,9 +230,12 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     `venv\Scripts\python -m pip install -r requirements-dev.txt`。test_hittest /
     test_resize_freedom / test_wordclick 是**独立脚本套件**（import 即开真窗口，
     pytest.ini 已把它们排除出收集，別删这个排除），用 `venv\Scripts\python
-    test_hittest.py` 逐个跑。**测试进程 import main.py 会被
-    单实例 Mutex 直接 sys.exit**——参考 test_game_mode.py 顶部先打桩
-    CreateMutexW 的写法。UI 动画用例一律用 test_ui_polish.py 的 `_pump_until`
+    test_hittest.py` 逐个跑。**测试进程 import realtime_subtitle.app 会被
+    单实例 Mutex 直接 sys.exit**——import 之前设
+    `os.environ["REALTIME_SUBTITLE_NO_SINGLETON"] = "1"`（参考 test_game_mode.py
+    顶部）。以前是 monkeypatch `ctypes.windll.kernel32.CreateMutexW`，
+    app.py 改用 `use_last_error=True` 的独立 WinDLL 句柄之后那种打桩已经失效
+    （patch 的是 `ctypes.windll.kernel32`，模块拿的是另一个句柄），别照抄旧写法。UI 动画用例一律用 test_ui_polish.py 的 `_pump_until`
     等条件成立，别写"固定 pump 若干毫秒再断言"（那样在忙机器上会偶发挂，
     以前 fade 两个用例就是这么变成"重跑即绿"的假回归的）。
 16. **Qt 测试必须持模块级 QApplication 引用**，否则被 GC 后建 QWidget 直接

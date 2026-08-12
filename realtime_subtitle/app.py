@@ -15,11 +15,24 @@ if sys.platform == "win32":
 # 单实例守卫：双开会有两路音频采集互抢+热键注册冲突+两个悬浮窗叠着。
 # 必须放在重量级 import（torch/模型加载）之前——第二个实例秒退，
 # 不浪费几秒加载时间和显存。句柄存模块级变量，进程活着就一直持有。
-if sys.platform == "win32":
+#
+# ☠️ 测试进程 import 本模块会被这段直接 sys.exit（字幕开着时症状是"pytest
+# 静默退出"）。以前靠在 import 前 monkeypatch ctypes.windll.kernel32 绕开，
+# 那既脆（换 ctypes 调用方式就失效）又要写进 CLAUDE.md 让人记住；现在改成
+# 环境变量开关，tests/ 里设一次即可，也不会真去占那个 mutex。
+if sys.platform == "win32" and not os.environ.get("REALTIME_SUBTITLE_NO_SINGLETON"):
     import ctypes
-    _single_instance_mutex = ctypes.windll.kernel32.CreateMutexW(
+    # ☠️ 错误码必须走 use_last_error=True 的独立句柄 + ctypes.get_last_error()。
+    # CPython 文档明确写着**不能**直接调 windll.kernel32.GetLastError()：ctypes
+    # 会在你那次调用和这次取值之间发起别的 Windows API 调用，错误码可能已被
+    # 覆盖。它一直"能用"是运气；一旦读到 0，守卫失效 = 双开，而双开的症状
+    # （两路 WASAPI 互抢、热键注册冲突、两个悬浮窗叠着）极难归因到这里。
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p)
+    _kernel32.CreateMutexW.restype = ctypes.c_void_p  # HANDLE 是 64 位，别让它被截成 int
+    _single_instance_mutex = _kernel32.CreateMutexW(
         None, False, "realtime_subtitle_single_instance")
-    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
         print("⚠️  实时字幕已经在运行了，不再启动第二个实例")
         # 启动脚本是Hidden窗口+日志重定向，print用户看不见——弹个会自动
         # 消失的提示框（MessageBoxTimeoutW：user32未文档化但十几年稳定存在）

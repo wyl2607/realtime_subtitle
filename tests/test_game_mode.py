@@ -3,22 +3,18 @@
 
 运行: venv\\Scripts\\python.exe -m pytest test_game_mode.py -q
 
-⚠️ main.py 顶部有单实例 Mutex（已在运行会 sys.exit(0)），import 前必须打桩，
-否则字幕程序开着时 pytest 进程会直接退出。打桩还保证测试进程不真持有
+⚠️ app.py 顶部有单实例 Mutex（已在运行会 sys.exit(0)），import 前必须关掉，
+否则字幕程序开着时 pytest 进程会直接退出。环境变量还保证测试进程不真持有
 mutex——不会挡住用户随后启动真程序。
+
+（以前这里是 monkeypatch ctypes.windll.kernel32.CreateMutexW/GetLastError。
+app.py 改用 use_last_error=True 的独立 WinDLL 句柄之后那种打桩就失效了——
+patch 的是 ctypes.windll.kernel32，而模块拿的是另一个句柄。开关比打桩稳。）
 """
-import ctypes
+import os
 
-_orig_create = ctypes.windll.kernel32.CreateMutexW
-_orig_getlast = ctypes.windll.kernel32.GetLastError
-ctypes.windll.kernel32.CreateMutexW = lambda *a: 1
-ctypes.windll.kernel32.GetLastError = lambda: 0
-try:
-    import realtime_subtitle.app as main  # noqa: E402  重量级但只 import 模块，不实例化
-finally:
-    ctypes.windll.kernel32.CreateMutexW = _orig_create
-    ctypes.windll.kernel32.GetLastError = _orig_getlast
-
+os.environ["REALTIME_SUBTITLE_NO_SINGLETON"] = "1"
+import realtime_subtitle.app as main  # noqa: E402  重量级但只 import 模块，不实例化
 import realtime_subtitle.config as config  # noqa: E402
 
 
