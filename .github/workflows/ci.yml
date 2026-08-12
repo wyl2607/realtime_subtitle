@@ -49,28 +49,35 @@ jobs:
   # 任何一个 job 装过 requirements.txt 本身**。dependabot 每周都会提抬下限的
   # PR，没有这道守卫它随时会再来一次。
   #
-  # --dry-run 只拉 metadata、不下载 wheel（整个 job 十几秒）。
-  # --platform win_amd64 是因为本项目只支持 Windows：pyaudiowpatch 根本没有
-  # linux 轮子，在 ubuntu 上按本机平台解会假失败。
-  # 用 3.13 的解释器 + --python-version 逐个目标解析，比起 4 份 setup-python
-  # 更省事，而且 --platform 本来就要求 --only-binary + --target。
+  # --dry-run 只拉 metadata、不下载 wheel（整个 job 十几秒）。用一个 3.13 的
+  # 解释器 + --python-version 逐个目标解析，不用开四份 setup-python。
+  #
+  # ☠️ 必须跑在 windows runner 上，不能用 ubuntu + `--platform win_amd64`。
+  # 第一版就是那么写的，结果 3.13 假失败：
+  #     ERROR: Could not find a version that satisfies the requirement
+  #            nvidia-nccl-cu13==2.29.7; platform_system == "Linux" (from torch)
+  # 因为 `--platform` **只改 wheel 标签匹配，不改环境标记求值**——
+  # `platform_system` 仍按运行中的解释器算。在 ubuntu 上它是 "Linux"，于是
+  # torch 那条 Linux 专属依赖被激活，再被 --only-binary + win_amd64 卡死。
+  # 本项目只支持 Windows（pyaudiowpatch 连 linux 轮子都没有），在目标平台上
+  # 解析本来就是更诚实的测法。
   deps-resolve:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:
           python-version: "3.13"
       - name: Resolve requirements.txt for every supported Python
+        shell: bash
         run: |
           python -m pip install --upgrade pip
           failed=0
           for v in 3.10 3.11 3.12 3.13; do
             echo "::group::python $v"
             if pip install --dry-run --ignore-installed \
-                 --python-version "$v" --platform win_amd64 \
-                 --only-binary=:all: --target /tmp/resolve-$v \
-                 -r requirements.txt; then
+                 --python-version "$v" --only-binary=:all: \
+                 --target "/tmp/resolve-$v" -r requirements.txt; then
               echo "OK   python $v"
             else
               echo "::error::requirements.txt 在 Python $v 上解析失败（README/CLAUDE.md 声称支持 3.10-3.13）"
