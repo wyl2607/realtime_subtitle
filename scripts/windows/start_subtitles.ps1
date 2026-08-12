@@ -4,13 +4,26 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = (Get-Item $PSScriptRoot).Parent.Parent.FullName
 Set-Location $RepoRoot
 
+# ☠️ 判"是不是本项目的进程"一律用 StartsWith，不要用 -like。-like 会把路径里的
+# [ ] 当成通配符字符类，而 install.ps1 只拦非 ASCII、[ 是 ASCII——装在
+# C:\tools\[wip]\realtime_subtitle 这种目录下时，本脚本会误判"没在运行"允许
+# 双开，停止脚本会认不出自己的进程只能走窗口标题兜底。
+# OrdinalIgnoreCase：Windows 路径不区分大小写，Get-Process 返回的盘符/目录
+# 大小写不保证和 $RepoRoot 一致。
+$VenvPrefix = Join-Path $RepoRoot "venv"
+function Test-OurProcess {
+    param($Proc)
+    return $Proc -and $Proc.Path -and
+        $Proc.Path.StartsWith($VenvPrefix, [StringComparison]::OrdinalIgnoreCase)
+}
+
 $pidFile = "$RepoRoot\subtitle.pid"
 if (Test-Path $pidFile) {
     $oldPid = Get-Content $pidFile
     $oldProc = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
     # PID会被系统回收复用：光"这个PID有进程"不算数，还得确认真是本项目venv的
     # python（2026-07-17实测：残留pid被别的进程占用→误判"已在运行"拒绝启动）
-    if ($oldProc -and $oldProc.Path -like "$RepoRoot\venv\*") {
+    if (Test-OurProcess $oldProc) {
         Write-Host "已经在运行中（PID $oldPid），不用重复启动。要重启请先运行 停止字幕.bat"
         exit
     }
@@ -72,8 +85,18 @@ $txModel = $cfg[0]
 # 首次启动检测：Whisper 模型还没下载过（HF 缓存里没有）就明确告知要等几分钟。
 # Hidden 启动 + 下载无进度条，不提示的话新用户会以为"双击没反应"
 $whisperModel = $cfg[1]
-$hfHome = if ($env:HF_HOME) { $env:HF_HOME } else { Join-Path $env:USERPROFILE ".cache\huggingface" }
-$firstRun = -not (Get-ChildItem (Join-Path $hfHome "hub") -Directory -Filter "models--*whisper*" -ErrorAction SilentlyContinue |
+# HuggingFace 缓存位置。优先级必须和 huggingface_hub 自己的一致：
+#   HF_HUB_CACHE > HUGGINGFACE_HUB_CACHE(旧名) > HF_HOME\hub > ~\.cache\huggingface\hub
+# ☠️ 以前只认 HF_HOME，于是设了 HF_HUB_CACHE 的用户（模型放别的盘）每次启动
+# 都会看到"首次启动，要下 1-3GB"的提示并被多留 10 秒——而模型明明早就在本地。
+# uninstall.ps1 里有一份同样的实现（那边漏掉的后果更重：模型扫不到、删不掉）。
+function Get-HFHubDir {
+    if ($env:HF_HUB_CACHE) { return $env:HF_HUB_CACHE }
+    if ($env:HUGGINGFACE_HUB_CACHE) { return $env:HUGGINGFACE_HUB_CACHE }
+    if ($env:HF_HOME) { return (Join-Path $env:HF_HOME "hub") }
+    return (Join-Path $env:USERPROFILE ".cache\huggingface\hub")
+}
+$firstRun = -not (Get-ChildItem (Get-HFHubDir) -Directory -Filter "models--*whisper*" -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -like "*$whisperModel*" })
 $models = (Invoke-RestMethod -Uri "http://127.0.0.1:11434/api/tags").models.name
 if ($models -notcontains $txModel) {

@@ -6,6 +6,15 @@ Set-Location $RepoRoot
 
 $pidFile = "$RepoRoot\subtitle.pid"
 $stopFlag = "$RepoRoot\.stop"
+# ☠️ 判"是不是本项目的进程"一律用 StartsWith，不要用 -like（-like 把路径里的
+# [ ] 当通配符字符类，装在 C:\tools\[wip]\... 下就认不出自己的进程了）。
+# 本文件末尾的残留检查一直用的就是 StartsWith，这里跟它统一。
+$VenvPrefix = Join-Path $RepoRoot "venv"
+function Test-OurProcess {
+    param($Proc)
+    return $Proc -and $Proc.Path -and
+        $Proc.Path.StartsWith($VenvPrefix, [StringComparison]::OrdinalIgnoreCase)
+}
 # 优雅退出正常1-2秒（积压任务直接丢弃、在飞流式翻译会被打断），但
 # .stop轮询0.5s+在飞识别(GPU被抢最坏~2.5s)+Ollama卸载HTTP(~1-2s)叠加时
 # 会顶到3秒边缘（2026-07-20实测3次停止2次超时强杀）。放到5秒：退得快
@@ -31,7 +40,7 @@ if (Test-Path $pidFile) {
     $targetProc = Get-Process -Id $targetPid -ErrorAction SilentlyContinue
     # 与 start 对称：PID 会被系统回收复用。只对「本项目 venv 下的 python」
     # 写 .stop / 强杀；路径对不上就当陈旧 pid，删文件后走窗口标题兜底。
-    $isOurs = $targetProc -and $targetProc.Path -like "$RepoRoot\venv\*"
+    $isOurs = Test-OurProcess $targetProc
     if ($isOurs) {
         # 写停止标记：主程序 QTimer 看到后走 app.quit → stop() 关线程/模型
         New-Item -ItemType File -Path $stopFlag -Force | Out-Null
@@ -133,7 +142,8 @@ Remove-Item "$RepoRoot\.paused" -ErrorAction SilentlyContinue
 $leftover = $null
 for ($i = 0; $i -lt 32; $i++) {
     $leftover = Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith("$RepoRoot\venv") }
+        Where-Object { $_.ExecutablePath -and
+            $_.ExecutablePath.StartsWith($VenvPrefix, [StringComparison]::OrdinalIgnoreCase) }
     if (-not $leftover) { break }
     Start-Sleep -Milliseconds 250
 }

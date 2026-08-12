@@ -90,7 +90,12 @@ if ($changed -contains "requirements.txt") {
         exit 1
     }
 }
-if ($changed -contains "install.ps1") {
+# ☠️ 必须按后缀匹配，不能 -contains "install.ps1"。git diff --name-only 返回的是
+# 带目录的路径，而 -contains 是精确匹配——包化之后真正的安装脚本在
+# scripts/windows/install.ps1，于是这条提示只有在根目录那个 10 行转发 shim
+# 变了时才会命中，改真正的安装脚本反而不提示（CLAUDE.md 第 26/28 条同一类
+# "挪目录时的漏改"，这次漏在 PowerShell 侧）。
+if ($changed -match 'install\.ps1$') {
     Write-Host "ℹ️ 安装脚本本身有更新，建议重跑一次 install.ps1（会刷新桌面快捷方式/本机配置检测）"
 }
 

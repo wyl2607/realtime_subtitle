@@ -61,10 +61,17 @@ function Remove-Path {
     }
 }
 
-# HuggingFace 缓存位置：HF_HOME 优先，其次默认路径。
+# HuggingFace 缓存位置。优先级必须和 huggingface_hub 自己的一致：
+#   HF_HUB_CACHE > HUGGINGFACE_HUB_CACHE(旧名) > HF_HOME\hub > ~\.cache\huggingface\hub
+# ☠️ 以前这里只认 HF_HOME。设了 HF_HUB_CACHE 的用户（把模型放到别的盘，多盘
+# 机器很常见）在本脚本里的后果是：那 1-3GB 的 Whisper 模型**根本扫不到**，
+# 卸载完静默留在硬盘上——而这个脚本存在的全部理由就是"东西散在四个位置，
+# 只删仓库目录收不回来"。start_subtitles.ps1 里有一份同样的实现。
 # 只在这个 hub 目录里找 faster-whisper 的模型，绝不整个清空——
 # 用户很可能有别的项目在共用这个缓存。
 function Get-HFHubDir {
+    if ($env:HF_HUB_CACHE) { return $env:HF_HUB_CACHE }
+    if ($env:HUGGINGFACE_HUB_CACHE) { return $env:HUGGINGFACE_HUB_CACHE }
     if ($env:HF_HOME) { return (Join-Path $env:HF_HOME "hub") }
     return (Join-Path $env:USERPROFILE ".cache\huggingface\hub")
 }
