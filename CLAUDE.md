@@ -455,6 +455,16 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     本机任何进程都能补位。加新的 Ollama 调用路径时不用自己重复这套，
     但也别绕过 `_translate_single_sentence` 直接发转录。
 
+30. **`numpy` 下限必须停在 2.2，不要跟 dependabot 抬到最新。** 2026-08-12
+    审计时 `requirements.txt` 写的是 `numpy>=2.5.1`，而 numpy 2.5 起
+    `requires_python >=3.12`、连 cp310 轮子都没有。本机只有 3.13 所以装得上，
+    但 `install.ps1` / README 仍接受 3.10–3.13——3.10 上 `pip install -r
+    requirements.txt` 会直接失败。版本门槛：2.2.x ≥3.10，2.3/2.4 ≥3.11，
+    2.5+ ≥3.12。3.12/3.13 会自己漂到 2.5.x，不用把下限抬上去。
+    同一轮评估过 `--generate-hashes` 锁文件：一份锁钉不死 3.10–3.13 的
+    wheel 矩阵，再叠加 CPU 档要滤掉 `nvidia-*` 行，hash 校验会碎。放弃，
+    理由写在 `requirements.txt` 文件头。
+
 ## 5. 目录地图
 
 ```

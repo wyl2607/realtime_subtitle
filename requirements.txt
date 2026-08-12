@@ -1,11 +1,18 @@
 # 核心依赖（上限防止 pip 漂到破坏 ctranslate2/CUDA 的组合）
+#
+# 不做 --generate-hashes 锁文件。一份锁钉不死 Python 3.10–3.13（wheel 按
+# cp 标签分；numpy 2.5+ 连 3.10 轮子都没有），再叠加 install.ps1 的 CPU
+# 档要滤掉 nvidia-* 行，hash 校验会碎。区间钉 + 上限已经是这个支持矩阵
+# 下能做的。
 faster-whisper>=1.2.1,<2.0.0   # Whisper 语音识别
 ctranslate2>=4.8.1,<5.0.0      # RTX 50系(Blackwell/sm_120)最低要 4.6.2：旧版int8路径
                                # 直接CUBLAS_STATUS_NOT_SUPPORTED崩溃，4.6.2起自动禁用。
                                # 下限现在是 4.8.1（dependabot 提的，RTX 5060 实测过）
 requests>=2.34.2,<3.0.0         # Ollama API 调用
 torch>=2.13.0,<3.0.0             # CPU版即可：项目本身不用torch，但ctranslate2内部会import它
-numpy>=2.5.1,<3.0.0            # 数值计算
+numpy>=2.2.0,<3.0.0            # 数值计算。下限必须停在 2.2：2.3 起要 3.11，
+                               # 2.5 起要 3.12。抬高下限会让 install.ps1 仍接受
+                               # 的 Python 3.10 当场装不上。3.12/3.13 会自己漂到 2.5.x。
 
 # CUDA 运行库（缺了程序起不来！）
 # Windows下ctranslate2按名字LoadLibraryA加载cublas64_12.dll，
