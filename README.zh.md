@@ -36,6 +36,10 @@
 - **抗 GPU 抢占**：游戏占 GPU 时字幕滞后而非永久丢词
 - **窗口自适应**：边缘拖拽缩放，位置/大小/字号可持久化
 - **点词查词**：单击德语词，本地 LLM 给原形/词性/释义
+- **中德双向**：`Ctrl+Alt+L` 循环的是**语言对**，放中文视频就出德语字幕。
+  自动切换（`AUTO_DETECT_LANGUAGE`，**默认关**）连续 3 次检测到同一新语言才切；
+  切换真正发生前有约 12 秒的垃圾字幕——那段音频还在用旧语言的参数解码。
+  嫌乱切就调大 `LANGUAGE_SWITCH_STREAK`，嫌垃圾窗口长就调小 `LANGUAGE_DETECT_INTERVAL`。
 - **鼠标穿透**：`Ctrl+Alt+M` 点击穿过字幕落到视频/游戏上
 - **字幕存档**：按天写入 `transcripts/`，默认永久保留。是明文，且本程序抓的是**系统全部声音**——想自动清理就在 `config_local.py` 里设 `TRANSCRIPT_KEEP_DAYS = 30`，完全不想记录就 `SAVE_TRANSCRIPT = False`
 - **热键**：暂停、切语言、性能模式（见「使用」）
@@ -104,7 +108,7 @@ venv\Scripts\python -u main.py
 | 查词 | 单击德语词 |
 | 鼠标穿透 | `Ctrl+Alt+M` |
 | 暂停/继续 | `Ctrl+Alt+P` |
-| 切换识别语言 | `Ctrl+Alt+L`（默认德语↔英语） |
+| 切换语言对 | `Ctrl+Alt+L`（德→中 / 中→德 / 英→中，改 `config.LANGUAGE_PAIRS`） |
 | 性能模式 | `Ctrl+Alt+G` |
 | 回看本场 | 📜 |
 | 调参 | ⚙️ |

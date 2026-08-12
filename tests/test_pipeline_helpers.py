@@ -2002,7 +2002,21 @@ def test_language_vote_needs_a_streak():
     assert run([("zh", .95), ("en", .95), ("zh", .95), ("en", .95)]) == [None] * 4
 
 
-def test_auto_detect_is_off_by_default():
-    """默认必须是关的。开着等于把'误切'的风险默认加给所有用户，
-    而这个功能的收益是场景性的（同时看中文和德语内容的人才需要）。"""
-    assert getattr(config, "AUTO_DETECT_LANGUAGE", False) is False
+def test_auto_detect_is_off_by_default_in_repo_config():
+    """仓库默认必须是关的。开着等于把"误切"的风险默认加给所有用户，而这个
+    功能的收益是场景性的（同时看中文和德语内容的人才需要）。
+
+    ☠️ 必须读 config.py 的**源码字面量**，不能读 config.AUTO_DETECT_LANGUAGE。
+    后者是 config_local.py 覆盖之后的生效值——真开了这个功能的机器（比如作者
+    自己的）跑测试就会红，那是用例写错了不是代码错了。这条第一次就是那么写的，
+    当场被自己的机器打回来。update_subtitles.ps1 用正则读 version.py 是同一个
+    思路：要问"仓库里写的是什么"就别去问运行期。
+    """
+    import re
+    import pathlib
+
+    src = (pathlib.Path(__file__).resolve().parents[1]
+           / "realtime_subtitle" / "config.py").read_text(encoding="utf-8")
+    m = re.search(r"^AUTO_DETECT_LANGUAGE\s*=\s*(\w+)", src, re.M)
+    assert m, "config.py 里找不到 AUTO_DETECT_LANGUAGE"
+    assert m.group(1) == "False", f"仓库默认被改成了 {m.group(1)}"

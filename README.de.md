@@ -40,6 +40,12 @@ Systemton ──WASAPI-Loopback──▶ Faster-Whisper (CUDA oder CPU)
 - **GPU-freundlich unter Last** — bei Spielen eher Verzögerung als dauerhafter Wortverlust
 - **Skalierbares Overlay** — Kanten/Ecken ziehen; Position und Größe bleiben erhalten
 - **Wortklick** — Lemma / Wortart / Bedeutung per lokalem LLM
+- **Beide Richtungen (DE↔ZH)** — `Ctrl+Alt+L` wechselt das *Sprachpaar*, bei
+  chinesischem Ton also deutsche Untertitel. Optionale automatische
+  Sprachumschaltung (`AUTO_DETECT_LANGUAGE`, standardmäßig aus) greift erst,
+  wenn dreimal hintereinander dieselbe neue Sprache erkannt wird; bis dahin sind
+  die Untertitel rund 12 Sekunden lang unbrauchbar, weil der Ton in diesem
+  Zeitraum noch mit der alten Sprache transkribiert wird.
 - **Klick-durchlässig** — `Ctrl+Alt+M` für Vollbild-Video/Spiele
 - **Tages-Archiv** — Ordner `transcripts/`, standardmäßig unbegrenzt aufbewahrt. Klartext, und diese App nimmt **sämtlichen** System-Ton auf: `TRANSCRIPT_KEEP_DAYS = 30` löscht Älteres automatisch, `SAVE_TRANSCRIPT = False` zeichnet gar nichts auf
 - **Hotkeys** — Pause, Sprache, Leistungsmodus (siehe Nutzung)
@@ -108,7 +114,7 @@ venv\Scripts\python -u main.py
 | Wort nachschlagen | Deutsch-Wort anklicken |
 | Klick-durchlässig | `Ctrl+Alt+M` |
 | Pause / Weiter | `Ctrl+Alt+P` |
-| Erkennungssprache | `Ctrl+Alt+L` (Standard de ↔ en) |
+| Sprachpaar wechseln | `Ctrl+Alt+L` (de→zh / zh→de / en→zh, siehe `config.LANGUAGE_PAIRS`) |
 | Leistungsmodus | `Ctrl+Alt+G` |
 | Verlauf | 📜 |
 | Einstellungen | ⚙️ |

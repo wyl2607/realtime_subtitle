@@ -37,9 +37,17 @@ TRANSLATION_TARGET_NAMES = {"zh": "简体中文"}
 # 开了之后如果发现乱切：先把 LANGUAGE_SWITCH_STREAK 调大（最有效），
 # 再考虑抬 LANGUAGE_SWITCH_MIN_PROB。
 AUTO_DETECT_LANGUAGE = False
-# 每隔这么多秒做一次检测。检测要跑一遍 Whisper 编码器（约等于一次识别的
-# 开销），6 秒一次约合 5% 的额外 GPU；设 0 等于关掉自动检测
-LANGUAGE_DETECT_INTERVAL = 6.0
+# 每隔这么多秒做一次检测。
+# ☠️ 这个值和 LANGUAGE_SWITCH_STREAK 一起决定了**换语言时的垃圾字幕窗口**：
+# 切换真正发生之前要攒够连击，而那段时间里新语言的音频是拿旧语言参数解码的，
+# 出来的是废话。2026-08-12 真机实测（德语切回中文时）那 18 秒长这样：
+#     China und China, China, China, China, China...
+#     和国.和国.和国.
+# 窗口 = STREAK × INTERVAL，而单次检测实测只要 **180ms**（large-v3-turbo
+# float16，且几乎不随缓冲长度变化——30 秒 pad_or_trim，见避坑清单第 20 条）。
+# 所以缩短间隔是最划算的旋钮：4 秒一次 = 窗口 12 秒、额外 GPU 约 4.5%。
+# 嫌垃圾窗口长就继续往下调（3 秒 → 窗口 9 秒、6% GPU）；嫌费卡就往上调。
+LANGUAGE_DETECT_INTERVAL = 4.0
 # 缓冲里至少攒够这么多秒音频才值得检测——太短的片段检测极不可靠
 LANGUAGE_DETECT_MIN_SEC = 3.0
 # 置信度门槛：低于它的检测结果直接丢弃（不计入连击）

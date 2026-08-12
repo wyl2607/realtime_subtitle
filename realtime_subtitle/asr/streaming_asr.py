@@ -253,7 +253,19 @@ class OnlineASRProcessor:
 
     def _ts_words(self, segments):
         """segment 流 → [(start, end, word)]，段级过滤静音幻觉。
-        注意 faster-whisper 的 word.word 自带前导空格，不能 strip（拼接时需要）"""
+
+        注意 faster-whisper 的 word.word 自带前导空格，拉丁语系拼接时需要它，
+        **不能无条件 strip**。
+
+        ☠️ 但中文/日文必须 strip：这些语言词间本来就不该有空格，照抄下来
+        屏幕上就是「另外,软件方面的 更 新同 样值得 关注。」（2026-08-12 加
+        中→德时真机实测到的）。而且存档里也是这个样子，回看很难受。
+        剥空格是确定性的（相邻两次识别对同一段音频结果一致），不会扰动
+        local agreement 的前缀一致判定——和 _apply_corrections /
+        _collapse_word_runs 放在同一个出口是同一个理由。
+        """
+        strip_spaces = config.SOURCE_LANGUAGE in getattr(
+            config, "NO_SPACE_LANGUAGES", ("zh", "ja"))
         out = []
         for segment in segments:
             if segment.no_speech_prob > 0.9:
@@ -263,7 +275,8 @@ class OnlineASRProcessor:
                     print(f"   🚫 丢弃幻觉片段: {segment.text.strip()[:40]}")
                 continue
             for word in segment.words:
-                out.append((word.start, word.end, word.word))
+                text = word.word.lstrip() if strip_spaces else word.word
+                out.append((word.start, word.end, text))
         return self._collapse_word_runs(self._apply_corrections(out))
 
     def process_iter(self):

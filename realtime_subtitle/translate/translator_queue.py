@@ -1080,7 +1080,8 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
                     self._emit_display()
             return  # 本轮全是词典感叹词，不用打Ollama
 
-        german = " ".join(batch)
+        # 合并成一次请求时同样不能给中文插空格（见 _append_committed）
+        german = ("" if _no_space_language() else " ").join(batch)
         translation = None
         try:
             t0 = time.time()
@@ -1488,7 +1489,10 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
                 with self._stats_lock:
                     self._stat_held_misfire += 1
         if self.pending_text:
-            self.pending_text += " " + committed_text
+            # ☠️ 无空格语言不能插分隔符：中文残句拼起来会变成
+            # 「另外,软件方面的 更新同样值得关注」。拉丁语系仍然需要这个空格
+            sep = "" if _no_space_language() else " "
+            self.pending_text += sep + committed_text
         else:
             self.pending_text = committed_text
 

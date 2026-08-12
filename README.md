@@ -39,6 +39,11 @@ System audio ──WASAPI loopback──▶ Faster-Whisper (CUDA or CPU)
 - **GPU preemption friendly** — under game load, subtitles lag instead of dropping forever
 - **Resizable overlay** — drag edges/corners; size and position persist across restarts
 - **Word lookup** — click a German word for lemma / POS / meaning (local LLM)
+- **Bidirectional (DE↔ZH)** — `Ctrl+Alt+L` cycles the *language pair*, so Chinese
+  audio gets German subtitles. Optional auto-detect (`AUTO_DETECT_LANGUAGE`, off by
+  default) switches for you after it sees the same new language 3 times in a row;
+  expect ~12s of garbage subtitles before it commits, since the audio in that window
+  is still being decoded with the old language.
 - **Click-through mode** — `Ctrl+Alt+M` so the overlay ignores mouse hits over video/games
 - **Daily transcript archive** — `transcripts/` (timestamp + source + translation), kept
   forever by default. Plain text, and this app captures **all** system audio: set
@@ -109,7 +114,7 @@ venv\Scripts\python -u main.py
 | Word lookup | Single-click a German word |
 | Click-through | `Ctrl+Alt+M` |
 | Pause / resume | `Ctrl+Alt+P` (works over fullscreen games) |
-| Cycle recognition language | `Ctrl+Alt+L` (default de ↔ en; extend `config.LANGUAGE_CYCLE`) |
+| Cycle language pair | `Ctrl+Alt+L` (de→zh / zh→de / en→zh; edit `config.LANGUAGE_PAIRS`) |
 | Performance mode | `Ctrl+Alt+G` (lighter ASR + model; free GPU for games) |
 | Session history | 📜 on the overlay |
 | Settings | ⚙️ (timing, font size, line count — live) |
