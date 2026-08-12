@@ -80,10 +80,10 @@ def _atomic_write_json(path, data):
 def _ai_web_enabled():
     """「🌐 问更强的AI」按钮是否显示（config 里模板设空 = 关掉这个出网入口）。
 
-    延迟 import translator_queue，沿用本模块其它 AI 相关调用点的惯例
+    延迟 import translate.lookup，沿用本模块其它 AI 相关调用点的惯例
     （UI 模块不在导入期把翻译侧整条依赖链拉起来）。
     """
-    from realtime_subtitle.translate.translator_queue import ai_web_enabled
+    from realtime_subtitle.translate.lookup import ai_web_enabled
     return ai_web_enabled()
 
 
@@ -691,7 +691,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
 
     def _on_ai_analysis_clicked(self):
         """🤖：过滤最近 N 分钟德文 → 本地总结；空内容直接提示不打 Ollama。"""
-        from realtime_subtitle.translate.translator_queue import (
+        from realtime_subtitle.translate.lookup import (
             filter_recent_german_context,
             build_web_query_for_background,
         )
@@ -742,7 +742,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         if seq != self._ai_analysis_seq:
             return
         import html as _html
-        from realtime_subtitle.translate.translator_queue import build_web_query_for_background
+        from realtime_subtitle.translate.lookup import build_web_query_for_background
         body = _html.escape(text).replace("\n", "<br>")
         web_q = build_web_query_for_background(self._ai_context_text)
         self.ai_analysis_popup.update_content(
@@ -756,7 +756,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
     def _on_word_deep_explain(self, context):
         """WordPopup「深度解释」按钮：先改成加载态，再丢给 translator。"""
         import html as _html
-        from realtime_subtitle.translate.translator_queue import build_web_query_for_sentence
+        from realtime_subtitle.translate.lookup import build_web_query_for_sentence
         ctx = (context or "").strip()
         if not ctx:
             self.word_popup.update_content(
@@ -796,7 +796,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         if seq != self._deep_explain_seq:
             return
         import html as _html
-        from realtime_subtitle.translate.translator_queue import build_web_query_for_sentence
+        from realtime_subtitle.translate.lookup import build_web_query_for_sentence
         body = _html.escape(text).replace("\n", "<br>")
         ctx = getattr(self.word_popup, "_context", "") or ""
         self.word_popup.update_content(
@@ -810,7 +810,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
     def _open_ai_web(self, prompt_text):
         """跳网页版更强 AI；失败只 status 提一句，不弹阻塞框。"""
         import webbrowser
-        from realtime_subtitle.translate.translator_queue import build_ai_web_url
+        from realtime_subtitle.translate.lookup import build_ai_web_url
         q = (prompt_text or "").strip()
         if not q:
             self.show_status("没有可追问的内容")

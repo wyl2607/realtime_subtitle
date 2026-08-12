@@ -16,7 +16,7 @@ from PyQt5.QtCore import QPoint, Qt
 from PyQt5.QtTest import QTest
 
 import realtime_subtitle.config as config
-from realtime_subtitle.translate.translator_queue import (
+from realtime_subtitle.translate.lookup import (
     filter_recent_german_context,
     build_background_summary_prompt,
     build_deep_explain_prompt,
@@ -148,7 +148,7 @@ def test_ai_web_can_be_disabled_by_emptying_template(monkeypatch):
     看起来像"关了但还是弹浏览器"。现在空模板 = 按钮不显示、URL 为空串，
     _open_ai_web 直接给一条状态提示。
     """
-    from realtime_subtitle.translate.translator_queue import ai_web_enabled
+    from realtime_subtitle.translate.lookup import ai_web_enabled
 
     monkeypatch.setattr(config, "AI_ANALYSIS_WEB_URL_TEMPLATE", "")
     assert ai_web_enabled() is False

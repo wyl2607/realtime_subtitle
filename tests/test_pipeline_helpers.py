@@ -1571,7 +1571,7 @@ def test_build_ai_web_url_survives_a_broken_template(monkeypatch, bad_template):
     的注释本来就鼓励用户把模板换成 ChatGPT 等。
     """
     from realtime_subtitle import config
-    from realtime_subtitle.translate.translator_queue import build_ai_web_url
+    from realtime_subtitle.translate.lookup import build_ai_web_url
 
     monkeypatch.setattr(config, "AI_ANALYSIS_WEB_URL_TEMPLATE", bad_template,
                         raising=False)
@@ -1580,7 +1580,7 @@ def test_build_ai_web_url_survives_a_broken_template(monkeypatch, bad_template):
 
 def test_build_ai_web_url_still_works_for_valid_templates(monkeypatch):
     from realtime_subtitle import config
-    from realtime_subtitle.translate.translator_queue import build_ai_web_url
+    from realtime_subtitle.translate.lookup import build_ai_web_url
 
     monkeypatch.setattr(config, "AI_ANALYSIS_WEB_URL_TEMPLATE",
                         "https://chatgpt.com/?q={query}&hints=search", raising=False)
@@ -1702,7 +1702,7 @@ def test_local_ollama_unresolvable_does_not_block_startup(monkeypatch):
 def test_ai_web_url_requires_query_placeholder(monkeypatch):
     """模板里没有 {query} 时 .format() 不报错、原样返回——于是浏览器打开一个
     空首页，用户刚才那句问题凭空消失，而且没有任何提示。必须显式挡住。"""
-    from realtime_subtitle.translate.translator_queue import build_ai_web_url
+    from realtime_subtitle.translate.lookup import build_ai_web_url
 
     monkeypatch.setattr(config, "AI_ANALYSIS_WEB_URL_TEMPLATE",
                         "https://grok.com/", raising=False)
@@ -1712,7 +1712,7 @@ def test_ai_web_url_requires_query_placeholder(monkeypatch):
 def test_ai_web_url_requires_http_scheme(monkeypatch):
     """webbrowser.open 在 Windows 上对"不像 URL"的字符串会退化成 os.startfile
     （= ShellExecute）。把配置写错的后果限制成"按钮不可用"。"""
-    from realtime_subtitle.translate.translator_queue import build_ai_web_url
+    from realtime_subtitle.translate.lookup import build_ai_web_url
 
     for bad in ("file:///C:/Windows/system32/calc.exe?{query}",
                 r"C:\Windows\system32\calc.exe {query}",
@@ -1722,7 +1722,7 @@ def test_ai_web_url_requires_http_scheme(monkeypatch):
 
 
 def test_ai_web_url_still_builds_normal_template(monkeypatch):
-    from realtime_subtitle.translate.translator_queue import build_ai_web_url
+    from realtime_subtitle.translate.lookup import build_ai_web_url
 
     monkeypatch.setattr(config, "AI_ANALYSIS_WEB_URL_TEMPLATE",
                         "https://grok.com/?q={query}", raising=False)
