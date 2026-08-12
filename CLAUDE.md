@@ -480,7 +480,11 @@ realtime_subtitle/paths.py    运行时文件落点的唯一真相源（REPO_ROO
 realtime_subtitle/capture/audio_capture.py      WASAPI Loopback 采集 + 设备热切换
 realtime_subtitle/asr/streaming_asr.py      local agreement 增量识别（词级前缀提交）
 realtime_subtitle/translate/translator_queue.py   Whisper/Ollama 持有者：切句、翻译队列、草稿、术语表
-realtime_subtitle/translate/lookup.py    点词查词 + 🤖AI分析（LookupMixin，被上面那个类 mixin 进去）
+realtime_subtitle/translate/lookup.py    点词查词 + 🤖AI分析（LookupMixin）
+realtime_subtitle/translate/transcript.py     字幕存档 + 保留期清理（TranscriptMixin）
+realtime_subtitle/translate/runtime_stats.py  分钟级性能概况（StatsMixin）
+                      ☠️ 这三个 mixin 都不自己 __init__，字段由
+                      WhisperQueueTranslator.__init__ 建；契约写在各自模块 docstring 里
 realtime_subtitle/ui/subtitle_window.py    悬浮窗主类（+ window_frame/window_chrome/subtitle_render/
                       window_geometry/settings_window/popups 拆分模块）
 config.py             全部默认参数（仓库文件，别为单机改它）
