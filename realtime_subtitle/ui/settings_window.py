@@ -31,8 +31,32 @@ TUNING_KEYS = (
 )
 
 
+# 会被原样插进富文本/样式表的键，读回时必须过一遍校验（见 apply_tuning）
+_COLOR_KEYS = ("CHINESE_TEXT_COLOR", "DRAFT_TEXT_COLOR", "UNSTABLE_TEXT_COLOR")
+
+
+def _sanitize_font_family(value):
+    """字体族串会被插进 Qt 样式表（window_chrome._apply_styles 等）。
+
+    剥掉能提前结束一条声明/整个规则块的字符，坏值就退回默认——否则
+    window_state.json 里一个手改坏的值能让整张样式表失效，症状是"字幕突然
+    没有样式了"，而没人会想到去看那个文件。
+    """
+    cleaned = str(value).replace("{", "").replace("}", "").replace(";", "").strip()
+    return cleaned or "Microsoft YaHei, Arial"
+
+
 def apply_tuning(tuning):
-    """把 state['tuning'] 写回 config；坏键/类型异常跳过。"""
+    """把 state['tuning'] 写回 config；坏键/类型异常跳过。
+
+    ☠️ 颜色和字体不能只做 str() 就 setattr。它们随后会被**原样**插进富文本和
+    样式表：颜色进 subtitle_render 的 `<span style="color:{...}">`（三处）、
+    字体进 window_chrome/tv_window 的样式表 f-string。而这个函数的输入是
+    window_state.json——一个手改坏的值现在会静默把整条字幕行渲染坏。
+    同模块里本来就有写好的校验器 apply_text_color()，以前这里绕过了它。
+    （能写 window_state.json 的人也能写 config_local.py，而后者是被 exec 的，
+    所以这不是信任边界；这么改纯粹是因为校验器是现成的、成本为零。）
+    """
     if not isinstance(tuning, dict):
         return
     for key in TUNING_KEYS:
@@ -40,6 +64,12 @@ def apply_tuning(tuning):
             continue
         try:
             val = tuning[key]
+            if key in _COLOR_KEYS:
+                apply_text_color(key, val)  # 自带 #rgb/#rrggbb 校验 + 规范化
+                continue
+            if key == "FONT_FAMILY":
+                setattr(config, key, _sanitize_font_family(val))
+                continue
             current = getattr(config, key)
             if isinstance(current, bool):
                 # json 可能给 0/1；bool 是 int 子类，必须先于 int 判断

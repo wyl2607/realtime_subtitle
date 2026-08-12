@@ -46,6 +46,13 @@ OLLAMA_MODEL = "qwen3.5:9b"  # Ollama 模型名称
 # 仓库里的 .ps1 脚本一直用的就是 127.0.0.1，只有这一行是 localhost，
 # 所以"脚本很快、字幕很慢"看着像 GPU 问题，其实是 DNS。
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"  # Ollama API 地址
+# ☠️ 启动时会校验 OLLAMA_BASE_URL 解析出来的地址**全部是环回地址**，否则直接
+# 拒绝启动（translator_queue._assert_local_ollama）。因为本程序会把识别出的
+# 全部原文发到这个地址，而 README 承诺的是"不向任何云端发送音频或文本"——
+# 没有这道校验的话，config_local.py 里改错一个字就能静默把系统全部声音的
+# 转录（可能含语音通话）送出本机，屏幕上和日志里都看不出任何异常。
+# 确实要用局域网里另一台机器的 Ollama：在 config_local.py 里设 True 显式声明。
+ALLOW_REMOTE_OLLAMA = False
 # Ollama GPU offload layers：None = 让 Ollama 按当前显存自动决定。
 # 不要把某台机器测出的固定层数写死；小显存设备会因此把模型挤进系统内存，
 # 而不同模型的总层数也不一样。需要手动限制时可在 config_local.py 覆盖为整数。

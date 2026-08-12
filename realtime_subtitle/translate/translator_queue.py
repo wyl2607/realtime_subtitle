@@ -19,6 +19,7 @@ import time
 import re
 import queue
 import socket
+import ipaddress
 from urllib.parse import urlparse
 from threading import Event, Lock, Thread
 from concurrent.futures import ThreadPoolExecutor
@@ -278,6 +279,21 @@ def build_ai_web_url(prompt_text):
     template = (template or "").strip()
     if not template:
         return ""
+    # ☠️ scheme 白名单：调用方是 webbrowser.open()，而 Windows 上它对"不像 URL"
+    # 的字符串会退化成 os.startfile，也就是 ShellExecute——模板写成一个本地
+    # 路径就会去"打开"那个文件。这不是提权路径（config_local.py 本来就是被
+    # exec 的），价值纯粹是把配置写错的后果限制成"按钮不可用"而不是"点一下
+    # 弹出个莫名其妙的程序"。
+    if not template.lower().startswith(("http://", "https://")):
+        print(f"   ⚠️  AI_ANALYSIS_WEB_URL_TEMPLATE 必须以 http:// 或 https:// 开头，"
+              f"「问更强的AI」已禁用: {template[:60]!r}")
+        return ""
+    # ☠️ 没有 {query} 时 .format() **不会报错**，原样返回模板——于是浏览器打开
+    # 一个空首页、用户刚才那句问题凭空消失，而且没有任何提示。必须显式挡住
+    if "{query}" not in template:
+        print(f"   ⚠️  AI_ANALYSIS_WEB_URL_TEMPLATE 里没有 {{query}} 占位符，"
+              f"问题会丢失，「问更强的AI」已禁用: {template[:60]!r}")
+        return ""
     try:
         return template.format(query=quote(prompt_text or "", safe=""))
     except (KeyError, IndexError, ValueError) as e:
@@ -318,6 +334,63 @@ _warm_model = None
 # （2026-08-02 实测：开机冷读 5.6GB 模型花了 33.8 秒，其间两句翻译被超时丢弃）
 _warm_done = Event()
 _warm_ok = False  # 预热是否真的成功（失败也要 set 事件，但不能当模型已热）
+
+
+class RemoteOllamaRefused(RuntimeError):
+    """OLLAMA_BASE_URL 指向本机之外，且用户没有显式声明这是有意的。"""
+
+
+def _assert_local_ollama(base_url):
+    """☠️ 拦住"把转录发到本机之外"的配置。返回 True 表示通过（给测试用）。
+
+    README 第一句就是「不向任何云端发送音频或文本」，但在这个函数之前，
+    真正保证这件事的只有 config.py 里那一行默认值——而 config_local.py 是被
+    `exec_module` 加载的，CLAUDE.md 第 2 节还明确鼓励让 AI 助手去写它。
+    一个手滑（或一段被投毒）的 OLLAMA_BASE_URL 就会把**系统全部声音的转录**
+    连同上下文一路 POST 到外网，而屏幕上和日志里不会有任何异样：翻译照常出
+    中文，用户完全无从察觉。这是本项目唯一一条能静默违反自身隐私承诺的路径。
+
+    所以这里是**硬失败**而不是警告——静默泄露比"字幕起不来"严重得多，而且
+    起不来是看得见的，能被修。真要连局域网里另一台机器的 Ollama（确实有人
+    这么用）：在 config_local.py 里写 `ALLOW_REMOTE_OLLAMA = True` 显式声明，
+    那就是知情同意，本函数直接放行。
+
+    ☠️ 必须在 `_spawn_startup_warm()` 之前调用——预热请求本身就打这个地址。
+    虽然预热的 prompt 是空的（不含转录内容），但"确认过是本机才发第一个包"
+    是更容易讲清楚的语义。
+
+    解析不出来时放行：那说明请求本来也发不出去，交给 __init__ 里的连通性
+    检查去报，在这里拦只会把"Ollama 没起来"升级成"程序起不来"。
+    """
+    if getattr(config, "ALLOW_REMOTE_OLLAMA", False):
+        return True
+    host = urlparse(base_url).hostname
+    if not host:
+        return True
+    try:
+        infos = socket.getaddrinfo(host, None, 0, socket.SOCK_STREAM)
+    except OSError:
+        return True
+    remote = set()
+    for info in infos:
+        # IPv6 可能带 %scope 后缀（fe80::1%eth0），ip_address 不认
+        addr = info[4][0].split("%")[0]
+        try:
+            if not ipaddress.ip_address(addr).is_loopback:
+                remote.add(addr)
+        except ValueError:
+            continue
+    if not remote:
+        return True
+    raise RemoteOllamaRefused(
+        f"OLLAMA_BASE_URL 指向本机之外的地址：{host} → {', '.join(sorted(remote))}。\n"
+        f"   本程序会把**识别出的全部原文**（抓的是系统全部声音，可能含语音通话）"
+        f"发到这个地址，\n"
+        f"   这与 README「不向任何云端发送音频或文本」的承诺冲突，因此拒绝启动。\n"
+        f"   → 正常情况：把 config_local.py 里的 OLLAMA_BASE_URL 改回 "
+        f"http://127.0.0.1:11434\n"
+        f"   → 确实想用另一台机器上的 Ollama：在 config_local.py 里加一行 "
+        f"ALLOW_REMOTE_OLLAMA = True")
 
 
 def _warn_if_ipv6_first_host(base_url):
@@ -432,8 +505,23 @@ def _ensure_ml_deps():
 class WhisperQueueTranslator:
     """local agreement 增量识别 + 异步 Ollama 翻译"""
 
+    # 上一条存档写在哪一天（跨天要重跑保留期清理，见 _save_transcript）。
+    # 放类属性而不是只在 __init__ 里赋值：单测习惯用 __new__ 造个壳只塞它关心的
+    # 几个字段，__init__ 中途失败时也一样是半成品——存档路径不该因此炸
+    _transcript_day = None
+    # 11434 后面确实是 Ollama 吗（见 _check_ollama_identity）。同样放类属性。
+    # 默认是"已验证、无需重验"，所以正常路径一次额外请求都不会发
+    _ollama_impostor = False         # 上次校验的结论是"有回应但不是 Ollama"
+    _ollama_recheck_pending = False  # 连接断过/启动时没验成，恢复后要重新确认
+    _ollama_verify_next = 0.0        # 下次允许重新校验的时刻（节流）
+
     def __init__(self):
         """初始化翻译器"""
+        # ☠️ 第一件事：确认翻译地址在本机。放在所有 print / 模型加载 / 预热
+        # 之前，是为了"一个包都还没发出去"就把不合规的配置挡下来。
+        # 抛出的异常由 app._load_models 接住，报错会持久显示在悬浮窗上
+        _assert_local_ollama(config.OLLAMA_BASE_URL)
+
         print("🔄 正在加载 Faster-Whisper 模型...")
         print(f"   模型: {config.WHISPER_MODEL}")
         print(f"   计算类型: {config.WHISPER_COMPUTE_TYPE}")
@@ -602,34 +690,24 @@ class WhisperQueueTranslator:
                     os.makedirs(self._transcript_dir, exist_ok=True)
                     print(f"📝 字幕记录已开启: {config.TRANSCRIPT_DIR}\\日期.txt")
                     self._prune_old_transcripts()
+                    # 记下"这次清理覆盖的是哪一天"，免得第一条字幕又白清一次
+                    self._transcript_day = time.strftime("%Y-%m-%d")
                 except OSError as e:
                     print(f"⚠️  字幕记录目录创建失败，记录功能关闭: {e}")
                     self._transcript_ok = False
 
             _warn_if_ipv6_first_host(config.OLLAMA_BASE_URL)
-            # 启动时检查Ollama是否可达（不可达只警告，不中断启动）。
-            # ☠️ 光看"没抛异常"不够：11434 没被 Ollama 占着时，本机任何进程都能
-            # 抢先 bind 它（_MAX_STREAM_CHARS 的注释里已经提过这个前提）。那样
-            # 我们会把**系统全部声音的转录**连同上下文一路 POST 给它，再把它
-            # 返回的任意文本当字幕上屏并写进 transcripts。校验一下响应体里确实
-            # 有 version 字段，成本一次 JSON 解析，能把"端口被别的东西占了"
-            # 和"Ollama 正常"区分开。
-            try:
-                resp = self.ollama_session.get(
-                    f"{config.OLLAMA_BASE_URL}/api/version", timeout=2)
-                version = ""
-                try:
-                    version = (resp.json() or {}).get("version", "")
-                except ValueError:
-                    pass
-                if version:
-                    print(f"✅ Ollama 连接正常 (v{version}, {config.OLLAMA_MODEL})")
-                else:
-                    print(f"⚠️  {config.OLLAMA_BASE_URL} 有回应，但它不像是 Ollama"
-                          f"（/api/version 没返回 version 字段）。")
-                    print(f"   这个端口可能被别的程序占了——本程序会把识别出的原文发到"
-                          f"这个地址，请先确认它确实是 Ollama。")
-            except requests.RequestException:
+            # 端口身份校验（不可达只警告，不中断启动）。详见 _check_ollama_identity
+            state, version = self._check_ollama_identity()
+            self._ollama_impostor = (state == "impostor")
+            if state == "ok":
+                print(f"✅ Ollama 连接正常 (v{version}, {config.OLLAMA_MODEL})")
+            elif state == "impostor":
+                self._warn_ollama_impostor()
+            else:
+                # 现在没验成（Ollama 还没起来）：等它起来之后、第一次真要发
+                # 转录之前补验一次，别在"没验过"的状态下把原文发出去
+                self._ollama_recheck_pending = True
                 print(f"⚠️  无法连接 Ollama ({config.OLLAMA_BASE_URL})，字幕将只显示德语原文")
                 print(f"   请确认 Ollama 已启动: ollama serve")
 
@@ -666,7 +744,16 @@ class WhisperQueueTranslator:
         （_save_transcript 的格式），而 mtime 会被同步网盘/备份工具刷新。
         认不出日期的文件一律不碰（可能是用户自己放进去的）。
         """
-        days = int(getattr(config, "TRANSCRIPT_KEEP_DAYS", 0) or 0)
+        # ☠️ 配置值必须容错。这个函数现在也从 _save_transcript 的跨天分支调，
+        # 而那条路径在 _translation_worker 里、外面没有 try——config_local.py
+        # 里写成 TRANSCRIPT_KEEP_DAYS = "30" 之类的话，一个 ValueError 就会把
+        # 整个翻译 worker 打断（句对不上屏），症状和"配置写错"毫无关联
+        try:
+            days = int(getattr(config, "TRANSCRIPT_KEEP_DAYS", 0) or 0)
+        except (TypeError, ValueError):
+            print("⚠️  TRANSCRIPT_KEEP_DAYS 不是整数，本次不清理存档"
+                  f"（当前值 {getattr(config, 'TRANSCRIPT_KEEP_DAYS', None)!r}）")
+            return
         if days <= 0:
             return
         cutoff = time.time() - days * 86400
@@ -699,11 +786,22 @@ class WhisperQueueTranslator:
 
         translation 为空 = 这句没翻出来（Ollama 挂了/熔断中）。原文照写，
         只是不留那行空的译文——回看时能看出"这句当时没有中文"，而不是整句消失。
+
+        ☠️ 跨天时要再跑一次 _prune_old_transcripts。以前它只在 __init__ 里调
+        一次，而字幕程序的典型用法是**开机挂着不关**——也就是说设了
+        TRANSCRIPT_KEEP_DAYS 的用户，只要不重启就永远不会真的清理，配置看着
+        生效实际没生效。这是隐私措施不是省磁盘（存档是明文、抓的是系统全部
+        声音），"以为在删其实没删"比不提供这个选项更糟。
+        本函数只在 _tx_executor 这一个线程里被调，_transcript_day 不用加锁。
         """
         if not self._transcript_ok:
             return
         try:
-            path = os.path.join(self._transcript_dir, time.strftime("%Y-%m-%d") + ".txt")
+            day = time.strftime("%Y-%m-%d")
+            if day != self._transcript_day:
+                self._transcript_day = day
+                self._prune_old_transcripts()
+            path = os.path.join(self._transcript_dir, day + ".txt")
             with open(path, "a", encoding="utf-8") as f:
                 f.write(f"[{time.strftime('%H:%M:%S')}] {source_text}\n")
                 if translation:
@@ -848,6 +946,70 @@ class WhisperQueueTranslator:
             print(f"⛔ 翻译连续失败，暂停请求 {secs} 秒（期间只显示德语原文）")
             if self.on_status:
                 self.on_status(f"⛔ 翻译服务无响应，暂停 {secs} 秒后自动重试（先只显德语）")
+
+    # ------------------------------------------------------------------
+    # Ollama 端口身份校验
+    # ------------------------------------------------------------------
+    def _check_ollama_identity(self, timeout=2):
+        """11434 后面到底是不是 Ollama。返回 (状态, version)。
+
+        状态取值 'ok' / 'impostor' / 'unreachable'。
+
+        ☠️ 光看"请求没抛异常"不够：11434 没被 Ollama 占着时，本机任何进程都能
+        抢先 bind 它。那样我们会把**系统全部声音的转录**连同上下文一路 POST
+        给它，再把它返回的任意文本当字幕上屏并写进 transcripts。校验响应体里
+        确实有 version 字段，成本一次 JSON 解析，就能把两者分开。
+        """
+        try:
+            resp = self.ollama_session.get(
+                f"{config.OLLAMA_BASE_URL}/api/version", timeout=timeout)
+        except requests.RequestException:
+            return "unreachable", ""
+        try:
+            version = (resp.json() or {}).get("version", "")
+        except ValueError:
+            version = ""
+        return ("ok", version) if version else ("impostor", "")
+
+    def _warn_ollama_impostor(self):
+        print(f"🚨 {config.OLLAMA_BASE_URL} 有回应，但它不像是 Ollama"
+              f"（/api/version 没返回 version 字段）。")
+        print(f"   这个端口可能被别的程序占了。本程序会把识别出的原文发到这个地址，"
+              f"在确认它确实是 Ollama 之前，翻译已暂停（只显示原文）。")
+        if self.on_status:
+            self.on_status("🚨 11434 端口上的程序不像 Ollama，已暂停翻译（只显原文）")
+
+    def _ollama_identity_ok(self):
+        """发翻译请求前的门禁。返回 False 表示这一句不要发出去。
+
+        ☠️ 启动时校验一次是不够的：Ollama 是独立安装的服务、会自动更新并重启
+        （CLAUDE.md 第 4 节第 6 条自己记着这事），重启的窗口期里端口是空的，
+        任何本机进程都能补位。而此后每一句字幕仍会无条件发过去。
+
+        但重验只在**真的需要**时做——启动验过且此后没断过连的话，这里是一次
+        属性判断、零请求。触发重验的只有两种情况：启动时没验成（Ollama 当时
+        还没起来），以及此后发生过 ConnectionError（我们验证过的那个服务可能
+        已经不在了）。
+
+        判据只拦 impostor，**不拦 unreachable**：连不上的话请求本来就会失败，
+        由现有的 ConnectionError 路径去报（还带 60 秒节流的屏幕提示），在这里
+        拦只会把"Ollama 没起来"升级成"字幕永远没有中文"。
+        校验本身有 30 秒节流，Ollama 长时间不在时不会每句都多付一次 2 秒 GET。
+        """
+        if not (self._ollama_impostor or self._ollama_recheck_pending):
+            return True
+        now = time.time()
+        if now < self._ollama_verify_next:
+            return not self._ollama_impostor  # 节流期内沿用上次结论
+        self._ollama_verify_next = now + 30
+        state, _version = self._check_ollama_identity()
+        if state != "unreachable":
+            self._ollama_recheck_pending = False  # 有明确结论了
+        was_impostor = self._ollama_impostor
+        self._ollama_impostor = (state == "impostor")
+        if self._ollama_impostor and not was_impostor:
+            self._warn_ollama_impostor()
+        return not self._ollama_impostor
 
     def _await_model_ready(self):
         """首句翻译前等后台预热落地（有界）。
@@ -1505,6 +1667,10 @@ class WhisperQueueTranslator:
             if self._circuit_open():
                 return sentence
 
+            # 确认端口后面确实是 Ollama 才把转录发出去（见 _ollama_identity_ok）
+            if not self._ollama_identity_ok():
+                return sentence
+
             # 模型还没进显存时先等后台预热落地，并改用长超时
             self._await_model_ready()
             if self.closing:
@@ -1622,7 +1788,11 @@ class WhisperQueueTranslator:
 
         except requests.ConnectionError as e:
             # Ollama没在运行——屏幕上给用户明确提示（60秒节流），
-            # 否则只是默默全德语，用户不知道发生了什么
+            # 否则只是默默全德语，用户不知道发生了什么。
+            # ☠️ 顺带作废端口身份校验：连接断过就说明我们验证过的那个服务可能
+            # 已经不在了（Ollama 自动更新会重启），恢复之后必须重新确认一次
+            # 端口后面还是它，而不是趁虚而入的别的进程
+            self._ollama_recheck_pending = True
             print(f"   ⚠️  翻译失败: {e}，显示德语原文")
             if self.on_status and time.time() - self._ollama_down_notified > 60:
                 self._ollama_down_notified = time.time()

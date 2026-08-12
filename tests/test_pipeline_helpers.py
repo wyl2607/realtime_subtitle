@@ -764,6 +764,10 @@ def _translator_for_tx(**overrides):
     t._asr_backlog_n = 0
     t._asr_busy = False
     t._tx_slow_until = 0.0
+    # 端口身份校验：ConnectionError 会把 _ollama_recheck_pending 置真，此后
+    # _ollama_identity_ok 会真去 GET /api/version——各用例的假 session 只实现了
+    # post，所以这里统一打桩成"已确认是 Ollama"。要测门禁本身的用例自己覆盖它
+    t._check_ollama_identity = lambda timeout=2: ("ok", "test")
     t.on_status = None
     for k, v in overrides.items():
         setattr(t, k, v)
@@ -1630,3 +1634,161 @@ def test_prune_old_transcripts_respects_keep_days(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "TRANSCRIPT_KEEP_DAYS", 0, raising=False)
     t._prune_old_transcripts()
     assert {p.name for p in tmp_path.iterdir()} == names
+
+
+# ======================================================================
+# 2026-08-12 审计修复的回归用例
+# ======================================================================
+
+
+def _fake_getaddrinfo(*addrs):
+    """造一份 socket.getaddrinfo 的返回：只有 sockaddr[0] 会被读到。"""
+    return lambda *a, **kw: [(0, 0, 0, "", (addr, 0)) for addr in addrs]
+
+
+def test_local_ollama_accepts_loopback(monkeypatch):
+    import socket
+    from realtime_subtitle.translate import translator_queue as tq
+
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_getaddrinfo("127.0.0.1"))
+    assert tq._assert_local_ollama("http://127.0.0.1:11434") is True
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_getaddrinfo("::1", "127.0.0.1"))
+    assert tq._assert_local_ollama("http://localhost:11434") is True
+
+
+def test_local_ollama_refuses_remote_host(monkeypatch):
+    """☠️ 这条盯的是全项目唯一一条能静默违反隐私承诺的路径。
+
+    README 第一句是「不向任何云端发送音频或文本」，而 OLLAMA_BASE_URL 收的是
+    **系统全部声音的转录**（可能含语音通话）。config_local.py 是被 exec 的、
+    CLAUDE.md 第 2 节还鼓励 AI 助手去写它——所以这里必须是硬失败，不能是警告：
+    改错一个字的后果是转录静默出网，而屏幕上和日志里看不出任何异常。
+    """
+    import socket
+    from realtime_subtitle.translate import translator_queue as tq
+
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_getaddrinfo("203.0.113.7"))
+    with pytest.raises(tq.RemoteOllamaRefused):
+        tq._assert_local_ollama("http://ollama.example.com:11434")
+
+    # 环回 + 外网混在一起也要拦（DNS 返回多条时不能只看第一条）
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_getaddrinfo("127.0.0.1", "10.0.0.5"))
+    with pytest.raises(tq.RemoteOllamaRefused):
+        tq._assert_local_ollama("http://ollama.lan:11434")
+
+
+def test_local_ollama_opt_in_allows_remote(monkeypatch):
+    """确实要用另一台机器的 Ollama：显式声明即放行（知情同意）。"""
+    import socket
+    from realtime_subtitle.translate import translator_queue as tq
+
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_getaddrinfo("203.0.113.7"))
+    monkeypatch.setattr(config, "ALLOW_REMOTE_OLLAMA", True, raising=False)
+    assert tq._assert_local_ollama("http://ollama.example.com:11434") is True
+
+
+def test_local_ollama_unresolvable_does_not_block_startup(monkeypatch):
+    """解析不了就放行：请求本来也发不出去，交给连通性检查报。
+    在这里拦只会把"Ollama 没起来"升级成"程序起不来"。"""
+    import socket
+    from realtime_subtitle.translate import translator_queue as tq
+
+    def _boom(*a, **kw):
+        raise socket.gaierror("no such host")
+
+    monkeypatch.setattr(socket, "getaddrinfo", _boom)
+    assert tq._assert_local_ollama("http://nope.invalid:11434") is True
+
+
+def test_ai_web_url_requires_query_placeholder(monkeypatch):
+    """模板里没有 {query} 时 .format() 不报错、原样返回——于是浏览器打开一个
+    空首页，用户刚才那句问题凭空消失，而且没有任何提示。必须显式挡住。"""
+    from realtime_subtitle.translate.translator_queue import build_ai_web_url
+
+    monkeypatch.setattr(config, "AI_ANALYSIS_WEB_URL_TEMPLATE",
+                        "https://grok.com/", raising=False)
+    assert build_ai_web_url("问题") == ""
+
+
+def test_ai_web_url_requires_http_scheme(monkeypatch):
+    """webbrowser.open 在 Windows 上对"不像 URL"的字符串会退化成 os.startfile
+    （= ShellExecute）。把配置写错的后果限制成"按钮不可用"。"""
+    from realtime_subtitle.translate.translator_queue import build_ai_web_url
+
+    for bad in ("file:///C:/Windows/system32/calc.exe?{query}",
+                r"C:\Windows\system32\calc.exe {query}",
+                "grok.com/?q={query}"):
+        monkeypatch.setattr(config, "AI_ANALYSIS_WEB_URL_TEMPLATE", bad, raising=False)
+        assert build_ai_web_url("问题") == "", bad
+
+
+def test_ai_web_url_still_builds_normal_template(monkeypatch):
+    from realtime_subtitle.translate.translator_queue import build_ai_web_url
+
+    monkeypatch.setattr(config, "AI_ANALYSIS_WEB_URL_TEMPLATE",
+                        "https://grok.com/?q={query}", raising=False)
+    url = build_ai_web_url("a b&c")
+    assert url == "https://grok.com/?q=a%20b%26c"
+
+
+def test_ollama_identity_blocks_impostor_but_not_downtime(monkeypatch):
+    """端口身份校验：只拦"有回应但不是 Ollama"，不拦"连不上"。
+
+    Ollama 会自动更新并重启（CLAUDE.md 第 4 节第 6 条），重启窗口期里 11434
+    是空的、本机任何进程都能补位——启动时查一次不够。但连不上时必须放行，
+    否则"Ollama 没起来"会变成"字幕永远没有中文"（现有的 ConnectionError
+    路径才是报这件事的地方，还带 60 秒节流的屏幕提示）。
+    """
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
+
+    def _make(state):
+        t = object.__new__(WhisperQueueTranslator)
+        t.on_status = None
+        t._ollama_recheck_pending = True   # 断过连，需要重验
+        t._check_ollama_identity = lambda timeout=2: (state, "")
+        return t
+
+    impostor = _make("impostor")
+    assert impostor._ollama_identity_ok() is False
+    assert impostor._ollama_identity_ok() is False, "节流期内也要保持拦住"
+
+    down = _make("unreachable")
+    assert down._ollama_identity_ok() is True, "连不上不该拦，交给 ConnectionError 路径"
+    assert down._ollama_recheck_pending is True, "还没有明确结论，下次还要再验"
+
+    good = _make("ok")
+    assert good._ollama_identity_ok() is True
+    assert good._ollama_recheck_pending is False, "验过了就不该再多花一次请求"
+
+
+def test_ollama_identity_costs_nothing_on_the_normal_path():
+    """启动时验过、此后没断过连 = 一次属性判断，零请求。
+
+    这条盯的是"别为了安全检查给每句字幕都加一次 2 秒 GET"——假 session 上
+    连 .get 都没有，一旦有人把门禁改成无条件重验，这里就会 AttributeError。
+    """
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
+
+    t = object.__new__(WhisperQueueTranslator)
+    t.on_status = None
+    assert t._ollama_identity_ok() is True
+
+
+def test_save_transcript_prunes_on_day_rollover(tmp_path, monkeypatch):
+    """保留期以前只在 __init__ 里跑一次，而字幕程序的典型用法是开机挂着不关
+    ——也就是说设了 TRANSCRIPT_KEEP_DAYS 的用户只要不重启就永远不会真的清理。
+    """
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
+
+    t = object.__new__(WhisperQueueTranslator)
+    t._transcript_ok = True
+    t._transcript_dir = str(tmp_path)
+    t._transcript_day = "2026-08-11"  # 假装上一条是昨天写的
+
+    calls = []
+    t._prune_old_transcripts = lambda: calls.append(1)
+
+    t._save_transcript("Hallo.", "你好")
+    assert calls == [1], "跨天时必须重跑一次保留期清理"
+    t._save_transcript("Noch was.", "还有")
+    assert calls == [1], "同一天内不该反复清理"
