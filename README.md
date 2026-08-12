@@ -4,6 +4,12 @@
 
 No audio or transcript is sent to the cloud. Recognition and translation run on your machine.
 
+> **This is enforced, not just documented.** At startup the app resolves
+> `OLLAMA_BASE_URL` and refuses to run unless every resolved address is a loopback
+> address — otherwise one typo in `config_local.py` would silently ship your transcripts
+> off the machine while subtitles kept working normally. To use an Ollama on another
+> machine, set `ALLOW_REMOTE_OLLAMA = True` in `config_local.py`.
+
 > **One exception, and only if you click it:** the `🌐 Ask a stronger AI` button in the
 > popups opens your system browser with a question built from the last few minutes of
 > recognized source text (≤300 chars), sent to a web AI (grok.com by default,

@@ -4,6 +4,13 @@
 
 Erkennung und Übersetzung laufen offline; Audio und Transkripte verlassen den Rechner nicht.
 
+> **Das wird durchgesetzt, nicht nur auf dem Papier.** Beim Start löst das Programm
+> `OLLAMA_BASE_URL` auf und bricht den Start ab, wenn nicht alle aufgelösten Adressen
+> Loopback-Adressen sind — sonst würde schon ein Tippfehler in `config_local.py` dazu
+> führen, dass deine Transkripte unbemerkt den Rechner verlassen, während die Untertitel
+> ganz normal weiterlaufen. Für Ollama auf einem anderen Rechner:
+> `ALLOW_REMOTE_OLLAMA = True` in `config_local.py` setzen.
+
 > **Eine Ausnahme, und nur wenn du sie anklickst:** Der Button `🌐 Stärkere KI fragen`
 > öffnet den Systembrowser mit einer Frage aus den letzten Minuten des erkannten Textes
 > (≤300 Zeichen) an eine Web-KI (standardmäßig grok.com,
