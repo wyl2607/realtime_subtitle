@@ -10,10 +10,10 @@
 版本规则见 CLAUDE.md 第 3 节「版本号怎么改」。
 """
 
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 
 # 这一版的代号/日期，只用于展示（打 tag 时顺手更新）
-__version_date__ = "2026-08-12"
+__version_date__ = "2026-08-13"
 
 
 def version_string():
