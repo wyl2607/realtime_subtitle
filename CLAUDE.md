@@ -465,6 +465,13 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     wheel 矩阵，再叠加 CPU 档要滤掉 `nvidia-*` 行，hash 校验会碎。放弃，
     理由写在 `requirements.txt` 文件头。
 
+    **这件事现在有 CI 守卫**：`deps-resolve` job 拿 `pip install --dry-run
+    --python-version X --platform win_amd64` 在 3.10/3.11/3.12/3.13 上各解析
+    一遍 `requirements.txt`，任一失败就红。它存在的理由是——出事的时候 CI
+    是**全绿**的：另外几个 job 装的都是自己写死的 `numpy>=1.24,<3` 之类，
+    从来没有任何一个 job 装过 `requirements.txt` 本身。改依赖钉法时先在本地
+    跑一遍那段循环，别等 PR 变红。
+
 ## 5. 目录地图
 
 ```

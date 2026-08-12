@@ -4,6 +4,10 @@
 # cp 标签分；numpy 2.5+ 连 3.10 轮子都没有），再叠加 install.ps1 的 CPU
 # 档要滤掉 nvidia-* 行，hash 校验会碎。区间钉 + 上限已经是这个支持矩阵
 # 下能做的。
+#
+# ☠️ 本文件的**可解析性**由 CI 的 deps-resolve job 盯着：它在 3.10/3.11/
+# 3.12/3.13 上各 dry-run 解析一遍。改任何一行的钉法之前，先想清楚最低那档
+# Python 上有没有轮子——numpy 那条注释就是踩过之后写的。
 faster-whisper>=1.2.1,<2.0.0   # Whisper 语音识别
 ctranslate2>=4.8.1,<5.0.0      # RTX 50系(Blackwell/sm_120)最低要 4.6.2：旧版int8路径
                                # 直接CUBLAS_STATUS_NOT_SUPPORTED崩溃，4.6.2起自动禁用。

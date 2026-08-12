@@ -11,9 +11,10 @@ permissions:
   contents: read
 
 # Coverage map (see issue #23):
-# - lint:    ruff（E9 + F，规则集为什么这么窄见 ruff.toml）
-# - ubuntu:  pure pipeline helpers (no torch/PyQt/WASAPI)
-# - windows: full pytest suite except standalone GUI harness scripts
+# - lint:          ruff（E9 + F，规则集为什么这么窄见 ruff.toml）
+# - deps-resolve:  requirements.txt 在 3.10–3.13 上都解得出来（见第 4 节第 30 条）
+# - ubuntu:        pure pipeline helpers (no torch/PyQt/WASAPI)
+# - windows:       full pytest suite except standalone GUI harness scripts
 #   (those open real windows and sys.exit; still manual / optional)
 
 jobs:
@@ -38,6 +39,46 @@ jobs:
       - name: ruff check
         # --output-format github 让告警直接标在 PR 的对应行上
         run: ruff check --output-format github .
+
+  # requirements.txt 必须在**所有声明支持的 Python** 上解得出来。
+  #
+  # ☠️ 这个 job 是 2026-08-12 那次 numpy 事故的直接产物（第 4 节第 30 条）：
+  # requirements.txt 当时写着 numpy>=2.5.1，而 numpy 2.5 起 requires_python>=3.12、
+  # 没有 cp310 轮子——3.10/3.11 的用户走到"装依赖"那步直接失败。而 CI 全绿。
+  # 原因是另外两个 job 装的都是自己写死的 "numpy>=1.24,<3" 之类，**从来没有
+  # 任何一个 job 装过 requirements.txt 本身**。dependabot 每周都会提抬下限的
+  # PR，没有这道守卫它随时会再来一次。
+  #
+  # --dry-run 只拉 metadata、不下载 wheel（整个 job 十几秒）。
+  # --platform win_amd64 是因为本项目只支持 Windows：pyaudiowpatch 根本没有
+  # linux 轮子，在 ubuntu 上按本机平台解会假失败。
+  # 用 3.13 的解释器 + --python-version 逐个目标解析，比起 4 份 setup-python
+  # 更省事，而且 --platform 本来就要求 --only-binary + --target。
+  deps-resolve:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
+        with:
+          python-version: "3.13"
+      - name: Resolve requirements.txt for every supported Python
+        run: |
+          python -m pip install --upgrade pip
+          failed=0
+          for v in 3.10 3.11 3.12 3.13; do
+            echo "::group::python $v"
+            if pip install --dry-run --ignore-installed \
+                 --python-version "$v" --platform win_amd64 \
+                 --only-binary=:all: --target /tmp/resolve-$v \
+                 -r requirements.txt; then
+              echo "OK   python $v"
+            else
+              echo "::error::requirements.txt 在 Python $v 上解析失败（README/CLAUDE.md 声称支持 3.10-3.13）"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $failed
 
   pipeline-helpers-ubuntu:
     runs-on: ubuntu-latest
