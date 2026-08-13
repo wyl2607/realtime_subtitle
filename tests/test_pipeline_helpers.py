@@ -2178,3 +2178,59 @@ def test_chinese_blacklist_spares_real_speech_about_subscriptions():
         assert not asr._is_hallucination("他每个月都要交一笔订阅费。")
         assert not asr._is_hallucination("片尾会请观众订阅频道。")
         assert not asr._is_hallucination("谢谢观看。")
+def test_shutdown_does_not_hang_on_stuck_translation(monkeypatch):
+    """☠️ 翻译池以前是 `shutdown(wait=True)` 无界关的。
+
+    `_await_model_ready` 分片轮询了 closing、流式循环里也查 closing，但两者
+    之间的 `ollama_session.post()` 在首个数据块到达之前是纯阻塞的，上界是
+    _translate_timeout() 选出来的读超时——GPU 忙时那是 OLLAMA_TIMEOUT_COLD
+    （90 秒）。于是"翻译正等首 token 时点❌"会把 shutdown 挂到 90 秒，而
+    stop_subtitles.ps1 只给 5 秒宽限、到点强杀，强杀掉的正是排在后面的
+    _save_lookup_cache() 和 _unload_our_models()。
+    """
+    import threading
+    import time as _time
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
+
+    t = WhisperQueueTranslator.__new__(WhisperQueueTranslator)
+    t.closing = False
+    stuck = threading.Event()  # 永远不置位 = 模拟卡在 post() 里的 worker
+
+    class _StuckExecutor:
+        def shutdown(self, wait=True, cancel_futures=False):
+            stuck.wait()  # 无界阻塞
+
+    class _FastExecutor:
+        def __init__(self):
+            self.closed = False
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            self.closed = True
+
+    t._asr_executor = _FastExecutor()
+    t._tx_executor = _StuckExecutor()
+    t._lookup_executor = _FastExecutor()
+    t._analysis_executor = _FastExecutor()
+
+    unloaded = []
+    monkeypatch.setattr(t, "_save_lookup_cache", lambda: unloaded.append("cache"),
+                        raising=False)
+    monkeypatch.setattr(t, "_unload_our_models", lambda: unloaded.append("models"),
+                        raising=False)
+
+    class _Sess:
+        def close(self):
+            pass
+
+    t.ollama_session = t.lookup_session = t.analysis_session = _Sess()
+
+    t0 = _time.time()
+    try:
+        t.shutdown()
+        elapsed = _time.time() - t0
+        # 排干预算是 3 秒，留一点余量给慢机器
+        assert elapsed < 8, f"shutdown 被卡住的翻译挂了 {elapsed:.1f} 秒"
+        # 关键：卸显存和存缓存这两步必须照常跑到
+        assert unloaded == ["cache", "models"], unloaded
+    finally:
+        stuck.set()

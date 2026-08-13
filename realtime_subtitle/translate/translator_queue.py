@@ -1858,16 +1858,31 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
         # （窗口在关、transcript也差不了几句），翻完再退纯属浪费退出时间。
         # 在飞的那一个任务照常等完：ASR最坏~2.5秒（GPU被抢时），流式翻译
         # 循环里查closing、一个数据块(~0.1秒)内就break出来
+        # ASR 先关，且这一个**必须**无界等：它一停就不会再往翻译队列塞句子，
+        # 而在飞的那一轮识别最坏 ~2.5 秒（GPU 被抢时），有明确上界
         self._asr_executor.shutdown(wait=True, cancel_futures=True)
-        self._tx_executor.shutdown(wait=True, cancel_futures=True)
         # ☠️ 查词请求也带 keep_alive="2h"：在飞的那一个如果在
         # _unload_our_models **之后**才落地，会把刚卸掉的模型重新拉回显存
         # 留驻两小时（和 2026-07-20 修的预热线程竞态同类，当时只处理了预热）。
         # 有界等待：正常查词 1-2 秒就回来；卡住的话最多等 3 秒放弃继续退出
         # （宁可漏卸一次也不拖住退出——stop 脚本还有 HTTP 卸载兜底）
-        # AI 分析走的是另一个池（同样带 keep_alive="2h"），一起有界排干
+        # AI 分析走的是另一个池（同样带 keep_alive="2h"），一起有界排干。
+        #
+        # ☠️ **翻译池也必须在这一组里**，它以前是和 ASR 一样 wait=True 无界关的。
+        # `_await_model_ready` 分片轮询了 closing、流式响应循环里也查 closing，
+        # 看着两头都堵住了——但**两者之间那个 `ollama_session.post()` 在首个
+        # 数据块到达之前是纯阻塞的**，上界是 `_translate_timeout()` 选出来的读
+        # 超时，而 GPU 正忙于识别时它返回的是 OLLAMA_TIMEOUT_COLD（默认 90 秒）。
+        # 于是"某一句正在等首 token 时点 ❌"会把 shutdown 挂到 90 秒，而
+        # stop_subtitles.ps1 只给 5 秒宽限、到点强杀——强杀掉的正是下面的
+        # `_save_lookup_cache()` 和 `_unload_our_models()`：查词缓存整份丢失、
+        # 5.6GB 显存按 keep_alive="2h" 白占两小时。也就是 CLAUDE.md 第 4 节
+        # 第 28 条刚修好的那个后果，从另一个方向复活了。
+        # 这三个池的取舍完全一样（宁可漏卸一次也不拖住退出），写法就该一样；
+        # 之前只有翻译池是无界的，这个不一致本身就是漏改的证据。
         drains = []
-        for executor, name in ((self._lookup_executor, "LookupDrain"),
+        for executor, name in ((self._tx_executor, "TranslateDrain"),
+                               (self._lookup_executor, "LookupDrain"),
                                (self._analysis_executor, "AnalysisDrain")):
             t = Thread(
                 target=executor.shutdown,
