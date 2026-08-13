@@ -19,7 +19,7 @@ import time
 import re
 import socket
 import ipaddress
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 from threading import Event, Lock, Thread
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque, OrderedDict
@@ -198,6 +198,18 @@ def _pending_too_long(text, lang=None):
     return len(text.split()) > config.MAX_PENDING_WORDS
 
 
+def _batch_max_chars(lang=None):
+    """一次翻译请求最多合并多少字符（TRANSLATE_BATCH_MAX_CHARS 的入口）。
+
+    ☠️ 字符不是等价单位：300 个汉字的信息量约等于 750 个德语字符，拿德语的
+    上限去量中文，等于每次请求塞进 2.5 倍的内容——生成 token 数、单次延迟、
+    跑进复读的概率跟着一起涨，而这三样正是这个上限要压住的东西。
+    """
+    if _no_space_language(lang):
+        return getattr(config, "TRANSLATE_BATCH_MAX_CHARS_CJK", 120)
+    return getattr(config, "TRANSLATE_BATCH_MAX_CHARS", 300)
+
+
 def _draft_too_short(text, lang=None):
     """残句短到不值得出草稿吗（DRAFT_MIN_WORDS 的入口）。
 
@@ -356,6 +368,45 @@ class RemoteOllamaRefused(RuntimeError):
     """OLLAMA_BASE_URL 指向本机之外，且用户没有显式声明这是有意的。"""
 
 
+# ☠️ 校验通过后钉住的地址（主机名已换成解析出来的环回 IP 字面量）。
+# 见 _assert_local_ollama 末尾那段"为什么必须钉"。None = 还没校验过/
+# 用户显式声明了 ALLOW_REMOTE_OLLAMA，两种情况都退回现读 config。
+_pinned_ollama_url = None
+
+
+def ollama_url():
+    """所有打 Ollama 的请求都走这里，不要直接读 config.OLLAMA_BASE_URL。
+
+    ☠️ 两个理由，缺一不可：
+
+    1) **防 TOCTOU**。_assert_local_ollama 只在启动时解析一次主机名，可
+       requests 是**每个请求都重新解析**的。配置里写主机名时，启动那一刻解析
+       到 127.0.0.1、十分钟后 DNS 记录（或 hosts 文件）改指向外网，转录就
+       静默出去了——而那道校验是本项目唯一挡住"违反自身隐私承诺"的闸门，
+       只在启动时关一次等于形同虚设。钉成 IP 字面量之后 DNS 再也搬不动它。
+    2) 顺带把 localhost 的 **2 秒 IPv6 税**真正修掉，而不只是警告一句。
+       以前 _warn_if_ipv6_first_host 只能提示用户自己去改 config；现在
+       localhost 会被直接钉成 127.0.0.1，配置写错的人不用再付那笔税。
+       （避坑清单第 4 节第 22 条量过：翻译 p50 2.88 秒 → 0.60 秒。）
+    """
+    return _pinned_ollama_url or config.OLLAMA_BASE_URL
+
+
+def _pin_url_to_address(base_url, addr):
+    """把 base_url 里的主机名换成 addr 这个 IP 字面量，其余部分原样保留。
+
+    IPv6 字面量在 URL 里必须带方括号（[::1]:11434），否则 urlunparse 拼出来
+    的地址 requests 会解析错。
+    """
+    parsed = urlparse(base_url)
+    host = f"[{addr}]" if ":" in addr else addr
+    netloc = f"{host}:{parsed.port}" if parsed.port else host
+    if parsed.username:
+        cred = parsed.username + (f":{parsed.password}" if parsed.password else "")
+        netloc = f"{cred}@{netloc}"
+    return urlunparse(parsed._replace(netloc=netloc))
+
+
 def _assert_local_ollama(base_url):
     """☠️ 拦住"把转录发到本机之外"的配置。返回 True 表示通过（给测试用）。
 
@@ -377,8 +428,19 @@ def _assert_local_ollama(base_url):
 
     解析不出来时放行：那说明请求本来也发不出去，交给 __init__ 里的连通性
     检查去报，在这里拦只会把"Ollama 没起来"升级成"程序起不来"。
+
+    ☠️ **校验通过之后必须把地址钉成 IP 字面量**（写进 _pinned_ollama_url，
+    此后所有请求走 ollama_url()）。只校验不钉的话这道闸门只在启动那一刻关了
+    一次：requests 每个请求都会重新解析主机名，配置里写主机名时，DNS 记录
+    （或 hosts 文件）中途改指向外网就能让转录静默出去，而屏幕上和日志里
+    照样没有任何异样。钉成 IP 之后 DNS 再也搬不动它。顺带把 localhost 的
+    2 秒 IPv6 税也真正修掉了（第 4 节第 22 条）。
     """
+    global _pinned_ollama_url
     if getattr(config, "ALLOW_REMOTE_OLLAMA", False):
+        # 用户显式声明要连别的机器：不钉。那种场景下主机名可能本来就指望
+        # DNS 做故障转移，钉死反而是错的——隐私取舍已经由用户自己承担了
+        _pinned_ollama_url = None
         return True
     host = urlparse(base_url).hostname
     if not host:
@@ -388,15 +450,30 @@ def _assert_local_ollama(base_url):
     except OSError:
         return True
     remote = set()
+    loopback = []
     for info in infos:
         # IPv6 可能带 %scope 后缀（fe80::1%eth0），ip_address 不认
         addr = info[4][0].split("%")[0]
         try:
-            if not ipaddress.ip_address(addr).is_loopback:
+            if ipaddress.ip_address(addr).is_loopback:
+                loopback.append((info[0], addr))
+            else:
                 remote.add(addr)
         except ValueError:
             continue
     if not remote:
+        # 全是环回地址 → 钉住。优先 IPv4：Ollama 只监听 127.0.0.1:11434
+        # （第 4 节第 22 条实测过没有 IPv6 监听），钉到 ::1 上等于每个请求
+        # 白付那 2 秒再回退
+        pick = next((a for fam, a in loopback if fam == socket.AF_INET), None)
+        pick = pick or (loopback[0][1] if loopback else None)
+        if pick:
+            _pinned_ollama_url = _pin_url_to_address(base_url, pick)
+            if _pinned_ollama_url != base_url:
+                print(f"🔒 Ollama 地址已钉为 {_pinned_ollama_url}"
+                      f"（原配置是主机名 {host}）")
+                print(f"   钉住是为了防 DNS 中途改指向把转录送出本机，"
+                      f"顺带免掉 IPv6 环回那 2 秒")
         return True
     raise RemoteOllamaRefused(
         f"OLLAMA_BASE_URL 指向本机之外的地址：{host} → {', '.join(sorted(remote))}。\n"
@@ -460,7 +537,7 @@ def _startup_warm_ollama(model=None):
     try:
         t0 = time.time()
         requests.post(
-            f"{config.OLLAMA_BASE_URL}/api/generate",
+            f"{ollama_url()}/api/generate",
             json={"model": model, "prompt": "", "keep_alive": "2h"},
             timeout=120,  # 冷加载可能要十几秒，网络栈慢时再宽些
         ).close()
@@ -724,7 +801,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
                     print(f"⚠️  字幕记录目录创建失败，记录功能关闭: {e}")
                     self._transcript_ok = False
 
-            _warn_if_ipv6_first_host(config.OLLAMA_BASE_URL)
+            _warn_if_ipv6_first_host(ollama_url())
             # 端口身份校验（不可达只警告，不中断启动）。详见 _check_ollama_identity
             state, version = self._check_ollama_identity()
             self._ollama_impostor = (state == "impostor")
@@ -736,7 +813,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
                 # 现在没验成（Ollama 还没起来）：等它起来之后、第一次真要发
                 # 转录之前补验一次，别在"没验过"的状态下把原文发出去
                 self._ollama_recheck_pending = True
-                print(f"⚠️  无法连接 Ollama ({config.OLLAMA_BASE_URL})，字幕将只显示德语原文")
+                print(f"⚠️  无法连接 Ollama ({ollama_url()})，字幕将只显示德语原文")
                 print(f"   请确认 Ollama 已启动: ollama serve")
 
             # ☠️ 和启动预热对账：窗口是秒开的，⚙️面板在 Whisper 加载的这十几秒
@@ -928,7 +1005,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
         """
         try:
             resp = self.ollama_session.get(
-                f"{config.OLLAMA_BASE_URL}/api/version", timeout=timeout)
+                f"{ollama_url()}/api/version", timeout=timeout)
         except requests.RequestException:
             return "unreachable", ""
         try:
@@ -938,7 +1015,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
         return ("ok", version) if version else ("impostor", "")
 
     def _warn_ollama_impostor(self):
-        print(f"🚨 {config.OLLAMA_BASE_URL} 有回应，但它不像是 Ollama"
+        print(f"🚨 {ollama_url()} 有回应，但它不像是 Ollama"
               f"（/api/version 没返回 version 字段）。")
         print(f"   这个端口可能被别的程序占了。本程序会把识别出的原文发到这个地址，"
               f"在确认它确实是 Ollama 之前，翻译已暂停（只显示原文）。")
@@ -1049,7 +1126,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
         （延迟和幻觉风险都涨），超限的留给下一轮（本轮末尾自我再调度）。
         至少取一句（单句本身可超过上限）；已有batch时若再塞会超限则停。
         """
-        max_chars = getattr(config, "TRANSLATE_BATCH_MAX_CHARS", 300)
+        max_chars = _batch_max_chars()
         with self._tx_lock:
             if not self._tx_queue:
                 return
@@ -1354,7 +1431,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
                 timeout = self._translate_timeout()
                 try:
                     response = self.ollama_session.post(
-                        f"{config.OLLAMA_BASE_URL}/api/generate",
+                        f"{ollama_url()}/api/generate",
                         json=payload,
                         stream=True,
                         # 流式下timeout是"相邻数据块间隔"上限，不是总时长
@@ -1596,7 +1673,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
             try:
                 # keep_alive=0 = 立即卸载，先腾出显存再加载新模型
                 self.ollama_session.post(
-                    f"{config.OLLAMA_BASE_URL}/api/generate",
+                    f"{ollama_url()}/api/generate",
                     json={"model": old_model, "prompt": "", "keep_alive": 0},
                     timeout=30,
                 ).close()
@@ -1608,7 +1685,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
             t0 = time.time()
             # prompt留空：Ollama只加载模型不生成，是官方的预热用法
             self.ollama_session.post(
-                f"{config.OLLAMA_BASE_URL}/api/generate",
+                f"{ollama_url()}/api/generate",
                 json={"model": model, "prompt": "", "keep_alive": "2h"},
                 timeout=60,  # 冷加载可能要十几秒
             ).close()
@@ -1937,13 +2014,13 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
                             getattr(config, "GAME_MODE_OLLAMA_MODEL", None)) if m]
         try:
             loaded = self.ollama_session.get(
-                f"{config.OLLAMA_BASE_URL}/api/ps", timeout=2,
+                f"{ollama_url()}/api/ps", timeout=2,
             ).json().get("models", [])
             for m in loaded:
                 name = m.get("name")
                 if any(self._model_name_matches(name, ours_name) for ours_name in ours):
                     self.ollama_session.post(
-                        f"{config.OLLAMA_BASE_URL}/api/generate",
+                        f"{ollama_url()}/api/generate",
                         json={"model": name, "prompt": "", "keep_alive": 0},
                         timeout=3,
                     ).close()
