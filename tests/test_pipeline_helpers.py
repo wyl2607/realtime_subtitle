@@ -2234,3 +2234,91 @@ def test_shutdown_does_not_hang_on_stuck_translation(monkeypatch):
         assert unloaded == ["cache", "models"], unloaded
     finally:
         stuck.set()
+
+
+def test_ollama_url_is_pinned_to_resolved_ip(monkeypatch):
+    """☠️ 校验通过后必须把地址钉成 IP 字面量，不能每个请求现解析主机名。
+
+    `_assert_local_ollama` 只在启动时解析一次，而 requests 是**每个请求都重新
+    解析**的。配置里写主机名时，启动那一刻解析到 127.0.0.1、十分钟后 DNS 记录
+    （或 hosts 文件）改指向外网，转录就静默出去了——而这道校验是本项目唯一挡住
+    "违反自身隐私承诺"的闸门，只在启动时关一次等于形同虚设。
+    """
+    import socket
+    import realtime_subtitle.translate.translator_queue as tq
+
+    def _fake_getaddrinfo(host, *a, **k):
+        if host == "localhost":
+            # Windows 上的真实顺序：IPv6 在前（第 4 节第 22 条）
+            return [(socket.AF_INET6, 1, 6, "", ("::1", 0, 0, 0)),
+                    (socket.AF_INET, 1, 6, "", ("127.0.0.1", 0))]
+        raise OSError("unknown host")
+
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_getaddrinfo)
+    monkeypatch.setattr(config, "ALLOW_REMOTE_OLLAMA", False, raising=False)
+    monkeypatch.setattr(tq, "_pinned_ollama_url", None, raising=False)
+
+    assert tq._assert_local_ollama("http://localhost:11434") is True
+    # 钉成 IPv4：Ollama 只监听 127.0.0.1，钉到 ::1 上等于每个请求白付 2 秒
+    assert tq.ollama_url() == "http://127.0.0.1:11434"
+
+    # 钉住之后，就算 config 被改成别的主机名，请求也不会跟着走
+    monkeypatch.setattr(config, "OLLAMA_BASE_URL", "http://evil.example:11434")
+    assert tq.ollama_url() == "http://127.0.0.1:11434"
+
+
+def test_ollama_url_not_pinned_when_remote_allowed(monkeypatch):
+    """用户显式声明要连别的机器时不钉：那种场景下主机名可能本来就指望
+    DNS 做故障转移，钉死反而是错的（隐私取舍已由用户自己承担）。"""
+    import realtime_subtitle.translate.translator_queue as tq
+
+    monkeypatch.setattr(config, "ALLOW_REMOTE_OLLAMA", True, raising=False)
+    monkeypatch.setattr(config, "OLLAMA_BASE_URL", "http://nas.local:11434")
+    monkeypatch.setattr(tq, "_pinned_ollama_url", "http://127.0.0.1:11434",
+                        raising=False)
+
+    assert tq._assert_local_ollama("http://nas.local:11434") is True
+    assert tq.ollama_url() == "http://nas.local:11434"
+
+
+def test_pin_url_preserves_port_and_brackets_ipv6():
+    """IPv6 字面量在 URL 里必须带方括号，否则 requests 解析错。"""
+    from realtime_subtitle.translate.translator_queue import _pin_url_to_address
+
+    assert _pin_url_to_address(
+        "http://localhost:11434", "127.0.0.1") == "http://127.0.0.1:11434"
+    assert _pin_url_to_address(
+        "http://localhost:11434", "::1") == "http://[::1]:11434"
+    # 没写端口时不要凭空造一个出来
+    assert _pin_url_to_address("http://localhost", "127.0.0.1") == "http://127.0.0.1"
+
+
+def test_all_ollama_requests_go_through_ollama_url():
+    """☠️ 静态扫描：请求路径里不许再出现 config.OLLAMA_BASE_URL。
+
+    钉地址这件事只有"所有调用点都走 ollama_url()"才成立，漏一处就等于给
+    那道隐私闸门开了个后门。这条拦的是整个类别——以后新增 Ollama 调用路径
+    照样会被拦下，不用记住今天这九个位置。
+    """
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[1] / "realtime_subtitle"
+    offenders = []
+    for path in root.rglob("*.py"):
+        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if re.search(r'\{config\.OLLAMA_BASE_URL\}/api/', line):
+                offenders.append(f"{path.name}:{i}")
+    assert not offenders, (
+        f"这些请求绕过了 ollama_url()，等于绕过 _assert_local_ollama 的钉地址：{offenders}")
+
+
+def test_batch_max_chars_is_smaller_for_no_space_languages():
+    """☠️ 字符不是等价单位：300 个汉字的信息量约等于 750 个德语字符，
+    拿德语的上限去量中文等于每次请求塞进 2.5 倍的内容——生成 token 数、
+    单次延迟、跑进复读的概率跟着一起涨，而这三样正是这个上限要压住的。"""
+    from realtime_subtitle.translate.translator_queue import _batch_max_chars
+
+    assert _batch_max_chars(lang="de") == config.TRANSLATE_BATCH_MAX_CHARS
+    assert _batch_max_chars(lang="zh") == config.TRANSLATE_BATCH_MAX_CHARS_CJK
+    assert _batch_max_chars(lang="zh") < _batch_max_chars(lang="de")

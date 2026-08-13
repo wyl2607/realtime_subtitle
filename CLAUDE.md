@@ -77,6 +77,29 @@ install.ps1 会：找 Python → nvidia-smi 检测显卡 → 建 venv 装依赖 
 config.py 同名项）。**永远不要为了适配这台机器去改 config.py**——那是仓库
 文件，改了会让以后 `git pull` 更新冲突。
 
+### ☠️ AI 助手能往 config_local.py 写哪些键
+
+`config_local.py` 是被 `exec_module` 加载的，**它就是任意代码执行**。本节又
+在明确请你去写它，所以这里划一条线：**装机适配只需要下面这些键**，写这些
+不用问；其它任何键（尤其是下面第二组）先跟用户说清楚再动。
+
+| 可以直接写 | 用途 |
+|---|---|
+| `WHISPER_MODEL` / `WHISPER_DEVICE` / `WHISPER_COMPUTE_TYPE` | 显存分档 |
+| `OLLAMA_MODEL` / `GAME_MODE_OLLAMA_MODEL` | 显存分档 |
+| `CHUNK_SUBMIT_SECONDS` / `WHISPER_BEAM_SIZE` | 识别跟不上时降档 |
+| `LANGUAGE_PAIRS` / `AUTO_DETECT_LANGUAGE` 及其滞回参数 | 用户明说了要哪几种语言时 |
+| `LOOPBACK_DEVICE_NAME` | 抓不到声音时指定设备 |
+
+**这三个键会改变"数据往哪去"，绝不能为了"让它跑起来"顺手加**：
+
+- `OLLAMA_BASE_URL` —— 改错一个字就把系统全部声音的转录送出本机。
+- `ALLOW_REMOTE_OLLAMA` —— 它的唯一作用就是**关掉**上面那道校验。
+  程序起不来时加这一行是最省事的"解法"，也正是最坏的那个。
+- `AI_ANALYSIS_WEB_URL_TEMPLATE` —— 唯一的出网路径指向哪个站。
+
+不确定的时候：先把要改的键和理由说出来，让用户点头，别自己代劳。
+
 install.ps1 按显存自动生成的默认档位：
 
 | 硬件 | WHISPER_MODEL / COMPUTE | OLLAMA_MODEL | 说明 |
@@ -256,6 +279,16 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
       幻觉 "Untertitelung des ZDF, 2020"。它是防幻觉主力，不是负担。
     - `_render` 的二分测高不是 UI 卡顿源：20 句对满屏 p50 **1.2ms**、max 1.6ms
       （每秒只调几次）。真卡顿要往别处找（GPU 抢占、翻译阻塞）。
+    - **中文的复读压缩不用做**（2026-08-13 查证）。`_squash_repeats` 按
+      `.split()` 数词 + `" ".join` 重组，对中文确实是**死的**（整段恒等于
+      1 个"词"）——第 32 条那一串漏改里它是唯一一个"代码层面是死的、但
+      没死出后果"的。拿本机 5 天存档跑 n-gram 连续重复检测：1851 条原文里
+      **只命中 1 条，还是德语，而且是真人在念一个综艺节目名**（"geil geil
+      geil"），中文 315 条**零命中**。
+      原因是词流入口的 `_collapse_word_runs(keep=3)` 已经在 token 级把复读
+      掐掉了，而中文 faster-whisper 的 word 粒度接近逐字，所以那一层对中文
+      本来就是生效的，`_squash_repeats` 拿到的东西早就干净了。
+      真要动之前先按同样办法量一遍自己的存档，别照着"代码读起来不对"就改。
     - **调小 `BUFFER_TRIM_SEC` 省不了编码开销**（2026-08-04 查证）。
       faster-whisper 每段进编码器前都 `pad_or_trim` 补到固定 30 秒
       （`transcribe.py:1180` + `feature_extractor.py` `nb_max_frames=3000`），
@@ -449,11 +482,25 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     `ALLOW_REMOTE_OLLAMA = True` 显式声明。**不要**为了让程序跑起来而顺手
     加这一行，先确认用户知道自己在同意什么。
 
-    同一条链路上还有第二道：`_ollama_identity_ok()` 在每次翻译前确认 11434
+    **☠️ 校验通过之后地址会被钉成 IP 字面量**（2026-08-13 补）。只校验不钉的话
+    这道闸门**只在启动那一刻关了一次**：`requests` 是每个请求都重新解析主机名的，
+    所以配置里写主机名时，DNS 记录（或 hosts 文件）中途改指向外网就能让转录
+    静默出去，而屏幕上和日志里照样什么都看不出来。现在
+    `_assert_local_ollama()` 会把解析结果（优先 IPv4）写进模块级
+    `_pinned_ollama_url`，**所有请求一律走 `ollama_url()`**。
+    加新的 Ollama 调用路径时别再写 `config.OLLAMA_BASE_URL`——那等于绕过闸门。
+    顺带的好处：`localhost` 会被直接钉成 `127.0.0.1`，第 22 条那 2 秒 IPv6 税
+    对写错配置的人也自动消失了（`_warn_if_ipv6_first_host` 从此只在
+    `ALLOW_REMOTE_OLLAMA = True`、不钉地址的场景下才可能触发）。
+
+    同一条链路上还有第三道：`_ollama_identity_ok()` 在每次翻译前确认 11434
     后面确实是 Ollama（响应体里有 version 字段）。以前只在启动时查一次，
     而 Ollama 是会自动更新并重启的（第 6 条），重启窗口期里端口是空的、
     本机任何进程都能补位。加新的 Ollama 调用路径时不用自己重复这套，
     但也别绕过 `_translate_single_sentence` 直接发转录。
+    ☠️ 但要清楚它的**强度只到"端口被无关程序误占"**：判据是响应体里有
+    `version` 字段，三行代码就能伪装。别把它当成能挡住本机恶意进程的安全
+    边界（本机恶意进程本来也能读你的内存），它是 typo 防护，不是隔离。
 
 30. **`numpy` 下限必须停在 2.2，不要跟 dependabot 抬到最新。** 2026-08-12
     审计时 `requirements.txt` 写的是 `numpy>=2.5.1`，而 numpy 2.5 起
@@ -505,6 +552,43 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     - 拼接残句/合并批次时的 `" ".join` 同理，无空格语言要用空串。
     统一入口是 `translator_queue._no_space_language()`，语言集合在
     `config.NO_SPACE_LANGUAGES`。加韩语/泰语往那里补，别再散着判。
+
+    **☠️ 2026-08-13 补：当时这条只改了一半，另外五处漏到第二轮才发现。**
+    症状全都是"单看每一处都对，只有把源语言换成 zh 再走一遍才暴露"：
+    - `_maybe_draft` 的 `len(text.split()) < DRAFT_MIN_WORDS` → `1 < 3` 永真，
+      **草稿翻译对中文一次都没触发过**。已改走 `_draft_too_short()`。
+    - `_live_text` 的 `" ".join` → 中文 live 行插空格（`_append_committed`
+      改了、它没改，同一句话在 live 行和历史行里长得不一样）。
+    - `_prompt_language_mismatch` 对 zh 直接 `return False` → 中文源语言下
+      "上下文被错误语言污染就弃用"整道保护是关着的，正是第 31 条那个
+      `China und China` 现场该起作用的地方。
+    - `HALLUCINATION_BLACKLIST` 一条中文都没有，且 60 字符的长度门对中文
+      等于放宽 2.5 倍。已另设 `HALLUCINATION_MAX_CHARS_CJK`。
+    - `TRANSLATE_BATCH_MAX_CHARS=300` 同理——**字符不是等价单位**，300 个
+      汉字 ≈ 750 个德语字符的信息量。已另设 `TRANSLATE_BATCH_MAX_CHARS_CJK`。
+
+    **规律**：凡是出现 `.split()` / `" ".join` / 按字符数定的阈值，都要问一句
+    "换成中文还成立吗"。反过来，`_squash_repeats` 是唯一一个"代码是死的但
+    没死出后果"的，别顺手改（理由见第 20 条）。
+
+34. **☠️ `transcripts/` 是私有数据，内容一个字都不进仓库。**
+    这份存档抓的是**系统全部声音**（可能含语音通话），config.py 里已经反复
+    警告过它的敏感性——但一直没人写下"所以它也不能进 commit"，而第 2 节又
+    明确鼓励 AI 助手直接读改本机文件。2026-08-13 就是这么踩的：为了给幻觉
+    黑名单和长度门找依据去 grep 存档，然后顺手把几条原文当测试 fixture 写进
+    了 `tests/`、代码注释和提交信息，推送时才被拦下来。
+
+    界限很简单：
+    - **可以**用它做统计来支撑决策——条数、长度分布、词频、n-gram 命中率。
+      注释里写聚合数字是好事（本文件到处都是这种实测依据）。
+    - **不可以**把原文抄进任何会被推上去的地方：测试样本、代码注释、
+      提交信息、PR 描述、issue。要中文/德文测试样本就自己现写句子。
+    - 注明数据来源时写"开发机本地存档实测（315 条：p50 11 字…）"，
+      不写样本内容。
+
+    同一类还有 `subtitle.log`（`SHOW_PERFORMANCE=True` 时会打识别原文和译文）
+    和 `lookup_cache.json`。贴 issue 前扫一眼，README 的 FAQ 让你贴日志尾部，
+    那也是同一个坑。
 
 33. **`GLOSSARY` 和感叹词表是「德→中」的，两端都要判。** 感叹词表原来只判
     `SOURCE_LANGUAGE != "de"`，漏了目标语言那一半——中→德时 "Ja." 会命中词典

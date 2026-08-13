@@ -436,13 +436,17 @@ class LookupMixin:
 释义: 中文释义，最多2条，分号隔开
 本句中: 一句话说明它在上面那句话里的意思
 """
+        # ☠️ 延迟 import：translator_queue 在模块级 import 本模块，反过来就是循环。
+        # 地址必须走 ollama_url() 而不是 config.OLLAMA_BASE_URL——启动校验会把主机名
+        # 钉成 IP 字面量，绕过它等于绕过那道隐私闸门（见 _assert_local_ollama）
+        from realtime_subtitle.translate.translator_queue import ollama_url
         self._enter_inflight()  # 草稿翻译看这个让路，见 translator_queue._maybe_draft
         try:
             t0 = time.time()
             # 用查词专属session：和翻译线程共享一个requests.Session
             # 并发使用不保证线程安全
             response = self.lookup_session.post(
-                f"{config.OLLAMA_BASE_URL}/api/generate",
+                f"{ollama_url()}/api/generate",
                 json={
                     "model": config.OLLAMA_MODEL,
                     "prompt": prompt,
@@ -530,11 +534,12 @@ class LookupMixin:
 
     def _run_ai_analysis_request(self, prompt, callback, num_predict=400, label="分析"):
         """共用 Ollama /api/generate 路径：失败只改弹窗文案，不重试、不打扰主链路。"""
+        from realtime_subtitle.translate.translator_queue import ollama_url  # 同上：防循环 import
         self._enter_inflight()  # 草稿翻译看这个让路，见 translator_queue._maybe_draft
         try:
             t0 = time.time()
             response = self.analysis_session.post(
-                f"{config.OLLAMA_BASE_URL}/api/generate",
+                f"{ollama_url()}/api/generate",
                 json={
                     "model": config.OLLAMA_MODEL,
                     "prompt": prompt,
