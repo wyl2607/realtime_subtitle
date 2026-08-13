@@ -165,6 +165,35 @@ def build_web_query_for_sentence(sentence, max_fragment_chars=AI_WEB_FRAGMENT_MA
     return f"请帮我解释这句{lang_name}的背景：「{frag}」"
 
 
+# 确认框里预览多少字原文。够看清"发出去的是哪一段"，又不至于撑成一面墙
+AI_WEB_CONFIRM_PREVIEW_CHARS = 300
+
+
+def build_ai_web_confirm_text(query, url, preview_chars=AI_WEB_CONFIRM_PREVIEW_CHARS):
+    """「问更强的AI」发送前确认框的正文。纯函数，单测直接 import。
+
+    ☠️ 为什么值得专门弹一次框：README 第一句是「不向任何云端发送音频或文本」，
+    而这个按钮是那句话**唯一**的例外。在此之前用户点下去之前看不到具体会发出
+    什么——AI_CONTEXT_MAX_CHARS 默认 1400 字，而本程序抓的是系统全部声音
+    （可能含语音通话、私人对话）。"按钮上写着会发出去"和"亲眼见过这 1400 字"
+    是两回事，后者才叫知情同意。
+
+    正文里三样缺一不可：**发到哪个域名**（模板是用户可改的，可能早就不是
+    grok.com 了）、**总共多少字**、**前若干字长什么样**。
+    """
+    from urllib.parse import urlparse
+
+    q = (query or "").strip()
+    host = urlparse(url or "").hostname or "（未知站点）"
+    preview = q if len(q) <= preview_chars else q[:preview_chars] + "……"
+    return (
+        f"即将把下面这段内容发送到 {host}（在浏览器里打开）。\n"
+        f"这是本程序唯一会把内容送出本机的操作，共 {len(q)} 字：\n\n"
+        f"{preview}\n\n"
+        f"⚠️ 本程序抓的是系统全部声音，请确认上面没有你不想外发的内容。"
+    )
+
+
 def ai_web_enabled():
     """「🌐 问更强的AI」是否可用。
 

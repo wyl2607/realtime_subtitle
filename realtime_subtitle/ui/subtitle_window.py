@@ -821,10 +821,40 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
             # 模板写坏了也走这条（build_ai_web_url 会在日志里说清是哪种）
             self.show_status("「问更强的AI」不可用：config 里的模板为空或格式不对（详见 subtitle.log）")
             return
+        # ☠️ 发之前让用户亲眼看一遍要发什么。这是本程序唯一把内容送出本机的
+        # 路径（README 第一句「不向任何云端发送音频或文本」的唯一例外），而
+        # 按钮上那行字挡不住"我不知道它要发我刚才那 1400 个字"——抓的是系统
+        # 全部声音，可能含语音通话。config_local.py 里 AI_WEB_CONFIRM = False
+        # 可以关掉这个确认（自己清楚在发什么的人不用每次点两下）。
+        if getattr(config, "AI_WEB_CONFIRM", True):
+            from realtime_subtitle.translate.lookup import build_ai_web_confirm_text
+            if not self._ask_ai_web_confirm(build_ai_web_confirm_text(q, url)):
+                self.show_status("已取消，内容没有发出去")
+                return
         try:
             webbrowser.open(url)
         except Exception as e:
             self.show_status(f"无法打开网页: {e}")
+
+    def _ask_ai_web_confirm(self, text):
+        """弹出发送确认框，返回用户是否同意。
+
+        单独抽成一个方法是为了让测试能替换掉它——否则用例要么真弹窗阻塞，
+        要么得去 monkeypatch QMessageBox 这种全局的东西。
+        """
+        from PyQt5.QtWidgets import QMessageBox
+
+        box = QMessageBox(self.container)
+        box.setWindowTitle("发送到外部 AI？")
+        box.setIcon(QMessageBox.Warning)
+        box.setText(text)
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+        # ☠️ 默认落在「取消」上：这个框是回车/空格键很容易顺手撞到的，
+        # 而误触的后果是内容真的发出去了，不可撤销
+        box.setDefaultButton(QMessageBox.Cancel)
+        box.button(QMessageBox.Yes).setText("发送并打开网页")
+        box.button(QMessageBox.Cancel).setText("取消")
+        return box.exec_() == QMessageBox.Yes
 
     def _quit_application(self):
         """退出程序"""

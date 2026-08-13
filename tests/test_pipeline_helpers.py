@@ -1849,7 +1849,7 @@ def test_tx_drop_warning_is_throttled(capsys):
 
 
 def test_cjk_sentence_split_actually_splits():
-    """☠️ 加中→德之前，中文输入下这条管线是**完全不出字幕**的。
+    r"""☠️ 加中→德之前，中文输入下这条管线是**完全不出字幕**的。
 
     实测：`_split_sentences("这是第一句。然后还有一句？对的。")` 切出 0 句。
     两个原因缺一不可——全角 。！？ 不在 [.!?…] 里；就算加进去，原正则的

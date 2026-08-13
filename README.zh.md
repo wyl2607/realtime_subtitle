@@ -11,8 +11,10 @@
 
 > **唯一的例外，而且只有你点它才会发生**：弹窗里的「🌐 问更强的AI」按钮会把最近几分钟
 > 识别出的原文（≤300 字）拼成一句提问，用系统浏览器打开网页版 AI（默认 grok.com，
-> `config.AI_ANALYSIS_WEB_URL_TEMPLATE` 可改）。不点就不发。把那个模板设成空串即可
-> 让按钮彻底消失。注意本程序抓的是**系统全部声音**，可能包含语音通话内容。
+> `config.AI_ANALYSIS_WEB_URL_TEMPLATE` 可改）。不点就不发，而且点了之后还会先弹一个框，
+> 把**要发出去的内容原样亮给你看**（发到哪个域名、共多少字、前 300 字），确认了才发；
+> 嫌烦可以 `AI_WEB_CONFIRM = False` 关掉。把那个模板设成空串即可让按钮彻底消失。
+> 注意本程序抓的是**系统全部声音**，可能包含语音通话内容。
 
 [English](README.md) · [Deutsch](README.de.md) · [目录结构](docs/STRUCTURE.md) · [Windows 操作清单](docs/WINDOWS-RUNBOOK.md)
 
