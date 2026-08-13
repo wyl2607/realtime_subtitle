@@ -952,3 +952,107 @@ def test_ai_workers_use_reduced_num_predict():
 
 def test_config_ai_context_max_chars_reduced():
     assert config.AI_CONTEXT_MAX_CHARS == 1400
+
+
+# ---------------------------------------------------------------------------
+# 出网前确认（唯一把内容送出本机的路径）
+# ---------------------------------------------------------------------------
+
+def test_confirm_text_shows_host_length_and_preview():
+    """☠️ 确认框正文里三样缺一不可：发到哪个域名、共多少字、前若干字长什么样。
+
+    域名必须显示：AI_ANALYSIS_WEB_URL_TEMPLATE 是用户可改的，config 注释还
+    鼓励换成 ChatGPT 等，所以"点这个按钮会发去哪"不能靠记忆。
+    """
+    from realtime_subtitle.translate.lookup import build_ai_web_confirm_text
+
+    q = "请帮我解释这句德语的背景：「Guten Tag」"
+    text = build_ai_web_confirm_text(q, "https://grok.com/?q=xxx")
+    assert "grok.com" in text
+    assert str(len(q)) in text          # 总字数
+    assert "Guten Tag" in text          # 预览里看得见实际内容
+    assert "系统全部声音" in text        # 提醒这份内容的来源
+
+    # 模板换成别的站时，显示的必须跟着变（不能写死 grok）
+    other = build_ai_web_confirm_text(q, "https://chatgpt.com/?q=xxx")
+    assert "chatgpt.com" in other and "grok.com" not in other
+
+
+def test_confirm_text_truncates_long_content():
+    """1400 字的上下文不能整段糊进对话框，但要让用户知道总量。"""
+    from realtime_subtitle.translate.lookup import (
+        build_ai_web_confirm_text, AI_WEB_CONFIRM_PREVIEW_CHARS,
+    )
+
+    long_q = "德" * 1400
+    text = build_ai_web_confirm_text(long_q, "https://grok.com/?q=x")
+    assert "1400" in text                                  # 总字数照实说
+    assert text.count("德") == AI_WEB_CONFIRM_PREVIEW_CHARS  # 预览被截断
+    assert "……" in text
+
+
+def test_open_ai_web_does_not_send_when_user_cancels(monkeypatch):
+    """☠️ 取消 = 一个包都不发。这一步不可撤销（URL 会进浏览器历史和对方
+    服务器日志），所以"点了确认才发"必须有用例盯着。"""
+    import webbrowser
+    from realtime_subtitle.ui.subtitle_window import SubtitleWindow
+
+    opened = []
+    monkeypatch.setattr(webbrowser, "open", lambda url: opened.append(url))
+    monkeypatch.setattr(config, "AI_WEB_CONFIRM", True, raising=False)
+    monkeypatch.setattr(config, "AI_ANALYSIS_WEB_URL_TEMPLATE",
+                        "https://example.test/ai?q={query}")
+
+    w = object.__new__(SubtitleWindow)
+    w.show_status = lambda *a, **k: None
+    w._open_ai_web = SubtitleWindow._open_ai_web.__get__(w)
+
+    asked = []
+    w._ask_ai_web_confirm = lambda text: (asked.append(text), False)[1]
+    w._open_ai_web("请帮我解释这句德语的背景：「Hallo」")
+    assert asked, "该弹确认框却没弹"
+    assert opened == [], "用户取消了，一个包都不该发"
+
+    # 点了确认才真的打开
+    w._ask_ai_web_confirm = lambda text: True
+    w._open_ai_web("请帮我解释这句德语的背景：「Hallo」")
+    assert len(opened) == 1
+    assert opened[0].startswith("https://example.test/")
+
+
+def test_open_ai_web_confirm_can_be_disabled(monkeypatch):
+    """自己清楚每次在发什么的人可以关掉；关了就不该再弹。"""
+    import webbrowser
+    from realtime_subtitle.ui.subtitle_window import SubtitleWindow
+
+    opened = []
+    monkeypatch.setattr(webbrowser, "open", lambda url: opened.append(url))
+    monkeypatch.setattr(config, "AI_WEB_CONFIRM", False, raising=False)
+    monkeypatch.setattr(config, "AI_ANALYSIS_WEB_URL_TEMPLATE",
+                        "https://example.test/ai?q={query}")
+
+    w = object.__new__(SubtitleWindow)
+    w.show_status = lambda *a, **k: None
+    w._open_ai_web = SubtitleWindow._open_ai_web.__get__(w)
+
+    def _should_not_be_called(text):
+        raise AssertionError("AI_WEB_CONFIRM=False 时不该弹确认框")
+
+    w._ask_ai_web_confirm = _should_not_be_called
+    w._open_ai_web("随便问点什么")
+    assert len(opened) == 1
+
+
+def test_ai_web_confirm_defaults_to_on_in_repo_config():
+    """☠️ 读 config.py 的**源码字面量**，不读运行期值——在 config_local.py 里
+    关掉了这个确认的机器（作者自己的）跑测试不该因此变红。
+    同 test_auto_detect_is_off_by_default_in_repo_config 的思路。
+    """
+    import re
+    import pathlib
+
+    src = (pathlib.Path(__file__).resolve().parents[1]
+           / "realtime_subtitle" / "config.py").read_text(encoding="utf-8")
+    m = re.search(r"^AI_WEB_CONFIRM\s*=\s*(\w+)", src, re.M)
+    assert m, "config.py 里找不到 AI_WEB_CONFIRM"
+    assert m.group(1) == "True", f"仓库默认被改成了 {m.group(1)}"

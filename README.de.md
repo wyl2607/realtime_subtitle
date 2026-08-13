@@ -14,9 +14,11 @@ Erkennung und Übersetzung laufen offline; Audio und Transkripte verlassen den R
 > **Eine Ausnahme, und nur wenn du sie anklickst:** Der Button `🌐 Stärkere KI fragen`
 > öffnet den Systembrowser mit einer Frage aus den letzten Minuten des erkannten Textes
 > (≤300 Zeichen) an eine Web-KI (standardmäßig grok.com,
-> `config.AI_ANALYSIS_WEB_URL_TEMPLATE`). Ohne Klick wird nichts gesendet. Template auf
-> einen leeren String setzen entfernt den Button. Achtung: Das Programm nimmt **den
-> gesamten Systemton** auf, also ggf. auch Sprachanrufe.
+> `config.AI_ANALYSIS_WEB_URL_TEMPLATE`). Ohne Klick wird nichts gesendet — und selbst dann
+> zeigt dir zuerst ein Dialog, **was genau gesendet würde** (Zielhost, Gesamtlänge, erste
+> 300 Zeichen), und wartet auf deine Bestätigung; mit `AI_WEB_CONFIRM = False` abschaltbar.
+> Template auf einen leeren String setzen entfernt den Button. Achtung: Das Programm nimmt
+> **den gesamten Systemton** auf, also ggf. auch Sprachanrufe.
 
 [English](README.md) · [中文](README.zh.md) · [Repository-Struktur](docs/STRUCTURE.md) · [Windows-Anleitung](docs/WINDOWS-RUNBOOK.md)
 
