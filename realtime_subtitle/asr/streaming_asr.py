@@ -170,8 +170,19 @@ class OnlineASRProcessor:
 
     @staticmethod
     def _prompt_language_mismatch(text):
-        """已提交上下文是否明显是"非目标语言"。只处理 de/en 这对最常见的
-        误认组合；判定保守：错误语言功能词≥3个且≥目标语言的2倍才算"""
+        """已提交上下文是否明显是"非目标语言"。判定保守：错误语言功能词≥3个
+        且≥目标语言的2倍才算。
+
+        ☠️ 中文/日文源语言下这条以前直接 `return False`，也就是**整道保护是
+        关着的**——而 CLAUDE.md 第 4 节第 31 条记的那个现场（德语切回中文的
+        18 秒窗口里字幕是 `China und China, China, China...`）正是它该起作用
+        的场景：那些拉丁词会被提交进 commited，再经 initial_prompt 喂回去
+        自我强化。切换路径上 clear_context() 能兜住，但**稳态下**（中文视频里
+        插一段德语/英语原声）没有任何东西能把 prompt 拉回中文。
+
+        无空格语言的判据比 de/en 那对简单得多：中文上下文里本来就不该出现
+        连串的拉丁功能词，所以 en 和 de 合起来数，不用比谁多。
+        """
         words = re.findall(r"[a-zäöüß']+", text.lower())
         en = sum(1 for w in words if w in _EN_STOPWORDS)
         de = sum(1 for w in words if w in _DE_STOPWORDS)
@@ -180,12 +191,21 @@ class OnlineASRProcessor:
             return en >= 3 and en >= 2 * max(de, 1)
         if lang == "en":
             return de >= 3 and de >= 2 * max(en, 1)
+        if lang in getattr(config, "NO_SPACE_LANGUAGES", ("zh", "ja")):
+            return (en + de) >= 3
         return False
 
     # 命中黑名单后还要满足的长度门：幻觉字幕都是"Untertitelung des ZDF, 2020"
     # 这种短固定句，真人讲话里出现同样的词（新闻里 "Copyright"、讨论字幕时的
     # "Untertitel"）一般是长句里的一个词。
     HALLUCINATION_MAX_CHARS = 60
+    # ☠️ 无空格语言要另设一档。60 个汉字的信息量约等于 150 个德语字符
+    # （config 里 MAX_PENDING_CHARS=60 ≈ MAX_PENDING_WORDS=24 就是这个换算），
+    # 拿德语的门去量中文等于把门放宽 2.5 倍，而命中的代价是**整段静默丢弃**。
+    # 30 这个值是在开发机的本地存档上量的（315 条真实中文原文的长度分布：
+    # p50 11 字、p90 23 字、最长 51 字，样本内容未外传）——30 盖得住幻觉套话
+    # （都是十几个字的固定句），又让真人的长句整段放行。
+    HALLUCINATION_MAX_CHARS_CJK = 30
 
     def _is_hallucination(self, text):
         """整段丢弃的判定，所以宁可漏杀不可误杀。
@@ -199,7 +219,11 @@ class OnlineASRProcessor:
         段落里出现这些词，压倒性可能是真人在说话。
         """
         stripped = (text or "").strip()
-        if len(stripped) > self.HALLUCINATION_MAX_CHARS:
+        cap = (self.HALLUCINATION_MAX_CHARS_CJK
+               if config.SOURCE_LANGUAGE in getattr(
+                   config, "NO_SPACE_LANGUAGES", ("zh", "ja"))
+               else self.HALLUCINATION_MAX_CHARS)
+        if len(stripped) > cap:
             return False
         lowered = stripped.lower()
         return any(pattern in lowered for pattern in config.HALLUCINATION_BLACKLIST)
