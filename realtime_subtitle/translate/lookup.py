@@ -150,14 +150,19 @@ def build_deep_explain_prompt(sentence):
     )
 
 
-def build_web_query_for_background(german_text, max_fragment_chars=AI_WEB_FRAGMENT_MAX_CHARS):
-    frag = (german_text or "")[:max_fragment_chars]
-    return f"请帮我总结并解释这段德语直播内容的背景：「{frag}」"
+# ☠️ 这两条以前把"德语"写死在问句里。同一个文件里另外两个 build_*_prompt
+# 都老老实实按 LANGUAGE_NAMES 取当前源语言，只有出网这两条漏了——中→德时
+# 会问出"请帮我解释这句德语的背景：「一段中文」"，把外面那个模型直接带偏。
+def build_web_query_for_background(source_text, max_fragment_chars=AI_WEB_FRAGMENT_MAX_CHARS):
+    frag = (source_text or "")[:max_fragment_chars]
+    lang_name = config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)
+    return f"请帮我总结并解释这段{lang_name}直播内容的背景：「{frag}」"
 
 
 def build_web_query_for_sentence(sentence, max_fragment_chars=AI_WEB_FRAGMENT_MAX_CHARS):
     frag = (sentence or "")[:max_fragment_chars]
-    return f"请帮我解释这句德语的背景：「{frag}」"
+    lang_name = config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)
+    return f"请帮我解释这句{lang_name}的背景：「{frag}」"
 
 
 def ai_web_enabled():

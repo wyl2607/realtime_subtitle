@@ -2020,3 +2020,161 @@ def test_auto_detect_is_off_by_default_in_repo_config():
     m = re.search(r"^AUTO_DETECT_LANGUAGE\s*=\s*(\w+)", src, re.M)
     assert m, "config.py 里找不到 AUTO_DETECT_LANGUAGE"
     assert m.group(1) == "False", f"仓库默认被改成了 {m.group(1)}"
+
+
+# ======================================================================
+# 中文源语言路径的漏改（2026-08-13）
+#
+# 下面这几条是同一类 bug：加中→德那轮把切句/残句兜底/词流出口都统一到了
+# _no_space_language()，但另外几处按"空格分词的拉丁语系"写的判定漏掉了。
+# 每一处单看都对，只有把源语言换成 zh 再走一遍才暴露。
+# ======================================================================
+
+
+def _with_source_language(lang):
+    """临时切源语言的上下文管理器（用例之间必须还原，否则互相污染）。"""
+    import contextlib
+
+    @contextlib.contextmanager
+    def _ctx():
+        old_src, old_tgt = config.SOURCE_LANGUAGE, config.TARGET_LANGUAGE
+        try:
+            config.SOURCE_LANGUAGE = lang
+            config.TARGET_LANGUAGE = "de" if lang == "zh" else "zh"
+            yield
+        finally:
+            config.SOURCE_LANGUAGE, config.TARGET_LANGUAGE = old_src, old_tgt
+
+    return _ctx()
+
+
+def test_draft_gate_counts_chars_for_no_space_languages():
+    """☠️ 草稿门以前是 `len(text.split()) < DRAFT_MIN_WORDS`，中文残句整段恒
+    等于 1 个"词"，`1 < 3` 永真——**放中文视频时草稿翻译一次都没触发过**。
+    和 _pending_too_long 是同一个坑，那边改了这边漏了。"""
+    from realtime_subtitle.translate.translator_queue import _draft_too_short
+
+    # 德语：原行为一字不变
+    assert _draft_too_short("Das ist", lang="de")          # 2 词 < 3
+    assert not _draft_too_short("Das ist ein", lang="de")  # 3 词
+
+    # 中文：按字符数。修之前这两条都会返回 True（门永远关着）
+    assert _draft_too_short("软件", lang="zh")             # 2 字 < 8
+    assert not _draft_too_short("我们来聊聊这个话题", lang="zh")
+
+
+def test_maybe_draft_fires_for_chinese_pending():
+    """端到端确认上一条：中文残句必须真的能把草稿任务提交出去。"""
+    from threading import Lock
+
+    t = _translator_for_tx()
+    t._asr_lock = Lock()
+    t._stats_lock = Lock()
+    t._stat_draft = 0
+    t._audio_inbox = []
+    t._asr_busy = False
+    t._draft_last_text = ""
+    t._draft_last_time = 0.0
+    t._ollama_hot = True
+    submitted = []
+
+    class _Exec:
+        def submit(self, *a, **k):
+            submitted.append(a)
+
+    t._tx_executor = _Exec()
+    t.on_draft = lambda s: None
+
+    with _with_source_language("zh"):
+        t.pending_text = "我们今天来聊聊这个话题的细节"
+        t._maybe_draft()
+    assert len(submitted) == 1, "中文残句应该出草稿（修复前这里恒为 0）"
+
+
+def test_live_text_has_no_spaces_for_chinese():
+    """live 行拼接和 _append_committed 是同一条规则，以前只改了后者：
+    中文 live 行会长成「这是第一句。 然后还有一句？ 残句」。"""
+    from threading import Lock
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
+
+    t = WhisperQueueTranslator.__new__(WhisperQueueTranslator)
+    t._tx_lock = Lock()
+    t._tx_inflight = ["这是第一句。"]
+    t._tx_queue = ["然后还有一句？"]
+    t.pending_text = "剩下的残句"
+
+    with _with_source_language("zh"):
+        assert t._live_text() == "这是第一句。然后还有一句？剩下的残句"
+
+    # 德语侧原行为不变
+    t._tx_inflight, t._tx_queue, t.pending_text = ["Hallo Welt."], ["Wie geht's?"], "und dann"
+    with _with_source_language("de"):
+        assert t._live_text() == "Hallo Welt. Wie geht's? und dann"
+
+
+def test_prompt_discards_latin_contamination_in_chinese():
+    """☠️ 中文源语言下"上下文被错误语言污染就弃用"这道保护以前是关着的
+    （_prompt_language_mismatch 对 zh 直接 return False）。
+
+    而 CLAUDE.md 第 4 节第 31 条记的那个现场——德语切回中文的窗口里字幕是
+    `China und China, China...`——正是它该起作用的场景：那些拉丁词会被提交进
+    commited，再经 initial_prompt 喂回去自我强化。切换路径上 clear_context()
+    能兜住，稳态下（中文视频里插一段德语原声）以前没有任何东西能拉回来。
+    """
+    asr = OnlineASRProcessor.__new__(OnlineASRProcessor)
+    asr.init()
+    asr.buffer_time_offset = 100.0  # 全部已滚出缓冲
+
+    with _with_source_language("zh"):
+        # 上下文整段是德语功能词 → 弃用，换回中文语言锚
+        asr.commited = _committed_words("das ist nicht der und die sind".split())
+        assert asr._prompt() == config.LANGUAGE_SEED_PROMPTS["zh"]
+
+        # 正常中文上下文照常喂回去（别把好上下文误杀了）
+        asr.commited = _committed_words(list("我们今天来聊聊这个话题的几个细节。"))
+        assert asr._prompt() != config.LANGUAGE_SEED_PROMPTS["zh"]
+
+        # 中文里夹一两个外来词（科技评测里极常见）不该触发：门槛是 3 个功能词
+        asr.commited = _committed_words(list("我们说到的") + ["die", "Software"])
+        assert asr._prompt() != config.LANGUAGE_SEED_PROMPTS["zh"]
+
+
+def test_hallucination_length_gate_is_tighter_for_chinese():
+    """☠️ 60 字符的长度门是按德语调的。60 个汉字的信息量约等于 150 个德语
+    字符，拿它去量中文等于把门放宽 2.5 倍，而命中的代价是整段静默丢弃。
+
+    开发机本地存档上量过 315 条真实中文原文的长度分布：p50 11 字、p90 23 字、
+    最长 51 字——所以 31~60 字这一段必须放行，那都是真人在说话。
+    """
+    asr = OnlineASRProcessor.__new__(OnlineASRProcessor)
+
+    with _with_source_language("zh"):
+        # 短固定套话：照杀
+        assert asr._is_hallucination("请不吝点赞 订阅 转发 打赏")
+        assert asr._is_hallucination("优优独播剧场")
+        # 35 字的真话里出现同样的词：放行（德语的 60 字门会把它误杀）
+        long_real = "他们在讨论要不要给这个视频加上明镜与点点栏目那种风格的片尾字幕"
+        assert len(long_real) > asr.HALLUCINATION_MAX_CHARS_CJK
+        assert not asr._is_hallucination(long_real)
+
+    # 德语侧的门一点没动
+    with _with_source_language("de"):
+        assert asr._is_hallucination("Untertitelung des ZDF, 2020")
+        assert not asr._is_hallucination(
+            "Der Streit um das Copyright bei generativen Modellen beschäftigt "
+            "inzwischen mehrere Gerichte in Europa.")
+
+
+def test_chinese_blacklist_spares_real_speech_about_subscriptions():
+    """☠️ 这条是防"以后有人凭印象往表里加词"的。
+
+    "订阅" / "频道" / "谢谢观看" 看着都很像幻觉套话，但它们在真人说话里是
+    常规词汇：讲订阅制的段落会反复出现"订阅费"，科技评测的片尾本来就会请
+    观众订阅频道。收了它们 = 把整段真话静默丢掉，而用户屏幕上只是缺一句、
+    毫无提示。下面这几条断言用的是等价的自造句，不是任何真实存档内容。
+    """
+    asr = OnlineASRProcessor.__new__(OnlineASRProcessor)
+    with _with_source_language("zh"):
+        assert not asr._is_hallucination("他每个月都要交一笔订阅费。")
+        assert not asr._is_hallucination("片尾会请观众订阅频道。")
+        assert not asr._is_hallucination("谢谢观看。")

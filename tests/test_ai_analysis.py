@@ -170,6 +170,27 @@ def test_build_web_query_for_background_mentions_live():
     assert "背景" in q
 
 
+def test_build_web_query_follows_source_language():
+    """☠️ 这两条出网问句以前把"德语"写死了。同一个文件里的
+    build_background_summary_prompt / build_deep_explain_prompt 都按
+    LANGUAGE_NAMES 取当前源语言，只有出网这两条漏了——中→德时会问出
+    「请帮我解释这句德语的背景：「一段中文」」，把外面那个模型直接带偏。
+    """
+    old = config.SOURCE_LANGUAGE
+    try:
+        config.SOURCE_LANGUAGE = "de"
+        assert "德语" in build_web_query_for_sentence("Guten Tag")
+        assert "德语" in build_web_query_for_background("Guten Tag")
+
+        config.SOURCE_LANGUAGE = "zh"
+        q1 = build_web_query_for_sentence("我们来聊聊这个话题")
+        q2 = build_web_query_for_background("我们来聊聊这个话题")
+        assert "中文" in q1 and "德语" not in q1, q1
+        assert "中文" in q2 and "德语" not in q2, q2
+    finally:
+        config.SOURCE_LANGUAGE = old
+
+
 # ---------------------------------------------------------------------------
 # 弹窗 UI
 # ---------------------------------------------------------------------------

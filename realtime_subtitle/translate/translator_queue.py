@@ -198,6 +198,18 @@ def _pending_too_long(text, lang=None):
     return len(text.split()) > config.MAX_PENDING_WORDS
 
 
+def _draft_too_short(text, lang=None):
+    """残句短到不值得出草稿吗（DRAFT_MIN_WORDS 的入口）。
+
+    ☠️ 和上面那条完全同源：`len(text.split())` 对中文恒等于 1，`1 < 3` 永真，
+    于是**中文源语言下草稿翻译从来没触发过**。加中→德那轮只改了
+    _pending_too_long，这一处漏了。无空格语言按字符数（DRAFT_MIN_CHARS）。
+    """
+    if _no_space_language(lang):
+        return len(text) < getattr(config, "DRAFT_MIN_CHARS", 8)
+    return len(text.split()) < getattr(config, "DRAFT_MIN_WORDS", 3)
+
+
 def language_pairs():
     """当前生效的「源语言→目标语言」列表，也是 Ctrl+Alt+L 的循环顺序。
 
@@ -801,7 +813,11 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
             parts = list(self._tx_inflight) + list(self._tx_queue)
         if self.pending_text:
             parts.append(self.pending_text)
-        return " ".join(parts)
+        # ☠️ 无空格语言不能插分隔符，和 _append_committed 里同一条规则：
+        # 中文 live 行会长成「这是第一句。 然后还有一句？ 残句」。那边加中→德
+        # 时改了，这里漏了——同一句话在 live 行和成句之后的历史行里长得不一样
+        sep = "" if _no_space_language() else " "
+        return sep.join(parts)
 
     def _emit_display(self):
         if self.on_display:
@@ -1135,7 +1151,10 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
         if not getattr(config, "DRAFT_TRANSLATION", False) or not self.on_draft:
             return
         text = self.pending_text
-        if len(text.split()) < getattr(config, "DRAFT_MIN_WORDS", 3):
+        # ☠️ 不能一律 .split()：中文残句整段恒等于 1 个"词"，这道门对中文永远
+        # 关着，草稿翻译一次都不会触发。和 _pending_too_long 是同一个坑，
+        # 那边改了、这里当时漏了（见 config.DRAFT_MIN_CHARS 的注释）
+        if _draft_too_short(text):
             return
         if text == self._draft_last_text:
             return  # 残句没变，上一版草稿还有效
