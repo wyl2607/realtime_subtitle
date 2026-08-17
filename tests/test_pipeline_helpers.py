@@ -2002,6 +2002,139 @@ def test_language_vote_needs_a_streak():
     assert run([("zh", .95), ("en", .95), ("zh", .95), ("en", .95)]) == [None] * 4
 
 
+def test_decode_health_triggers_once_on_sustained_bad_decode():
+    """☠️ 误切自愈的判定核心。2026-08-17 两次现场都是「检测报 1.00」，也就是
+    切换前的置信度门**根本没有触发的机会**，只能靠事后发现解码在硬凑。
+
+    实测同一段 30 秒德语音频（large-v3-turbo）：
+        language="de"（正确）  avg_logprob -0.308
+        language="zh"（误切）  avg_logprob -2.945
+    阈值 -1.0 落在正中间。
+    """
+    from realtime_subtitle.translate.translator_queue import DecodeHealth
+
+    def run(seq, thr=-1.0, need=4):
+        h = DecodeHealth()
+        return [h.feed(x, thr, need) for x in seq]
+
+    # 连续 4 轮低于阈值才触发，且**只触发一次**（trigger 语义不是电平语义）：
+    # 一直烂着的音频不该每轮都清一次上下文
+    assert run([-2.9] * 6) == [False, False, False, True, False, False]
+    # 正常解码：一次都不触发
+    assert run([-0.31] * 8) == [False] * 8
+    # 中间恢复一次 → 连击清零，重新从头数
+    assert run([-2.9, -2.9, -2.9, -0.31, -2.9, -2.9, -2.9]) == [False] * 7
+    # ☠️ None（本轮没有语音段）是「跳过」：既不计坏也不清零。
+    # 连击的语义因此是"最近 N 个**有语音**的轮次都解不动"，中间隔多少静音
+    # 都不影响——否则德语对谈的停顿密度足以让 4 连击永远攒不满，自愈是死的
+    assert run([-2.9, -2.9, None, -2.9, -2.9]) == [False, False, False, False, True]
+    # 纯静音自己永远不会触发
+    assert run([None] * 10) == [False] * 10
+    # 但只要中间有一轮解码是正常的就清零 → 不存在"孤立坏轮次攒够"
+    assert run([-2.9, None, -0.31, None, -2.9, -2.9, -2.9]) == [False] * 7
+    # 恢复正常之后重新武装，能再触发一次
+    h = DecodeHealth()
+    seq = [-2.9] * 4 + [-0.31] + [-2.9] * 4
+    assert [h.feed(x, -1.0, 4) for x in seq].count(True) == 2
+
+
+def test_decode_logprob_ignores_silence_segments():
+    """no_speech_prob>0.9 的段要排除：静音段的 logprob 是噪声，混进来会在
+    说话人停顿时把中位数拖低，制造假警报。"""
+    class Seg:
+        def __init__(self, lp, nsp):
+            self.avg_logprob, self.no_speech_prob = lp, nsp
+
+    f = OnlineASRProcessor._decode_logprob
+    assert f([Seg(-0.3, 0.0), Seg(-0.3, 0.0)]) == pytest.approx(-0.3)
+    # 静音段那条 -9.0 必须被丢掉，否则中位数被拖到负很多
+    assert f([Seg(-0.3, 0.0), Seg(-0.3, 0.0), Seg(-9.0, 0.99)]) == pytest.approx(-0.3)
+    # 全是静音段 → None（"没有语音"不等于"解码失败"）
+    assert f([Seg(-9.0, 0.99)]) is None
+    assert f([]) is None
+
+
+def test_reset_prompt_context_keeps_audio_buffer():
+    """☠️ 自愈清的是**文字上下文**，绝不能顺手把音频缓冲也丢了：触发时刻是
+    "解码质量烂但还没决定切不切语言"，那段音频还要接着识别。"""
+    asr = OnlineASRProcessor.__new__(OnlineASRProcessor)
+    asr.init()
+    asr.audio_buffer = np.ones(16000, dtype=np.float32)
+    asr.commited = [(0.0, 1.0, "垃圾"), (1.0, 2.0, "文字")]
+    asr.reset_prompt_context()
+    assert asr.commited == []
+    assert len(asr.audio_buffer) == 16000  # 音频一个采样都没丢
+
+
+def test_decode_health_rescue_wiring_fires_and_is_bounded(monkeypatch):
+    """自愈接线的正向对照：光有状态机不够，得证明它接上之后真会动。
+
+    ☠️ 这条测的是 _check_decode_health 的**副作用**，而不是要不要切语言——
+    它刻意不自己切。要不要切、切到哪个仍然只由 _maybe_detect_language 那条
+    路（声学检测 + 置信度门 + 语言对白名单）决定，所以误报的最坏结果只是
+    "白清一次上下文 + 早做一次 180ms 的检测"。
+
+    GPU/float16 实测 226 个健康轮次：中位 -0.320、p10 -0.580，只有 1.8% 的
+    轮次瞬时低于 -1.0 且从未连成 4 轮 —— 即 ROUNDS=4 足以压住孤立坏轮次。
+    """
+    import time as _time
+
+    from realtime_subtitle.translate.translator_queue import (
+        DecodeHealth, LanguageVote, WhisperQueueTranslator)
+
+    class _Proc:
+        def __init__(self):
+            self.last_avg_logprob = None
+            self.commited = [(0.0, 1.0, "垃圾")]
+            self.audio_buffer = np.ones(16000, dtype=np.float32)
+
+        def reset_prompt_context(self):
+            self.commited = []
+
+    t = object.__new__(WhisperQueueTranslator)
+    t.processor = _Proc()
+    t._decode_health = DecodeHealth()
+    t._lang_vote = LanguageVote()
+    t._lang_rescue = False
+    t._lang_detect_next = _time.time() + 20.0  # 假装刚切过、正被冷却憋着
+    t.on_status = None
+    monkeypatch.setattr(config, "AUTO_DETECT_LANGUAGE", True, raising=False)
+    monkeypatch.setattr(config, "LANGUAGE_RESCUE_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "SHOW_PERFORMANCE", False, raising=False)
+
+    # 健康解码：什么都不该发生，冷却也不该被动
+    cooldown_before = t._lang_detect_next
+    for _ in range(10):
+        t.processor.last_avg_logprob = -0.32
+        t._check_decode_health()
+    assert t._lang_rescue is False
+    assert t.processor.commited != []          # 上下文没被乱清
+    assert t._lang_detect_next == cooldown_before
+
+    # 持续烂解码：第 4 轮触发自愈
+    for _ in range(4):
+        t.processor.last_avg_logprob = -2.95
+        t._check_decode_health()
+    assert t._lang_rescue is True
+    assert t.processor.commited == []          # 被污染的 prompt 上下文清掉了
+    assert t._lang_detect_next == 0.0          # 冷却被撕掉，下一句就重测
+    assert len(t.processor.audio_buffer) == 16000  # ☠️ 音频缓冲绝不能跟着丢
+
+    # 再烂下去也不重复触发（trigger 语义），免得每轮清一次上下文
+    t.processor.commited = [(0.0, 1.0, "新的")]
+    t._lang_detect_next = 5.0
+    for _ in range(6):
+        t.processor.last_avg_logprob = -2.95
+        t._check_decode_health()
+    assert t.processor.commited == [(0.0, 1.0, "新的")]
+    assert t._lang_detect_next == 5.0
+
+    # 解码恢复正常 → 撤掉抢救状态，检测回到正常连击数
+    t.processor.last_avg_logprob = -0.32
+    t._check_decode_health()
+    assert t._lang_rescue is False
+
+
 def test_auto_detect_is_off_by_default_in_repo_config():
     """仓库默认必须是关的。开着等于把"误切"的风险默认加给所有用户，而这个
     功能的收益是场景性的（同时看中文和德语内容的人才需要）。

@@ -122,6 +122,9 @@ class OnlineASRProcessor:
         self.buffer_time_offset = offset if offset is not None else 0
         self.transcript_buffer.last_commited_time = self.buffer_time_offset
         self.commited = []  # 全部已提交词（prompt 上下文用），只保留尾部若干
+        # 上一轮解码的 avg_logprob 中位数（误切自愈的输入，见 _decode_logprob）。
+        # None = 这一轮没有语音段，健康度判定应当跳过而不是当成"坏"
+        self.last_avg_logprob = None
 
     def insert_audio_chunk(self, audio):
         """攒块；真正拼进 audio_buffer 在 process_iter/finish 里一次 concatenate。"""
@@ -307,6 +310,47 @@ class OnlineASRProcessor:
             out.append(w)
         return out
 
+    @staticmethod
+    def _decode_logprob(segments):
+        """本轮解码的 avg_logprob 中位数；没有语音段时返回 None。
+
+        ☠️ 这是"源语言被设错了"的**唯一可靠信号**。误切之后 Whisper 照样吐
+        出通顺的目标语言文字（被强制成中文时吐的是中文句子），所以文字层面
+        的一切判据——字符集、复读、黑名单——都抓不住它；只有解码器自己知道
+        它在硬凑。2026-08-17 拿同一段 30 秒德语音频实测（large-v3-turbo）：
+
+            language="de"（正确）  avg_logprob -0.308
+            language="zh"（误切）  avg_logprob -2.945
+
+        间隔 2.64，Whisper 惯用的"解码失败"阈值 -1.0 正好落在中间。
+
+        ☠️ **不要顺手把 compression_ratio 也用上**：同一次实测里它是 1.66
+        vs 1.43，正确的那次反而更高，完全不分离。它抓的是"复读"，而复读只是
+        误切的偶发伴随症状，不是必然结果。
+
+        no_speech_prob>0.9 的段要排除：静音段的 logprob 是噪声，混进来会在
+        说话人停顿时把中位数拖低，制造假警报。
+        """
+        vals = [s.avg_logprob for s in segments if s.no_speech_prob <= 0.9]
+        if not vals:
+            return None
+        vals.sort()
+        return vals[len(vals) // 2]
+
+    def reset_prompt_context(self):
+        """丢掉喂给 initial_prompt 的已提交上下文，但**保留音频缓冲**。
+
+        误切之后那段垃圾文字会经 initial_prompt 喂回解码器自我强化（避坑清单
+        记着"英文一旦被误认能锁死近 3 分钟"）。_prompt_language_mismatch 那道
+        保护对这个场景是瞎的：它数的是拉丁功能词，而被强制成中文时吐出来的
+        全是汉字，一个都数不到。
+
+        这里只清文字上下文、不动 self.audio_buffer——调用点是"解码质量已经
+        烂了但还没决定切不切语言"，音频还要接着识别。清完 _prompt() 会退回
+        LANGUAGE_SEED_PROMPTS 的语言锚。
+        """
+        self.commited = []
+
     def _ts_words(self, segments):
         """segment 流 → [(start, end, word)]，段级过滤静音幻觉。
 
@@ -352,6 +396,10 @@ class OnlineASRProcessor:
             vad_filter=True,
         )
         res = list(segments)
+        # ☠️ 必须在 _ts_words 之前从**原始** segment 流上取：那边会把幻觉段
+        # 和 no_speech 段过滤掉，而误切时被丢掉的恰恰是最烂的那几段——过滤
+        # 之后再算，等于专门把证据挑走了
+        self.last_avg_logprob = self._decode_logprob(res)
 
         tsw = self._ts_words(res)
         self.transcript_buffer.insert(tsw, self.buffer_time_offset)

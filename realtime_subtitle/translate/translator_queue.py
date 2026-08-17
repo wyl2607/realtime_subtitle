@@ -309,6 +309,57 @@ class LanguageVote:
         return None
 
 
+class DecodeHealth:
+    """解码质量的连击判定。纯状态机，不碰模型也不碰线程，单测直接跑。
+
+    职责只有一个：回答"当前源语言是不是设错了"。输入是每轮识别的
+    avg_logprob 中位数（见 OnlineASRProcessor._decode_logprob）。
+
+    ☠️ 为什么需要它，而不是靠已有的那几道防线：
+      - `LANGUAGE_SWITCH_MIN_PROB` 是**切换前**的闸，而误切那两次报的都是
+        1.00，它根本没有被触发的机会；
+      - `_prompt_language_mismatch` 数的是拉丁功能词，被强制成中文时吐出来
+        的全是汉字，一个都数不到（对这个场景是瞎的）；
+      - `HALLUCINATION_BLACKLIST` 只认固定套话，接不住随机乱词。
+    三道都在文字层面，而误切之后的文字是**通顺的**——只有解码器自己知道
+    它在硬凑。
+
+    只在**跨过阈值那一刻**返回一次 True（trigger 语义，不是电平语义），
+    免得一直烂着的音频每轮都触发一次自愈。
+    """
+
+    def __init__(self):
+        self.bad = 0
+        self.fired = False
+
+    def reset(self):
+        self.bad = 0
+        self.fired = False
+
+    def feed(self, logprob, threshold, need_rounds):
+        """喂一轮解码质量。返回 True 表示"刚跨过阈值，该自愈了"。
+
+        ☠️ logprob=None（本轮没有语音段）是**跳过**：既不计坏、也不清零。
+        三种取舍里只有这个是对的：
+          - 算成"坏"：说话人一停顿、放一段纯音乐就攒够连击，误触发；
+          - 算成"好"（清零）：更糟——真误切时，说话人每次换气都会把连击清掉，
+            而德语对谈的停顿密度足以让 4 连击**永远攒不满**，整个自愈就是死的；
+          - 跳过：连击的语义变成"最近 N 个**有语音**的轮次都解不动"，中间隔多少
+            静音都不影响。而只要有一轮解码正常就会清零，所以不存在"两个相隔
+            很远的孤立坏轮次也能攒够"——语言设对时正常轮次是连续不断的。
+        """
+        if logprob is None:
+            return False
+        if logprob >= threshold:
+            self.reset()          # 解码正常：连击清零，自愈资格也一并收回
+            return False
+        self.bad += 1
+        if self.bad < max(1, int(need_rounds)) or self.fired:
+            return False
+        self.fired = True         # 触发过就不再重复，等恢复正常再重新武装
+        return True
+
+
 def _glossary_applies():
     """GLOSSARY 是德→中的对照表，只有这个方向上注入才有意义。"""
     return (config.SOURCE_LANGUAGE == "de"
@@ -696,6 +747,10 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
             # 下次允许检测的时刻 + 滞回投票状态。都只在 ASR 线程里读写
             self._lang_detect_next = 0.0
             self._lang_vote = LanguageVote()
+            # 误切自愈：解码质量连击 + "正在抢救"标志。同样只在 ASR 线程读写。
+            # _lang_rescue 期间检测改用更短的 LANGUAGE_RESCUE_STREAK
+            self._decode_health = DecodeHealth()
+            self._lang_rescue = False
             self._asr_executor = ThreadPoolExecutor(max_workers=1)
 
             # 翻译队列：ASR线程往里放完整句子，翻译worker每次醒来把积压的全部
@@ -1695,6 +1750,49 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
             if not self.closing:
                 print(f"   ⚠️  模型预热失败（首句翻译会稍慢）: {e}")
 
+    def _check_decode_health(self):
+        """解码质量烂到一定程度 = 源语言八成设错了，立刻启动自愈（ASR 线程）。
+
+        自愈做三件事，都很便宜：
+          1. **清 prompt 上下文**——垃圾文字经 initial_prompt 自我强化是这个
+             故障"能锁死几分钟"的原因，断掉它比切不切语言更要紧，而且就算
+             判断错了，代价也只是丢一次上下文（下一句自己会补回来）；
+          2. **清掉检测冷却**——切换刚发生过时 LANGUAGE_SWITCH_COOLDOWN 会
+             把检测憋住 20 秒，而这正是最需要马上重测的时刻；
+          3. **降低连击要求**——见 config.LANGUAGE_RESCUE_STREAK。
+
+        注意它**不自己切语言**。要不要切、切到哪个，仍然只由
+        _maybe_detect_language 那条路（声学检测 + 置信度门 + 语言对白名单）
+        决定；这里只是把它从冷却里放出来。所以误报的最坏结果是"白清一次
+        上下文 + 早做一次 180ms 的检测"，不会凭解码质量瞎切语言。
+        """
+        if not getattr(config, "LANGUAGE_RESCUE_ENABLED", True):
+            return
+        if not getattr(config, "AUTO_DETECT_LANGUAGE", False):
+            return  # 自动检测关着时无处可切，清上下文也没意义
+        lp = getattr(self.processor, "last_avg_logprob", None)
+        if config.SHOW_PERFORMANCE and lp is not None:
+            print(f"   🩺 解码质量 avg_logprob {lp:+.2f}")
+        if not self._decode_health.feed(
+                lp,
+                getattr(config, "LANGUAGE_RESCUE_LOGPROB", -1.0),
+                getattr(config, "LANGUAGE_RESCUE_ROUNDS", 4)):
+            # 恢复正常了就撤掉抢救状态，检测回到正常连击数
+            if self._lang_rescue and not self._decode_health.bad:
+                self._lang_rescue = False
+            return
+
+        self._lang_rescue = True
+        self.processor.reset_prompt_context()
+        self._lang_vote.reset()      # 旧连击是在"语言已经错了"的前提下攒的
+        self._lang_detect_next = 0.0  # 撕掉冷却，下一句话就重测
+        name = language_name(config.SOURCE_LANGUAGE)
+        print(f"🩺 解码质量持续异常（avg_logprob {lp:+.2f} < "
+              f"{getattr(config, 'LANGUAGE_RESCUE_LOGPROB', -1.0)}），"
+              f"疑似源语言不是{name}：已清上下文并立即重测语言")
+        if self.on_status:
+            self.on_status(f"🩺 字幕异常，正在重新判定语言…")
+
     def _maybe_detect_language(self):
         """到点就做一次语言检测，够连击就请求切换语言对（跑在 ASR 线程）。
 
@@ -1732,10 +1830,16 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
         if config.SHOW_PERFORMANCE:
             print(f"   🌐 语言检测: {lang} ({prob:.2f})")
 
+        # 抢救状态下用更短的连击：解码质量已经证明当前语言是错的，
+        # "当前语言正确"这个先验塌了，再要 3 次确认纯属拖时间（见
+        # _check_decode_health）。置信度门不放松——那是防切错的最后一道
+        need_streak = (getattr(config, "LANGUAGE_RESCUE_STREAK", 2)
+                       if self._lang_rescue
+                       else getattr(config, "LANGUAGE_SWITCH_STREAK", 3))
         new_lang = self._lang_vote.feed(
             lang, prob, config.SOURCE_LANGUAGE, allowed,
             getattr(config, "LANGUAGE_SWITCH_MIN_PROB", 0.85),
-            getattr(config, "LANGUAGE_SWITCH_STREAK", 3))
+            need_streak)
         if not new_lang:
             return
 
@@ -1765,6 +1869,11 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
             self._lang_vote.reset()
             self._lang_detect_next = time.time() + getattr(
                 config, "LANGUAGE_SWITCH_COOLDOWN", 20.0)
+        # 抢救结束：语言已经换掉，健康度要从零重新观察。不清的话，切换后
+        # 头几轮若仍然偏低会立刻二次触发，而那时候 prompt 才刚锚回去
+        if getattr(self, "_decode_health", None) is not None:
+            self._decode_health.reset()
+            self._lang_rescue = False
         name = language_name(new_lang)
         tname = language_name(new_target)
         print(f"🌐 语言对已切换为: {name} → {tname}")
@@ -1873,6 +1982,9 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
 
         self._emit_display()
         self._maybe_draft()
+        # ☠️ 顺序不能反：自愈要在检测**之前**跑，它的作用正是把本轮的检测
+        # 冷却清掉。放到后面的话，发现解码烂了还得再等一整个检测间隔
+        self._check_decode_health()
         # ☠️ 语言检测必须在这里（ASR 线程内、识别刚跑完）：WhisperModel 不是
         # 线程安全的，见 streaming_asr.detect_language 的注释
         self._maybe_detect_language()
