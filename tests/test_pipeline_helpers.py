@@ -2165,6 +2165,40 @@ def test_hallucination_length_gate_is_tighter_for_chinese():
             "inzwischen mehrere Gerichte in Europa.")
 
 
+def test_hallucination_gate_catches_mixed_script_boilerplate():
+    """☠️ 2026-08-17 现场：中西混排的幻觉套话从中文档底下溜过去了。
+
+    自动语言检测误切到中文之后，屏幕上出现并写进了存档：
+
+        优优独播剧场——YoYoTelevisionSeriesExclusive   （37 字符）
+
+    "优独播剧场" 就在 HALLUCINATION_BLACKLIST 里，但当时的长度门是**按
+    SOURCE_LANGUAGE 选一档去量整串**：zh 档 30 → 37 > 30 → 判"太长，是真话"
+    → 漏杀；de 档 60 → 37 ≤ 60 → 拦下。也就是专门为中文加的那条词条，偏偏
+    只在中文模式下失效——6 个汉字的幻觉被 31 个拉丁字符的尾巴撑过了门。
+
+    同一个字符串在两种源语言下判定相反，这个不一致本身就是"选档"写法错了
+    的证据。现在按 _weighted_len 逐字符折算，与源语言无关。
+    """
+    asr = OnlineASRProcessor.__new__(OnlineASRProcessor)
+    mixed = "优优独播剧场——YoYoTelevisionSeriesExclusive"
+    spaced = "优优独播剧场——YoYo Television Series Exclusive"
+
+    # 两种源语言下都必须拦下，且判定一致（这才是这条测试的重点）
+    for lang in ("zh", "de"):
+        with _with_source_language(lang):
+            assert asr._is_hallucination(mixed), f"{lang} 档漏杀了混排幻觉"
+            assert asr._is_hallucination(spaced), f"{lang} 档漏杀了带空格变体"
+
+    # 折算规则本身：一个汉字抵两个拉丁字符
+    assert asr._weighted_len("abc") == 3
+    assert asr._weighted_len("汉字") == 4
+    # 纯中文串的行为和旧的 CJK 档逐字等价：30 字仍在门内、31 字仍在门外
+    with _with_source_language("zh"):
+        assert asr._is_hallucination("优独播剧场" + "啊" * 25)
+        assert not asr._is_hallucination("优独播剧场" + "啊" * 26)
+
+
 def test_chinese_blacklist_spares_real_speech_about_subscriptions():
     """☠️ 这条是防"以后有人凭印象往表里加词"的。
 

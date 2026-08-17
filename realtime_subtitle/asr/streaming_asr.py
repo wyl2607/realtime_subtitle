@@ -34,6 +34,11 @@ _DE_STOPWORDS = {
 # 复读判定时从词上剥掉的标点（"Geh!"和"Geh"算同一个词）
 _WORD_PUNCT = ".!?…,;:\"'«»„“”-–—"
 
+# 幻觉长度门的字符折算用（见 _weighted_len）。覆盖 NO_SPACE_LANGUAGES 里
+# 的两种文字：汉字（含扩展A）+ 日文假名。全角标点刻意不算——它们在中西
+# 混排的幻觉套话里也就一两个，按拉丁字符记更保守（更不容易误杀真话）。
+_CJK_CHAR = re.compile(r'[぀-ヿ㐀-䶿一-鿿]')
+
 
 class HypothesisBuffer:
     """两次连续识别结果的最长公共词前缀才提交（local agreement-2）
@@ -199,13 +204,42 @@ class OnlineASRProcessor:
     # 这种短固定句，真人讲话里出现同样的词（新闻里 "Copyright"、讨论字幕时的
     # "Untertitel"）一般是长句里的一个词。
     HALLUCINATION_MAX_CHARS = 60
-    # ☠️ 无空格语言要另设一档。60 个汉字的信息量约等于 150 个德语字符
-    # （config 里 MAX_PENDING_CHARS=60 ≈ MAX_PENDING_WORDS=24 就是这个换算），
-    # 拿德语的门去量中文等于把门放宽 2.5 倍，而命中的代价是**整段静默丢弃**。
+    # 无空格语言的等效门。60 个汉字的信息量约等于 150 个德语字符（config 里
+    # MAX_PENDING_CHARS=60 ≈ MAX_PENDING_WORDS=24 就是这个换算），拿德语的门
+    # 去量中文等于把门放宽 2.5 倍，而命中的代价是**整段静默丢弃**。
     # 30 这个值是在开发机的本地存档上量的（315 条真实中文原文的长度分布：
     # p50 11 字、p90 23 字、最长 51 字，样本内容未外传）——30 盖得住幻觉套话
     # （都是十几个字的固定句），又让真人的长句整段放行。
+    #
+    # ☠️ 它**不再是"中文模式下改用的另一个门"**（那个写法漏杀了混排幻觉，
+    # 见 _weighted_len）。现在只剩一个门 HALLUCINATION_MAX_CHARS，这个常量
+    # 的作用是提供折算权重的分母：60/30 = 一个汉字抵两个拉丁字符。
     HALLUCINATION_MAX_CHARS_CJK = 30
+
+    @classmethod
+    def _weighted_len(cls, text):
+        """按信息量折算的长度：一个汉字/假名算 CJK_WEIGHT 个拉丁字符。
+
+        ☠️ 这里**不能按 SOURCE_LANGUAGE 选一个档去量整串**（2026-08-17 现场）。
+        幻觉套话经常是中西混排的，而两档的差值恰好会把最典型的那条放过去：
+
+            "优优独播剧场——YoYoTelevisionSeriesExclusive"  共 37 字符
+                zh 档(30) → 37 > 30 → 判"太长，是真话" → **漏杀**
+                de 档(60) → 37 ≤ 60 → 拦下
+
+        也就是说专门为中文加的那条黑名单词条，偏偏在中文模式下失效——6 个
+        汉字的幻觉被 31 个拉丁字符的尾巴撑过了门。同一个字符串在两种源语言
+        下判定相反，这个不一致本身就说明"选档"的写法是错的。
+
+        改成逐字符折算之后规则与源语言无关：纯中文/纯德语的行为和原来逐字
+        相同（见下面权重的由来），只有混排串的判定被修正。
+        """
+        # 权重就是两档的比值（60/30=2），即"一个汉字 ≈ 两个拉丁字符"。
+        # 用比值而不是写死 2，是为了让上面两个常量继续是唯一的真值来源：
+        # 谁调其中一个，折算关系跟着走，不会出现常量和魔数各说各话。
+        weight = cls.HALLUCINATION_MAX_CHARS / cls.HALLUCINATION_MAX_CHARS_CJK
+        cjk = len(_CJK_CHAR.findall(text))
+        return (len(text) - cjk) + cjk * weight
 
     def _is_hallucination(self, text):
         """整段丢弃的判定，所以宁可漏杀不可误杀。
@@ -216,14 +250,12 @@ class OnlineASRProcessor:
         一句，日志里也只有 SHOW_PERFORMANCE 打开时才看得到。
 
         加一道长度门：幻觉都是短的固定套话，超过 HALLUCINATION_MAX_CHARS 的
-        段落里出现这些词，压倒性可能是真人在说话。
+        段落里出现这些词，压倒性可能是真人在说话。长度按 _weighted_len 折算，
+        中西混排串不再因为选错档而漏杀。
         """
         stripped = (text or "").strip()
-        cap = (self.HALLUCINATION_MAX_CHARS_CJK
-               if config.SOURCE_LANGUAGE in getattr(
-                   config, "NO_SPACE_LANGUAGES", ("zh", "ja"))
-               else self.HALLUCINATION_MAX_CHARS)
-        if len(stripped) > cap:
+        cap = self.HALLUCINATION_MAX_CHARS
+        if self._weighted_len(stripped) > cap:
             return False
         lowered = stripped.lower()
         return any(pattern in lowered for pattern in config.HALLUCINATION_BLACKLIST)
