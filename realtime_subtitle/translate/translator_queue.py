@@ -589,7 +589,21 @@ def _startup_warm_ollama(model=None):
         t0 = time.time()
         requests.post(
             f"{ollama_url()}/api/generate",
-            json={"model": model, "prompt": "", "keep_alive": "2h"},
+            json={"model": model, "prompt": "", "keep_alive": "2h",
+                  # ☠️ 预热也必须带 num_ctx，它和翻译/查词一样是"一条 Ollama
+                  # 调用路径"（CLAUDE.md 第 21 条）。不带的话装出来的是**默认
+                  # 上下文长度**的 runner，首句翻译按 OLLAMA_NUM_CTX 一请求就
+                  # 换 runner，整个模型重装一遍——预热白做，而它存在的唯一
+                  # 理由就是免掉这笔钱。2026-08-28 实测(qwen3.5:4b, 0.33.1)：
+                  # 预热(默认) → 翻译 num_ctx=8192，load_duration **6.34 秒**；
+                  # 预热带上 num_ctx 之后同样这句 load_duration **0.00 秒**。
+                  # 现在默认值恰好也是 4096、和 OLLAMA_NUM_CTX 撞上了，所以
+                  # 一直没暴露。别指望这个巧合：用户在 config_local.py 改一下
+                  # OLLAMA_NUM_CTX（CLAUDE.md 第 2 节明确鼓励改那个文件），
+                  # 或者 Ollama 哪次升级动了默认上下文长度，都会让它失效——
+                  # 而且**失败是静默的**，日志照样打印"🔥 预热完成"，只有首句
+                  # 白付 6 秒然后撞 OLLAMA_TIMEOUT=15（issue #16 那套震荡）。
+                  "options": {"num_ctx": getattr(config, "OLLAMA_NUM_CTX", 4096)}},
             timeout=120,  # 冷加载可能要十几秒，网络栈慢时再宽些
         ).close()
         _warm_ok = True
@@ -1414,7 +1428,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
             # 半句片段，模型会把整段上下文重翻一遍上屏（实测 3/3 复现，74字 vs 15字），
             # 用户看到的是刚读过的几句又滚一遍；第二条挡"（注：建议补全后半句…）"这
             # 类译注；第三条挡 24 小时制时间（22.15 Uhr 实测 3/3 被翻成"九点十五"）。
-            prompt = f"""/no_think 你是{lang_name}{style_role}。请把{lang_name}对白翻译成自然的{target_name}。
+            prompt = f"""你是{lang_name}{style_role}。请把{lang_name}对白翻译成自然的{target_name}。
 
 【要求】
 {style_rules}
@@ -1739,9 +1753,12 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
         try:
             t0 = time.time()
             # prompt留空：Ollama只加载模型不生成，是官方的预热用法
+            # num_ctx 的理由同 _startup_warm_ollama：不带就是装了个默认上下文
+            # 长度的 runner，切模式后第一句照样要重装一遍（CLAUDE.md 第 21 条）
             self.ollama_session.post(
                 f"{ollama_url()}/api/generate",
-                json={"model": model, "prompt": "", "keep_alive": "2h"},
+                json={"model": model, "prompt": "", "keep_alive": "2h",
+                      "options": {"num_ctx": getattr(config, "OLLAMA_NUM_CTX", 4096)}},
                 timeout=60,  # 冷加载可能要十几秒
             ).close()
             self._ollama_hot = True  # 新模型已进显存，翻译可以回到正常超时

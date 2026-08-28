@@ -359,6 +359,24 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     `load_duration` 0.27 秒、单次查词 3.3~4.0 秒。加新的 Ollama 调用路径时
     别写 num_ctx 字面量，`test_lookup_worker_shares_num_ctx_with_translation`
     会盯着查词这一条。
+
+    **☠️「预热」也是一条 Ollama 调用路径**（2026-08-28 补，本条最容易漏的地方）。
+    `_startup_warm_ollama` / `_warm_model_worker` 那两个空 prompt 请求曾经不带
+    `num_ctx`，于是装出来的是**默认上下文长度**的 runner，首句翻译一请求就换
+    runner、整个模型重装一遍——**预热白做，而它存在的唯一理由就是免掉这笔钱**。
+    实测（qwen3.5:4b / Ollama 0.33.1）：预热(默认) → 翻译 `num_ctx=8192`
+    `load_duration` **6.34 秒**；预热带上 `num_ctx` 之后同样这句 **0.00 秒**。
+
+    这个 bug 藏得住是因为 **Ollama 当前的默认上下文长度恰好也是 4096**，和
+    `OLLAMA_NUM_CTX` 撞上了。别指望这个巧合：用户按第 2 节改一下
+    `OLLAMA_NUM_CTX`、或者 Ollama 哪次升级动了默认值，它就没了。而且
+    **失败是静默的**——日志照样打印「🔥 预热完成」，只有首句白付 6 秒，
+    然后正好撞上 `OLLAMA_TIMEOUT=15` 和第 25 条那套超时震荡，现象是
+    「装完第一次用，头一两分钟只有德语没中文」，极易误诊成 Ollama 没跑。
+    `test_warm_requests_share_num_ctx_with_translation` 盯着这两条路径，
+    它**故意把 num_ctx 设成 4096 以外的值**，就是为了不让那个巧合把测试变空。
+    唯一不需要 num_ctx 的是卸载请求（`keep_alive=0`）：卸载按模型名整个卸，
+    不挑 runner。
 22. **☠️ `OLLAMA_BASE_URL` 必须写 `http://127.0.0.1:11434`，不能写 `localhost`。**
     Ollama 只监听 IPv4（`netstat -ano | findstr 11434` 看得到只有
     `127.0.0.1:11434` 一条），而 Windows 上 `getaddrinfo("localhost")` 返回

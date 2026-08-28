@@ -1370,6 +1370,64 @@ def test_warm_model_worker_waits_for_startup_warm_before_unload(monkeypatch):
     assert order[1:] == ["unload", "warm-new"], order
 
 
+def test_warm_requests_share_num_ctx_with_translation(monkeypatch):
+    """☠️ 两条预热路径也必须带 config.OLLAMA_NUM_CTX（CLAUDE.md 第 21 条）。
+
+    Ollama 的 runner 按 (模型, 上下文长度) 缓存。预热不带 num_ctx = 装了个
+    **默认上下文长度**的 runner，首句翻译按 OLLAMA_NUM_CTX 一请求就换 runner、
+    整个模型重装一遍——预热白做，而它存在的唯一理由就是免掉这笔钱。
+
+    2026-08-28 实测（qwen3.5:4b / Ollama 0.33.1）：
+        预热(默认) → 翻译 num_ctx=8192   load_duration **6.34 秒**
+        预热带 num_ctx → 同样这句        load_duration **0.00 秒**（wall 0.25s）
+
+    ☠️ 别因为"现在跑着没事"就删掉这条测试：没事只是因为 Ollama 当前的默认
+    上下文长度恰好也是 4096、和 OLLAMA_NUM_CTX 撞上了。用户在 config_local.py
+    改一下 OLLAMA_NUM_CTX（第 2 节明确鼓励改那个文件），或者 Ollama 哪次升级
+    动了默认值，巧合就没了。而且**失败是静默的**：日志照样打印"🔥 预热完成"，
+    只有首句白付 6 秒然后撞 OLLAMA_TIMEOUT=15（issue #16 那套超时震荡）。
+    这条测试盯的就是那个巧合——所以它必须把 num_ctx 设成 4096 以外的值。
+    """
+    import realtime_subtitle.translate.translator_queue as tq
+
+    monkeypatch.setattr(config, "OLLAMA_NUM_CTX", 8192)
+
+    class _Resp:
+        def close(self):
+            pass
+
+    # ① 启动预热（模块级 requests.post，独立于 session）
+    posted = []
+    monkeypatch.setattr(tq.requests, "post",
+                        lambda url, json=None, timeout=None: (posted.append(json), _Resp())[1])
+    tq._spawn_startup_warm()
+    tq._warm_thread.join(timeout=5)
+    assert posted, "启动预热一个请求都没发"
+    assert posted[0]["options"]["num_ctx"] == 8192, (
+        f"启动预热漏了 num_ctx，装出来的 runner 和翻译对不上：{posted[0]}")
+
+    # ② 切模型后的预热（走 ollama_session）。卸载那条 keep_alive=0 不算——
+    #    卸载是按模型名整个卸，不挑 runner，带不带 num_ctx 都一样
+    warmed = []
+
+    class _Session:
+        def post(self, url, json=None, timeout=None):
+            if json.get("keep_alive") != 0:
+                warmed.append(json)
+            return _Resp()
+
+    t = tq.WhisperQueueTranslator.__new__(tq.WhisperQueueTranslator)
+    t.ollama_session = _Session()
+    t.closing = False
+    t._ollama_hot = True
+    monkeypatch.setattr(tq, "_warm_thread", None, raising=False)
+    t._warm_model_worker(old_model="qwen3.5:9b", new_model="qwen3.5:4b")
+
+    assert warmed, "切模型后的预热一个请求都没发"
+    assert warmed[0]["options"]["num_ctx"] == 8192, (
+        f"切模型预热漏了 num_ctx，切完第一句还要重装一遍：{warmed[0]}")
+
+
 def test_translator_note_is_stripped():
     """☠️ 2026-08-02 ZDF 实测：句子被截断时模型会追加一整段"（注：建议补全
     后半句…）"到字幕条上。prompt 里已经禁止，这里是兜底剥离。"""
