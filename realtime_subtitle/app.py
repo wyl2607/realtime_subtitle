@@ -338,6 +338,7 @@ class SubtitleApp:
             2: ("Ctrl+Alt+L", ord('L'), self._switch_language),
             3: ("Ctrl+Alt+M", ord('M'), self.subtitle_window.toggle_click_through),
             4: ("Ctrl+Alt+G", ord('G'), self._toggle_perf_hotkey),
+            5: ("Ctrl+Alt+C", ord('C'), self.subtitle_window.toggle_cinema),
         }
 
         def hotkey_loop():
@@ -510,7 +511,8 @@ class SubtitleApp:
         print(f"   - 源语言: {config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)}")
         print(f"   - 翻译语域: {getattr(config, 'TRANSLATION_STYLE', '（默认）')}")
         print(f"   - 快捷键: Ctrl+Alt+P 暂停/继续, Ctrl+Alt+L 切换源语言,")
-        print(f"             Ctrl+Alt+M 鼠标穿透, Ctrl+Alt+G 跳「⚡性能」模式")
+        print(f"             Ctrl+Alt+M 鼠标穿透, Ctrl+Alt+G 跳「⚡性能」模式,")
+        print(f"             Ctrl+Alt+C 影院字幕条（全屏看剧）")
         print("\n" + "=" * 60)
         print("🎉 开始享受实时字幕吧！")
         print("=" * 60 + "\n")

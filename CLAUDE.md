@@ -484,6 +484,21 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     就能复现（torch 只要能 import，临时放个空的 `torch.py` 在 PYTHONPATH 里
     即可，不用真下几百 MB）。
 
+    **第三种成因：Qt 虚函数重写里抛异常**（2026-08-28 加 🎞 影院条时踩的）。
+    `CinemaBar.changeEvent` 里写了 `QEvent.ScreenChangeInternal` —— 那是 Qt 的
+    **内部**枚举，PyQt5 根本没暴露（`dir(QEvent)` 里一个带 screen 的都没有）。
+    窗口一构造 `changeEvent` 就被调用 → AttributeError → **PyQt5 对虚函数重写
+    里的未捕获异常是直接 `abort()` 整个进程**，不往上抛。现象和上面两种一模
+    一样：跑到 90% 直接消失，无 FAILED、无 traceback、退出码 127。
+
+    ☠️ **这一种上面那个"单文件 -x --tb=short"的区分办法不管用**——它根本不
+    产生 traceback，单独构造那个窗口同样是秒退无输出。只能逐行 `print(flush=True)`
+    二分到具体哪一句。教训：**在 Qt 虚函数重写（`changeEvent`/`eventFilter`/
+    `showEvent`/`paintEvent`…）里，任何属性访问都要先确认它在 PyQt5 里真存在**。
+    `test_ui_code_never_references_nonexistent_qevent_members` 现在源码扫描
+    `realtime_subtitle/ui/*.py` 里所有 `QEvent.X`，写下去就红——用源码扫描而不是
+    行为测试，是因为行为测试要真触发那条分支才炸，而它平时不触发。
+
 28. **☠️ 运行时文件的路径一律走 `realtime_subtitle/paths.py`，别再用 `__file__` 推**
     （2026-08-11，上一条的直接后果，隔了一天才发现）。第 26 条只修了 import，
     **按 `__file__` 算落点的代码一处都没改**，于是包化之后：

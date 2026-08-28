@@ -48,6 +48,7 @@ from realtime_subtitle.ui.settings_window import (  # noqa: F401
 )
 from realtime_subtitle.ui.popups import HistoryWindow, WordPopup, AIAnalysisPopup
 from realtime_subtitle.ui.tv_window import TVWindow
+from realtime_subtitle.ui.cinema_bar import CinemaBar
 from realtime_subtitle.ui.window_chrome import WindowChromeMixin
 from realtime_subtitle.ui.subtitle_render import LiveTextRenderMixin
 
@@ -99,6 +100,7 @@ class SubtitleSignals(QObject):
     ai_analysis = pyqtSignal(str, int)  # 🤖 背景总结结果 (text, seq)
     deep_explain = pyqtSignal(str, int)  # 点词「深度解释」结果 (text, seq)
     toggle_ct = pyqtSignal()  # 切换鼠标穿透模式（热键线程→主线程）
+    toggle_cinema = pyqtSignal()  # 切换 🎞 影院字幕条（热键线程→主线程）
     mode = pyqtSignal(object)  # 当前模式名(str)或 None(自定义)：热键线程→主线程
 
 class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
@@ -196,6 +198,13 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         self.tv_btn.setStyleSheet(button_style)
         self.tv_btn.clicked.connect(self._toggle_tv)
         self.tv_btn.setToolTip("电视全屏模式（大字滚动，Esc 退出）")
+
+        # 影院字幕条：叠在全屏视频底部的透明覆盖层（全屏看剧场景）
+        self.cinema_btn = QPushButton("🎞")
+        self.cinema_btn.setFixedSize(30, 30)
+        self.cinema_btn.setStyleSheet(button_style)
+        self.cinema_btn.clicked.connect(self._toggle_cinema)
+        self.cinema_btn.setToolTip("影院字幕条（叠在全屏视频底部，鼠标可穿透）")
 
         # AI 分析：最近几分钟背景总结（本地 Ollama → 可跳网页版追问）
         self.ai_btn = QPushButton("🤖")
@@ -306,8 +315,8 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         bar_layout = QHBoxLayout()
         bar_layout.setContentsMargins(0, 0, 0, 0)
         bar_layout.setSpacing(6)
-        for b in (self.minimize_btn, self.history_btn, self.tv_btn,
-                  self.ai_btn, self.settings_btn, self.quit_btn):
+        for b in (self.minimize_btn, self.history_btn, self.cinema_btn,
+                  self.tv_btn, self.ai_btn, self.settings_btn, self.quit_btn):
             b.setParent(self.btn_bar)
             bar_layout.addWidget(b)
         self.btn_bar.setLayout(bar_layout)
@@ -394,6 +403,19 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         # 这半秒钟混在启动过程里感觉不到。
         self.tv_window.warm_up()
 
+        # 🎞 影院字幕条（初始隐藏）：叠在全屏视频底部的透明覆盖层。
+        # 不做 warm_up：它不走 showFullScreen，没有那笔全屏转场固定开销。
+        cine_state = self._state.get("cinema") or {}
+        try:
+            config.CINEMA_FONT_SIZE = int(cine_state["font_size"])
+        except (KeyError, TypeError, ValueError):
+            pass
+        if isinstance(cine_state.get("show_german"), bool):
+            config.CINEMA_SHOW_GERMAN = cine_state["show_german"]
+        self.cinema_bar = CinemaBar()
+        ci = cine_state.get("screen_index")
+        self.cinema_bar.screen_index = ci if isinstance(ci, int) else None
+
         # ⚙️/📜 几何：有持久化就恢复（钳进当前某屏）；否则首次显示时贴字幕窗所在屏
         self._settings_ever_shown = False
         self._history_ever_shown = False
@@ -428,6 +450,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         self.signals.ai_analysis.connect(self._show_ai_analysis)
         self.signals.deep_explain.connect(self._show_deep_explain)
         self.signals.toggle_ct.connect(self._toggle_click_through)
+        self.signals.toggle_cinema.connect(self._toggle_cinema)
         self.signals.mode.connect(self._on_mode_applied)
         
         print("✅ 字幕窗口已创建")
@@ -564,6 +587,11 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
             state["history_geo"] = self._state["history_geo"]
         state["tv"] = {"font_size": int(config.TV_FONT_SIZE),
                        "screen_index": self.tv_window.screen_index}
+        # 🎞 只存样式偏好，**不存"上次是不是开着"**：影院条是跟着"我现在要全屏
+        # 看剧"这个当下意图开的，重启后默认关着才对（开着会挡住下一次的普通使用）
+        state["cinema"] = {"font_size": int(config.CINEMA_FONT_SIZE),
+                           "show_german": bool(config.CINEMA_SHOW_GERMAN),
+                           "screen_index": self.cinema_bar.screen_index}
         state["tuning"] = collect_tuning()
         # 当前模式名（None → JSON null）；仅显示态，重启不重放模型/beam 副作用
         active = getattr(self.settings_window, "_active_preset", None)
@@ -594,6 +622,14 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
     def toggle_click_through(self):
         """切换鼠标穿透（线程安全，热键线程调用）"""
         self.signals.toggle_ct.emit()
+
+    def toggle_cinema(self):
+        """切换 🎞 影院字幕条（线程安全，热键线程调用）。
+
+        ☠️ 必须有热键，光有按钮是不够的：影院条的使用场景就是**视频已经全屏**，
+        而那时候主字幕窗被视频盖住，右上角那排按钮一个都点不到。
+        """
+        self.signals.toggle_cinema.emit()
 
     def notify_mode_applied(self, name):
         """模式已应用（线程安全，热键线程/主线程都调这个）→ 主线程同步 UI"""
@@ -688,6 +724,21 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
             self.tv_window.backfill([zh for _, zh, _ in self.sentence_pairs])
             self.tv_window.open_fullscreen(
                 avoid_center=self.container.frameGeometry().center())
+
+    def _toggle_cinema(self):
+        """切换影院字幕条：开在**主字幕窗所在**那块屏（视频就在这块屏上）。
+
+        和 📺 相反：📺 avoid 主窗（另一块屏当电视），🎞 prefer 主窗那块屏。
+        打开时立刻把最后一句灌进去，别让用户对着空条等下一句才知道它活着。
+        """
+        if self.cinema_bar.isVisible():
+            self.cinema_bar.hide()
+            return
+        self.cinema_bar.open_on(
+            prefer_center=self.container.frameGeometry().center())
+        if self.sentence_pairs:
+            de, zh, _ = self.sentence_pairs[-1]
+            self.cinema_bar.append_pair(de, zh)
 
     def _on_ai_analysis_clicked(self):
         """🤖：过滤最近 N 分钟德文 → 本地总结；空内容直接提示不打 Ollama。"""

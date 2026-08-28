@@ -294,6 +294,23 @@ FONT_SIZE = 22  # 字体大小（首次运行按屏幕 DPI 缩放倍率放大）
 TV_FONT_SIZE = 64       # 全屏大字字号（Ctrl+滚轮调节）
 TV_FONT_SIZE_MIN = 24
 TV_FONT_SIZE_MAX = 160
+
+# ============ 影院字幕条（🎞，全屏看剧用）============
+# 叠在全屏视频最下方的 Netflix/YouTube 式字幕条：透明背景 + 文字自带半透明
+# 黑底，只显示最新一句，说完自动淡出。
+# ☠️ 和 📺 电视全屏是两回事，别混：📺 是**不透明黑底全屏**窗（副屏/电视场景，
+# 盖在视频上会全黑），本条是**叠在视频上的透明覆盖层**（单屏全屏看剧场景）。
+CINEMA_FONT_SIZE = 34        # 中文字号（Ctrl+滚轮调节；德语按下面的比例缩）
+CINEMA_FONT_SIZE_MIN = 16
+CINEMA_FONT_SIZE_MAX = 96
+CINEMA_GERMAN_RATIO = 0.62   # 德语行字号 = 中文字号 × 此比例（原文当参考，不抢戏）
+CINEMA_SHOW_GERMAN = True    # 字幕条是否也显示德语原文（False = 纯中文，最不挡画面）
+CINEMA_BOTTOM_MARGIN = 64    # 距屏幕底部的像素（留出播放器进度条的位置）
+CINEMA_MAX_WIDTH_RATIO = 0.8  # 字幕条最大宽度占屏宽的比例（太宽读起来要转头）
+CINEMA_BG_ALPHA = 150        # 文字底衬的黑色不透明度 0-255（0=纯描边无底衬）
+# 最后一句显示满这么久还没有新句子就淡出，别在画面上杵着。
+# 0 = 不自动隐藏（一直显示最后一句）
+CINEMA_HOLD_SEC = 6.0
 FONT_FAMILY = "Microsoft YaHei, Arial"  # 字体
 MAX_SUBTITLE_LENGTH = 400  # 字幕最大字符数（双语显示需要更多空间）
 SHOW_BILINGUAL = True  # 同时显示德语原文和中文翻译
