@@ -128,7 +128,7 @@ def build_background_summary_prompt(german_text):
     """🤖 背景总结：3-5 句中文讲最近在聊什么。"""
     lang_name = config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)
     return (
-        f"/no_think 你在帮一位正在看{lang_name}直播/视频的中文用户快速跟上背景。"
+        f"你在帮一位正在看{lang_name}直播/视频的中文用户快速跟上背景。"
         f"下面是最近几分钟的{lang_name}字幕原文（可能有识别误差）。\n\n"
         f"{german_text}\n\n"
         "请用中文写 3-5 句话：这段时间在讲什么主题、关键人物/事件、"
@@ -140,7 +140,7 @@ def build_deep_explain_prompt(sentence):
     """点词升级：整句背景/含义/俚语双关，比单词释义更展开。"""
     lang_name = config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)
     return (
-        f"/no_think 你在帮一位中文用户理解一句{lang_name}对白的深层含义。\n"
+        f"你在帮一位中文用户理解一句{lang_name}对白的深层含义。\n"
         f"原句：{sentence}\n\n"
         "请用中文解释：\n"
         "1) 这句话在说什么（自然通顺的释义）\n"
@@ -456,7 +456,7 @@ class LookupMixin:
         # 双检：submit 前到 worker 之间可能已被别的点击填入缓存
         if self._serve_cached_lookup(word, cache_key, context, callback):
             return
-        prompt = f"""/no_think 你是{lang_name}汉词典。简明解释{lang_name}单词"{word}"。
+        prompt = f"""你是{lang_name}汉词典。简明解释{lang_name}单词"{word}"。
 它出现在这句话里：{context}
 
 严格按这个格式输出，不要多余内容：

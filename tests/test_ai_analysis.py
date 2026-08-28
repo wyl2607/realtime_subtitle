@@ -99,16 +99,31 @@ def test_filter_skips_legacy_two_tuples_without_timestamp():
 # prompt / URL
 # ---------------------------------------------------------------------------
 
-def test_background_summary_prompt_contains_source_and_no_think():
+# ☠️ 2026-08-28 实测（qwen3.5:4b / Ollama 0.33.1）：qwen3.5 **不再认**
+# `/no_think` 这个 magic token，真正关掉思考的只有 API 的 `think: False`。
+# 同一句德语三组对照（num_predict=512）：
+#     /no_think + think=False   18 tok / 0.34s / 输出正常   ← 改之前的写法
+#     只有 think=False          20 tok / 0.33s / 输出正常   ← 现在的写法
+#     只有 /no_think，不传 think  **512 tok / 5.57s / response 为空**
+# 第三行就是把 `think: False` 当冗余删掉之后会发生的事：整段生成全跑进
+# thinking 字段、撞满 num_predict，字幕拿到一个空串。所以 prompt 里那个
+# `/no_think` 不是"保险"，是**假保险**——留着只会让人以为它还在起作用。
+# 要挡思考请改 payload 的 `think`，别往 prompt 里加 token。
+_NO_THINK_IS_DEAD = (
+    "prompt 里不该再出现 /no_think：qwen3.5 已经不认它了，"
+    "真正生效的是 payload 里的 think=False（见本文件顶部注释）")
+
+
+def test_background_summary_prompt_contains_source():
     p = build_background_summary_prompt("Das ist ein Test.")
-    assert "/no_think" in p
+    assert "/no_think" not in p, _NO_THINK_IS_DEAD
     assert "Das ist ein Test." in p
     assert "3-5" in p or "3–5" in p
 
 
 def test_deep_explain_prompt_is_richer_than_word_lookup():
     p = build_deep_explain_prompt("Das ist der absolute Wahnsinn!")
-    assert "/no_think" in p
+    assert "/no_think" not in p, _NO_THINK_IS_DEAD
     assert "Das ist der absolute Wahnsinn!" in p
     # 比查词格式（原形/词性/释义）更展开：背景 + 俚语
     assert "俚语" in p or "双关" in p
@@ -507,6 +522,39 @@ def test_lookup_worker_shares_num_ctx_with_translation():
 
     assert posted[0]["options"]["num_ctx"] == config.OLLAMA_NUM_CTX
     assert posted[0]["stream"] is True, "查词要流式，首行才能先上屏"
+
+
+def test_ollama_requests_disable_thinking_via_payload():
+    """☠️ 挡住思考的是 payload 里的 `think: False`，不是 prompt 里的 /no_think。
+
+    见本文件顶部 _NO_THINK_IS_DEAD 那段实测：qwen3.5 不认 /no_think，只传它
+    不传 think 的话，512 个 token 全跑进 thinking 字段、字幕拿到空串。
+    以前**一条测试都没盯过 think**（真正生效的机制反而是裸的），而 prompt 里
+    那个假保险却有两条测试盯着——2026-08-28 把这个盯反了的地方掉了个个儿。
+    """
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
+
+    posted = []
+
+    class _FakeSession:
+        def post(self, url, json, stream=False, timeout=None):
+            posted.append(json)
+            return _FakeStreamResponse(["结果"])
+
+    # ① 查词
+    t = _lookup_translator()
+    t.lookup_session = _FakeSession()
+    WhisperQueueTranslator._lookup_worker(
+        t, "Wort", "ein Kontext", lambda w, txt: None, seq=1)
+
+    # ② AI 分析（背景总结 / 深度解释共用这条）
+    t.analysis_session = _FakeSession()
+    WhisperQueueTranslator._run_ai_analysis_request(t, "prompt", lambda x: None)
+
+    assert len(posted) == 2, posted
+    for p in posted:
+        assert p["think"] is False, f"漏了 think=False，生成会全跑进 thinking：{p}"
+        assert "/no_think" not in p["prompt"], _NO_THINK_IS_DEAD
 
 
 def test_lookup_worker_streams_partial_lines_only():
