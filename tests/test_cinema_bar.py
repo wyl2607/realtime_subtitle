@@ -197,6 +197,84 @@ def test_clamp_screen_index():
 
 
 # ---------------------------------------------------------------------------
+# ⚙️ 面板接线
+# ---------------------------------------------------------------------------
+
+def _panel_with_bar():
+    """⚙️ 面板 + 挂好的影院条（真实里由 SubtitleWindow.__init__ 回挂）。"""
+    from realtime_subtitle.ui.settings_window import SettingsWindow
+    _app()
+    win = SettingsWindow()
+    bar = CinemaBar()
+    bar.resize(600, 200)
+    bar.show()
+    win._cinema_bar = bar
+    return win, bar
+
+
+def test_cinema_controls_do_not_drop_out_of_preset():
+    """☠️ 调影院条**不该**把左上角指示器打成「⚙️ 自定义」。
+
+    PRESETS 里没有任何一个模式定义 CINEMA_* 键，所以调字幕条字号并没有偏离
+    当前模式。而模式身份一掉就再也回不去（面板本来就有的痛点），别再加新的
+    触发点——对照组是 test_presets 里那条：拨 idle_flush_slider 必须掉出模式。
+    """
+    win, _bar = _panel_with_bar()
+    orig = (config.CINEMA_FONT_SIZE, config.CINEMA_BG_ALPHA, config.CINEMA_SHOW_GERMAN)
+    try:
+        win.restore_active_preset("看剧")
+        assert win._active_preset == "看剧"
+
+        info = win.cinema_font_slider
+        info["slider"].setValue(round(40 / info["step"]))
+        assert config.CINEMA_FONT_SIZE == 40, "值要真写进 config"
+        assert win._active_preset == "看剧", "调字号不该掉出「看剧」"
+
+        info = win.cinema_alpha_slider
+        info["slider"].setValue(round(200 / info["step"]))
+        assert config.CINEMA_BG_ALPHA == 200
+        assert win._active_preset == "看剧", "调底衬不该掉出「看剧」"
+
+        win.cinema_german_cb.setChecked(False)
+        assert config.CINEMA_SHOW_GERMAN is False
+        assert win._active_preset == "看剧", "切德语行不该掉出「看剧」"
+    finally:
+        (config.CINEMA_FONT_SIZE, config.CINEMA_BG_ALPHA,
+         config.CINEMA_SHOW_GERMAN) = orig
+
+
+def test_panel_pushes_style_to_the_bar_live():
+    """面板一动，字幕条当场重排——不用重启也不用等下一句。"""
+    win, bar = _panel_with_bar()
+    orig = config.CINEMA_FONT_SIZE
+    try:
+        bar.append_pair("Hallo", "你好")
+        info = win.cinema_font_slider
+        info["slider"].setValue(round(48 / info["step"]))
+        assert "48px" in bar.chinese_label.styleSheet(), "字号没推到样式表"
+    finally:
+        config.CINEMA_FONT_SIZE = orig
+
+
+def test_hiding_german_clears_the_stale_german_line():
+    """☠️ 关掉德语行要连当前内容一起清。
+
+    否则关掉之后**上一行德语还留在屏幕上**，要等下一句才消失——用户会以为
+    开关没生效。
+    """
+    win, bar = _panel_with_bar()
+    orig = config.CINEMA_SHOW_GERMAN
+    try:
+        bar.append_pair("Guten Abend", "晚上好")
+        assert bar.german_label.text() == "Guten Abend"
+        win.cinema_german_cb.setChecked(False)
+        assert bar.german_label.text() == "", "残留的德语行没清掉"
+    finally:
+        config.CINEMA_SHOW_GERMAN = orig
+        win.cinema_german_cb.setChecked(orig)
+
+
+# ---------------------------------------------------------------------------
 # 与主窗接线
 # ---------------------------------------------------------------------------
 
@@ -231,9 +309,12 @@ def test_subtitle_window_wires_cinema_bar_and_persists_style():
         win._save_state_if_changed()
         with open(sw_mod.STATE_FILE, encoding="utf-8") as f:
             state = json.load(f)
-        assert "cinema" in state
-        assert set(state["cinema"]) == {"font_size", "show_german", "screen_index"}
+        # ☠️ 样式三项走 tuning（唯一数据源），state["cinema"] 只剩 screen_index
+        assert set(state["cinema"]) == {"screen_index"}
         assert "visible" not in state["cinema"], "别持久化开关态，理由见 docstring"
+        for key in ("CINEMA_FONT_SIZE", "CINEMA_SHOW_GERMAN", "CINEMA_BG_ALPHA"):
+            assert key in state["tuning"], f"{key} 该由 tuning 持久化"
+            assert key not in state["cinema"], f"{key} 存了两份，迟早漂"
         win.container.close()
     finally:
         sw_mod.STATE_FILE = orig_state

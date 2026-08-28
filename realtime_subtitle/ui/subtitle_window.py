@@ -405,16 +405,15 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
 
         # 🎞 影院字幕条（初始隐藏）：叠在全屏视频底部的透明覆盖层。
         # 不做 warm_up：它不走 showFullScreen，没有那笔全屏转场固定开销。
+        # ☠️ 字号/底衬/德语开关走 TUNING_KEYS（apply_tuning 早就写回 config 了），
+        # 这里**不要**再从 state["cinema"] 读一遍——两个数据源必然会漂。
+        # state["cinema"] 只剩 screen_index：那是窗口状态不是 config 值。
         cine_state = self._state.get("cinema") or {}
-        try:
-            config.CINEMA_FONT_SIZE = int(cine_state["font_size"])
-        except (KeyError, TypeError, ValueError):
-            pass
-        if isinstance(cine_state.get("show_german"), bool):
-            config.CINEMA_SHOW_GERMAN = cine_state["show_german"]
         self.cinema_bar = CinemaBar()
         ci = cine_state.get("screen_index")
         self.cinema_bar.screen_index = ci if isinstance(ci, int) else None
+        # 面板比它先构造，建好后回挂，⚙️ 里那三个控件才推得动它
+        self.settings_window._cinema_bar = self.cinema_bar
 
         # ⚙️/📜 几何：有持久化就恢复（钳进当前某屏）；否则首次显示时贴字幕窗所在屏
         self._settings_ever_shown = False
@@ -587,11 +586,10 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
             state["history_geo"] = self._state["history_geo"]
         state["tv"] = {"font_size": int(config.TV_FONT_SIZE),
                        "screen_index": self.tv_window.screen_index}
-        # 🎞 只存样式偏好，**不存"上次是不是开着"**：影院条是跟着"我现在要全屏
-        # 看剧"这个当下意图开的，重启后默认关着才对（开着会挡住下一次的普通使用）
-        state["cinema"] = {"font_size": int(config.CINEMA_FONT_SIZE),
-                           "show_german": bool(config.CINEMA_SHOW_GERMAN),
-                           "screen_index": self.cinema_bar.screen_index}
+        # 🎞 样式三项在 tuning 里（唯一数据源），这里只剩它在哪块屏。
+        # **不存"上次是不是开着"**：影院条跟着"我现在要全屏看剧"这个当下意图开，
+        # 重启后默认关着才对（开着会挡住下一次的普通使用）
+        state["cinema"] = {"screen_index": self.cinema_bar.screen_index}
         state["tuning"] = collect_tuning()
         # 当前模式名（None → JSON null）；仅显示态，重启不重放模型/beam 副作用
         active = getattr(self.settings_window, "_active_preset", None)

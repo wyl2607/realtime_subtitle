@@ -28,6 +28,13 @@ TUNING_KEYS = (
     "UNSTABLE_TEXT_COLOR",
     "FONT_FAMILY",
     "TRANSLATION_STYLE",
+    # 🎞 影院字幕条的样式。放这里而不是 state["cinema"]，是为了**只有一个
+    # 数据源**——两边都存会在"面板改了值但没重启"时对不上。
+    # state["cinema"] 现在只剩 screen_index（那是窗口状态不是 config 值，
+    # 和 tv 的 screen_index 同类）。
+    "CINEMA_FONT_SIZE",
+    "CINEMA_SHOW_GERMAN",
+    "CINEMA_BG_ALPHA",
 )
 
 
@@ -158,6 +165,8 @@ class SettingsWindow(DraggableWidget):
         self._active_preset = None
         self._applying_preset = False
         self._preset_buttons = {}  # name -> QPushButton
+        # 🎞 影院条由 SubtitleWindow 建好之后挂进来（它比本面板晚构造）
+        self._cinema_bar = None
 
         layout = QVBoxLayout()
 
@@ -323,10 +332,45 @@ class SettingsWindow(DraggableWidget):
         display_layout.addWidget(font_row)
         display_group.setLayout(display_layout)
 
+        # ---- 🎞 影院字幕条（全屏看剧叠在视频底部的那条）----
+        # 单独一组：它和上面那些"悬浮窗长什么样"的项互不影响，混在一起会让人
+        # 以为改字号也会动悬浮窗。三个控件都 mark_custom=False，理由见 _create_slider。
+        cinema_group = QGroupBox("🎞 影院字幕条（Ctrl+Alt+C 开关）")
+        cinema_layout = QVBoxLayout()
+
+        def set_cinema_font(v):
+            config.CINEMA_FONT_SIZE = int(v)
+            self._restyle_cinema()
+
+        self.cinema_font_slider = self._create_slider(
+            "字幕条字号", config.CINEMA_FONT_SIZE_MIN, config.CINEMA_FONT_SIZE_MAX,
+            config.CINEMA_FONT_SIZE, 2, set_cinema_font, mark_custom=False)
+
+        def set_cinema_alpha(v):
+            config.CINEMA_BG_ALPHA = int(v)
+            self._restyle_cinema()
+
+        self.cinema_alpha_slider = self._create_slider(
+            "底衬浓度", 0, 255, getattr(config, "CINEMA_BG_ALPHA", 150), 5,
+            set_cinema_alpha, mark_custom=False)
+        self.cinema_alpha_slider['widget'].setToolTip(
+            "文字背后那层黑的不透明度。0 = 全透明（亮画面上会看不清）")
+
+        self.cinema_german_cb = QCheckBox("字幕条也显示德语原文")
+        self.cinema_german_cb.setToolTip("取消勾选 = 纯中文，最不挡画面")
+        self.cinema_german_cb.setChecked(bool(getattr(config, "CINEMA_SHOW_GERMAN", True)))
+        self.cinema_german_cb.toggled.connect(self._on_cinema_german_toggled)
+
+        cinema_layout.addWidget(self.cinema_font_slider['widget'])
+        cinema_layout.addWidget(self.cinema_alpha_slider['widget'])
+        cinema_layout.addWidget(self.cinema_german_cb)
+        cinema_group.setLayout(cinema_layout)
+
         # 添加到主布局
         layout.addWidget(duration_group)
         layout.addWidget(energy_group)
         layout.addWidget(display_group)
+        layout.addWidget(cinema_group)
 
         # 重置按钮
         reset_btn = QPushButton("🔄 恢复默认值")
@@ -336,8 +380,15 @@ class SettingsWindow(DraggableWidget):
         layout.addStretch()
         self.setLayout(layout)
 
-    def _create_slider(self, label, min_val, max_val, current_val, step, callback):
-        """创建滑块控件"""
+    def _create_slider(self, label, min_val, max_val, current_val, step, callback,
+                       mark_custom=True):
+        """创建滑块控件。
+
+        mark_custom=False 用于**和四个模式正交**的控件：PRESETS 里没有任何一个
+        模式定义 CINEMA_* 键，所以调影院条的字号并没有偏离当前模式，不该把
+        左上角指示器打成「⚙️ 自定义」。（模式身份一掉就再也回不去，是这个面板
+        本来就有的痛点，别再往里加新的触发点。）
+        """
         widget = QWidget()
         layout = QHBoxLayout()
 
@@ -359,7 +410,8 @@ class SettingsWindow(DraggableWidget):
         def on_change(int_value):
             value = int_value * step
             value_label.setText(f"{value:.3f}")
-            self._mark_custom()
+            if mark_custom:
+                self._mark_custom()
             callback(value)
             print(f"📊 {label}: {value:.3f}")
 
@@ -408,6 +460,28 @@ class SettingsWindow(DraggableWidget):
             self._on_font_change()
         print(f"📊 {config_key}: {normalized}")
         return normalized
+
+    def _on_cinema_german_toggled(self, checked):
+        """字幕条德语行开关。不 _mark_custom（PRESETS 不定义 CINEMA_* 键）。"""
+        config.CINEMA_SHOW_GERMAN = bool(checked)
+        self._restyle_cinema(clear=True)
+        print(f"🎞 字幕条德语原文: {'显示' if checked else '隐藏'}")
+
+    def _restyle_cinema(self, clear=False):
+        """把改好的样式推给影院条。
+
+        ☠️ 面板比 cinema_bar 先构造（SubtitleWindow.__init__ 的顺序），所以只能
+        惰性取——但回调只可能在用户点面板时触发，那时它早就建好了。
+        clear=True：德语开关切换时要连内容一起清，否则关掉德语后**上一行德语
+        还留在屏幕上**，直到下一句才消失。
+        """
+        bar = getattr(self, "_cinema_bar", None)
+        if bar is None:
+            return
+        if clear:
+            bar.clear_text()
+        bar._apply_font()
+        bar._relayout()
 
     def _on_chinese_only_toggled(self, checked):
         """勾上=只显中文 → SHOW_BILINGUAL=False。"""
@@ -556,6 +630,8 @@ class SettingsWindow(DraggableWidget):
             (self.max_pairs_slider, config.MAX_SENTENCE_PAIRS),
             (self.font_size_slider, config.FONT_SIZE),
             (self.bg_opacity_slider, config.BACKGROUND_OPACITY),
+            (self.cinema_font_slider, config.CINEMA_FONT_SIZE),
+            (self.cinema_alpha_slider, config.CINEMA_BG_ALPHA),
         ]
         for info, val in pairs:
             slider = info['slider']
@@ -576,6 +652,10 @@ class SettingsWindow(DraggableWidget):
         self.draft_cb.blockSignals(True)
         self.draft_cb.setChecked(bool(getattr(config, "DRAFT_TRANSLATION", True)))
         self.draft_cb.blockSignals(False)
+
+        self.cinema_german_cb.blockSignals(True)
+        self.cinema_german_cb.setChecked(bool(getattr(config, "CINEMA_SHOW_GERMAN", True)))
+        self.cinema_german_cb.blockSignals(False)
 
         for key, btn in (
             ("CHINESE_TEXT_COLOR", self.color_btn_chinese),
