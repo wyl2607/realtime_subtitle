@@ -29,6 +29,7 @@ subtitle.pid
 .paused
 .stop
 transcripts/
+downloads/
 subtitle.err.log
 window_state.json
 window_state.json.tmp

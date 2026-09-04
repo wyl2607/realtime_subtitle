@@ -19,7 +19,7 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
 If Ollama is missing, accept the winget prompt (`Y`).
 
 Desktop folder: **德语直播实时字幕**  
-- 启动字幕.bat / 停止 / 暂停继续 / 更新 / 卸载
+- 启动字幕.bat / 下载并加字幕.bat / 停止 / 暂停继续 / 更新 / 卸载
 
 ## B. Existing install — update to latest layout
 
@@ -37,7 +37,7 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\update_subtitles.ps1
 powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
 ```
 
-`install.ps1` is idempotent: it will not wipe `config_local.py` / transcripts.
+`install.ps1` is idempotent: it will not wipe `config_local.py` / transcripts / downloads.
 
 Then:
 
@@ -51,6 +51,7 @@ Then:
 | Start | Desktop **启动字幕.bat** |
 | Stop | **停止字幕.bat** |
 | Pause | **暂停继续字幕.bat** or `Ctrl+Alt+P` |
+| Download + bilingual SRT | **下载并加字幕.bat**; outputs go to `downloads\<video-id>\` |
 | Update later | **更新字幕.bat** |
 
 Manual start (debug):
@@ -58,6 +59,8 @@ Manual start (debug):
 ```powershell
 cd C:\realtime_subtitle
 venv\Scripts\python -u main.py
+# Video download + bilingual subtitles:
+venv\Scripts\python download_subtitle.py "https://www.youtube.com/watch?v=..."
 ```
 
 Logs: `subtitle.log`, `subtitle.err.log`, `logs\`.

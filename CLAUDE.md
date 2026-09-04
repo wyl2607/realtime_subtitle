@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-> 运行时代码在包 `realtime_subtitle/`（capture / asr / translate / ui）。入口仍是根目录 `main.py`。
+> 运行时代码在包 `realtime_subtitle/`（capture / asr / translate / ui / offline）。实时入口是根目录 `main.py`，离线视频入口是 `download_subtitle.py`。
 
 
 > 目录分级见 [docs/STRUCTURE.md](docs/STRUCTURE.md)；Windows 脚本在 `scripts/windows/`。
@@ -67,7 +67,7 @@ install.ps1 最后一步会自检（import torch/PyQt5/pyaudiowpatch/soxr + 走�
 
 install.ps1 会：找 Python → nvidia-smi 检测显卡 → 建 venv 装依赖 → 按显存
 生成 `config_local.py` 降级配置 → 启动 Ollama 并拉取配置对应的翻译模型 →
-在桌面生成「德语直播实时字幕」文件夹（启动/停止/暂停/更新四个 bat + 说明）。
+在桌面生成「德语直播实时字幕」文件夹（启动/下载并加字幕/停止/暂停/更新/卸载 bat + 说明）。
 
 首次点"启动字幕.bat"还会自动下载 Whisper 模型（1-3GB），属于正常现象。
 
@@ -135,7 +135,7 @@ install.ps1 按显存自动生成的默认档位：
 - **拿更新**：双击桌面"更新字幕.bat"（= `update_subtitles.ps1`）：
   `git pull --ff-only` + requirements 变了才重装依赖 + 提示是否需要重跑
   install.ps1。config_local.py / window_state.json / transcripts/ 都不在 git
-  里，更新永远不会碰它们。
+  里，更新永远不会碰它们（包括 `downloads/`）。
 - **更新失败**基本都是有人直接改了仓库文件。处理：`git stash` 后重试；根治：
   把改动挪进 config_local.py 或让上游合并。
 
@@ -632,7 +632,7 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     "换成中文还成立吗"。反过来，`_squash_repeats` 是唯一一个"代码是死的但
     没死出后果"的，别顺手改（理由见第 20 条）。
 
-34. **☠️ `transcripts/` 是私有数据，内容一个字都不进仓库。**
+34. **☠️ `transcripts/` 和 `downloads/` 是私有数据，内容一个字都不进仓库。**
     这份存档抓的是**系统全部声音**（可能含语音通话），config.py 里已经反复
     警告过它的敏感性——但一直没人写下"所以它也不能进 commit"，而第 2 节又
     明确鼓励 AI 助手直接读改本机文件。2026-08-13 就是这么踩的：为了给幻觉
@@ -646,6 +646,10 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
       提交信息、PR 描述、issue。要中文/德文测试样本就自己现写句子。
     - 注明数据来源时写"开发机本地存档实测（315 条：p50 11 字…）"，
       不写样本内容。
+
+    `downloads/` 还可能包含用户下载的完整视频、原文字幕、双语字幕和学习笔记，
+    同样不能提交或复制到测试夹具。不同于 `transcripts/`，它不一定含系统其他声音，
+    但仍属于用户个人学习资料，默认只留在本机。
 
     同一类还有 `subtitle.log`（`SHOW_PERFORMANCE=True` 时会打识别原文和译文）
     和 `lookup_cache.json`。贴 issue 前扫一眼，README 的 FAQ 让你贴日志尾部，
@@ -661,7 +665,9 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
 
 ```
 main.py               入口：接线各模块、热键注册、单实例守卫（import 顺序敏感！）
+download_subtitle.py  离线视频处理入口：下载 → 识别 → 双语 SRT → 学习笔记
 realtime_subtitle/paths.py    运行时文件落点的唯一真相源（REPO_ROOT/repo_path，见第4节第28条）
+realtime_subtitle/offline.py  离线批处理实现；字幕源语言先显示，翻译逐条调用本地 Ollama
 realtime_subtitle/capture/audio_capture.py      WASAPI Loopback 采集 + 设备热切换
 realtime_subtitle/asr/streaming_asr.py      local agreement 增量识别（词级前缀提交）
 realtime_subtitle/translate/translator_queue.py   Whisper/Ollama 持有者：切句、翻译队列、草稿、术语表
@@ -675,12 +681,14 @@ realtime_subtitle/ui/subtitle_window.py    悬浮窗主类（+ window_frame/wind
 config.py             全部默认参数（仓库文件，别为单机改它）
 config_local.py       本机覆盖（gitignore，install.ps1 生成，机器适配都写这）
 scripts/windows/install.ps1  一键安装 + 硬件检测 + 桌面快捷方式（根目录 install.ps1 为兼容转发）
+scripts/windows/download_subtitle.ps1  输入视频地址，调用离线批处理并保留窗口显示结果
 scripts/windows/update_subtitles.ps1  一键更新（git pull + 按需装依赖）
 scripts/windows/uninstall.ps1  卸载（逐项问 Y/N，默认不删）；-CleanCache 只清下载残file
 scripts/windows/{start,stop,pause}_subtitles.ps1  启动（PID 管理/Ollama 保活）/停止/暂停
 tests/                所有 pytest 用例（三个独立 GUI 脚本套件见第 4 节第 15 条）
 requirements-dev.txt  测试依赖（pytest），只有改代码的人要装
 transcripts/          字幕存档（每天一个文件）
+downloads/            离线视频、原文/双语 SRT 和学习笔记（gitignore，可能很大）
 ```
 
 ☠️ **包化之后 `import config` 不再可用**，一律写 `from realtime_subtitle import config`。

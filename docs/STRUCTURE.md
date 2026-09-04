@@ -1,18 +1,20 @@
 # Repository layout
 
-Graded layout (2026-08). Runtime code lives in the **`realtime_subtitle/` package** by domain. Root only keeps the Windows entrypoint `main.py` and personal/runtime artifacts.
+Graded layout (2026-08). Runtime code lives in the **`realtime_subtitle/` package** by domain. Root keeps the Windows entrypoints (`main.py` and `download_subtitle.py`) plus personal/runtime artifacts.
 
 ```text
 realtime_subtitle/                 # install root (clone path)
 ├── main.py                        # thin entry → realtime_subtitle.app:main
+├── download_subtitle.py           # batch download/subtitle entrypoint
 ├── realtime_subtitle/             # Python package
 │   ├── config.py, version.py
 │   ├── app.py                     # SubtitleApp orchestration
+│   ├── offline.py                  # download → ASR → bilingual SRT → study guide
 │   ├── capture/audio_capture.py   # WASAPI loopback
 │   ├── asr/streaming_asr.py       # local-agreement streaming ASR
 │   ├── translate/translator_queue.py
 │   └── ui/                        # overlay, settings, popups, TV, chrome
-├── scripts/windows/               # install / start / stop / pause / update / uninstall
+├── scripts/windows/               # install / start / stop / pause / update / uninstall / download
 ├── tests/
 ├── docs/
 ├── README.md · README.de.md · README.zh.md
@@ -46,7 +48,14 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
 # root shim still works:
 powershell -ExecutionPolicy Bypass -File install.ps1
 venv\Scripts\python -u main.py
+# batch video subtitles:
+venv\Scripts\python download_subtitle.py "https://www.youtube.com/watch?v=..."
 ```
+
+The batch pipeline writes private media and subtitle work under `downloads/<video-id>/`.
+It downloads up to 2160p, uses the project’s Faster-Whisper bootstrap, and translates
+each segment with local Ollama. Chinese source language targets German; all other source
+languages target Chinese. The bilingual SRT always places source text before the translation.
 
 ## Multi-language READMEs
 

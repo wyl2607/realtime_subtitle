@@ -12,7 +12,7 @@
 # 原则：
 #   - 每一步先报体积再问 Y/N，默认 N，不做"一把梭全删"
 #   - 只碰这个项目自己产生的东西（HuggingFace 缓存里只动 faster-whisper 的模型）
-#   - 用户数据（字幕存档/个人配置/窗口位置）默认保留，只告诉在哪
+#   - 用户数据（字幕存档/下载视频、字幕和学习笔记/个人配置/窗口位置）默认保留，只告诉在哪
 # ============================================================
 param(
     # 只清垃圾不卸载：删中断下载的 .incomplete 残file + 没有完整模型的空壳目录。
@@ -256,6 +256,7 @@ Write-Host ""
 Write-Host "------------------------------------------"
 Write-Host "以下是你的数据，本脚本一律不动，要删自己删："
 Write-Host "   字幕存档   $RepoRoot\transcripts\"
+Write-Host "   下载字幕   $RepoRoot\downloads\"
 Write-Host "   个人配置   $RepoRoot\config_local.py"
 Write-Host "   窗口位置   $RepoRoot\window_state.json"
 Write-Host "   运行日志   $RepoRoot\subtitle.log / subtitle.err.log / logs\"

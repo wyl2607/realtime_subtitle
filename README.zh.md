@@ -44,6 +44,7 @@
   嫌乱切就调大 `LANGUAGE_SWITCH_STREAK`，嫌垃圾窗口长就调小 `LANGUAGE_DETECT_INTERVAL`。
 - **鼠标穿透**：`Ctrl+Alt+M` 点击穿过字幕落到视频/游戏上
 - **字幕存档**：按天写入 `transcripts/`，默认永久保留。是明文，且本程序抓的是**系统全部声音**——想自动清理就在 `config_local.py` 里设 `TRANSCRIPT_KEEP_DAYS = 30`，完全不想记录就 `SAVE_TRANSCRIPT = False`
+- **下载并制作双语字幕**：桌面「下载并加字幕.bat」或 `scripts\windows\download_subtitle.ps1` 会下载最高 4K 视频、提取语音、生成 SRT，并用本地 Ollama 翻译；中文源语言输出“中文 + 德语”，德语/英语/其他源语言输出“原文 + 中文”，同时生成中文学习笔记
 - **热键**：暂停、切语言、性能模式（见「使用」）
 
 ## 系统要求
@@ -71,7 +72,7 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
 # powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-安装脚本会检查路径与 Python、检测显存（或 CPU 降级）、创建 venv、装依赖、引导 Ollama，并在桌面生成「德语直播实时字幕」快捷方式文件夹。
+安装脚本会检查路径与 Python、检测显存（或 CPU 降级）、创建 venv、装依赖、引导 Ollama，并在桌面生成「德语直播实时字幕」快捷方式文件夹（含下载并加字幕）。
 
 若未安装 Ollama，脚本会询问是否用 **`winget install --id Ollama.Ollama -e`** 自动安装（装完在常见路径查找 exe，不依赖当前 PATH 刷新）。拒绝则打开官网下载页。
 
@@ -116,6 +117,23 @@ venv\Scripts\python -u main.py
 | 调参 | ⚙️ |
 | 退出 | ❌ 或停止快捷方式 |
 
+### 下载视频并制作双语字幕
+
+双击桌面上的「下载并加字幕.bat」即可：如果剪贴板里有视频链接，程序会自动读取；没有有效链接时会出现输入提示，也可以直接粘贴或手动输入。程序默认下载最高 2160p（4K）画面，使用本地 Faster-Whisper 识别，并逐条调用本地 Ollama 翻译，避免长上下文造成字幕重复。
+
+输出在 `downloads\<视频ID>\`：
+
+- `<视频ID>_bilingual.srt`：每条先显示原文，再显示中文或德语译文，可直接导入播放器
+- `<视频ID>_source.srt`：原文字幕，便于单独复习
+- `<视频ID>_learning_guide.md`：中文内容概述、对话脉络、重点表达和学习方法
+
+语言规则固定为：中文视频 → 中文 + 德语；德语、英语及其他语言 → 原文 + 中文。命令行也可以使用：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\windows\download_subtitle.ps1 -Url "视频地址"
+# 不生成学习笔记：加 -NoSummary
+```
+
 **颜色**：**白**=已确定源语言；*灰斜体*=可能修正的尾部；*浅蓝斜体*=草稿译文；浅灰=正式译文。
 
 ## 配置
@@ -137,8 +155,8 @@ GLOSSARY = {...}
 | 路径 | 职责 |
 |---|---|
 | `main.py` | 入口（`python -u main.py`） |
-| `realtime_subtitle/` | 包：`capture/` `asr/` `translate/` `ui/` `app.py` |
-| `scripts/windows/` | 安装、启动、停止、暂停、更新、卸载 |
+| `realtime_subtitle/` | 包：`capture/` `asr/` `translate/` `ui/` `offline.py` `app.py` |
+| `scripts/windows/` | 安装、启动、停止、暂停、更新、卸载、下载并加字幕 |
 | `tests/` | 单元测试 + 独立 GUI 脚本套件 |
 | `docs/` | 设计文档、中文笔记 |
 
@@ -161,6 +179,7 @@ venv\Scripts\python -m pytest tests\test_pipeline_helpers.py -q
 | 只有原文没有译文 | 启动 Ollama；`ollama pull` 程序实际使用的 `config.OLLAMA_MODEL` |
 | 频繁 “GPU 繁忙” | 设置里加大提交节奏，或换小 Whisper 模型 |
 | 换耳机后无字幕 | 设置「设备名包含」或 `LOOPBACK_DEVICE_NAME` |
+| 下载或加字幕失败 | 确认已安装 `ffmpeg`，首次运行先启动 Ollama；重新安装依赖以补齐 `yt-dlp` |
 
 日志：`subtitle.log` / `subtitle.err.log`，以及 `logs/` 轮转。
 

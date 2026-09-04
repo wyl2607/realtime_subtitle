@@ -50,6 +50,7 @@ Systemton ──WASAPI-Loopback──▶ Faster-Whisper (CUDA oder CPU)
   Zeitraum noch mit der alten Sprache transkribiert wird.
 - **Klick-durchlässig** — `Ctrl+Alt+M` für Vollbild-Video/Spiele
 - **Tages-Archiv** — Ordner `transcripts/`, standardmäßig unbegrenzt aufbewahrt. Klartext, und diese App nimmt **sämtlichen** System-Ton auf: `TRANSCRIPT_KEEP_DAYS = 30` löscht Älteres automatisch, `SAVE_TRANSCRIPT = False` zeichnet gar nichts auf
+- **Video herunterladen und Untertitel erzeugen** — Desktop-Shortcut `下载并加字幕.bat` oder `scripts\windows\download_subtitle.ps1` lädt bis 4K, transkribiert lokal, erzeugt SRT-Dateien, übersetzt jede Zeile mit lokalem Ollama und schreibt einen chinesischen Lernleitfaden. Chinesische Quelle wird Chinesisch + Deutsch; Deutsch, Englisch und andere Quellen werden Quelle + Chinesisch.
 - **Hotkeys** — Pause, Sprache, Leistungsmodus (siehe Nutzung)
 
 ## Systemvoraussetzungen
@@ -77,7 +78,7 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
 # powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-Das Setup prüft Pfad und Python, erkennt NVIDIA-VRAM (sonst CPU-Profil), legt ein venv an, installiert Abhängigkeiten, führt durch Ollama und legt Desktop-Shortcuts an.
+Das Setup prüft Pfad und Python, erkennt NVIDIA-VRAM (sonst CPU-Profil), legt ein venv an, installiert Abhängigkeiten, führt durch Ollama und legt Desktop-Shortcuts an (Start, Stopp, Pause, Update, Deinstallation sowie Download und Untertitel).
 
 Fehlt Ollama, bietet das Setup **`winget install --id Ollama.Ollama -e`** an (Suche über übliche Installationspfade). Ablehnen öffnet die Download-Seite.
 
@@ -122,6 +123,23 @@ venv\Scripts\python -u main.py
 | Einstellungen | ⚙️ |
 | Beenden | ❌ oder Stopp-Shortcut |
 
+### Video herunterladen und zweisprachige SRT-Dateien erstellen
+
+`下载并加字幕.bat` doppelklicken. Wenn die Zwischenablage eine Video-Adresse enthält, wird sie automatisch verwendet; sonst erscheint eine Eingabeaufforderung zum Einfügen oder Tippen. Standardmäßig werden bis zu 2160p (4K) geladen. Danach extrahiert das Programm die Tonspur, nutzt das lokale Faster-Whisper-Modell und übersetzt jede Untertitelzeile einzeln mit lokalem Ollama, damit lange Videos keinen doppelten Kontext aufbauen.
+
+Die Dateien liegen unter `downloads\<video-id>\`:
+
+- `<video-id>_bilingual.srt` — zuerst Quelle, danach Übersetzung; direkt im Player nutzbar
+- `<video-id>_source.srt` — nur die erkannte Quelle
+- `<video-id>_learning_guide.md` — chinesische Übersicht, Gesprächsablauf, Ausdrücke und Lernschritte
+
+Feste Sprachregel: Chinesische Quelle → Chinesisch + Deutsch; deutsche, englische und alle anderen Quellen → Quelle + Chinesisch. Kommandozeile:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\windows\download_subtitle.ps1 -Url "Video-Adresse"
+# Mit -NoSummary den Lernleitfaden überspringen
+```
+
 **Farben:** weiß = feste Quelle · grau kursiv = vorläufiges Quellenende · hellblau kursiv = Entwurfsübersetzung · hellgrau = finale Übersetzung.
 
 ## Konfiguration
@@ -144,7 +162,7 @@ VRAM-Stufen und Modellwahl: [CLAUDE.md](CLAUDE.md).
 |---|---|
 | `main.py` | Einstieg (`python -u main.py`) |
 | `realtime_subtitle/` | Paket: `capture/`, `asr/`, `translate/`, `ui/`, `app.py` |
-| `scripts/windows/` | Install, Start, Stop, Pause, Update, Uninstall |
+| `scripts/windows/` | Install, Start, Stop, Pause, Update, Uninstall, Download und Untertitel |
 | `tests/` | Pytest + manuelle GUI-Suites |
 | `docs/` | Design, chinesische Notizen, Struktur |
 
@@ -165,6 +183,7 @@ venv\Scripts\python -m pytest tests\test_pipeline_helpers.py -q
 | Nur Quelle, keine Übersetzung | Ollama starten; Modell laut `config.OLLAMA_MODEL` pullen |
 | Häufig „GPU busy“ | Commit-Intervall erhöhen oder kleineres Whisper-Modell |
 | Kein Ton nach Headset-Wechsel | Gerätename in den Einstellungen / `LOOPBACK_DEVICE_NAME` |
+| Download oder Untertitel schlagen fehl | `ffmpeg` im PATH prüfen, Ollama starten und die Abhängigkeiten inklusive `yt-dlp` neu installieren |
 
 Logs: `subtitle.log`, `subtitle.err.log`, Rotation unter `logs/`.
 

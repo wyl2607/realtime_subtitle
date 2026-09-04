@@ -50,6 +50,11 @@ System audio ──WASAPI loopback──▶ Faster-Whisper (CUDA or CPU)
 - **Daily transcript archive** — `transcripts/` (timestamp + source + translation), kept
   forever by default. Plain text, and this app captures **all** system audio: set
   `TRANSCRIPT_KEEP_DAYS = 30` to auto-prune, or `SAVE_TRANSCRIPT = False` to record nothing.
+- **Download and subtitle batch** — Desktop `下载并加字幕.bat` or
+  `scripts\windows\download_subtitle.ps1` downloads up to 4K, transcribes locally,
+  creates SRT files, translates one segment at a time with local Ollama, and writes a
+  Chinese study guide. Chinese source becomes Chinese + German; German, English, and
+  other source languages become source + Chinese.
 - **Hotkeys** — pause, language cycle, performance mode (see Usage)
 
 ## Requirements
@@ -77,7 +82,7 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
 # powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-The installer checks the path and Python, detects NVIDIA VRAM (or falls back to CPU), creates a venv, installs dependencies, guides Ollama setup, and writes desktop shortcuts under **“德语直播实时字幕”** (start / stop / pause / update / uninstall).
+The installer checks the path and Python, detects NVIDIA VRAM (or falls back to CPU), creates a venv, installs dependencies, guides Ollama setup, and writes desktop shortcuts under **“德语直播实时字幕”** (start / stop / pause / update / uninstall / download-and-subtitle).
 
 If Ollama is missing, the installer offers **`winget install --id Ollama.Ollama -e`** (finds the binary via common paths; PATH need not refresh). Decline to open the download page instead.
 
@@ -122,6 +127,23 @@ venv\Scripts\python -u main.py
 | Settings | ⚙️ (timing, font size, line count — live) |
 | Quit | ❌ or desktop stop shortcut |
 
+### Download a video and create bilingual subtitles
+
+Double-click the desktop `下载并加字幕.bat`. If the clipboard contains a video URL it is used automatically; otherwise the console prompts for a URL, which can be pasted or typed. The default maximum is 2160p (4K). The pipeline extracts audio, runs the project’s local Faster-Whisper model, writes source and bilingual SRT files, and translates each subtitle independently with local Ollama so long videos do not accumulate duplicated context.
+
+Files are written to `downloads\<video-id>\`:
+
+- `<video-id>_bilingual.srt` — source first, then the translation; ready to import into a player
+- `<video-id>_source.srt` — source-only SRT for review
+- `<video-id>_learning_guide.md` — Chinese overview, dialogue flow, expressions, and study steps
+
+The fixed language policy is Chinese source → Chinese + German; German, English, and every other source language → source + Chinese. Command-line use:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\windows\download_subtitle.ps1 -Url "video URL"
+# Add -NoSummary to skip the study guide
+```
+
 **Colours:** white = committed source · grey italic = provisional source tail · light-blue italic = draft translation · light grey = final translation.
 
 ## Configuration
@@ -143,8 +165,8 @@ VRAM tiers and model picks are documented in [CLAUDE.md](CLAUDE.md).
 | Path | Role |
 |---|---|
 | `main.py` | Thin entrypoint (`python -u main.py`) |
-| `realtime_subtitle/` | Package: `capture/`, `asr/`, `translate/`, `ui/`, `app.py` |
-| `scripts/windows/` | Install, start, stop, pause, update, uninstall |
+| `realtime_subtitle/` | Package: `capture/`, `asr/`, `translate/`, `ui/`, `offline.py`, `app.py` |
+| `scripts/windows/` | Install, start, stop, pause, update, uninstall, download-and-subtitle |
 | `tests/` | Pytest + standalone GUI harnesses |
 | `docs/` | Design specs, Chinese notes, structure guide |
 
@@ -168,6 +190,7 @@ venv\Scripts\python -m pytest tests\test_pipeline_helpers.py -q
 | Frequent “GPU busy” | Settings → slower commit interval, or smaller Whisper model in `config_local.py` |
 | No audio after headset change | Settings → device name contains… or `LOOPBACK_DEVICE_NAME` in `config_local.py` |
 | Tiny UI on laptop | Windows display scaling; `Ctrl+scroll` for subtitle font size |
+| Download or subtitle failure | Make sure `ffmpeg` is on PATH, start Ollama once, and reinstall dependencies to add `yt-dlp` |
 
 Logs: `subtitle.log` / `subtitle.err.log` (and rotated files under `logs/`).
 

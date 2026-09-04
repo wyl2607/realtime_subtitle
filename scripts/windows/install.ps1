@@ -11,7 +11,7 @@
 #   2. 检测 NVIDIA 显卡（没有就自动生成 CPU 降级配置）
 #   3. 创建 venv 并安装依赖（无 N 卡时跳过 CUDA 运行库）
 #   4. 检查/引导安装 Ollama，拉取翻译模型
-#   5. 在桌面生成快捷方式文件夹（启动/停止/暂停）
+#   5. 在桌面生成快捷方式文件夹（启动/停止/暂停/下载加字幕）
 #   6. 自检：把最容易坏的依赖当场 import 一遍
 # 全程可重复运行（幂等），中断后重跑即可。
 # ============================================================
@@ -30,7 +30,7 @@ Write-Host "=========================================="
 Write-Host ""
 
 # ---------- 0. 安装路径必须是纯 ASCII ----------
-# ☠️ 桌面那四个 .bat 里会内嵌本目录的绝对路径，而 bat 在 chcp 65001 下解析
+# ☠️ 桌面快捷方式里的 .bat 会内嵌本目录的绝对路径，而 bat 在 chcp 65001 下解析
 # 含非 ASCII 的行会把下一行开头吃掉（避坑清单第 4 条），启动脚本直接损坏。
 # 中文 Windows 用户名（C:\Users\张三\...）是最常见的触发方式，而且症状
 # 完全看不出跟路径有关，所以这里直接拦住，不让人装完再踩。
@@ -315,6 +315,7 @@ New-Item -ItemType Directory -Path $shortcutDir -Force | Out-Null
 
 $batTemplate = @(
     @("启动字幕.bat", "scripts\windows\start_subtitles.ps1"),
+    @("下载并加字幕.bat", "scripts\windows\download_subtitle.ps1"),
     @("停止字幕.bat", "scripts\windows\stop_subtitles.ps1"),
     @("暂停继续字幕.bat", "scripts\windows\pause_subtitles.ps1"),
     @("更新字幕.bat", "scripts\windows\update_subtitles.ps1"),
@@ -371,6 +372,7 @@ Write-Host "  ✅ 快捷方式已生成: $shortcutDir"
 Write-Host "[6/6] 验证安装..."
 $smokeCode = @"
 import torch
+import yt_dlp
 from realtime_subtitle import config
 import PyQt5.QtWidgets, pyaudiowpatch, soxr
 from realtime_subtitle.translate import translator_queue
