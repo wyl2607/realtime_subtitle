@@ -15,7 +15,7 @@
 #   - 用户数据（字幕存档/下载视频、字幕和学习笔记/个人配置/窗口位置）默认保留，只告诉在哪
 # ============================================================
 param(
-    # 只清垃圾不卸载：删中断下载的 .incomplete 残file + 没有完整模型的空壳目录。
+    # 只清垃圾不卸载：删中断下载的 .incomplete 残文件 + 没有完整模型的空壳目录。
     # 给"还要继续用，只是想腾点空间"的场景。
     [switch]$CleanCache
 )
@@ -24,7 +24,7 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = (Get-Item $PSScriptRoot).Parent.Parent.FullName
 Set-Location $RepoRoot
 
-# 体积按量级选单位：残file经常只有几百 KB，一律按 GB 显示会变成一串"0 GB"，
+# 体积按量级选单位：残文件经常只有几百 KB，一律按 GB 显示会变成一串"0 GB"，
 # 看着像脚本坏了
 function Format-Size {
     param([double]$Bytes)
@@ -88,25 +88,25 @@ Write-Host ""
 
 $hubDir = Get-HFHubDir
 
-# ---------- 清理模式：只删中断下载的残file和空壳目录 ----------
+# ---------- 清理模式：只删中断下载的残文件和空壳目录 ----------
 if ($CleanCache) {
-    Write-Host "[1/2] 扫描中断的下载残file（*.incomplete）..."
+    Write-Host "[1/2] 扫描中断的下载残文件（*.incomplete）..."
     $freed = 0.0
     if (Test-Path -LiteralPath $hubDir) {
         $incomplete = @(Get-ChildItem -LiteralPath $hubDir -Recurse -File -Filter "*.incomplete" -ErrorAction SilentlyContinue)
         if ($incomplete.Count -gt 0) {
             $bytes = ($incomplete | Measure-Object -Property Length -Sum).Sum
-            Write-Host "  发现 $($incomplete.Count) 个残file，合计 $(Format-Size $bytes)："
+            Write-Host "  发现 $($incomplete.Count) 个残文件，合计 $(Format-Size $bytes)："
             foreach ($f in $incomplete) {
                 Write-Host "     $(Format-Size $f.Length)`t$($f.Name)"
             }
-            if (Confirm-Step "  删掉这些残file？（下次要用会重新下载）") {
+            if (Confirm-Step "  删掉这些残文件？（下次要用会重新下载）") {
                 foreach ($f in $incomplete) { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue }
                 $freed += $bytes
                 Write-Host "     ✅ 已清理"
             }
         } else {
-            Write-Host "  ✅ 没有残file"
+            Write-Host "  ✅ 没有残文件"
         }
     } else {
         Write-Host "  ℹ️ 没有 HuggingFace 缓存目录，跳过"

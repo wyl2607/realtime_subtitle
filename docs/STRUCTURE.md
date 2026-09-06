@@ -17,7 +17,7 @@ realtime_subtitle/                 # install root (clone path)
 ├── scripts/windows/               # install / start / stop / pause / update / uninstall / download
 ├── tests/
 ├── docs/
-├── README.md · README.de.md · README.zh.md
+├── README.md · README.en.md · README.de.md · README.zh.md
 └── CLAUDE.md
 ```
 
@@ -59,7 +59,7 @@ languages target Chinese. The bilingual SRT always places source text before the
 
 ## Multi-language READMEs
 
-See [README-i18n.md](README-i18n.md).
+See [README-i18n.md](README-i18n.md). GitHub landing (`README.md`) is Chinese; English is [`README.en.md`](../README.en.md).
 
 ## Windows operators
 

@@ -1,4 +1,4 @@
-# README language policy (EN / DE / ZH)
+# README language policy (ZH / EN / DE)
 
 Tracks [issue #27](https://github.com/wyl2607/realtime_subtitle/issues/27).
 
@@ -6,11 +6,13 @@ Tracks [issue #27](https://github.com/wyl2607/realtime_subtitle/issues/27).
 
 | Audience | File | Language |
 |----------|------|----------|
-| Public default (GitHub landing) | [`README.md`](../README.md) | English |
+| Public default (GitHub landing, Chinese friends) | [`README.md`](../README.md) | 中文 |
+| English users | [`README.en.md`](../README.en.md) | English |
 | German users | [`README.de.md`](../README.de.md) | Deutsch |
-| Chinese users | [`README.zh.md`](../README.zh.md) | 中文 |
+| Old Chinese URL | [`README.zh.md`](../README.zh.md) | stub → `README.md` |
 | Deep install / hardware tiers / pitfalls | [`CLAUDE.md`](../CLAUDE.md) | 中文 (AI + advanced) |
 | Layout | [`docs/STRUCTURE.md`](STRUCTURE.md) | English |
+| Windows runbook | [`docs/WINDOWS-RUNBOOK.md`](WINDOWS-RUNBOOK.md) (EN), [`docs/zh/WINDOWS-RUNBOOK.md`](zh/WINDOWS-RUNBOOK.md) (ZH) | |
 
 ## Sync rules
 
@@ -28,8 +30,9 @@ Tracks [issue #27](https://github.com/wyl2607/realtime_subtitle/issues/27).
 ## Checklist (copy into PR body when README-related)
 
 ```text
-- [ ] README.md (EN)
+- [ ] README.md (ZH landing)
+- [ ] README.en.md (EN)
 - [ ] README.de.md (DE)
-- [ ] README.zh.md (ZH)
+- [ ] README.zh.md still points at README.md
 - [ ] CLAUDE.md paths still correct (if install/layout changed)
 ```

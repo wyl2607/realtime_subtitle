@@ -1,18 +1,17 @@
-# Scripts
+# 脚本
 
-## Windows (`scripts/windows/`)
+## Windows（`scripts/windows/`）
 
-| Script | Role |
-|--------|------|
-| `install.ps1` | One-shot setup (Python, venv, GPU tier, Ollama, desktop shortcuts) |
-| `download_subtitle.ps1` | Download a video, create bilingual SRT files, and write a study guide |
-| `start_subtitles.ps1` | Start app (single-instance, Ollama health wait) |
-| `stop_subtitles.ps1` | Graceful stop then force-kill fallback |
-| `pause_subtitles.ps1` | Toggle pause flag without unloading models |
-| `update_subtitles.ps1` | `git pull` + dependency sync |
-| `uninstall.ps1` | Interactive cleanup (optional `-CleanCache`) |
+| 脚本 | 作用 |
+|------|------|
+| `install.ps1` | 一键安装（Python、venv、显存分档、Ollama、桌面快捷方式） |
+| `download_subtitle.ps1` | 下载视频、生成双语 SRT、写学习笔记 |
+| `start_subtitles.ps1` | 启动（单实例、等待 Ollama 就绪） |
+| `stop_subtitles.ps1` | 先优雅退出，超时再强杀 |
+| `pause_subtitles.ps1` | 暂停识别，不卸载模型 |
+| `update_subtitles.ps1` | `git pull` + 同步依赖 |
+| `uninstall.ps1` | 交互卸载（可选 `-CleanCache`） |
 
-All scripts resolve `$RepoRoot` two levels above this folder and run with the repository as working directory.
+这些脚本会把仓库根目录解析成上两级，并在仓库根目录下运行。
 
-Root `install.ps1` and `download_subtitle.ps1` are **compatibility shims** that forward to
-the canonical scripts in this folder.
+根目录的 `install.ps1` 和 `download_subtitle.ps1` 是**兼容入口**，会转到本目录里的正式脚本。

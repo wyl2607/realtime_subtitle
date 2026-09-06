@@ -942,12 +942,12 @@ def process_url(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Download media and create source+translation SRT subtitles.")
-    parser.add_argument("url", help="video URL")
-    parser.add_argument("--output-dir", type=Path, help="download root; defaults to the repository downloads/")
-    parser.add_argument("--source-language", default="auto", help="Whisper language code or auto")
-    parser.add_argument("--max-height", type=int, default=2160, help="maximum video height, default 2160")
-    parser.add_argument("--no-summary", action="store_true", help="skip the local-model learning guide")
+    parser = argparse.ArgumentParser(description="下载视频并生成本地双语字幕（原文 + 译文 SRT）。")
+    parser.add_argument("url", help="视频地址")
+    parser.add_argument("--output-dir", type=Path, help="下载根目录，默认仓库 downloads/")
+    parser.add_argument("--source-language", default="auto", help="Whisper 语言代码，或 auto")
+    parser.add_argument("--max-height", type=int, default=2160, help="最高画面高度，默认 2160")
+    parser.add_argument("--no-summary", action="store_true", help="不生成学习笔记")
     args = parser.parse_args(argv)
     try:
         process_url(args.url, args.output_dir, args.source_language, args.max_height, not args.no_summary)

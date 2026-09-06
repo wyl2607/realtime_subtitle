@@ -145,7 +145,7 @@ install.ps1 按显存自动生成的默认档位：
 都读它。以前版本号写死在 main.py 横幅里（"实时字幕软件 v2.0"），既没有 tag
 对得上、改了也没人知道，用户报 bug 只能贴 commit hash。
 
-用语义化版本 `主.次.修`（当前 2.0.0，沿用横幅上一直写着的 v2）：
+用语义化版本 `主.次.修`（当前 2.5.0）：
 
 | 位 | 什么时候进位 | 例子 |
 |---|---|---|
@@ -683,7 +683,7 @@ config_local.py       本机覆盖（gitignore，install.ps1 生成，机器适�
 scripts/windows/install.ps1  一键安装 + 硬件检测 + 桌面快捷方式（根目录 install.ps1 为兼容转发）
 scripts/windows/download_subtitle.ps1  输入视频地址，调用离线批处理并保留窗口显示结果
 scripts/windows/update_subtitles.ps1  一键更新（git pull + 按需装依赖）
-scripts/windows/uninstall.ps1  卸载（逐项问 Y/N，默认不删）；-CleanCache 只清下载残file
+scripts/windows/uninstall.ps1  卸载（逐项问 Y/N，默认不删）；-CleanCache 只清下载残文件
 scripts/windows/{start,stop,pause}_subtitles.ps1  启动（PID 管理/Ollama 保活）/停止/暂停
 tests/                所有 pytest 用例（三个独立 GUI 脚本套件见第 4 节第 15 条）
 requirements-dev.txt  测试依赖（pytest），只有改代码的人要装

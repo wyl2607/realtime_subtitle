@@ -1,6 +1,8 @@
 # Windows runbook (after package layout)
 
-Repo is already on GitHub `master` (`f872c9e`+). Do this on the Windows machine.
+中文版：[docs/zh/WINDOWS-RUNBOOK.md](zh/WINDOWS-RUNBOOK.md)。
+
+Repo is already on GitHub `master`. Do this on the Windows machine.
 
 ## A. First-time install (new PC)
 
@@ -52,6 +54,7 @@ Then:
 | Stop | **停止字幕.bat** |
 | Pause | **暂停继续字幕.bat** or `Ctrl+Alt+P` |
 | Download + bilingual SRT | **下载并加字幕.bat**; outputs go to `downloads\<video-id>\` |
+| Cinema bar | `Ctrl+Alt+C` (use the hotkey once the video is already fullscreen) |
 | Update later | **更新字幕.bat** |
 
 Manual start (debug):

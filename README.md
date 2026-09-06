@@ -1,203 +1,203 @@
-# Realtime Subtitle
+# 实时字幕翻译系统
 
-**Offline German (and English) live subtitles for Windows** — capture system audio, recognize speech, translate locally, and show a bilingual always-on-top overlay.
+**Windows 全离线实时字幕**：捕获系统声音 → 本地语音识别 → 本地翻译 → 置顶悬浮窗双语显示。
 
-No audio or transcript is sent to the cloud. Recognition and translation run on your machine.
+识别与翻译均在本机完成，不向任何云端发送音频或文本。当前版本 **v2.5.0**。
 
-> **This is enforced, not just documented.** At startup the app resolves
-> `OLLAMA_BASE_URL` and refuses to run unless every resolved address is a loopback
-> address — otherwise one typo in `config_local.py` would silently ship your transcripts
-> off the machine while subtitles kept working normally. To use an Ollama on another
-> machine, set `ALLOW_REMOTE_OLLAMA = True` in `config_local.py`.
+> **给朋友用（三步）**
+> 1. 克隆到**纯英文路径**（推荐 `C:\realtime_subtitle`，中文用户名目录会把启动脚本弄坏）
+> 2. 运行安装：`powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1`（国内网络加 `-Mirror`）
+> 3. 桌面文件夹「德语直播实时字幕」里双击「启动字幕.bat」，再打开任意德/英/中文视频
 
-> **One exception, and only if you click it:** the `🌐 Ask a stronger AI` button in the
-> popups opens your system browser with a question built from the last few minutes of
-> recognized source text (≤300 chars), sent to a web AI (grok.com by default,
-> `config.AI_ANALYSIS_WEB_URL_TEMPLATE`). Nothing leaves the machine unless you press it,
-> and even then a dialog first shows you **exactly what would be sent** (target host,
-> total length, first 300 chars) and waits for your confirmation — set
-> `AI_WEB_CONFIRM = False` to skip it. Set that template to an empty string to remove the
-> button entirely. Note this app captures **all system audio**, which may include voice calls.
+> **这一条是代码强制的，不只是文档承诺**：启动时会解析 `OLLAMA_BASE_URL`，只要解析出的
+> 地址不全是环回地址就拒绝启动——否则 `config_local.py` 里改错一个字，就能把你的转录
+> 静默送出本机，而字幕照常出中文、屏幕上和日志里都看不出异常。确实要用另一台机器上的
+> Ollama：在 `config_local.py` 里写 `ALLOW_REMOTE_OLLAMA = True`。
 
-[Deutsch](README.de.md) · [中文](README.zh.md) · [Repository layout](docs/STRUCTURE.md) · [Windows runbook](docs/WINDOWS-RUNBOOK.md)
+> **唯一的例外，而且只有你点它才会发生**：弹窗里的「🌐 问更强的AI」按钮会把最近几分钟
+> 识别出的原文（≤300 字）拼成一句提问，用系统浏览器打开网页版 AI（默认 grok.com，
+> `config.AI_ANALYSIS_WEB_URL_TEMPLATE` 可改）。不点就不发，而且点了之后还会先弹一个框，
+> 把**要发出去的内容原样亮给你看**（发到哪个域名、共多少字、前 300 字），确认了才发；
+> 嫌烦可以 `AI_WEB_CONFIRM = False` 关掉。把那个模板设成空串即可让按钮彻底消失。
+> 注意本程序抓的是**系统全部声音**，可能包含语音通话内容。
+
+[English](README.en.md) · [Deutsch](README.de.md) · [目录结构](docs/STRUCTURE.md) · [Windows 操作清单](docs/zh/WINDOWS-RUNBOOK.md)
 
 ```text
-System audio ──WASAPI loopback──▶ Faster-Whisper (CUDA or CPU)
-                                      │ local-agreement streaming
-                                      ▼
-                               Source text ──▶ Ollama (local LLM) translation
-                                      │
-                                      ▼
-                         Overlay: source first + draft + final bilingual lines
+系统声音 ──WASAPI Loopback──▶ Faster-Whisper (large-v3-turbo, CUDA/CPU)
+              │                       │ local agreement 增量识别
+              │                       ▼
+              │               源语言句子 ──▶ Ollama（本地 LLM）翻译
+              │                       │
+              ▼                       ▼
+        悬浮窗：源语言先行 + 草稿译文 + 正式双语句对
 ```
 
-## Features
+## 特点
 
-- **Source text first** — partial recognition appears immediately (grey = still revisable); translation follows
-- **Draft translation** — mid-sentence draft in light blue italic; replaced by the final line when ready
-- **Local-agreement streaming ASR** — prefix-stable commits, fewer fragment duplicates (ported from [whisper_streaming](https://github.com/ufal/whisper_streaming), MIT)
-- **Glossary** — political and domain terms in `config.py` (`GLOSSARY`)
-- **Hallucination filter** — drops typical TV-subtitle ghost phrases on silence/music
-- **GPU preemption friendly** — under game load, subtitles lag instead of dropping forever
-- **Resizable overlay** — drag edges/corners; size and position persist across restarts
-- **Word lookup** — click a German word for lemma / POS / meaning (local LLM)
-- **Bidirectional (DE↔ZH)** — `Ctrl+Alt+L` cycles the *language pair*, so Chinese
-  audio gets German subtitles. Optional auto-detect (`AUTO_DETECT_LANGUAGE`, off by
-  default) switches for you after it sees the same new language 3 times in a row;
-  expect ~12s of garbage subtitles before it commits, since the audio in that window
-  is still being decoded with the old language.
-- **Click-through mode** — `Ctrl+Alt+M` so the overlay ignores mouse hits over video/games
-- **Daily transcript archive** — `transcripts/` (timestamp + source + translation), kept
-  forever by default. Plain text, and this app captures **all** system audio: set
-  `TRANSCRIPT_KEEP_DAYS = 30` to auto-prune, or `SAVE_TRANSCRIPT = False` to record nothing.
-- **Download and subtitle batch** — Desktop `下载并加字幕.bat` or
-  `scripts\windows\download_subtitle.ps1` downloads up to 4K, transcribes locally,
-  creates SRT files, translates one segment at a time with local Ollama, and writes a
-  Chinese study guide. Chinese source becomes Chinese + German; German, English, and
-  other source languages become source + Chinese.
-- **Hotkeys** — pause, language cycle, performance mode (see Usage)
+- **源语言先行显示**：识别一提交立即上屏（灰色部分表示还可能修正），译文随后跟上
+- **草稿译文**：半句即可出浅蓝斜体草稿，正式翻译完成后自动替换
+- **local agreement 增量识别**：词级前缀提交，减少流式重复碎片（移植自 [whisper_streaming](https://github.com/ufal/whisper_streaming)，MIT）
+- **术语表**：政党/政治等专名在 `config.py` 的 `GLOSSARY` 中维护
+- **幻觉过滤**：拦截静音/音乐段的电视字幕惯用语幻觉
+- **抗 GPU 抢占**：游戏占 GPU 时字幕滞后而非永久丢词
+- **窗口自适应**：边缘拖拽缩放，位置/大小/字号可持久化
+- **点词查词**：单击德语词，本地 LLM 给原形/词性/释义
+- **中德双向**：`Ctrl+Alt+L` 循环的是**语言对**，放中文视频就出德语字幕。
+  自动切换（`AUTO_DETECT_LANGUAGE`，**默认关**）连续 3 次检测到同一新语言才切；
+  切换真正发生前有约 12 秒的垃圾字幕——那段音频还在用旧语言的参数解码。
+  嫌乱切就调大 `LANGUAGE_SWITCH_STREAK`，嫌垃圾窗口长就调小 `LANGUAGE_DETECT_INTERVAL`。
+- **鼠标穿透**：`Ctrl+Alt+M` 点击穿过字幕落到视频/游戏上
+- **🎞 影院字幕条**：叠在全屏视频底部的透明字幕（`Ctrl+Alt+C`），永远鼠标穿透，不抢播放器点击
+- **📺 电视全屏**：在另一块屏用大字不透明窗显示（Esc 退出）
+- **🤖 AI 分析**：本地总结最近几分钟；🌐 问更强的 AI 会先弹出确认框
+- **字幕存档**：按天写入 `transcripts/`，默认永久保留。是明文，且本程序抓的是**系统全部声音**——想自动清理就在 `config_local.py` 里设 `TRANSCRIPT_KEEP_DAYS = 30`，完全不想记录就 `SAVE_TRANSCRIPT = False`
+- **下载并制作双语字幕**：桌面「下载并加字幕.bat」或 `scripts\windows\download_subtitle.ps1` 会下载最高 4K 视频、提取语音、生成 SRT，并用本地 Ollama 翻译；中文源语言输出“中文 + 德语”，德语/英语/其他源语言输出“原文 + 中文”，同时生成中文学习笔记
+- **热键**：暂停、切语言、性能模式、影院字幕条（见「使用」）
 
-## Requirements
+## 系统要求
 
-| | Recommended | Minimum |
+| | 推荐 | 最低 |
 |---|---|---|
-| OS | Windows 10/11 64-bit | Windows 10/11 (**Windows only** — WASAPI loopback) |
-| GPU | NVIDIA 8 GB+ VRAM | CPU-only works (higher latency) |
-| RAM | 16 GB | 8 GB |
-| Disk | ~10 GB (deps + models) | ~6 GB |
-| Python | 3.10–3.13 | same |
-| Other | [Ollama](https://ollama.com/) for translation | same |
+| 系统 | Windows 10/11 64 位 | 同左（**仅 Windows**，WASAPI） |
+| 显卡 | NVIDIA 8GB+ 显存 | 无独显可 CPU（延迟更大） |
+| 内存 | 16GB | 8GB |
+| 硬盘 | 约 10GB | 约 6GB |
+| Python | 3.10–3.13 | 同左 |
+| 其它 | [Ollama](https://ollama.com/) | 同左 |
 
-## Install
+## 安装
 
-Clone into an **ASCII-only path** (e.g. `C:\realtime_subtitle`). Desktop shortcuts embed absolute paths; non-ASCII user profiles (common on Chinese Windows) break the generated `.bat` files.
+请克隆到**纯英文路径**（如 `C:\realtime_subtitle`）。桌面快捷方式会内嵌绝对路径，非 ASCII 用户目录会弄坏生成的 `.bat`。
 
 ```powershell
 git clone https://github.com/wyl2607/realtime_subtitle.git
 cd realtime_subtitle
 powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
-# China mirror: powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1 -Mirror
+# 国内镜像：powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1 -Mirror
 
-# Root shim still works:
+# 根目录兼容入口仍然可用：
 # powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-The installer checks the path and Python, detects NVIDIA VRAM (or falls back to CPU), creates a venv, installs dependencies, guides Ollama setup, and writes desktop shortcuts under **“德语直播实时字幕”** (start / stop / pause / update / uninstall / download-and-subtitle).
+安装脚本会检查路径与 Python、检测显存（或 CPU 降级）、创建 venv、装依赖、引导 Ollama，并在桌面生成「德语直播实时字幕」快捷方式文件夹（含下载并加字幕）。
 
-If Ollama is missing, the installer offers **`winget install --id Ollama.Ollama -e`** (finds the binary via common paths; PATH need not refresh). Decline to open the download page instead.
+若未安装 Ollama，脚本会询问是否用 **`winget install --id Ollama.Ollama -e`** 自动安装（装完在常见路径查找 exe，不依赖当前 PATH 刷新）。拒绝则打开官网下载页。
 
-First launch downloads the Whisper model (~1.6 GB).
+首次启动会下载 Whisper 模型（约 1.6GB）。
 
-**AI-assisted install:** ask an agent to clone this repo and follow [CLAUDE.md](CLAUDE.md) for hardware tiers and known pitfalls.
+**交给 AI 装**：克隆本仓库并按 [CLAUDE.md](CLAUDE.md) 的硬件分档与避坑清单操作。
 
-## Update & uninstall
+## 更新与卸载
 
-| Action | Command |
+| 动作 | 方式 |
 |---|---|
-| Update | Desktop `更新字幕.bat` or `scripts\windows\update_subtitles.ps1` (`git pull` + deps) |
-| Uninstall / free space | `scripts\windows\uninstall.ps1` (asks per component; default is keep) |
-| Cache only | `scripts\windows\uninstall.ps1 -CleanCache` |
+| 更新 | 桌面「更新字幕.bat」或 `scripts\windows\update_subtitles.ps1` |
+| 卸载 / 腾空间 | `scripts\windows\uninstall.ps1`（逐项询问，默认保留） |
+| 只清缓存 | `scripts\windows\uninstall.ps1 -CleanCache` |
 
-Personal files never go into git: `config_local.py`, window state, `transcripts/`.
+个人配置不进 git：`config_local.py`、窗口状态、`transcripts/`。
 
 <details>
-<summary>Manual install (no scripts)</summary>
+<summary>手动安装（不用脚本）</summary>
 
 ```powershell
 python -m venv venv
 venv\Scripts\pip install -r requirements.txt
-# Install Ollama: https://ollama.com/download
+# 安装 Ollama: https://ollama.com/download
 ollama pull qwen3.5:9b
 venv\Scripts\python -u main.py
 ```
 </details>
 
-## Usage
+## 使用
 
-| Action | How |
+| 操作 | 方式 |
 |---|---|
-| Move overlay | Drag anywhere on the window |
-| Resize | Drag edges / corners (larger window = more history) |
-| Word lookup | Single-click a German word |
-| Click-through | `Ctrl+Alt+M` |
-| Pause / resume | `Ctrl+Alt+P` (works over fullscreen games) |
-| Cycle language pair | `Ctrl+Alt+L` (de→zh / zh→de / en→zh; edit `config.LANGUAGE_PAIRS`) |
-| Performance mode | `Ctrl+Alt+G` (lighter ASR + model; free GPU for games) |
-| Session history | 📜 on the overlay |
-| Settings | ⚙️ (timing, font size, line count — live) |
-| Quit | ❌ or desktop stop shortcut |
+| 移动窗口 | 拖动窗口任意位置 |
+| 缩放 | 拖边缘/四角 |
+| 查词 | 单击德语词 |
+| 鼠标穿透 | `Ctrl+Alt+M` |
+| 暂停/继续 | `Ctrl+Alt+P` |
+| 切换语言对 | `Ctrl+Alt+L`（德→中 / 中→德 / 英→中，改 `config.LANGUAGE_PAIRS`） |
+| 性能模式 | `Ctrl+Alt+G` |
+| 影院字幕条 | `Ctrl+Alt+C` 或 🎞（视频已经全屏时必须用热键） |
+| 电视全屏 | 📺 |
+| AI 分析 | 🤖 |
+| 回看本场 | 📜 |
+| 调参 | ⚙️（节奏、字号、影院字幕条样式当场生效） |
+| 退出 | ❌ 或停止快捷方式 |
 
-### Download a video and create bilingual subtitles
+### 下载视频并制作双语字幕
 
-Double-click the desktop `下载并加字幕.bat`. If the clipboard contains a video URL it is used automatically; otherwise the console prompts for a URL, which can be pasted or typed. The default maximum is 2160p (4K). The pipeline extracts audio, runs the project’s local Faster-Whisper model, writes source and bilingual SRT files, and translates each subtitle independently with local Ollama so long videos do not accumulate duplicated context.
+双击桌面上的「下载并加字幕.bat」即可：如果剪贴板里有视频链接，程序会自动读取；没有有效链接时会出现输入提示，也可以直接粘贴或手动输入。程序默认下载最高 2160p（4K）画面，使用本地 Faster-Whisper 识别，并逐条调用本地 Ollama 翻译，避免长上下文造成字幕重复。
 
-Files are written to `downloads\<video-id>\`:
+输出在 `downloads\<视频ID>\`：
 
-- `<video-id>_bilingual.srt` — source first, then the translation; ready to import into a player
-- `<video-id>_source.srt` — source-only SRT for review
-- `<video-id>_learning_guide.md` — Chinese overview, dialogue flow, expressions, and study steps
+- `<视频ID>_bilingual.srt`：每条先显示原文，再显示中文或德语译文，可直接导入播放器
+- `<视频ID>_source.srt`：原文字幕，便于单独复习
+- `<视频ID>_learning_guide.md`：中文内容概述、对话脉络、重点表达和学习方法
 
-The fixed language policy is Chinese source → Chinese + German; German, English, and every other source language → source + Chinese. Command-line use:
+语言规则固定为：中文视频 → 中文 + 德语；德语、英语及其他语言 → 原文 + 中文。命令行也可以使用：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\windows\download_subtitle.ps1 -Url "video URL"
-# Add -NoSummary to skip the study guide
+powershell -ExecutionPolicy Bypass -File scripts\windows\download_subtitle.ps1 -Url "视频地址"
+# 不生成学习笔记：加 -NoSummary
 ```
 
-**Colours:** white = committed source · grey italic = provisional source tail · light-blue italic = draft translation · light grey = final translation.
+**颜色**：**白**=已确定源语言；*灰斜体*=可能修正的尾部；*浅蓝斜体*=草稿译文；浅灰=正式译文。
 
-## Configuration
+## 配置
 
-Defaults live in [config.py](config.py). Prefer overrides in **`config_local.py`** (gitignored):
+默认在 [config.py](config.py)。个人覆盖写 **`config_local.py`**（gitignore）：
 
 ```python
-WHISPER_MODEL = "large-v3-turbo"   # or "medium" / "small"
-OLLAMA_MODEL = "qwen3.5:9b"        # weaker machines: "qwen3.5:2b"
+WHISPER_MODEL = "large-v3-turbo"   # 显存不够改 medium / small
+OLLAMA_MODEL = "qwen3.5:9b"        # 弱机可 qwen3.5:2b
 SOURCE_LANGUAGE = "de"
 DRAFT_TRANSLATION = True
 GLOSSARY = {...}
 ```
 
-VRAM tiers and model picks are documented in [CLAUDE.md](CLAUDE.md).
+显存分档见 [CLAUDE.md](CLAUDE.md)。
 
-## Repository layout
+## 目录结构
 
-| Path | Role |
+| 路径 | 职责 |
 |---|---|
-| `main.py` | Thin entrypoint (`python -u main.py`) |
-| `realtime_subtitle/` | Package: `capture/`, `asr/`, `translate/`, `ui/`, `offline.py`, `app.py` |
-| `scripts/windows/` | Install, start, stop, pause, update, uninstall, download-and-subtitle |
-| `tests/` | Pytest + standalone GUI harnesses |
-| `docs/` | Design specs, Chinese notes, structure guide |
+| `main.py` | 入口（`python -u main.py`） |
+| `realtime_subtitle/` | 包：`capture/` `asr/` `translate/` `ui/` `offline.py` `app.py` |
+| `scripts/windows/` | 安装、启动、停止、暂停、更新、卸载、下载并加字幕 |
+| `tests/` | 单元测试 + 独立 GUI 脚本套件 |
+| `docs/` | 设计文档、中文笔记 |
 
-See [docs/STRUCTURE.md](docs/STRUCTURE.md).
+详见 [docs/STRUCTURE.md](docs/STRUCTURE.md)。三语 README 同步规范见 [docs/README-i18n.md](docs/README-i18n.md)。
 
-## Tests
+## 测试
 
 ```powershell
 venv\Scripts\pip install -r requirements-dev.txt
 venv\Scripts\python -m pytest tests\test_pipeline_helpers.py -q
-# GUI harnesses (not collected by pytest):
+# GUI 独立套件（pytest 不收集）：
 # venv\Scripts\python tests\test_hittest.py
 ```
 
-## Troubleshooting
+## 常见问题
 
-| Symptom | What to try |
+| 现象 | 处理 |
 |---|---|
-| `cublas64_12.dll` missing | Reinstall `nvidia-cublas-cu12` / `nvidia-cudnn-cu12` from `requirements.txt` |
-| Source only, no translation | Start Ollama; `ollama pull` the model printed by `from realtime_subtitle import config; print(config.OLLAMA_MODEL)` |
-| Frequent “GPU busy” | Settings → slower commit interval, or smaller Whisper model in `config_local.py` |
-| No audio after headset change | Settings → device name contains… or `LOOPBACK_DEVICE_NAME` in `config_local.py` |
-| Tiny UI on laptop | Windows display scaling; `Ctrl+scroll` for subtitle font size |
-| Download or subtitle failure | Make sure `ffmpeg` is on PATH, start Ollama once, and reinstall dependencies to add `yt-dlp` |
+| 缺少 `cublas64_12.dll` | 按 `requirements.txt` 重装 nvidia-cublas/cudnn |
+| 只有原文没有译文 | 启动 Ollama；`ollama pull` 程序实际使用的 `config.OLLAMA_MODEL` |
+| 频繁 “GPU 繁忙” | 设置里加大提交节奏，或换小 Whisper 模型 |
+| 换耳机后无字幕 | 设置「设备名包含」或 `LOOPBACK_DEVICE_NAME` |
+| 下载或加字幕失败 | 确认已安装 `ffmpeg`，首次运行先启动 Ollama；重新安装依赖以补齐 `yt-dlp` |
 
-Logs: `subtitle.log` / `subtitle.err.log` (and rotated files under `logs/`).
+日志：`subtitle.log` / `subtitle.err.log`，以及 `logs/` 轮转。
 
-## Credits & license
+## 致谢与许可
 
-- Originally inspired by [leik1000/realtime_subtitle](https://github.com/leik1000/realtime_subtitle) (Apache-2.0); recognition pipeline rewritten
-- Streaming agreement ideas from [ufal/whisper_streaming](https://github.com/ufal/whisper_streaming) (MIT)
+- 最初基于 [leik1000/realtime_subtitle](https://github.com/leik1000/realtime_subtitle)（Apache-2.0），识别管线已重写
+- 增量识别思路来自 [ufal/whisper_streaming](https://github.com/ufal/whisper_streaming)（MIT）
 - [Faster-Whisper](https://github.com/SYSTRAN/faster-whisper) · [Qwen](https://github.com/QwenLM/Qwen) · [Ollama](https://ollama.com/) · [pyaudiowpatch](https://github.com/s0d3s/PyAudioWPatch)
 
-Licensed under [Apache-2.0](LICENSE).
+本项目采用 [Apache-2.0](LICENSE) 许可证。

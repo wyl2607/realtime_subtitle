@@ -20,7 +20,7 @@ Erkennung und Übersetzung laufen offline; Audio und Transkripte verlassen den R
 > Template auf einen leeren String setzen entfernt den Button. Achtung: Das Programm nimmt
 > **den gesamten Systemton** auf, also ggf. auch Sprachanrufe.
 
-[English](README.md) · [中文](README.zh.md) · [Repository-Struktur](docs/STRUCTURE.md) · [Windows-Anleitung](docs/WINDOWS-RUNBOOK.md)
+[中文](README.md) · [English](README.en.md) · [Repository-Struktur](docs/STRUCTURE.md) · [Windows-Anleitung](docs/WINDOWS-RUNBOOK.md)
 
 ```text
 Systemton ──WASAPI-Loopback──▶ Faster-Whisper (CUDA oder CPU)
@@ -49,9 +49,12 @@ Systemton ──WASAPI-Loopback──▶ Faster-Whisper (CUDA oder CPU)
   die Untertitel rund 12 Sekunden lang unbrauchbar, weil der Ton in diesem
   Zeitraum noch mit der alten Sprache transkribiert wird.
 - **Klick-durchlässig** — `Ctrl+Alt+M` für Vollbild-Video/Spiele
+- **Kinoleiste** — transparenter Netflix-ähnlicher Streifen am unteren Bildrand (`Ctrl+Alt+C` / 🎞); immer klick-durchlässig
+- **TV-Vollbild** — undurchsichtiges Großschrift-Fenster auf einem zweiten Bildschirm (📺)
+- **KI-Analyse** — 🤖 fasst die letzten Minuten lokal zusammen; 🌐 öffnet eine Web-KI erst nach Bestätigung
 - **Tages-Archiv** — Ordner `transcripts/`, standardmäßig unbegrenzt aufbewahrt. Klartext, und diese App nimmt **sämtlichen** System-Ton auf: `TRANSCRIPT_KEEP_DAYS = 30` löscht Älteres automatisch, `SAVE_TRANSCRIPT = False` zeichnet gar nichts auf
 - **Video herunterladen und Untertitel erzeugen** — Desktop-Shortcut `下载并加字幕.bat` oder `scripts\windows\download_subtitle.ps1` lädt bis 4K, transkribiert lokal, erzeugt SRT-Dateien, übersetzt jede Zeile mit lokalem Ollama und schreibt einen chinesischen Lernleitfaden. Chinesische Quelle wird Chinesisch + Deutsch; Deutsch, Englisch und andere Quellen werden Quelle + Chinesisch.
-- **Hotkeys** — Pause, Sprache, Leistungsmodus (siehe Nutzung)
+- **Hotkeys** — Pause, Sprache, Leistungsmodus, Kinoleiste (siehe Nutzung)
 
 ## Systemvoraussetzungen
 
@@ -119,8 +122,11 @@ venv\Scripts\python -u main.py
 | Pause / Weiter | `Ctrl+Alt+P` |
 | Sprachpaar wechseln | `Ctrl+Alt+L` (de→zh / zh→de / en→zh, siehe `config.LANGUAGE_PAIRS`) |
 | Leistungsmodus | `Ctrl+Alt+G` |
+| Kinoleiste | `Ctrl+Alt+C` oder 🎞 (nötig, wenn das Video schon Vollbild ist) |
+| TV-Vollbild | 📺 |
+| KI-Analyse | 🤖 |
 | Verlauf | 📜 |
-| Einstellungen | ⚙️ |
+| Einstellungen | ⚙️ (Takt, Schriftgröße, Kinoleiste — live) |
 | Beenden | ❌ oder Stopp-Shortcut |
 
 ### Video herunterladen und zweisprachige SRT-Dateien erstellen
