@@ -21,11 +21,87 @@ function Test-OurInterpreter {
     }
 }
 
-function Test-RealtimeCommandLine {
+if (-not ('RealtimeSubtitle.Native' -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+namespace RealtimeSubtitle {
+    public static class Native {
+        [DllImport("shell32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern IntPtr CommandLineToArgvW(string lpCmdLine, out int pNumArgs);
+        [DllImport("kernel32.dll")]
+        public static extern IntPtr LocalFree(IntPtr hMem);
+    }
+}
+"@
+}
+
+function Split-WindowsCommandLine {
     param($CommandLine)
-    if (-not $CommandLine) { return $false }
-    if ($CommandLine -match 'download_subtitle\.py') { return $false }
-    return [bool]($CommandLine -match '(^|[\\/\s])main\.py(\s|$)')
+    if (-not $CommandLine) { return @() }
+    $argc = 0
+    $ptr = [IntPtr]::Zero
+    try {
+        $ptr = [RealtimeSubtitle.Native]::CommandLineToArgvW([string]$CommandLine, [ref]$argc)
+        if ($ptr -eq [IntPtr]::Zero -or $argc -le 0) { return @() }
+        $args = @()
+        for ($i = 0; $i -lt $argc; $i++) {
+            $itemPtr = [Runtime.InteropServices.Marshal]::ReadIntPtr($ptr, $i * [IntPtr]::Size)
+            $args += [Runtime.InteropServices.Marshal]::PtrToStringUni($itemPtr)
+        }
+        return $args
+    } finally {
+        if ($ptr -ne [IntPtr]::Zero) {
+            [RealtimeSubtitle.Native]::LocalFree($ptr) | Out-Null
+        }
+    }
+}
+
+function Get-PythonEntryScript {
+    param($CommandLine)
+    $argv = @(Split-WindowsCommandLine $CommandLine)
+    if ($argv.Count -lt 2) { return $null }
+    for ($i = 1; $i -lt $argv.Count; $i++) {
+        $arg = [string]$argv[$i]
+        if ($arg -eq '--') {
+            if ($i + 1 -lt $argv.Count) { return [string]$argv[$i + 1] }
+            return $null
+        }
+        if ($arg -eq '-') { return $null }
+        if ($arg.StartsWith('--')) {
+            if ($arg -eq '--check-hash-based-pycs') { $i++ }
+            continue
+        }
+        if ($arg.StartsWith('-c') -or $arg.StartsWith('-m')) { return $null }
+        if ($arg -eq '-W' -or $arg -eq '-X') { $i++; continue }
+        if ($arg.StartsWith('-')) { continue }
+        return $arg
+    }
+    return $null
+}
+
+function Test-RealtimeCommandLine {
+    param($CommandLine, $RepoRoot)
+    $script = Get-PythonEntryScript $CommandLine
+    if (-not $script) { return $false }
+    $name = [IO.Path]::GetFileName($script)
+    if ($name -and $name.Equals('download_subtitle.py', [StringComparison]::OrdinalIgnoreCase)) {
+        return $false
+    }
+    if (-not ($name -and $name.Equals('main.py', [StringComparison]::OrdinalIgnoreCase))) {
+        return $false
+    }
+    $bare = ($script -eq $name)
+    if ($bare) { return $true }
+    if (-not $RepoRoot) { return $false }
+    if (-not [IO.Path]::IsPathRooted($script)) { return $false }
+    try {
+        $actual = [IO.Path]::GetFullPath($script)
+        $expected = [IO.Path]::GetFullPath((Join-Path $RepoRoot 'main.py'))
+        return $actual.Equals($expected, [StringComparison]::OrdinalIgnoreCase)
+    } catch {
+        return $false
+    }
 }
 
 function Read-SubtitleIdentity {
@@ -72,7 +148,7 @@ function Test-RealtimeInstance {
     }
     $cmd = Get-ProcessCommandLine -ProcessId $Proc.Id
     if (-not (Test-OurInterpreter $Proc.Path $RepoRoot)) { return $false }
-    if (-not (Test-RealtimeCommandLine $cmd)) { return $false }
+    if (-not (Test-RealtimeCommandLine $cmd $RepoRoot)) { return $false }
     if ($Identity -and $Identity.pid -and ([int]$Identity.pid -ne $Proc.Id)) {
         return $false
     }

@@ -1,5 +1,10 @@
 """F04：停止对象必须是当前实时字幕实例。测试不实际杀进程。"""
+import json
+import os
+import subprocess
 from pathlib import Path
+
+import pytest
 
 from realtime_subtitle.instance_identity import (
     confirm_realtime_process,
@@ -7,6 +12,12 @@ from realtime_subtitle.instance_identity import (
     is_realtime_command,
     parse_pid_file,
     should_force_stop,
+)
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+IDENTITY_PS1 = REPO_ROOT / "scripts" / "windows" / "_identity.ps1"
+WINDOWS_POWERSHELL = Path(os.environ.get("SystemRoot", r"C:\Windows")) / (
+    "System32/WindowsPowerShell/v1.0/powershell.exe"
 )
 
 
@@ -176,14 +187,120 @@ def test_missing_live_start_time_cannot_force_kill(tmp_path):
 
 
 def test_stop_script_does_not_use_bare_venv_prefix():
-    from pathlib import Path
-
-    text = (Path(__file__).resolve().parents[1]
-            / "scripts" / "windows" / "stop_subtitles.ps1").read_text(encoding="utf-8-sig")
-    helper = (Path(__file__).resolve().parents[1]
-              / "scripts" / "windows" / "_identity.ps1").read_text(encoding="utf-8-sig")
+    text = (REPO_ROOT / "scripts" / "windows" / "stop_subtitles.ps1").read_text(
+        encoding="utf-8-sig")
+    helper = IDENTITY_PS1.read_text(encoding="utf-8-sig")
     # 裸 StartsWith(venv) 会匹配 venv_backup；必须精确 python.exe + main.py
     assert "venv_backup" in text
     assert "Test-RealtimeInstance" in text
     assert "main.py" in helper
     assert "GetFullPath" in helper
+
+
+def _identity_cases(repo: Path) -> list[tuple[str, str, bool]]:
+    """(name, command_line, expected). repo 是当前仓库根。"""
+    main_py = repo / "main.py"
+    quoted_main = f'python.exe "{main_py}"'
+    other_main = repo.parent / "other" / "main.py"
+    return [
+        ("launcher_relative", r"python.exe -u main.py", True),
+        ("quoted_absolute_this_repo", quoted_main, True),
+        ("worker_arg_main", r"python.exe worker.py main.py", False),
+        (
+            "worker_input_main",
+            f'python.exe worker.py --input "{main_py}"',
+            False,
+        ),
+        (
+            "other_repo_main",
+            f'python.exe -u "{other_main}"',
+            False,
+        ),
+        ("python_c", 'python.exe -c "print(1)"', False),
+        ("offline_entry", r"python.exe -u download_subtitle.py https://x", False),
+        ("empty", "", False),
+    ]
+
+
+def test_realtime_command_uses_python_entry_not_any_main_argument(tmp_path):
+    repo = tmp_path / "project"
+    repo.mkdir()
+    (repo / "main.py").write_text("", encoding="utf-8")
+    for name, command, expected in _identity_cases(repo):
+        assert is_realtime_command(command, repo) is expected, name
+
+
+@pytest.mark.skipif(os.name != "nt" or not WINDOWS_POWERSHELL.is_file(), reason="需要 Windows PowerShell 5.1")
+def test_powershell_realtime_command_matches_python_entry_rules(tmp_path):
+    repo = tmp_path / "project"
+    repo.mkdir()
+    (repo / "main.py").write_text("", encoding="utf-8")
+    cases = [
+        {"name": name, "command": command, "expect": int(expected)}
+        for name, command, expected in _identity_cases(repo)
+    ]
+    case_file = tmp_path / "cases.json"
+    case_file.write_text(json.dumps(cases, ensure_ascii=False), encoding="utf-8")
+    script = tmp_path / "run_identity.ps1"
+    script.write_text(
+        "param($Helper, $RepoRoot, $CaseFile)\n"
+        "$ErrorActionPreference = 'Stop'\n"
+        ". $Helper\n"
+        "$cases = Get-Content -LiteralPath $CaseFile -Encoding UTF8 -Raw | ConvertFrom-Json\n"
+        "$failed = @()\n"
+        "foreach ($c in @($cases)) {\n"
+        "  $got = [int][bool](Test-RealtimeCommandLine -CommandLine $c.command -RepoRoot $RepoRoot)\n"
+        "  if ($got -ne [int]$c.expect) {\n"
+        "    $failed += \"$($c.name): got=$got expect=$($c.expect) cmd=$($c.command)\"\n"
+        "  }\n"
+        "}\n"
+        "if ($failed.Count) { $failed -join [Environment]::NewLine; exit 1 }\n"
+        "Write-Output 'OK'\n",
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [
+            str(WINDOWS_POWERSHELL), "-NoProfile", "-NonInteractive", "-File", str(script),
+            "-Helper", str(IDENTITY_PS1), "-RepoRoot", str(repo), "-CaseFile", str(case_file),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "OK" in result.stdout
+
+
+def test_force_stop_rejects_pid_reuse_even_with_matching_command(tmp_path):
+    repo = tmp_path / "proj"
+    ours = repo / "venv" / "Scripts" / "python.exe"
+    ours.parent.mkdir(parents=True)
+    ours.write_text("")
+    recorded = {
+        "pid": 9,
+        "start_time": "111",
+        "exe": str(ours),
+        "command_line": f"{ours} -u main.py",
+        "repo_root": str(repo),
+    }
+    live = {
+        "pid": 9,
+        "start_time": "222",
+        "exe": str(ours),
+        "command_line": f"{ours} -u main.py",
+    }
+    assert should_force_stop(recorded, live) is False
+
+
+def test_stop_script_revalidates_identity_before_force_kill():
+    text = (REPO_ROOT / "scripts" / "windows" / "stop_subtitles.ps1").read_text(
+        encoding="utf-8-sig")
+    force_lines = [
+        (index, line) for index, line in enumerate(text.splitlines())
+        if line.strip().startswith("Stop-Process") and "-Force" in line
+    ]
+    assert len(force_lines) >= 2, "PID 路径和窗口标题路径都应有强杀"
+    lines = text.splitlines()
+    for index, _line in force_lines:
+        prelude = "\n".join(lines[max(0, index - 12):index])
+        assert "Test-RealtimeInstance" in prelude, prelude

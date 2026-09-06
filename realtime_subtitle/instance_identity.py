@@ -6,11 +6,12 @@ Window titles are only a discovery hint; they never authorize a kill.
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 
-_MAIN_ENTRY = re.compile(r"(?:^|[\\/\s])main\.py(?:\s|$)", re.I)
-_OFFLINE_ENTRY = re.compile(r"download_subtitle\.py", re.I)
+_OFFLINE_ENTRY = "download_subtitle.py"
+_MAIN_ENTRY = "main.py"
 
 
 def parse_pid_file(raw: str) -> dict:
@@ -49,12 +50,128 @@ def is_our_interpreter(exe_path: str | None, repo_root) -> bool:
     return actual in expected
 
 
-def is_realtime_command(command_line: str | None) -> bool:
+def split_windows_command_line(command_line: str) -> list[str]:
+    """Split a CreateProcess/WMI command line the way CommandLineToArgvW does."""
     if not command_line:
+        return []
+    if os.name == "nt":
+        try:
+            return _split_command_line_win32(command_line)
+        except OSError:
+            pass
+    return _split_command_line_portable(command_line)
+
+
+def _split_command_line_win32(command_line: str) -> list[str]:
+    import ctypes
+
+    argc = ctypes.c_int()
+    CommandLineToArgvW = ctypes.windll.shell32.CommandLineToArgvW
+    CommandLineToArgvW.restype = ctypes.POINTER(ctypes.c_wchar_p)
+    CommandLineToArgvW.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
+    argv = CommandLineToArgvW(command_line, ctypes.byref(argc))
+    if not argv:
+        raise OSError("CommandLineToArgvW failed")
+    try:
+        return [argv[i] for i in range(argc.value)]
+    finally:
+        ctypes.windll.kernel32.LocalFree(argv)
+
+
+def _split_command_line_portable(command_line: str) -> list[str]:
+    args: list[str] = []
+    i = 0
+    n = len(command_line)
+    while i < n:
+        while i < n and command_line[i] in " \t":
+            i += 1
+        if i >= n:
+            break
+        token: list[str] = []
+        in_quotes = False
+        while i < n:
+            char = command_line[i]
+            if not in_quotes and char in " \t":
+                break
+            if char == "\\":
+                slashes = 0
+                while i < n and command_line[i] == "\\":
+                    slashes += 1
+                    i += 1
+                if i < n and command_line[i] == '"':
+                    token.append("\\" * (slashes // 2))
+                    if slashes % 2 == 0:
+                        in_quotes = not in_quotes
+                    else:
+                        token.append('"')
+                    i += 1
+                else:
+                    token.append("\\" * slashes)
+                continue
+            if char == '"':
+                in_quotes = not in_quotes
+                i += 1
+                continue
+            token.append(char)
+            i += 1
+        args.append("".join(token))
+    return args
+
+
+def python_entry_script(command_line: str | None) -> str | None:
+    """Return the script path Python would execute, or None if it is not a file entry."""
+    argv = split_windows_command_line(command_line or "")
+    if len(argv) < 2:
+        return None
+    index = 1
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--":
+            return argv[index + 1] if index + 1 < len(argv) else None
+        if arg == "-":
+            return None
+        if arg.startswith("--"):
+            if arg == "--check-hash-based-pycs":
+                index += 2
+                continue
+            index += 1
+            continue
+        if arg.startswith("-c") or arg.startswith("-m"):
+            return None
+        if arg in {"-W", "-X"}:
+            index += 2
+            continue
+        if arg.startswith("-"):
+            index += 1
+            continue
+        return arg
+    return None
+
+
+def _is_bare_filename(path: str) -> bool:
+    return Path(path).name == path and "/" not in path and "\\" not in path
+
+
+def is_realtime_command(command_line: str | None, repo_root=None) -> bool:
+    script = python_entry_script(command_line)
+    if not script:
         return False
-    if _OFFLINE_ENTRY.search(command_line):
+    name = Path(script).name.lower()
+    if name == _OFFLINE_ENTRY:
         return False
-    return bool(_MAIN_ENTRY.search(command_line))
+    if name != _MAIN_ENTRY:
+        return False
+    if _is_bare_filename(script):
+        # 启动器契约：python.exe -u main.py。带目录的相对路径不能猜工作目录。
+        return True
+    if repo_root is None:
+        return False
+    try:
+        actual = Path(script).resolve()
+        expected = (Path(repo_root) / "main.py").resolve()
+    except OSError:
+        return False
+    return os.path.normcase(str(actual)) == os.path.normcase(str(expected))
 
 
 def confirm_realtime_process(
@@ -65,7 +182,7 @@ def confirm_realtime_process(
 ) -> bool:
     """Title is ignored for authorization; interpreter + entry must match."""
     del window_title
-    return is_our_interpreter(exe, repo_root) and is_realtime_command(command_line)
+    return is_our_interpreter(exe, repo_root) and is_realtime_command(command_line, repo_root)
 
 
 def should_force_stop(recorded: dict | None, live: dict | None) -> bool:

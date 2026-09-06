@@ -43,8 +43,13 @@ if (Test-Path $pidFile) {
             Write-Host "已优雅停止实时字幕程序 (PID $targetPid)"
             $stopped = $true
         } else {
-            Stop-Process -Id $targetPid -Force
-            Write-Host "优雅退出超时，已强制停止 (PID $targetPid)"
+            $live = Get-Process -Id $targetPid -ErrorAction SilentlyContinue
+            if (Test-RealtimeInstance $live $identity $RepoRoot) {
+                Stop-Process -Id $targetPid -Force
+                Write-Host "优雅退出超时，已强制停止 (PID $targetPid)"
+            } else {
+                Write-Host "等待期间进程身份已变化，放弃强杀 (PID $targetPid)"
+            }
             $stopped = $true
         }
     } elseif ($targetProc) {
@@ -70,7 +75,10 @@ if (-not $stopped) {
         foreach ($proc in $verified) {
             New-Item -ItemType File -Path $stopFlag -Force | Out-Null
             if (-not (Wait-ProcessExit -ProcessId $proc.Id -Seconds $graceSeconds)) {
-                Stop-Process -Id $proc.Id -Force
+                $live = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
+                if (Test-RealtimeInstance $live $null $RepoRoot) {
+                    Stop-Process -Id $proc.Id -Force
+                }
             }
         }
         Write-Host "已按窗口标题停止实时字幕程序"
@@ -148,7 +156,7 @@ for ($i = 0; $i -lt 32; $i++) {
         Where-Object {
             $_.ExecutablePath -and
             (Test-OurInterpreter $_.ExecutablePath $RepoRoot) -and
-            (Test-RealtimeCommandLine $_.CommandLine)
+            (Test-RealtimeCommandLine $_.CommandLine $RepoRoot)
         }
     if (-not $leftover) { break }
     Start-Sleep -Milliseconds 250
