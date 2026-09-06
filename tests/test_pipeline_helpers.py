@@ -753,6 +753,7 @@ def _translator_for_tx(**overrides):
     from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 
     tq._warm_done.set()
+    tq._warm_ok = False  # 别让别的用例留下的启动预热把假翻译器当成已热
     t = WhisperQueueTranslator.__new__(WhisperQueueTranslator)
     t._tx_lock = Lock()
     t._tx_queue = []
@@ -2073,6 +2074,15 @@ def test_language_pairs_switch_both_ends(monkeypatch):
     assert target_for("zh") == "de"
 
 
+def test_danish_is_named_and_in_language_pairs():
+    from realtime_subtitle.translate.translator_queue import language_name, language_pairs, target_for
+
+    assert language_name("da") == "丹麦语"
+    assert ("da", "zh") in language_pairs()
+    assert target_for("da") == "zh"
+    assert "da" in config.LANGUAGE_SEED_PROMPTS
+
+
 def test_legacy_language_cycle_still_works(monkeypatch):
     """老 config_local.py 里可能只写了 LANGUAGE_CYCLE = ["de","en"]（那时候
     目标语言是写死的中文）。不能让它们升级后失效。"""
@@ -2756,3 +2766,74 @@ def test_batch_max_chars_is_smaller_for_no_space_languages():
     assert _batch_max_chars(lang="de") == config.TRANSLATE_BATCH_MAX_CHARS
     assert _batch_max_chars(lang="zh") == config.TRANSLATE_BATCH_MAX_CHARS_CJK
     assert _batch_max_chars(lang="zh") < _batch_max_chars(lang="de")
+
+
+def test_startup_warm_uses_short_keep_alive(monkeypatch):
+    """☠️ 启动预热不能用 keep_alive=2h。
+
+    WhisperQueueTranslator() 先发预热再赋给 app.translator。加载中关窗时
+    translator 还是 None，stop() 走不到 shutdown，2h 租期会把模型留在显存
+    约两小时（实机 qwen3.5:9b 约 5.49GB）。预热改短租期后，最坏残留有上限；
+    正常翻译请求仍用 2h 续租。
+    """
+    import realtime_subtitle.translate.translator_queue as tq
+
+    posted = []
+
+    class _Resp:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        tq.requests, "post",
+        lambda url, json=None, timeout=None: (posted.append(json), _Resp())[1])
+    monkeypatch.setattr(config, "OLLAMA_MODEL", "qwen3.5:9b")
+
+    tq._spawn_startup_warm()
+    tq._warm_thread.join(timeout=5)
+    assert posted, "启动预热一个请求都没发"
+    keep = posted[0].get("keep_alive")
+    assert keep not in (None, "2h", "2H"), posted[0]
+    seconds = tq._keep_alive_seconds(keep)
+    assert 30 <= seconds <= 60, f"预热租期应在 30–60 秒：{keep!r} -> {seconds}"
+
+
+def test_release_startup_warm_unloads_when_translator_never_assigned(monkeypatch):
+    """加载中途退出：translator 仍是 None，也必须等预热落地并 keep_alive=0。"""
+    import realtime_subtitle.translate.translator_queue as tq
+
+    posts = []
+
+    class _Resp:
+        def json(self):
+            return {"models": [{"name": "qwen3.5:9b"}]}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        tq.requests, "post",
+        lambda url, json=None, timeout=None: (posts.append(json), _Resp())[1])
+    monkeypatch.setattr(config, "OLLAMA_MODEL", "qwen3.5:9b")
+    monkeypatch.setattr(config, "GAME_MODE_OLLAMA_MODEL", None, raising=False)
+
+    class _FakeSession:
+        def get(self, url, **kw):
+            return _Resp()
+
+        def post(self, url, json=None, **kw):
+            posts.append(json)
+            return _Resp()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tq.requests, "Session", _FakeSession)
+
+    tq._spawn_startup_warm()
+    tq._warm_thread.join(timeout=5)
+    tq.release_startup_warm()
+
+    unloads = [p for p in posts if p and p.get("keep_alive") == 0]
+    assert unloads, f"预热模型没被卸载：{posts}"
+    assert unloads[0]["model"] == "qwen3.5:9b"

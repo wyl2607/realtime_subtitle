@@ -413,6 +413,11 @@ _warm_model = None
 # （2026-08-02 实测：开机冷读 5.6GB 模型花了 33.8 秒，其间两句翻译被超时丢弃）
 _warm_done = Event()
 _warm_ok = False  # 预热是否真的成功（失败也要 set 事件，但不能当模型已热）
+# 加载中途退出：translator 还没赋给 app，stop() 靠这个标志让预热收尾后自卸
+_warm_cancel = Event()
+# 启动预热用短租期。构造未完成就关窗时 shutdown 走不到，2h 会把 5.6GB
+# 模型留驻两小时。正常翻译/查词请求仍用 keep_alive="2h" 续成长租期。
+STARTUP_WARM_KEEP_ALIVE = "60s"
 
 
 class RemoteOllamaRefused(RuntimeError):
@@ -587,9 +592,36 @@ def _warn_if_ipv6_first_host(base_url):
     return True
 
 
+def _keep_alive_seconds(value):
+    """把 Ollama keep_alive 写成秒，方便测试断言短租期上限。"""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if text in ("0", "-1"):
+        return float(text)
+    unit = text[-1]
+    try:
+        amount = float(text[:-1] if unit in "smh" else text)
+    except ValueError:
+        return None
+    if unit == "s":
+        return amount
+    if unit == "m":
+        return amount * 60
+    if unit == "h":
+        return amount * 3600
+    return amount
+
+
 def _spawn_startup_warm():
-    global _warm_thread, _warm_model
+    global _warm_thread, _warm_model, _warm_ok
     _warm_done.clear()
+    _warm_cancel.clear()
+    _warm_ok = False
     # 在 spawn 的这一刻定下预热哪个模型，并记下来供后面对账
     _warm_model = config.OLLAMA_MODEL
     _warm_thread = Thread(target=_startup_warm_ollama, args=(_warm_model,),
@@ -612,7 +644,7 @@ def _startup_warm_ollama(model=None):
         t0 = time.time()
         requests.post(
             f"{ollama_url()}/api/generate",
-            json={"model": model, "prompt": "", "keep_alive": "2h",
+            json={"model": model, "prompt": "", "keep_alive": STARTUP_WARM_KEEP_ALIVE,
                   # ☠️ 预热也必须带 num_ctx，它和翻译/查词一样是"一条 Ollama
                   # 调用路径"（CLAUDE.md 第 21 条）。不带的话装出来的是**默认
                   # 上下文长度**的 runner，首句翻译按 OLLAMA_NUM_CTX 一请求就
@@ -636,6 +668,53 @@ def _startup_warm_ollama(model=None):
     finally:
         # ☠️ 成功失败都要 set：等待方（_await_model_ready）否则会白等满超时
         _warm_done.set()
+        # 关窗发生在构造返回前：stop() 已置取消标志。预热请求若在卸载之后
+        # 才落地，会把模型重新留驻——这里自己卸，短租期是超时兜底。
+        if _warm_cancel.is_set() and _warm_ok:
+            _unload_startup_warm_model(model)
+
+
+def _unload_startup_warm_model(model, timeout=3.0):
+    """只卸这次启动预热实际装进显存的模型。未加载则不发 keep_alive=0。"""
+    if not model:
+        return
+    remaining = max(0.2, float(timeout))
+    session = requests.Session()
+    try:
+        loaded = session.get(
+            f"{ollama_url()}/api/ps", timeout=min(2.0, remaining),
+        ).json().get("models", [])
+        for item in loaded:
+            name = item.get("name")
+            if WhisperQueueTranslator._model_name_matches(name, model):
+                session.post(
+                    f"{ollama_url()}/api/generate",
+                    json={"model": name, "prompt": "", "keep_alive": 0},
+                    timeout=min(3.0, remaining),
+                ).close()
+                print(f"🧹 已卸载启动预热模型 {name}（释放显存）")
+    except Exception:
+        pass
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+
+def release_startup_warm(timeout=3.0):
+    """translator 还是 None 时的退出入口：等预热落地，再卸掉它装的模型。
+
+    等不及时靠 STARTUP_WARM_KEEP_ALIVE 到期；不杀 Ollama、不无限 join。
+    """
+    _warm_cancel.set()
+    t = _warm_thread
+    if t is not None and t.is_alive():
+        t.join(timeout=timeout)
+    if t is not None and t.is_alive():
+        return  # 短租期兜底；预热线程若随后落地会自己卸
+    if _warm_ok:
+        _unload_startup_warm_model(_warm_model, timeout=timeout)
 
 
 _WhisperModel = None  # set by _ensure_ml_deps()

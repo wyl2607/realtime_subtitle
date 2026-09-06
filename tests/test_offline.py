@@ -105,7 +105,9 @@ def test_translate_resumes_completed_rows(tmp_path, monkeypatch):
     seen.clear()
     offline.translate_segments(rows, "de", "zh", checkpoint_path=ckpt)
     assert all(r.get("translation") == "译" for r in rows)
-    assert not any("Eins" in p for p in seen), "已完成的第 1 条不该再请求"
+    assert len(seen) == 2, "已完成的第 1 条不该再作为当前条目请求"
+    assert all("德语原文：\nEins\n" not in p for p in seen)
+    assert "Eins" in seen[0]  # 只作为 Zwei 的上一句语境
 
 
 def test_checkpoint_rejects_language_change(tmp_path):
@@ -369,8 +371,115 @@ def test_guide_candidate_block_respects_budget(tmp_path, monkeypatch, candidate_
     assert all(len(p) <= final_budget for p in finals)
     if candidate_count == 0:
         assert "不要编造" in finals[-1] or "无合适候选" in finals[-1]
+        assert "预算不足暂不展示" not in finals[-1]
     elif candidate_count == 1:
         assert "选 1 条" in finals[-1]
+
+
+def test_long_video_keeps_vocab_candidates_after_summary_merge(tmp_path, monkeypatch):
+    """☠️ 240 条合格字幕 / 20 分钟：先删光候选再归并摘要的话，腾出预算也不会恢复。
+
+    复现条件与交接方案一致：每条都符合候选长度，模型摘要替身约 140 字。
+    最终 prompt 必须仍含预算能装下的原始表达，不能写成「本次无合适候选」。
+    """
+    _stub_ollama_local(monkeypatch)
+    finals = []
+
+    def fake_req(session, url, model, prompt, num_predict=512):
+        if "必须输出 Markdown" in prompt:
+            finals.append(prompt)
+            return (
+                "## 内容概述\n一段概述\n"
+                "## 对话脉络\n- 第一条\n"
+                "## 重点词汇与表达\n- Wort — 词；提示\n"
+                "## 学习方法\n1. 听原文\n"
+            )
+        return "这是一个用于确认长视频归并行为的摘要。" * 7
+
+    monkeypatch.setattr(offline, "_ollama_request", fake_req)
+    monkeypatch.setattr(offline.config, "OLLAMA_NUM_CTX", 4096)
+    rows = [
+        {
+            "start": i * 5.0,
+            "end": i * 5.0 + 5.0,
+            "text": f"Wir lernen heute viele neue deutsche Ausdruecke Nummer {i:03d}.",
+            "translation": "今天学习新的德语表达。",
+        }
+        for i in range(240)
+    ]
+    dest = tmp_path / "guide.md"
+    offline.write_learning_guide(rows, "test", "https://example.test/x", 1200, "de", "zh", dest)
+    assert finals, "没有发出最终学习笔记 prompt"
+    prompt = finals[-1]
+    budget = offline.input_char_budget(output_tokens=1800)
+    assert len(prompt) <= budget
+    assert "本次无合适候选" not in prompt
+    assert "Ausdruecke" in prompt
+    vocab_lines = [line for line in prompt.splitlines() if line.startswith("- ") and "Ausdruecke" in line]
+    assert len(vocab_lines) >= 3, f"最终词汇输入太少：{len(vocab_lines)}"
+    assert dest.is_file()
+
+
+def test_guide_rejects_heading_only_sections():
+    headings_only = "\n".join(offline._GUIDE_SECTIONS)
+    assert offline._guide_has_required_sections(headings_only) is False
+
+    missing_overview_body = (
+        "## 内容概述\n"
+        "## 对话脉络\n- 第一条\n"
+        "## 重点词汇与表达\n- Wort — 词\n"
+        "## 学习方法\n1. 听原文\n"
+    )
+    assert offline._guide_has_required_sections(missing_overview_body) is False
+
+    missing_one_heading = (
+        "## 内容概述\n一段概述\n"
+        "## 对话脉络\n- 第一条\n"
+        "## 学习方法\n1. 听原文\n"
+    )
+    assert offline._guide_has_required_sections(missing_one_heading) is False
+
+    allowed_method_suffix = (
+        "## 内容概述\n一段概述\n"
+        "## 对话脉络\n- 第一条\n"
+        "## 重点词汇与表达\n本次无合适候选，字幕里没有适合单独列出的表达。\n"
+        "## 学习方法（配合双语SRT）\n1. 听原文\n"
+    )
+    assert offline._guide_has_required_sections(allowed_method_suffix) is True
+
+
+def test_heading_only_guide_does_not_overwrite_old_note(tmp_path, monkeypatch):
+    _stub_ollama_local(monkeypatch)
+    dest = tmp_path / "guide.md"
+    dest.write_text("# 旧笔记\n保留\n", encoding="utf-8")
+
+    def fake_req(session, url, model, prompt, num_predict=512):
+        if "必须输出 Markdown" in prompt:
+            return "\n".join(offline._GUIDE_SECTIONS)
+        return "摘要"
+
+    monkeypatch.setattr(offline, "_ollama_request", fake_req)
+    rows = [{"start": 0, "end": 1, "text": "Hallo zusammen, wir sprechen heute.", "translation": "你好"}]
+    with pytest.raises(offline.OfflineSubtitleError, match="不完整"):
+        offline.write_learning_guide(rows, "T", "https://example.test/x", 10, "de", "zh", dest)
+    assert dest.read_text(encoding="utf-8") == "# 旧笔记\n保留\n"
+
+
+def test_translation_prompt_keeps_previous_sentence_readonly():
+    prompt = offline._translation_prompt(
+        "de", "zh", "nur, mutmaßlich, vermutlich, möglicherweise.",
+        previous_text="Vier Wochen lang",
+    )
+    assert "Vier Wochen lang" in prompt
+    assert "nur, mutmaßlich, vermutlich, möglicherweise." in prompt
+    assert "不要把邻句译入" in prompt or "不要翻译进本条" in prompt or "只作语境" in prompt
+    assert offline.TX_STRATEGY_VERSION >= 3
+
+
+def test_guide_prompt_allows_fewer_outline_points_when_material_is_short():
+    prompt = offline._final_guide_prompt("摘要", "- Wort → 词", 1)
+    assert "素材不足" in prompt
+    assert "视频中表示" in prompt or "主持人认为" in prompt
 
 
 def test_input_budget_rejects_too_small_context():

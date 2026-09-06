@@ -236,10 +236,12 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     4096帧/块、纯音频谱能量比）：一次性重采样 90.4dB，逐块无状态只有
     **34.3dB**。喂给 Whisper 的每一帧都会叠一层噪声底。
 13. **任何"退出前卸载 Ollama 模型"的路径，都要先等在飞的请求落地**。翻译
-    /查词/预热请求都带 `keep_alive="2h"`，只要有一个在 `_unload_our_models()`
-    之后才返回，模型就被重新拉回显存留驻两小时。现在预热线程和查词线程
-    各有一个有界 3 秒的等待（`shutdown()` 里），加新的 Ollama 调用路径时
-    记得一起处理。
+    /查词请求带 `keep_alive="2h"`，启动预热用短租期 `STARTUP_WARM_KEEP_ALIVE`
+    （60 秒）。只要有一个 2h 请求在 `_unload_our_models()` 之后才返回，模型
+    就被重新拉回显存留驻两小时。加载中途退出时 `self.translator` 仍是 None，
+    `stop()` 必须走 `release_startup_warm()`，不能只靠 shutdown。现在预热
+    线程和查词线程各有一个有界 3 秒的等待，加新的 Ollama 调用路径时记得
+    一起处理。
 14. **模式系统只有一个写入口**：`main.py::SubtitleApp._apply_mode`。⚙️面板的
     四个按钮和 Ctrl+Alt+G 都转发到它；面板控件的显示一律靠
     `refresh_from_config()` 读回，不要再给面板加"自己 setValue 一遍"的旁路

@@ -215,6 +215,54 @@ def test_repeat_perf_toggle_stable():
         _restore(snap)
 
 
+def test_stop_releases_startup_warm_when_translator_is_none(monkeypatch):
+    """加载中点❌：self.translator 仍是 None，stop() 也必须收掉预热租期。"""
+    import realtime_subtitle.translate.translator_queue as tq
+
+    posts = []
+
+    class _Resp:
+        def json(self):
+            return {"models": [{"name": "qwen3.5:9b"}]}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        tq.requests, "post",
+        lambda url, json=None, timeout=None: (posts.append(json), _Resp())[1])
+    monkeypatch.setattr(config, "OLLAMA_MODEL", "qwen3.5:9b")
+    monkeypatch.setattr(config, "GAME_MODE_OLLAMA_MODEL", None, raising=False)
+
+    class _FakeSession:
+        def get(self, url, **kw):
+            return _Resp()
+
+        def post(self, url, json=None, **kw):
+            posts.append(json)
+            return _Resp()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tq.requests, "Session", _FakeSession)
+
+    tq._spawn_startup_warm()
+    tq._warm_thread.join(timeout=5)
+
+    app = main.SubtitleApp.__new__(main.SubtitleApp)
+    app.translator = None
+    app.audio_capture = None
+    app._hotkey_tid = None
+    app.running = True
+    app._closing = False
+    app.stop()
+
+    unloads = [p for p in posts if p and p.get("keep_alive") == 0]
+    assert unloads, f"加载中关闭没有卸载预热模型：{posts}"
+    assert unloads[0]["model"] == "qwen3.5:9b"
+
+
 if __name__ == "__main__":
     import pytest
     import sys

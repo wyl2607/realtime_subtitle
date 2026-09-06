@@ -131,6 +131,10 @@ class SubtitleApp:
         # （残余毫秒级窗口由停止脚本的超时强杀+Ollama卸载兜底，不追求零竞态）
         translator = None
         try:
+            if self._closing:
+                from realtime_subtitle.translate.translator_queue import release_startup_warm
+                release_startup_warm()
+                return
             # 翻译器（Whisper 模型 + Ollama 预热，启动耗时大头）
             translator = WhisperQueueTranslator()
             if self._closing:
@@ -469,6 +473,12 @@ class SubtitleApp:
         if self.translator is not None:
             print("   - 正在关闭识别与翻译线程...")
             self.translator.shutdown()
+        else:
+            # 加载中途退出：WhisperQueueTranslator() 还没返回，self.translator
+            # 仍是 None，但后台预热可能已经把模型留在 Ollama 里。
+            from realtime_subtitle.translate.translator_queue import release_startup_warm
+            print("   - 正在结束加载中的翻译模型预热...")
+            release_startup_warm()
 
         # 清掉停止标记（若仍在）
         try:

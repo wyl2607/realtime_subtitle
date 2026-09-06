@@ -260,7 +260,8 @@ def test_powershell_realtime_command_matches_python_entry_rules(tmp_path):
     )
     result = subprocess.run(
         [
-            str(WINDOWS_POWERSHELL), "-NoProfile", "-NonInteractive", "-File", str(script),
+            str(WINDOWS_POWERSHELL), "-NoProfile", "-NonInteractive",
+            "-ExecutionPolicy", "Bypass", "-File", str(script),
             "-Helper", str(IDENTITY_PS1), "-RepoRoot", str(repo), "-CaseFile", str(case_file),
         ],
         capture_output=True,

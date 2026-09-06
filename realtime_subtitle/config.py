@@ -17,12 +17,12 @@ TARGET_LANGUAGE = "zh"
 # ☠️ Ctrl+Alt+L 循环的是**语言对**，不是单个源语言——切源语言而不切目标语言的话，
 # 放中文视频会得到"中文→中文"。这个列表同时兼任 源语言→目标语言 的映射表，
 # 自动检测（AUTO_DETECT_LANGUAGE）也只会在这里出现过的源语言之间切。
-LANGUAGE_PAIRS = [("de", "zh"), ("zh", "de"), ("en", "zh")]
+LANGUAGE_PAIRS = [("de", "zh"), ("zh", "de"), ("en", "zh"), ("da", "zh")]
 # 兼容：老的 config_local.py 里可能写着 LANGUAGE_CYCLE = ["de","en"]（只列源语言）。
 # 仍然生效，目标语言按 LANGUAGE_PAIRS 查、查不到就用 TARGET_LANGUAGE。
 LANGUAGE_CYCLE = None
 LANGUAGE_NAMES = {"de": "德语", "en": "英语", "fr": "法语", "es": "西班牙语",
-                  "ja": "日语", "zh": "中文"}
+                  "ja": "日语", "zh": "中文", "da": "丹麦语"}
 # 目标语言在 prompt 里的叫法（只在这里不一样时才需要写）。
 # ☠️ zh 必须是"简体中文"而不是"中文"：不点明简体，模型有概率输出繁体。
 # 参数化目标语言之前 prompt 里写死的就是"简体中文"，这里是在保持原行为。
@@ -93,6 +93,7 @@ LANGUAGE_SEED_PROMPTS = {
     "de": "Hallo zusammen, wir sprechen heute auf Deutsch über dieses Thema.",
     "en": "Hello everyone, today we are talking about this topic in English.",
     "zh": "大家好，我们今天用中文来聊一聊这个话题。",
+    "da": "Hej allesammen, i dag taler vi dansk om dette emne.",
 }
 WHISPER_TASK = "transcribe"  # "transcribe"=转录原语言, "translate"=翻译成英文
 WHISPER_BEAM_SIZE = 3  # beam search 大小。whisper_streaming作者用5，这里用3保延迟

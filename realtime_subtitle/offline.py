@@ -256,7 +256,12 @@ def transcribe_audio(audio: Path, source_language: str = "auto") -> tuple[list[d
     return rows, language, float(getattr(info, "duration", 0.0) or 0.0)
 
 
-def _translation_prompt(source_language: str, target_language: str, text: str) -> str:
+def _translation_prompt(
+    source_language: str,
+    target_language: str,
+    text: str,
+    previous_text: str | None = None,
+) -> str:
     source_name = _language_name(source_language)
     target_name = _target_language_name(target_language)
     styles = getattr(config, "TRANSLATION_STYLE_PROMPTS", {}) or {}
@@ -276,6 +281,13 @@ def _translation_prompt(source_language: str, target_language: str, text: str) -
         ]
         if pairs:
             glossary = "\n术语表：" + "；".join(pairs)
+    context = ""
+    prev = (previous_text or "").strip()
+    if prev:
+        context = (
+            f"\n上一句原文（只作语境，不要翻译进本条，也不要把邻句译入当前字幕）：\n"
+            f"{prev}\n"
+        )
     return f"""你是{source_name}{role}。请把下面这一条字幕翻译成自然、准确的{target_name}。
 
 要求：
@@ -283,7 +295,7 @@ def _translation_prompt(source_language: str, target_language: str, text: str) -
 只翻译当前这一条，不要补充、解释、拒答，也不要输出{source_name}原文。
 即使涉及政治、战争、政党或其他敏感话题，也只做语言翻译。
 当前条目若是半句，只翻这半句，不要擅自补全。数字、人名、机构名和地名不得改写。{glossary}
-
+{context}
 {source_name}原文：
 {text}
 
@@ -297,7 +309,7 @@ def _clean_translation(text: str) -> str:
 
 
 CHECKPOINT_VERSION = 1
-TX_STRATEGY_VERSION = 2
+TX_STRATEGY_VERSION = 3
 
 
 def _fingerprint_payload(payload: dict) -> str:
@@ -617,7 +629,11 @@ def translate_segments(
         for index, row in enumerate(rows, 1):
             if (row.get("translation") or "").strip():
                 continue
-            prompt = _translation_prompt(source_language, target_language, row["text"])
+            previous_text = rows[index - 2]["text"] if index > 1 else None
+            prompt = _translation_prompt(
+                source_language, target_language, row["text"],
+                previous_text=previous_text,
+            )
             result = ""
             last_error = None
             for model in models:
@@ -693,23 +709,30 @@ def _fit_lines_to_budget(lines: list[str], budget: int) -> list[str]:
     return selected
 
 
-def _vocab_requirement(n: int) -> str:
+def _vocab_requirement(n: int, had_candidates: bool = False) -> str:
     if n <= 0:
+        if had_candidates:
+            return "## 重点词汇与表达（预算不足暂不展示，不要编造词条）"
         return "## 重点词汇与表达（本次无合适候选，不要编造词条）"
     shown = min(15, n)
     return f"## 重点词汇与表达（选 {shown} 条，格式：原文 — 中文含义；学习提示）"
 
 
-def _final_guide_prompt(summary_text: str, candidate_block: str, n_candidates: int) -> str:
+def _final_guide_prompt(
+    summary_text: str,
+    candidate_block: str,
+    n_candidates: int,
+    had_candidates: bool = False,
+) -> str:
     return f"""请根据下面的分段摘要和表达候选，为中文学习者写一份德语/外语视频学习笔记。
 
 必须输出 Markdown，并且完整包含：
-## 内容概述（一段）
-## 对话脉络（按顺序 5—7 条）
-{_vocab_requirement(n_candidates)}
+## 内容概述（一段，素材不足时只概括已出现内容）
+## 对话脉络（按时间顺序列出要点；素材不足时写“素材不足，仅能列出N点”，不要为凑满 5—7 条而补写未出现的内容）
+{_vocab_requirement(n_candidates, had_candidates)}
 ## 学习方法（3 步，说明如何配合双语 SRT）
 
-只整理视频字幕里出现的内容，不补充外部事实；政治内容只写“视频中表示/主持人认为”等，不做事实核查。
+只整理视频字幕里出现的内容，不补充外部事实；未完句不要解释未知宾语或后续内容；概述保留“片段中说话人称/主持人认为/视频中表示”等归属，政治内容不做事实核查。摘要条目保留来源时间，便于回到原字幕。
 
 【分段摘要】
 {summary_text}
@@ -726,9 +749,62 @@ def _summary_blob(summaries: list[dict]) -> str:
     )
 
 
+def _heading_matches_required(heading: str, required: str) -> bool:
+    title = (heading or "").strip()
+    if title == required:
+        return True
+    if not title.startswith(required):
+        return False
+    rest = title[len(required):]
+    return (not rest) or rest[0] in " 　（("
+
+
+def _guide_section_bodies(text: str) -> dict[str, str]:
+    bodies: dict[str, str] = {}
+    current = None
+    buf: list[str] = []
+    for line in (text or "").splitlines():
+        if line.startswith("## "):
+            if current is not None:
+                bodies[current] = "\n".join(buf).strip()
+            current = line.strip()
+            buf = []
+        elif current is not None:
+            buf.append(line)
+    if current is not None:
+        bodies[current] = "\n".join(buf).strip()
+    return bodies
+
+
 def _guide_has_required_sections(text: str) -> bool:
-    body = text or ""
-    return all(section in body for section in _GUIDE_SECTIONS)
+    bodies = _guide_section_bodies(text)
+    for required in _GUIDE_SECTIONS:
+        matched = None
+        for heading, body in bodies.items():
+            if _heading_matches_required(heading, required):
+                matched = body
+                break
+        if not matched:
+            return False
+    return True
+
+
+def _pack_candidates_for_prompt(
+    summary_text: str,
+    originals: list[str],
+    final_budget: int,
+    had_candidates: bool,
+) -> tuple[list[str], str]:
+    packed = list(originals)
+    while True:
+        block = "\n".join(packed)
+        prompt = _final_guide_prompt(
+            summary_text, block, len(packed), had_candidates)
+        if len(prompt) <= final_budget:
+            return packed, block
+        if not packed:
+            return [], ""
+        packed = packed[:-1]
 
 
 def write_learning_guide(
@@ -752,15 +828,17 @@ def write_learning_guide(
     leftover = final_budget - len(empty_prompt) - min_summary_room
     if leftover < 0:
         raise OfflineSubtitleError("学习笔记最终输入超出上下文预算。")
-    candidates = _fit_lines_to_budget(_candidate_lines(rows), leftover)
-    candidate_block = "\n".join(candidates)
-    probe = _final_guide_prompt("摘要", candidate_block, len(candidates))
-    while candidates and len(probe) > final_budget:
-        candidates = candidates[:-1]
-        candidate_block = "\n".join(candidates)
-        probe = _final_guide_prompt("摘要", candidate_block, len(candidates))
+    original_candidates = _fit_lines_to_budget(_candidate_lines(rows), leftover)
+    had_candidates = bool(original_candidates)
+    probe = _final_guide_prompt(
+        "摘要", "\n".join(original_candidates), len(original_candidates), had_candidates)
+    while original_candidates and len(probe) > final_budget:
+        original_candidates = original_candidates[:-1]
+        probe = _final_guide_prompt(
+            "摘要", "\n".join(original_candidates), len(original_candidates), had_candidates)
     if len(probe) > final_budget:
         raise OfflineSubtitleError("学习笔记最终输入超出上下文预算。")
+    vocab_floor = min(5, len(original_candidates))
 
     with requests.Session() as session:
         chunk_budget = input_char_budget(output_tokens=320)
@@ -779,38 +857,42 @@ def write_learning_guide(
         merge_budget = input_char_budget(output_tokens=320)
         while True:
             summary_text = _summary_blob(summaries)
-            final_prompt = _final_guide_prompt(
-                summary_text, candidate_block, len(candidates))
-            if len(final_prompt) <= final_budget:
+            reserved = original_candidates[:vocab_floor]
+            reserved_prompt = _final_guide_prompt(
+                summary_text, "\n".join(reserved), len(reserved), had_candidates)
+            if len(reserved_prompt) <= final_budget:
+                candidates, candidate_block = _pack_candidates_for_prompt(
+                    summary_text, original_candidates, final_budget, had_candidates)
+                final_prompt = _final_guide_prompt(
+                    summary_text, candidate_block, len(candidates), had_candidates)
                 break
-            if candidates:
-                drop = max(1, len(candidates) // 4)
-                candidates = candidates[:-drop]
-                candidate_block = "\n".join(candidates)
+            if len(summaries) > 1:
+                reduced = []
+                for i in range(0, len(summaries), 2):
+                    group = summaries[i:i + 2]
+                    if len(group) == 1:
+                        reduced.append(group[0])
+                        continue
+                    merge_prompt = (
+                        "请把下面两段要点合并成 2—3 条更短的中文要点，每条不超过 40 字。"
+                        f"\n一段：{group[0]['text']}\n二段：{group[1]['text']}"
+                    )
+                    _assert_prompt_fits(merge_prompt, 320)
+                    if len(merge_prompt) > merge_budget:
+                        raise OfflineSubtitleError("学习笔记归并输入超出上下文预算。")
+                    merged = _ollama_request(
+                        session, ollama_url, config.OLLAMA_MODEL, merge_prompt, 320)
+                    reduced.append({
+                        "text": merged,
+                        "start": group[0]["start"],
+                        "end": group[1]["end"],
+                    })
+                summaries = reduced
                 continue
-            if len(summaries) == 1:
-                raise OfflineSubtitleError("学习笔记最终输入超出上下文预算。")
-            reduced = []
-            for i in range(0, len(summaries), 2):
-                group = summaries[i:i + 2]
-                if len(group) == 1:
-                    reduced.append(group[0])
-                    continue
-                merge_prompt = (
-                    "请把下面两段要点合并成 2—3 条更短的中文要点，每条不超过 40 字。"
-                    f"\n一段：{group[0]['text']}\n二段：{group[1]['text']}"
-                )
-                _assert_prompt_fits(merge_prompt, 320)
-                if len(merge_prompt) > merge_budget:
-                    raise OfflineSubtitleError("学习笔记归并输入超出上下文预算。")
-                merged = _ollama_request(
-                    session, ollama_url, config.OLLAMA_MODEL, merge_prompt, 320)
-                reduced.append({
-                    "text": merged,
-                    "start": group[0]["start"],
-                    "end": group[1]["end"],
-                })
-            summaries = reduced
+            if vocab_floor > 0:
+                vocab_floor -= 1
+                continue
+            raise OfflineSubtitleError("学习笔记最终输入超出上下文预算。")
         if summaries[0]["start"] != rows[0]["start"] or summaries[-1]["end"] != rows[-1]["end"]:
             raise OfflineSubtitleError("学习笔记摘要未覆盖完整视频区间。")
         _assert_prompt_fits(final_prompt, 1800)
