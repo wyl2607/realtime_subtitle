@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -43,12 +44,12 @@ def test_process_url_wires_source_and_bilingual_outputs(tmp_path, monkeypatch):
             return False
 
         def extract_info(self, url, download=False):
-            return {"id": "demo", "title": "Demo"}
+            return {"id": "demo", "title": "Demo", "extractor": "youtube"}
 
     video = tmp_path / "demo.mp4"
     video.write_bytes(b"video")
     monkeypatch.setattr(offline, "_load_yt_dlp", lambda: SimpleNamespace(YoutubeDL=FakeYoutubeDL))
-    monkeypatch.setattr(offline, "download_video", lambda url, job_dir, max_height: ({"id": "demo", "title": "Demo"}, video))
+    monkeypatch.setattr(offline, "download_video", lambda url, job_dir, max_height: ({"id": "demo", "title": "Demo", "extractor": "youtube"}, video))
     monkeypatch.setattr(offline, "_extract_audio", lambda video, audio: None)
     monkeypatch.setattr(
         offline,
@@ -66,7 +67,7 @@ def test_process_url_wires_source_and_bilingual_outputs(tmp_path, monkeypatch):
     assert result["source_language"] == "de"
     assert result["target_language"] == "zh"
     assert result["guide"] is None
-    assert (tmp_path / "out" / "demo" / "demo_bilingual.srt").read_text(encoding="utf-8-sig").endswith(
+    assert (tmp_path / "out" / "youtube_demo" / "demo_bilingual.srt").read_text(encoding="utf-8-sig").endswith(
         "Guten Morgen\n早上好\n"
     )
 
@@ -169,6 +170,12 @@ def test_job_lock_blocks_second_holder(tmp_path):
                 pass
 
 
+def test_different_jobs_can_lock_in_parallel(tmp_path):
+    with offline.JobLock(tmp_path / "a" / "_job.lock"):
+        with offline.JobLock(tmp_path / "b" / "_job.lock"):
+            pass
+
+
 def test_process_url_skips_asr_when_checkpoint_matches(tmp_path, monkeypatch):
     class FakeYoutubeDL:
         def __init__(self, options):
@@ -198,7 +205,7 @@ def test_process_url_skips_asr_when_checkpoint_matches(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(offline, "translate_segments", lambda *a, **k: a[0][0].update(translation="早上好") if a else None)
 
-    job_dir = tmp_path / "out" / "demo"
+    job_dir = tmp_path / "out" / "youtube_demo"
     job_dir.mkdir(parents=True)
     rows = [{"start": 0, "end": 1, "text": "Guten Morgen", "translation": "早上好"}]
     offline.save_checkpoint(job_dir / "_job_checkpoint.json", offline.build_checkpoint(
@@ -226,22 +233,303 @@ def test_chunk_rows_rejects_single_oversized_row():
         offline.chunk_rows_for_summary(rows, budget=400)
 
 
-def test_merge_summaries_keeps_head_and_tail():
-    summaries = [
-        {"text": "开头内容", "start": 0, "end": 10},
-        {"text": "中间" * 40, "start": 10, "end": 20},
-        {"text": "结尾内容", "start": 20, "end": 30},
+def test_truncated_ollama_response_is_rejected():
+    response = SimpleNamespace(
+        raise_for_status=lambda: None,
+        json=lambda: {"response": "不完整的译文", "done": True, "done_reason": "length"},
+    )
+    session = SimpleNamespace(post=lambda *args, **kwargs: response)
+    with pytest.raises(offline.TruncatedModelOutput):
+        offline._ollama_request(session, "unused", "unused", "unused")
+
+
+def test_ollama_request_rejects_empty_error_and_incomplete():
+    def call(payload):
+        response = SimpleNamespace(raise_for_status=lambda: None, json=lambda: payload)
+        session = SimpleNamespace(post=lambda *args, **kwargs: response)
+        return offline._ollama_request(session, "u", "m", "p")
+
+    with pytest.raises(offline.OfflineSubtitleError):
+        call({"error": "model busy"})
+    with pytest.raises(offline.OfflineSubtitleError):
+        call({"response": "", "done": True, "done_reason": "stop"})
+    with pytest.raises(offline.OfflineSubtitleError):
+        call({"response": "还没写完", "done": False, "done_reason": "stop"})
+    with pytest.raises(offline.OfflineSubtitleError):
+        call({"response": 123, "done": True, "done_reason": "stop"})
+    assert call({"response": "完整译文", "done": True, "done_reason": "stop"}) == "完整译文"
+
+
+def test_truncated_translation_is_not_checkpointed(tmp_path, monkeypatch):
+    _stub_ollama_local(monkeypatch)
+    rows = [
+        {"start": 0, "end": 1, "text": "Eins"},
+        {"start": 1, "end": 2, "text": "Zwei"},
     ]
-    merged = offline.merge_summaries_to_budget(summaries, budget=80)
-    assert merged[0]["start"] == 0
-    assert merged[-1]["end"] == 30
-    blob = "".join(s["text"] for s in merged)
-    assert "开头" in blob and "结尾" in blob
+
+    def fake_req(session, url, model, prompt, num_predict=512):
+        if "Zwei" in prompt:
+            raise offline.TruncatedModelOutput("模型输出达到上限被截断。")
+        return "译"
+
+    monkeypatch.setattr(offline, "_ollama_request", fake_req)
+    ckpt = tmp_path / "_job_checkpoint.json"
+    with pytest.raises(offline.OfflineSubtitleError):
+        offline.translate_segments(rows, "de", "zh", checkpoint_path=ckpt)
+    assert rows[0].get("translation") == "译"
+    assert not rows[1].get("translation")
+    loaded = offline.load_checkpoint(ckpt)
+    assert loaded["rows"][1].get("translation") in (None, "")
+
+
+def test_learning_guide_failure_keeps_existing_note_and_srt(tmp_path, monkeypatch):
+    _stub_ollama_local(monkeypatch)
+    dest = tmp_path / "guide.md"
+    dest.write_text("# 旧笔记\n", encoding="utf-8")
+    srt = tmp_path / "demo_bilingual.srt"
+    srt.write_text("keep me", encoding="utf-8-sig")
+
+    def boom(*args, **kwargs):
+        raise offline.TruncatedModelOutput("截断")
+
+    monkeypatch.setattr(offline, "_ollama_request", boom)
+    rows = [{"start": 0, "end": 1, "text": "Hallo", "translation": "你好"}]
+    with pytest.raises(offline.OfflineSubtitleError):
+        offline.write_learning_guide(rows, "Titel", "https://example.test/x", 1.0, "de", "zh", dest)
+    assert dest.read_text(encoding="utf-8") == "# 旧笔记\n"
+    assert srt.read_text(encoding="utf-8-sig") == "keep me"
+
+
+def test_typical_guide_fits_default_context(tmp_path, monkeypatch):
+    _stub_ollama_local(monkeypatch)
+    prompts = []
+
+    def fake_req(session, url, model, prompt, num_predict=512):
+        prompts.append((prompt, num_predict))
+        if "必须输出 Markdown" in prompt:
+            return (
+                "## 内容概述\n一段概述\n"
+                "## 对话脉络\n- 第一条\n"
+                "## 重点词汇与表达\n- Wort — 词；提示\n"
+                "## 学习方法\n1. 听原文\n"
+            )
+        return "摘要"
+
+    monkeypatch.setattr(offline, "_ollama_request", fake_req)
+    monkeypatch.setattr(offline.config, "OLLAMA_NUM_CTX", 4096)
+    rows = [
+        {
+            "start": i * 5,
+            "end": i * 5 + 5,
+            "text": "Das ist ein ganz normaler deutscher Satz zum Lernen.",
+            "translation": "这是一个用于学习的普通德语句子。",
+        }
+        for i in range(30)
+    ]
+    dest = tmp_path / "guide.md"
+    offline.write_learning_guide(rows, "Demo", "https://example.test/x", 150, "de", "zh", dest)
+    assert dest.is_file()
+    for prompt, num_predict in prompts:
+        budget = offline.input_char_budget(output_tokens=num_predict)
+        assert len(prompt) <= budget, f"{len(prompt)} > {budget} (num_predict={num_predict})"
+
+
+@pytest.mark.parametrize("candidate_count", [0, 1, 24])
+def test_guide_candidate_block_respects_budget(tmp_path, monkeypatch, candidate_count):
+    _stub_ollama_local(monkeypatch)
+    prompts = []
+
+    def fake_req(session, url, model, prompt, num_predict=512):
+        prompts.append(prompt)
+        if "必须输出 Markdown" in prompt:
+            return (
+                "## 内容概述\n概述\n## 对话脉络\n- a\n"
+                "## 重点词汇与表达\n- x\n## 学习方法\n1. 听\n"
+            )
+        return "摘要"
+
+    monkeypatch.setattr(offline, "_ollama_request", fake_req)
+    monkeypatch.setattr(offline.config, "OLLAMA_NUM_CTX", 4096)
+    rows = []
+    for i in range(max(candidate_count, 1)):
+        source = ("Wort " * 18).strip() if candidate_count else "Hi"
+        rows.append({
+            "start": float(i),
+            "end": float(i + 1),
+            "text": source if candidate_count else "Hi",
+            "translation": "词" * 40,
+        })
+    if candidate_count == 0:
+        rows = [{"start": 0, "end": 1, "text": "Hi", "translation": "嗨"}]
+    dest = tmp_path / "guide.md"
+    offline.write_learning_guide(rows, "T", "https://example.test/x", 10, "de", "zh", dest)
+    final_budget = offline.input_char_budget(output_tokens=1800)
+    finals = [p for p in prompts if "必须输出 Markdown" in p]
+    assert finals
+    assert all(len(p) <= final_budget for p in finals)
+    if candidate_count == 0:
+        assert "不要编造" in finals[-1] or "无合适候选" in finals[-1]
+    elif candidate_count == 1:
+        assert "选 1 条" in finals[-1]
 
 
 def test_input_budget_rejects_too_small_context():
     with pytest.raises(offline.OfflineSubtitleError):
         offline.input_char_budget(num_ctx=100, output_tokens=90)
+
+
+def test_second_job_is_rejected_before_download(tmp_path, monkeypatch):
+    events = []
+
+    class FakeYoutubeDL:
+        def __init__(self, options):
+            self.options = options
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def extract_info(self, url, download=False):
+            assert download is False
+            return {"id": "demo", "title": "Demo", "extractor": "youtube"}
+
+    class BlockingLock:
+        def __init__(self, path):
+            pass
+
+        def __enter__(self):
+            events.append("lock")
+            raise offline.OfflineSubtitleError("already locked")
+
+        def __exit__(self, *args):
+            return False
+
+    def download(*args, **kwargs):
+        events.append("download")
+        return {}, tmp_path / "demo.mp4"
+
+    monkeypatch.setattr(offline, "_load_yt_dlp", lambda: SimpleNamespace(YoutubeDL=FakeYoutubeDL))
+    monkeypatch.setattr(offline, "download_video", download)
+    monkeypatch.setattr(offline, "JobLock", BlockingLock)
+    with pytest.raises(offline.OfflineSubtitleError, match="already locked"):
+        offline.process_url("https://example.test/demo", tmp_path / "out", summary=False)
+    assert events == ["lock"]
+
+
+def test_cross_extractor_does_not_reuse_cached_media(tmp_path, monkeypatch):
+    job = tmp_path / "123"
+    job.mkdir()
+    (job / "123.mp4").write_bytes(b"site_a_media")
+    downloaded = []
+
+    class FakeYoutubeDL:
+        def __init__(self, options):
+            self.options = options
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def extract_info(self, url, download=False):
+            if download:
+                downloaded.append(True)
+                dest = Path(self.options["outtmpl"].replace("%(ext)s", "mp4"))
+                dest.write_bytes(b"site_b_media")
+            return {"id": "123", "title": "B", "extractor": "site_b"}
+
+    monkeypatch.setattr(offline.shutil, "which", lambda name: "ffmpeg")
+    monkeypatch.setattr(offline, "_load_yt_dlp", lambda: SimpleNamespace(YoutubeDL=FakeYoutubeDL))
+    with pytest.raises(offline.OfflineSubtitleError, match="来源"):
+        offline.download_video("https://site-b.test/123", job)
+    assert downloaded == []
+    assert (job / "123.mp4").read_bytes() == b"site_a_media"
+
+
+def test_matching_source_reuses_media_and_legacy_cache_is_not_claimed(tmp_path, monkeypatch):
+    monkeypatch.setattr(offline.shutil, "which", lambda name: "ffmpeg")
+
+    class FakeYoutubeDL:
+        def __init__(self, options):
+            self.options = options
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def extract_info(self, url, download=False):
+            if download:
+                dest = Path(self.options["outtmpl"].replace("%(ext)s", "mp4"))
+                dest.write_bytes(b"fresh")
+            return {"id": "abc", "title": "A", "extractor": "youtube"}
+
+    monkeypatch.setattr(offline, "_load_yt_dlp", lambda: SimpleNamespace(YoutubeDL=FakeYoutubeDL))
+    job = tmp_path / "youtube_abc"
+    job.mkdir()
+    video = job / "youtube_abc.mp4"
+    video.write_bytes(b"cached")
+    offline.save_media_source(job, "youtube", "abc", "https://example.test/abc")
+    info, found = offline.download_video("https://example.test/abc", job)
+    assert info["extractor"] == "youtube"
+    assert found.read_bytes() == b"cached"
+
+    legacy = tmp_path / "abc"
+    legacy.mkdir()
+    (legacy / "abc.mp4").write_bytes(b"old")
+    with pytest.raises(offline.OfflineSubtitleError, match="来源"):
+        offline.download_video("https://example.test/abc", legacy)
+
+
+def test_process_url_separates_same_id_from_different_extractors(tmp_path, monkeypatch):
+    calls = []
+
+    class FakeYoutubeDL:
+        def __init__(self, options):
+            self.options = options
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def extract_info(self, url, download=False):
+            extractor = "site_a" if "site-a" in url else "site_b"
+            return {"id": "123", "title": extractor, "extractor": extractor}
+
+    def fake_download(url, job_dir, max_height=2160):
+        calls.append((url, job_dir.name))
+        job_dir.mkdir(parents=True, exist_ok=True)
+        video = job_dir / f"{job_dir.name}.mp4"
+        video.write_bytes(url.encode("utf-8"))
+        extractor = "site_a" if "site-a" in url else "site_b"
+        return {"id": "123", "title": extractor, "extractor": extractor}, video
+
+    monkeypatch.setattr(offline, "_load_yt_dlp", lambda: SimpleNamespace(YoutubeDL=FakeYoutubeDL))
+    monkeypatch.setattr(offline, "download_video", fake_download)
+    monkeypatch.setattr(offline, "_extract_audio", lambda video, audio: None)
+    monkeypatch.setattr(
+        offline,
+        "transcribe_audio",
+        lambda audio, source_language: ([{"start": 0, "end": 1, "text": "Hallo"}], "de", 1),
+    )
+    monkeypatch.setattr(
+        offline,
+        "translate_segments",
+        lambda rows, source, target, **kw: rows[0].update(translation="你好"),
+    )
+
+    first = offline.process_url("https://site-a.test/123", tmp_path / "out", summary=False)
+    second = offline.process_url("https://site-b.test/123", tmp_path / "out", summary=False)
+    assert first["video"] != second["video"]
+    assert {name for _, name in calls} == {"site_a_123", "site_b_123"}
+    assert first["video"].read_bytes() == b"https://site-a.test/123"
+    assert second["video"].read_bytes() == b"https://site-b.test/123"
 
 
 def test_learning_guide_prompts_stay_within_budget(tmp_path, monkeypatch):
@@ -250,6 +538,11 @@ def test_learning_guide_prompts_stay_within_budget(tmp_path, monkeypatch):
 
     def fake_req(session, url, model, prompt, num_predict=512):
         prompts.append((len(prompt), num_predict))
+        if "必须输出 Markdown" in prompt:
+            return (
+                "## 内容概述\n概述\n## 对话脉络\n- a\n"
+                "## 重点词汇与表达\n- x\n## 学习方法\n1. 听\n"
+            )
         return "摘要"
 
     monkeypatch.setattr(offline, "_ollama_request", fake_req)
@@ -260,9 +553,7 @@ def test_learning_guide_prompts_stay_within_budget(tmp_path, monkeypatch):
     dest = tmp_path / "guide.md"
     offline.write_learning_guide(
         rows, "Titel", "https://example.test/x", 400.0, "de", "zh", dest)
-    chunk_budget = offline.input_char_budget(output_tokens=320)
-    final_budget = offline.input_char_budget(output_tokens=1800)
     for length, npred in prompts:
-        limit = chunk_budget if npred <= 400 else final_budget
-        assert length <= limit + 200, f"prompt {length} exceeded budget {limit} (num_predict={npred})"
+        limit = offline.input_char_budget(output_tokens=npred)
+        assert length <= limit, f"prompt {length} exceeded budget {limit} (num_predict={npred})"
     assert dest.is_file()

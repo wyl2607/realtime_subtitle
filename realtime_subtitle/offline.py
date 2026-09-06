@@ -28,6 +28,10 @@ class OfflineSubtitleError(RuntimeError):
     """A user-actionable failure in the batch download/subtitle pipeline."""
 
 
+class TruncatedModelOutput(OfflineSubtitleError):
+    """The model hit its output limit before finishing."""
+
+
 def target_language_for(source_language: str) -> str:
     """Chinese source gets German; every other source gets Chinese."""
     return "de" if (source_language or "").lower().startswith("zh") else "zh"
@@ -87,11 +91,67 @@ def _load_yt_dlp():
     return yt_dlp
 
 
+MEDIA_SOURCE_NAME = "_media_source.json"
+MEDIA_SOURCE_VERSION = 1
+
+
 def _video_id(info: dict, url: str) -> str:
     raw = str(info.get("id") or "").strip()
     if not raw:
         raw = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
     return re.sub(r"[^A-Za-z0-9_.-]", "_", raw)
+
+
+def _normalize_extractor(info: dict) -> str:
+    raw = str(info.get("extractor_key") or info.get("extractor") or "").strip()
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]", "_", raw).strip("._") or "unknown"
+    return cleaned.lower()
+
+
+def job_key(extractor: str, video_id: str) -> str:
+    extractor = (extractor or "unknown").strip() or "unknown"
+    video_id = (video_id or "unknown").strip() or "unknown"
+    name = f"{extractor}_{video_id}"
+    if len(name) <= 120:
+        return name
+    digest = hashlib.sha256(f"{extractor}\0{video_id}".encode("utf-8")).hexdigest()[:16]
+    return f"{extractor[:32]}_{digest}"
+
+
+def save_media_source(job_dir: Path, extractor: str, video_id: str, url: str) -> None:
+    payload = {
+        "version": MEDIA_SOURCE_VERSION,
+        "extractor": extractor,
+        "video_id": video_id,
+        "source_url": url,
+    }
+    atomic_write_text(
+        Path(job_dir) / MEDIA_SOURCE_NAME,
+        json.dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def load_media_source(job_dir: Path) -> dict | None:
+    path = Path(job_dir) / MEDIA_SOURCE_NAME
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("version") != MEDIA_SOURCE_VERSION:
+        return None
+    if not data.get("extractor") or not data.get("video_id"):
+        return None
+    return data
+
+
+def media_source_matches(job_dir: Path, extractor: str, video_id: str) -> bool:
+    data = load_media_source(job_dir)
+    if not data:
+        return False
+    return data.get("extractor") == extractor and data.get("video_id") == video_id
 
 
 def download_video(url: str, job_dir: Path, max_height: int = 2160) -> tuple[dict, Path]:
@@ -101,15 +161,22 @@ def download_video(url: str, job_dir: Path, max_height: int = 2160) -> tuple[dic
     if not shutil.which("ffmpeg"):
         raise OfflineSubtitleError("找不到 ffmpeg。请安装 ffmpeg 并加入 PATH。")
     yt_dlp = _load_yt_dlp()
+    job_dir = Path(job_dir)
     job_dir.mkdir(parents=True, exist_ok=True)
-    existing = _find_video(job_dir, job_dir.name)
+    try:
+        with yt_dlp.YoutubeDL({"quiet": True, "noplaylist": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as exc:
+        raise OfflineSubtitleError(f"无法读取视频信息：{exc}") from exc
+    extractor = _normalize_extractor(info)
+    video_id = _video_id(info, url)
+    existing = _find_video(job_dir, job_dir.name) or _find_video(job_dir, video_id)
     if existing:
-        try:
-            with yt_dlp.YoutubeDL({"quiet": True, "noplaylist": True}) as ydl:
-                info = ydl.extract_info(url, download=False)
-        except Exception as exc:
-            raise OfflineSubtitleError(f"无法读取已下载视频的信息：{exc}") from exc
-        return info, existing
+        if media_source_matches(job_dir, extractor, video_id):
+            return info, existing
+        raise OfflineSubtitleError(
+            "任务目录里已有无法确认来源的媒体文件，未复用缓存。请检查后重试或换输出目录。"
+        )
 
     output = str(job_dir / f"{job_dir.name}.%(ext)s")
     options = {
@@ -126,12 +193,14 @@ def download_video(url: str, job_dir: Path, max_height: int = 2160) -> tuple[dic
     except Exception as exc:
         raise OfflineSubtitleError(f"视频下载失败：{exc}") from exc
 
+    extractor = _normalize_extractor(info)
+    video_id = _video_id(info, url)
     video = _find_video(job_dir, job_dir.name)
     if not video:
-        video_id = _video_id(info, url)
         video = _find_video(job_dir, video_id)
     if not video:
         raise OfflineSubtitleError("视频下载完成，但没有找到合并后的视频文件。请检查 yt-dlp/ffmpeg。")
+    save_media_source(job_dir, extractor, video_id, url)
     return info, video
 
 
@@ -228,6 +297,7 @@ def _clean_translation(text: str) -> str:
 
 
 CHECKPOINT_VERSION = 1
+TX_STRATEGY_VERSION = 2
 
 
 def _fingerprint_payload(payload: dict) -> str:
@@ -261,6 +331,7 @@ def tx_fingerprint(source_language: str, target_language: str) -> str:
         "language_names": getattr(config, "LANGUAGE_NAMES", {}),
         "translation_target_names": getattr(config, "TRANSLATION_TARGET_NAMES", {}),
         "ollama_num_ctx": getattr(config, "OLLAMA_NUM_CTX", ""),
+        "tx_strategy_version": TX_STRATEGY_VERSION,
     })
 
 
@@ -420,10 +491,10 @@ class JobLock:
         self.fh = None
 
 
-def input_char_budget(num_ctx=None, output_tokens: int = 320, template_chars: int = 0) -> int:
-    """Conservative character budget for mixed German/Chinese prompts."""
+def input_char_budget(num_ctx=None, output_tokens: int = 320) -> int:
+    """Conservative character budget for a complete prompt, not leftover body text."""
     num_ctx = int(num_ctx or getattr(config, "OLLAMA_NUM_CTX", 4096))
-    reserve_tokens = int(output_tokens) + 96 + max(0, int(template_chars / 1.5))
+    reserve_tokens = int(output_tokens) + 96
     usable = num_ctx - reserve_tokens
     if usable < 128:
         raise OfflineSubtitleError("模型上下文预算不足，无法生成本次请求。")
@@ -449,26 +520,40 @@ def chunk_rows_for_summary(rows: list[dict], budget: int) -> list[list[dict]]:
     return chunks
 
 
-def merge_summaries_to_budget(summaries: list[dict], budget: int) -> list[dict]:
-    items = list(summaries or [])
-    if not items:
-        return []
-    while True:
-        blob = "\n".join(f"[{s['start']}-{s['end']}] {s['text']}" for s in items)
-        if len(blob) <= budget or len(items) == 1:
-            return items
-        merged = []
-        for i in range(0, len(items), 2):
-            group = items[i:i + 2]
-            if len(group) == 1:
-                merged.append(group[0])
-            else:
-                merged.append({
-                    "text": f"{group[0]['text']} / {group[1]['text']}",
-                    "start": group[0]["start"],
-                    "end": group[1]["end"],
-                })
-        items = merged
+def _assert_prompt_fits(prompt: str, output_tokens: int) -> None:
+    budget = input_char_budget(output_tokens=output_tokens)
+    if len(prompt) > budget:
+        raise OfflineSubtitleError("学习笔记最终输入超出上下文预算。")
+
+
+def _can_expand_output(prompt: str, num_predict: int) -> tuple[bool, int]:
+    num_ctx = int(getattr(config, "OLLAMA_NUM_CTX", 4096))
+    expanded = min(max(num_predict * 2, 768), 1536)
+    if expanded <= num_predict:
+        return False, num_predict
+    prompt_tokens = int(len(prompt) / 1.5) + 96
+    return prompt_tokens + expanded < num_ctx, expanded
+
+
+def _parse_ollama_payload(payload) -> str:
+    if not isinstance(payload, dict):
+        raise OfflineSubtitleError("模型返回了无法解析的响应。")
+    error = payload.get("error")
+    if error:
+        raise OfflineSubtitleError(f"模型返回错误：{error}")
+    if "done" not in payload or "response" not in payload:
+        raise OfflineSubtitleError("模型响应缺少完成状态。")
+    text = payload.get("response")
+    if not isinstance(text, str) or not text.strip():
+        raise OfflineSubtitleError("模型没有返回可用文本。")
+    if payload.get("done") is not True:
+        raise OfflineSubtitleError("模型响应未完成。")
+    if str(payload.get("done_reason") or "") == "length":
+        raise TruncatedModelOutput("模型输出达到上限被截断。")
+    cleaned = _clean_translation(text)
+    if not cleaned:
+        raise OfflineSubtitleError("模型没有返回可用文本。")
+    return cleaned
 
 
 def _ollama_request(session: requests.Session, url: str, model: str, prompt: str, num_predict: int = 512) -> str:
@@ -490,7 +575,11 @@ def _ollama_request(session: requests.Session, url: str, model: str, prompt: str
         timeout=max(120, int(getattr(config, "OLLAMA_TIMEOUT_COLD", 90))),
     )
     response.raise_for_status()
-    return _clean_translation(response.json().get("response", ""))
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise OfflineSubtitleError("模型返回了无法解析的响应。") from exc
+    return _parse_ollama_payload(payload)
 
 
 def translate_segments(
@@ -534,11 +623,22 @@ def translate_segments(
             for model in models:
                 if not model:
                     continue
+                num_predict = 512
+                expanded = False
                 for attempt in range(2):
                     try:
-                        result = _ollama_request(session, ollama_url, model, prompt)
+                        result = _ollama_request(
+                            session, ollama_url, model, prompt, num_predict)
                         if result and not any(marker in result for marker in _REFUSAL_MARKERS):
                             break
+                    except TruncatedModelOutput as exc:
+                        last_error = exc
+                        if not expanded:
+                            fits, bigger = _can_expand_output(prompt, num_predict)
+                            if fits:
+                                num_predict = bigger
+                                expanded = True
+                                continue
                     except Exception as exc:
                         last_error = exc
                     time.sleep(1.0)
@@ -565,6 +665,72 @@ def _summary_chunk_prompt(rows: list[dict]) -> str:
 """
 
 
+_GUIDE_SECTIONS = ("## 内容概述", "## 对话脉络", "## 重点词汇与表达", "## 学习方法")
+
+
+def _candidate_lines(rows: list[dict], max_n: int = 24) -> list[str]:
+    items = []
+    for row in rows:
+        source = row["text"].strip()
+        target = row.get("translation", "").strip()
+        if 20 <= len(source) <= 100 and source:
+            items.append(f"{source} → {target}")
+    if not items:
+        return []
+    sampled = items[::max(1, len(items) // max_n)][:max_n]
+    return ["- " + item for item in sampled]
+
+
+def _fit_lines_to_budget(lines: list[str], budget: int) -> list[str]:
+    selected: list[str] = []
+    for line in lines:
+        trial = selected + [line]
+        if selected and len("\n".join(trial)) > budget:
+            break
+        if len("\n".join(trial)) > budget:
+            break
+        selected.append(line)
+    return selected
+
+
+def _vocab_requirement(n: int) -> str:
+    if n <= 0:
+        return "## 重点词汇与表达（本次无合适候选，不要编造词条）"
+    shown = min(15, n)
+    return f"## 重点词汇与表达（选 {shown} 条，格式：原文 — 中文含义；学习提示）"
+
+
+def _final_guide_prompt(summary_text: str, candidate_block: str, n_candidates: int) -> str:
+    return f"""请根据下面的分段摘要和表达候选，为中文学习者写一份德语/外语视频学习笔记。
+
+必须输出 Markdown，并且完整包含：
+## 内容概述（一段）
+## 对话脉络（按顺序 5—7 条）
+{_vocab_requirement(n_candidates)}
+## 学习方法（3 步，说明如何配合双语 SRT）
+
+只整理视频字幕里出现的内容，不补充外部事实；政治内容只写“视频中表示/主持人认为”等，不做事实核查。
+
+【分段摘要】
+{summary_text}
+
+【表达候选】
+{candidate_block}
+"""
+
+
+def _summary_blob(summaries: list[dict]) -> str:
+    return "\n".join(
+        f"片段 {i + 1}（{_srt_time(item['start'])}-{_srt_time(item['end'])}）：{item['text'][:280]}"
+        for i, item in enumerate(summaries)
+    )
+
+
+def _guide_has_required_sections(text: str) -> bool:
+    body = text or ""
+    return all(section in body for section in _GUIDE_SECTIONS)
+
+
 def write_learning_guide(
     rows: list[dict],
     title: str,
@@ -580,55 +746,48 @@ def write_learning_guide(
     ollama_url = translator_queue.ollama_url()
     if not rows:
         raise OfflineSubtitleError("没有可整理的字幕，无法生成学习笔记。")
-    candidates = []
-    for row in rows:
-        source = row["text"].strip()
-        target = row.get("translation", "").strip()
-        if 20 <= len(source) <= 100 and source:
-            candidates.append(f"{source} → {target}")
-    candidates = candidates[::max(1, len(candidates) // 24)][:24] if candidates else []
-    candidate_block = "\n".join("- " + item for item in candidates)
-    header_template = f"标题:{title}\n表达候选:\n{candidate_block}\n"
+    final_budget = input_char_budget(output_tokens=1800)
+    empty_prompt = _final_guide_prompt("", "", 0)
+    min_summary_room = 80
+    leftover = final_budget - len(empty_prompt) - min_summary_room
+    if leftover < 0:
+        raise OfflineSubtitleError("学习笔记最终输入超出上下文预算。")
+    candidates = _fit_lines_to_budget(_candidate_lines(rows), leftover)
+    candidate_block = "\n".join(candidates)
+    probe = _final_guide_prompt("摘要", candidate_block, len(candidates))
+    while candidates and len(probe) > final_budget:
+        candidates = candidates[:-1]
+        candidate_block = "\n".join(candidates)
+        probe = _final_guide_prompt("摘要", candidate_block, len(candidates))
+    if len(probe) > final_budget:
+        raise OfflineSubtitleError("学习笔记最终输入超出上下文预算。")
 
     with requests.Session() as session:
         chunk_budget = input_char_budget(output_tokens=320)
         chunks = chunk_rows_for_summary(rows, chunk_budget)
         summaries = []
         for chunk in chunks:
+            prompt = _summary_chunk_prompt(chunk)
+            _assert_prompt_fits(prompt, 320)
             text = _ollama_request(
-                session, ollama_url, config.OLLAMA_MODEL,
-                _summary_chunk_prompt(chunk), 320)
+                session, ollama_url, config.OLLAMA_MODEL, prompt, 320)
             summaries.append({
                 "text": text,
                 "start": chunk[0]["start"],
                 "end": chunk[-1]["end"],
             })
-        final_budget = input_char_budget(
-            output_tokens=1800, template_chars=len(header_template) + 400)
         merge_budget = input_char_budget(output_tokens=320)
         while True:
-            summary_text = "\n".join(
-                f"片段 {i + 1}（{_srt_time(item['start'])}-{_srt_time(item['end'])}）：{item['text'][:280]}"
-                for i, item in enumerate(summaries)
-            )
-            final_prompt = f"""请根据下面的分段摘要和表达候选，为中文学习者写一份德语/外语视频学习笔记。
-
-必须输出 Markdown，并且完整包含：
-## 内容概述（一段）
-## 对话脉络（按顺序 5—7 条）
-## 重点词汇与表达（选 10—15 条，格式：原文 — 中文含义；学习提示）
-## 学习方法（3 步，说明如何配合双语 SRT）
-
-只整理视频字幕里出现的内容，不补充外部事实；政治内容只写“视频中表示/主持人认为”等，不做事实核查。
-
-【分段摘要】
-{summary_text}
-
-【表达候选】
-{candidate_block}
-"""
+            summary_text = _summary_blob(summaries)
+            final_prompt = _final_guide_prompt(
+                summary_text, candidate_block, len(candidates))
             if len(final_prompt) <= final_budget:
                 break
+            if candidates:
+                drop = max(1, len(candidates) // 4)
+                candidates = candidates[:-drop]
+                candidate_block = "\n".join(candidates)
+                continue
             if len(summaries) == 1:
                 raise OfflineSubtitleError("学习笔记最终输入超出上下文预算。")
             reduced = []
@@ -641,6 +800,7 @@ def write_learning_guide(
                     "请把下面两段要点合并成 2—3 条更短的中文要点，每条不超过 40 字。"
                     f"\n一段：{group[0]['text']}\n二段：{group[1]['text']}"
                 )
+                _assert_prompt_fits(merge_prompt, 320)
                 if len(merge_prompt) > merge_budget:
                     raise OfflineSubtitleError("学习笔记归并输入超出上下文预算。")
                 merged = _ollama_request(
@@ -653,7 +813,11 @@ def write_learning_guide(
             summaries = reduced
         if summaries[0]["start"] != rows[0]["start"] or summaries[-1]["end"] != rows[-1]["end"]:
             raise OfflineSubtitleError("学习笔记摘要未覆盖完整视频区间。")
-        guide = _ollama_request(session, ollama_url, config.OLLAMA_MODEL, final_prompt, 1800)
+        _assert_prompt_fits(final_prompt, 1800)
+        guide = _ollama_request(
+            session, ollama_url, config.OLLAMA_MODEL, final_prompt, 1800)
+        if not _guide_has_required_sections(guide):
+            raise OfflineSubtitleError("学习笔记结果不完整。")
     minutes, seconds = divmod(int(duration), 60)
     header = f"""# 字幕学习笔记
 
@@ -688,17 +852,17 @@ def process_url(
     except Exception as exc:
         raise OfflineSubtitleError(f"无法读取视频信息：{exc}") from exc
     video_id = _video_id(info, url)
-    job_dir = root / video_id
-    video_info, video = download_video(url, job_dir, max_height)
-    job_dir.mkdir(parents=True, exist_ok=True)
+    extractor = _normalize_extractor(info)
+    job_dir = root / job_key(extractor, video_id)
     audio = job_dir / "_audio_16k.wav"
     source_srt = job_dir / f"{video_id}_source.srt"
     bilingual_srt = job_dir / f"{video_id}_bilingual.srt"
     checkpoint_path = job_dir / "_job_checkpoint.json"
     guide: Path | None = job_dir / f"{video_id}_learning_guide.md" if summary else None
-    extractor = str(video_info.get("extractor") or info.get("extractor") or "")
     with JobLock(job_dir / "_job.lock"):
         try:
+            video_info, video = download_video(url, job_dir, max_height)
+            extractor = _normalize_extractor(video_info) or extractor
             print(f"开始处理：{video_info.get('title', video_id)}", flush=True)
             checkpoint = load_checkpoint(checkpoint_path)
             locked_source = source_language if source_language != "auto" else None
