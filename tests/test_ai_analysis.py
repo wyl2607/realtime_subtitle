@@ -631,7 +631,8 @@ def test_cache_hit_still_bumps_seq_so_inflight_lookup_expires():
     assert [a[0] for a in submitted] == ["Apfel"]
 
     # B：预先塞进缓存 → 命中，同步回调
-    t._lookup_cache_put(("birne", "de"), ("原形: die Birne", "ctx2"))
+    from realtime_subtitle.translate.lookup import lookup_cache_key
+    t._lookup_cache_put(lookup_cache_key("Birne", "de", "ctx2"), "原形: die Birne")
     t.lookup_word("Birne", "ctx2", cb)
     assert shown == ["Birne"], "缓存命中要立刻回调"
     assert t._lookup_seq == 2, "命中缓存也必须涨 seq"
@@ -751,8 +752,9 @@ def test_lookup_cache_roundtrips_through_disk(tmp_path, monkeypatch):
         lambda self: str(tmp_path / "lookup_cache.json"))
 
     t = _lookup_translator()
-    t._lookup_cache_put(("haus", "de"), ("原形: das Haus", "ctx1"))
-    t._lookup_cache_put(("baum", "de"), ("原形: der Baum", "ctx2"))
+    from realtime_subtitle.translate.lookup import lookup_cache_key
+    t._lookup_cache_put(lookup_cache_key("Haus", "de", "ctx1"), "原形: das Haus")
+    t._lookup_cache_put(lookup_cache_key("Baum", "de", "ctx2"), "原形: der Baum")
     t._save_lookup_cache()
 
     t2 = _lookup_translator()
@@ -780,9 +782,12 @@ def test_lookup_cache_respects_max_on_load(tmp_path, monkeypatch):
     import json as _json
     from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 
+    from realtime_subtitle.translate.lookup import LOOKUP_CACHE_VERSION
     path = tmp_path / "lookup_cache.json"
-    rows = [[f"wort{i}", "de", f"释义{i}", "ctx"] for i in range(10)]
-    path.write_text(_json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+    rows = [[f"Wort{i}", "de", "ctx", f"释义{i}"] for i in range(10)]
+    path.write_text(_json.dumps(
+        {"version": LOOKUP_CACHE_VERSION, "rows": rows}, ensure_ascii=False),
+        encoding="utf-8")
     monkeypatch.setattr(
         WhisperQueueTranslator, "_lookup_cache_path", lambda self: str(path))
 
@@ -790,7 +795,7 @@ def test_lookup_cache_respects_max_on_load(tmp_path, monkeypatch):
     t._LOOKUP_CACHE_MAX = 4
     t._load_lookup_cache()
     assert len(t._lookup_cache) == 4
-    assert list(t._lookup_cache)[0] == ("wort6", "de"), "该丢的是最旧的那批"
+    assert list(t._lookup_cache)[0] == ("Wort6", "de", "ctx"), "该丢的是最旧的那批"
 
 
 def test_run_ai_analysis_request_sets_and_clears_inflight_flag_even_on_failure():

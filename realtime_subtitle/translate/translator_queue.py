@@ -419,6 +419,10 @@ class RemoteOllamaRefused(RuntimeError):
     """OLLAMA_BASE_URL 指向本机之外，且用户没有显式声明这是有意的。"""
 
 
+class OllamaUnverified(RuntimeError):
+    """本地模式下尚未把地址钉到环回，禁止发送请求正文。"""
+
+
 # ☠️ 校验通过后钉住的地址（主机名已换成解析出来的环回 IP 字面量）。
 # 见 _assert_local_ollama 末尾那段"为什么必须钉"。None = 还没校验过/
 # 用户显式声明了 ALLOW_REMOTE_OLLAMA，两种情况都退回现读 config。
@@ -439,8 +443,24 @@ def ollama_url():
        以前 _warn_if_ipv6_first_host 只能提示用户自己去改 config；现在
        localhost 会被直接钉成 127.0.0.1，配置写错的人不用再付那笔税。
        （避坑清单第 4 节第 22 条量过：翻译 p50 2.88 秒 → 0.60 秒。）
+
+    默认本地模式下，没有钉住的环回地址就禁止返回配置主机名：首次 DNS 失败
+    不代表以后仍失败，回退后一旦解析到远端，请求路径就不再受环回校验约束。
+    恢复时会重新校验并钉地址。ALLOW_REMOTE_OLLAMA 的显式远端模式单独放行。
     """
-    return _pinned_ollama_url or config.OLLAMA_BASE_URL
+    if getattr(config, "ALLOW_REMOTE_OLLAMA", False):
+        return config.OLLAMA_BASE_URL
+    if _pinned_ollama_url:
+        return _pinned_ollama_url
+    try:
+        _assert_local_ollama(config.OLLAMA_BASE_URL)
+    except RemoteOllamaRefused:
+        raise
+    if _pinned_ollama_url:
+        return _pinned_ollama_url
+    raise OllamaUnverified(
+        f"OLLAMA_BASE_URL 尚未校验为环回地址（{config.OLLAMA_BASE_URL}），"
+        f"拒绝发送请求正文。")
 
 
 def _pin_url_to_address(base_url, addr):
@@ -477,8 +497,10 @@ def _assert_local_ollama(base_url):
     虽然预热的 prompt 是空的（不含转录内容），但"确认过是本机才发第一个包"
     是更容易讲清楚的语义。
 
-    解析不出来时放行：那说明请求本来也发不出去，交给 __init__ 里的连通性
-    检查去报，在这里拦只会把"Ollama 没起来"升级成"程序起不来"。
+    解析失败或没有主机名时**不放行**：启动仍可继续（本函数返回 False 而不是
+    抛异常），但 ollama_url() 在钉住环回地址之前会拒绝给出可发请求的 URL。
+    首次 DNS 失败不代表以后仍失败——若这里返回 True 且不钉地址，之后解析到
+    远端时请求就会带着字幕正文出去。恢复时由 ollama_url() 重新校验并钉地址。
 
     ☠️ **校验通过之后必须把地址钉成 IP 字面量**（写进 _pinned_ollama_url，
     此后所有请求走 ollama_url()）。只校验不钉的话这道闸门只在启动那一刻关了
@@ -495,11 +517,11 @@ def _assert_local_ollama(base_url):
         return True
     host = urlparse(base_url).hostname
     if not host:
-        return True
+        return False
     try:
         infos = socket.getaddrinfo(host, None, 0, socket.SOCK_STREAM)
     except OSError:
-        return True
+        return False
     remote = set()
     loopback = []
     for info in infos:
@@ -512,21 +534,8 @@ def _assert_local_ollama(base_url):
                 remote.add(addr)
         except ValueError:
             continue
-    if not remote:
-        # 全是环回地址 → 钉住。优先 IPv4：Ollama 只监听 127.0.0.1:11434
-        # （第 4 节第 22 条实测过没有 IPv6 监听），钉到 ::1 上等于每个请求
-        # 白付那 2 秒再回退
-        pick = next((a for fam, a in loopback if fam == socket.AF_INET), None)
-        pick = pick or (loopback[0][1] if loopback else None)
-        if pick:
-            _pinned_ollama_url = _pin_url_to_address(base_url, pick)
-            if _pinned_ollama_url != base_url:
-                print(f"🔒 Ollama 地址已钉为 {_pinned_ollama_url}"
-                      f"（原配置是主机名 {host}）")
-                print(f"   钉住是为了防 DNS 中途改指向把转录送出本机，"
-                      f"顺带免掉 IPv6 环回那 2 秒")
-        return True
-    raise RemoteOllamaRefused(
+    if remote:
+        raise RemoteOllamaRefused(
         f"OLLAMA_BASE_URL 指向本机之外的地址：{host} → {', '.join(sorted(remote))}。\n"
         f"   本程序会把**识别出的全部原文**（抓的是系统全部声音，可能含语音通话）"
         f"发到这个地址，\n"
@@ -535,6 +544,20 @@ def _assert_local_ollama(base_url):
         f"http://127.0.0.1:11434\n"
         f"   → 确实想用另一台机器上的 Ollama：在 config_local.py 里加一行 "
         f"ALLOW_REMOTE_OLLAMA = True")
+    if not loopback:
+        return False
+    # 全是环回地址 → 钉住。优先 IPv4：Ollama 只监听 127.0.0.1:11434
+    # （第 4 节第 22 条实测过没有 IPv6 监听），钉到 ::1 上等于每个请求
+    # 白付那 2 秒再回退
+    pick = next((a for fam, a in loopback if fam == socket.AF_INET), None)
+    pick = pick or loopback[0][1]
+    _pinned_ollama_url = _pin_url_to_address(base_url, pick)
+    if _pinned_ollama_url != base_url:
+        print(f"🔒 Ollama 地址已钉为 {_pinned_ollama_url}"
+              f"（原配置是主机名 {host}）")
+        print(f"   钉住是为了防 DNS 中途改指向把转录送出本机，"
+              f"顺带免掉 IPv6 环回那 2 秒")
+    return True
 
 
 def _warn_if_ipv6_first_host(base_url):
@@ -974,7 +997,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
     # ------------------------------------------------------------------
     def _enqueue_sentences(self, sentences):
         """完整句子进翻译队列，唤醒worker"""
-        if not sentences:
+        if self.closing or not sentences:
             return
         sentences = _squash_repeats(sentences)  # 压缩Whisper复读伪影
         with self._tx_lock:
@@ -1075,7 +1098,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
         try:
             resp = self.ollama_session.get(
                 f"{ollama_url()}/api/version", timeout=timeout)
-        except requests.RequestException:
+        except (requests.RequestException, OllamaUnverified):
             return "unreachable", ""
         try:
             version = (resp.json() or {}).get("version", "")
@@ -2057,37 +2080,22 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
         self._emit_display()
 
     def shutdown(self):
-        """关闭识别/翻译线程（main.stop调用）。先ASR后翻译：
-        ASR关完就不会再往翻译队列塞句子"""
-        self.closing = True  # 在飞worker的出口检查：不再回调正在拆的UI
-        # cancel_futures=True：队列里还没开跑的识别/翻译全部丢弃——结果没人看
-        # （窗口在关、transcript也差不了几句），翻完再退纯属浪费退出时间。
-        # 在飞的那一个任务照常等完：ASR最坏~2.5秒（GPU被抢时），流式翻译
-        # 循环里查closing、一个数据块(~0.1秒)内就break出来
-        # ASR 先关，且这一个**必须**无界等：它一停就不会再往翻译队列塞句子，
-        # 而在飞的那一轮识别最坏 ~2.5 秒（GPU 被抢时），有明确上界
-        self._asr_executor.shutdown(wait=True, cancel_futures=True)
-        # ☠️ 查词请求也带 keep_alive="2h"：在飞的那一个如果在
-        # _unload_our_models **之后**才落地，会把刚卸掉的模型重新拉回显存
-        # 留驻两小时（和 2026-07-20 修的预热线程竞态同类，当时只处理了预热）。
-        # 有界等待：正常查词 1-2 秒就回来；卡住的话最多等 3 秒放弃继续退出
-        # （宁可漏卸一次也不拖住退出——stop 脚本还有 HTTP 卸载兜底）
-        # AI 分析走的是另一个池（同样带 keep_alive="2h"），一起有界排干。
-        #
-        # ☠️ **翻译池也必须在这一组里**，它以前是和 ASR 一样 wait=True 无界关的。
-        # `_await_model_ready` 分片轮询了 closing、流式响应循环里也查 closing，
-        # 看着两头都堵住了——但**两者之间那个 `ollama_session.post()` 在首个
-        # 数据块到达之前是纯阻塞的**，上界是 `_translate_timeout()` 选出来的读
-        # 超时，而 GPU 正忙于识别时它返回的是 OLLAMA_TIMEOUT_COLD（默认 90 秒）。
-        # 于是"某一句正在等首 token 时点 ❌"会把 shutdown 挂到 90 秒，而
-        # stop_subtitles.ps1 只给 5 秒宽限、到点强杀——强杀掉的正是下面的
-        # `_save_lookup_cache()` 和 `_unload_our_models()`：查词缓存整份丢失、
-        # 5.6GB 显存按 keep_alive="2h" 白占两小时。也就是 CLAUDE.md 第 4 节
-        # 第 28 条刚修好的那个后果，从另一个方向复活了。
-        # 这三个池的取舍完全一样（宁可漏卸一次也不拖住退出），写法就该一样；
-        # 之前只有翻译池是无界的，这个不一致本身就是漏改的证据。
+        """关闭识别/翻译线程（main.stop 调用）。
+
+        顺序：拒绝新任务 → 先存缓存 → 取消排队 → 共享截止时间等待在飞任务
+        → 独立 Session 卸载 → 仅在排干完成后关闭 worker Session。
+
+        daemon 排干线程不能终止 executor 工作线程；超时后无法保证硬上界。
+        """
+        self.closing = True  # 在飞 worker 的出口检查：不再回调正在拆的 UI
+        # 缓存必须在任何可能无界的等待之前落盘。以前 ASR wait=True 排在
+        # _save_lookup_cache 前面：识别卡住就把整份查词缓存带走。
+        self._save_lookup_cache()
+        # cancel_futures=True：队列里还没开跑的识别/翻译全部丢弃。
+        # 四个池共用一个单调时钟截止时间，ASR 也不再无界等。
         drains = []
-        for executor, name in ((self._tx_executor, "TranslateDrain"),
+        for executor, name in ((self._asr_executor, "AsrDrain"),
+                               (self._tx_executor, "TranslateDrain"),
                                (self._lookup_executor, "LookupDrain"),
                                (self._analysis_executor, "AnalysisDrain")):
             t = Thread(
@@ -2096,11 +2104,17 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
                 daemon=True, name=name)
             t.start()
             drains.append(t)
-        deadline = time.time() + 3
+        deadline = time.monotonic() + 3
         for t in drains:
-            t.join(timeout=max(0.0, deadline - time.time()))
-        self._save_lookup_cache()
-        self._unload_our_models()
+            t.join(timeout=max(0.0, deadline - time.monotonic()))
+        drained = all(not t.is_alive() for t in drains)
+        self._shutdown_incomplete = not drained
+        # 卸载用短生命 Session，不跟可能仍在 post 的 worker 并发复用。
+        self._unload_our_models(deadline=deadline)
+        if not drained:
+            print("⚠️  退出等待超时：工作线程仍在跑。无法保证硬上界，"
+                  "会话留给它们收尾（停止脚本有进程级兜底）。")
+            return
         try:
             self.ollama_session.close()
             self.lookup_session.close()
@@ -2123,39 +2137,51 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
             return False
         return loaded_name == configured or loaded_name.startswith(configured + ":")
 
-    def _unload_our_models(self):
+    def _unload_our_models(self, deadline=None):
         """退出时主动卸载本程序加载的翻译模型。
 
         翻译请求带 keep_alive=2h：stop脚本会CLI卸载，但❌按钮/Ctrl+C退出不经过
         stop脚本，模型会在显存里赖到2小时到期（2026-07-17 实测：程序退了，
-        9b 还独占 5.6GB）。必须放在两个 executor shutdown **之后**：在飞的
+        9b 还独占 5.6GB）。必须放在 executor 排干 **之后**：在飞的
         翻译/预热任务收尾会重新加载模型，先卸就白卸了。
         只卸"/api/ps 里确实加载着、且名字是本程序配置"的模型——对未加载的
         模型发 keep_alive=0 会先触发一次完整加载（纯浪费退出时间），
-        用户自己跑的无关模型更不能碰。"""
-        # 启动预热若还在飞，先等它落地（有界3秒）：预热请求在卸载**之后**
-        # 完成会把模型重新留驻2小时——"加载中途退出"的窗口期正好撞上
+        用户自己跑的无关模型更不能碰。
+
+        用独立短生命 Session，避免和尚未结束的 worker 并发使用同一 Session。
+        """
+        remaining = 3.0
+        if deadline is not None:
+            remaining = max(0.2, deadline - time.monotonic())
+        # 启动预热若还在飞，先等它落地：预热请求在卸载**之后**完成会把模型
+        # 重新留驻2小时——"加载中途退出"的窗口期正好撞上
         t = _warm_thread
         if t is not None and t.is_alive():
-            t.join(timeout=3)
+            t.join(timeout=min(3.0, remaining))
 
         ours = [m for m in (config.OLLAMA_MODEL,
                             getattr(config, "GAME_MODE_OLLAMA_MODEL", None)) if m]
+        session = requests.Session()
         try:
-            loaded = self.ollama_session.get(
-                f"{ollama_url()}/api/ps", timeout=2,
+            loaded = session.get(
+                f"{ollama_url()}/api/ps", timeout=min(2.0, remaining),
             ).json().get("models", [])
             for m in loaded:
                 name = m.get("name")
                 if any(self._model_name_matches(name, ours_name) for ours_name in ours):
-                    self.ollama_session.post(
+                    session.post(
                         f"{ollama_url()}/api/generate",
                         json={"model": name, "prompt": "", "keep_alive": 0},
-                        timeout=3,
+                        timeout=min(3.0, remaining),
                     ).close()
                     print(f"🧹 已卸载翻译模型 {name}（释放显存）")
         except Exception:
             pass  # Ollama不在/超时都无所谓：模型最多赖到keep_alive到期，不阻塞退出
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
 
     def __del__(self):
         """清理资源"""

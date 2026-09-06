@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
+import math
+import os
 import re
 import shutil
 import subprocess
@@ -224,6 +227,250 @@ def _clean_translation(text: str) -> str:
     return text.strip().strip('"“”')
 
 
+CHECKPOINT_VERSION = 1
+
+
+def _fingerprint_payload(payload: dict) -> str:
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def asr_fingerprint(source_language: str) -> str:
+    seed = (getattr(config, "LANGUAGE_SEED_PROMPTS", {}) or {}).get(source_language, "")
+    return _fingerprint_payload({
+        "source_language": source_language or "",
+        "whisper_model": getattr(config, "WHISPER_MODEL", ""),
+        "whisper_device": getattr(config, "WHISPER_DEVICE", ""),
+        "whisper_compute_type": getattr(config, "WHISPER_COMPUTE_TYPE", ""),
+        "whisper_beam_size": getattr(config, "WHISPER_BEAM_SIZE", ""),
+        "language_seed_prompt": seed,
+    })
+
+
+def tx_fingerprint(source_language: str, target_language: str) -> str:
+    return _fingerprint_payload({
+        "source_language": source_language or "",
+        "target_language": target_language or "",
+        "ollama_model": getattr(config, "OLLAMA_MODEL", ""),
+        "fallback_model": getattr(config, "GAME_MODE_OLLAMA_MODEL", None),
+        "translation_style": getattr(config, "TRANSLATION_STYLE", ""),
+        "translation_style_prompts": getattr(config, "TRANSLATION_STYLE_PROMPTS", {}),
+        "glossary": getattr(config, "GLOSSARY", {}),
+        "language_names": getattr(config, "LANGUAGE_NAMES", {}),
+        "translation_target_names": getattr(config, "TRANSLATION_TARGET_NAMES", {}),
+        "ollama_num_ctx": getattr(config, "OLLAMA_NUM_CTX", ""),
+    })
+
+
+def build_checkpoint(
+    video_id: str,
+    source_url: str,
+    extractor: str,
+    source_language: str,
+    target_language: str,
+    rows: list[dict],
+    asr_done: bool = False,
+    complete: bool = False,
+    duration: float = 0.0,
+) -> dict:
+    return {
+        "version": CHECKPOINT_VERSION,
+        "video_id": video_id,
+        "source_url": source_url,
+        "extractor": extractor or "",
+        "source_language": source_language,
+        "target_language": target_language,
+        "asr_fingerprint": asr_fingerprint(source_language),
+        "tx_fingerprint": tx_fingerprint(source_language, target_language),
+        "rows": rows,
+        "duration": duration,
+        "asr_done": asr_done,
+        "complete": complete,
+    }
+
+
+def save_checkpoint(path: Path, data: dict) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def load_checkpoint(path: Path) -> dict | None:
+    path = Path(path)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("version") != CHECKPOINT_VERSION:
+        return None
+    if not isinstance(data.get("rows"), list):
+        return None
+    for row in data["rows"]:
+        if not isinstance(row, dict) or not isinstance(row.get("text"), str):
+            return None
+        try:
+            start = float(row["start"])
+            end = float(row["end"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not math.isfinite(start) or not math.isfinite(end):
+            return None
+        if "translation" in row and not isinstance(row["translation"], str):
+            return None
+    return data
+
+
+def checkpoint_asr_usable(
+    data: dict | None,
+    video_id: str,
+    source_language: str,
+    source_url: str | None = None,
+    extractor: str | None = None,
+) -> bool:
+    if not data or not data.get("asr_done") or not data.get("rows"):
+        return False
+    if data.get("video_id") != video_id:
+        return False
+    if source_url is not None and data.get("source_url") != source_url:
+        return False
+    if extractor is not None and data.get("extractor") != extractor:
+        return False
+    if data.get("source_language") != source_language:
+        return False
+    return data.get("asr_fingerprint") == asr_fingerprint(source_language)
+
+
+def checkpoint_tx_usable(
+    data: dict | None,
+    source_language: str,
+    target_language: str,
+    video_id: str | None = None,
+    source_url: str | None = None,
+    extractor: str | None = None,
+) -> bool:
+    if not data:
+        return False
+    if video_id is not None and data.get("video_id") != video_id:
+        return False
+    if source_url is not None and data.get("source_url") != source_url:
+        return False
+    if extractor is not None and data.get("extractor") != extractor:
+        return False
+    if data.get("source_language") != source_language:
+        return False
+    if data.get("target_language") != target_language:
+        return False
+    return data.get("tx_fingerprint") == tx_fingerprint(source_language, target_language)
+
+
+def atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding=encoding)
+    tmp.replace(path)
+
+
+class JobLock:
+    """Task-level exclusive lock so two jobs don't clobber the same audio file."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.fh = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fh = open(self.path, "a+b")
+        if self.fh.tell() == 0:
+            self.fh.write(b"0")
+            self.fh.flush()
+        self.fh.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(self.fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            self.fh.close()
+            self.fh = None
+            raise OfflineSubtitleError("同一视频任务已在运行，请等待完成后再试。") from exc
+        return self
+
+    def __exit__(self, *exc):
+        if not self.fh:
+            return
+        try:
+            self.fh.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(self.fh.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        try:
+            self.fh.close()
+        except OSError:
+            pass
+        self.fh = None
+
+
+def input_char_budget(num_ctx=None, output_tokens: int = 320, template_chars: int = 0) -> int:
+    """Conservative character budget for mixed German/Chinese prompts."""
+    num_ctx = int(num_ctx or getattr(config, "OLLAMA_NUM_CTX", 4096))
+    reserve_tokens = int(output_tokens) + 96 + max(0, int(template_chars / 1.5))
+    usable = num_ctx - reserve_tokens
+    if usable < 128:
+        raise OfflineSubtitleError("模型上下文预算不足，无法生成本次请求。")
+    return max(200, int(usable * 1.2 * 0.5))
+
+
+def chunk_rows_for_summary(rows: list[dict], budget: int) -> list[list[dict]]:
+    chunks: list[list[dict]] = []
+    current: list[dict] = []
+    for row in rows:
+        trial = current + [row]
+        if current and len(_summary_chunk_prompt(trial)) > budget:
+            chunks.append(current)
+            current = [row]
+            if len(_summary_chunk_prompt(current)) > budget:
+                raise OfflineSubtitleError("单条字幕超过学习笔记的输入预算。")
+        else:
+            current = trial
+            if len(_summary_chunk_prompt(current)) > budget:
+                raise OfflineSubtitleError("单条字幕超过学习笔记的输入预算。")
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def merge_summaries_to_budget(summaries: list[dict], budget: int) -> list[dict]:
+    items = list(summaries or [])
+    if not items:
+        return []
+    while True:
+        blob = "\n".join(f"[{s['start']}-{s['end']}] {s['text']}" for s in items)
+        if len(blob) <= budget or len(items) == 1:
+            return items
+        merged = []
+        for i in range(0, len(items), 2):
+            group = items[i:i + 2]
+            if len(group) == 1:
+                merged.append(group[0])
+            else:
+                merged.append({
+                    "text": f"{group[0]['text']} / {group[1]['text']}",
+                    "start": group[0]["start"],
+                    "end": group[1]["end"],
+                })
+        items = merged
+
+
 def _ollama_request(session: requests.Session, url: str, model: str, prompt: str, num_predict: int = 512) -> str:
     response = session.post(
         f"{url}/api/generate",
@@ -246,7 +493,13 @@ def _ollama_request(session: requests.Session, url: str, model: str, prompt: str
     return _clean_translation(response.json().get("response", ""))
 
 
-def translate_segments(rows: list[dict], source_language: str, target_language: str) -> None:
+def translate_segments(
+    rows: list[dict],
+    source_language: str,
+    target_language: str,
+    checkpoint_path: Path | None = None,
+    checkpoint_meta: dict | None = None,
+) -> None:
     """Translate sequentially to keep Ollama/Whisper GPU use predictable."""
     from realtime_subtitle.translate import translator_queue
 
@@ -260,29 +513,44 @@ def translate_segments(rows: list[dict], source_language: str, target_language: 
     fallback = getattr(config, "GAME_MODE_OLLAMA_MODEL", None)
     if fallback and fallback not in models:
         models.append(fallback)
-    session = requests.Session()
-    for index, row in enumerate(rows, 1):
-        prompt = _translation_prompt(source_language, target_language, row["text"])
-        result = ""
-        last_error = None
-        for model in models:
-            if not model:
+
+    def persist():
+        if not checkpoint_path:
+            return
+        payload = dict(checkpoint_meta or {})
+        payload["version"] = payload.get("version", CHECKPOINT_VERSION)
+        payload["rows"] = rows
+        payload["asr_done"] = True
+        payload["complete"] = False
+        save_checkpoint(checkpoint_path, payload)
+
+    with requests.Session() as session:
+        for index, row in enumerate(rows, 1):
+            if (row.get("translation") or "").strip():
                 continue
-            for attempt in range(2):
-                try:
-                    result = _ollama_request(session, ollama_url, model, prompt)
-                    if result and not any(marker in result for marker in _REFUSAL_MARKERS):
-                        break
-                except Exception as exc:
-                    last_error = exc
-                time.sleep(1.0)
-            if result and not any(marker in result for marker in _REFUSAL_MARKERS):
-                break
-        if not result or any(marker in result for marker in _REFUSAL_MARKERS):
-            raise OfflineSubtitleError(f"第 {index} 条字幕翻译失败：{last_error or '本地模型没有返回译文'}")
-        row["translation"] = result
-        if index % 20 == 0 or index == 1:
-            print(f"翻译进度：{index}/{len(rows)}", flush=True)
+            prompt = _translation_prompt(source_language, target_language, row["text"])
+            result = ""
+            last_error = None
+            for model in models:
+                if not model:
+                    continue
+                for attempt in range(2):
+                    try:
+                        result = _ollama_request(session, ollama_url, model, prompt)
+                        if result and not any(marker in result for marker in _REFUSAL_MARKERS):
+                            break
+                    except Exception as exc:
+                        last_error = exc
+                    time.sleep(1.0)
+                if result and not any(marker in result for marker in _REFUSAL_MARKERS):
+                    break
+            if not result or any(marker in result for marker in _REFUSAL_MARKERS):
+                persist()
+                raise OfflineSubtitleError(f"第 {index} 条字幕翻译失败：{last_error or '本地模型没有返回译文'}")
+            row["translation"] = result
+            persist()
+            if index % 20 == 0 or index == 1:
+                print(f"翻译进度：{index}/{len(rows)}", flush=True)
 
 
 def _summary_chunk_prompt(rows: list[dict]) -> str:
@@ -310,19 +578,40 @@ def write_learning_guide(
 
     translator_queue._assert_local_ollama(config.OLLAMA_BASE_URL)
     ollama_url = translator_queue.ollama_url()
-    session = requests.Session()
-    summaries = []
-    for start in range(0, len(rows), 40):
-        summaries.append(_ollama_request(session, ollama_url, config.OLLAMA_MODEL, _summary_chunk_prompt(rows[start:start + 40]), 320))
-    summary_text = "\n".join(f"片段 {i + 1}：{text[:280]}" for i, text in enumerate(summaries))
+    if not rows:
+        raise OfflineSubtitleError("没有可整理的字幕，无法生成学习笔记。")
     candidates = []
     for row in rows:
         source = row["text"].strip()
         target = row.get("translation", "").strip()
         if 20 <= len(source) <= 100 and source:
             candidates.append(f"{source} → {target}")
-    candidates = candidates[::max(1, len(candidates) // 24)][:24]
-    final_prompt = f"""请根据下面的分段摘要和表达候选，为中文学习者写一份德语/外语视频学习笔记。
+    candidates = candidates[::max(1, len(candidates) // 24)][:24] if candidates else []
+    candidate_block = "\n".join("- " + item for item in candidates)
+    header_template = f"标题:{title}\n表达候选:\n{candidate_block}\n"
+
+    with requests.Session() as session:
+        chunk_budget = input_char_budget(output_tokens=320)
+        chunks = chunk_rows_for_summary(rows, chunk_budget)
+        summaries = []
+        for chunk in chunks:
+            text = _ollama_request(
+                session, ollama_url, config.OLLAMA_MODEL,
+                _summary_chunk_prompt(chunk), 320)
+            summaries.append({
+                "text": text,
+                "start": chunk[0]["start"],
+                "end": chunk[-1]["end"],
+            })
+        final_budget = input_char_budget(
+            output_tokens=1800, template_chars=len(header_template) + 400)
+        merge_budget = input_char_budget(output_tokens=320)
+        while True:
+            summary_text = "\n".join(
+                f"片段 {i + 1}（{_srt_time(item['start'])}-{_srt_time(item['end'])}）：{item['text'][:280]}"
+                for i, item in enumerate(summaries)
+            )
+            final_prompt = f"""请根据下面的分段摘要和表达候选，为中文学习者写一份德语/外语视频学习笔记。
 
 必须输出 Markdown，并且完整包含：
 ## 内容概述（一段）
@@ -336,9 +625,35 @@ def write_learning_guide(
 {summary_text}
 
 【表达候选】
-{chr(10).join('- ' + item for item in candidates)}
+{candidate_block}
 """
-    guide = _ollama_request(session, ollama_url, config.OLLAMA_MODEL, final_prompt, 1800)
+            if len(final_prompt) <= final_budget:
+                break
+            if len(summaries) == 1:
+                raise OfflineSubtitleError("学习笔记最终输入超出上下文预算。")
+            reduced = []
+            for i in range(0, len(summaries), 2):
+                group = summaries[i:i + 2]
+                if len(group) == 1:
+                    reduced.append(group[0])
+                    continue
+                merge_prompt = (
+                    "请把下面两段要点合并成 2—3 条更短的中文要点，每条不超过 40 字。"
+                    f"\n一段：{group[0]['text']}\n二段：{group[1]['text']}"
+                )
+                if len(merge_prompt) > merge_budget:
+                    raise OfflineSubtitleError("学习笔记归并输入超出上下文预算。")
+                merged = _ollama_request(
+                    session, ollama_url, config.OLLAMA_MODEL, merge_prompt, 320)
+                reduced.append({
+                    "text": merged,
+                    "start": group[0]["start"],
+                    "end": group[1]["end"],
+                })
+            summaries = reduced
+        if summaries[0]["start"] != rows[0]["start"] or summaries[-1]["end"] != rows[-1]["end"]:
+            raise OfflineSubtitleError("学习笔记摘要未覆盖完整视频区间。")
+        guide = _ollama_request(session, ollama_url, config.OLLAMA_MODEL, final_prompt, 1800)
     minutes, seconds = divmod(int(duration), 60)
     header = f"""# 字幕学习笔记
 
@@ -352,7 +667,7 @@ def write_learning_guide(
 > 本文件只整理视频字幕内容，不是事实核查；个别自动识别的专名或半句请结合原音确认。
 
 """
-    output.write_text(header + guide.strip() + "\n", encoding="utf-8")
+    atomic_write_text(output, header + guide.strip() + "\n", encoding="utf-8")
 
 
 def process_url(
@@ -379,37 +694,87 @@ def process_url(
     audio = job_dir / "_audio_16k.wav"
     source_srt = job_dir / f"{video_id}_source.srt"
     bilingual_srt = job_dir / f"{video_id}_bilingual.srt"
+    checkpoint_path = job_dir / "_job_checkpoint.json"
     guide: Path | None = job_dir / f"{video_id}_learning_guide.md" if summary else None
-    try:
-        print(f"开始处理：{video_info.get('title', video_id)}", flush=True)
-        _extract_audio(video, audio)
-        rows, detected_language, duration = transcribe_audio(audio, source_language)
-        if not rows:
-            raise OfflineSubtitleError("没有识别到可用语音。")
-        effective_language = source_language if source_language != "auto" else detected_language
-        source_srt.write_text(build_srt(rows, bilingual=False), encoding="utf-8-sig")
-        target_language = target_language_for(effective_language)
-        translate_segments(rows, effective_language, target_language)
-        bilingual_srt.write_text(build_srt(rows, bilingual=True), encoding="utf-8-sig")
-        if summary:
-            assert guide is not None
-            try:
-                write_learning_guide(rows, str(video_info.get("title", video_id)), url, duration, effective_language, target_language, guide)
-            except Exception as exc:
-                print(f"学习总结生成失败（字幕已完成）：{exc}", file=sys.stderr, flush=True)
-                guide = None
-        print(f"完成：{bilingual_srt}", flush=True)
-        return {
-            "video": video,
-            "source_srt": source_srt,
-            "bilingual_srt": bilingual_srt,
-            "guide": guide,
-            "source_language": effective_language,
-            "target_language": target_language,
-            "segments": len(rows),
-        }
-    finally:
-        audio.unlink(missing_ok=True)
+    extractor = str(video_info.get("extractor") or info.get("extractor") or "")
+    with JobLock(job_dir / "_job.lock"):
+        try:
+            print(f"开始处理：{video_info.get('title', video_id)}", flush=True)
+            checkpoint = load_checkpoint(checkpoint_path)
+            locked_source = source_language if source_language != "auto" else None
+            rows = []
+            duration = 0.0
+            effective_language = locked_source or "und"
+            checkpoint_source = checkpoint.get("source_language") if checkpoint else None
+            resume_source = locked_source or checkpoint_source
+            if resume_source and checkpoint_asr_usable(
+                checkpoint, video_id, resume_source, url, extractor,
+            ):
+                rows = list(checkpoint["rows"])
+                duration = float(checkpoint.get("duration") or 0.0)
+                effective_language = resume_source
+            else:
+                _extract_audio(video, audio)
+                rows, detected_language, duration = transcribe_audio(audio, source_language)
+                if not rows:
+                    raise OfflineSubtitleError("没有识别到可用语音。")
+                effective_language = source_language if source_language != "auto" else detected_language
+            target_language = target_language_for(effective_language)
+            if checkpoint and not checkpoint_tx_usable(
+                checkpoint, effective_language, target_language,
+                video_id, url, extractor,
+            ):
+                for row in rows:
+                    row.pop("translation", None)
+            atomic_write_text(source_srt, build_srt(rows, bilingual=False), encoding="utf-8-sig")
+            meta = build_checkpoint(
+                video_id=video_id,
+                source_url=url,
+                extractor=extractor,
+                source_language=effective_language,
+                target_language=target_language,
+                rows=rows,
+                asr_done=True,
+                complete=False,
+                duration=duration,
+            )
+            save_checkpoint(checkpoint_path, meta)
+            translate_segments(
+                rows, effective_language, target_language,
+                checkpoint_path=checkpoint_path, checkpoint_meta=meta,
+            )
+            atomic_write_text(bilingual_srt, build_srt(rows, bilingual=True), encoding="utf-8-sig")
+            meta = build_checkpoint(
+                video_id=video_id,
+                source_url=url,
+                extractor=extractor,
+                source_language=effective_language,
+                target_language=target_language,
+                rows=rows,
+                asr_done=True,
+                complete=True,
+                duration=duration,
+            )
+            save_checkpoint(checkpoint_path, meta)
+            if summary:
+                assert guide is not None
+                try:
+                    write_learning_guide(rows, str(video_info.get("title", video_id)), url, duration, effective_language, target_language, guide)
+                except Exception as exc:
+                    print(f"学习总结生成失败（字幕已完成）：{exc}", file=sys.stderr, flush=True)
+                    guide = None
+            print(f"完成：{bilingual_srt}", flush=True)
+            return {
+                "video": video,
+                "source_srt": source_srt,
+                "bilingual_srt": bilingual_srt,
+                "guide": guide,
+                "source_language": effective_language,
+                "target_language": target_language,
+                "segments": len(rows),
+            }
+        finally:
+            audio.unlink(missing_ok=True)
 
 
 def main(argv: list[str] | None = None) -> int:

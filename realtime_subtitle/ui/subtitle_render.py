@@ -4,6 +4,7 @@ HTML/QTextDocument构建 + 点词查词命中测试。以mixin形式并入 Subti
 """
 import html
 import time
+import uuid
 from PyQt5.QtCore import Qt
 import realtime_subtitle.config as config
 class LiveTextRenderMixin:
@@ -265,10 +266,12 @@ class LiveTextRenderMixin:
         from PyQt5.QtGui import QCursor
         self._lookup_anchor = QCursor.pos()
         self._lookup_context = context  # 深度解释用整句，不靠弹窗事后再猜
-        # ☠️ UI 侧也要记"当前在等哪个词"：translator 的 seq 门控挡不住
-        # "worker 判定没过期 → emit 进 Qt 队列 → 用户点了新词 → 旧 emit 才被
-        # 主线程执行"这段窗口期。按词名对一下最省事，也够用
+        # ☠️ 一次点击一个 request_id：translator 的 seq 门控挡不住
+        # "worker 判定没过期 → emit 进 Qt 队列 → 用户点了同一个词的新句境 →
+        # 旧 emit 才被主线程执行"。只比词名会把旧释义安到新句上。
+        request_id = uuid.uuid4().hex
         self._lookup_pending_word = word
+        self._lookup_pending_id = request_id
         # 点新词会使进行中的深度解释过时（共享 WordPopup，旧结果回来别盖查词）
         self._deep_explain_seq = getattr(self, "_deep_explain_seq", 0) + 1
         # HTTP 超时 15s；弹窗要比它多留一点余量，避免 8-15s 区间先消失再闪回
@@ -279,17 +282,23 @@ class LiveTextRenderMixin:
             show_deep=False,
             show_web=False,
         )
-        self.on_lookup(word, context)
+        try:
+            self.on_lookup(word, context, request_id)
+        except TypeError:
+            self.on_lookup(word, context)
 
-    def show_lookup_result(self, word, text):
+    def show_lookup_result(self, word, text, request_id=None):
         """词典查询完成（线程安全，从查词线程调）"""
-        self.signals.lookup.emit(word or "", text or "", False)
+        self.signals.lookup.emit(word or "", text or "", False, request_id or "")
 
-    def show_lookup_partial(self, word, text):
+    def show_lookup_partial(self, word, text, request_id=None):
         """流式生成中的半成品（线程安全）：已经成行的部分先上屏"""
-        self.signals.lookup.emit(word or "", text or "", True)
+        self.signals.lookup.emit(word or "", text or "", True, request_id or "")
 
-    def _show_lookup(self, word, text, partial=False):
+    def _show_lookup(self, word, text, partial=False, request_id=""):
+        pending_id = getattr(self, "_lookup_pending_id", None)
+        if pending_id is not None and request_id and request_id != pending_id:
+            return  # 排在 Qt 队列里的旧请求，别盖上去
         pending = getattr(self, "_lookup_pending_word", None)
         if pending is not None and word and word != pending:
             return  # 排在 Qt 队列里的旧词结果，用户已经点别的了，别盖上去

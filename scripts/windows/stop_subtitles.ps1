@@ -4,17 +4,11 @@ $ErrorActionPreference = "SilentlyContinue"
 $RepoRoot = (Get-Item $PSScriptRoot).Parent.Parent.FullName
 Set-Location $RepoRoot
 
+. "$PSScriptRoot\_identity.ps1"
 $pidFile = "$RepoRoot\subtitle.pid"
 $stopFlag = "$RepoRoot\.stop"
-# ☠️ 判"是不是本项目的进程"一律用 StartsWith，不要用 -like（-like 把路径里的
-# [ ] 当通配符字符类，装在 C:\tools\[wip]\... 下就认不出自己的进程了）。
-# 本文件末尾的残留检查一直用的就是 StartsWith，这里跟它统一。
-$VenvPrefix = Join-Path $RepoRoot "venv"
-function Test-OurProcess {
-    param($Proc)
-    return $Proc -and $Proc.Path -and
-        $Proc.Path.StartsWith($VenvPrefix, [StringComparison]::OrdinalIgnoreCase)
-}
+# 停止对象必须是当前实时实例：精确 venv\Scripts\python.exe + main.py + 创建时间。
+# 裸 StartsWith(venv) 会误匹配 venv_backup，也会把同 venv 的离线任务当实时字幕。
 # 优雅退出正常1-2秒（积压任务直接丢弃、在飞流式翻译会被打断），但
 # .stop轮询0.5s+在飞识别(GPU被抢最坏~2.5s)+Ollama卸载HTTP(~1-2s)叠加时
 # 会顶到3秒边缘（2026-07-20实测3次停止2次超时强杀）。放到5秒：退得快
@@ -36,11 +30,11 @@ function Wait-ProcessExit {
 }
 
 if (Test-Path $pidFile) {
-    $targetPid = (Get-Content $pidFile | Select-Object -First 1).Trim()
-    $targetProc = Get-Process -Id $targetPid -ErrorAction SilentlyContinue
-    # 与 start 对称：PID 会被系统回收复用。只对「本项目 venv 下的 python」
-    # 写 .stop / 强杀；路径对不上就当陈旧 pid，删文件后走窗口标题兜底。
-    $isOurs = Test-OurProcess $targetProc
+    $identity = Read-SubtitleIdentity $pidFile
+    $targetPid = if ($identity) { $identity.pid } else { $null }
+    $targetProc = if ($targetPid) { Get-Process -Id $targetPid -ErrorAction SilentlyContinue } else { $null }
+    # 与 start 对称：PID 会被系统回收复用。身份不确定时提示，不自动强杀。
+    $isOurs = Test-RealtimeInstance $targetProc $identity $RepoRoot
     if ($isOurs) {
         # 写停止标记：主程序 QTimer 看到后走 app.quit → stop() 关线程/模型
         New-Item -ItemType File -Path $stopFlag -Force | Out-Null
@@ -54,17 +48,26 @@ if (Test-Path $pidFile) {
             $stopped = $true
         }
     } elseif ($targetProc) {
-        Write-Host "subtitle.pid 里的 PID $targetPid 不是本项目进程（可能已被系统复用），忽略并清理。"
+        Write-Host "subtitle.pid 里的 PID $targetPid 不是当前实时字幕实例（可能已被系统复用，或是离线任务），忽略并清理。"
+    } elseif ($identity -and $identity.pid -and -not $targetProc) {
+        Write-Host "subtitle.pid 里的 PID $($identity.pid) 已不存在，忽略并清理。"
     }
     Remove-Item $pidFile -ErrorAction SilentlyContinue
 }
 
 if (-not $stopped) {
-    # 兜底：按窗口标题找。必须匹配"实时字幕"，不能只看"有窗口标题"，
-    # 否则会把用户开着的其它python图形程序一起杀掉
+    # 窗口标题只用于发现候选，命中后仍要验证解释器和 main.py 入口。
     $procs = Get-Process python -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -like "*实时字幕*" }
-    if ($procs) {
-        foreach ($proc in $procs) {
+    $verified = @()
+    foreach ($proc in $procs) {
+        if (Test-RealtimeInstance $proc $null $RepoRoot) {
+            $verified += $proc
+        } else {
+            Write-Host "窗口标题像实时字幕但不是本仓库实例（PID $($proc.Id)），跳过。"
+        }
+    }
+    if ($verified) {
+        foreach ($proc in $verified) {
             New-Item -ItemType File -Path $stopFlag -Force | Out-Null
             if (-not (Wait-ProcessExit -ProcessId $proc.Id -Seconds $graceSeconds)) {
                 Stop-Process -Id $proc.Id -Force
@@ -142,8 +145,11 @@ Remove-Item "$RepoRoot\.paused" -ErrorAction SilentlyContinue
 $leftover = $null
 for ($i = 0; $i -lt 32; $i++) {
     $leftover = Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.ExecutablePath -and
-            $_.ExecutablePath.StartsWith($VenvPrefix, [StringComparison]::OrdinalIgnoreCase) }
+        Where-Object {
+            $_.ExecutablePath -and
+            (Test-OurInterpreter $_.ExecutablePath $RepoRoot) -and
+            (Test-RealtimeCommandLine $_.CommandLine)
+        }
     if (-not $leftover) { break }
     Start-Sleep -Milliseconds 250
 }

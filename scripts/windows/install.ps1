@@ -161,6 +161,9 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 Write-Host "  ✅ 依赖安装完成"
+. "$PSScriptRoot\_update_deps.ps1"
+$tier = if ($hasGpu) { "gpu" } else { "cpu" }
+Write-DepsFingerprint -RepoRoot $RepoRoot -Tier $tier
 
 # ---------- 4. 按硬件生成本机配置 ----------
 # config_local.py 会覆盖 config.py 的同名配置（config.py 末尾 import 它）。

@@ -46,6 +46,31 @@ import realtime_subtitle.config as config
 # iter_lines() 就会一直把内容往 parts 里堆，内存跟着涨、翻译 worker 也永远
 # 不返回。一条字幕的中文再长也就几百字，20000 是留足余量的保险丝。
 _MAX_STREAM_CHARS = 20000
+LOOKUP_CACHE_VERSION = 2
+
+
+def normalize_lookup_context(context):
+    """轻量空白归一化：不折叠大小写，不引入词形还原。"""
+    return " ".join((context or "").split())
+
+
+def lookup_cache_key(word, language, context):
+    """(原词大小写, 语言, 归一化句境)。Essen/essen、跨句 Band 不得共用一格。"""
+    return (word, language, normalize_lookup_context(context))
+
+
+def _lookup_text_ok(text):
+    """最基本的内容检查：空结果不进缓存，格式轻微变化仍算成功。"""
+    return bool((text or "").strip())
+
+
+def _emit_lookup(callback, word, text, request_id=None):
+    if callback is None:
+        return
+    try:
+        callback(word, text, request_id)
+    except TypeError:
+        callback(word, text)
 
 
 def lookup_language_for(word):
@@ -286,24 +311,26 @@ class LookupMixin:
         """启动时读回上次的查词缓存（学德语时高频词跨会话继续秒回）。
 
         文件坏了/格式变了一律当没有——这是纯加速缓存，绝不能让它挡住启动。
-        JSON 没有元组键，落盘格式是 [[词, 语言, 释义, 当时的句境], ...]，
-        按 LRU 顺序（最旧在前）写，读回来 insert 顺序天然就是原来的 LRU。
+        v2 落盘：{"version": 2, "rows": [[词, 语言, 句境, 释义], ...]}，
+        按 LRU 顺序（最旧在前）写。旧版把大小写折进键里，无法凭空恢复，直接丢弃。
         """
         path = self._lookup_cache_path()
         if not path or not os.path.exists(path):
             return
         try:
             with open(path, "r", encoding="utf-8") as f:
-                rows = json.load(f)
+                data = json.load(f)
+            if not isinstance(data, dict) or data.get("version") != LOOKUP_CACHE_VERSION:
+                return
             loaded = 0
-            for row in rows:
+            for row in data.get("rows") or []:
                 if not isinstance(row, (list, tuple)) or len(row) != 4:
                     continue
-                word, lang, text, ctx = row
+                word, lang, ctx, text = row
                 if not (isinstance(word, str) and isinstance(lang, str)
                         and isinstance(text, str) and isinstance(ctx, str)):
                     continue
-                self._lookup_cache[(word, lang)] = (text, ctx)
+                self._lookup_cache[(word, lang, ctx)] = text
                 loaded += 1
             while len(self._lookup_cache) > self._LOOKUP_CACHE_MAX:
                 self._lookup_cache.popitem(last=False)
@@ -320,13 +347,14 @@ class LookupMixin:
             return
         try:
             with self._lookup_cache_lock:
-                rows = [[w, lang, text, ctx]
-                        for (w, lang), (text, ctx) in self._lookup_cache.items()]
+                rows = [[w, lang, ctx, text]
+                        for (w, lang, ctx), text in self._lookup_cache.items()]
             if not rows:
                 return
             tmp = path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(rows, f, ensure_ascii=False)
+                json.dump({"version": LOOKUP_CACHE_VERSION, "rows": rows},
+                          f, ensure_ascii=False)
             os.replace(tmp, path)
             if config.SHOW_PERFORMANCE:
                 print(f"   📖 查词缓存已保存 {len(rows)} 条")
@@ -352,44 +380,46 @@ class LookupMixin:
             while len(self._lookup_cache) > self._LOOKUP_CACHE_MAX:
                 self._lookup_cache.popitem(last=False)
 
-    def _serve_cached_lookup(self, word, cache_key, context, callback):
-        """缓存命中就直接回调，返回True。缓存值是(词典文本, 当时的句境)：
-        同一个词在【不同句子】里点，"本句中"那行是上一个句子的解释，
-        会误导学习者——剥掉它再显示（原形/词性/释义与句境无关照常秒回）"""
+    def _serve_cached_lookup(self, word, cache_key, context, callback,
+                             request_id=None):
+        """缓存命中就直接回调，返回True。键已含句境，不同句必须重新查。"""
         cached = self._lookup_cache_get(cache_key)
         if cached is None:
             return False
-        text, cached_context = cached
-        if context != cached_context:
-            text = "\n".join(
-                line for line in text.splitlines()
-                if not line.strip().startswith("本句中")).strip()
+        text = cached[0] if isinstance(cached, tuple) else cached
         if config.SHOW_PERFORMANCE:
             print(f"   📖 查词缓存命中: {word}")
-        callback(word, text)
+        _emit_lookup(callback, word, text, request_id)
         return True
 
-    def lookup_word(self, word, context, callback, on_partial=None):
-        """查一个德语/英语单词的词典解释，完成后调 callback(word, text)。
+    def lookup_word(self, word, context, callback, on_partial=None, request_id=None):
+        """查一个德语/英语单词的词典解释，完成后调 callback(word, text, request_id)。
 
-        on_partial(word, text)（可选）：流式生成期间**整行**地把已出的内容
+        on_partial(word, text, request_id)（可选）：流式生成期间**整行**地把已出的内容
         推给弹窗，让"原形/词性"先上屏，不用干等整段。同样必须线程安全。
 
         callback 必须线程安全（SubtitleWindow.show_lookup_result 走Qt信号）。
         缓存命中在调用线程同步返回，不进 executor、不打 Ollama。
+        request_id 从 UI 点击贯穿到信号；缺省时用 seq 字符串。
         """
         # ☠️ seq 必须在**查缓存之前**递增：命中缓存时也要让在飞的上一次查词过期。
         # 否则「点生词A(慢，流式在跑) → 点查过的词B(缓存秒回)」时 seq 不涨，
         # A 的 partial/final 全部判定为"没过期"，会一行行把 B 的结果盖掉，
         # 用户看到刚点的 B 变回 A。缓存越大越持久，这条路径越常走。
+        if getattr(self, "closing", False):
+            return
         self._lookup_seq += 1  # 只在 UI 线程递增（点击回调），worker 只读
         seq = self._lookup_seq
-        cache_key = (word.lower(), lookup_language_for(word))
-        if self._serve_cached_lookup(word, cache_key, context, callback):
+        if request_id is None:
+            request_id = str(seq)
+        cache_key = lookup_cache_key(word, lookup_language_for(word), context)
+        if self._serve_cached_lookup(word, cache_key, context, callback,
+                                     request_id=request_id):
             return
         try:
             self._lookup_executor.submit(
-                self._lookup_worker, word, context, callback, seq, on_partial)
+                self._lookup_worker, word, context, callback, seq, on_partial,
+                request_id)
         except RuntimeError:
             pass  # 程序正在退出
 
@@ -397,9 +427,10 @@ class LookupMixin:
         """有更新的点击了 → 这次的结果不要再弹（沿用 _tx_epoch 的代数门控思路）"""
         return seq is not None and seq != self._lookup_seq
 
-    def _stream_lookup(self, response, word, seq, on_partial):
-        """读查词的流式响应，返回最终文本；退出中/已过时返回 None。
+    def _stream_lookup(self, response, word, seq, on_partial, request_id=None):
+        """读查词的流式响应，返回 (status, text)。
 
+        status: complete / cancelled / incomplete
         partial 只按【整行】推：查词结果是"原形/词性/释义/本句中"四行的固定
         格式，按 token 推会让弹窗在半个词上抖，按行推则是一行一行长出来。
         """
@@ -407,27 +438,30 @@ class LookupMixin:
         emitted_chars = 0  # 已经推给弹窗的字符数（都落在换行边界上）
         total_chars = 0    # 累计收到的字符数（保险丝，见 _MAX_STREAM_CHARS）
         last_emit = 0.0
+        saw_done = False
+        saw_error = None
+        truncated = False
         for line in response.iter_lines():
-            if self.closing:
-                return None  # 正在退出：别等生成完，外层 finally 会 close 连接
-            if self._lookup_stale(seq):
-                # 用户已经点了别的词。这里**中途放弃**是有意的行为改变：
-                # 非流式时代拿到的是完整文本，过时了也照样进缓存（下次秒回）；
-                # 流式下半截文本进缓存只会污染词典，不如立刻断连——close 会让
-                # Ollama 停止生成，把 GPU 让给用户真正在等的那个词
-                return None
+            if self.closing or self._lookup_stale(seq):
+                return "cancelled", None
             if not line:
                 continue
             try:
                 data = json.loads(line)
             except ValueError:
                 continue
-            parts.append(data.get("response", ""))
-            total_chars += len(parts[-1])
-            if data.get("done"):
+            if data.get("error"):
+                saw_error = data.get("error")
                 break
+            piece = data.get("response", "") or ""
+            parts.append(piece)
+            total_chars += len(piece)
             if total_chars > _MAX_STREAM_CHARS:
                 print(f"   ⚠️  查词响应超过 {_MAX_STREAM_CHARS} 字符，提前截断")
+                truncated = True
+                break
+            if data.get("done"):
+                saw_done = True
                 break
             if not on_partial or time.time() - last_emit <= 0.15:
                 continue
@@ -440,21 +474,27 @@ class LookupMixin:
                              flags=re.DOTALL).strip()
             if partial:
                 last_emit = time.time()
-                on_partial(word, partial)
-        text = "".join(parts)
-        return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+                _emit_lookup(on_partial, word, partial, request_id)
+        if self.closing or self._lookup_stale(seq):
+            return "cancelled", None
+        text = re.sub(r'<think>.*?</think>', '', "".join(parts), flags=re.DOTALL).strip()
+        if saw_error or truncated or not saw_done or not _lookup_text_ok(text):
+            return "incomplete", text
+        return "complete", text
 
-    def _lookup_worker(self, word, context, callback, seq=None, on_partial=None):
+    def _lookup_worker(self, word, context, callback, seq=None, on_partial=None,
+                       request_id=None):
         # ☠️ 查的是**被点那个词**的语言，不一定是 SOURCE_LANGUAGE：中→德时
         # 德语在译文行上，见 lookup_language_for。两处 cache_key 必须同源，
         # 否则 lookup_word 存的和这里查的对不上，缓存等于永不命中
         word_lang = lookup_language_for(word)
         lang_name = config.LANGUAGE_NAMES.get(word_lang, word_lang)
-        cache_key = (word.lower(), word_lang)
+        cache_key = lookup_cache_key(word, word_lang, context)
         if self._lookup_stale(seq):
             return  # 排队期间用户已经点了别的词，这次白跑，连请求都不用发
         # 双检：submit 前到 worker 之间可能已被别的点击填入缓存
-        if self._serve_cached_lookup(word, cache_key, context, callback):
+        if self._serve_cached_lookup(word, cache_key, context, callback,
+                                     request_id=request_id):
             return
         prompt = f"""你是{lang_name}汉词典。简明解释{lang_name}单词"{word}"。
 它出现在这句话里：{context}
@@ -509,25 +549,29 @@ class LookupMixin:
             try:
                 if response.status_code == 200:
                     self._ollama_hot = True  # 查词成功也证明模型在显存里
-                    text = self._stream_lookup(response, word, seq, on_partial)
-                    if text is None:
-                        return  # 退出中/已过时，_stream_lookup 里已经短路
+                    status, text = self._stream_lookup(
+                        response, word, seq, on_partial, request_id=request_id)
+                    if status == "cancelled":
+                        return
                     if config.SHOW_PERFORMANCE:
                         print(f"   📖 查词 {word} {time.time() - t0:.1f}秒")
-                    if text:
-                        # 结果过时也照样进缓存（下次点这个词就秒回），只是不弹窗
-                        self._lookup_cache_put(cache_key, (text, context))
+                    if status == "complete" and text:
+                        self._lookup_cache_put(cache_key, text)
                     if self._lookup_stale(seq):
                         return
-                    callback(word, text or "（没查到）")
+                    if status == "complete":
+                        _emit_lookup(callback, word, text or "（没查到）", request_id)
+                    else:
+                        _emit_lookup(callback, word, "查询失败（响应不完整）", request_id)
                 elif not self._lookup_stale(seq):
-                    callback(word, f"查询失败（HTTP {response.status_code}）")
+                    _emit_lookup(callback, word,
+                                 f"查询失败（HTTP {response.status_code}）", request_id)
             finally:
                 # stream=True 的连接不 close 不会归还连接池（和翻译侧同一个坑）
                 response.close()
         except Exception as e:
             if not self.closing and not self._lookup_stale(seq):
-                callback(word, f"查询失败: {e}")
+                _emit_lookup(callback, word, f"查询失败: {e}", request_id)
         finally:
             self._exit_inflight()
 
@@ -537,6 +581,8 @@ class LookupMixin:
     # ------------------------------------------------------------------
     def analyze_background(self, german_text, callback):
         """最近 N 分钟内容的背景总结。callback(text) 必须线程安全。"""
+        if getattr(self, "closing", False):
+            return
         try:
             self._analysis_executor.submit(
                 self._analyze_background_worker, german_text, callback)
@@ -550,6 +596,8 @@ class LookupMixin:
 
     def deep_explain(self, sentence, callback):
         """整句深度解释（比查词更展开）。callback(text) 必须线程安全。"""
+        if getattr(self, "closing", False):
+            return
         try:
             self._analysis_executor.submit(
                 self._deep_explain_worker, sentence, callback)

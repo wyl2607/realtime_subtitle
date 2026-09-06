@@ -647,8 +647,7 @@ def test_shutdown_unloads_only_our_loaded_models(monkeypatch):
             pass
 
     class _FakeSession:
-        def __init__(self, loaded):
-            self.loaded = loaded
+        loaded = []
 
         def get(self, url, **kw):
             assert url.endswith("/api/ps")
@@ -658,18 +657,24 @@ def test_shutdown_unloads_only_our_loaded_models(monkeypatch):
             posts.append(json)
             return _Resp()
 
+        def close(self):
+            pass
+
     monkeypatch.setattr(config, "OLLAMA_MODEL", "test-main")
     monkeypatch.setattr(config, "GAME_MODE_OLLAMA_MODEL", "test-game", raising=False)
 
+    import realtime_subtitle.translate.translator_queue as tq
+    monkeypatch.setattr(tq.requests, "Session", _FakeSession)
+
     # 主模型+游戏模型+无关模型都加载着 → 只卸我们的两个，keep_alive=0
-    t.ollama_session = _FakeSession(["test-main", "test-game", "someone-elses-model"])
+    _FakeSession.loaded = ["test-main", "test-game", "someone-elses-model"]
     t._unload_our_models()
     assert sorted(p["model"] for p in posts) == ["test-game", "test-main"], posts
     assert all(p["keep_alive"] == 0 for p in posts)
 
     # 我们的模型都没加载 → 零 post（发了反而触发加载）
     posts.clear()
-    t.ollama_session = _FakeSession(["someone-elses-model"])
+    _FakeSession.loaded = ["someone-elses-model"]
     t._unload_our_models()
     assert posts == []
 
@@ -678,7 +683,10 @@ def test_shutdown_unloads_only_our_loaded_models(monkeypatch):
         def get(self, *a, **kw):
             raise OSError("connection refused")
 
-    t.ollama_session = _DeadSession()
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tq.requests, "Session", _DeadSession)
     t._unload_our_models()
 
 
@@ -713,21 +721,22 @@ def test_unload_matches_model_name_without_tag(monkeypatch):
             pass
 
     class _FakeSession:
-        def __init__(self, loaded):
-            self.loaded = loaded
-
         def get(self, url, **kw):
-            return _Resp({"models": [{"name": n} for n in self.loaded]})
+            return _Resp({"models": [{"name": n} for n in ["qwen3.5:latest", "someone-elses:7b"]]})
 
         def post(self, url, json=None, **kw):
             posts.append(json)
             return _Resp()
 
+        def close(self):
+            pass
+
     monkeypatch.setattr(config, "OLLAMA_MODEL", "qwen3.5")
     monkeypatch.setattr(config, "GAME_MODE_OLLAMA_MODEL", None, raising=False)
 
+    import realtime_subtitle.translate.translator_queue as tq
+    monkeypatch.setattr(tq.requests, "Session", _FakeSession)
     t = W.__new__(W)
-    t.ollama_session = _FakeSession(["qwen3.5:latest", "someone-elses:7b"])
     t._unload_our_models()
     assert [p["model"] for p in posts] == ["qwen3.5:latest"], posts
     assert posts[0]["keep_alive"] == 0
@@ -1219,7 +1228,7 @@ def test_shutdown_waits_for_lookup_before_unloading():
     t._analysis_executor = ThreadPoolExecutor(max_workers=1)
     t._analysis_executor.submit(_time.sleep, 5)
     t._save_lookup_cache = lambda: None
-    t._unload_our_models = lambda: order.append("unload")
+    t._unload_our_models = lambda **kw: order.append("unload")
     t.ollama_session = type("S", (), {"close": lambda self: None})()
     t.lookup_session = type("S", (), {"close": lambda self: None})()
 
@@ -1745,16 +1754,107 @@ def test_local_ollama_opt_in_allows_remote(monkeypatch):
 
 
 def test_local_ollama_unresolvable_does_not_block_startup(monkeypatch):
-    """解析不了就放行：请求本来也发不出去，交给连通性检查报。
-    在这里拦只会把"Ollama 没起来"升级成"程序起不来"。"""
+    """解析失败不能升级成程序起不来，但也绝不能当成校验通过。
+
+    首次 DNS 失败不代表以后仍失败：若这里返回 True 且不钉地址，之后解析到
+    远端时请求就会带着字幕正文出去，而环回闸门已经关过了。
+    """
     import socket
     from realtime_subtitle.translate import translator_queue as tq
 
     def _boom(*a, **kw):
         raise socket.gaierror("no such host")
 
+    monkeypatch.setattr(config, "ALLOW_REMOTE_OLLAMA", False, raising=False)
+    monkeypatch.setattr(tq, "_pinned_ollama_url", None, raising=False)
     monkeypatch.setattr(socket, "getaddrinfo", _boom)
-    assert tq._assert_local_ollama("http://nope.invalid:11434") is True
+    # 不抛 RemoteOllamaRefused：启动还能走连通性检查
+    assert tq._assert_local_ollama("http://nope.invalid:11434") is False
+    with pytest.raises(tq.OllamaUnverified):
+        tq.ollama_url()
+
+
+def test_local_ollama_missing_host_is_unverified(monkeypatch):
+    import realtime_subtitle.translate.translator_queue as tq
+
+    monkeypatch.setattr(config, "ALLOW_REMOTE_OLLAMA", False, raising=False)
+    monkeypatch.setattr(config, "OLLAMA_BASE_URL", "http://")
+    monkeypatch.setattr(tq, "_pinned_ollama_url", None, raising=False)
+    assert tq._assert_local_ollama("http://") is False
+    with pytest.raises(tq.OllamaUnverified):
+        tq.ollama_url()
+
+
+def test_dns_fail_then_remote_does_not_send_body(monkeypatch):
+    """首次 DNS 抛异常、随后解析为非环回：不得发出含字幕正文的请求。"""
+    import socket
+    import realtime_subtitle.translate.translator_queue as tq
+
+    calls = []
+    state = {"fail": True}
+
+    def _getaddrinfo(host, *a, **kw):
+        calls.append(host)
+        if state["fail"]:
+            raise socket.gaierror("temporary failure")
+        return [(socket.AF_INET, 1, 6, "", ("203.0.113.9", 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", _getaddrinfo)
+    monkeypatch.setattr(config, "ALLOW_REMOTE_OLLAMA", False, raising=False)
+    monkeypatch.setattr(config, "OLLAMA_BASE_URL", "http://ollama.lan:11434")
+    monkeypatch.setattr(tq, "_pinned_ollama_url", None, raising=False)
+
+    assert tq._assert_local_ollama("http://ollama.lan:11434") is False
+    with pytest.raises(tq.OllamaUnverified):
+        tq.ollama_url()
+
+    posts = []
+
+    class _Session:
+        def post(self, url, json=None, stream=None, timeout=None):
+            posts.append((url, json))
+            raise AssertionError("未钉环回地址不得发请求")
+
+    t = _translator_for_tx(ollama_session=_Session())
+    state["fail"] = False
+    out = t._translate_single_sentence("Das ist ein Test.", "")
+    assert posts == [], f"解析成远端后仍发出了请求: {posts}"
+    assert out == "Das ist ein Test."  # 降级原文，不外发
+
+
+def test_dns_fail_then_loopback_allows_and_pins(monkeypatch):
+    """恢复到环回之后才允许请求，并钉成 IP 字面量。"""
+    import socket
+    import realtime_subtitle.translate.translator_queue as tq
+
+    state = {"fail": True}
+
+    def _getaddrinfo(host, *a, **kw):
+        if state["fail"]:
+            raise socket.gaierror("temporary failure")
+        return [(socket.AF_INET, 1, 6, "", ("127.0.0.1", 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", _getaddrinfo)
+    monkeypatch.setattr(config, "ALLOW_REMOTE_OLLAMA", False, raising=False)
+    monkeypatch.setattr(config, "OLLAMA_BASE_URL", "http://localhost:11434")
+    monkeypatch.setattr(tq, "_pinned_ollama_url", None, raising=False)
+
+    assert tq._assert_local_ollama("http://localhost:11434") is False
+    state["fail"] = False
+    assert tq.ollama_url() == "http://127.0.0.1:11434"
+
+
+def test_ipv6_only_loopback_is_pinned(monkeypatch):
+    import socket
+    import realtime_subtitle.translate.translator_queue as tq
+
+    monkeypatch.setattr(
+        socket, "getaddrinfo",
+        lambda *a, **kw: [(socket.AF_INET6, 1, 6, "", ("::1", 0, 0, 0))])
+    monkeypatch.setattr(config, "ALLOW_REMOTE_OLLAMA", False, raising=False)
+    monkeypatch.setattr(tq, "_pinned_ollama_url", None, raising=False)
+    assert tq._assert_local_ollama("http://localhost:11434") is True
+    assert tq.ollama_url() == "http://[::1]:11434"
 
 
 def test_ai_web_url_requires_query_placeholder(monkeypatch):
@@ -2440,7 +2540,7 @@ def test_shutdown_does_not_hang_on_stuck_translation(monkeypatch):
     unloaded = []
     monkeypatch.setattr(t, "_save_lookup_cache", lambda: unloaded.append("cache"),
                         raising=False)
-    monkeypatch.setattr(t, "_unload_our_models", lambda: unloaded.append("models"),
+    monkeypatch.setattr(t, "_unload_our_models", lambda **kw: unloaded.append("models"),
                         raising=False)
 
     class _Sess:
@@ -2459,6 +2559,115 @@ def test_shutdown_does_not_hang_on_stuck_translation(monkeypatch):
         assert unloaded == ["cache", "models"], unloaded
     finally:
         stuck.set()
+
+
+def test_shutdown_saves_cache_before_stuck_asr(monkeypatch):
+    """缓存必须在可能无界的等待之前落盘。ASR 卡住也不能把查词缓存带走。"""
+    import threading
+    import time as _time
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
+
+    t = WhisperQueueTranslator.__new__(WhisperQueueTranslator)
+    t.closing = False
+    stuck = threading.Event()
+
+    class _StuckExecutor:
+        def shutdown(self, wait=True, cancel_futures=False):
+            stuck.wait()
+
+    class _FastExecutor:
+        def shutdown(self, wait=True, cancel_futures=False):
+            pass
+
+    t._asr_executor = _StuckExecutor()
+    t._tx_executor = t._lookup_executor = t._analysis_executor = _FastExecutor()
+    order = []
+    monkeypatch.setattr(t, "_save_lookup_cache", lambda: order.append("cache"),
+                        raising=False)
+    monkeypatch.setattr(t, "_unload_our_models", lambda **kw: order.append("unload"),
+                        raising=False)
+
+    class _Sess:
+        def close(self):
+            order.append("close")
+
+    t.ollama_session = t.lookup_session = t.analysis_session = _Sess()
+    t0 = _time.time()
+    try:
+        t.shutdown()
+        elapsed = _time.time() - t0
+        assert elapsed < 8, f"卡住的 ASR 把 shutdown 挂了 {elapsed:.1f} 秒"
+        assert order[0] == "cache", order
+        assert "unload" in order
+    finally:
+        stuck.set()
+
+
+def test_unload_uses_dedicated_session_not_worker_session(monkeypatch):
+    """排干超时后不能再并发复用 worker 的 Session 做卸载。"""
+    import realtime_subtitle.translate.translator_queue as tq
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
+
+    used = []
+
+    class _Resp:
+        def json(self):
+            return {"models": [{"name": "test-main"}]}
+
+        def close(self):
+            pass
+
+    class _WorkerSession:
+        def get(self, *a, **k):
+            used.append("worker")
+            raise AssertionError("卸载不能复用 worker Session")
+
+        def post(self, *a, **k):
+            used.append("worker-post")
+            raise AssertionError("卸载不能复用 worker Session")
+
+    class _CleanupSession:
+        def get(self, url, **kw):
+            used.append("cleanup")
+            return _Resp()
+
+        def post(self, url, json=None, **kw):
+            used.append("cleanup-post")
+            return _Resp()
+
+        def close(self):
+            used.append("cleanup-close")
+
+    monkeypatch.setattr(config, "OLLAMA_MODEL", "test-main")
+    monkeypatch.setattr(config, "GAME_MODE_OLLAMA_MODEL", None, raising=False)
+    monkeypatch.setattr(tq, "_warm_thread", None)
+    monkeypatch.setattr(tq.requests, "Session", lambda: _CleanupSession())
+
+    t = WhisperQueueTranslator.__new__(WhisperQueueTranslator)
+    t.ollama_session = _WorkerSession()
+    t._unload_our_models()
+    assert "worker" not in used
+    assert "cleanup" in used
+    assert "cleanup-post" in used
+
+
+def test_lookup_word_refuses_new_work_when_closing():
+    t = _translator_for_tx()
+    t.closing = True
+    t._lookup_seq = 0
+    t._lookup_cache = __import__("collections").OrderedDict()
+    t._lookup_cache_lock = __import__("threading").Lock()
+    t._LOOKUP_CACHE_MAX = 200
+    submitted = []
+
+    class _Exec:
+        def submit(self, *a, **k):
+            submitted.append(a)
+
+    t._lookup_executor = _Exec()
+    t.lookup_word("Haus", "ctx", lambda *a: None)
+    assert submitted == []
+    assert t._lookup_seq == 0
 
 
 def test_ollama_url_is_pinned_to_resolved_ip(monkeypatch):

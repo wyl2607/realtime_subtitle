@@ -12,6 +12,8 @@ $ErrorActionPreference = "Stop"
 # Repo root (this file lives in scripts/windows/)
 $RepoRoot = (Get-Item $PSScriptRoot).Parent.Parent.FullName
 Set-Location $RepoRoot
+. "$PSScriptRoot\_identity.ps1"
+. "$PSScriptRoot\_update_deps.ps1"
 
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
     Write-Host "❌ 没有安装 git，无法自动更新。"
@@ -49,25 +51,33 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 $new = (git rev-parse HEAD).Trim()
-if ($old -eq $new) {
-    Write-Host "✅ 已经是最新版本，无需更新。"
+$tier = Get-InstallTier
+$currentFp = Get-CurrentDepsFingerprint -RepoRoot $RepoRoot -Tier $tier
+$storedFp = Read-StoredDepsFingerprint $RepoRoot
+$needDeps = -not $currentFp -or ($storedFp -ne $currentFp)
+$codeChanged = $old -ne $new
+
+if (-not $codeChanged -and -not $needDeps) {
+    Write-Host "✅ 已经是最新版本（代码和依赖都无需更新）。"
     exit 0
 }
 
 $newVer = Read-LocalVersion
 Write-Host ""
-if ($newVer -ne $oldVer) {
-    Write-Host "版本：v$oldVer → v$newVer"
+if ($codeChanged) {
+    if ($newVer -ne $oldVer) {
+        Write-Host "版本：v$oldVer → v$newVer"
+    } else {
+        Write-Host "版本：v$newVer（版本号未变，是修补更新）"
+    }
+    Write-Host "本次更新内容："
+    git log --oneline --no-decorate "$old..$new"
+    Write-Host ""
 } else {
-    Write-Host "版本：v$newVer（版本号未变，是修补更新）"
+    Write-Host "代码已经最新，但依赖上次安装失败或不完整，正在补装..."
 }
-Write-Host "本次更新内容："
-git log --oneline --no-decorate "$old..$new"
-Write-Host ""
 
-# requirements.txt 变了才重装依赖（没变就不浪费时间）
-$changed = git diff --name-only $old $new
-if ($changed -contains "requirements.txt") {
+if ($needDeps) {
     # ☠️ venv 不一定存在：还没跑过 install.ps1，或者被杀毒软件删了文件
     # （CLAUDE.md 第 1 节明确记着这个现象）。以前这里直接 & 一个不存在的
     # exe，PowerShell 抛 CommandNotFoundException 原始异常栈——代码其实
@@ -76,19 +86,30 @@ if ($changed -contains "requirements.txt") {
     if (-not (Test-Path $vpy)) {
         Write-Host "⚠️ 代码已经更新好了，但没找到 venv："
         Write-Host "   $vpy"
-        Write-Host "   本次更新改了 requirements.txt，依赖必须同步才能跑起来。"
-        Write-Host "   跑一次安装脚本即可（幂等，会自动把缺的补上）："
+        Write-Host "   依赖必须同步才能跑起来。跑一次安装脚本即可（幂等，会自动把缺的补上）："
         Write-Host "   powershell -ExecutionPolicy Bypass -File `"$PSScriptRoot\install.ps1`""
         exit 1
     }
-    Write-Host "依赖清单有变化，正在同步（可能需要几分钟）..."
-    $pipArgs = @("-m", "pip", "install", "-r", "$RepoRoot\requirements.txt")
+    $reqFile = Get-RequirementsFileForTier -RepoRoot $RepoRoot -Tier $tier
+    if ($tier -eq "cpu") {
+        Write-Host "CPU 模式：跳过 CUDA 运行库（nvidia-*），正在同步依赖..."
+    } else {
+        Write-Host "正在同步依赖（可能需要几分钟）..."
+    }
+    $pipArgs = @("-m", "pip", "install", "-r", $reqFile)
     if ($Mirror) { $pipArgs += @("-i", "https://pypi.tuna.tsinghua.edu.cn/simple") }
     & $vpy @pipArgs
     if ($LASTEXITCODE -ne 0) {
         Write-Host "❌ 依赖安装失败，请检查网络后重跑本脚本（大陆网络加 -Mirror 参数）"
+        Write-Host "   代码若已更新会保留；下次即使提交不变也会重试依赖。"
         exit 1
     }
+    Write-DepsFingerprint -RepoRoot $RepoRoot -Tier $tier
+}
+
+$changed = @()
+if ($codeChanged) {
+    $changed = git diff --name-only $old $new
 }
 # ☠️ 必须按后缀匹配，不能 -contains "install.ps1"。git diff --name-only 返回的是
 # 带目录的路径，而 -contains 是精确匹配——包化之后真正的安装脚本在
@@ -102,8 +123,9 @@ if ($changed -match 'install\.ps1$') {
 # 字幕正在运行的话提醒重启
 $pidFile = "$RepoRoot\subtitle.pid"
 if (Test-Path $pidFile) {
-    $runPid = Get-Content $pidFile
-    if (Get-Process -Id $runPid -ErrorAction SilentlyContinue) {
+    $identity = Read-SubtitleIdentity $pidFile
+    $runPid = if ($identity) { $identity.pid } else { $null }
+    if ($runPid -and (Get-Process -Id $runPid -ErrorAction SilentlyContinue)) {
         Write-Host "⚠️ 字幕正在运行——先双击 停止字幕.bat 再 启动字幕.bat，新版本才生效。"
     }
 }

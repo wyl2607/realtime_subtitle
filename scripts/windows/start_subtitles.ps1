@@ -10,20 +10,16 @@ Set-Location $RepoRoot
 # 双开，停止脚本会认不出自己的进程只能走窗口标题兜底。
 # OrdinalIgnoreCase：Windows 路径不区分大小写，Get-Process 返回的盘符/目录
 # 大小写不保证和 $RepoRoot 一致。
-$VenvPrefix = Join-Path $RepoRoot "venv"
-function Test-OurProcess {
-    param($Proc)
-    return $Proc -and $Proc.Path -and
-        $Proc.Path.StartsWith($VenvPrefix, [StringComparison]::OrdinalIgnoreCase)
-}
+. "$PSScriptRoot\_identity.ps1"
 
 $pidFile = "$RepoRoot\subtitle.pid"
 if (Test-Path $pidFile) {
-    $oldPid = Get-Content $pidFile
-    $oldProc = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
-    # PID会被系统回收复用：光"这个PID有进程"不算数，还得确认真是本项目venv的
-    # python（2026-07-17实测：残留pid被别的进程占用→误判"已在运行"拒绝启动）
-    if (Test-OurProcess $oldProc) {
+    $oldIdentity = Read-SubtitleIdentity $pidFile
+    $oldPid = if ($oldIdentity) { $oldIdentity.pid } else { $null }
+    $oldProc = if ($oldPid) { Get-Process -Id $oldPid -ErrorAction SilentlyContinue } else { $null }
+    # PID会被系统回收复用：光"这个PID有进程"不算数，还得确认解释器、入口和
+    # 创建时间都对得上（裸 StartsWith(venv) 会误匹配 venv_backup）。
+    if (Test-RealtimeInstance $oldProc $oldIdentity $RepoRoot) {
         Write-Host "已经在运行中（PID $oldPid），不用重复启动。要重启请先运行 停止字幕.bat"
         exit
     }
@@ -137,7 +133,7 @@ $proc = Start-Process -FilePath "$RepoRoot\venv\Scripts\python.exe" `
     -WorkingDirectory $RepoRoot -PassThru -WindowStyle Hidden `
     -RedirectStandardOutput "$RepoRoot\subtitle.log" `
     -RedirectStandardError "$RepoRoot\subtitle.err.log"
-$proc.Id | Out-File -FilePath $pidFile -Encoding ascii
+Write-SubtitleIdentity -Proc $proc -PidFile $pidFile -RepoRoot $RepoRoot
 Write-Host "已启动 (PID $($proc.Id))，运行日志: subtitle.log"
 if ($firstRun) {
     Write-Host ""
