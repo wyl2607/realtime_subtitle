@@ -282,6 +282,7 @@ class LanguageVote:
     def __init__(self):
         self.lang = None      # 正在攒连击的候选语言
         self.streak = 0
+        self.last_event = None  # same_language / unsupported / low_confidence / streak / switch
 
     def reset(self):
         self.lang = None
@@ -291,12 +292,15 @@ class LanguageVote:
         """喂一次检测结果。返回该切换到的语言，或 None（不切）。"""
         if not lang or lang == current:
             self.reset()          # 检测结果就是当前语言：本来就没事
+            self.last_event = "same_language"
             return None
         if lang not in allowed:
             self.reset()          # 不在配置的语言对里，当噪声
+            self.last_event = "unsupported"
             return None
         if prob is None or prob < min_prob:
             self.reset()          # 置信度不够：不仅不切，还要打断连击
+            self.last_event = "low_confidence"
             return None
         if lang == self.lang:
             self.streak += 1
@@ -305,8 +309,125 @@ class LanguageVote:
             self.streak = 1
         if self.streak >= max(1, int(need_streak)):
             self.reset()
+            self.last_event = "switch"
             return lang
+        self.last_event = "streak"
         return None
+
+
+def describe_language_config_source(exists=None, text=None):
+    """自动检测开关是仓库默认还是 config_local 覆盖。只读文本，不 exec。"""
+    if exists is None:
+        from pathlib import Path
+        from realtime_subtitle.paths import REPO_ROOT
+        path = REPO_ROOT / "config_local.py"
+        exists = path.is_file()
+        text = path.read_text(encoding="utf-8") if exists else ""
+    if not exists:
+        return "config.py（无 config_local.py）"
+    if re.search(r"^AUTO_DETECT_LANGUAGE\s*=", text or "", re.M):
+        return "config_local.py（覆盖 AUTO_DETECT_LANGUAGE）"
+    return "config.py 默认（config_local.py 未覆盖自动检测）"
+
+
+def language_startup_log_lines(
+        auto_detect, source, target, interval, min_sec, min_prob, streak,
+        cooldown, config_source, allowed):
+    """启动诊断行。不含音频/字幕正文。"""
+    status = "开" if auto_detect else "关"
+    langs = ", ".join(allowed)
+    return [
+        f"🌐 自动语言检测: {status}（来源: {config_source}）",
+        f"   当前语言对: {source} → {target}",
+        f"   检测参数: 间隔{interval}s / 最短音频{min_sec}s / "
+        f"置信度≥{min_prob} / 连击{streak} / 冷却{cooldown}s",
+        f"   允许切换的源语言: {langs}",
+    ]
+
+
+def log_language_startup():
+    """把生效的自动检测配置打进默认日志（不要求 SHOW_PERFORMANCE）。"""
+    allowed = tuple(sorted({src for src, _ in language_pairs()}))
+    for line in language_startup_log_lines(
+            auto_detect=bool(getattr(config, "AUTO_DETECT_LANGUAGE", False)),
+            source=config.SOURCE_LANGUAGE,
+            target=getattr(config, "TARGET_LANGUAGE", "zh"),
+            interval=getattr(config, "LANGUAGE_DETECT_INTERVAL", 4.0),
+            min_sec=getattr(config, "LANGUAGE_DETECT_MIN_SEC", 3.0),
+            min_prob=getattr(config, "LANGUAGE_SWITCH_MIN_PROB", 0.85),
+            streak=getattr(config, "LANGUAGE_SWITCH_STREAK", 3),
+            cooldown=getattr(config, "LANGUAGE_SWITCH_COOLDOWN", 20.0),
+            config_source=describe_language_config_source(),
+            allowed=allowed):
+        print(line)
+
+
+def language_switch_source_label(source):
+    return {"manual": "手动", "auto": "自动检测", "rescue": "自愈后自动"}.get(
+        source, source or "未知")
+
+
+def _log_sig(value):
+    if isinstance(value, float):
+        return round(value, 2)
+    return value
+
+
+def format_language_detect_line(kind, **fields):
+    """单条语言诊断。字段只有语言码/置信度/原因，不含音频或字幕正文。"""
+    now = time.strftime("%H:%M:%S")
+    if kind == "candidate":
+        return (f"🌐 [{now}] 语言候选: {fields['lang']} "
+                f"({fields['prob']:.2f}) 连击 {fields['streak']}/{fields['need']}")
+    if kind == "cooldown":
+        return f"🌐 [{now}] 语言检测跳过: 冷却中（剩余 {fields['remaining']:.0f}s）"
+    if kind == "audio_short":
+        return (f"🌐 [{now}] 语言检测跳过: 音频不足 "
+                f"({fields['have']:.1f}s < {fields['need']:.1f}s)")
+    if kind == "unsupported":
+        return (f"🌐 [{now}] 语言检测跳过: 不支持的语言 "
+                f"{fields['lang']} ({fields['prob']:.2f})")
+    if kind == "low_confidence":
+        return (f"🌐 [{now}] 语言检测跳过: 置信度不足 "
+                f"{fields['lang']} {fields['prob']:.2f} < {fields['min_prob']}")
+    if kind == "same_language":
+        return (f"🌐 [{now}] 语言检测: 当前已是 {fields['lang']} "
+                f"({fields['prob']:.2f})")
+    if kind == "switch_request":
+        return (f"🌐 [{now}] 语言切换请求: → {fields['lang']} "
+                f"（来源: {fields['source_label']}）")
+    if kind == "switch_applied":
+        return (f"🌐 [{now}] 语言对已切换为: {fields['pair']} "
+                f"（来源: {fields['source_label']}）")
+    return f"🌐 [{now}] 语言检测: {kind}"
+
+
+class LanguageDetectLogger:
+    """状态变化才打日志，避免每帧刷屏。
+
+    remaining / have 每帧都在变，只进文案、不进去重键——否则冷却窗口里
+    每次 process_iter 都会打一行。
+    """
+
+    _DISPLAY_ONLY = frozenset({"remaining", "have"})
+
+    def __init__(self):
+        self._last_sig = None
+
+    def line(self, kind, **fields):
+        sig_fields = ((k, _log_sig(v)) for k, v in fields.items()
+                      if k not in self._DISPLAY_ONLY)
+        sig = (kind,) + tuple(sorted(sig_fields))
+        if sig == self._last_sig:
+            return None
+        self._last_sig = sig
+        return format_language_detect_line(kind, **fields)
+
+    def emit(self, kind, **fields):
+        text = self.line(kind, **fields)
+        if text:
+            print(text)
+        return text
 
 
 class DecodeHealth:
@@ -859,10 +980,13 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
             # 待切换源语言（热键写入；ASR 每批处理前抢占执行，避免 inbox
             # 循环不返回时 submit(task) 永远排在后面饿死）
             self._pending_lang_switch = None
+            self._pending_lang_source = None  # manual / auto / rescue
             # 自动语言检测（默认关，见 config.AUTO_DETECT_LANGUAGE）：
             # 下次允许检测的时刻 + 滞回投票状态。都只在 ASR 线程里读写
             self._lang_detect_next = 0.0
+            self._lang_in_cooldown = False  # 切语言后的冷却，不是检测间隔
             self._lang_vote = LanguageVote()
+            self._lang_log = LanguageDetectLogger()
             # 误切自愈：解码质量连击 + "正在抢救"标志。同样只在 ASR 线程读写。
             # _lang_rescue 期间检测改用更短的 LANGUAGE_RESCUE_STREAK
             self._decode_health = DecodeHealth()
@@ -1033,7 +1157,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
         print("🧹 已清空识别与翻译上下文")
         self._emit_display()
 
-    def request_switch_language(self, new_lang):
+    def request_switch_language(self, new_lang, source="manual"):
         """切换源语言：写入待切换标志，由 ASR 线程在每批音频边界抢占执行。
 
         清上下文 + 改 SOURCE_LANGUAGE 必须在识别线程串行（热键线程先改语言
@@ -1041,9 +1165,15 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
         _process_inbox 后面——收件箱持续非空时 inbox 循环不返回，切换会饿死
         （GPU 被游戏抢占的正是这种场景）。标志在 _process_inbox 每轮取音频
         前检查，最坏等当前这一批识别结束（~2.5s）而不是永远卡住。
+
+        source: manual / auto / rescue，用于把「检测到了」和「真正应用了」分开记。
         """
+        label = language_switch_source_label(source)
+        print(format_language_detect_line(
+            "switch_request", lang=new_lang, source_label=label))
         with self._asr_lock:
             self._pending_lang_switch = new_lang
+            self._pending_lang_source = source
             if self._asr_scheduled:
                 return  # 识别线程醒着，下一批边界会看到标志
             self._asr_scheduled = True
@@ -1905,12 +2035,20 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
         self.processor.reset_prompt_context()
         self._lang_vote.reset()      # 旧连击是在"语言已经错了"的前提下攒的
         self._lang_detect_next = 0.0  # 撕掉冷却，下一句话就重测
+        self._lang_in_cooldown = False
         name = language_name(config.SOURCE_LANGUAGE)
         print(f"🩺 解码质量持续异常（avg_logprob {lp:+.2f} < "
               f"{getattr(config, 'LANGUAGE_RESCUE_LOGPROB', -1.0)}），"
               f"疑似源语言不是{name}：已清上下文并立即重测语言")
         if self.on_status:
             self.on_status(f"🩺 字幕异常，正在重新判定语言…")
+
+    def _lang_logger(self):
+        log = getattr(self, "_lang_log", None)
+        if log is None:
+            log = LanguageDetectLogger()
+            self._lang_log = log
+        return log
 
     def _maybe_detect_language(self):
         """到点就做一次语言检测，够连击就请求切换语言对（跑在 ASR 线程）。
@@ -1921,6 +2059,8 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
         切换本身仍然走 request_switch_language——那条路已经处理好了
         "在每批音频边界串行执行 + clear_context + 递增 epoch 作废在飞的翻译"，
         这里绝不能自己去改 config.SOURCE_LANGUAGE。
+
+        诊断日志不依赖 SHOW_PERFORMANCE（那个开关会把字幕正文打进 subtitle.log）。
         """
         if not getattr(config, "AUTO_DETECT_LANGUAGE", False):
             return
@@ -1928,26 +2068,37 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
         if interval <= 0:
             return
         now = time.time()
+        log = self._lang_logger()
         if now < self._lang_detect_next:
+            # 只有切语言后的冷却才记；两次检测之间的间隔等待保持静默。
+            if getattr(self, "_lang_in_cooldown", False):
+                log.emit("cooldown", remaining=self._lang_detect_next - now)
             return
+        self._lang_in_cooldown = False
         self._lang_detect_next = now + interval
 
         allowed = {src for src, _ in language_pairs()}
         if len(allowed) < 2:
             return  # 只配了一个语言对，没什么可切的
 
+        min_sec = getattr(config, "LANGUAGE_DETECT_MIN_SEC", 3.0)
         try:
-            got = self.processor.detect_language(
-                min_seconds=getattr(config, "LANGUAGE_DETECT_MIN_SEC", 3.0))
+            got = self.processor.detect_language(min_seconds=min_sec)
         except Exception as e:
             # 检测失败绝不能影响识别主链路——它只是个锦上添花的功能
             print(f"⚠️  语言检测失败（不影响字幕）: {e.__class__.__name__}: {e}")
             return
         if got is None:
-            return  # 缓冲里音频还不够，下一轮再说
+            have = 0.0
+            buf = getattr(self.processor, "buffer_seconds", None)
+            if callable(buf):
+                try:
+                    have = float(buf())
+                except Exception:
+                    have = 0.0
+            log.emit("audio_short", have=have, need=float(min_sec))
+            return
         lang, prob = got
-        if config.SHOW_PERFORMANCE:
-            print(f"   🌐 语言检测: {lang} ({prob:.2f})")
 
         # 抢救状态下用更短的连击：解码质量已经证明当前语言是错的，
         # "当前语言正确"这个先验塌了，再要 3 次确认纯属拖时间（见
@@ -1955,21 +2106,34 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
         need_streak = (getattr(config, "LANGUAGE_RESCUE_STREAK", 2)
                        if self._lang_rescue
                        else getattr(config, "LANGUAGE_SWITCH_STREAK", 3))
+        min_prob = getattr(config, "LANGUAGE_SWITCH_MIN_PROB", 0.85)
         new_lang = self._lang_vote.feed(
-            lang, prob, config.SOURCE_LANGUAGE, allowed,
-            getattr(config, "LANGUAGE_SWITCH_MIN_PROB", 0.85),
-            need_streak)
+            lang, prob, config.SOURCE_LANGUAGE, allowed, min_prob, need_streak)
+        event = getattr(self._lang_vote, "last_event", None)
+        if event == "unsupported":
+            log.emit("unsupported", lang=lang, prob=prob)
+        elif event == "low_confidence":
+            log.emit("low_confidence", lang=lang, prob=prob, min_prob=min_prob)
+        elif event == "same_language":
+            log.emit("same_language", lang=lang, prob=prob)
+        elif event == "streak":
+            log.emit("candidate", lang=lang, prob=prob,
+                     streak=self._lang_vote.streak, need=need_streak)
+        elif event == "switch":
+            log.emit("candidate", lang=lang, prob=prob,
+                     streak=need_streak, need=need_streak)
         if not new_lang:
             return
 
         # 刚切过就静默一段时间，掐掉来回横跳
+        self._lang_in_cooldown = True
         self._lang_detect_next = now + getattr(config, "LANGUAGE_SWITCH_COOLDOWN", 20.0)
         name = language_name(new_lang)
         tname = language_name(target_for(new_lang))
-        print(f"🌐 自动检测到{name}（{prob:.2f}），切换语言对: {name} → {tname}")
         if self.on_status:
             self.on_status(f"🌐 检测到{name}，自动切换: {name} → {tname}")
-        self.request_switch_language(new_lang)
+        source = "rescue" if self._lang_rescue else "auto"
+        self.request_switch_language(new_lang, source=source)
 
     def _apply_pending_lang_switch(self, new_lang):
         """在 ASR 线程内执行：清上下文 + 改语言对（与识别串行）。
@@ -1982,10 +2146,13 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
         new_target = target_for(new_lang)
         config.SOURCE_LANGUAGE = new_lang
         config.TARGET_LANGUAGE = new_target
+        source = getattr(self, "_pending_lang_source", None) or "manual"
+        self._pending_lang_source = None
         # 手动切（Ctrl+Alt+L）之后也要清投票：否则切换前攒的那点连击会跨过
         # 这次切换继续累加，可能刚切完就被自动检测又切回去
         if getattr(self, "_lang_vote", None) is not None:
             self._lang_vote.reset()
+            self._lang_in_cooldown = True
             self._lang_detect_next = time.time() + getattr(
                 config, "LANGUAGE_SWITCH_COOLDOWN", 20.0)
         # 抢救结束：语言已经换掉，健康度要从零重新观察。不清的话，切换后
@@ -1995,7 +2162,9 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
             self._lang_rescue = False
         name = language_name(new_lang)
         tname = language_name(new_target)
-        print(f"🌐 语言对已切换为: {name} → {tname}")
+        print(format_language_detect_line(
+            "switch_applied", pair=f"{name} → {tname}",
+            source_label=language_switch_source_label(source)))
         if self.on_status:
             self.on_status(f"🌐 已切换: {name} → {tname}")
 

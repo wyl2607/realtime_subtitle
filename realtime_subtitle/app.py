@@ -266,7 +266,7 @@ class SubtitleApp:
         # "清上下文+改语言"作为一个任务在识别线程内串行执行。之前是这里
         # 先改config再排清理任务——窗口期内会拿新语言参数识别缓冲里的
         # 旧语言音频，蹦出乱词
-        self.translator.request_switch_language(new_lang)
+        self.translator.request_switch_language(new_lang, source="manual")
         self.subtitle_window.show_status(f"🌐 切换中: {name} → {tname}…")
         print(f"🌐 [热键] 请求切换语言对: {name} → {tname}")
 
@@ -521,6 +521,8 @@ class SubtitleApp:
         print(f"   - 翻译: Qwen + Whisper (Ollama {config.OLLAMA_MODEL})")
         print(f"   - 设备: {config.WHISPER_DEVICE.upper()}")
         print(f"   - 源语言: {config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)}")
+        from realtime_subtitle.translate.translator_queue import log_language_startup
+        log_language_startup()
         print(f"   - 翻译语域: {getattr(config, 'TRANSLATION_STYLE', '（默认）')}")
         print(f"   - 快捷键: Ctrl+Alt+P 暂停/继续, Ctrl+Alt+L 切换源语言,")
         print(f"             Ctrl+Alt+M 鼠标穿透, Ctrl+Alt+G 跳「⚡性能」模式,")

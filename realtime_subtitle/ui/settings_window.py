@@ -4,11 +4,38 @@
 from PyQt5.QtWidgets import (
     QLabel, QWidget, QVBoxLayout, QHBoxLayout, QSlider,
     QPushButton, QGroupBox, QLineEdit, QCheckBox, QColorDialog, QFontComboBox,
+    QScrollArea, QFrame, QApplication,
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor, QFont
 import realtime_subtitle.config as config
 from realtime_subtitle.ui.window_frame import DraggableWidget
+from realtime_subtitle.ui.window_geometry import (
+    screen_scale_factor, settings_initial_geometry,
+)
+
+
+# 设置面板自身字号（100% 缩放起点）。字幕正文仍由 config.FONT_SIZE /「字幕字号」控制。
+# 只乘 screen_scale_factor，不开 AA_EnableHighDpiScaling（见 CLAUDE.md 第 24 条）。
+PANEL_FONT_PX_AT_100 = 17
+
+
+def panel_font_px(scale=None):
+    """面板控件像素字号。scale 缺省读主屏 DPI。"""
+    if scale is None:
+        scale = screen_scale_factor()
+    return max(16, int(round(PANEL_FONT_PX_AT_100 * float(scale))))
+
+
+def format_slider_value(value, step):
+    """按步长显示：整数滑块不带 .000，小数位数跟步长走。"""
+    step = float(step)
+    value = float(value)
+    if step >= 1:
+        return str(int(round(value)))
+    text = f"{step:.10f}".rstrip("0")
+    decimals = len(text.split(".", 1)[1]) if "." in text else 0
+    return f"{value:.{decimals}f}"
 
 
 # 面板可调参数（存 window_state.json 的 "tuning"；FONT_SIZE/BACKGROUND_OPACITY
@@ -120,11 +147,15 @@ def apply_text_color(config_key, hex_color):
     return normalized
 
 
-def _style_color_button(button, hex_color):
+def _style_color_button(button, hex_color, font_px=None):
     """颜色按钮底色显示当前色。"""
+    px = font_px or button.font().pixelSize() or PANEL_FONT_PX_AT_100
+    if px < 0:
+        px = PANEL_FONT_PX_AT_100
     button.setStyleSheet(
         f"background-color: {hex_color}; color: #000; border: 1px solid #666; "
-        f"padding: 4px 10px; min-width: 72px;"
+        f"padding: 6px 12px; min-width: 80px; min-height: {px + 8}px; "
+        f"font-size: {px}px;"
     )
 
 
@@ -151,8 +182,6 @@ class SettingsWindow(DraggableWidget):
         self.on_mode_change = on_mode_change
         self.setWindowTitle("⚙️ 参数调节（可拖动）")
         self.setWindowFlags(Qt.WindowStaysOnTopHint)
-        # 场景预设 + checkbox/颜色/字体后内容变高；高度放宽，小屏仍可拖看全
-        self.setGeometry(100, 100, 520, 1060)
 
         # 真默认快照：由 SubtitleWindow 在应用 tuning 之前拍下并传入；
         # 单测直接 new 时回退到当前 config（等同出厂若未改过）。
@@ -168,7 +197,12 @@ class SettingsWindow(DraggableWidget):
         # 🎞 影院条由 SubtitleWindow 建好之后挂进来（它比本面板晚构造）
         self._cinema_bar = None
 
-        layout = QVBoxLayout()
+        scale = screen_scale_factor()
+        self._panel_font_px = panel_font_px(scale)
+        self._apply_panel_chrome(scale)
+
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
 
         # 模式（面板最顶部）
         preset_group = QGroupBox("模式")
@@ -177,8 +211,11 @@ class SettingsWindow(DraggableWidget):
             btn = QPushButton(label)
             btn.setCheckable(True)
             btn.setToolTip(f"切换到「{name}」模式（整套套用：节奏/句对/双语/草稿/解码/语域）")
+            px = self._panel_font_px
+            btn.setFont(self.font())
             btn.setStyleSheet(
-                "QPushButton { padding: 6px 10px; }"
+                f"QPushButton {{ padding: 8px 12px; font-size: {px}px; "
+                f"min-height: {px + 12}px; }}"
                 "QPushButton:checked {"
                 "  background-color: #3a6ea5; color: white; font-weight: bold;"
                 "  border: 1px solid #5a8ec5;"
@@ -220,9 +257,10 @@ class SettingsWindow(DraggableWidget):
         device_layout = QHBoxLayout()
         device_layout.setContentsMargins(0, 0, 0, 0)
         device_label = QLabel("设备名包含:")
-        device_label.setMinimumWidth(120)
+        self._fit_label_width(device_label)
         device_label.setToolTip("空=系统默认播放设备；填 FiiO / Speakers 等子串匹配 loopback（约5秒内热切换）")
         self.device_name_edit = QLineEdit()
+        self.device_name_edit.setFont(self.font())
         self.device_name_edit.setPlaceholderText("空=默认播放设备")
         self.device_name_edit.setText(getattr(config, 'LOOPBACK_DEVICE_NAME', '') or '')
         self.device_name_edit.setToolTip(device_label.toolTip())
@@ -260,7 +298,7 @@ class SettingsWindow(DraggableWidget):
                 self._on_font_change()
 
         self.font_size_slider = self._create_slider(
-            "字体大小", 14, 72, config.FONT_SIZE, 1, set_font_size
+            "字幕字号", 14, 72, config.FONT_SIZE, 1, set_font_size
         )
 
         def set_bg_opacity(v):
@@ -274,12 +312,14 @@ class SettingsWindow(DraggableWidget):
 
         # 只显中文：勾上 = 隐藏德语原文（SHOW_BILINGUAL=False）
         self.chinese_only_cb = QCheckBox("只显中文（隐藏德语原文）")
+        self.chinese_only_cb.setFont(self.font())
         self.chinese_only_cb.setToolTip("勾选后同窗口可多显示约一倍句对")
         self.chinese_only_cb.setChecked(not getattr(config, "SHOW_BILINGUAL", True))
         self.chinese_only_cb.toggled.connect(self._on_chinese_only_toggled)
 
         # 草稿中文：游戏模式会禁用此开关
         self.draft_cb = QCheckBox("草稿中文（残句先出浅蓝译文）")
+        self.draft_cb.setFont(self.font())
         self.draft_cb.setToolTip("翻译 worker 空闲时出草稿；游戏模式会强制关闭")
         self.draft_cb.setChecked(bool(getattr(config, "DRAFT_TRANSLATION", True)))
         self.draft_cb.toggled.connect(self._on_draft_toggled)
@@ -312,7 +352,7 @@ class SettingsWindow(DraggableWidget):
         font_layout = QHBoxLayout()
         font_layout.setContentsMargins(0, 0, 0, 0)
         font_label = QLabel("字体:")
-        font_label.setMinimumWidth(120)
+        self._fit_label_width(font_label)
         self.font_combo = QFontComboBox()
         self.font_combo.setMaxVisibleItems(20)
         primary = (config.FONT_FAMILY or "Microsoft YaHei").split(",")[0].strip()
@@ -357,6 +397,7 @@ class SettingsWindow(DraggableWidget):
             "文字背后那层黑的不透明度。0 = 全透明（亮画面上会看不清）")
 
         self.cinema_german_cb = QCheckBox("字幕条也显示德语原文")
+        self.cinema_german_cb.setFont(self.font())
         self.cinema_german_cb.setToolTip("取消勾选 = 纯中文，最不挡画面")
         self.cinema_german_cb.setChecked(bool(getattr(config, "CINEMA_SHOW_GERMAN", True)))
         self.cinema_german_cb.toggled.connect(self._on_cinema_german_toggled)
@@ -377,8 +418,49 @@ class SettingsWindow(DraggableWidget):
         reset_btn.clicked.connect(self._reset_defaults)
         layout.addWidget(reset_btn)
 
-        layout.addStretch()
-        self.setLayout(layout)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(inner)
+        self._scroll = scroll
+
+        outer = QVBoxLayout()
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.addWidget(scroll)
+        self.setLayout(outer)
+
+    def _apply_panel_chrome(self, scale):
+        """面板字体 + 受屏幕约束的初始几何。不开全局 DPI 缩放。"""
+        px = self._panel_font_px
+        font = QFont("Microsoft YaHei")
+        font.setPixelSize(px)
+        self.setFont(font)
+        self.setStyleSheet(
+            f"QWidget {{ font-size: {px}px; }}"
+            f"QGroupBox {{ font-size: {px}px; font-weight: bold; "
+            f"padding-top: {px + 8}px; }}"
+            f"QCheckBox {{ font-size: {px}px; min-height: {px + 10}px; spacing: 8px; }}"
+            f"QLineEdit, QComboBox, QFontComboBox {{ font-size: {px}px; "
+            f"min-height: {px + 10}px; }}"
+            f"QPushButton {{ font-size: {px}px; min-height: {px + 12}px; "
+            f"padding: 8px 12px; }}"
+            f"QLabel {{ font-size: {px}px; }}"
+            f"QSlider {{ min-height: {max(24, px)}px; }}"
+        )
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            x, y, w, h = settings_initial_geometry(
+                area.x(), area.y(), area.width(), area.height(), scale)
+            self.setGeometry(x, y, w, h)
+        else:
+            self.setGeometry(100, 100, 560, 720)
+
+    def _fit_label_width(self, label):
+        """标题宽度按当前字体测量，避免放大后被 120px 截断。"""
+        fm = label.fontMetrics()
+        label.setMinimumWidth(fm.horizontalAdvance(label.text()) + 12)
 
     def _create_slider(self, label, min_val, max_val, current_val, step, callback,
                        mark_custom=True):
@@ -394,7 +476,8 @@ class SettingsWindow(DraggableWidget):
 
         # 标签
         label_widget = QLabel(f"{label}:")
-        label_widget.setMinimumWidth(120)
+        label_widget.setFont(self.font())
+        self._fit_label_width(label_widget)
 
         # 滑块（用round避免浮点截断，如0.01/0.001=9.999...被int截成9）
         slider = QSlider(Qt.Horizontal)
@@ -402,18 +485,21 @@ class SettingsWindow(DraggableWidget):
         slider.setMaximum(round(max_val / step))
         slider.setValue(round(current_val / step))
 
-        # 数值显示
-        value_label = QLabel(f"{current_val:.3f}")
-        value_label.setMinimumWidth(60)
+        # 数值显示：位数跟步长走（字幕字号 24，不是 24.000）
+        value_label = QLabel(format_slider_value(current_val, step))
+        value_label.setFont(self.font())
+        sample = format_slider_value(max_val, step)
+        value_label.setMinimumWidth(value_label.fontMetrics().horizontalAdvance(sample) + 10)
 
         # 滑块变化时更新；手动改动会清掉预设高亮（apply_preset 期间跳过）
         def on_change(int_value):
             value = int_value * step
-            value_label.setText(f"{value:.3f}")
+            shown = format_slider_value(value, step)
+            value_label.setText(shown)
             if mark_custom:
                 self._mark_custom()
             callback(value)
-            print(f"📊 {label}: {value:.3f}")
+            print(f"📊 {label}: {shown}")
 
         slider.valueChanged.connect(on_change)
 
@@ -422,13 +508,17 @@ class SettingsWindow(DraggableWidget):
         layout.addWidget(value_label)
         widget.setLayout(layout)
 
-        return {'widget': widget, 'slider': slider, 'label': value_label, 'step': step}
+        return {
+            'widget': widget, 'slider': slider, 'label': value_label,
+            'title': label_widget, 'step': step,
+        }
 
     def _make_color_button(self, label, config_key, hex_color):
         """颜色选择按钮：底色=当前色，点击弹 QColorDialog。"""
         btn = QPushButton(label)
         btn.setToolTip(f"点击选择{label}颜色")
-        _style_color_button(btn, hex_color)
+        btn.setFont(self.font())
+        _style_color_button(btn, hex_color, self._panel_font_px)
         btn.clicked.connect(lambda: self._pick_color(config_key, btn))
         return btn
 
@@ -638,7 +728,7 @@ class SettingsWindow(DraggableWidget):
             step = info['step']
             slider.blockSignals(True)
             slider.setValue(round(val / step))
-            info['label'].setText(f"{val:.3f}")
+            info['label'].setText(format_slider_value(val, step))
             slider.blockSignals(False)
 
         self.device_name_edit.blockSignals(True)

@@ -72,3 +72,23 @@ def screen_scale_factor():
     except (AttributeError, ZeroDivisionError):
         return 1.0
     return min(max(factor, 1.0), 2.0)
+
+
+def settings_initial_geometry(area_x, area_y, area_w, area_h, scale=1.0):
+    """设置面板初始几何：受可用屏幕约束，内容超出靠滚动。
+
+    旧实现写死 520×1060，1366×768 上底部被切掉。纯算术、不碰 Qt。
+    返回 (x, y, w, h)。
+    """
+    scale = min(max(float(scale), 1.0), 2.0)
+    w = min(int(560 * scale), max(360, int(area_w * 0.92)))
+    # 100% 下约一屏放下全部控件；小屏被 92% 可用高钳住，靠滚动看完
+    preferred_h = int(1080 * scale)
+    h = min(preferred_h, max(360, int(area_h * 0.92)))
+    x = area_x + min(80, max(0, (area_w - w) // 8))
+    y = area_y + min(60, max(0, (area_h - h) // 10))
+    if x + w > area_x + area_w:
+        x = area_x + max(0, area_w - w)
+    if y + h > area_y + area_h:
+        y = area_y + max(0, area_h - h)
+    return max(area_x, x), max(area_y, y), w, h

@@ -2323,6 +2323,249 @@ def test_auto_detect_is_off_by_default_in_repo_config():
     assert m.group(1) == "False", f"仓库默认被改成了 {m.group(1)}"
 
 
+def test_language_startup_log_lines_include_effective_config_without_body():
+    """启动就要打出自动检测开关、语言对、参数和配置来源；不含音频/字幕正文。"""
+    from realtime_subtitle.translate.translator_queue import language_startup_log_lines
+
+    lines = language_startup_log_lines(
+        auto_detect=False,
+        source="de",
+        target="zh",
+        interval=4.0,
+        min_sec=3.0,
+        min_prob=0.85,
+        streak=3,
+        cooldown=20.0,
+        config_source="config.py（无 config_local.py）",
+        allowed=("de", "zh", "en", "da"),
+    )
+    text = "\n".join(lines)
+    assert "自动语言检测" in text
+    assert "关" in text
+    assert "de" in text and "zh" in text
+    assert "4.0" in text or "4s" in text or "间隔4" in text
+    assert "0.85" in text
+    assert "3" in text
+    assert "20" in text
+    assert "config.py" in text
+    assert "Hallo" not in text
+    assert "音频" not in text or "最短音频" in text
+
+
+def test_describe_language_config_source_distinguishes_local_override():
+    from realtime_subtitle.translate.translator_queue import describe_language_config_source
+
+    assert "无 config_local" in describe_language_config_source(exists=False, text="")
+    assert "未覆盖" in describe_language_config_source(
+        exists=True, text="WHISPER_MODEL = 'small'\n")
+    assert "覆盖" in describe_language_config_source(
+        exists=True, text="AUTO_DETECT_LANGUAGE = True\n")
+
+
+def test_language_detect_logger_emits_on_state_change_only():
+    """同一候选/同一原因只打一次；连击进度变化才再打。不含正文。"""
+    from realtime_subtitle.translate.translator_queue import LanguageDetectLogger
+
+    log = LanguageDetectLogger()
+    a = log.line("candidate", lang="zh", prob=0.95, streak=1, need=3)
+    b = log.line("candidate", lang="zh", prob=0.95, streak=1, need=3)
+    c = log.line("candidate", lang="zh", prob=0.96, streak=2, need=3)
+    d = log.line("cooldown", remaining=19.0)
+    e = log.line("cooldown", remaining=19.0)
+    f = log.line("cooldown", remaining=18.4)
+    g = log.line("cooldown", remaining=1.0)
+    assert a and "zh" in a and "0.95" in a and "1/3" in a
+    assert b is None
+    assert c and "2/3" in c
+    assert d and "冷却" in d
+    assert e is None
+    assert f is None, "冷却剩余秒数每帧在变，不能当成新状态"
+    assert g is None
+    assert "Guten" not in (a + (c or "") + (d or ""))
+
+
+def test_format_language_detect_line_covers_skip_reasons():
+    from realtime_subtitle.translate.translator_queue import format_language_detect_line
+
+    short = format_language_detect_line("audio_short", have=1.2, need=3.0)
+    unsupported = format_language_detect_line("unsupported", lang="it", prob=0.99)
+    low = format_language_detect_line("low_confidence", lang="zh", prob=0.40, min_prob=0.85)
+    same = format_language_detect_line("same_language", lang="de", prob=1.00)
+    assert "音频" in short and "1.2" in short
+    assert "it" in unsupported and "不支持" in unsupported
+    assert "0.40" in low
+    assert "de" in same
+    for line in (short, unsupported, low, same):
+        assert "Hallo" not in line
+
+
+def test_maybe_detect_language_logs_without_show_performance(monkeypatch, capsys):
+    """诊断语言状态不能要求打开会打印字幕正文的 SHOW_PERFORMANCE。"""
+    import time as _time
+    from threading import Lock
+    from realtime_subtitle.translate.translator_queue import (
+        LanguageVote, LanguageDetectLogger, WhisperQueueTranslator)
+
+    class _Proc:
+        def __init__(self):
+            self.calls = 0
+            self.buffer_sec = 8.0
+
+        def detect_language(self, min_seconds=3.0):
+            self.calls += 1
+            return ("zh", 0.95)
+
+        def buffer_seconds(self):
+            return self.buffer_sec
+
+    t = object.__new__(WhisperQueueTranslator)
+    t.processor = _Proc()
+    t._lang_vote = LanguageVote()
+    t._lang_log = LanguageDetectLogger()
+    t._lang_rescue = False
+    t._lang_detect_next = 0.0
+    t._asr_lock = Lock()
+    t._asr_scheduled = True
+    t._pending_lang_switch = None
+    t._pending_lang_source = None
+    t.on_status = None
+    t._asr_executor = type("_E", (), {"submit": staticmethod(lambda *a, **k: None)})()
+    monkeypatch.setattr(config, "AUTO_DETECT_LANGUAGE", True, raising=False)
+    monkeypatch.setattr(config, "SHOW_PERFORMANCE", False, raising=False)
+    monkeypatch.setattr(config, "LANGUAGE_DETECT_INTERVAL", 4.0, raising=False)
+    monkeypatch.setattr(config, "LANGUAGE_SWITCH_STREAK", 3, raising=False)
+    monkeypatch.setattr(config, "LANGUAGE_SWITCH_MIN_PROB", 0.85, raising=False)
+    monkeypatch.setattr(config, "SOURCE_LANGUAGE", "de", raising=False)
+    monkeypatch.setattr(_time, "time", lambda: 1000.0)
+
+    t._maybe_detect_language()
+    t._lang_detect_next = 0.0
+    t._maybe_detect_language()
+    t._lang_detect_next = 0.0
+    t._maybe_detect_language()
+    out = capsys.readouterr().out
+    assert "SHOW_PERFORMANCE" not in out
+    assert "zh" in out
+    assert "0.95" in out
+    assert "语言切换请求" in out
+    assert "自动" in out
+    assert t._pending_lang_switch == "zh"
+    assert t._pending_lang_source == "auto"
+
+
+def test_request_and_apply_language_switch_logs_source(monkeypatch, capsys):
+    """请求和应用必须能分开看；带来源（手动/自动/自愈）。"""
+    from threading import Lock
+    from realtime_subtitle.translate.translator_queue import (
+        LanguageVote, DecodeHealth, WhisperQueueTranslator)
+
+    t = object.__new__(WhisperQueueTranslator)
+    t._asr_lock = Lock()
+    t._asr_scheduled = True
+    t._pending_lang_switch = None
+    t._pending_lang_source = None
+    t._asr_executor = type("_E", (), {"submit": staticmethod(lambda *a, **k: None)})()
+    t._lang_vote = LanguageVote()
+    t._decode_health = DecodeHealth()
+    t._lang_rescue = False
+    t._lang_detect_next = 0.0
+    t.on_status = None
+    t.context_history = []
+    t._tx_lock = Lock()
+    t._tx_queue = []
+    t._tx_inflight = []
+    t._tx_epoch = 0
+    t.pending_text = ""
+    t._held_since = 0.0
+    t._last_unstable = ""
+    t._draft_last_text = ""
+    t.on_display = None
+    t.processor = type("_P", (), {
+        "init": lambda self: None,
+        "reset_prompt_context": lambda self: None,
+    })()
+
+    t.request_switch_language("zh", source="manual")
+    req = capsys.readouterr().out
+    assert "语言切换请求" in req
+    assert "手动" in req
+    assert t._pending_lang_source == "manual"
+
+    monkeypatch.setattr(config, "SOURCE_LANGUAGE", "de", raising=False)
+    monkeypatch.setattr(config, "TARGET_LANGUAGE", "zh", raising=False)
+    t._apply_pending_lang_switch("zh")
+    applied = capsys.readouterr().out
+    assert "已切换" in applied
+    assert "手动" in applied
+    assert config.SOURCE_LANGUAGE == "zh"
+
+
+def test_maybe_detect_language_cooldown_does_not_log_every_frame(monkeypatch, capsys):
+    """切语言后冷却窗口内，每轮 process_iter 都会进 _maybe_detect_language。
+    剩余秒数每帧都在变，绝不能按帧打「冷却中」。"""
+    import time as _time
+    from threading import Lock
+    from realtime_subtitle.translate.translator_queue import (
+        LanguageVote, LanguageDetectLogger, WhisperQueueTranslator)
+
+    class _Proc:
+        def detect_language(self, min_seconds=3.0):
+            raise AssertionError("冷却期间不该做检测")
+
+    clock = {"t": 1000.0}
+    t = object.__new__(WhisperQueueTranslator)
+    t.processor = _Proc()
+    t._lang_vote = LanguageVote()
+    t._lang_log = LanguageDetectLogger()
+    t._lang_rescue = False
+    t._lang_in_cooldown = True
+    t._lang_detect_next = 1020.0  # 切语言后 20s 冷却
+    t._asr_lock = Lock()
+    t._asr_scheduled = True
+    t._pending_lang_switch = None
+    t._pending_lang_source = None
+    t.on_status = None
+    monkeypatch.setattr(config, "AUTO_DETECT_LANGUAGE", True, raising=False)
+    monkeypatch.setattr(config, "SHOW_PERFORMANCE", False, raising=False)
+    monkeypatch.setattr(config, "LANGUAGE_DETECT_INTERVAL", 4.0, raising=False)
+    monkeypatch.setattr(_time, "time", lambda: clock["t"])
+
+    for _ in range(40):
+        t._maybe_detect_language()
+        clock["t"] += 0.5
+    out = capsys.readouterr().out
+    cool = [ln for ln in out.splitlines() if "冷却" in ln]
+    assert len(cool) == 1, cool
+
+
+def test_maybe_detect_language_interval_wait_is_not_cooldown(monkeypatch, capsys):
+    """两次检测之间的 4 秒间隔不是「冷却」，不应打冷却日志。"""
+    import time as _time
+    from threading import Lock
+    from realtime_subtitle.translate.translator_queue import (
+        LanguageVote, LanguageDetectLogger, WhisperQueueTranslator)
+
+    class _Proc:
+        def detect_language(self, min_seconds=3.0):
+            raise AssertionError("间隔等待期间不该做检测")
+
+    t = object.__new__(WhisperQueueTranslator)
+    t.processor = _Proc()
+    t._lang_vote = LanguageVote()
+    t._lang_log = LanguageDetectLogger()
+    t._lang_rescue = False
+    t._lang_detect_next = 1004.0  # 刚做完一次检测，4s 后再测
+    t._asr_lock = Lock()
+    t.on_status = None
+    monkeypatch.setattr(config, "AUTO_DETECT_LANGUAGE", True, raising=False)
+    monkeypatch.setattr(config, "LANGUAGE_DETECT_INTERVAL", 4.0, raising=False)
+    monkeypatch.setattr(_time, "time", lambda: 1000.5)
+
+    t._maybe_detect_language()
+    out = capsys.readouterr().out
+    assert "冷却" not in out
+
+
 # ======================================================================
 # 中文源语言路径的漏改（2026-08-13）
 #

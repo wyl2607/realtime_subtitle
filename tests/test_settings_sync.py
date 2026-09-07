@@ -57,8 +57,8 @@ def test_refresh_from_config_syncs_sliders_and_labels_without_writeback():
         assert win.font_size_slider['slider'].value() == round(
             28 / win.font_size_slider['step'])
         # 数值标签手动同步（blockSignals 后 valueChanged 不走）
-        assert win.chunk_submit_slider['label'].text() == f"{1.2:.3f}"
-        assert win.font_size_slider['label'].text() == f"{28:.3f}"
+        assert win.chunk_submit_slider['label'].text() == "1.2"
+        assert win.font_size_slider['label'].text() == "28"
         # blockSignals 生效：refresh 不应通过回调改写 config
         assert config.CHUNK_SUBMIT_SECONDS == 1.2
         assert config.FONT_SIZE == 28
