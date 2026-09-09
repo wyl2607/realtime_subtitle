@@ -688,6 +688,8 @@ scripts/windows/download_subtitle.ps1  输入视频地址，调用离线批处�
 scripts/windows/update_subtitles.ps1  一键更新（git pull + 按需装依赖）
 scripts/windows/uninstall.ps1  卸载（逐项问 Y/N，默认不删）；-CleanCache 只清下载残文件
 scripts/windows/{start,stop,pause}_subtitles.ps1  启动（PID 管理/Ollama 保活）/停止/暂停
+scripts/windows/start_and_update_subtitles.ps1  纯编排：update →（代码真变了才）stop → start；
+                      三步都开子进程跑，理由（exit 语义 + pull 换掉脚本自身）写在文件头
 tests/                所有 pytest 用例（三个独立 GUI 脚本套件见第 4 节第 15 条）
 requirements-dev.txt  测试依赖（pytest），只有改代码的人要装
 transcripts/          字幕存档（每天一个文件）

@@ -92,6 +92,7 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
 
 | 动作 | 方式 |
 |---|---|
+| 更新 + 启动 | 桌面「启动并更新字幕.bat」（先拉最新版再启动；更新失败也照常启动） |
 | 更新 | 桌面「更新字幕.bat」或 `scripts\windows\update_subtitles.ps1` |
 | 卸载 / 腾空间 | `scripts\windows\uninstall.ps1`（逐项询问，默认保留） |
 | 只清缓存 | `scripts\windows\uninstall.ps1 -CleanCache` |

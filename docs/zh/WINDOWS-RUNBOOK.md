@@ -19,7 +19,7 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
 如果没有 Ollama，安装脚本问到时选 `Y`（用 winget 装）。
 
 桌面文件夹：**德语直播实时字幕**
-- 启动字幕.bat / 下载并加字幕.bat / 停止 / 暂停继续 / 更新 / 卸载 / 操作说明.txt
+- 启动字幕.bat / 启动并更新字幕.bat / 下载并加字幕.bat / 停止 / 暂停继续 / 更新 / 卸载 / 操作说明.txt
 
 ## B. 已有安装 —— 更新到最新版
 
@@ -48,6 +48,7 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
 | 动作 | 怎么做 |
 |------|--------|
 | 启动 | 桌面 **启动字幕.bat** |
+| 启动前顺手更新 | **启动并更新字幕.bat**（更新失败也照常启动；真拉到新版且字幕在跑会自动重启） |
 | 停止 | **停止字幕.bat** |
 | 暂停 | **暂停继续字幕.bat** 或 `Ctrl+Alt+P` |
 | 下载并加双语字幕 | **下载并加字幕.bat**；结果在 `downloads\<视频ID>\` |

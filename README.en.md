@@ -97,6 +97,7 @@ First launch downloads the Whisper model (~1.6 GB).
 
 | Action | Command |
 |---|---|
+| Update + start | Desktop `启动并更新字幕.bat` (pull, then launch; still launches if the pull fails) |
 | Update | Desktop `更新字幕.bat` or `scripts\windows\update_subtitles.ps1` (`git pull` + deps) |
 | Uninstall / free space | `scripts\windows\uninstall.ps1` (asks per component; default is keep) |
 | Cache only | `scripts\windows\uninstall.ps1 -CleanCache` |

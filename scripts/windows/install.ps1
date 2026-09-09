@@ -318,6 +318,7 @@ New-Item -ItemType Directory -Path $shortcutDir -Force | Out-Null
 
 $batTemplate = @(
     @("启动字幕.bat", "scripts\windows\start_subtitles.ps1"),
+    @("启动并更新字幕.bat", "scripts\windows\start_and_update_subtitles.ps1"),
     @("下载并加字幕.bat", "scripts\windows\download_subtitle.ps1"),
     @("停止字幕.bat", "scripts\windows\stop_subtitles.ps1"),
     @("暂停继续字幕.bat", "scripts\windows\pause_subtitles.ps1"),
@@ -326,7 +327,7 @@ $batTemplate = @(
 )
 foreach ($pair in $batTemplate) {
     $head = "@echo off`r`nchcp 65001 >nul`r`npowershell -NoProfile -ExecutionPolicy Bypass -File `"$RepoRoot\$($pair[1])`"`r`n"
-    if ($pair[0] -eq "启动字幕.bat") {
+    if ($pair[0] -in @("启动字幕.bat", "启动并更新字幕.bat")) {
         # 成功≈3秒自动关；失败保留窗口让人看得到报错（报错文本由ps1打印）。
         # ⚠️ bat 必须纯 ASCII：chcp 65001 下 cmd 解析含中文的行会把下一行开头吃掉。
         # 用 ping 当 sleep：timeout.exe 在 stdin 被重定向时直接报错
