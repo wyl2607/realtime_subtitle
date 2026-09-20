@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 # Coverage map (see issue #23):
-# - lint:          ruff（E9 + F，规则集为什么这么窄见 ruff.toml）
+# - lint:          ruff（E9 + F，规则集为什么这么窄见 pyproject.toml）
 # - deps-resolve:  requirements.txt 在 3.10–3.13 上都解得出来（见第 4 节第 30 条）
 # - ubuntu:        pure pipeline helpers (no torch/PyQt/WASAPI)
 # - windows:       full pytest suite except standalone GUI harness scripts
@@ -121,7 +121,7 @@ jobs:
       - name: Run pytest suite (skip standalone GUI harness scripts)
         shell: bash
         run: |
-          # pytest.ini already ignores test_hittest / resize_freedom / wordclick
+          # pyproject.toml already ignores test_hittest / resize_freedom / wordclick
           # Prefer non-interactive Qt
           export QT_QPA_PLATFORM=offscreen
           python -m pytest tests -q --tb=line

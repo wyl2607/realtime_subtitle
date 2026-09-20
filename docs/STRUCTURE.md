@@ -9,7 +9,8 @@ realtime_subtitle/                  # clone root
 ├── main.py                         # thin entry → realtime_subtitle.app:main
 ├── download_subtitle.py            # offline: download → ASR → bilingual SRT → study guide
 ├── config_local.py                 # NOT in git; machine-specific overrides (installer writes it)
-├── requirements.txt · requirements-dev.txt · pytest.ini · ruff.toml
+├── requirements.txt · requirements-dev.txt   # dependency lists (the only source of truth)
+├── pyproject.toml                  # pytest + ruff config; deliberately has no [project] table
 ├── *.ps1                           # compat shims → scripts/windows/ (see "Root shims")
 │
 ├── realtime_subtitle/              # the package

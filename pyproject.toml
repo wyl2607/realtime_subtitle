@@ -1,0 +1,57 @@
+# 工具配置的单一落点。2026-09-21 把 pytest.ini 和 ruff.toml 合并到这里，
+# 根目录少两个文件。两份文件里的**理由注释一条都没丢**，它们比配置本身值钱。
+#
+# ☠️ 这里**没有** [project] 段，是故意的：本项目不是要发到 PyPI 的库，而是
+# 一个 git clone 下来就地跑的 Windows 应用。加上 [project] 会让 pip 把它当成
+# 可安装包，而 install.ps1 走的是"建 venv + 装 requirements.txt"这条路——
+# 两套元数据并存，迟早对不上。依赖清单的唯一真相源仍然是 requirements.txt
+# （deps_fingerprint 和 CI 的 deps-resolve job 都只认它）。
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+# ☠️ 三个独立 GUI 脚本套件不是 pytest 用例：import 即开真窗口并 sys.exit，
+# 被收集进来会把整个跑批弄成"跑到一半静默消失"。**别删这三行排除**
+# （CLAUDE.md 第 4 节第 15 条）。手动跑它们：
+#   $env:PYTHONPATH="."; venv\Scripts\python tests\test_hittest.py
+#   $env:PYTHONPATH="."; venv\Scripts\python tests\test_resize_freedom.py
+#   $env:PYTHONPATH="."; venv\Scripts\python tests\test_wordclick.py
+addopts = [
+    "--ignore=tests/test_hittest.py",
+    "--ignore=tests/test_resize_freedom.py",
+    "--ignore=tests/test_wordclick.py",
+]
+
+# --- ruff ------------------------------------------------------------------
+#
+# 为什么只开这么窄的一档：这个项目 11.5k 行、39 处 except Exception、21 处
+# except: pass，全靠人眼。但它的代码风格是**有意为之**的（到处是延迟 import、
+# 多行 print 的续行统一带 f 前缀、注释写"为什么"不写"做什么"），所以这里
+# 不追求"符合某种通用风格"，只追求**拦住真错误**。
+#
+# 选 E9 + F 的理由，是 CLAUDE.md 第 4 节第 26/28 条那次事故：包化重构时函数体
+# 里 30 多处延迟 import 一个都没改，master 的 CI 连红 6 次、ubuntu 18 failed、
+# windows 一堆 ModuleNotFoundError。那一类问题里的 F821(undefined-name)、
+# F811(重复定义)、F401(挪走之后没人用的残留 import) ruff 都能在 PR 阶段白捡。
+#
+# ☠️ 别顺手把规则集调宽。开了 SIM/PLR/RUF 之类之后本仓库会冒出 189 条告警，
+# 全是风格分歧（try-except-pass 是这里的有意设计，manual-from-import 26 处也是），
+# 那种噪音的唯一效果是训练人忽略 CI。
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E9", "F"]
+# F541 = f-string 里没有占位符。本仓库 8 处全是**多行 print 的续行**，作者为了
+# 整块视觉一致才都带上 f 前缀（例如 _warn_if_ipv6_first_host 里那三行提示）。
+# 这是风格不是缺陷，修它只会制造 diff 噪音。
+ignore = ["F541"]
+
+[tool.ruff.lint.per-file-ignores]
+# 独立 GUI 脚本套件（上面的 addopts 已把它们排除出收集）：import 即开真窗口，
+# 顶部要在 import 之前塞 config 赋值，E402 那类顺序规则对它们没意义
+"tests/test_hittest.py" = ["E402"]
+"tests/test_resize_freedom.py" = ["E402"]
+"tests/test_wordclick.py" = ["E402"]

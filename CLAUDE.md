@@ -276,12 +276,12 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
 
 改代码（如果用户让你改功能）：
 
-15. 改完跑测试：`venv\Scripts\python -m pytest`（569 项，以实际输出为准）。
+15. 改完跑测试：`venv\Scripts\python -m pytest`（573 项，以实际输出为准）。
     ☠️ **pytest 不在 requirements.txt 里**（那份是给最终用户装的，install.ps1
     不会装 pytest），新环境上第一次跑会报 `No module named pytest`，先装：
     `venv\Scripts\python -m pip install -r requirements-dev.txt`。test_hittest /
     test_resize_freedom / test_wordclick 是**独立脚本套件**（import 即开真窗口，
-    pytest.ini 已把它们排除出收集，別删这个排除），用 `venv\Scripts\python
+    pyproject.toml 的 addopts 已把它们排除出收集，別删这个排除），用 `venv\Scripts\python
     test_hittest.py` 逐个跑。**测试进程 import realtime_subtitle.app 会被
     单实例 Mutex 直接 sys.exit**——import 之前设
     `os.environ["REALTIME_SUBTITLE_NO_SINGLETON"] = "1"`（参考 test_game_mode.py
@@ -996,6 +996,41 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     判据很明确：**只有当"所有还在用的人都至少重跑过一次 install.ps1"时才
     能删**，而这件事我们无从观测。7 个小文件，留着的代价接近零，别为洁癖
     去赌。真要删之前，先让更新脚本连着几个版本打一行"请重跑 install.ps1"。
+
+46. **☠️ 仓库根目录是有清单的，加文件前先看 `tests/test_repo_root_inventory.py`。**
+    （2026-09-21）
+
+    根目录是**唯一没有主人的地方**：包里的东西有模块归属，`docs/` 有语言目录，
+    `tests/` 有命名约定——只有根目录是"先临时放一下"的默认落点，而临时放的
+    东西没有人会再挪走。所以那份清单是会报错的：新增一个没登记的根文件，
+    `test_no_unexplained_files_at_repo_root` 直接红，并逼你写清它为什么必须在
+    那儿。**理由那一列不是装饰**，它是下一个人判断"这个还能不能删"的唯一依据。
+
+    现在根上 19 个文件，只有三类：
+
+    | 类别 | 文件 | 为什么必须在根 |
+    |---|---|---|
+    | 入口 | `main.py` / `download_subtitle.py` | ☠️ 停止脚本按**入口脚本名**识别进程，改名或挪位置会让它认不出自己的进程 |
+    | 工具/依赖配置 | `requirements*.txt` / `pyproject.toml` / `.gitignore` | 工具只认根 |
+    | 文档 + 转发壳 | `README*.md` / `CLAUDE.md` / `LICENSE` / 7 个 `*.ps1` | GitHub 约定；转发壳见第 45 条 |
+
+    **2026-09-21 把 `pytest.ini` + `ruff.toml` 合进了 `pyproject.toml`**，
+    两份文件里的理由注释一条没丢（它们比配置本身值钱）。
+    ☠️ 那个文件里**故意没有 `[project]` 段**：本项目不是要发 PyPI 的库，而是
+    clone 下来就地跑的 Windows 应用；加 `[project]` 会让 pip 把它当可安装包，
+    和 install.ps1 那条"建 venv + 装 requirements.txt"的路径形成两套元数据，
+    迟早对不上。依赖的唯一真相源仍然只有 `requirements.txt`。
+
+    ☠️ **别为了"根目录看起来整齐"去挪 `main.py`**。第 26/28 条记着上一次目录
+    重构的账：30 多处函数体内的延迟 import 没跟着改、按 `__file__` 算落点的
+    代码一处都没改，master 的 CI 连红 6 次，还有个 bug 隔了一天才发现。
+
+    同一份清单还钉住转发壳：指向的脚本必须存在、必须真的在转发、不许长出
+    业务逻辑。☠️ **转发参数一律用 `$args` 原样透传，别列举参数名**——
+    `download_subtitle.ps1` 原来列了 Url/OutputDir/NoSummary 三个，而真脚本
+    还有 SourceLanguage / TargetLanguage / SubtitleMode 以及 Input/Path/File
+    别名，于是从根目录调用时那几个参数直接报"找不到参数"，而且**只在真用到
+    那个参数时才暴露**。
 
 ## 5. 目录地图
 
