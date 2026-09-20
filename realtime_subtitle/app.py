@@ -107,6 +107,7 @@ class SubtitleApp:
         self._mode_before_perf = None
         # 面板四个按钮 / 手动拨滑块 → 都回到 _apply_mode 这唯一入口
         self.subtitle_window.settings_window.on_mode_change = self._apply_mode
+        self.subtitle_window.settings_window.on_language_change = self._request_language_pair
 
     def _load_models(self):
         """后台线程：加载 Whisper/Ollama + 音频采集，完成后接线并启动。
@@ -147,6 +148,7 @@ class SubtitleApp:
             translator.on_pair = self.subtitle_window.add_pair
             translator.on_draft = self.subtitle_window.update_draft
             translator.on_status = self.subtitle_window.show_status
+            translator.on_language_applied = self.subtitle_window.notify_language_applied
             self.translator = translator  # 此后 stop() 会负责 shutdown 它
             # 点词查词：窗口点击→translator查Ollama→回调线程安全地弹结果
             # on_partial：流式生成中整行地先上屏，不用干等整段
@@ -269,6 +271,33 @@ class SubtitleApp:
         self.translator.request_switch_language(new_lang, source="manual")
         self.subtitle_window.show_status(f"🌐 切换中: {name} → {tname}…")
         print(f"🌐 [热键] 请求切换语言对: {name} → {tname}")
+
+    def _request_language_pair(self, src, tgt=None):
+        """⚙️ 面板点语言对：复用 request_switch_language，源和目标一起切。
+
+        tgt 是面板按钮上那一对的目标语言。必须显式传下去——配了 zh→en 和
+        zh→de 两条时，只传源语言的话后台只能查到第一条，第二个按钮永远切不上。
+
+        ☠️ 这里不许有"等于 config.SOURCE_LANGUAGE 就直接 return"的快捷路径。
+        config 只在后台真正应用之后才变，而应用要等 ASR 的批边界：
+        「德语 → 点英语 → 再点德语」里第二次点击那一刻 config 还是 de，
+        于是它被当成"没变化"扔掉，最后停在英语——用户最后一次选择失效。
+        所有点击一律提交给后台，由它在消费时比较实际语言对（见
+        _apply_pending_lang_switch：无变化时只刷 UI，不清音频）。
+        """
+        from realtime_subtitle.translate.translator_queue import (
+            language_name, target_for,
+        )
+        target = tgt or target_for(src)
+        if self.translator is None:
+            config.SOURCE_LANGUAGE = src
+            config.TARGET_LANGUAGE = target
+            self.subtitle_window.settings_window.refresh_from_config()
+            return
+        name = language_name(src)
+        tname = language_name(target)
+        self.translator.request_switch_language(src, source="manual", target=target)
+        self.subtitle_window.show_status(f"🌐 切换中: {name} → {tname}…")
 
     def _apply_mode(self, name):
         """唯一的"应用模式"入口（⚙️面板按钮和 Ctrl+Alt+G 都走这里）。

@@ -9,6 +9,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor, QFont
 import realtime_subtitle.config as config
+from realtime_subtitle import language_policy
 from realtime_subtitle.ui.window_frame import DraggableWidget
 from realtime_subtitle.ui.window_geometry import (
     screen_scale_factor, settings_initial_geometry,
@@ -25,6 +26,24 @@ def panel_font_px(scale=None):
     if scale is None:
         scale = screen_scale_factor()
     return max(16, int(round(PANEL_FONT_PX_AT_100 * float(scale))))
+
+
+def configured_language_pairs():
+    """面板用的语言对列表。
+
+    ☠️ 解析规则只有一份，在 language_policy 里（它不 import Qt，所以 UI 用它
+    也不用把翻译模块拖进导入链）。以前这里自己读 LANGUAGE_PAIRS，漏了老配置
+    的 LANGUAGE_CYCLE：后台有两个语言对、面板却一个按钮都没有。
+    """
+    return language_policy.language_pairs()
+
+
+def pair_target(source):
+    return language_policy.target_for(source)
+
+
+def pair_label(source, target=None):
+    return language_policy.pair_label(source, target)
 
 
 def format_slider_value(value, step):
@@ -62,6 +81,13 @@ TUNING_KEYS = (
     "CINEMA_FONT_SIZE",
     "CINEMA_SHOW_GERMAN",
     "CINEMA_BG_ALPHA",
+    # 识别语言和四个场景模式正交，必须进 tuning 才能重启恢复，又不能进 PRESETS。
+    "AUTO_DETECT_LANGUAGE",
+    # ☠️ 源语言和目标语言要**分别**存。只存源语言的话，配了 zh→en 和 zh→de
+    # 两条时重启就没法知道用户上次选的是哪一条，只能退回 target_for 的第一条。
+    # 恢复时按整对校验（见 apply_tuning）。
+    "SOURCE_LANGUAGE",
+    "TARGET_LANGUAGE",
 )
 
 
@@ -104,6 +130,21 @@ def apply_tuning(tuning):
             if key == "FONT_FAMILY":
                 setattr(config, key, _sanitize_font_family(val))
                 continue
+            if key == "SOURCE_LANGUAGE":
+                # 整对一起恢复：目标语言在同一份 tuning 里，能对上就用它，
+                # 对不上（配置改过了）才退回这个源语言的默认目标
+                src = str(val)
+                if src not in language_policy.allowed_sources():
+                    continue
+                tgt = tuning.get("TARGET_LANGUAGE")
+                tgt = str(tgt) if isinstance(tgt, str) else None
+                if not tgt or (src, tgt) not in language_policy.allowed_pairs():
+                    tgt = pair_target(src)
+                setattr(config, "SOURCE_LANGUAGE", src)
+                setattr(config, "TARGET_LANGUAGE", tgt)
+                continue
+            if key == "TARGET_LANGUAGE":
+                continue  # 已经在 SOURCE_LANGUAGE 那一支里成对处理过
             current = getattr(config, key)
             if isinstance(current, bool):
                 # json 可能给 0/1；bool 是 int 子类，必须先于 int 判断
@@ -194,6 +235,8 @@ class SettingsWindow(DraggableWidget):
         self._active_preset = None
         self._applying_preset = False
         self._preset_buttons = {}  # name -> QPushButton
+        self.on_language_change = None  # 源语言码 → main 走 request_switch_language
+        self._lang_pair_buttons = {}  # (source, target) -> QPushButton
         # 🎞 影院条由 SubtitleWindow 建好之后挂进来（它比本面板晚构造）
         self._cinema_bar = None
 
@@ -226,6 +269,50 @@ class SettingsWindow(DraggableWidget):
             preset_layout.addWidget(btn)
         preset_group.setLayout(preset_layout)
         layout.addWidget(preset_group)
+
+        lang_group = QGroupBox("识别语言")
+        lang_layout = QVBoxLayout()
+        self.auto_detect_cb = QCheckBox("自动识别语言（在已配置的语言对之间切换）")
+        self.auto_detect_cb.setFont(self.font())
+        self.auto_detect_cb.setToolTip(
+            "打开后连续多次检测到同一新语言才切换。和上面的直播/看剧/性能/精听无关。")
+        self.auto_detect_cb.setChecked(bool(getattr(config, "AUTO_DETECT_LANGUAGE", False)))
+        self.auto_detect_cb.toggled.connect(self._on_auto_detect_toggled)
+        lang_layout.addWidget(self.auto_detect_cb)
+
+        self.current_pair_label = QLabel(
+            "当前: " + pair_label(config.SOURCE_LANGUAGE, config.TARGET_LANGUAGE))
+        self.current_pair_label.setFont(self.font())
+        lang_layout.addWidget(self.current_pair_label)
+
+        pair_row = QWidget()
+        pair_layout = QHBoxLayout()
+        pair_layout.setContentsMargins(0, 0, 0, 0)
+        px = self._panel_font_px
+        for src, tgt in configured_language_pairs():
+            btn = QPushButton(pair_label(src, tgt))
+            btn.setCheckable(True)
+            btn.setFont(self.font())
+            btn.setStyleSheet(
+                f"QPushButton {{ padding: 8px 12px; font-size: {px}px; "
+                f"min-height: {px + 12}px; }}"
+                "QPushButton:checked {"
+                "  background-color: #3a6ea5; color: white; font-weight: bold;"
+                "  border: 1px solid #5a8ec5;"
+                "}"
+            )
+            btn.setToolTip("手动选择识别语言对；自动识别开着时也会立即生效并进入冷却")
+            btn.clicked.connect(
+                lambda checked=False, s=src, t=tgt: self._on_pair_clicked(s, t))
+            # ☠️ 键是**整对**不是源语言：配了 zh→en 和 zh→de 两条时，按源语言
+            # 索引会让后一个按钮把前一个挤掉，面板上只剩一个、还切不了目标语言
+            self._lang_pair_buttons[(src, tgt)] = btn
+            pair_layout.addWidget(btn)
+        pair_row.setLayout(pair_layout)
+        lang_layout.addWidget(pair_row)
+        lang_group.setLayout(lang_layout)
+        layout.addWidget(lang_group)
+        self._sync_language_buttons()
 
         # 流式识别设置
         duration_group = QGroupBox("流式识别设置")
@@ -641,6 +728,35 @@ class SettingsWindow(DraggableWidget):
             self._active_preset = None
         self._sync_preset_button_highlight()
 
+    def _on_auto_detect_toggled(self, checked):
+        """自动识别和四个场景模式正交，不把指示器打成自定义。"""
+        config.AUTO_DETECT_LANGUAGE = bool(checked)
+
+    def _apply_language_locally(self, src, tgt=None):
+        config.SOURCE_LANGUAGE = src
+        config.TARGET_LANGUAGE = tgt or pair_target(src)
+        self.current_pair_label.setText(
+            "当前: " + pair_label(src, config.TARGET_LANGUAGE))
+
+    def _sync_language_buttons(self):
+        current = (getattr(config, "SOURCE_LANGUAGE", "de"),
+                   getattr(config, "TARGET_LANGUAGE", "zh"))
+        for pair, btn in self._lang_pair_buttons.items():
+            btn.blockSignals(True)
+            btn.setChecked(pair == current)
+            btn.blockSignals(False)
+        self.current_pair_label.setText("当前: " + pair_label(*current))
+
+    def _on_pair_clicked(self, src, tgt=None):
+        """手动选语言对：有回调就交给 main（走 request_switch_language），
+        高亮等实际应用后再刷，避免「点了但还没切上」的假状态。"""
+        if self.on_language_change:
+            self.on_language_change(src, tgt)
+            self._sync_language_buttons()
+            return
+        self._apply_language_locally(src, tgt)
+        self._sync_language_buttons()
+
     def _on_preset_clicked(self, name):
         """模式按钮：只把请求转给 main 的唯一入口 _apply_mode。
 
@@ -703,6 +819,20 @@ class SettingsWindow(DraggableWidget):
             if self._on_font_change:
                 self._on_font_change()
 
+        if 'AUTO_DETECT_LANGUAGE' in self._defaults:
+            self.auto_detect_cb.setChecked(bool(self._defaults['AUTO_DETECT_LANGUAGE']))
+
+        if 'SOURCE_LANGUAGE' in self._defaults:
+            src = self._defaults['SOURCE_LANGUAGE']
+            tgt = self._defaults.get('TARGET_LANGUAGE')
+            if not tgt or (src, tgt) not in language_policy.allowed_pairs():
+                tgt = pair_target(src)
+            if self.on_language_change:
+                self.on_language_change(src, tgt)
+            else:
+                self._apply_language_locally(src, tgt)
+            self._sync_language_buttons()
+
         print("🔄 参数已恢复默认值")
 
     def refresh_from_config(self):
@@ -758,5 +888,10 @@ class SettingsWindow(DraggableWidget):
         self.font_combo.blockSignals(True)
         self.font_combo.setCurrentFont(QFont(primary))
         self.font_combo.blockSignals(False)
+
+        self.auto_detect_cb.blockSignals(True)
+        self.auto_detect_cb.setChecked(bool(getattr(config, "AUTO_DETECT_LANGUAGE", False)))
+        self.auto_detect_cb.blockSignals(False)
+        self._sync_language_buttons()
 
 

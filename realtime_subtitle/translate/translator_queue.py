@@ -34,6 +34,7 @@ from realtime_subtitle.translate.lookup import LookupMixin, _MAX_STREAM_CHARS
 from realtime_subtitle.translate.transcript import TranscriptMixin
 from realtime_subtitle.translate.runtime_stats import StatsMixin
 from realtime_subtitle.paths import repo_path
+from realtime_subtitle import language_policy
 import realtime_subtitle.config as config
 # 过滤所有警告信息
 warnings.filterwarnings("ignore")
@@ -225,26 +226,16 @@ def _draft_too_short(text, lang=None):
 def language_pairs():
     """当前生效的「源语言→目标语言」列表，也是 Ctrl+Alt+L 的循环顺序。
 
-    兼容老配置：config_local.py 里可能还写着 LANGUAGE_CYCLE = ["de","en"]
-    （只列源语言，那时候目标语言是写死的中文）。那种情况下按 TARGET_LANGUAGE
-    补齐成对，不让老配置失效。
+    ☠️ 实现在 realtime_subtitle/language_policy.py，这里只是转发。设置面板
+    需要同一份答案，而它不能 import 本模块（会把 torch/faster-whisper 拉进
+    UI 的导入链）；两边各写一份解析的后果见 language_policy 的文件头。
     """
-    pairs = getattr(config, "LANGUAGE_PAIRS", None)
-    if pairs:
-        return [(s, t) for s, t in pairs]
-    legacy = getattr(config, "LANGUAGE_CYCLE", None)
-    if legacy:
-        default_target = getattr(config, "TARGET_LANGUAGE", "zh")
-        return [(s, default_target) for s in legacy]
-    return [(config.SOURCE_LANGUAGE, getattr(config, "TARGET_LANGUAGE", "zh"))]
+    return language_policy.language_pairs()
 
 
 def target_for(source_lang):
     """这个源语言配的目标语言是哪个（查不到就用 TARGET_LANGUAGE）。"""
-    for src, tgt in language_pairs():
-        if src == source_lang:
-            return tgt
-    return getattr(config, "TARGET_LANGUAGE", "zh")
+    return language_policy.target_for(source_lang)
 
 
 def current_target_language():
@@ -999,6 +990,12 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
             self._tx_queue = []      # 已入队待翻译
             self._tx_inflight = []   # 正在翻译中
             self._tx_epoch = 0       # 切语言时+1：在飞的翻译完成时代数不符就丢弃
+            # 语言对代数。☠️ 和 _tx_epoch 不是一回事：_tx_epoch 是"这批翻译还
+            # 算不算数"，只在本模块内判；_lang_revision 跟着**每一次真正生效的
+            # 语言切换**递增，随 UI 事件一起发出去，由最后消费的那一端（Qt 槽）
+            # 校验。因为"检查代数"和"发出回调"之间锁是放开的，中间可以插进一次
+            # 切换，旧语言的句对就会落到新语言的画面上（审核 O04）
+            self._lang_revision = 0
             # 最近一次翻译超时后，"慢"状态保持到这个时刻为止（见 _translate_timeout）
             self._tx_slow_until = 0.0
             self.closing = False     # shutdown置True：所有worker出口不再回调UI
@@ -1038,6 +1035,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
             self.on_pair = None     # (german, chinese) -> None
             self.on_draft = None    # (chinese_draft) -> None 残句的草稿中文
             self.on_status = None   # (text) -> None 状态提示（如Ollama挂了）
+            self.on_language_applied = None  # (src, tgt) -> None 语言对真正写进 config 之后
             self._ollama_down_notified = 0.0  # 上次提示"翻译服务未运行"的时间（节流）
 
             # 冷启动治理（2026-08-02）：模型没进显存前，翻译请求要等预热、用长超时、
@@ -1157,7 +1155,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
         print("🧹 已清空识别与翻译上下文")
         self._emit_display()
 
-    def request_switch_language(self, new_lang, source="manual"):
+    def request_switch_language(self, new_lang, source="manual", target=None):
         """切换源语言：写入待切换标志，由 ASR 线程在每批音频边界抢占执行。
 
         清上下文 + 改 SOURCE_LANGUAGE 必须在识别线程串行（热键线程先改语言
@@ -1167,6 +1165,15 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
         前检查，最坏等当前这一批识别结束（~2.5s）而不是永远卡住。
 
         source: manual / auto / rescue，用于把「检测到了」和「真正应用了」分开记。
+
+        target: 显式指定目标语言（面板按「中文 → 德语」这种整对来点）。
+        不传就按 language_policy 定：手动切用 target_for，自动检测走
+        resolve_target（不覆盖用户显式选过的目标）。
+
+        ☠️ 语言、目标和来源是**一个请求整体**：字段分开写、分开读的话，后一个
+        请求可能只覆盖掉其中一部分（消费到 en 却记成 auto 的来源），日志和冷却
+        语义跟着一起错。这里在同一把 _asr_lock 内一次写完，消费端
+        （_process_inbox）也在同一把锁内一次取完并清空。
         """
         label = language_switch_source_label(source)
         print(format_language_detect_line(
@@ -1174,6 +1181,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
         with self._asr_lock:
             self._pending_lang_switch = new_lang
             self._pending_lang_source = source
+            self._pending_lang_target = target
             if self._asr_scheduled:
                 return  # 识别线程醒着，下一批边界会看到标志
             self._asr_scheduled = True
@@ -1200,6 +1208,23 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
     def _emit_display(self):
         if self.on_display:
             self.on_display(self._live_text(), self._last_unstable)
+
+    # ------------------------------------------------------------------
+    # 带语言代数的 UI 事件（O04）
+    # ------------------------------------------------------------------
+    def _emit_pair(self, source_text, target_text):
+        """句对上屏。带上发出这一刻的语言代数，UI 侧拒收过期的。
+
+        ☠️ 不能只靠发出前再查一次代数：查完到真正 emit 之间锁是放开的，
+        窗口关不掉。判据必须跟着事件走，由最后消费的那一端校验。
+        """
+        if self.on_pair:
+            self.on_pair(source_text, target_text,
+                         getattr(self, "_lang_revision", 0))
+
+    def _emit_draft(self, text):
+        if self.on_draft:
+            self.on_draft(text, getattr(self, "_lang_revision", 0))
 
     # ------------------------------------------------------------------
     # 翻译（独立worker线程）
@@ -1460,7 +1485,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
                 for g, zh in direct:
                     self._save_transcript(g, zh)
                     if self.on_pair:
-                        self.on_pair(g, zh)
+                        self._emit_pair(g, zh)
                 with self._stats_lock:
                     self._stat_dict += len(direct)
 
@@ -1506,7 +1531,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
         if self.on_pair:
             # 翻译失败时 translation==german：只显示一遍德语，
             # 不要"德语\n德语"重复两行（Ollama挂掉时实测很难看）
-            self.on_pair(german, "" if translation == german else translation)
+            self._emit_pair(german, "" if translation == german else translation)
         self._draft_last_text = ""  # 正式句对上屏了，残句草稿从头再来
         self._emit_display()
 
@@ -1573,7 +1598,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
             with self._tx_lock:
                 if epoch != self._tx_epoch:
                     return
-            self.on_draft(text)
+            self._emit_draft(text)
         return emit
 
     def _draft_worker(self, snapshot):
@@ -1604,7 +1629,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
         if self.pending_text.startswith(snapshot):
             if config.SHOW_PERFORMANCE:
                 print(f"   ✏️  草稿: {translation[:50]}{'...' if len(translation) > 50 else ''}")
-            self.on_draft(translation)
+            self._emit_draft(translation)
 
 
     def _translate_single_sentence(self, sentence, german_context, on_partial=None):
@@ -2135,19 +2160,44 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
         source = "rescue" if self._lang_rescue else "auto"
         self.request_switch_language(new_lang, source=source)
 
-    def _apply_pending_lang_switch(self, new_lang):
-        """在 ASR 线程内执行：清上下文 + 改语言对（与识别串行）。
+    def _apply_pending_lang_switch(self, new_lang, source=None, target=None):
+        """在 ASR 线程内执行：清上下文 + 改语言对（与识别串行）。返回是否真切了。
 
         ☠️ 源语言和目标语言必须**一起改**。只改源语言的话，放中文视频会变成
         "中文→中文"：识别对了，翻译 prompt 还在要求输出中文，模型于是把原句
         抄一遍。目标语言从 LANGUAGE_PAIRS 查（见 target_for）。
+
+        「请求的语言对 == 当前语言对」这一分支只能在这里判，不能在 UI 层判
+        （见 app._request_language_pair 的注释）。此时**没有**旧语言音频要丢、
+        也没有旧语言上下文要清，所以只刷 UI 和冷却：无变化的点击不该把用户
+        正在看的字幕清空。
+
+        ☠️ 这里**只用传进来的 source，绝不读写 self._pending_lang_source**。
+        pending 字段的存/取/清一律留在 _asr_lock 里（request_switch_language 写、
+        _process_inbox 取）。本函数跑在锁外且很慢（clear_context），这期间新的
+        请求会入队——以前这里收尾时清一次 _pending_lang_source，清掉的其实是
+        **下一条请求**的来源，于是一条 auto 请求被消费成 manual。给那行加锁
+        也不对：它本来就没有资格动别人的请求。
         """
-        self.clear_context()
-        new_target = target_for(new_lang)
+        source = source or "manual"  # 直接调用（热键/单测）的兼容默认
+        old_source = getattr(config, "SOURCE_LANGUAGE", None)
+        old_target = getattr(config, "TARGET_LANGUAGE", None)
+        if target:
+            new_target = target                      # 面板点的是整对，照办
+        elif source == "manual":
+            new_target = target_for(new_lang)
+        else:
+            # ☠️ 自动检测/抢救只改源语言：用户显式选过的目标语言不许被它覆盖
+            new_target = language_policy.resolve_target(
+                new_lang, old_source, old_target)
+        changed = (new_lang != old_source or new_target != old_target)
+        if changed:
+            self.clear_context()
+            # 语言对已经变了：这个代数之前发出的 UI 事件都属于旧语言，
+            # 消费端（UI 槽）按它拒收，见 O04
+            self._lang_revision = getattr(self, "_lang_revision", 0) + 1
         config.SOURCE_LANGUAGE = new_lang
         config.TARGET_LANGUAGE = new_target
-        source = getattr(self, "_pending_lang_source", None) or "manual"
-        self._pending_lang_source = None
         # 手动切（Ctrl+Alt+L）之后也要清投票：否则切换前攒的那点连击会跨过
         # 这次切换继续累加，可能刚切完就被自动检测又切回去
         if getattr(self, "_lang_vote", None) is not None:
@@ -2166,15 +2216,29 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
             "switch_applied", pair=f"{name} → {tname}",
             source_label=language_switch_source_label(source)))
         if self.on_status:
-            self.on_status(f"🌐 已切换: {name} → {tname}")
+            self.on_status(
+                f"🌐 已切换: {name} → {tname}" if changed
+                else f"🌐 当前已是: {name} → {tname}")
+        cb = getattr(self, "on_language_applied", None)
+        if cb:
+            cb(new_lang, new_target, getattr(self, "_lang_revision", 0))
+        return changed
 
     def _process_inbox(self):
         """识别线程主循环：每批边界先处理语言切换，再消化收件箱，空了才睡。"""
         while True:
             with self._asr_lock:
                 pending_lang = self._pending_lang_switch
+                pending_source = None
+                pending_target = None
                 if pending_lang is not None:
+                    # 语言/目标/来源一次取完一次清空，见 request_switch_language
+                    pending_source = getattr(
+                        self, "_pending_lang_source", None) or "manual"
+                    pending_target = getattr(self, "_pending_lang_target", None)
                     self._pending_lang_switch = None
+                    self._pending_lang_source = None
+                    self._pending_lang_target = None
                 items = self._audio_inbox
                 self._audio_inbox = []
                 self._asr_backlog_n = 0  # 已全部取走，积压清零
@@ -2182,15 +2246,20 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
                     self._asr_scheduled = False
                     return
             if pending_lang is not None:
+                switched = False
                 try:
-                    self._apply_pending_lang_switch(pending_lang)
+                    switched = self._apply_pending_lang_switch(
+                        pending_lang, source=pending_source,
+                        target=pending_target)
                 except Exception as e:
                     print(f"⚠️  切换源语言失败: {e}")
                 # ☠️ 这一批音频是切换【之前】抓的旧语言声音，绝不能用新语言参数
                 # 去识别（蹦出乱词）。_apply_pending_lang_switch → clear_context
                 # 本来就已经把识别缓冲整个丢掉了，再把切换前的音频塞进新缓冲
-                # 自相矛盾。用户主动按热键时丢掉不到一秒的旧语言音频是正确取舍
-                if items:
+                # 自相矛盾。用户主动按热键时丢掉不到一秒的旧语言音频是正确取舍。
+                # 请求的语言对和当前一致时什么都没变，这一批仍是"本语言"的
+                # 音频，丢掉纯属白扣用户一秒字幕
+                if items and switched:
                     print(f"🧹 切换语言，丢弃切换前的 {len(items)} 块音频")
                     items = []
             if not items:

@@ -13,13 +13,13 @@ class LiveTextRenderMixin:
         """更新live德语行：committed=已提交未翻译（白），unstable=未稳定尾部（灰）"""
         self.signals.live.emit(committed or "", unstable or "")
 
-    def add_pair(self, german, chinese):
-        """一段德语翻译完成，加入历史句对"""
-        self.signals.pair.emit(german or "", chinese or "")
+    def add_pair(self, german, chinese, revision=0):
+        """一段句对翻译完成，加入历史。revision = 发出时的语言代数（见 _add_pair）"""
+        self.signals.pair.emit(german or "", chinese or "", int(revision))
 
-    def update_draft(self, chinese):
-        """live德语的草稿中文（线程安全）。正式句对完成后自动清掉"""
-        self.signals.draft.emit(chinese or "")
+    def update_draft(self, chinese, revision=0):
+        """live 行的草稿译文（线程安全）。正式句对完成后自动清掉"""
+        self.signals.draft.emit(chinese or "", int(revision))
 
     def show_status(self, text):
         """显示一条状态提示（线程安全）。不进句对历史，下次内容更新时自然消失"""
@@ -40,13 +40,29 @@ class LiveTextRenderMixin:
         self._status_clear_timer.stop()
         self._render()
 
-    def _update_draft(self, chinese):
+    def _update_draft(self, chinese, revision=0):
+        if self._is_stale_language(revision):
+            return
         self.live_draft = chinese
         self.tv_window.update_draft(chinese)
         self.cinema_bar.update_draft(chinese)
         self._render()
 
-    def _add_pair(self, german, chinese):
+    def _is_stale_language(self, revision):
+        """这条事件是切换语言**之前**发出的吗（审核 O04）。
+
+        ☠️ 判据必须在这里——最后消费的地方——而不是发出前再查一次代数：
+        翻译 worker 查完代数到真正回调之间锁是放开的，中间插进一次切换，
+        旧语言的句对就会落在新语言的画面上。事件自带代数，这里比一次即可。
+        """
+        current = getattr(self, "language_revision", 0)
+        return int(revision or 0) < current
+
+    def _add_pair(self, german, chinese, revision=0):
+        if self._is_stale_language(revision):
+            if config.SHOW_PERFORMANCE:
+                print(f"   🌐 丢弃切换语言前的句对（代数 {revision}）")
+            return
         # 第三元是墙钟时间：🤖 按"最近 N 分钟"过滤时用（二元组没法做时间窗）
         self.sentence_pairs.append((german, chinese, time.time()))
         while len(self.sentence_pairs) > self.HISTORY_KEEP:

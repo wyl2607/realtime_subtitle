@@ -17,6 +17,10 @@ TARGET_LANGUAGE = "zh"
 # ☠️ Ctrl+Alt+L 循环的是**语言对**，不是单个源语言——切源语言而不切目标语言的话，
 # 放中文视频会得到"中文→中文"。这个列表同时兼任 源语言→目标语言 的映射表，
 # 自动检测（AUTO_DETECT_LANGUAGE）也只会在这里出现过的源语言之间切。
+# 同一个源语言可以配多条（如 ("zh","en") 和 ("zh","de")）：⚙️ 面板会各出一个
+# 按钮，可以独立切换和恢复。同源多条时 Ctrl+Alt+L 按本列表顺序循环，而
+# target_for()/自动检测的"默认目标"取的是**第一条**匹配的——想让哪个当默认就
+# 把它排前面（细节见 CLAUDE.md 第 4 节第 41 条）。
 LANGUAGE_PAIRS = [("de", "zh"), ("zh", "de"), ("en", "zh"), ("da", "zh")]
 # 兼容：老的 config_local.py 里可能写着 LANGUAGE_CYCLE = ["de","en"]（只列源语言）。
 # 仍然生效，目标语言按 LANGUAGE_PAIRS 查、查不到就用 TARGET_LANGUAGE。

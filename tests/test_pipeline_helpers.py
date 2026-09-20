@@ -361,7 +361,7 @@ def test_translation_worker_dict_shortcircuit_and_order():
     displays = []
     t.on_display = lambda c, u: displays.append((c, u))
     pairs = []
-    t.on_pair = lambda g, zh: pairs.append((g, zh))
+    t.on_pair = lambda g, zh, rev=0: pairs.append((g, zh))
     t._save_transcript = lambda g, zh: None
     calls = []
 
@@ -420,7 +420,7 @@ def test_transcript_keeps_source_when_translation_failed():
     t.on_draft = None
     t.on_display = lambda c, u: None
     pairs = []
-    t.on_pair = lambda g, zh: pairs.append((g, zh))
+    t.on_pair = lambda g, zh, rev=0: pairs.append((g, zh))
     saved = []
     t._save_transcript = lambda g, zh: saved.append((g, zh))
     # 翻译失败：_translate_single_sentence 的约定是原样返回原文
@@ -566,9 +566,11 @@ def test_lang_switch_pending_preempts_before_audio_batch():
     applied = []
     processed = []
 
-    def apply(lang):
+    def apply(lang, source=None, target=None):
+        # 返回值 = "真切了吗"。切了才允许丢这批切换前的音频（审核 B01：请求的
+        # 语言对和当前一致时什么都没变，丢音频等于白扣用户一秒字幕）
         applied.append(lang)
-        # 模拟 clear 后不依赖真实 processor
+        return True
     t._apply_pending_lang_switch = apply
     t._process_items = lambda items: processed.append(len(items))
 
@@ -1150,7 +1152,7 @@ def test_draft_skipped_while_model_cold():
         def submit(self, *a, **k):
             submitted.append(a)
     t._tx_executor = _Exec()
-    t.on_draft = lambda s: None
+    t.on_draft = lambda s, rev=0: None
 
     t._ollama_hot = False
     t._maybe_draft()
@@ -1590,7 +1592,7 @@ def test_draft_worker_yields_to_asr_at_request_time():
     t = _translator_for_tx()
     t.context_history = []
     t.pending_text = "Das ist ein Satz"
-    t.on_draft = lambda s: None
+    t.on_draft = lambda s, rev=0: None
     calls = []
     t._translate_single_sentence = lambda *a, **k: calls.append(a) or "译文"
 
@@ -2566,6 +2568,79 @@ def test_maybe_detect_language_interval_wait_is_not_cooldown(monkeypatch, capsys
     assert "冷却" not in out
 
 
+def test_short_audio_does_not_force_german(monkeypatch):
+    """系统采集不知道视频是否结束。静音/音频不足不能猜回德语。"""
+    import time as _time
+    from threading import Lock
+    from realtime_subtitle.translate.translator_queue import (
+        LanguageVote, LanguageDetectLogger, WhisperQueueTranslator)
+
+    class _Proc:
+        def detect_language(self, min_seconds=3.0):
+            return None
+
+        def buffer_seconds(self):
+            return 0.2
+
+    t = object.__new__(WhisperQueueTranslator)
+    t.processor = _Proc()
+    t._lang_vote = LanguageVote()
+    t._lang_log = LanguageDetectLogger()
+    t._lang_rescue = False
+    t._lang_detect_next = 0.0
+    t._lang_in_cooldown = False
+    t._asr_lock = Lock()
+    t.on_status = None
+    monkeypatch.setattr(config, "AUTO_DETECT_LANGUAGE", True, raising=False)
+    monkeypatch.setattr(config, "SOURCE_LANGUAGE", "zh", raising=False)
+    monkeypatch.setattr(config, "TARGET_LANGUAGE", "de", raising=False)
+    monkeypatch.setattr(_time, "time", lambda: 5000.0)
+
+    t._maybe_detect_language()
+    assert config.SOURCE_LANGUAGE == "zh"
+    assert config.TARGET_LANGUAGE == "de"
+    assert getattr(t, "_pending_lang_switch", None) is None
+
+
+def test_apply_pending_lang_switch_notifies_ui(monkeypatch):
+    from threading import Lock
+    from realtime_subtitle.translate.translator_queue import (
+        LanguageVote, DecodeHealth, WhisperQueueTranslator)
+
+    t = object.__new__(WhisperQueueTranslator)
+    t._asr_lock = Lock()
+    t._pending_lang_source = "manual"
+    t._lang_vote = LanguageVote()
+    t._lang_vote.lang, t._lang_vote.streak = "zh", 2
+    t._decode_health = DecodeHealth()
+    t._lang_rescue = False
+    t._lang_detect_next = 0.0
+    t.on_status = None
+    t.context_history = []
+    t._tx_lock = Lock()
+    t._tx_queue = []
+    t._tx_inflight = []
+    t._tx_epoch = 0
+    t.pending_text = ""
+    t._held_since = 0.0
+    t._last_unstable = ""
+    t._draft_last_text = ""
+    t.on_display = None
+    t.processor = type("_P", (), {
+        "init": lambda self: None,
+        "reset_prompt_context": lambda self: None,
+    })()
+    applied = []
+    t.on_language_applied = lambda src, tgt, rev=0: applied.append((src, tgt))
+    monkeypatch.setattr(config, "SOURCE_LANGUAGE", "de", raising=False)
+    monkeypatch.setattr(config, "TARGET_LANGUAGE", "zh", raising=False)
+
+    t._apply_pending_lang_switch("zh")
+    assert applied == [("zh", "de")]
+    assert t._lang_vote.streak == 0
+    assert t._lang_in_cooldown is True
+
+
 # ======================================================================
 # 中文源语言路径的漏改（2026-08-13）
 #
@@ -2627,7 +2702,7 @@ def test_maybe_draft_fires_for_chinese_pending():
             submitted.append(a)
 
     t._tx_executor = _Exec()
-    t.on_draft = lambda s: None
+    t.on_draft = lambda s, rev=0: None
 
     with _with_source_language("zh"):
         t.pending_text = "我们今天来聊聊这个话题的细节"

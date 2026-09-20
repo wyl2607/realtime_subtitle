@@ -94,14 +94,15 @@ class SubtitleSignals(QObject):
     # 是 2026-07-06 双层显示重写之前的旧接口，此后零调用方，已删
     status = pyqtSignal(str)  # 状态提示（如暂停/继续），不进字幕历史
     live = pyqtSignal(str, str)  # live德语行更新 (committed, unstable)
-    pair = pyqtSignal(str, str)  # 一段德语翻译完成 (german, chinese)
-    draft = pyqtSignal(str)  # live德语的草稿中文（正式句对完成后被替换）
+    pair = pyqtSignal(str, str, int)  # 句对完成 (原文, 译文, 语言代数)
+    draft = pyqtSignal(str, int)  # 草稿译文 + 语言代数（正式句对完成后被替换）
     lookup = pyqtSignal(str, str, bool, str)  # (word, 词典文本, 是否流式中间态, request_id)
     ai_analysis = pyqtSignal(str, int)  # 🤖 背景总结结果 (text, seq)
     deep_explain = pyqtSignal(str, int)  # 点词「深度解释」结果 (text, seq)
     toggle_ct = pyqtSignal()  # 切换鼠标穿透模式（热键线程→主线程）
     toggle_cinema = pyqtSignal()  # 切换 🎞 影院字幕条（热键线程→主线程）
     mode = pyqtSignal(object)  # 当前模式名(str)或 None(自定义)：热键线程→主线程
+    language = pyqtSignal(str, str, int)  # 语言对已应用 (源, 目标, 代数)：ASR 线程→主线程
 
 class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
     """字幕悬浮窗"""
@@ -451,6 +452,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         self.signals.toggle_ct.connect(self._toggle_click_through)
         self.signals.toggle_cinema.connect(self._toggle_cinema)
         self.signals.mode.connect(self._on_mode_applied)
+        self.signals.language.connect(self._on_language_applied)
         
         print("✅ 字幕窗口已创建")
         print(f"   位置: ({x}, {y})  大小: {w}x{h}")
@@ -632,6 +634,19 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
     def notify_mode_applied(self, name):
         """模式已应用（线程安全，热键线程/主线程都调这个）→ 主线程同步 UI"""
         self.signals.mode.emit(name)
+
+    def notify_language_applied(self, src, tgt, revision=0):
+        """语言对已写入 config（ASR 线程也会调）→ 主线程刷新面板显示。"""
+        self.signals.language.emit(src, tgt, int(revision))
+
+    def _on_language_applied(self, src, tgt, revision):
+        """☠️ 这里是"新语言从此生效"的分界线。
+
+        Qt 队列连接保证同一个发出线程的事件按发出顺序到达主线程，所以在这条
+        之后到达的、代数更旧的句对/草稿一定是切换前发出的——正是要拒掉的那些。
+        """
+        self.language_revision = int(revision)
+        self.settings_window.refresh_from_config()
 
     def _on_mode_applied(self, name):
         """主线程槽：真实模式名才需要把面板控件从 config 重读一遍 + 刷高亮；
