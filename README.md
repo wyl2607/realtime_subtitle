@@ -80,7 +80,7 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
 # powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-安装脚本会检查路径与 Python、检测显存（或 CPU 降级）、创建 venv、装依赖、引导 Ollama，并在桌面生成「德语直播实时字幕」快捷方式文件夹（含 YouTube 下载加字幕）。
+安装脚本会检查路径与 Python、检测显存（或 CPU 降级）、创建 venv、装依赖、引导 Ollama，并在桌面生成「德语直播实时字幕」文件夹，里面是五个快捷方式：启动（同时会更新）、YouTube 下载加字幕、停止、暂停继续、卸载。
 
 若未安装 Ollama，脚本会询问是否用 **`winget install --id Ollama.Ollama -e`** 自动安装（装完在常见路径查找 exe，不依赖当前 PATH 刷新）。拒绝则打开官网下载页。
 
@@ -172,7 +172,7 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\download_subtitle.ps1 -
 
 ## 配置
 
-默认在 [config.py](config.py)。个人覆盖写 **`config_local.py`**（gitignore）：
+默认在 [config.py](realtime_subtitle/config.py)。个人覆盖写 **`config_local.py`**（gitignore）：
 
 ```python
 WHISPER_MODEL = "large-v3-turbo"   # 显存不够改 medium / small
@@ -201,8 +201,9 @@ GLOSSARY = {...}
 ```powershell
 venv\Scripts\pip install -r requirements-dev.txt
 venv\Scripts\python -m pytest tests\test_pipeline_helpers.py -q
-# GUI 独立套件（pytest 不收集）：
-# venv\Scripts\python tests\test_hittest.py
+# GUI 独立套件（pytest 不收集，会开真窗口）：
+# ☠️ 必须带 PYTHONPATH=. ，否则 ModuleNotFoundError: realtime_subtitle
+$env:PYTHONPATH="."; venv\Scripts\python tests\test_hittest.py
 ```
 
 ## 常见问题

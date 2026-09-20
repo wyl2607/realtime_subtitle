@@ -20,7 +20,7 @@ Erkennung und Übersetzung laufen offline; Audio und Transkripte verlassen den R
 > Template auf einen leeren String setzen entfernt den Button. Achtung: Das Programm nimmt
 > **den gesamten Systemton** auf, also ggf. auch Sprachanrufe.
 
-[中文](README.md) · [English](README.en.md) · [Repository-Struktur](docs/STRUCTURE.md) · [Windows-Anleitung](docs/WINDOWS-RUNBOOK.md)
+[中文](README.md) · [English](README.en.md) · [Repository-Struktur](docs/STRUCTURE.md) · [Windows-Anleitung](docs/de/WINDOWS-RUNBOOK.md)
 
 ```text
 Systemton ──WASAPI-Loopback──▶ Faster-Whisper (CUDA oder CPU)
@@ -151,7 +151,7 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\download_subtitle.ps1 -
 
 ## Konfiguration
 
-Standardwerte in [config.py](config.py). Persönliche Overrides in **`config_local.py`** (gitignored):
+Standardwerte in [config.py](realtime_subtitle/config.py). Persönliche Overrides in **`config_local.py`** (gitignored):
 
 ```python
 WHISPER_MODEL = "large-v3-turbo"   # oder "medium" / "small"

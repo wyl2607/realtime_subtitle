@@ -19,7 +19,7 @@ No audio or transcript is sent to the cloud. Recognition and translation run on 
 > `AI_WEB_CONFIRM = False` to skip it. Set that template to an empty string to remove the
 > button entirely. Note this app captures **all system audio**, which may include voice calls.
 
-[中文](README.md) · [Deutsch](README.de.md) · [Repository layout](docs/STRUCTURE.md) · [Windows runbook](docs/WINDOWS-RUNBOOK.md)
+[中文](README.md) · [Deutsch](README.de.md) · [Repository layout](docs/STRUCTURE.md) · [Windows runbook](docs/en/WINDOWS-RUNBOOK.md)
 
 ```text
 System audio ──WASAPI loopback──▶ Faster-Whisper (CUDA or CPU)
@@ -85,7 +85,7 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
 # powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-The installer checks the path and Python, detects NVIDIA VRAM (or falls back to CPU), creates a venv, installs dependencies, guides Ollama setup, and writes desktop shortcuts under **“德语直播实时字幕”** (start / stop / pause / update / uninstall / download-and-subtitle).
+The installer checks the path and Python, detects NVIDIA VRAM (or falls back to CPU), creates a venv, installs dependencies, guides Ollama setup, and writes five desktop shortcuts under **“德语直播实时字幕”**: start (which also updates), download-and-subtitle, stop, pause, uninstall.
 
 If Ollama is missing, the installer offers **`winget install --id Ollama.Ollama -e`** (finds the binary via common paths; PATH need not refresh). Decline to open the download page instead.
 
@@ -156,7 +156,7 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\download_subtitle.ps1 -
 
 ## Configuration
 
-Defaults live in [config.py](config.py). Prefer overrides in **`config_local.py`** (gitignored):
+Defaults live in [config.py](realtime_subtitle/config.py). Prefer overrides in **`config_local.py`** (gitignored):
 
 ```python
 WHISPER_MODEL = "large-v3-turbo"   # or "medium" / "small"
@@ -185,8 +185,9 @@ See [docs/STRUCTURE.md](docs/STRUCTURE.md).
 ```powershell
 venv\Scripts\pip install -r requirements-dev.txt
 venv\Scripts\python -m pytest tests\test_pipeline_helpers.py -q
-# GUI harnesses (not collected by pytest):
-# venv\Scripts\python tests\test_hittest.py
+# GUI harnesses (not collected by pytest; they open real windows):
+# Needs PYTHONPATH=. or it fails with ModuleNotFoundError: realtime_subtitle
+$env:PYTHONPATH="."; venv\Scripts\python tests\test_hittest.py
 ```
 
 ## Troubleshooting
