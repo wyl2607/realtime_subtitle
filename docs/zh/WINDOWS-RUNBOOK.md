@@ -19,7 +19,7 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
 如果没有 Ollama，安装脚本问到时选 `Y`（用 winget 装）。
 
 桌面文件夹：**德语直播实时字幕**
-- 启动字幕.bat / 启动并更新字幕.bat / 下载并加字幕.bat / 停止 / 暂停继续 / 更新 / 卸载 / 操作说明.txt
+- 启动字幕.bat（每次先更新）/ YouTube下载加字幕.bat / 停止 / 暂停继续 / 卸载 / 操作说明.txt
 
 ## B. 已有安装 —— 更新到最新版
 
@@ -47,13 +47,12 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
 
 | 动作 | 怎么做 |
 |------|--------|
-| 启动 | 桌面 **启动字幕.bat** |
-| 启动前顺手更新 | **启动并更新字幕.bat**（更新失败也照常启动；真拉到新版且字幕在跑会自动重启） |
+| 启动（每次先更新） | 桌面 **启动字幕.bat**；更新失败也照常启动，真拉到新版且字幕在跑会自动重启 |
 | 停止 | **停止字幕.bat** |
 | 暂停 | **暂停继续字幕.bat** 或 `Ctrl+Alt+P` |
-| 下载并加双语字幕 | **下载并加字幕.bat**；结果在 `downloads\<视频ID>\` |
+| 下载并加双语字幕 | **YouTube下载加字幕.bat**；结果在 `downloads\<视频ID>\` |
 | 影院字幕条 | `Ctrl+Alt+C`（视频已经全屏时用热键） |
-| 以后更新 | **更新字幕.bat** |
+| 只更新不启动 | `scripts\windows\update_subtitles.ps1`（桌面不再单独放） |
 
 手动启动（排错）：
 

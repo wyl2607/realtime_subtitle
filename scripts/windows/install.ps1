@@ -316,29 +316,50 @@ $desktop = [Environment]::GetFolderPath("Desktop")
 $shortcutDir = Join-Path $desktop "德语直播实时字幕"
 New-Item -ItemType Directory -Path $shortcutDir -Force | Out-Null
 
+# ☠️ 这张表是桌面入口的**单一真相源**，tests/test_desktop_shortcuts.py 盯着它：
+# 每个 ps1 必须真的存在，且每个 bat 名必须在操作说明模板里出现过。以前这三处
+# （本表 / user-guide-template.txt / README）各写各的，改一处漏两处。
+#
+# 「启动字幕.bat」指向 start_and_update_subtitles.ps1 而不是 start_subtitles.ps1：
+# 2026-09-20 把「启动」「更新」「启动并更新」三个入口合成了一个。理由是那三个
+# 里只有一个是用户真正想要的动作——「我要看字幕」——另外两个是实现细节漏到了
+# 桌面上。合并后的行为就是原来「启动并更新字幕」的行为：更新失败（断网/冲突/
+# 不是 git 装的）不中断，照常用当前版本启动；只有真拉到新代码且字幕正在跑才
+# 停掉重启。两个 ps1 都留着，是被它调用的实现，不再单独出现在桌面上。
 $batTemplate = @(
-    @("启动字幕.bat", "scripts\windows\start_subtitles.ps1"),
-    @("启动并更新字幕.bat", "scripts\windows\start_and_update_subtitles.ps1"),
-    @("下载并加字幕.bat", "scripts\windows\download_subtitle.ps1"),
+    @("启动字幕.bat", "scripts\windows\start_and_update_subtitles.ps1"),
+    @("YouTube下载加字幕.bat", "scripts\windows\download_subtitle.ps1"),
     @("停止字幕.bat", "scripts\windows\stop_subtitles.ps1"),
     @("暂停继续字幕.bat", "scripts\windows\pause_subtitles.ps1"),
-    @("更新字幕.bat", "scripts\windows\update_subtitles.ps1"),
     @("卸载字幕.bat", "scripts\windows\uninstall.ps1")
 )
 foreach ($pair in $batTemplate) {
     $head = "@echo off`r`nchcp 65001 >nul`r`npowershell -NoProfile -ExecutionPolicy Bypass -File `"$RepoRoot\$($pair[1])`"`r`n"
-    if ($pair[0] -in @("启动字幕.bat", "启动并更新字幕.bat")) {
+    if ($pair[0] -eq "启动字幕.bat") {
         # 成功≈3秒自动关；失败保留窗口让人看得到报错（报错文本由ps1打印）。
         # ⚠️ bat 必须纯 ASCII：chcp 65001 下 cmd 解析含中文的行会把下一行开头吃掉。
         # 用 ping 当 sleep：timeout.exe 在 stdin 被重定向时直接报错
         $tail = "if errorlevel 1 goto :err`r`nping -n 4 127.0.0.1 >nul`r`nexit /b 0`r`n:err`r`necho.`r`npause`r`n"
-    } elseif ($pair[0] -eq "更新字幕.bat" -or $pair[0] -eq "卸载字幕.bat") {
-        # 这两个窗口一律保留：更新要看到"更新了什么"，卸载要看到"删了什么/剩什么"
+    } elseif ($pair[0] -eq "卸载字幕.bat") {
+        # 卸载窗口一律保留：要让人看到"删了什么/还剩什么"
         $tail = "echo.`r`npause`r`n"
     } else {
         $tail = "ping -n 3 127.0.0.1 >nul`r`n"
     }
     [System.IO.File]::WriteAllText((Join-Path $shortcutDir $pair[0]), $head + $tail, (New-Object System.Text.UTF8Encoding $false))
+}
+
+# ☠️ 清掉已经退役的快捷方式。装过老版本的人桌面上留着这几个文件，而它们
+# 指向的 ps1 还在（被合并入口调用着），所以双击照样能跑——于是"合并"对老用户
+# 等于没发生，他还是三个图标对着选。按**确切文件名**删，不扫整个目录：这个
+# 文件夹是用户的，他可能往里放了自己的东西。
+$retiredBats = @("启动并更新字幕.bat", "更新字幕.bat", "下载并加字幕.bat")
+foreach ($old in $retiredBats) {
+    $oldPath = Join-Path $shortcutDir $old
+    if (Test-Path -LiteralPath $oldPath) {
+        Remove-Item -LiteralPath $oldPath -Force -ErrorAction SilentlyContinue
+        Write-Host "  🧹 已移除退役入口: $old"
+    }
 }
 # 操作说明从仓库模板生成（单一真相源）。以前正文内联写在这里，加了
 # Ctrl+Alt+M/G、📺电视全屏、点词查词、模式系统之后一直没同步——而且这个

@@ -53,7 +53,7 @@ Systemton ──WASAPI-Loopback──▶ Faster-Whisper (CUDA oder CPU)
 - **TV-Vollbild** — undurchsichtiges Großschrift-Fenster auf einem zweiten Bildschirm (📺)
 - **KI-Analyse** — 🤖 fasst die letzten Minuten lokal zusammen; 🌐 öffnet eine Web-KI erst nach Bestätigung
 - **Tages-Archiv** — Ordner `transcripts/`, standardmäßig unbegrenzt aufbewahrt. Klartext, und diese App nimmt **sämtlichen** System-Ton auf: `TRANSCRIPT_KEEP_DAYS = 30` löscht Älteres automatisch, `SAVE_TRANSCRIPT = False` zeichnet gar nichts auf
-- **Video herunterladen und Untertitel erzeugen** — Desktop-Shortcut `下载并加字幕.bat` oder `scripts\windows\download_subtitle.ps1` lädt bis 4K, transkribiert lokal, erzeugt SRT-Dateien, übersetzt jede Zeile mit lokalem Ollama und schreibt einen chinesischen Lernleitfaden. Chinesische Quelle wird Chinesisch + Deutsch; Deutsch, Englisch und andere Quellen werden Quelle + Chinesisch.
+- **Video herunterladen und Untertitel erzeugen** — Desktop-Shortcut `YouTube下载加字幕.bat` oder `scripts\windows\download_subtitle.ps1` lädt bis 4K, transkribiert lokal, erzeugt SRT-Dateien, übersetzt jede Zeile mit lokalem Ollama und schreibt einen chinesischen Lernleitfaden. Chinesische Quelle wird Chinesisch + Deutsch; Deutsch, Englisch und andere Quellen werden Quelle + Chinesisch.
 - **Hotkeys** — Pause, Sprache, Leistungsmodus, Kinoleiste (siehe Nutzung)
 
 ## Systemvoraussetzungen
@@ -131,7 +131,7 @@ venv\Scripts\python -u main.py
 
 ### Video herunterladen und zweisprachige SRT-Dateien erstellen
 
-`下载并加字幕.bat` doppelklicken. Wenn die Zwischenablage eine Video-Adresse enthält, wird sie automatisch verwendet; sonst erscheint eine Eingabeaufforderung zum Einfügen oder Tippen. Standardmäßig werden bis zu 2160p (4K) geladen. Danach extrahiert das Programm die Tonspur, nutzt das lokale Faster-Whisper-Modell und übersetzt jede Untertitelzeile einzeln mit lokalem Ollama, damit lange Videos keinen doppelten Kontext aufbauen.
+`YouTube下载加字幕.bat` doppelklicken. Wenn die Zwischenablage eine Video-Adresse enthält, wird sie automatisch verwendet; sonst erscheint eine Eingabeaufforderung zum Einfügen oder Tippen. Standardmäßig werden bis zu 2160p (4K) geladen. Danach extrahiert das Programm die Tonspur, nutzt das lokale Faster-Whisper-Modell und übersetzt jede Untertitelzeile einzeln mit lokalem Ollama, damit lange Videos keinen doppelten Kontext aufbauen.
 
 Die Dateien liegen unter `downloads\<video-id>\`:
 

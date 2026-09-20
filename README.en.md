@@ -53,7 +53,7 @@ System audio ──WASAPI loopback──▶ Faster-Whisper (CUDA or CPU)
 - **Daily transcript archive** — `transcripts/` (timestamp + source + translation), kept
   forever by default. Plain text, and this app captures **all** system audio: set
   `TRANSCRIPT_KEEP_DAYS = 30` to auto-prune, or `SAVE_TRANSCRIPT = False` to record nothing.
-- **Download and subtitle batch** — Desktop `下载并加字幕.bat` or
+- **Download and subtitle batch** — Desktop `YouTube下载加字幕.bat` or
   `scripts\windows\download_subtitle.ps1` downloads up to 4K, transcribes locally,
   creates SRT files, translates one segment at a time with local Ollama, and writes a
   Chinese study guide. Chinese source becomes Chinese + German; German, English, and
@@ -97,8 +97,8 @@ First launch downloads the Whisper model (~1.6 GB).
 
 | Action | Command |
 |---|---|
-| Update + start | Desktop `启动并更新字幕.bat` (pull, then launch; still launches if the pull fails) |
-| Update | Desktop `更新字幕.bat` or `scripts\windows\update_subtitles.ps1` (`git pull` + deps) |
+| Start (pulls first) | Desktop `启动字幕.bat` — pulls the latest, then launches; still launches if the pull fails |
+| Update only | `scripts\windows\update_subtitles.ps1` (`git pull` + deps; no separate desktop entry any more) |
 | Uninstall / free space | `scripts\windows\uninstall.ps1` (asks per component; default is keep) |
 | Cache only | `scripts\windows\uninstall.ps1 -CleanCache` |
 
@@ -136,7 +136,7 @@ venv\Scripts\python -u main.py
 
 ### Download a video and create bilingual subtitles
 
-Double-click the desktop `下载并加字幕.bat`. If the clipboard contains a video URL it is used automatically; otherwise the console prompts for a URL, which can be pasted or typed. The default maximum is 2160p (4K). The pipeline extracts audio, runs the project’s local Faster-Whisper model, writes source and bilingual SRT files, and translates each subtitle independently with local Ollama so long videos do not accumulate duplicated context.
+Double-click the desktop `YouTube下载加字幕.bat`. If the clipboard contains a video URL it is used automatically; otherwise the console prompts for a URL, which can be pasted or typed. The default maximum is 2160p (4K). The pipeline extracts audio, runs the project’s local Faster-Whisper model, writes source and bilingual SRT files, and translates each subtitle independently with local Ollama so long videos do not accumulate duplicated context.
 
 Files are written to `downloads\<video-id>\`:
 

@@ -67,7 +67,7 @@ install.ps1 最后一步会自检（import torch/PyQt6/pyaudiowpatch/soxr + 走�
 
 install.ps1 会：找 Python → nvidia-smi 检测显卡 → 建 venv 装依赖 → 按显存
 生成 `config_local.py` 降级配置 → 启动 Ollama 并拉取配置对应的翻译模型 →
-在桌面生成「德语直播实时字幕」文件夹（启动/下载并加字幕/停止/暂停/更新/卸载 bat + 说明）。
+在桌面生成「德语直播实时字幕」文件夹（启动/YouTube下载加字幕/停止/暂停/卸载 五个 bat + 说明）。
 
 首次点"启动字幕.bat"还会自动下载 Whisper 模型（1-3GB），属于正常现象。
 
@@ -136,10 +136,14 @@ install.ps1 按显存自动生成的默认档位：
 
 ## 3. 更新机制
 
-- **拿更新**：双击桌面"更新字幕.bat"（= `update_subtitles.ps1`）：
+- **拿更新**：双击桌面"启动字幕.bat"就会顺手更新——2026-09-20 起桌面上只有
+  这一个启动入口，它 = `start_and_update_subtitles.ps1` = 先 `update` 再
+  `start`（第 4 节第 45 条）。更新那一段仍是 `update_subtitles.ps1`：
   `git pull --ff-only` + requirements 变了才重装依赖 + 提示是否需要重跑
   install.ps1。config_local.py / window_state.json / transcripts/ 都不在 git
   里，更新永远不会碰它们（包括 `downloads/`）。
+  只想更新、不想启动（改代码时常用）：直接跑
+  `powershell -File scripts\windows\update_subtitles.ps1`，桌面上不再单独放它。
 - **更新失败**基本都是有人直接改了仓库文件。处理：`git stash` 后重试；根治：
   把改动挪进 config_local.py 或让上游合并。
 
@@ -195,7 +199,9 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
   （全绿，条数以实际输出为准）再发 PR——`gh repo fork wyl2607/realtime_subtitle --remote=true`，
   开分支提交，push 到自己的 fork，`gh pr create`。改动尽量小、提交信息写清
   根因。不要 push 到 upstream（leik1000 是最初的模板仓库，早已分道扬镳）。
-- 改代码前先双击"更新字幕.bat"拉到最新，避免在旧版上修已经修过的东西。
+- 改代码前先 `powershell -File scripts\windows\update_subtitles.ps1` 拉到最新，
+  避免在旧版上修已经修过的东西（双击桌面"启动字幕.bat"也会更新，但它会把
+  字幕程序一起起来，改代码时通常不想要）。
 
 ## 4. ☠️ 避坑清单（每一条都是真实踩过的）
 
@@ -269,7 +275,7 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
 
 改代码（如果用户让你改功能）：
 
-15. 改完跑测试：`venv\Scripts\python -m pytest`（137 项，以实际输出为准）。
+15. 改完跑测试：`venv\Scripts\python -m pytest`（549 项，以实际输出为准）。
     ☠️ **pytest 不在 requirements.txt 里**（那份是给最终用户装的，install.ps1
     不会装 pytest），新环境上第一次跑会报 `No module named pytest`，先装：
     `venv\Scripts\python -m pip install -r requirements-dev.txt`。test_hittest /
@@ -948,6 +954,39 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     **换算代码在生产环境里一次都没执行过**。怎么验写在
     [docs/TODO.md](docs/TODO.md) 第 1 条，验完回来把这段删掉。
 
+45. **☠️ 桌面上只有五个 bat，而且那张表是单一真相源。**（2026-09-20）
+
+    原来有七个，其中三个是同一件事的三种拼法：「启动字幕」「更新字幕」
+    「启动并更新字幕」。用户真正想要的动作只有一个——**我要看字幕**——
+    另外两个是实现细节漏到了桌面上。现在合成一个：
+
+    | 桌面 bat | 指向 |
+    |---|---|
+    | 启动字幕.bat | `start_and_update_subtitles.ps1`（先 update 再 start） |
+    | YouTube下载加字幕.bat | `download_subtitle.ps1` |
+    | 停止字幕.bat / 暂停继续字幕.bat / 卸载字幕.bat | 同名 ps1 |
+
+    `update_subtitles.ps1` 和 `start_subtitles.ps1` **都还在**，它们是被
+    `start_and_update_subtitles.ps1` 调用的实现，只是不再单独出现在桌面上。
+    改代码时想只更新不启动，直接跑 `update_subtitles.ps1`。
+
+    ☠️ **光"不再生成"对老用户没用**：他桌面上那三个 bat 是上一次 install
+    写下的，而它们指向的 ps1 还在，所以双击照样能跑——不主动删的话，
+    "合并"对他等于没发生，他还是三个图标对着选。install.ps1 里的
+    `$retiredBats` 按**确切文件名**删（不扫目录：那个文件夹是用户的，
+    他可能往里放了自己的东西）。以后再退役入口，记得往那张名单里加。
+
+    ☠️ **桌面入口这件事有三处副本**：install.ps1 的 `$batTemplate`、
+    `docs/zh/user-guide-template.txt`（生成「操作说明.txt」）、README/RUNBOOK。
+    前两处由 `tests/test_desktop_shortcuts.py` 钉住——每个入口指向的 ps1 必须
+    真实存在、必须在操作说明里被解释过、退役的必须从说明里消失。
+    加/改/删入口时那个测试会先红给你看。
+
+    「下载并加字幕」改名叫「YouTube下载加字幕」只是**把已有能力说清楚**，
+    功能一行没动：它本来就是 yt-dlp + 本地 Whisper + 本地 Ollama，也本来就
+    能直接拖本地视频进去。⚠️ 名字里的 YouTube 是"主要面向"，不是"只支持"
+    ——别据此去删别的站的支持，也别对外说支持某个没真实验证过的站（第 39 条）。
+
 ## 5. 目录地图
 
 ```
@@ -970,12 +1009,16 @@ realtime_subtitle/ui/subtitle_window.py    悬浮窗主类（+ window_frame/wind
 config.py             全部默认参数（仓库文件，别为单机改它）
 config_local.py       本机覆盖（gitignore，install.ps1 生成，机器适配都写这）
 scripts/windows/install.ps1  一键安装 + 硬件检测 + 桌面快捷方式（根目录 install.ps1 为兼容转发）
-scripts/windows/download_subtitle.ps1  输入视频地址，调用离线批处理并保留窗口显示结果
-scripts/windows/update_subtitles.ps1  一键更新（git pull + 按需装依赖）
+                      ☠️ 里面的 $batTemplate 是桌面入口的单一真相源，见第4节第45条
+scripts/windows/start_and_update_subtitles.ps1  ★ 桌面「启动字幕.bat」指向这里（唯一启动入口）
+                      纯编排：update →（代码真变了才）stop → start；三步都开子进程跑，
+                      理由（exit 语义 + pull 换掉脚本自身）写在文件头
+scripts/windows/download_subtitle.ps1  ★ 桌面「YouTube下载加字幕.bat」；调用离线批处理并保留窗口显示结果
+scripts/windows/update_subtitles.ps1  一键更新（git pull + 按需装依赖）。被上面那个调用，
+                      桌面上不再单独放；只更新不启动时直接跑它
 scripts/windows/uninstall.ps1  卸载（逐项问 Y/N，默认不删）；-CleanCache 只清下载残文件
 scripts/windows/{start,stop,pause}_subtitles.ps1  启动（PID 管理/Ollama 保活）/停止/暂停
-scripts/windows/start_and_update_subtitles.ps1  纯编排：update →（代码真变了才）stop → start；
-                      三步都开子进程跑，理由（exit 语义 + pull 换掉脚本自身）写在文件头
+                      start_subtitles.ps1 同样只被 start_and_update 调用，桌面上没有它
 tests/                所有 pytest 用例（三个独立 GUI 脚本套件见第 4 节第 15 条）
 requirements-dev.txt  测试依赖（pytest），只有改代码的人要装
 transcripts/          字幕存档（每天一个文件）

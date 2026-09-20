@@ -21,7 +21,7 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
 If Ollama is missing, accept the winget prompt (`Y`).
 
 Desktop folder: **德语直播实时字幕**  
-- 启动字幕.bat / 启动并更新字幕.bat / 下载并加字幕.bat / 停止 / 暂停继续 / 更新 / 卸载
+- 启动字幕.bat（每次先更新）/ YouTube下载加字幕.bat / 停止 / 暂停继续 / 卸载
 
 ## B. Existing install — update to latest layout
 
@@ -50,13 +50,12 @@ Then:
 
 | Action | How |
 |--------|-----|
-| Start | Desktop **启动字幕.bat** |
-| Start, updating first | **启动并更新字幕.bat** (still starts if the pull fails; restarts a running instance only when new code actually landed) |
+| Start (pulls first) | Desktop **启动字幕.bat**; still starts if the pull fails, and restarts a running instance only when new code actually landed |
 | Stop | **停止字幕.bat** |
 | Pause | **暂停继续字幕.bat** or `Ctrl+Alt+P` |
-| Download + bilingual SRT | **下载并加字幕.bat**; outputs go to `downloads\<video-id>\` |
+| Download + bilingual SRT | **YouTube下载加字幕.bat**; outputs go to `downloads\<video-id>\` |
 | Cinema bar | `Ctrl+Alt+C` (use the hotkey once the video is already fullscreen) |
-| Update later | **更新字幕.bat** |
+| Update only | `scripts\windows\update_subtitles.ps1` (no separate desktop entry) |
 
 Manual start (debug):
 

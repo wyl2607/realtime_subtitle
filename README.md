@@ -52,7 +52,7 @@
 - **📺 电视全屏**：在另一块屏用大字不透明窗显示（Esc 退出）
 - **🤖 AI 分析**：本地总结最近几分钟；🌐 问更强的 AI 会先弹出确认框
 - **字幕存档**：按天写入 `transcripts/`，默认永久保留。是明文，且本程序抓的是**系统全部声音**——想自动清理就在 `config_local.py` 里设 `TRANSCRIPT_KEEP_DAYS = 30`，完全不想记录就 `SAVE_TRANSCRIPT = False`
-- **下载并制作双语字幕**：桌面「下载并加字幕.bat」或 `scripts\windows\download_subtitle.ps1` 会下载最高 4K 视频、提取语音、生成 SRT，并用本地 Ollama 翻译；中文源语言输出“中文 + 德语”，德语/英语/其他源语言输出“原文 + 中文”，同时生成中文学习笔记
+- **下载并制作双语字幕**：桌面「YouTube下载加字幕.bat」或 `scripts\windows\download_subtitle.ps1` 会下载最高 4K 视频、提取语音、生成 SRT，并用本地 Ollama 翻译；中文源语言输出“中文 + 德语”，德语/英语/其他源语言输出“原文 + 中文”，同时生成中文学习笔记
 - **热键**：暂停、切语言、性能模式、影院字幕条（见「使用」）
 
 ## 系统要求
@@ -80,7 +80,7 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
 # powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-安装脚本会检查路径与 Python、检测显存（或 CPU 降级）、创建 venv、装依赖、引导 Ollama，并在桌面生成「德语直播实时字幕」快捷方式文件夹（含下载并加字幕）。
+安装脚本会检查路径与 Python、检测显存（或 CPU 降级）、创建 venv、装依赖、引导 Ollama，并在桌面生成「德语直播实时字幕」快捷方式文件夹（含 YouTube 下载加字幕）。
 
 若未安装 Ollama，脚本会询问是否用 **`winget install --id Ollama.Ollama -e`** 自动安装（装完在常见路径查找 exe，不依赖当前 PATH 刷新）。拒绝则打开官网下载页。
 
@@ -92,8 +92,8 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
 
 | 动作 | 方式 |
 |---|---|
-| 更新 + 启动 | 桌面「启动并更新字幕.bat」（先拉最新版再启动；更新失败也照常启动） |
-| 更新 | 桌面「更新字幕.bat」或 `scripts\windows\update_subtitles.ps1` |
+| 启动（每次先更新） | 桌面「启动字幕.bat」——先拉最新版再启动；更新失败（断网/冲突）也照常启动 |
+| 只更新不启动 | `scripts\windows\update_subtitles.ps1`（桌面上不再单独放这个入口） |
 | 卸载 / 腾空间 | `scripts\windows\uninstall.ps1`（逐项询问，默认保留） |
 | 只清缓存 | `scripts\windows\uninstall.ps1 -CleanCache` |
 
@@ -131,7 +131,7 @@ venv\Scripts\python -u main.py
 
 ### 下载视频并制作双语字幕
 
-双击桌面上的「下载并加字幕.bat」即可：如果剪贴板里有视频链接，程序会自动读取（有多个链接时会让你选一个，不会替你随机决定）；没有有效链接时会出现输入提示。**也可以直接把本地视频/音频文件拖进那个输入框**——本地文件不经过任何下载器，走的是同一条识别/翻译/导出链路，身份按文件内容算（改名不算新视频，改了内容才算）。合集/播放列表、图文帖、没有音轨的链接会在**开始识别之前**被拦下并说明原因。随后依次问两个问题——**字幕形式**（1 双语，默认；2 单语只要译文）和**译文语言**（1 英语，中文视频的默认；2 德语），直接回车就是默认值。程序默认下载最高 2160p（4K）画面，使用本地 Faster-Whisper 识别，并逐条调用本地 Ollama 翻译，避免长上下文造成字幕重复。
+双击桌面上的「YouTube下载加字幕.bat」即可：如果剪贴板里有视频链接，程序会自动读取（有多个链接时会让你选一个，不会替你随机决定）；没有有效链接时会出现输入提示。**也可以直接把本地视频/音频文件拖进那个输入框**——本地文件不经过任何下载器，走的是同一条识别/翻译/导出链路，身份按文件内容算（改名不算新视频，改了内容才算）。合集/播放列表、图文帖、没有音轨的链接会在**开始识别之前**被拦下并说明原因。随后依次问两个问题——**字幕形式**（1 双语，默认；2 单语只要译文）和**译文语言**（1 英语，中文视频的默认；2 德语），直接回车就是默认值。程序默认下载最高 2160p（4K）画面，使用本地 Faster-Whisper 识别，并逐条调用本地 Ollama 翻译，避免长上下文造成字幕重复。
 
 输出在 `downloads\<视频ID>\`，文件名带语言标签，**换目标语言不会覆盖上一份**：
 
@@ -190,7 +190,7 @@ GLOSSARY = {...}
 |---|---|
 | `main.py` | 入口（`python -u main.py`） |
 | `realtime_subtitle/` | 包：`capture/` `asr/` `translate/` `ui/` `offline.py` `app.py` |
-| `scripts/windows/` | 安装、启动、停止、暂停、更新、卸载、下载并加字幕 |
+| `scripts/windows/` | 安装、启动、停止、暂停、更新、卸载、下载加字幕 |
 | `tests/` | 单元测试 + 独立 GUI 脚本套件 |
 | `docs/` | 设计文档、中文笔记 |
 
