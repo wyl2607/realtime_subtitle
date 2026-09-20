@@ -276,7 +276,7 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
 
 改代码（如果用户让你改功能）：
 
-15. 改完跑测试：`venv\Scripts\python -m pytest`（552 项，以实际输出为准）。
+15. 改完跑测试：`venv\Scripts\python -m pytest`（566 项，以实际输出为准）。
     ☠️ **pytest 不在 requirements.txt 里**（那份是给最终用户装的，install.ps1
     不会装 pytest），新环境上第一次跑会报 `No module named pytest`，先装：
     `venv\Scripts\python -m pip install -r requirements-dev.txt`。test_hittest /
