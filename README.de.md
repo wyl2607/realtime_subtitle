@@ -135,11 +135,12 @@ venv\Scripts\python -u main.py
 
 Die Dateien liegen unter `downloads\<video-id>\`:
 
-- `<video-id>_bilingual.srt` — zuerst Quelle, danach Übersetzung; direkt im Player nutzbar
-- `<video-id>_source.srt` — nur die erkannte Quelle
-- `<video-id>_learning_guide.md` — chinesische Übersicht, Gesprächsablauf, Ausdrücke und Lernschritte
+- `<video-id>.<quelle>-<ziel>.bilingual.srt` — zuerst Quelle, danach Übersetzung; direkt im Player nutzbar
+- `<video-id>.<quelle>-<ziel>.target.srt` — nur die Übersetzung (einsprachig)
+- `<video-id>.<quelle>.source.srt` — nur die erkannte Quelle
+- `<video-id>.<quelle>-<ziel>.learning.md` — chinesische Übersicht, Gesprächsablauf, Ausdrücke und Lernschritte
 
-Feste Sprachregel: Chinesische Quelle → Chinesisch + Deutsch; deutsche, englische und alle anderen Quellen → Quelle + Chinesisch. Kommandozeile:
+Das Skript fragt nach der Untertitelform (1 zweisprachig, Standard; 2 nur Übersetzung) und der Zielsprache (1 Englisch, Standard für chinesische Videos; 2 Deutsch). Standardziele: chinesische Quelle → Englisch, alle anderen → Chinesisch; eine ausdrücklich gewählte Zielsprache wird von der Spracherkennung nie überschrieben. Alle drei SRT-Varianten entstehen bei jedem Lauf, und die Dateinamen tragen das Sprachpaar — ein Wechsel von Ziel oder Form überschreibt also nichts und startet die Spracherkennung nicht neu. Das Paar Chinesisch → Deutsch der Echtzeit-Pipeline (`LANGUAGE_PAIRS`) bleibt unverändert. Kommandozeile:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\windows\download_subtitle.ps1 -Url "Video-Adresse"

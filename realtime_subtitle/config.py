@@ -523,6 +523,22 @@ SHOW_PERFORMANCE = False
 # 这是 SHOW_PERFORMANCE=False 后仅剩的观测手段：约1行/分钟，撑不大日志
 STATS_SUMMARY_INTERVAL = 60
 
+# ============ 离线下载的凭据（默认都不带）============
+# ☠️ 这两个键是**凭据**，默认 None，程序绝不会自己去翻浏览器。要不要拿自己的
+# 登录态去下载受限内容，是用户自己的决定，AI 助手不要替他打开（同 CLAUDE.md
+# 第 2 节那三个"改变数据往哪去"的键）。
+#
+# 在 config_local.py 里二选一：
+#     OFFLINE_COOKIES_FILE = r"D:\私密\cookies.txt"   # Netscape 格式
+#     OFFLINE_COOKIES_FROM_BROWSER = "chrome"          # 或 ("chrome", "Default")
+#
+# 值只交给 yt-dlp，不进日志、不进 downloads/ 里的任务元数据和断点文件——
+# 那些文件用户会直接贴进 issue（见 CLAUDE.md 第 4 节第 34 条）。
+# 浏览器 cookies 在 Windows 上需要浏览器处于关闭状态才读得到，且等于把
+# 你的登录态交给一个下载器；能用 cookies 文件就别用整个浏览器 profile。
+OFFLINE_COOKIES_FILE = None
+OFFLINE_COOKIES_FROM_BROWSER = None
+
 # ============ 本机覆盖（放最后，能覆盖上面所有配置）============
 # install.ps1 在没有NVIDIA显卡的机器上会生成 config_local.py
 # （WHISPER_DEVICE="cpu" 等降级配置）；个人调参也可以写在那里，

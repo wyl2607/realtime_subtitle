@@ -8,8 +8,14 @@ from realtime_subtitle.offline import build_srt, target_language_for
 
 
 def test_target_language_policy():
-    assert target_language_for("zh") == "de"
-    assert target_language_for("zh-CN") == "de"
+    """离线默认：中文视频翻英文（2026-09-10 需求），其他翻中文。
+
+    ☠️ 这只是**离线**默认值。实时字幕的中→德（LANGUAGE_PAIRS）没有跟着改，
+    那是德语学习用途；显式 --target-language 一律优先于这里的默认。
+    """
+    assert target_language_for("zh") == "en"
+    assert target_language_for("zh-CN") == "en"
+    assert offline.default_target_for("zh") == "en"
     assert target_language_for("de") == "zh"
     assert target_language_for("en") == "zh"
     assert target_language_for("fr") == "zh"
@@ -48,7 +54,7 @@ def test_process_url_wires_source_and_bilingual_outputs(tmp_path, monkeypatch):
     video = tmp_path / "demo.mp4"
     video.write_bytes(b"video")
     monkeypatch.setattr(offline, "_load_yt_dlp", lambda: SimpleNamespace(YoutubeDL=FakeYoutubeDL))
-    monkeypatch.setattr(offline, "download_video", lambda url, job_dir, max_height: ({"id": "demo", "title": "Demo", "extractor": "youtube"}, video))
+    monkeypatch.setattr(offline, "download_video", lambda url, job_dir, max_height, info=None: ({"id": "demo", "title": "Demo", "extractor": "youtube"}, video))
     monkeypatch.setattr(offline, "_extract_audio", lambda video, audio: None)
     monkeypatch.setattr(
         offline,
@@ -66,9 +72,12 @@ def test_process_url_wires_source_and_bilingual_outputs(tmp_path, monkeypatch):
     assert result["source_language"] == "de"
     assert result["target_language"] == "zh"
     assert result["guide"] is None
-    assert (tmp_path / "out" / "youtube_demo" / "demo_bilingual.srt").read_text(encoding="utf-8-sig").endswith(
+    job = tmp_path / "out" / "youtube_demo"
+    assert (job / "demo.de-zh.bilingual.srt").read_text(encoding="utf-8-sig").endswith(
         "Guten Morgen\n早上好\n"
     )
+    assert (job / "demo.de.source.srt").is_file()
+    assert (job / "demo.de-zh.target.srt").is_file()
 
 
 def _stub_ollama_local(monkeypatch):
@@ -116,6 +125,7 @@ def test_checkpoint_rejects_language_change(tmp_path):
         video_id="demo", source_url="https://example.test/demo",
         extractor="youtube", source_language="de", target_language="zh",
         rows=rows, asr_done=True, complete=False,
+        requested_source_language="de",
     )
     offline.save_checkpoint(path, data)
     loaded = offline.load_checkpoint(path)
@@ -194,7 +204,7 @@ def test_process_url_skips_asr_when_checkpoint_matches(tmp_path, monkeypatch):
     video = tmp_path / "demo.mp4"
     video.write_bytes(b"video")
     monkeypatch.setattr(offline, "_load_yt_dlp", lambda: SimpleNamespace(YoutubeDL=FakeYoutubeDL))
-    monkeypatch.setattr(offline, "download_video", lambda url, job_dir, max_height: ({"id": "demo", "title": "Demo", "extractor": "youtube"}, video))
+    monkeypatch.setattr(offline, "download_video", lambda url, job_dir, max_height, info=None: ({"id": "demo", "title": "Demo", "extractor": "youtube"}, video))
     extracts = []
     transcribes = []
     monkeypatch.setattr(offline, "_extract_audio", lambda video, audio: extracts.append(1))
@@ -213,6 +223,7 @@ def test_process_url_skips_asr_when_checkpoint_matches(tmp_path, monkeypatch):
         video_id="demo", source_url="https://example.test/demo",
         extractor="youtube", source_language="de", target_language="zh",
         rows=rows, asr_done=True, complete=False,
+        requested_source_language="de",  # 上次也是显式 de，才谈得上复用
     ))
     offline.process_url("https://example.test/demo", tmp_path / "out", source_language="de", summary=False)
     assert extracts == []
@@ -610,7 +621,7 @@ def test_process_url_separates_same_id_from_different_extractors(tmp_path, monke
             extractor = "site_a" if "site-a" in url else "site_b"
             return {"id": "123", "title": extractor, "extractor": extractor}
 
-    def fake_download(url, job_dir, max_height=2160):
+    def fake_download(url, job_dir, max_height=2160, info=None):
         calls.append((url, job_dir.name))
         job_dir.mkdir(parents=True, exist_ok=True)
         video = job_dir / f"{job_dir.name}.mp4"
@@ -665,3 +676,107 @@ def test_learning_guide_prompts_stay_within_budget(tmp_path, monkeypatch):
         limit = offline.input_char_budget(output_tokens=npred)
         assert length <= limit, f"prompt {length} exceeded budget {limit} (num_predict={npred})"
     assert dest.is_file()
+
+
+# ======================================================================
+# 拒答识别（审核 B02）：译文内容不是控制信号
+#
+# 两级坑都在这里钉住：
+#  1. 子串黑名单（"法律法规"/"政治敏感"/"无法完成"…）会把合法译文判成拒答；
+#  2. 改成"锚开头的整句模式 + 长度上限"仍然不行——「抱歉，我不能帮你。」
+#     既可能是模型拒答，也可能就是影片里角色说的原话，字面完全相同。
+#
+# 取舍写在这里：**宁可留一条可能是拒答的怪译文，也不能让整片失败。**
+# 疑似拒答只打 needs_review 标记 + 提示，人工复核；失败判据只剩结构化那几条。
+# ======================================================================
+
+
+@pytest.mark.parametrize("german, translation", [
+    # 审核给的三组：合法对白，其译文和模型拒答的字面一模一样
+    ("Es tut mir leid, ich kann dir nicht helfen.", "抱歉，我不能帮你。"),
+    ("Ich kann diese Aufgabe nicht erledigen.", "我无法完成这项任务。"),
+    ("Tut mir leid, ich kann dir nicht helfen.", "Sorry, I cannot help you."),
+    # 第一级坑的原始用例
+    ("Wir müssen die Gesetze beachten.", "我们必须遵守法律法规。"),
+    ("Das Programm kann keine Bilder erzeugen.", "这个程序不能生成图片。"),
+])
+def test_natural_language_never_fails_the_job(tmp_path, monkeypatch, german, translation):
+    _stub_ollama_local(monkeypatch)
+    rows = [{"start": 0, "end": 1, "text": german}]
+    calls = []
+
+    def fake_req(session, url, model, prompt, num_predict=512):
+        calls.append(model)
+        return translation
+
+    monkeypatch.setattr(offline, "_ollama_request", fake_req)
+    ckpt = tmp_path / "_job_checkpoint.json"
+
+    offline.translate_segments(rows, "de", "zh", checkpoint_path=ckpt)
+
+    assert rows[0]["translation"] == translation
+    assert len(calls) == 1, "译文内容不该触发重试或换模型"
+    assert offline.load_checkpoint(ckpt)["rows"][0]["translation"] == translation
+
+
+def test_suspected_refusal_is_flagged_for_review_not_failed(tmp_path, monkeypatch):
+    """疑似拒答：译文照样保存，只多一个 needs_review 标记（非阻断）。"""
+    _stub_ollama_local(monkeypatch)
+    rows = [
+        {"start": 0, "end": 1, "text": "Hallo"},
+        {"start": 1, "end": 2, "text": "Tschüss"},
+    ]
+
+    def fake_req(session, url, model, prompt, num_predict=512):
+        # ☠️ 不能按 "Hallo" 判：第 2 条的 prompt 里 Hallo 会作为上一句语境出现
+        if "Tschüss" in prompt:
+            return "再见"
+        return "抱歉，我无法完成这个翻译请求。"
+
+    monkeypatch.setattr(offline, "_ollama_request", fake_req)
+    ckpt = tmp_path / "_job_checkpoint.json"
+
+    offline.translate_segments(rows, "de", "zh", checkpoint_path=ckpt)
+
+    assert rows[0]["translation"] == "抱歉，我无法完成这个翻译请求。"
+    assert rows[0].get("needs_review") is True
+    assert rows[1]["translation"] == "再见"
+    assert "needs_review" not in rows[1], "正常译文不该被挂标记"
+
+
+def test_review_flag_is_dropped_once_the_row_is_retranslated(tmp_path, monkeypatch):
+    _stub_ollama_local(monkeypatch)
+    rows = [{"start": 0, "end": 1, "text": "Hallo", "needs_review": True}]
+
+    monkeypatch.setattr(offline, "_ollama_request", lambda *a, **kw: "你好")
+    offline.translate_segments(rows, "de", "zh")
+
+    assert rows[0]["translation"] == "你好"
+    assert "needs_review" not in rows[0]
+
+
+def test_structured_failures_still_fail(tmp_path, monkeypatch):
+    """去掉文本判据不等于什么都不判：结构化校验一条都不能少。"""
+    def call(payload):
+        response = SimpleNamespace(raise_for_status=lambda: None, json=lambda: payload)
+        session = SimpleNamespace(post=lambda *args, **kwargs: response)
+        return offline._ollama_request(session, "u", "m", "p")
+
+    with pytest.raises(offline.OfflineSubtitleError):
+        call({"error": "model busy"})
+    with pytest.raises(offline.OfflineSubtitleError):
+        call({"response": "   ", "done": True, "done_reason": "stop"})
+    with pytest.raises(offline.OfflineSubtitleError):
+        call({"response": "还没写完", "done": False, "done_reason": "stop"})
+    with pytest.raises(offline.TruncatedModelOutput):
+        call({"response": "被截断的译文", "done": True, "done_reason": "length"})
+
+    # 模型一直不返回译文时，整条链路仍然要报失败（不是静默出空字幕）
+    _stub_ollama_local(monkeypatch)
+    rows = [{"start": 0, "end": 1, "text": "Hallo"}]
+    monkeypatch.setattr(
+        offline, "_ollama_request",
+        lambda *a, **kw: (_ for _ in ()).throw(offline.OfflineSubtitleError("空响应")))
+    with pytest.raises(offline.OfflineSubtitleError):
+        offline.translate_segments(rows, "de", "zh")
+    assert not rows[0].get("translation")

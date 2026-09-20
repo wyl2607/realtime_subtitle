@@ -120,7 +120,7 @@ venv\Scripts\python -u main.py
 | 查词 | 单击德语词 |
 | 鼠标穿透 | `Ctrl+Alt+M` |
 | 暂停/继续 | `Ctrl+Alt+P` |
-| 切换语言对 | `Ctrl+Alt+L`（德→中 / 中→德 / 英→中，改 `config.LANGUAGE_PAIRS`） |
+| 切换语言对 | `Ctrl+Alt+L` 循环（德→中 / 中→德 / 英→中），或在 ⚙️ 面板直接点某一对；改 `config.LANGUAGE_PAIRS` 可增删。同一个源语言可以配多条（如中→英、中→德），面板会各出一个按钮，选择会被记住 |
 | 性能模式 | `Ctrl+Alt+G` |
 | 影院字幕条 | `Ctrl+Alt+C` 或 🎞（视频已经全屏时必须用热键） |
 | 电视全屏 | 📺 |
@@ -131,18 +131,40 @@ venv\Scripts\python -u main.py
 
 ### 下载视频并制作双语字幕
 
-双击桌面上的「下载并加字幕.bat」即可：如果剪贴板里有视频链接，程序会自动读取；没有有效链接时会出现输入提示，也可以直接粘贴或手动输入。程序默认下载最高 2160p（4K）画面，使用本地 Faster-Whisper 识别，并逐条调用本地 Ollama 翻译，避免长上下文造成字幕重复。
+双击桌面上的「下载并加字幕.bat」即可：如果剪贴板里有视频链接，程序会自动读取（有多个链接时会让你选一个，不会替你随机决定）；没有有效链接时会出现输入提示。**也可以直接把本地视频/音频文件拖进那个输入框**——本地文件不经过任何下载器，走的是同一条识别/翻译/导出链路，身份按文件内容算（改名不算新视频，改了内容才算）。合集/播放列表、图文帖、没有音轨的链接会在**开始识别之前**被拦下并说明原因。随后依次问两个问题——**字幕形式**（1 双语，默认；2 单语只要译文）和**译文语言**（1 英语，中文视频的默认；2 德语），直接回车就是默认值。程序默认下载最高 2160p（4K）画面，使用本地 Faster-Whisper 识别，并逐条调用本地 Ollama 翻译，避免长上下文造成字幕重复。
 
-输出在 `downloads\<视频ID>\`：
+输出在 `downloads\<视频ID>\`，文件名带语言标签，**换目标语言不会覆盖上一份**：
 
-- `<视频ID>_bilingual.srt`：每条先显示原文，再显示中文或德语译文，可直接导入播放器
-- `<视频ID>_source.srt`：原文字幕，便于单独复习
-- `<视频ID>_learning_guide.md`：中文内容概述、对话脉络、重点表达和学习方法
+- `<视频ID>.<源>-<目标>.bilingual.srt`：原文 + 译文，可直接导入播放器
+- `<视频ID>.<源>-<目标>.target.srt`：只有译文（单语）
+- `<视频ID>.<源>.source.srt`：只有原文，便于单独复习
+- `<视频ID>.<源>-<目标>.learning.md`：中文内容概述、对话脉络、重点表达和学习方法
 
-语言规则固定为：中文视频 → 中文 + 德语；德语、英语及其他语言 → 原文 + 中文。命令行也可以使用：
+三种字幕每次都会一起导出，所以双语和单语之间改主意不用重跑。默认译文语言：**中文视频 → 英语**，其他语言 → 中文；显式指定的目标语言不会被自动识别结果覆盖。同一个视频换目标语言时不会重新识别，已经翻好的那一份也保留着，切回去是免费的。
+
+> 实时字幕的中文→德语（`LANGUAGE_PAIRS`）没有跟着改，那是德语学习用途。
+
+**分享文案可以整段粘贴**：程序会从里面抠出链接（中文标点不会被当成链接的一部分），多个链接时让你选。跑完会打印一行阶段耗时，例如 `阶段耗时：抽音频 3.1s，识别 412.0s，翻译 1180.4s；合计 1595.5s（视频 31.2 分钟，实时倍率 0.85x）`——复用缓存的阶段会标注出来，不会把"没跑"显示成"很快"。
+
+**下载失败怎么办**：需要登录、私密内容、地区限制、限流、链接失效这几类都会给中文说明，并提示同一条出路——先用别的方式把视频存到本地，再把文件拖进输入框（本地导入不联网、不需要登录）。确实需要登录态时，在 `config_local.py` 里显式配置：
+
+```python
+OFFLINE_COOKIES_FILE = r"D:\私密\cookies.txt"    # Netscape 格式，二选一
+OFFLINE_COOKIES_FROM_BROWSER = "chrome"           # 或 ("chrome", "Default")
+```
+
+默认两者都不设，程序不会自己去翻浏览器。凭据只交给下载器，不会写进日志、任务元数据或断点文件。
+
+> 小红书：`yt-dlp 2026.08.19` 认 `www.xiaohongshu.com/explore/<id>` 和 `/discovery/item/<id>`；**短链 `xhslink.com` 不在它的匹配规则里**，能否走通取决于跳转跟随，本项目没有用真实链接验证过。
+
+命令行也可以使用：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\windows\download_subtitle.ps1 -Url "视频地址"
+# 本地文件（-Url 也收路径，或用 -Path 别名）：
+powershell -ExecutionPolicy Bypass -File scripts\windows\download_subtitle.ps1 -Path "D:\视频\clip.mp4"
+# 直接指定，不走交互提问：
+powershell -ExecutionPolicy Bypass -File scripts\windows\download_subtitle.ps1 -Url "视频地址" -TargetLanguage de -SubtitleMode target
 # 不生成学习笔记：加 -NoSummary
 ```
 

@@ -140,11 +140,12 @@ Double-click the desktop `下载并加字幕.bat`. If the clipboard contains a v
 
 Files are written to `downloads\<video-id>\`:
 
-- `<video-id>_bilingual.srt` — source first, then the translation; ready to import into a player
-- `<video-id>_source.srt` — source-only SRT for review
-- `<video-id>_learning_guide.md` — Chinese overview, dialogue flow, expressions, and study steps
+- `<video-id>.<source>-<target>.bilingual.srt` — source first, then the translation; ready to import into a player
+- `<video-id>.<source>-<target>.target.srt` — translation only (monolingual)
+- `<video-id>.<source>.source.srt` — source-only SRT for review
+- `<video-id>.<source>-<target>.learning.md` — Chinese overview, dialogue flow, expressions, and study steps
 
-The fixed language policy is Chinese source → Chinese + German; German, English, and every other source language → source + Chinese. Command-line use:
+The script asks for the subtitle form (1 bilingual, the default; 2 translation only) and the target language (1 English, the default for Chinese videos; 2 German). Default targets: Chinese source → English, every other source → Chinese; an explicitly chosen target is never overridden by language detection. All three SRT variants are written every run, and the file names carry the language pair, so switching target or form never overwrites an earlier result and never re-runs ASR. The realtime pipeline's Chinese → German pair (`LANGUAGE_PAIRS`) is unchanged. Command-line use:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\windows\download_subtitle.ps1 -Url "video URL"

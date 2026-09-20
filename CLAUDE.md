@@ -88,7 +88,7 @@ config.py 同名项）。**永远不要为了适配这台机器去改 config.py*
 | `WHISPER_MODEL` / `WHISPER_DEVICE` / `WHISPER_COMPUTE_TYPE` | 显存分档 |
 | `OLLAMA_MODEL` / `GAME_MODE_OLLAMA_MODEL` | 显存分档 |
 | `CHUNK_SUBMIT_SECONDS` / `WHISPER_BEAM_SIZE` | 识别跟不上时降档 |
-| `LANGUAGE_PAIRS` / `AUTO_DETECT_LANGUAGE` 及其滞回参数 | 用户明说了要哪几种语言时 |
+| `LANGUAGE_PAIRS` / `AUTO_DETECT_LANGUAGE` 及其滞回参数 | 用户明说了要哪几种语言时（同一个源语言可以配多条，如 `("zh","en")` 和 `("zh","de")`，面板会各出一个按钮，见第 4 节第 41 条） |
 | `LOOPBACK_DEVICE_NAME` | 抓不到声音时指定设备 |
 
 **这三个键会改变"数据往哪去"，绝不能为了"让它跑起来"顺手加**：
@@ -97,6 +97,10 @@ config.py 同名项）。**永远不要为了适配这台机器去改 config.py*
 - `ALLOW_REMOTE_OLLAMA` —— 它的唯一作用就是**关掉**上面那道校验。
   程序起不来时加这一行是最省事的"解法"，也正是最坏的那个。
 - `AI_ANALYSIS_WEB_URL_TEMPLATE` —— 唯一的出网路径指向哪个站。
+- `OFFLINE_COOKIES_FILE` / `OFFLINE_COOKIES_FROM_BROWSER` —— 离线下载用的
+  **凭据**。要不要拿自己的登录态去下载受限内容是用户自己的决定，别为了
+  "让某个链接能下"顺手加上；尤其 `FROM_BROWSER` 等于把整个浏览器登录态
+  交给下载器。先说清楚再让用户点头。
 
 不确定的时候：先把要改的键和理由说出来，让用户点头，别自己代劳。
 
@@ -347,6 +351,20 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
       两个副产物结论：**电视窗只贵 0.15ms**，而且 **TV 字号 64→160 没有差别**
       ——后者证实了 `_update_bottom_anchor` 里那个"稳态留白恒为 0 就不
       setFrameFormat"的优化是真生效的（否则 160px 下整篇重排会很明显）。
+    - **离线 checkpoint「每翻一条存一次整份 rows」不用改成节流**（2026-09-10 量过）。
+      看着像 N² ——每条都把全部行序列化一遍——但常数极小。合成字幕实测
+      （单次 `persist()` 中位数 / 文件大小 / 整段累计）：
+
+      | 条数 | 目标数 | 单次保存 | 文件 | 整段累计 |
+      |---|---|---|---|---|
+      | 500 | 1 | 1.8ms | 119KB | 0.9s |
+      | 500 | 2 | 1.7ms | 155KB | 0.9s |
+      | 2000 | 1 | 3.6ms | 482KB | 7.2s |
+      | 2000 | 2 | 4.0ms | 625KB | 8.1s |
+
+      2000 条约等于一小时视频，翻译本身要几十分钟，这 8 秒是 **0.4%**。
+      改成"每 5 条存一次"省不下有意义的时间，却要拿断点进度去换（异常强退最多
+      重翻 5 条）。**别做这个优化。**
     - **`_render` 只构造要显示的句对，省下的是 0.05ms**（同日 A/B）。
       内存里攒满 `HISTORY_KEEP=50` 条、上屏上限 20 条的稳态下：全构造再切
       p50 0.65ms，只构造 20 条 p50 0.60ms。改动本身语义等价、留着没坏处，
@@ -664,13 +682,170 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     行**上，按 `SOURCE_LANGUAGE`(zh) 去查会让 prompt 变成"你是中文汉词典。
     简明解释中文单词 Kameraqualität"。现在按被点词的字符集判（`lookup_language_for`）。
 
+35. **☠️ 语言这件事有两条"单一入口"，都别绕。**（2026-09-10 审核 B01/B03）
+    - **配置怎么解析**：`realtime_subtitle/language_policy.py`。UI 面板和识别
+      线程都问它。以前两边各写一份，同一份 config_local.py（`LANGUAGE_PAIRS`
+      为空 + 老的 `LANGUAGE_CYCLE`）下后台有两个语言对、面板一个按钮都没有，
+      恢复上次选的源语言时 allowed 集合也是空的——**用户从面板改不动语言，
+      而且没有任何报错**。它不许 import Qt/requests/translator_queue
+      （面板要在 QApplication 之前读它，识别线程也不能因此把 PyQt5 拉进
+      导入链，见第 1 条），`test_language_policy.py` 用 AST 扫 import 盯着。
+    - **切换请求走哪条路**：一律 `request_switch_language`，
+      "要不要真切"只能在 `_apply_pending_lang_switch` 里判。
+      ☠️ **不要在 UI 层写 `if src == config.SOURCE_LANGUAGE: return`**：
+      config 只在后台的 ASR 批边界之后才变，「德语→点英语→再点德语」里
+      第二次点击那一刻 config 还是 de，于是被当成"没变化"扔掉，最终停在
+      英语——用户最后一次选择静默失效。语言和来源（manual/auto/rescue）
+      是一个请求整体，在同一把 `_asr_lock` 内一次写完、一次取完清空——
+      ☠️ `_apply_pending_lang_switch` 跑在锁外且很慢（clear_context），
+      **它不许读写 `_pending_lang_source`**：这期间入队的是下一条请求，
+      在那里清一次等于清掉别人的来源（一条 auto 被消费成 manual）；
+      给那行加锁也不对，它本来就没资格动别人的请求。
+      `_apply_pending_lang_switch` 的返回值是"真切了吗"，只有真切了才允许
+      丢掉那一批切换前的音频。`test_language_switch_requests.py` 盯着这些。
+
+36. **☠️ 译文内容永远不是控制信号，它最多只能产出"建议人工复核"。**
+    （2026-09-10 审核 B02，两轮才修对）
+
+    `offline.py` 第一版判据是子串黑名单（"法律法规"/"政治敏感"/"无法完成"/
+    "不能生成"）：一句完全合法的译文「我们必须遵守法律法规。」被判成模型拒答
+    → 重试 → 换模型 → 仍然失败，**整段视频停在那一条上**，而模型一直在
+    正常干活。
+
+    第二版换成"锚在开头的整句拒答模式 + 长度上限"，**仍然是错的**：
+    原文 "Es tut mir leid, ich kann dir nicht helfen." 的正确译文就是
+    「抱歉，我不能帮你。」，和模型拒答的字面**可以完全相同**，改成 fullmatch
+    也消除不了这个歧义。日常对白里这种句子很常见。
+
+    现在 `_looks_like_refusal()` 只用来给那一行打 `needs_review` 标记 + 打一行
+    提示，**不参与失败判定、不触发重试、不换模型**。失败判据全部是结构化的：
+    空响应 / 服务 error / `done=False` / 被 `length` 截断（都在
+    `_ollama_request` 里）。取舍是明写的：**宁可留一条可能是拒答的怪译文，
+    也不能让整片失败**。别再加更大的黑名单，也别引入第二个模型来判拒答——
+    代价和收益完全不对等。`tests/test_offline.py` 的参数化用例盯着这五组。
+
+37. **☠️ 离线缓存的身份必须描述"产生它的那次请求"。**（2026-09-10 审核 B04/B05）
+    - **ASR 指纹按"用户请求的模式"算，不按识别结果算**。`auto` 那次传给
+      Whisper 的是 `language=None`、没有 seed prompt；强制 `de` 那次传的是
+      `language="de"` + de 的 seed prompt——**两次是不同的解码**。以前拿检测
+      结果当指纹，等于让 auto 的产物冒充"用过 de 参数"，用户明确指定 de 之后
+      拿到的还是上次自动识别的老结果。checkpoint 里 `requested_source_language`
+      和 `detected_source_language` 分开存，谁也不许冒充谁。
+    - **checkpoint schema 是 v2**；v1 没有 requested 字段，无从判断能不能复用，
+      一律作废重识别一次。只作废缓存，不动已下载的媒体。
+    - **坏缓存要作废，不许悄悄夹紧时间把它"修好"**。`load_checkpoint` 现在
+      要求每条 `0 ≤ start < end` 且起点不倒退——以前只查"是不是有限数"，
+      于是 start=9/end=-1 照收，导出的 SRT 是反向时间轴（播放器里字幕整段
+      消失，日志里一切正常）。☠️ 但**不要禁止字幕重叠**：上一条没消失下一条
+      已开始是合理的，一律禁止会把好缓存判成坏的。
+    - **翻译缓存按 (source,target) 分开存**（checkpoint 的 `translations` 表），
+      ASR 结果跨目标共享。切目标语言不重跑 ASR，切回去也不重翻。
+      **字幕模式不进任何缓存身份**——它只是渲染，双语切单语不许触发模型。
+      ☠️ `translate_segments.persist()` 每次落盘必须**同时**更新 `rows` 和当前
+      语言的 `translations[src-tgt]`。只写 rows 的话，磁盘上"行里有译文、表里
+      是空的"，下次 `restore_translations` 以空表为准把已翻好的行清掉重翻——
+      **断点等于白存，而且只在失败/中断路径上暴露**，正常跑完那次看不出来。
+    - **只跑这次任务需要的阶段**：`subtitle_mode="source"` 不调翻译服务
+      （用户只要原文，不该被 Ollama 挂掉阻断）；没有译文就不写 target/bilingual
+      那两份，返回值里也不指向不存在的文件。`source + summary` 会尝试翻译
+      （笔记要原文译文成对），但翻译失败只跳过笔记，不撤销已完成的原文字幕。
+    - 导出名带语言标签（`{id}.{src}-{tgt}.bilingual.srt` 等），英文和德文成果
+      各存各的。三种模式每次一起导出，用户改主意不必重跑。
+      ⚠️ 这次改名之后，`downloads/` 里旧的 `<id>_bilingual.srt` 不会再被更新，
+      也不会被删——旧文件留在原地，新的用新名字。
+
+38. **☠️ 离线管线分成"导入"和"处理"两层，边界不许漏。**（2026-09-10 批次 3）
+    - `plan_media()` / `resolve_media()` 是**唯一碰网站的地方**：yt-dlp、登录、
+      限流重试、平台规则全在这一层。`process_media()` 拿到的是一份已经在本地的
+      `MediaSource`，之后 ASR / 翻译 / 导出里**不许出现"如果是小红书就……"**。
+      本地文件导入走的就是同一条 `process_media`，只是不下载。
+    - **本地文件不伪装成网站链接**：`extractor="local"`，身份是**整个文件内容**
+      的 SHA-256（`local_media_fingerprint`），不是文件名。文件**就地引用，
+      不复制不改名**。
+      ☠️ 别改回采样（只读首尾各 1MB）——那正是 v1 的 bug：1–2MiB 的文件后半段
+      根本没参与哈希，更大的文件中间整段没参与，保持大小改盲区字节就得到同一个
+      ID，于是**内容变了却复用旧字幕**。代价是真要读一遍文件（大文件是秒级），
+      比静默给错字幕便宜得多。指纹带 `v2_` 前缀，v1 的采样 ID 不会被继承。
+      也别拿 mtime 顶替内容校验：复制/解压会改它，覆盖写可能不改。
+    - **来源路径不参与本地身份判定**：`checkpoint_asr_usable` 对本地任务不比
+      `source_url`（a.mp4 改名 b.mp4 不是另一个视频，不该重跑 ASR、更不该
+      连带丢掉多目标翻译表）。`origin` 只是"从哪来的"，会被更新。
+    - **元信息里的"未知"不等于"没有"**：`acodec` 缺字段或为 `None` 是未知，
+      只有**每一路** format 都给出明确无音频证据才在下载前判成图文帖；有一个
+      未知就留给下载后的 ffprobe。`f.get("acodec") or "none"` 这种写法会把
+      三态压成两态，正常视频会被误杀。
+    - **下载回来的身份必须和上锁时的身份一致**：传了 `info` 只省掉
+      `download_video` 里那次显式只读解析，下载本身仍会解析，返回的 id/extractor
+      可能不同。不校验就会"锁着 A 目录、往 B 目录写"（B 不存在时是裸的
+      FileNotFoundError，存在时更糟——没持它的锁就动它）。不一致就带原因停下。
+    - ☠️ **下载必须在任务锁之内**。锁的位置取决于任务目录，任务目录又要先识别
+      才知道，所以顺序是：冻结选项 → 只读识别（`plan_media`，不下载）→ 上锁 →
+      `plan.fetch()` 下载 → `process_media(..., lock_held=True)`。整个任务只上
+      一次锁，中途不放开。重构时最容易把下载挪到锁外面，
+      `test_download_happens_inside_the_job_lock` 盯着这件事。
+    - **导入失败绝不能走到 ASR**：合集/播放列表、图文帖（所有 format 的
+      `acodec` 都是 none）、没有音轨的文件，都在导入阶段带原因失败。
+    - `TaskOptions` 是 frozen 的：这些值会进缓存指纹和导出名，中途被改一下就会
+      出现"指纹按 A 算、文件按 B 写"的错位。
+
+39. **☠️ 分享文案里抠链接：`https?://\S+` 是错的。**（2026-09-10 批次 4）
+    中文标点**不是空白字符**，所以
+    「打开【小红书】App查看！ http://xhslink.com/a/AbC123，快去看」
+    会被抠成 `http://xhslink.com/a/AbC123，快去看`——整句后半段跟着进了 URL。
+    规则只有一份：`offline.extract_share_urls()`，按"URL 合法字符"正向匹配，
+    撞到 CJK/全角标点就停；PowerShell 通过
+    `download_subtitle.py <文案> --list-urls` 调它，**别在 .ps1 里再写一套正则**。
+    两个必须保住的细节：查询串里的 `xsec_token=...` 要完整保留（分享链接的
+    一部分，掉了就打不开）；URL 自带的成对括号不能当句末标点剥掉。
+
+    **本机装的 yt-dlp 对小红书的支持范围**（`XiaoHongShuIE._VALID_URL`，
+    2026.08.19）：只认 `www.xiaohongshu.com/explore/<id>` 和
+    `/discovery/item/<id>`。**短链 `xhslink.com` 不在里面**，要靠 generic
+    extractor 跟跳转——这一条**没有真实链接验证过**，别对外说"支持小红书"。
+    `test_offline_platform.py` 把这个支持范围钉住了，改 yt-dlp 版本后它会提醒你。
+
+40. **平台失败要给出路，不要甩英文栈。**（2026-09-10 批次 4）
+    登录/私密/地区/限流/不支持/失效这几类都翻成中文并**指向本地导入**——
+    本地文件不联网、不需要登录，是权限问题唯一确定可用的出路。原始英文报错
+    仍然附在后面（贴 issue 要用）。加新的失败类型往 `_DOWNLOAD_HINTS` 里加，
+    别在调用点各写各的。
+
+41. **☠️ 实时链路里源语言和目标语言是两个独立的值。**（2026-09-10 批次 5，审核 F03）
+    `LANGUAGE_PAIRS` 允许同一个源语言配多条（`zh→en` 和 `zh→de`），所以：
+    - **面板按钮的键是 `(source, target)` 整对**，不是源语言。按源语言索引时
+      后一个按钮会把前一个从字典里挤掉，面板上只剩一个、而且切不了目标语言。
+    - **切换请求带完整的 `(source, target, origin)`**；只传源语言的话后台只能
+      `target_for()` 查到第一条，第二个按钮永远切不上。
+    - **tuning 两个键都要存**（`SOURCE_LANGUAGE` + `TARGET_LANGUAGE`），恢复时
+      按整对校验；配置改过、这一对不存在了才退回该源语言的默认目标。
+
+    **自动检测只改源语言，不覆盖用户显式选过的目标**（`language_policy.resolve_target`）。
+    "是不是显式的"不另外存状态位——存了很容易和 config 走散——判据就是
+    "和 `target_for(source)` 的默认值不一样"。但显式目标也得讲得通：中文下
+    选了德语、随后自动检测切到德语时，保持德语就成了德→德（模型把原句抄
+    一遍，见 `_apply_pending_lang_switch`），这种情况退回默认。
+
+42. **☠️ 跨语言的旧事件要在**最后消费的地方**拦，不能在发出前拦。**
+    （2026-09-10 批次 5，审核 O04）
+    翻译 worker 是「拿 `_tx_lock` 查代数 → 放锁 → 回调 UI」。查完到真正回调
+    之间锁是放开的，中间可以插进一次语言切换，于是旧语言的句对落在新语言的
+    画面上。发出前再查一次代数**关不掉这个窗口**——判据必须跟着事件走。
+    现在 `_lang_revision` 只在真正生效的切换时 +1，随 `on_pair`/`on_draft`
+    一起发出（`_emit_pair`/`_emit_draft`），Qt 槽 `_add_pair`/`_update_draft`
+    用 `_is_stale_language()` 拒收代数更旧的。
+    靠的是 **Qt 队列连接保序**：同一线程发出的事件按发出顺序到主线程，所以
+    "语言已切换"先到、旧句对随后到 → 被拒；反过来（切换前发出的最后一条
+    旧语言字幕先到）应当照常显示，别矫枉过正。加新的 UI 事件时一起带上代数。
+
 ## 5. 目录地图
 
 ```
 main.py               入口：接线各模块、热键注册、单实例守卫（import 顺序敏感！）
 download_subtitle.py  离线视频处理入口：下载 → 识别 → 双语 SRT → 学习笔记
 realtime_subtitle/paths.py    运行时文件落点的唯一真相源（REPO_ROOT/repo_path，见第4节第28条）
-realtime_subtitle/offline.py  离线批处理实现；字幕源语言先显示，翻译逐条调用本地 Ollama
+realtime_subtitle/language_policy.py  语言对配置的唯一解析入口（UI+识别线程共用，零 Qt 依赖，见第4节第35条）
+realtime_subtitle/offline.py  离线批处理实现；导入层(plan_media/resolve_media，唯一碰网站)
+                      与处理层(process_media，只认本地媒体)分开，见第4节第38条
 realtime_subtitle/capture/audio_capture.py      WASAPI Loopback 采集 + 设备热切换
 realtime_subtitle/asr/streaming_asr.py      local agreement 增量识别（词级前缀提交）
 realtime_subtitle/translate/translator_queue.py   Whisper/Ollama 持有者：切句、翻译队列、草稿、术语表
