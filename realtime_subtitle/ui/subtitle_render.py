@@ -266,13 +266,13 @@ class LiveTextRenderMixin:
         content_h = self.window.height() - 34
         doc_y0 = content_y0 + max(0, content_h - doc.size().height())  # AlignBottom
         hit = doc.documentLayout().hitTest(
-            QPointF(lp.x() - content_x0, lp.y() - doc_y0), Qt.ExactHit)
+            QPointF(lp.x() - content_x0, lp.y() - doc_y0), Qt.HitTestAccuracy.ExactHit)
         if hit < 0:
             return  # 点在空白处
 
         cursor = QTextCursor(doc)
         cursor.setPosition(hit)
-        cursor.select(QTextCursor.WordUnderCursor)
+        cursor.select(QTextCursor.SelectionType.WordUnderCursor)
         word = cursor.selectedText().strip(".,!?…:;\"'«»()")
         # 只查拉丁字母词（德语/英语）；点到中文/数字/空白不弹窗
         if len(word) < 2 or not all(c.isalpha() and ord(c) < 0x2E80 for c in word):

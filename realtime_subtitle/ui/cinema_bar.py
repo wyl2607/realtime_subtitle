@@ -40,16 +40,16 @@ class CinemaBar(QWidget):
         self.setWindowTitle("🎞 影院字幕条")
         # Tool 而不是 Window：不进任务栏/Alt+Tab（它是覆盖层不是应用窗口）
         self.setWindowFlags(
-            Qt.FramelessWindowHint
-            | Qt.WindowStaysOnTopHint
-            | Qt.Tool
-            | Qt.WindowDoesNotAcceptFocus
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowDoesNotAcceptFocus
         )
-        self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         # Qt 层的穿透（跨平台兜底）；Windows 上真正生效的是 show() 里那道
         # WS_EX_TRANSPARENT，两道都设是因为 Qt 这条在部分合成路径下不可靠
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
 
         self.screen_index = None  # None = 跟随主字幕窗所在屏
         self._ct_applied = False  # 原生穿透标志是否已经打上（只需一次）
@@ -61,8 +61,8 @@ class CinemaBar(QWidget):
 
         self.german_label = self._make_label(german=True)
         self.chinese_label = self._make_label(german=False)
-        layout.addWidget(self.german_label, 0, Qt.AlignHCenter | Qt.AlignBottom)
-        layout.addWidget(self.chinese_label, 0, Qt.AlignHCenter | Qt.AlignBottom)
+        layout.addWidget(self.german_label, 0, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom)
+        layout.addWidget(self.chinese_label, 0, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom)
         self.setLayout(layout)
 
         # 静默淡出计时器：每来一句就重置，超时把两行都清掉
@@ -75,10 +75,10 @@ class CinemaBar(QWidget):
     @staticmethod
     def _make_label(german):
         lb = QLabel("")
-        lb.setAlignment(Qt.AlignCenter)
+        lb.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lb.setWordWrap(True)
-        lb.setTextFormat(Qt.PlainText)  # 字幕是纯文本，别让 < > 被当标签解析
-        lb.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        lb.setTextFormat(Qt.TextFormat.PlainText)  # 字幕是纯文本，别让 < > 被当标签解析
+        lb.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         lb.hide()  # 没内容时整行不占位，也不显示空底衬
         return lb
 

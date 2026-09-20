@@ -159,11 +159,11 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         self.container = ResizableFramelessWidget()
         self.container.setWindowTitle("实时字幕")
         self.container.setWindowFlags(
-            Qt.WindowStaysOnTopHint |
-            Qt.FramelessWindowHint |
-            Qt.Tool
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.Tool
         )
-        self.container.setAttribute(Qt.WA_TranslucentBackground)
+        self.container.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
         # 创建按钮样式
         button_style = """
@@ -248,13 +248,13 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         # 在 _on_container_resize 里手动 setGeometry 铺满，窗口大小完全归用户
         self.window = QLabel(self.container)
         self._apply_styles()
-        self.window.setAlignment(Qt.AlignLeft | Qt.AlignBottom)
+        self.window.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom)
         self.window.setWordWrap(True)
-        self.window.setTextFormat(Qt.RichText)  # live行灰色尾部/双层显示需要富文本
+        self.window.setTextFormat(Qt.TextFormat.RichText)  # live行灰色尾部/双层显示需要富文本
         self.window.setText("🎬 等待音频输入...")
         # 字幕标签铺满后会挡住容器的 mouse*Event → 拖动失灵。
         # 设为鼠标穿透后：拖动/点词/滚轮都由容器统一收；点词仍用容器坐标映射回标签
-        self.window.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.window.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.container.setMinimumSize(360, 140)
 
         # 顶部拖动条：视觉上像系统标题栏；真正拖动由 WM_NCHITTEST→HTCAPTION 完成
@@ -263,8 +263,8 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         self.drag_bar = QLabel("⠿  实时字幕  ·  拖这里移动", self.container)
         self.container.drag_bar = self.drag_bar
         self.drag_bar.setFixedHeight(ResizableFramelessWidget.DRAG_BAR_HEIGHT)
-        self.drag_bar.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.drag_bar.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.drag_bar.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.drag_bar.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.drag_bar.setStyleSheet("""
             QLabel {
                 background-color: rgba(28, 28, 28, 210);
@@ -281,7 +281,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         # 模式常驻指示器（左上角）：不接 _set_controls_visible 的 hover 淡入淡出，
         # 一直显示当前模式——用户要能随时一眼看出现在是哪套参数在跑
         self.mode_indicator = QLabel("⚙️ 自定义", self.container)
-        self.mode_indicator.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.mode_indicator.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.mode_indicator.setStyleSheet("""
             QLabel {
                 background-color: rgba(20, 20, 20, 210);
@@ -296,7 +296,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
 
         # 鼠标穿透常驻指示器：穿透时 hover 全失效，必须无条件常显（不走 _set_controls_visible）
         self.ct_indicator = QLabel("👻 Ctrl+Alt+M 恢复", self.container)
-        self.ct_indicator.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.ct_indicator.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.ct_indicator.setStyleSheet("""
             QLabel {
                 background-color: rgba(20, 20, 20, 210);
@@ -334,7 +334,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         self._drag_fade = QPropertyAnimation(self._drag_opacity, b"opacity", self.container)
         self._btn_fade = QPropertyAnimation(self._btn_opacity, b"opacity", self.container)
         for anim in (self._drag_fade, self._btn_fade):
-            anim.setEasingCurve(QEasingCurve.OutCubic)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         # 只连一条 finished：两动画时长相同，idempotent 隐藏即可
         self._btn_fade.finished.connect(self._on_chrome_fade_finished)
 
@@ -910,15 +910,15 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
 
         box = QMessageBox(self.container)
         box.setWindowTitle("发送到外部 AI？")
-        box.setIcon(QMessageBox.Warning)
+        box.setIcon(QMessageBox.Icon.Warning)
         box.setText(text)
-        box.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
         # ☠️ 默认落在「取消」上：这个框是回车/空格键很容易顺手撞到的，
         # 而误触的后果是内容真的发出去了，不可撤销
-        box.setDefaultButton(QMessageBox.Cancel)
-        box.button(QMessageBox.Yes).setText("发送并打开网页")
-        box.button(QMessageBox.Cancel).setText("取消")
-        return box.exec_() == QMessageBox.Yes
+        box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        box.button(QMessageBox.StandardButton.Yes).setText("发送并打开网页")
+        box.button(QMessageBox.StandardButton.Cancel).setText("取消")
+        return box.exec() == QMessageBox.StandardButton.Yes
 
     def _quit_application(self):
         """退出程序"""
@@ -929,11 +929,11 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
             self.container,
             '退出确认',
             '确定要退出实时字幕程序吗？',
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
         )
         
-        if reply == QMessageBox.Yes:
+        if reply == QMessageBox.StandardButton.Yes:
             print("\n👋 用户点击退出按钮")
             print("   正在关闭程序...")
             self.app.quit()
@@ -949,4 +949,4 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         必须在主线程调用
         """
         print("🎬 字幕窗口事件循环启动")
-        sys.exit(self.app.exec_())
+        sys.exit(self.app.exec())

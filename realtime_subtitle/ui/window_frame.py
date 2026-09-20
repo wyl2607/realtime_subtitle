@@ -23,7 +23,7 @@ class DraggableWidget(QWidget):
 
     def mousePressEvent(self, event):
         """鼠标按下 - 开始拖动"""
-        if event.button() == Qt.LeftButton:
+        if event.button() == Qt.MouseButton.LeftButton:
             self.dragging = True
             self.drag_position = event.globalPos() - self.frameGeometry().topLeft()
             self._press_global = event.globalPos()
@@ -32,7 +32,7 @@ class DraggableWidget(QWidget):
     def mouseMoveEvent(self, event):
         """鼠标移动 - 拖动窗口（钳制在屏幕可用区域内。
         实测能把窗口拖出屏幕顶部，按钮行被切一半就再也够不着了）"""
-        if self.dragging and event.buttons() == Qt.LeftButton:
+        if self.dragging and event.buttons() == Qt.MouseButton.LeftButton:
             target = event.globalPos() - self.drag_position
             screen = QApplication.screenAt(event.globalPos())
             if screen:
@@ -44,7 +44,7 @@ class DraggableWidget(QWidget):
 
     def mouseReleaseEvent(self, event):
         """鼠标释放 - 结束拖动；没怎么动过就当作一次单击"""
-        if event.button() == Qt.LeftButton:
+        if event.button() == Qt.MouseButton.LeftButton:
             self.dragging = False
             if (self.on_click and self._press_global is not None
                     and (event.globalPos() - self._press_global).manhattanLength() < 6):
@@ -108,9 +108,9 @@ class ResizableFramelessWidget(DraggableWidget):
         # 窗口表面都能接住鼠标（test_hittest.py 有回归测试）
         self._underlay = QWidget(self)
         self._underlay.setObjectName("hitUnderlay")
-        self._underlay.setAttribute(Qt.WA_StyledBackground, True)
+        self._underlay.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         # 底衬只负责"可命中"，不抢走拖动/点击：事件交给顶层容器处理
-        self._underlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._underlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self._underlay.setStyleSheet("#hitUnderlay { background: rgba(0, 0, 0, 2); }")
         self._underlay.lower()
 

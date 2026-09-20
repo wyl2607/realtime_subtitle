@@ -222,7 +222,7 @@ class SettingsWindow(DraggableWidget):
         # 面板按钮和"手动改参数变自定义"都通过它走那唯一一个入口
         self.on_mode_change = on_mode_change
         self.setWindowTitle("⚙️ 参数调节（可拖动）")
-        self.setWindowFlags(Qt.WindowStaysOnTopHint)
+        self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint)
 
         # 真默认快照：由 SubtitleWindow 在应用 tuning 之前拍下并传入；
         # 单测直接 new 时回退到当前 config（等同出厂若未改过）。
@@ -507,8 +507,8 @@ class SettingsWindow(DraggableWidget):
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setWidget(inner)
         self._scroll = scroll
 
@@ -567,7 +567,7 @@ class SettingsWindow(DraggableWidget):
         self._fit_label_width(label_widget)
 
         # 滑块（用round避免浮点截断，如0.01/0.001=9.999...被int截成9）
-        slider = QSlider(Qt.Horizontal)
+        slider = QSlider(Qt.Orientation.Horizontal)
         slider.setMinimum(round(min_val / step))
         slider.setMaximum(round(max_val / step))
         slider.setValue(round(current_val / step))

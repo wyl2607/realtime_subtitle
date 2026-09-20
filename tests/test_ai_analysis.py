@@ -268,13 +268,13 @@ def test_word_popup_button_click_does_not_hide_blank_does():
     assert popup.isVisible()
 
     # 点深度解释：弹窗仍在，回调收到 context
-    QTest.mouseClick(popup.deep_btn, Qt.LeftButton)
+    QTest.mouseClick(popup.deep_btn, Qt.MouseButton.LeftButton)
     app.processEvents()
     assert popup.isVisible(), "点深度解释不应关闭弹窗"
     assert deep_clicks == ["Kontextsatz."]
 
     # 点问更强的AI：同样不关
-    QTest.mouseClick(popup.web_btn, Qt.LeftButton)
+    QTest.mouseClick(popup.web_btn, Qt.MouseButton.LeftButton)
     app.processEvents()
     assert popup.isVisible(), "点网页按钮不应关闭弹窗"
     assert web_clicks == ["web-q"]

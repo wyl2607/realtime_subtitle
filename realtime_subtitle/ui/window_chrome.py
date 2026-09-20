@@ -101,7 +101,7 @@ class WindowChromeMixin:
 
     def _on_wheel(self, event):
         """Ctrl+滚轮调字号（高频操作，不该每次都开设置面板拖滑块）"""
-        if not event.modifiers() & Qt.ControlModifier:
+        if not event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             return False
         step = 1 if event.angleDelta().y() > 0 else -1
         size = max(14, min(72, config.FONT_SIZE + step))

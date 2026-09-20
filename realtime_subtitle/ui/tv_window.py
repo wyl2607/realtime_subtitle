@@ -20,7 +20,7 @@ class TVWindow(QWidget):
         super().__init__()
         self.setWindowTitle("📺 电视全屏字幕")
         # 置顶：电视/副屏上不该被任务栏或别的窗口盖住
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
         # 持久化恢复用；None = 首开走默认选屏（非主字幕窗所在屏）
         self.screen_index = None
         self._has_draft = False  # 草稿永远只占文档最后一个 block
@@ -41,7 +41,7 @@ class TVWindow(QWidget):
         self.text.viewport().installEventFilter(self)
 
         # Esc 关闭（WindowShortcut 上下文：焦点在 QTextEdit 里也生效）
-        QShortcut(QKeySequence(Qt.Key_Escape), self, activated=self.hide)
+        QShortcut(QKeySequence(Qt.Key.Key_Escape), self, activated=self.hide)
 
         # 角落操作钮：全屏无边框窗没有系统按钮，鼠标用户需要出口
         btn_style = """
@@ -143,7 +143,7 @@ class TVWindow(QWidget):
 
     def _append_block(self, escaped, draft):
         cursor = QTextCursor(self.text.document())
-        cursor.movePosition(QTextCursor.End)
+        cursor.movePosition(QTextCursor.MoveOperation.End)
         if not (cursor.atStart() and cursor.atEnd()):  # 文档非空才另起一段
             fmt = QTextBlockFormat()
             # 段间距跟字号走，远看才分得清句子
@@ -160,9 +160,9 @@ class TVWindow(QWidget):
         if not self._has_draft:
             return
         cursor = QTextCursor(self.text.document())
-        cursor.movePosition(QTextCursor.End)
+        cursor.movePosition(QTextCursor.MoveOperation.End)
         # BlockUnderCursor 连同前面的段分隔符一起选中删除
-        cursor.select(QTextCursor.BlockUnderCursor)
+        cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
         cursor.removeSelectedText()
         self._has_draft = False
 
@@ -170,7 +170,7 @@ class TVWindow(QWidget):
     # 字号
     # ------------------------------------------------------------------
     def eventFilter(self, obj, event):
-        if event.type() == QEvent.Wheel and event.modifiers() & Qt.ControlModifier:
+        if event.type() == QEvent.Type.Wheel and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             self._adjust_font(+1 if event.angleDelta().y() > 0 else -1)
             return True  # 拦掉 QTextEdit 自带 Ctrl+滚轮 zoom（不走 config 不持久化）
         return super().eventFilter(obj, event)

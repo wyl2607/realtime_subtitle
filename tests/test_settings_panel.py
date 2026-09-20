@@ -178,12 +178,12 @@ def test_settings_checkboxes_keep_keyboard_focus():
     _app()
     win = SettingsWindow()
     try:
-        assert win.chinese_only_cb.focusPolicy() != Qt.NoFocus
-        assert win.draft_cb.focusPolicy() != Qt.NoFocus
-        assert win.cinema_german_cb.focusPolicy() != Qt.NoFocus
+        assert win.chinese_only_cb.focusPolicy() != Qt.FocusPolicy.NoFocus
+        assert win.draft_cb.focusPolicy() != Qt.FocusPolicy.NoFocus
+        assert win.cinema_german_cb.focusPolicy() != Qt.FocusPolicy.NoFocus
         win.show()
         QApplication.instance().processEvents()
-        win.chinese_only_cb.setFocus(Qt.TabFocusReason)
+        win.chinese_only_cb.setFocus(Qt.FocusReason.TabFocusReason)
         QApplication.instance().processEvents()
         assert win.chinese_only_cb.hasFocus()
     finally:

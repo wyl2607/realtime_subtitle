@@ -14,8 +14,8 @@ from PyQt5.QtCore import Qt
 
 app = QApplication(sys.argv)
 w = ResizableFramelessWidget()
-w.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
-w.setAttribute(Qt.WA_TranslucentBackground)  # 和真实字幕窗一致（曾导致鼠标穿透）
+w.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
+w.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)  # 和真实字幕窗一致（曾导致鼠标穿透）
 # 放到屏幕右上角：避开可能正在运行的字幕悬浮窗（同为置顶窗口，
 # 会盖住测试窗口导致 WindowFromPoint 误判）
 # BTN_RESERVE=200 后 400 宽窗口的中心点正好压在保留区边界上，加宽保住

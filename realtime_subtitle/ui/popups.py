@@ -53,7 +53,7 @@ class HistoryWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("📜 字幕历史（本场）")
-        self.setWindowFlags(Qt.WindowStaysOnTopHint)
+        self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint)
         self.setGeometry(150, 120, 720, 560)
 
         layout = QVBoxLayout()
@@ -103,27 +103,27 @@ class _AnalysisPopupBase(QWidget):
 
     def __init__(self, max_width=420):
         super().__init__()
-        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
-        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
         self.label = QLabel()
         self.label.setWordWrap(True)
-        self.label.setTextFormat(Qt.RichText)
+        self.label.setTextFormat(Qt.TextFormat.RichText)
         self.label.setStyleSheet(_POPUP_LABEL_STYLE)
         layout.addWidget(self.label)
 
         self.deep_btn = QPushButton("🔍 深度解释")
         self.deep_btn.setStyleSheet(_POPUP_BTN_STYLE)
-        self.deep_btn.setCursor(Qt.PointingHandCursor)
+        self.deep_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.deep_btn.hide()
         self.deep_btn.clicked.connect(self._on_deep_clicked)
         layout.addWidget(self.deep_btn)
 
         self.web_btn = QPushButton("🌐 问更强的AI")
         self.web_btn.setStyleSheet(_POPUP_BTN_STYLE)
-        self.web_btn.setCursor(Qt.PointingHandCursor)
+        self.web_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.web_btn.hide()
         self.web_btn.clicked.connect(self._on_web_clicked)
         layout.addWidget(self.web_btn)
