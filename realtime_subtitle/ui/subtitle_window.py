@@ -31,7 +31,7 @@ import realtime_subtitle.config as config
 from realtime_subtitle.paths import repo_path
 from realtime_subtitle.ui.window_geometry import (
     _screen_area_at, _clamp_geo_to_area, _clamp_geo_to_any_screen,
-    default_geometry, screen_scale_factor,
+    default_geometry, screen_scale_factor, qt_hidpi_scale, rescale_state_for_dpr,
 )
 from realtime_subtitle.ui.window_frame import ResizableFramelessWidget
 from realtime_subtitle.ui.settings_window import (
@@ -491,7 +491,15 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
                 continue
             if path != STATE_FILE:
                 print("⚠️  window_state.json 损坏，已从 .bak 恢复上一份布局")
-            return data
+            # 存档记着自己是在哪个坐标空间存的。Qt5（不开 HiDPI）下 DPR 恒为
+            # 1.0，这里是纯 no-op；换到 Qt6 之后同一组数字会被当成逻辑像素，
+            # 150% 的屏上窗口和字一起涨 50%，必须换算回来（见 rescale_state_for_dpr）
+            current_dpr = qt_hidpi_scale()
+            migrated = rescale_state_for_dpr(data, current_dpr)
+            if migrated is not data and migrated.get("coord_dpr") != data.get("coord_dpr"):
+                print(f"ℹ️  显示缩放变了（存档 {data.get('coord_dpr', 1.0)} → 当前 "
+                      f"{current_dpr}），窗口布局和字号已按比例换算")
+            return migrated
         return {}
 
     @staticmethod
@@ -574,7 +582,10 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         g = self.container.geometry()
         state = {"x": g.x(), "y": g.y(), "w": g.width(), "h": g.height(),
                  "font_size": config.FONT_SIZE,
-                 "bg_opacity": config.BACKGROUND_OPACITY}
+                 "bg_opacity": config.BACKGROUND_OPACITY,
+                 # 这些数字属于哪个坐标空间。Qt5 下恒为 1.0；换到 Qt6 之后
+                 # 下次加载会拿它和当时的 DPR 比，按比例换算（见 _load_state）
+                 "coord_dpr": qt_hidpi_scale()}
         # 辅助窗：本会话显示过则写当前几何；否则保留上次文件里的值（从未显示过不写新值）
         if self._settings_ever_shown:
             sg = self.settings_window.geometry()

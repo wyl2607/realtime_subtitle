@@ -837,6 +837,33 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     "语言已切换"先到、旧句对随后到 → 被拒；反过来（切换前发出的最后一条
     旧语言字幕先到）应当照常显示，别矫枉过正。加新的 UI 事件时一起带上代数。
 
+43. **☠️ HiDPI：会在 Qt6 下坏掉的是存档，不是缩放公式、更不是命中测试。**
+    （2026-09-20 查证，PyQt6 迁移第 2 步）
+
+    第 17/24 条读起来像是"一旦开了缩放，手算像素和 WM_NCHITTEST 全要重做"。
+    逐个查过之后**两件都不成立**：
+
+    - `screen_scale_factor()` 在 Qt6 下**自己就归 1.0**，不会双重缩放。
+      Qt 接管缩放后把 `logicalDotsPerInch` 报成 96，缩放那份由 Qt 出，总倍率
+      不变。实测（PyQt5 开/关 `AA_EnableHighDpiScaling` + `QT_SCALE_FACTOR`
+      模拟 150% 屏）：Qt5@100% 报 96 / DPR 1.0；Qt5@150% 报 144 / DPR 1.0
+      （我们乘 1.5）；Qt6@150% 报 96 / DPR 1.5（Qt 乘）。**别"顺手修"成除以
+      devicePixelRatio**——那会把该有的 1.0 改成 0.67。
+      `tests/test_hidpi_scaling.py` 把这三行钉住了。
+    - `nativeEvent` 的命中测试**与 Qt 坐标空间无关**：坐标来自 `lParam`、
+      窗口矩形来自 `GetWindowRect`，两边都是 Win32 屏幕物理像素，全程没有
+      一个数来自 Qt。唯一副作用是 `RESIZE_MARGIN`/`BTN_RESERVE` 是物理像素
+      常量，高缩放屏上手感偏窄——调参问题，且 Qt5 下本来就如此。
+
+    真正会出事的是 `window_state.json`：Qt5 存的是**物理**像素，Qt6 会把同样
+    的数字当**逻辑**像素用。150% 的笔记本上窗口和字一起涨 50%，而用户完全
+    不知道发生了什么（日志里没有任何异常）。所以存档现在记 `coord_dpr`，
+    加载时和当前 DPR 比对并按比例换算（`window_geometry.rescale_state_for_dpr`）。
+    ☠️ 换算用**显式键名单**，别遍历整个 dict：`tuning` 里绝大多数值
+    （`ENERGY_THRESHOLD_SPEECH`、`CHUNK_SUBMIT_SECONDS`…）不是像素，一起乘会
+    把用户的调参毁掉。x/y 可以是负数（多屏时左边/上方那块屏），不能和尺寸
+    一样 `max(1, …)`。新增像素单位的持久化项时记得加进那份名单。
+
 ## 5. 目录地图
 
 ```

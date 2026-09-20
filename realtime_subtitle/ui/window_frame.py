@@ -166,6 +166,14 @@ class ResizableFramelessWidget(DraggableWidget):
 
         if msg.message != 0x0084:  # WM_NCHITTEST
             return False, 0
+        # ☠️ 这段命中测试**与 Qt 的坐标空间无关**，Qt6 开着 HiDPI 也不用改。
+        # 两边的数都来自 Win32：坐标是 lParam 给的屏幕物理像素，窗口矩形是
+        # GetWindowRect 给的屏幕物理像素——全程没有一个数来自 Qt。
+        # CLAUDE.md 第 17 条说"开缩放会动到命中测试"，那是针对 Qt 侧布局的
+        # 泛化担心，在本函数上不成立（2026-09-20 查证）。真正受 HiDPI 影响的
+        # 是存盘的几何与像素字号，见 window_geometry.rescale_state_for_dpr。
+        # 唯一的副作用是 RESIZE_MARGIN/BTN_RESERVE 是物理像素常量，高缩放屏上
+        # 手感偏窄——那是调参问题，不是正确性问题，而且 Qt5 下本来就如此。
         # lParam 低/高16位是带符号的屏幕物理坐标（多屏/负坐标要按short解）
         x = ctypes.c_short(msg.lParam & 0xFFFF).value
         y = ctypes.c_short((msg.lParam >> 16) & 0xFFFF).value
