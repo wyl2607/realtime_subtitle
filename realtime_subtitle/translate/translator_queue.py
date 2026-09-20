@@ -318,7 +318,7 @@ class LanguageVote:
 def describe_language_config_source(exists=None, text=None):
     """自动检测开关是仓库默认还是 config_local 覆盖。只读文本，不 exec。"""
     if exists is None:
-        from pathlib import Path
+        # REPO_ROOT 本身就是 Path（见 paths.py），不需要再 import pathlib.Path
         from realtime_subtitle.paths import REPO_ROOT
         path = REPO_ROOT / "config_local.py"
         exists = path.is_file()

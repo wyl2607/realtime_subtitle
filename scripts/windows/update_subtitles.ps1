@@ -6,7 +6,8 @@
 # 更新后需要重启字幕（停止字幕.bat → 启动字幕.bat）才生效。
 # ============================================================
 param(
-    [switch]$Mirror  # 大陆网络：依赖同步走清华 PyPI 镜像（与 install.ps1 同参数）
+    [switch]$Mirror,  # 大陆网络：依赖同步走清华 PyPI 镜像（与 install.ps1 同参数）
+    [switch]$Prune    # 顺手卸载掉已经不在依赖清单里的包（见 scripts\prune_venv.py）
 )
 $ErrorActionPreference = "Stop"
 # Repo root (this file lives in scripts/windows/)
@@ -105,6 +106,23 @@ if ($needDeps) {
         exit 1
     }
     Write-DepsFingerprint -RepoRoot $RepoRoot -Tier $tier
+}
+
+# ☠️ 指纹只认 requirements.txt 的**文本**，而 `pip install -r` 从不卸载东西：
+# 从清单里删掉一行之后，那个包和它拖来的传递依赖会在已装好的机器上永远留着
+# （2026-09-20 本机实测 34 个，venv 4.0GB）。它们不会被 import，但会让 pip list
+# 和排障时的判断持续跑偏。默认只提示不动手——卸载是不可逆的，不该在"点一下
+# 更新"的流程里悄悄发生；真要清就显式加 -Prune。
+if ($needDeps -or $Prune) {
+    $vpy = "$RepoRoot\venv\Scripts\python.exe"
+    $pruner = "$RepoRoot\scripts\prune_venv.py"
+    if ((Test-Path $vpy) -and (Test-Path $pruner)) {
+        if ($Prune) {
+            & $vpy $pruner --yes
+        } else {
+            & $vpy $pruner --check
+        }
+    }
 }
 
 $changed = @()
