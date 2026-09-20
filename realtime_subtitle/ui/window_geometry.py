@@ -2,7 +2,7 @@
 窗口几何工具：屏幕定位 + 坐标钳制 + 首次运行的默认布局。
 被 popups.py（WordPopup 定位）和 subtitle_window.py（主窗/辅助窗定位）共用。
 """
-from PyQt5.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication
 
 import realtime_subtitle.config as config
 def _screen_area_at(global_pos):
@@ -24,7 +24,7 @@ def _clamp_geo_to_area(x, y, w, h, area):
 
 def _clamp_geo_to_any_screen(x, y, w, h):
     """按窗口中心/左上角找屏，钳进该屏；无屏则原样返回。"""
-    from PyQt5.QtCore import QPoint
+    from PyQt6.QtCore import QPoint
     screen = (QApplication.screenAt(QPoint(x + w // 2, y + h // 2))
               or QApplication.screenAt(QPoint(x, y))
               or QApplication.primaryScreen())
@@ -56,25 +56,28 @@ def default_geometry(area_x, area_y, area_w, area_h, scale=1.0):
 def screen_scale_factor():
     """**我们自己**还需要乘多少（逻辑 DPI / 96），限制在 1.0–2.0。
 
-    ☠️ 本项目所有字号都是像素单位（`setPixelSize` / 样式表 `font-size: Npx`），
-    而 Qt5 的 AA_EnableHighDpiScaling 是默认关闭的——悬浮窗是无 QLayout 的手动
-    setGeometry 布局 + WM_NCHITTEST 原生命中测试，全局开缩放会改坐标空间、
-    动到命中测试（见 CLAUDE.md 第 17 条），风险远大于收益。
-    代价是在 150% 缩放的笔记本上（笔记本几乎都不是 100%）字会小三分之一。
-    折中：首次运行时按这个倍率放大默认字号和默认窗口尺寸，用户之后
-    Ctrl+滚轮调过就以他调的为准。按钮条等 chrome 的字号仍未跟随缩放。
+    历史：本项目所有字号都是像素单位（`setPixelSize` / 样式表 `font-size: Npx`），
+    而 Qt5 的 HiDPI 默认关闭，150% 的笔记本上字会小三分之一。于是首次运行时
+    用这个倍率放大默认字号和默认窗口尺寸（用户 Ctrl+滚轮调过就以他调的为准）。
 
-    ☠️ **这个公式在 Qt6 下不需要改，别"顺手修"成除以 devicePixelRatio。**
-    Qt 接管缩放之后会把 logicalDotsPerInch 报成 96，本函数自动归 1.0，
-    缩放那份由 Qt 出——总倍率仍然是 1.5，不会双重缩放。本机实测
-    （PyQt5 开/关 AA_EnableHighDpiScaling + QT_SCALE_FACTOR 模拟 150% 屏）：
+    ☠️ **Qt6 下它已经恒等于 1.0 了，而且这是对的，别去"修"它。**
+    Qt6 的 HiDPI 关不掉，缩放全部落进 devicePixelRatio，`logicalDotsPerInch()`
+    被钉在基线不动。本机 PyQt6 6.11 / Qt 6.11 实测——注意 **QT_FONT_DPI 也一样
+    进 DPR**，也就是说 Qt6/Windows 上根本没有让 logicalDPI 偏离基线的路子：
 
-        Qt5 @100%   logicalDPI 96    DPR 1.0   本函数 1.00
-        Qt5 @150%   logicalDPI 144   DPR 1.0   本函数 1.50   ← 我们乘
-        Qt6 @150%   logicalDPI 96    DPR 1.5   本函数 1.00   ← Qt 乘
+        无环境变量           logicalDPI 96   DPR 1.0   本函数 1.00
+        QT_SCALE_FACTOR=1.5  logicalDPI 96   DPR 1.5   本函数 1.00   ← Qt 乘
+        QT_FONT_DPI=144      logicalDPI 96   DPR 1.5   本函数 1.00   ← Qt 乘
 
-    tests/test_hidpi_scaling.py 把这三行钉住了。真正会在 Qt6 下坏掉的不是
-    这个函数，是**存盘的几何和像素字号**——见 qt_hidpi_scale/rescale_state_for_dpr。
+    所以放大那份由 Qt 出，总倍率不变，**不存在双重缩放**。函数留着是兜底
+    （别的平台/未来的 Qt 若真报了非基线 logicalDPI，它仍然给出合理值），
+    留着的代价是零——返回 1.0 就是不乘。
+    ☠️ 千万别"顺手修"成除以 devicePixelRatio：那会把该有的 1.0 改成 0.67，
+    于是 Qt 放大 1.5 倍、我们缩小 1.5 倍，首次运行的字号回到没缩放的大小。
+    tests/test_hidpi_scaling.py 钉的就是「缩放只进 DPR、不进 logicalDPI」这条。
+
+    真正会在 Qt6 下坏掉的不是这个函数，是**存盘的几何和像素字号**
+    ——见 qt_hidpi_scale/rescale_state_for_dpr。
     """
     screen = QApplication.primaryScreen()
     if screen is None:
@@ -89,9 +92,9 @@ def screen_scale_factor():
 def qt_hidpi_scale():
     """Qt **已经替我们做掉**的那部分缩放（主屏 devicePixelRatio）。
 
-    Qt5 不开 AA_EnableHighDpiScaling 时恒为 1.0，Qt6 的 HiDPI 关不掉，
-    150% 的屏上是 1.5。存盘时要把它一起记下来：同一组数字在两个坐标空间里
-    含义不同（1054 在 Qt5 下是 1054 物理像素，在 Qt6 @150% 下是 1581 物理像素）。
+    Qt6 的 HiDPI 关不掉，150% 的屏上这里是 1.5（Qt5 时代恒为 1.0）。存盘时要把
+    它一起记下来：同一组数字在两个坐标空间里含义不同（1054 在 Qt5 下是 1054
+    物理像素，在 Qt6 @150% 下是 1581 物理像素）。
     """
     screen = QApplication.primaryScreen()
     if screen is None:
@@ -122,8 +125,8 @@ def rescale_state_for_dpr(state, current_dpr, saved_dpr=None):
     而且用户完全不知道发生了什么（日志里也没有任何异常）。
 
     老存档没有 coord_dpr 字段，一律按 1.0 算——本项目只支持 Windows
-    （pyaudiowpatch 连 linux 轮子都没有），而 Windows 上不开 AA_EnableHighDpiScaling
-    时 devicePixelRatio 恒为 1.0，所以这个假设对历史存档是准确的。
+    （pyaudiowpatch 连 linux 轮子都没有），而写下那些存档的是 Qt5、且 Qt5 的
+    HiDPI 默认关着，devicePixelRatio 恒为 1.0，所以这个假设对历史存档是准确的。
 
     ⚠️ 只按主屏的 DPR 算。多屏各自缩放不同时，窗口落点可能偏——但随后
     _clamp_geo_to_any_screen 会把它拽回某块屏内，不会丢窗。

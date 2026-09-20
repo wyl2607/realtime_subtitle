@@ -7,11 +7,12 @@
 本窗不需要自己的信号层。
 """
 import html
-from PyQt5.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QTextEdit, QPushButton, QShortcut,
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QTextEdit, QPushButton,
 )
-from PyQt5.QtCore import Qt, QEvent, QTimer
-from PyQt5.QtGui import QTextCursor, QTextBlockFormat, QKeySequence
+from PyQt6.QtCore import Qt, QEvent, QTimer
+# QShortcut 在 Qt6 里从 QtWidgets 搬到了 QtGui（它不是控件，本来就不该在那）
+from PyQt6.QtGui import QTextCursor, QTextBlockFormat, QKeySequence, QShortcut
 import realtime_subtitle.config as config
 class TVWindow(QWidget):
     """全屏滚动大字窗：新句从底部进入自动上滚；上翻回看时不打扰。"""

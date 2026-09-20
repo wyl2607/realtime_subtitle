@@ -26,8 +26,8 @@
 import sys
 import ctypes
 
-from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel
-from PyQt5.QtCore import Qt, QTimer
+from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel
+from PyQt6.QtCore import Qt, QTimer
 
 import realtime_subtitle.config as config
 
@@ -262,10 +262,10 @@ class CinemaBar(QWidget):
     def showEvent(self, event):
         """每次显示都重算几何：两次打开之间用户可能改了分辨率/插拔了显示器。
 
-        ☠️ 这里**不要**改成监听屏幕变更事件。PyQt5 没有暴露任何 screen 相关的
+        ☠️ 这里**不要**改成监听屏幕变更事件。PyQt6 没有暴露任何 screen 相关的
         QEvent（`hasattr(QEvent, "ScreenChangeInternal")` 是 False，`dir(QEvent)`
         里一个带 screen 的都没有），写了就是在 changeEvent 里访问不存在的属性
-        抛 AttributeError——而 **PyQt5 对虚函数重写里的未捕获异常是直接
+        抛 AttributeError——而 **PyQt6 对虚函数重写里的未捕获异常是直接
         abort() 整个进程**，不是往上抛。表现为退出码 127、连 traceback 都没有，
         本项目 2026-08-28 加这个窗时就这么崩过一次，测试跑到 90% 直接消失。
         真要跟随热插拔，用 QApplication.screenAdded/screenRemoved 信号。

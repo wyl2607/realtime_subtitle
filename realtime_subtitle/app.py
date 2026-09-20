@@ -52,18 +52,24 @@ os.environ['PYTHONWARNINGS'] = 'ignore'
 # faster-whisper的真实报错也被吞掉了，排障时什么都看不到
 logging.basicConfig(level=logging.ERROR)
 
-# ⚠️ 导入顺序是生死攸关的：torch 的 c10.dll 必须在任何 PyQt5 导入【之前】
-# 完成初始化，否则 OSError WinError 1114（DLL初始化例程失败），实测100%复现。
-# 现在窗口先显示、模型在后台线程加载（translator 构造被推迟了），所以这里
-# 显式先 import torch 固定 DLL 顺序——别把它挪到 PyQt5 之后，也别删
+# ⚠️ torch 必须在任何 Qt 导入【之前】——这条在 PyQt5 时代是硬伤：先 PyQt5
+# 后 torch = `OSError WinError 1114`（c10.dll 初始化例程失败），100% 复现。
+#
+# ☠️ **迁到 PyQt6 之后它不再复现了，但这一行仍然别删、别挪。**
+# 2026-09-20 迁移第 3 步实测（同机、torch 2.14.0+cpu，两个方向各起一个干净
+# 进程）：PyQt5 先导 → 照样 WinError 1114；PyQt6 先导 → 两个方向都干净通过。
+# 保留的理由是它一分钱不花：ctranslate2 本来就会无条件 import torch，这里
+# 只是把那次 import 提前到一个确定的位置。拿一行零成本的保险，去换一个
+# 只在"本机 + 这个 PyQt6/Qt/torch 版本组合"上验过一次的结论，不划算。
+# 真要删，先在别的机器上把两个方向都复现一遍。见 CLAUDE.md 第 4 节第 1 条。
 import torch  # noqa: F401
 from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 from realtime_subtitle.capture.audio_capture import AudioCapture, PAUSE_FLAG_FILE, STOP_FLAG_FILE
 from realtime_subtitle.ui.subtitle_window import SubtitleWindow
 from realtime_subtitle.ui.settings_window import MODE_ICONS as _MODE_ICON
-from PyQt5.QtCore import QTimer
+from PyQt6.QtCore import QTimer
 import realtime_subtitle.config as config
-# 纯常量模块，没有任何 import，放这里不影响上面那条 torch/PyQt5 的顺序约束
+# 纯常量模块，没有任何 import，放这里不影响上面那条 torch/PyQt6 的顺序约束
 from realtime_subtitle.version import version_string
 # 同样是纯 stdlib（pathlib），不影响 DLL 顺序
 from realtime_subtitle.paths import repo_path

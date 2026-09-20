@@ -12,10 +12,10 @@ from threading import Lock
 
 os.environ["REALTIME_SUBTITLE_NO_SINGLETON"] = "1"
 
-# ☠️ torch 必须先于 PyQt5，否则 WinError 1114 (c10.dll)（CLAUDE.md 第 4 节第 1 条）。
-# 别用 pytest.importorskip("PyQt5") 顶在前面——那就把顺序弄反了。
-import torch  # noqa: F401,E402  先于 PyQt5
-from PyQt5.QtWidgets import QApplication  # noqa: E402
+# ☠️ torch 仍然先于 PyQt6（Qt6 下已不再复现 WinError 1114，保留理由见 CLAUDE.md 第 4 节第 1 条）。
+# 别用 pytest.importorskip("PyQt6") 顶在前面——那就把顺序弄反了。
+import torch  # noqa: F401,E402  先于 PyQt6
+from PyQt6.QtWidgets import QApplication  # noqa: E402
 
 import realtime_subtitle.config as config  # noqa: E402
 from realtime_subtitle import language_policy  # noqa: E402

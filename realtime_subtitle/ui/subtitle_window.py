@@ -1,6 +1,6 @@
 """
 字幕悬浮窗UI模块
-使用PyQt5实现置顶悬浮窗口
+使用PyQt6实现置顶悬浮窗口
 
 2026-07-06 德语先行双层显示：
 - 历史区：最近几条已完成句对（德语行 + 中文行）
@@ -20,11 +20,11 @@ STATE_FILE）刻意留在这——test_tuning.py monkeypatch的是本模块的ST
 import sys
 import json
 import os
-from PyQt5.QtWidgets import (
+from PyQt6.QtWidgets import (
     QLabel, QApplication, QWidget, QHBoxLayout, QPushButton,
     QGraphicsOpacityEffect,
 )
-from PyQt5.QtCore import (
+from PyQt6.QtCore import (
     Qt, pyqtSignal, QObject, QTimer, QPropertyAnimation, QEasingCurve,
 )
 import realtime_subtitle.config as config
@@ -773,7 +773,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         german_text = filter_recent_german_context(self.sentence_pairs)
         # 弹窗锚在主字幕窗中心偏上，避免挡死最新字幕
         anchor = self.container.frameGeometry().center()
-        from PyQt5.QtCore import QPoint
+        from PyQt6.QtCore import QPoint
         anchor = QPoint(anchor.x(), self.container.frameGeometry().top() + 40)
         if not german_text:
             self.ai_analysis_popup.show_at(
@@ -917,7 +917,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         单独抽成一个方法是为了让测试能替换掉它——否则用例要么真弹窗阻塞，
         要么得去 monkeypatch QMessageBox 这种全局的东西。
         """
-        from PyQt5.QtWidgets import QMessageBox
+        from PyQt6.QtWidgets import QMessageBox
 
         box = QMessageBox(self.container)
         box.setWindowTitle("发送到外部 AI？")
@@ -933,7 +933,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
 
     def _quit_application(self):
         """退出程序"""
-        from PyQt5.QtWidgets import QMessageBox
+        from PyQt6.QtWidgets import QMessageBox
         
         # 确认对话框
         reply = QMessageBox.question(

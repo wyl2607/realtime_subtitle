@@ -3,8 +3,9 @@
 """
 import html
 import time
-from PyQt5.QtWidgets import QLabel, QWidget, QVBoxLayout, QTextEdit, QPushButton
-from PyQt5.QtCore import Qt
+from PyQt6.QtWidgets import QLabel, QWidget, QVBoxLayout, QTextEdit, QPushButton
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QTextCursor
 import realtime_subtitle.config as config
 from realtime_subtitle.ui.window_geometry import _screen_area_at
 
@@ -84,7 +85,9 @@ class HistoryWindow(QWidget):
         at_bottom = sb.value() >= sb.maximum() - 10  # 用户没往上翻才自动跟进
 
         cursor = self.text.textCursor()
-        cursor.movePosition(cursor.End)
+        # ☠️ 写成 `cursor.End` 会漏过第 1 步那道枚举守卫（它只看 `Q…` 开头的
+        # 前缀），Qt6 下这里是当场 AttributeError。见 test_qt_enum_style。
+        cursor.movePosition(QTextCursor.MoveOperation.End)
         stamp = time.strftime("%H:%M:%S")
         block = f'<span style="color:#777">[{stamp}]</span> {html.escape(german)}<br>' if german else ""
         block += f'<span style="color:#9ad0ff">{html.escape(chinese)}</span><br><br>'
@@ -131,7 +134,7 @@ class _AnalysisPopupBase(QWidget):
         self.setLayout(layout)
         self.setMaximumWidth(max_width)
 
-        from PyQt5.QtCore import QTimer
+        from PyQt6.QtCore import QTimer
         self._hide_timer = QTimer(self)
         self._hide_timer.setSingleShot(True)
         self._hide_timer.timeout.connect(self.hide)

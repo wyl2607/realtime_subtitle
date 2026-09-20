@@ -1,14 +1,24 @@
 """HiDPI：缩放倍率的语义，以及存档跨坐标空间的换算。
 
-PyQt6 迁移第 2 步留下的东西。核心事实（本机实测，见下面的参数化用例）：
+PyQt6 迁移第 2 步留下的东西，第 3 步真把 PyQt6 装进来之后重写过一次。
 
-    Qt5 @100%   logicalDPI 96    DPR 1.0   screen_scale_factor() = 1.00
-    Qt5 @150%   logicalDPI 144   DPR 1.0   screen_scale_factor() = 1.50  ← 我们乘
-    Qt6 @150%   logicalDPI 96    DPR 1.5   screen_scale_factor() = 1.00  ← Qt 乘
+☠️ **第 2 步写这个文件时机器上还只有 PyQt5**，当时是拿「PyQt5 + 打开
+`AA_EnableHighDpiScaling`」去**模拟** Qt6。那个办法现在既不可能也不必要：
+`AA_EnableHighDpiScaling` 在 PyQt6 里连枚举成员都不存在了，而 Qt6 的 HiDPI
+本来就一直开着——直接量真货就行。
 
-也就是说 `screen_scale_factor()` 在 Qt6 下**自己就归 1**，不会双重缩放，
-这个公式不需要为迁移改动。真正会坏的是存盘的几何和像素字号：Qt5 存的是
-物理像素，Qt6 会把同样的数字当逻辑像素用。
+真货量出来的结论和当初模拟的一致（PyQt6 6.11 / Qt 6.11）：
+
+    无环境变量           logicalDPI 96   DPR 1.0   screen_scale_factor() = 1.00
+    QT_SCALE_FACTOR=1.5  logicalDPI 96   DPR 1.5   screen_scale_factor() = 1.00
+    QT_FONT_DPI=144      logicalDPI 96   DPR 1.5   screen_scale_factor() = 1.00
+
+**Qt6 下缩放只进 DPR，绝不进 logicalDPI**，于是 `screen_scale_factor()` 自己
+就归 1、不会双重缩放。⚠️ 这比第 2 步的推断还强一点：连 QT_FONT_DPI 都落进
+DPR，Qt6/Windows 上没有让 logicalDPI 偏离基线的路子。
+
+真正会坏的是存盘的几何和像素字号：Qt5 存的是物理像素，Qt6 会把同样的数字
+当逻辑像素用——下半个文件测的就是那个换算。
 """
 import json
 import os
@@ -20,15 +30,11 @@ import pytest
 
 from realtime_subtitle.ui.window_geometry import rescale_state_for_dpr
 
-# 用 PyQt5 开/关 AA_EnableHighDpiScaling 来模拟 Qt6 的行为：这两种模式下
-# Qt 报告 DPI 的方式，正是 Qt5 和 Qt6 的差别所在。QT_FONT_DPI / QT_SCALE_FACTOR
-# 让本机（100% 屏）也能测出 150% 屏的表现。
+# 必须开子进程：QT_SCALE_FACTOR 这类只在 QApplication 构造那一刻读一次，
+# 而 pytest 进程里早就有一个 QApplication 了（第 4 节第 16 条）。
 _PROBE = textwrap.dedent("""
-    import json, sys
-    from PyQt5.QtCore import Qt, QCoreApplication
-    if sys.argv[1] == "on":
-        QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling, True)
-    from PyQt5.QtWidgets import QApplication
+    import json
+    from PyQt6.QtWidgets import QApplication
     app = QApplication([])
     screen = app.primaryScreen()
     print(json.dumps({"logical_dpi": screen.logicalDotsPerInch(),
@@ -36,9 +42,9 @@ _PROBE = textwrap.dedent("""
 """)
 
 
-def _probe(hidpi, env_extra):
+def _probe(env_extra):
     proc = subprocess.run(
-        [sys.executable, "-c", _PROBE, hidpi],
+        [sys.executable, "-c", _PROBE],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         env={**os.environ, **env_extra}, timeout=120,
     )
@@ -52,34 +58,35 @@ def _factor(probe):
     return min(max(probe["logical_dpi"] / 96.0, 1.0), 2.0)
 
 
-def test_scale_factor_semantics():
-    """☠️ 整个迁移设计的地基：Qt 接管缩放后，我们这边的倍率必须**不受影响**。
+@pytest.mark.parametrize("knob", ["QT_SCALE_FACTOR", "QT_FONT_DPI"])
+def test_scaling_lands_in_dpr_never_in_logical_dpi(knob):
+    """☠️ 整个 HiDPI 设计的地基：Qt6 的缩放只进 DPR，不进 logicalDPI。
 
-    断言的是不变式而不是具体数字。☠️ 第一版写死了"基线 logicalDPI = 96"，
-    结果 GitHub 的 Windows runner 报 100，`100/96 = 1.04` 让 CI 当场变红——
-    而代码一行问题都没有。真正要钉住的是「缩放出现在哪个量里」：
+    这条一旦不成立，`screen_scale_factor()` 就会跟着屏幕缩放一起涨，而 Qt
+    那边**也**已经放大过一次——首次运行的默认字号和窗口尺寸直接双重缩放。
 
-        缩放关（Qt5）：倍率进 logicalDPI，DPR 恒为 1.0   → 我们自己乘
-        缩放开（Qt6）：倍率进 DPR，logicalDPI 不动       → Qt 替我们乘
+    ☠️ 断言的是不变式，不是具体数字。第 2 步的第一版写死了"基线 logicalDPI
+    = 96"，结果 GitHub 的 Windows runner 报 100，`100/96 = 1.04` 让 CI 当场
+    变红——而代码一行问题都没有（CLAUDE.md 第 43 条）。同理**不要**断言
+    `base["dpr"] == 1.0`：那是"开发机屏幕是 100%"，不是本项目的性质，
+    在 150% 的笔记本上跑就会红。所以下面一律比**比值**。
+
+    两个旋钮都测：QT_FONT_DPI 在 Qt5 时代是进 logicalDPI 的，Qt6 下改成了
+    进 DPR——它比 QT_SCALE_FACTOR 更能抓住"Qt 又把缩放挪回 logicalDPI"的回归。
     """
-    base = _probe("off", {})
-    qt5_scaled = _probe("off", {"QT_FONT_DPI": "144"})
-    qt6_scaled = _probe("on", {"QT_SCALE_FACTOR": "1.5"})
+    base = _probe({})
+    scaled = _probe({knob: "1.5" if knob == "QT_SCALE_FACTOR" else "144"})
 
-    # Qt5：不开缩放时 DPR 恒为 1，倍率只体现在 logicalDPI 上
-    assert base["dpr"] == pytest.approx(1.0, abs=0.01), base
-    assert qt5_scaled["dpr"] == pytest.approx(1.0, abs=0.01), qt5_scaled
-    assert qt5_scaled["logical_dpi"] > base["logical_dpi"], (base, qt5_scaled)
+    # 反向对照：旋钮真的起作用了（否则下面两条断言全是空转）
+    assert scaled["dpr"] > base["dpr"] * 1.4, (base, scaled)
+    assert scaled["dpr"] == pytest.approx(base["dpr"] * 1.5, rel=0.02), (base, scaled)
 
-    # Qt6：倍率跑进 DPR，logicalDPI 停在基线不动
-    assert qt6_scaled["dpr"] == pytest.approx(1.5, abs=0.01), qt6_scaled
-    assert qt6_scaled["logical_dpi"] == pytest.approx(base["logical_dpi"], abs=0.5), \
-        (base, qt6_scaled)
+    # 正题：缩放没有渗进 logicalDPI
+    assert scaled["logical_dpi"] == pytest.approx(base["logical_dpi"], abs=0.5), \
+        (base, scaled)
 
-    # 于是 screen_scale_factor() 在 Qt6 下和不缩放时完全一样——不会双重缩放，
-    # 这个公式不需要为迁移改动
-    assert _factor(qt6_scaled) == pytest.approx(_factor(base), abs=0.01)
-    assert _factor(qt5_scaled) > _factor(base)
+    # 于是我们自己那份倍率纹丝不动——不会双重缩放
+    assert _factor(scaled) == pytest.approx(_factor(base), abs=0.01)
 
 
 # --- 存档换算 -----------------------------------------------------------

@@ -5,7 +5,7 @@ HTML/QTextDocument构建 + 点词查词命中测试。以mixin形式并入 Subti
 import html
 import time
 import uuid
-from PyQt5.QtCore import Qt
+from PyQt6.QtCore import Qt
 import realtime_subtitle.config as config
 class LiveTextRenderMixin:
 
@@ -152,7 +152,7 @@ class LiveTextRenderMixin:
         可能 setHtml 改掉内容）。排版参数（margin 0 / width-46 / pixelSize）
         与瀑布填充、点词坐标强绑定，勿改。
         """
-        from PyQt5.QtGui import QTextDocument, QFont
+        from PyQt6.QtGui import QTextDocument, QFont
         doc = QTextDocument()
         doc.setDocumentMargin(0)
         font = QFont(config.FONT_FAMILY.split(",")[0].strip())
@@ -165,7 +165,7 @@ class LiveTextRenderMixin:
 
     def _doc_for_render(self):
         """_render 测高用：font/size/width 未变则复用同一 QTextDocument。"""
-        from PyQt5.QtGui import QTextDocument, QFont
+        from PyQt6.QtGui import QTextDocument, QFont
         family = config.FONT_FAMILY.split(",")[0].strip()
         size = config.FONT_SIZE
         text_width = max(100, self.window.width() - 46)
@@ -258,8 +258,8 @@ class LiveTextRenderMixin:
         if not self.window.rect().contains(lp):
             return
 
-        from PyQt5.QtCore import QPointF
-        from PyQt5.QtGui import QTextCursor
+        from PyQt6.QtCore import QPointF
+        from PyQt6.QtGui import QTextCursor
         doc = self._build_doc(self._last_html)
         # 内容区 = 标签减 padding(15px 20px) 和 2px 边框
         content_x0, content_y0 = 22, 17
@@ -279,7 +279,7 @@ class LiveTextRenderMixin:
             return
         context = cursor.block().text()  # 该词所在行做上下文
 
-        from PyQt5.QtGui import QCursor
+        from PyQt6.QtGui import QCursor
         self._lookup_anchor = QCursor.pos()
         self._lookup_context = context  # 深度解释用整句，不靠弹窗事后再猜
         # ☠️ 一次点击一个 request_id：translator 的 seq 门控挡不住

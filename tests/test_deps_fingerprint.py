@@ -81,8 +81,8 @@ def test_update_script_retries_deps_when_commit_unchanged():
 # 删掉"这件事在已装好的机器上是**无声**的：包留着、传递依赖也留着。
 
 def test_canonical_name_follows_pep503():
-    assert canonical_name("PyQt5_sip") == canonical_name("pyqt5-sip")
-    assert canonical_name("PyQt5.Sip") == "pyqt5-sip"
+    assert canonical_name("PyQt6_sip") == canonical_name("pyqt6-sip")
+    assert canonical_name("PyQt6.Sip") == "pyqt6-sip"
     assert canonical_name("  Faster-Whisper  ") == "faster-whisper"
     assert canonical_name("") == ""
 
@@ -94,8 +94,8 @@ def test_orphan_packages_lists_only_what_closure_does_not_need():
 
 
 def test_orphan_packages_matches_names_case_insensitively():
-    """装的是 PyQt5_sip、清单里写的是 pyqt5-sip，不能因此被当成孤儿删掉。"""
-    assert orphan_packages(["PyQt5_sip"], ["pyqt5-sip"]) == []
+    """装的是 PyQt6_sip、清单里写的是 pyqt6-sip，不能因此被当成孤儿删掉。"""
+    assert orphan_packages(["PyQt6_sip"], ["pyqt6-sip"]) == []
 
 
 def test_orphan_packages_never_touches_venv_plumbing():

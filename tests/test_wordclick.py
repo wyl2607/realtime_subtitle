@@ -1,7 +1,7 @@
 """一次性验证脚本：点词查词的坐标命中数学。
 真实创建 SubtitleWindow，喂字幕内容，在标签内合成点击，
 断言 on_lookup 收到的是点击位置附近的德语词。"""
-import torch  # noqa: F401 先于PyQt5加载（见main.py坑注释）
+import torch  # noqa: F401 先于 PyQt6（见 main.py 坑注释）
 import sys
 
 sys.stdout.reconfigure(encoding="utf-8")
@@ -9,8 +9,8 @@ sys.stdout.reconfigure(encoding="utf-8")
 import realtime_subtitle.config as config
 config.SHOW_PERFORMANCE = False
 from realtime_subtitle.ui.subtitle_window import SubtitleWindow
-from PyQt5.QtCore import QPoint
-from PyQt5.QtGui import QTextCursor
+from PyQt6.QtCore import QPoint
+from PyQt6.QtGui import QTextCursor
 
 win = SubtitleWindow()
 win.container.setGeometry(1750, 30, 700, 260)  # 避开可能在跑的字幕窗

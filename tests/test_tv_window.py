@@ -3,15 +3,15 @@
 运行: venv\\Scripts\\python.exe -m pytest test_tv_window.py -q
 
 ⚠️ 不 import main.py（单实例 Mutex 会 sys.exit）。
-⚠️ torch 必须先于 PyQt5 加载，否则 WinError 1114（见 main.py / test_hittest.py）。
+⚠️ torch 仍然先于 PyQt6 加载（Qt6 下已不再复现 WinError 1114，保留理由见 CLAUDE.md 第 4 节第 1 条）。
 ⚠️ QApplication 必须持有模块级引用，否则会被立即 GC → 建 QWidget 时 qFatal 秒退。
 """
-import torch  # noqa: F401  先于 PyQt5
+import torch  # noqa: F401  先于 PyQt6
 import sys
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-from PyQt5.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication
 
 import realtime_subtitle.config as config
 from realtime_subtitle.ui.tv_window import TVWindow

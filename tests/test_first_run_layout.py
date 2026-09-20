@@ -7,10 +7,10 @@ config 里的 WINDOW_X/Y/WIDTH/HEIGHT 是按开发机屏幕写死的绝对坐标
 笔记本上会小一大截。这两条都只在**没有 window_state.json** 时才走到，
 所以开发机上永远测不到——这个文件专门盯它们。
 
-⚠️ torch 必须先于 PyQt5 加载，否则 WinError 1114。
+⚠️ torch 仍然先于 PyQt6 加载（Qt6 下已不再复现 WinError 1114，保留理由见 CLAUDE.md 第 4 节第 1 条）。
 ⚠️ 不 import main.py（单实例 Mutex 会 sys.exit）。
 """
-import torch  # noqa: F401  先于 PyQt5
+import torch  # noqa: F401  先于 PyQt6
 import sys
 
 sys.stdout.reconfigure(encoding="utf-8")
@@ -83,7 +83,7 @@ def test_default_geometry_matches_config_on_a_big_screen():
 
 def test_screen_scale_factor_is_bounded():
     """没有屏幕/拿不到 DPI 时必须安全退回 1.0，且不会放大到离谱。"""
-    from PyQt5.QtWidgets import QApplication  # noqa: F401  确认导入顺序没问题
+    from PyQt6.QtWidgets import QApplication  # noqa: F401  确认导入顺序没问题
     import realtime_subtitle.ui.window_geometry as window_geometry
 
     class _FakeScreen:

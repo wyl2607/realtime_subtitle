@@ -2,8 +2,8 @@
 无边框窗口基础部件：拖动 + Windows 原生边缘缩放/标题栏拖动命中测试。
 """
 import sys
-from PyQt5.QtWidgets import QWidget, QApplication
-from PyQt5.QtCore import Qt
+from PyQt6.QtWidgets import QWidget, QApplication
+from PyQt6.QtCore import Qt
 
 if sys.platform == "win32":
     import ctypes
@@ -21,20 +21,31 @@ class DraggableWidget(QWidget):
         self._press_global = None
         self.on_click = None  # 原地单击回调 (widget坐标QPoint) -> None
 
+    # ☠️ Qt6 删掉了 QMouseEvent.globalPos()/x()/y()，只剩 QPointF 版的
+    # globalPosition()（pos() 侥幸还在，但同一个文件里不留两种写法）。
+    # **必须 .toPoint()**：QPointF 在高缩放屏上带小数，而 frameGeometry()、
+    # move()、manhattanLength() 这一路全是整数 QPoint 的世界，混着算会静默
+    # 退化成浮点坐标。收口成 QPoint 之后语义和 Qt5 的 globalPos() 完全一致。
+    @staticmethod
+    def _global_pos(event):
+        return event.globalPosition().toPoint()
+
     def mousePressEvent(self, event):
         """鼠标按下 - 开始拖动"""
         if event.button() == Qt.MouseButton.LeftButton:
             self.dragging = True
-            self.drag_position = event.globalPos() - self.frameGeometry().topLeft()
-            self._press_global = event.globalPos()
+            press = self._global_pos(event)
+            self.drag_position = press - self.frameGeometry().topLeft()
+            self._press_global = press
             event.accept()
 
     def mouseMoveEvent(self, event):
         """鼠标移动 - 拖动窗口（钳制在屏幕可用区域内。
         实测能把窗口拖出屏幕顶部，按钮行被切一半就再也够不着了）"""
         if self.dragging and event.buttons() == Qt.MouseButton.LeftButton:
-            target = event.globalPos() - self.drag_position
-            screen = QApplication.screenAt(event.globalPos())
+            here = self._global_pos(event)
+            target = here - self.drag_position
+            screen = QApplication.screenAt(here)
             if screen:
                 area = screen.availableGeometry()
                 target.setX(max(area.left(), min(target.x(), area.right() - self.width() + 1)))
@@ -47,8 +58,8 @@ class DraggableWidget(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             self.dragging = False
             if (self.on_click and self._press_global is not None
-                    and (event.globalPos() - self._press_global).manhattanLength() < 6):
-                self.on_click(event.pos())
+                    and (self._global_pos(event) - self._press_global).manhattanLength() < 6):
+                self.on_click(event.position().toPoint())
             self._press_global = None
             event.accept()
 

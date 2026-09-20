@@ -1,15 +1,15 @@
 """设置面板可读性：字号、滚动、数值格式、小屏几何。
 
 对应 Grok 接手包批次 B。不 import main.py（单实例 Mutex 会 sys.exit）。
-torch 必须先于 PyQt5，QApplication 必须持有模块级引用。
+torch 仍然先于 PyQt6（CLAUDE.md 第 4 节第 1 条），QApplication 必须持有模块级引用。
 """
-import torch  # noqa: F401  先于 PyQt5
+import torch  # noqa: F401  先于 PyQt6
 import sys
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-from PyQt5.QtWidgets import QApplication, QScrollArea, QLabel
-from PyQt5.QtCore import Qt
+from PyQt6.QtWidgets import QApplication, QScrollArea, QLabel
+from PyQt6.QtCore import Qt
 
 import realtime_subtitle.config as config
 from realtime_subtitle.ui.settings_window import SettingsWindow
@@ -245,7 +245,7 @@ def test_collect_tuning_roundtrips_language():
 
 
 def test_settings_language_group_is_separate_from_scene_modes():
-    from PyQt5.QtWidgets import QGroupBox
+    from PyQt6.QtWidgets import QGroupBox
 
     _app()
     win = SettingsWindow()

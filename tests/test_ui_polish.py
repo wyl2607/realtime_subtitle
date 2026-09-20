@@ -3,18 +3,18 @@
 运行: venv\\Scripts\\python.exe -m pytest test_ui_polish.py -q
 
 ⚠️ 不 import main.py（单实例 Mutex 会 sys.exit）。
-⚠️ torch 必须先于 PyQt5 加载，否则 WinError 1114（见 main.py / test_hittest.py）。
+⚠️ torch 仍然先于 PyQt6 加载（Qt6 下已不再复现 WinError 1114，保留理由见 CLAUDE.md 第 4 节第 1 条）。
 ⚠️ QApplication 必须持有模块级引用，否则会被立即 GC → 建 QWidget 时 qFatal 秒退。
 """
-import torch  # noqa: F401  先于 PyQt5
+import torch  # noqa: F401  先于 PyQt6
 import sys
 import os
 import tempfile
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-from PyQt5.QtWidgets import QApplication, QGraphicsOpacityEffect
-from PyQt5.QtCore import QPropertyAnimation
+from PyQt6.QtWidgets import QApplication, QGraphicsOpacityEffect
+from PyQt6.QtCore import QPropertyAnimation
 
 import realtime_subtitle.config as config
 import realtime_subtitle.ui.subtitle_window as subtitle_window
@@ -58,7 +58,7 @@ def _pump(n=30, ms_each=20):
     for _ in range(n):
         app.processEvents()
         # QTest 不一定总在环境里；用 processEvents 足够让短动画收束
-        from PyQt5.QtCore import QThread
+        from PyQt6.QtCore import QThread
         QThread.msleep(ms_each)
 
 
@@ -69,7 +69,7 @@ def _pump_until(pred, timeout_ms=3000):
     偶发挂——CLAUDE.md 里专门写了"重跑即绿别当回归追"。改成等条件成立，
     断言的契约一点没变（终态必须正确），只是不再赌绝对时间。
     """
-    from PyQt5.QtCore import QThread
+    from PyQt6.QtCore import QThread
     app = _app()
     waited = 0
     while waited < timeout_ms:
@@ -219,7 +219,7 @@ def test_hit_test_build_doc_is_independent():
 
 def test_container_system_close_calls_app_quit():
     """Alt+F4 路径：container.on_system_close 必须接到 app.quit，不能只关窗。"""
-    from PyQt5.QtGui import QCloseEvent
+    from PyQt6.QtGui import QCloseEvent
 
     win = _window()
     assert win.container.on_system_close is not None

@@ -1,13 +1,13 @@
 """
 参数调节面板（⚙️）：tuning 持久化辅助函数 + 场景预设常量 + SettingsWindow。
 """
-from PyQt5.QtWidgets import (
+from PyQt6.QtWidgets import (
     QLabel, QWidget, QVBoxLayout, QHBoxLayout, QSlider,
     QPushButton, QGroupBox, QLineEdit, QCheckBox, QColorDialog, QFontComboBox,
     QScrollArea, QFrame, QApplication,
 )
-from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QColor, QFont
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QColor, QFont
 import realtime_subtitle.config as config
 from realtime_subtitle import language_policy
 from realtime_subtitle.ui.window_frame import DraggableWidget

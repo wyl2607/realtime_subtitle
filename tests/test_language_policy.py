@@ -25,7 +25,7 @@ def test_policy_module_stays_free_of_qt_and_model_deps():
     """
     import ast
 
-    banned = {"PyQt5", "requests", "torch", "faster_whisper",
+    banned = {"PyQt6", "requests", "torch", "faster_whisper",
               "realtime_subtitle.translate", "realtime_subtitle.ui"}
     tree = ast.parse(open(language_policy.__file__, encoding="utf-8").read())
     seen = set()

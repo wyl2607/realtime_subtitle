@@ -3,17 +3,17 @@
 运行: venv\\Scripts\\python.exe -m pytest test_ai_analysis.py -q
 
 ⚠️ 不 import main.py（单实例 Mutex 会 sys.exit）。
-⚠️ torch 必须先于 PyQt5 加载，否则 WinError 1114。
+⚠️ torch 仍然先于 PyQt6 加载（Qt6 下已不再复现 WinError 1114，保留理由见 CLAUDE.md 第 4 节第 1 条）。
 """
-import torch  # noqa: F401  先于 PyQt5
+import torch  # noqa: F401  先于 PyQt6
 import sys
 from urllib.parse import quote, unquote, urlparse, parse_qs
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-from PyQt5.QtWidgets import QApplication
-from PyQt5.QtCore import QPoint, Qt
-from PyQt5.QtTest import QTest
+from PyQt6.QtWidgets import QApplication
+from PyQt6.QtCore import QPoint, Qt
+from PyQt6.QtTest import QTest
 
 import realtime_subtitle.config as config
 from realtime_subtitle.translate.lookup import (
@@ -921,7 +921,7 @@ def test_result_callbacks_carry_seq_through_signal():
 def test_on_ai_analysis_clicked_bumps_seq_and_shows_web_while_loading():
     """发起背景总结：seq+1、分析中 show_web=True、回调带捕获的 seq。"""
     import time
-    from PyQt5.QtCore import QRect
+    from PyQt6.QtCore import QRect
     from realtime_subtitle.ui.subtitle_window import SubtitleWindow
 
     app = _app()

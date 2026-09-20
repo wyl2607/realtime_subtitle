@@ -3,18 +3,18 @@
 运行: venv\\Scripts\\python.exe -m pytest tests/test_cinema_bar.py -q
 
 ⚠️ 不 import main.py（单实例 Mutex 会 sys.exit）。
-⚠️ torch 必须先于 PyQt5 加载，否则 WinError 1114（见 main.py / test_hittest.py）。
+⚠️ torch 仍然先于 PyQt6 加载（Qt6 下已不再复现 WinError 1114，保留理由见 CLAUDE.md 第 4 节第 1 条）。
 ⚠️ QApplication 必须持有模块级引用，否则会被立即 GC → 建 QWidget 时 qFatal 秒退。
 """
-import torch  # noqa: F401  先于 PyQt5
+import torch  # noqa: F401  先于 PyQt6
 import re
 import sys
 from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-from PyQt5.QtWidgets import QApplication
-from PyQt5.QtCore import QEvent
+from PyQt6.QtWidgets import QApplication
+from PyQt6.QtCore import QEvent
 
 import realtime_subtitle.config as config
 from realtime_subtitle.ui.cinema_bar import CinemaBar
@@ -46,12 +46,12 @@ def _shown_bar():
 # ---------------------------------------------------------------------------
 
 def test_ui_code_never_references_nonexistent_qevent_members():
-    """☠️ UI 里引用的每个 `QEvent.X` 都必须真实存在于 PyQt5。
+    """☠️ UI 里引用的每个 `QEvent.X` 都必须真实存在于 PyQt6。
 
     2026-08-28 加影院条时踩过：`changeEvent` 里写了 `QEvent.ScreenChangeInternal`
-    ——那是 Qt 的**内部**枚举，PyQt5 根本没暴露（`dir(QEvent)` 里一个带 screen
+    ——那是 Qt 的**内部**枚举，PyQt6 根本没暴露（`dir(QEvent)` 里一个带 screen
     的都没有）。于是每次窗口构造时 changeEvent 一被调用就 AttributeError，而
-    **PyQt5 对虚函数重写里的未捕获异常是直接 abort() 整个进程**，不是往上抛。
+    **PyQt6 对虚函数重写里的未捕获异常是直接 abort() 整个进程**，不是往上抛。
 
     现场表现极具迷惑性：`pytest -q` 跑到 90% 直接消失，没有 FAILED、没有
     traceback、没有 short test summary，退出码 127（看着像"命令没找到"）。
@@ -69,7 +69,7 @@ def test_ui_code_never_references_nonexistent_qevent_members():
                 if not hasattr(QEvent, name):
                     offenders.append(f"{path.name}:{lineno} QEvent.{name}")
     assert not offenders, (
-        "这些 QEvent 成员在 PyQt5 里不存在，虚函数里访问会 abort 整个进程："
+        "这些 QEvent 成员在 PyQt6 里不存在，虚函数里访问会 abort 整个进程："
         + ", ".join(offenders))
 
 

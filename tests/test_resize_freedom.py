@@ -4,7 +4,7 @@ bug（第五版实测）：QLabel wordWrap 下最小高度=全部文本排版高
 自适应填充又总把窗口填满 → 布局最小高度≈当前高度 → 窗口只能拉大不能缩小
 （棘轮）。左右能调是因为折行让最小宽度很小——和用户描述完全一致。
 """
-import torch  # noqa: F401 先于PyQt5（见main.py坑注释）
+import torch  # noqa: F401 先于 PyQt6（见 main.py 坑注释）
 import sys
 
 sys.stdout.reconfigure(encoding="utf-8")

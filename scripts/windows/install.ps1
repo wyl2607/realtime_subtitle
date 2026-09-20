@@ -369,7 +369,7 @@ Write-Host "  ✅ 快捷方式已生成: $shortcutDir"
 # ---------- 7. 装完自检 ----------
 # 装完不验一下的话，环境问题要等用户双击启动、悬浮窗不出来、再去翻
 # subtitle.err.log 才暴露。这里当场把最容易坏的四类依赖走一遍：
-# torch(c10.dll) / PyQt5 / 音频捕获 / 重采样，再走一次 translator_queue
+# torch(c10.dll) / PyQt6 / 音频捕获 / 重采样，再走一次 translator_queue
 # 自己的 _ensure_ml_deps()——☠️ 必须走它，不能直接 import faster_whisper：
 # cublas 目录是那个函数往 PATH 里注入的（避坑清单第 2 条），绕过去测会在
 # 装得好好的机器上误报失败。
@@ -378,7 +378,7 @@ $smokeCode = @"
 import torch
 import yt_dlp
 from realtime_subtitle import config
-import PyQt5.QtWidgets, pyaudiowpatch, soxr
+import PyQt6.QtWidgets, pyaudiowpatch, soxr
 from realtime_subtitle.translate import translator_queue
 translator_queue._ensure_ml_deps()
 print('SMOKE_OK', config.WHISPER_MODEL, config.WHISPER_COMPUTE_TYPE, config.OLLAMA_MODEL)

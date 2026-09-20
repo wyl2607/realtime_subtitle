@@ -43,7 +43,7 @@ _PROTECTED = frozenset({"pip", "setuptools", "wheel", "uv"})
 
 
 def canonical_name(name: str) -> str:
-    """PEP 503 规范化：PyQt5_sip / pyqt5-sip / PyQt5.Sip 是同一个包。"""
+    """PEP 503 规范化：PyQt6_sip / pyqt6-sip / PyQt6.Sip 是同一个包。"""
     return re.sub(r"[-_.]+", "-", (name or "").strip()).lower()
 
 

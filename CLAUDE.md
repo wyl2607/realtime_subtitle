@@ -7,7 +7,7 @@
  — 给接手这台电脑的 AI 助手（Claude Code 等）
 
 这是一个**完全本地运行**的实时字幕系统：捕获 Windows 正在播放的声音（直播/视频/
-语音聊天），Faster-Whisper 实时识别德语，Ollama 本地大模型翻译成中文，PyQt5
+语音聊天），Faster-Whisper 实时识别德语，Ollama 本地大模型翻译成中文，PyQt6
 置顶悬浮窗双语显示。不向任何云端发送音频或文本。**仅支持 Windows**（音频捕获
 用 WASAPI Loopback）。
 
@@ -61,7 +61,7 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
 # 中国大陆网络：加 -Mirror 参数走清华 PyPI 镜像
 ```
 
-install.ps1 最后一步会自检（import torch/PyQt5/pyaudiowpatch/soxr + 走一遍
+install.ps1 最后一步会自检（import torch/PyQt6/pyaudiowpatch/soxr + 走一遍
 `translator_queue._ensure_ml_deps()`）。自检不过就别急着让用户双击启动，
 先按它打印的报错和第 4 节对。
 
@@ -201,8 +201,24 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
 
 安装/环境：
 
-1. **PyQt5 必须在 torch 之后导入**。main.py 的 import 顺序是生死攸关的：先
-   PyQt5 后 torch = `WinError 1114 (c10.dll)` 100% 复现。不要"整理 imports"。
+1. **torch 必须在 Qt 之前导入**——PyQt5 时代这是硬伤，Qt6 下降级成了「零成本
+   的保险」，但**结论不变：别动那个顺序，也别"整理 imports"**。
+
+   2026-09-20 迁移第 3 步实测（同机、torch 2.14.0+cpu，两个方向各起干净进程）：
+
+   | 先导入 | 后导入 | 结果 |
+   |---|---|---|
+   | PyQt5 | torch | ❌ `WinError 1114`，c10.dll 初始化例程失败 |
+   | torch | PyQt5 | ✅ |
+   | PyQt6 | torch | ✅ |
+   | torch | PyQt6 | ✅ |
+
+   **换成 PyQt6 之后这个坑不再复现**（PyQt5 那两行是反向对照，证明测法本身
+   有效、不是空转）。仍然保留 `app.py` 顶部那句显式 `import torch` 的理由：
+   ctranslate2 本来就会无条件 import torch，把它提前到一个确定的位置一分钱
+   不花；删掉它则等于拿一个只在「本机 + 这一组 PyQt6/Qt/torch 版本」上验过
+   一次的结论，去换一行免费的保险。真要删，先在别的机器、别的版本组合上把
+   两个方向都复现一遍。
 2. **cublas64_12.dll 只认 PATH**。Windows 上 ctranslate2 按名字 LoadLibraryA
    加载，`os.add_dll_directory()` 无效。realtime_subtitle/translate/translator_queue.py 顶部把
    `nvidia.cublas` pip 包的 bin 目录拼进 `os.environ["PATH"]`——这段代码
@@ -424,17 +440,23 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     就是这么揪出来的——Ollama 自报 `total_duration` 只有 385ms，客户端墙钟却是
     2437ms，差值 2052ms 稳如磐石，一看就不在 GPU 上。判据：
     `wall - total_duration` 应该是个位数毫秒，明显大于它就说明卡在传输层。
-24. **显示缩放（高DPI）只做了首次运行的默认值，没有全局开 Qt 缩放。**
+24. **显示缩放（高DPI）：Qt6 起由 Qt 全权负责，我们那套手工缩放已经失效但留着。**
+    ⚠️ 本条 2026-09-20 迁到 PyQt6 后改写过，原文写的是"没有全局开 Qt 缩放、
+    不要顺手去开那个开关"——**Qt6 的 HiDPI 关不掉，那个取舍已经不存在了**。
+
     本项目所有字号都是像素单位（`setPixelSize` / 样式表 `font-size: Npx`），
-    而 Qt5 的 `AA_EnableHighDpiScaling` 默认关闭。笔记本几乎都是 125%/150%
-    缩放，直接跑字会小三分之一。**不要顺手去开那个全局开关**——悬浮窗是无
-    QLayout 的手动 setGeometry + WM_NCHITTEST 原生命中测试（第 17 条），
-    开缩放会改坐标空间、动到命中测试，得连 test_hittest 一起重做。
-    现在的折中：`window_geometry.screen_scale_factor()` 读主屏逻辑 DPI，
-    **只在首次运行**（还没有 window_state.json）按倍率放大默认字号和默认
-    窗口尺寸，用户 Ctrl+滚轮调过之后一律以保存值为准。设置面板自身字体按
-    同一倍率放大（`panel_font_px`，100% 下 17px），**仍然不开全局 DPI 开关**。
-    悬浮窗按钮条等其它 chrome 的字号还没跟着缩放。
+    Qt5 时代 `AA_EnableHighDpiScaling` 默认关闭，笔记本几乎都是 125%/150%
+    缩放，直接跑字会小三分之一；于是有了
+    `window_geometry.screen_scale_factor()`：读主屏逻辑 DPI，**只在首次运行**
+    （还没有 window_state.json）按倍率放大默认字号和默认窗口尺寸，用户
+    Ctrl+滚轮调过之后一律以保存值为准。设置面板自身字体同一倍率
+    （`panel_font_px`，100% 下 17px）。悬浮窗按钮条等 chrome 的字号没跟。
+
+    Qt6 下这套**自动变成了 no-op 且这是对的**：缩放全进 devicePixelRatio，
+    `logicalDotsPerInch()` 被钉在基线，于是 `screen_scale_factor()` 恒为 1.0，
+    放大那份改由 Qt 出，总倍率不变。函数留着当兜底（别的平台/未来的 Qt 真报
+    了非基线 logicalDPI 时它仍给出合理值），成本为零。细节和实测见第 43 条。
+    ☠️ 别"顺手修"成除以 devicePixelRatio——那会把该有的 1.0 改成 0.67。
     同一处还修了另一个换机器才暴露的问题：config 里的 `WINDOW_X/Y` 是按
     开发机屏幕写死的绝对坐标，1366x768 的小笔记本上 y=750 整窗掉出屏幕，
     只能靠钳制拽回屏幕正中间；首次运行现在改走 `default_geometry()`
@@ -471,7 +493,7 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     ```
 
     本项目到处都是这种延迟 import，而且是有意为之（避免在导入期把
-    torch/PyQt5 整条链拉起来、绕开单实例 Mutex），所以数量远多于普通项目。
+    torch/PyQt6 整条链拉起来、绕开单实例 Mutex），所以数量远多于普通项目。
     结果是 master 的 CI 连红 6 次：ubuntu 18 failed、windows 一堆
     `ModuleNotFoundError`。
 
@@ -501,21 +523,21 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
 
     **区分办法**：`python -m pytest tests/xxx.py -x --tb=short` 单文件跑一遍，
     第一个真实失败的 traceback 就会出来（整套跑时它被后面的 qFatal 盖掉了）。
-    没有 Qt 环境时，本机 `pip install PyQt5` + `QT_QPA_PLATFORM=offscreen`
+    没有 Qt 环境时，本机 `pip install PyQt6` + `QT_QPA_PLATFORM=offscreen`
     就能复现（torch 只要能 import，临时放个空的 `torch.py` 在 PYTHONPATH 里
     即可，不用真下几百 MB）。
 
     **第三种成因：Qt 虚函数重写里抛异常**（2026-08-28 加 🎞 影院条时踩的）。
     `CinemaBar.changeEvent` 里写了 `QEvent.ScreenChangeInternal` —— 那是 Qt 的
-    **内部**枚举，PyQt5 根本没暴露（`dir(QEvent)` 里一个带 screen 的都没有）。
-    窗口一构造 `changeEvent` 就被调用 → AttributeError → **PyQt5 对虚函数重写
+    **内部**枚举，PyQt6 根本没暴露（`dir(QEvent)` 里一个带 screen 的都没有）。
+    窗口一构造 `changeEvent` 就被调用 → AttributeError → **PyQt6 对虚函数重写
     里的未捕获异常是直接 `abort()` 整个进程**，不往上抛。现象和上面两种一模
     一样：跑到 90% 直接消失，无 FAILED、无 traceback、退出码 127。
 
     ☠️ **这一种上面那个"单文件 -x --tb=short"的区分办法不管用**——它根本不
     产生 traceback，单独构造那个窗口同样是秒退无输出。只能逐行 `print(flush=True)`
     二分到具体哪一句。教训：**在 Qt 虚函数重写（`changeEvent`/`eventFilter`/
-    `showEvent`/`paintEvent`…）里，任何属性访问都要先确认它在 PyQt5 里真存在**。
+    `showEvent`/`paintEvent`…）里，任何属性访问都要先确认它在 PyQt6 里真存在**。
     `test_ui_code_never_references_nonexistent_qevent_members` 现在源码扫描
     `realtime_subtitle/ui/*.py` 里所有 `QEvent.X`，写下去就红——用源码扫描而不是
     行为测试，是因为行为测试要真触发那条分支才炸，而它平时不触发。
@@ -688,7 +710,7 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
       为空 + 老的 `LANGUAGE_CYCLE`）下后台有两个语言对、面板一个按钮都没有，
       恢复上次选的源语言时 allowed 集合也是空的——**用户从面板改不动语言，
       而且没有任何报错**。它不许 import Qt/requests/translator_queue
-      （面板要在 QApplication 之前读它，识别线程也不能因此把 PyQt5 拉进
+      （面板要在 QApplication 之前读它，识别线程也不能因此把 PyQt6 拉进
       导入链，见第 1 条），`test_language_policy.py` 用 AST 扫 import 盯着。
     - **切换请求走哪条路**：一律 `request_switch_language`，
       "要不要真切"只能在 `_apply_pending_lang_switch` 里判。
@@ -844,14 +866,27 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     逐个查过之后**两件都不成立**：
 
     - `screen_scale_factor()` 在 Qt6 下**自己就归 1.0**，不会双重缩放。
-      Qt 接管缩放后把 `logicalDotsPerInch` 报成 96，缩放那份由 Qt 出，总倍率
-      不变。实测（PyQt5 开/关 `AA_EnableHighDpiScaling` + `QT_SCALE_FACTOR`
-      模拟 150% 屏）——**缩放关时倍率进 logicalDPI、DPR 恒为 1；缩放开时倍率
-      进 DPR、logicalDPI 停在基线不动**。**别"顺手修"成除以 devicePixelRatio**
-      ——那会把该有的 1.0 改成 0.67。`tests/test_hidpi_scaling.py` 钉住了这条
-      不变式。⚠️ 钉的是不变式不是数字：**基线 logicalDPI 并非到处都是 96**
-      （本机 96，GitHub 的 Windows runner 是 100），写死数字会让 CI 在没人改
-      代码的日子变红——第一版就是这么红的。
+      Qt 接管缩放后把 `logicalDotsPerInch` 报在基线不动，缩放那份由 Qt 出，
+      总倍率不变。**别"顺手修"成除以 devicePixelRatio**——那会把该有的 1.0
+      改成 0.67。`tests/test_hidpi_scaling.py` 钉住了这条不变式。
+      ⚠️ 钉的是不变式不是数字：**基线 logicalDPI 并非到处都是 96**（本机 96，
+      GitHub 的 Windows runner 是 100），写死数字会让 CI 在没人改代码的日子
+      变红——第一版就是这么红的。同理别断言 `DPR == 1.0`，那是"开发机屏幕
+      是 100%"，不是本项目的性质。
+
+      ☠️ **第 2 步写这条时机器上还只有 PyQt5，上面是拿「PyQt5 + 打开
+      AA_EnableHighDpiScaling」模拟出来的推断。** 第 3 步真装上 PyQt6 之后
+      重量了一遍，结论成立，而且比推断更强（PyQt6 6.11 / Qt 6.11）：
+
+      | 环境 | logicalDPI | DPR | `screen_scale_factor()` |
+      |---|---|---|---|
+      | 无环境变量 | 96 | 1.0 | 1.00 |
+      | `QT_SCALE_FACTOR=1.5` | 96 | 1.5 | 1.00 |
+      | `QT_FONT_DPI=144` | 96 | 1.5 | 1.00 |
+
+      **连 `QT_FONT_DPI` 都落进 DPR**——Qt5 时代它是进 logicalDPI 的。也就是
+      Qt6/Windows 上根本没有让 logicalDPI 偏离基线的路子，`screen_scale_factor()`
+      实质上恒等于 1.0。它现在是个留着兜底的 no-op，不是活逻辑（第 24 条）。
     - `nativeEvent` 的命中测试**与 Qt 坐标空间无关**：坐标来自 `lParam`、
       窗口矩形来自 `GetWindowRect`，两边都是 Win32 屏幕物理像素，全程没有
       一个数来自 Qt。唯一副作用是 `RESIZE_MARGIN`/`BTN_RESERVE` 是物理像素
@@ -865,6 +900,50 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     （`ENERGY_THRESHOLD_SPEECH`、`CHUNK_SUBMIT_SECONDS`…）不是像素，一起乘会
     把用户的调参毁掉。x/y 可以是负数（多屏时左边/上方那块屏），不能和尺寸
     一样 `max(1, …)`。新增像素单位的持久化项时记得加进那份名单。
+
+44. **☠️ 本项目只支持 PyQt6，不要再写 PyQt5。**（2026-09-20 迁移第 3 步落地）
+
+    三步走到此结束：第 1 步全限定枚举 + `exec()`（`aa5ebc6`），第 2 步 HiDPI
+    与存档坐标空间（`340c0d3`/`2bb97f2`），第 3 步翻 import 并第一次真把
+    PyQt6 装进来。`requirements.txt` 钉 `PyQt6>=6.6.0,<7.0.0`，验证用的是
+    6.11.0 / Qt 6.11.2。
+
+    **翻 import 之外真正要动手的只有四处**（其余 56 处 `from PyQt5` 是纯文本
+    替换，源码 28 / 测试 28）：
+
+    | 位置 | Qt6 的变化 |
+    |---|---|
+    | `ui/tv_window.py` | `QShortcut` 从 QtWidgets 搬到 QtGui（`QAction` 同理，本项目没用到） |
+    | `ui/window_frame.py` | `QMouseEvent.globalPos()/x()/y()` **被删**，只剩 QPointF 版 `globalPosition()`；`pos()` 侥幸还在 |
+    | `tests/test_hidpi_scaling.py` | `AA_EnableHighDpiScaling` 连枚举成员都没了，原来那套模拟失去前提，改成直接量真 Qt6 |
+    | `deps_fingerprint` / CI / install.ps1 | 包名 `pyqt5-sip` → `pyqt6-sip`、钉版、自检 import |
+
+    ☠️ **`globalPosition()` 返回 QPointF，必须 `.toPoint()`**。高缩放屏上它带
+    小数，而 `frameGeometry()`/`move()`/`manhattanLength()` 一路都是整数 QPoint
+    的世界，混着算会静默退化成浮点坐标——不报错，只是拖窗慢慢飘。
+
+    ☠️ **第 1 步那道枚举守卫有个洞，是这次才兑现的**：它只看 `Q…` 开头的前缀，
+    **实例上取短枚举名一个都抓不到**。`popups.py` 里的
+    `cursor.movePosition(cursor.End)`（`cursor` 不以 Q 开头）就这么一路绿着过了
+    整个第 1 步，换上 PyQt6 当场 7 个用例一起红。
+    `test_no_short_enums_on_instances` 补上了这一类——判据比第一道松（只认成员
+    名，不知道 `cursor` 是什么类型），会有理论上的误报，真撞上时改名或留一条
+    带理由的豁免，别删用例。
+
+    **老用户怎么升级**：`requirements.txt` 变了 → 更新脚本会装上 PyQt6，但
+    `pip install -r` 从不卸载东西，PyQt5 会一直留在 venv 里（见第 30 条上面
+    那段注释）。清掉它：更新时加 `-Prune`，或
+    `venv\Scripts\python scripts\prune_venv.py --yes`——本机实测正好识别出
+    PyQt5 / PyQt5-Qt5 / PyQt5_sip 三个，没误伤别的包。留着也不影响运行，
+    只是白占 100 多 MB。
+
+    **这次验到哪一步**（别把没验的当验过了）：544 项 pytest 全绿、ruff 全绿、
+    三个独立 GUI 脚本（含 WM_NCHITTEST 那套）退出码全 0、install.ps1 的自检
+    代码走通——而且**以上都是在 venv 里已经彻底没有 PyQt5 的前提下跑的**。
+    ⚠️ **没验的**：没在真正的高缩放屏（125%/150%）上跑过一次，第 43 条那张表
+    是 `QT_SCALE_FACTOR` 模拟的；`rescale_state_for_dpr` 对老存档的换算也只有
+    单元测试，没有真机换屏回归。第一个在 150% 笔记本上用的人要特别看窗口
+    尺寸和字号对不对。
 
 ## 5. 目录地图
 

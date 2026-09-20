@@ -1,16 +1,16 @@
 """一次性验证脚本：ResizableFramelessWidget 的 WM_NCHITTEST 边缘命中测试。
 真实创建窗口后用 SendMessage 合成命中测试消息，断言各边/角/内部返回码。
-（torch必须先于PyQt5导入——见main.py的坑注释，这里import translator_queue太重，
+（torch 仍然先于 PyQt6 导入——见 main.py 的坑注释，这里import translator_queue太重，
 直接import torch占位即可）"""
-import torch  # noqa: F401 先于PyQt5加载，避免c10.dll WinError 1114
+import torch  # noqa: F401 先于 PyQt6（CLAUDE.md 第 4 节第 1 条）
 import sys
 import ctypes
 from ctypes import wintypes
 
 sys.stdout.reconfigure(encoding="utf-8")
-from PyQt5.QtWidgets import QApplication, QLabel
+from PyQt6.QtWidgets import QApplication, QLabel
 from realtime_subtitle.ui.subtitle_window import ResizableFramelessWidget
-from PyQt5.QtCore import Qt
+from PyQt6.QtCore import Qt
 
 app = QApplication(sys.argv)
 w = ResizableFramelessWidget()
