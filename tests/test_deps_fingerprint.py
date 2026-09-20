@@ -2,8 +2,10 @@
 import hashlib
 
 from realtime_subtitle.deps_fingerprint import (
+    canonical_name,
     filter_requirements_for_tier,
     fingerprint_requirements,
+    orphan_packages,
     should_reinstall_deps,
     update_status,
 )
@@ -72,3 +74,35 @@ def test_update_script_retries_deps_when_commit_unchanged():
     assert "即使提交不变也会重试依赖" in text
     assert "nvidia-" in text  # 延续 CPU 过滤
     assert "CUDA" in helper and "12.0" in helper  # 与 install.ps1 的 CPU 降级条件一致
+
+
+# --- 多余依赖的识别（scripts/prune_venv.py 用） ---------------------------
+# 指纹只认 requirements 的文本，`pip install -r` 又从不卸载东西，所以"某一行被
+# 删掉"这件事在已装好的机器上是**无声**的：包留着、传递依赖也留着。
+
+def test_canonical_name_follows_pep503():
+    assert canonical_name("PyQt5_sip") == canonical_name("pyqt5-sip")
+    assert canonical_name("PyQt5.Sip") == "pyqt5-sip"
+    assert canonical_name("  Faster-Whisper  ") == "faster-whisper"
+    assert canonical_name("") == ""
+
+
+def test_orphan_packages_lists_only_what_closure_does_not_need():
+    installed = ["faster-whisper", "numpy", "librosa", "numba", "transformers"]
+    required = ["faster-whisper", "numpy"]
+    assert orphan_packages(installed, required) == ["librosa", "numba", "transformers"]
+
+
+def test_orphan_packages_matches_names_case_insensitively():
+    """装的是 PyQt5_sip、清单里写的是 pyqt5-sip，不能因此被当成孤儿删掉。"""
+    assert orphan_packages(["PyQt5_sip"], ["pyqt5-sip"]) == []
+
+
+def test_orphan_packages_never_touches_venv_plumbing():
+    """pip/setuptools 不会出现在任何 requirements 闭包里，删了 venv 就废了。"""
+    assert orphan_packages(["pip", "setuptools", "wheel"], []) == []
+
+
+def test_orphan_packages_dedupes_and_sorts():
+    got = orphan_packages(["zeta", "Alpha", "alpha", "beta"], [])
+    assert got == ["Alpha", "beta", "zeta"]

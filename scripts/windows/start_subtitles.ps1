@@ -122,9 +122,19 @@ foreach ($name in @("subtitle.log", "subtitle.err.log")) {
         Move-Item $cur (Join-Path $logDir "$base-$stamp.log") -Force -ErrorAction SilentlyContinue
     }
 }
-Get-ChildItem $logDir -Filter "subtitle-*.log" -ErrorAction SilentlyContinue |
-    Sort-Object LastWriteTime -Descending | Select-Object -Skip 30 |
-    Remove-Item -Force -ErrorAction SilentlyContinue
+# ☠️ 两个前缀要分别裁剪，不能只写 "subtitle-*.log"。归档名来自上面的
+# $base，stdout 那份是 "subtitle-<时间戳>.log"，stderr 那份是
+# "subtitle.err-<时间戳>.log"——后者**不匹配** `subtitle-*`（中间是 `.err`），
+# 于是 err 归档从 2026-08-04 起一份都没被删过，而 stdout 那边正常滚动到 30 份。
+# 症状很隐蔽：logs\ 里两种日志的最老日期对不上，除此之外一切正常。
+# 各留 30 份而不是合起来 30 份：一次运行产出一对，合并计数会让 err 少的那边
+# 把 stdout 的历史挤掉。
+foreach ($prefix in @("subtitle", "subtitle.err")) {
+    Get-ChildItem $logDir -Filter "$prefix-*.log" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match "^$([regex]::Escape($prefix))-\d{8}-\d{6}\.log$" } |
+        Sort-Object LastWriteTime -Descending | Select-Object -Skip 30 |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+}
 
 # 隐藏窗口启动+输出写进日志文件。之前用-NoNewWindow让python挂在这个控制台上，
 # 用户手动关窗口时python会被一起杀掉，跟提示语说的"关窗不停止"正好相反

@@ -68,6 +68,15 @@ class AudioCapture:
         # None = 还没探到过，采集线程按"没变化"处理
         self._desired_device_name = None
         self.probe_thread = None
+        # ☠️ 重采样器挂在实例上、**不挂在采集线程的栈帧局部变量上**。
+        # 采集线程是 daemon，退出时它多半正卡在 stream.read() 里（见 stop()），
+        # 解释器不会展开它的栈帧 → 局部变量 resampler 一直活着 → soxr 的
+        # nanobind 扩展在卸载时打印 "leaked 1 instances / CSoxr"。挂到实例上
+        # 之后 stop() 能从线程外面把它放掉（见 _release_resampler）。
+        self._resampler = None
+        # 源采样率恰好==目标时不需要重采样器，此时 None 代表"原样透传"而不是
+        # "已经放掉了"，两者对 _resample() 的含义相反，用这个标志区分
+        self._passthrough = False
 
         print(f"🎤 音频捕获模块已初始化（连续流式提交）")
         print(f"   提交节奏: {config.CHUNK_SUBMIT_SECONDS}秒/块")
@@ -189,6 +198,46 @@ class AudioCapture:
 
         print("✅ 音频捕获已启动")
 
+    def _open_resampler(self, source_rate):
+        """建一个新的 ResampleStream 并挂到实例上（源采样率==目标时不建）。"""
+        self._release_resampler()
+        if source_rate == config.SAMPLE_RATE:
+            self._passthrough = True
+            return
+        self._resampler = soxr.ResampleStream(
+            source_rate, config.SAMPLE_RATE, 1, dtype="float32")
+
+    def _release_resampler(self):
+        """放掉重采样器。可以从采集线程外面调（stop()），靠引用计数保证安全：
+        采集线程若正在 _resample() 里，那一帧自己持有一个临时引用。"""
+        r = self._resampler
+        self._resampler = None
+        self._passthrough = False
+        if r is not None:
+            try:
+                r.clear()
+            except Exception:
+                pass
+
+    def _resample(self, audio_chunk):
+        """重采样到目标采样率。
+
+        ☠️ 必须写成独立方法，不能在采集循环里用 `resampler = self._resampler`
+        取个局部变量——那个局部变量会在循环各次迭代之间一直活着，线程卡在
+        stream.read() 时它照样持有 CSoxr，等于没改。本方法的栈帧每次返回就弹掉，
+        采集循环的栈帧里于是一个 soxr 对象引用都不留。
+
+        返回 None 表示"本块丢弃"：要么流式重采样的首块还在填充滤波器没有输出，
+        要么 stop() 已经把重采样器收走了（此时 self.running 也已是 False）。
+        """
+        r = self._resampler
+        if r is None:
+            # 源采样率==目标时本来就没有重采样器，原样透传；
+            # 正在停止时（running 已 False）丢掉，别把未重采样的音频当 16k 提交
+            return audio_chunk if self._passthrough else None
+        out = r.resample_chunk(audio_chunk)
+        return out if len(out) else None
+
     def stop(self):
         """停止音频捕获"""
         if not self.running:
@@ -203,6 +252,14 @@ class AudioCapture:
             self.process_thread.join(timeout=2)
         if self.probe_thread:
             self.probe_thread.join(timeout=2)
+
+        # ☠️ join 超时是常态，不是异常：WASAPI loopback 在**没有音频播放时不
+        # 投递数据**，而用户基本都是先暂停视频再点停止——采集线程于是卡在
+        # stream.read() 里，2 秒等不到，`finally` 里的释放永远不执行。
+        # 证据：归档日志里 "⏹️ 正在停止音频捕获" 之后从来没出现过
+        # "🔇 音频流已关闭"（那是 _capture_loop 退出时才打的）。
+        # 所以在这里补一次释放，线程展不展开都不影响。
+        self._release_resampler()
 
         print("✅ 音频捕获已停止")
 
@@ -236,7 +293,7 @@ class AudioCapture:
         while self.running:
             p = None
             stream = None
-            resampler = None
+            self._release_resampler()
             try:
                 # 每次(重)开都用新PyAudio实例：PortAudio设备列表在初始化时
                 # 冻结，旧实例看不到新的默认设备。
@@ -282,10 +339,9 @@ class AudioCapture:
                 # 频谱能量比）：一次性重采样 90.4dB，逐块无状态只有 34.3dB，
                 # ResampleStream 恢复到 90.4dB——喂给 Whisper 的每一帧音频
                 # 本来都叠着一层 -34dB 的宽带噪声。
-                # 只在源采样率≠目标时才需要（相等时下面走原样透传）
-                if source_rate != config.SAMPLE_RATE:
-                    resampler = soxr.ResampleStream(
-                        source_rate, config.SAMPLE_RATE, 1, dtype="float32")
+                # 只在源采样率≠目标时才需要（相等时走原样透传）。
+                # 重采样器挂在 self 上而不是局部变量，原因见 __init__ / _resample
+                self._open_resampler(source_rate)
 
                 # 连续提交缓冲（numpy数组列表，避免逐样本extend的开销）
                 chunk_buffer = []       # 当前积累的音频块
@@ -336,14 +392,7 @@ class AudioCapture:
                             low_volume_warned = False
                             # 暂停期间的块没喂给重采样器，滤波器状态里留了个缺口 →
                             # 恢复时重建一个干净的（代价 μs 级）
-                            if resampler is not None:
-                                try:
-                                    resampler.clear()
-                                except Exception:
-                                    pass
-                                resampler = None
-                                resampler = soxr.ResampleStream(
-                                    source_rate, config.SAMPLE_RATE, 1, dtype="float32")
+                            self._open_resampler(source_rate)
                             continue
 
                         # 转换为float32并归一化到[-1, 1]
@@ -355,10 +404,11 @@ class AudioCapture:
 
                         # 重采样到目标采样率（如果需要）
                         # 直接用soxr（librosa底层也是它，但librosa整包import要好几秒）
-                        if resampler is not None:
-                            audio_chunk = resampler.resample_chunk(audio_chunk)
-                            if len(audio_chunk) == 0:
-                                continue  # 流式重采样首块可能没有输出（滤波器还在填充）
+                        audio_chunk = self._resample(audio_chunk)
+                        if audio_chunk is None:
+                            # 流式重采样首块可能没有输出（滤波器还在填充）；
+                            # 或者 stop() 已经收走了重采样器
+                            continue
 
                         # 计算当前块的能量（RMS），只做静音门用
                         energy = np.sqrt(np.mean(audio_chunk ** 2))
@@ -418,11 +468,10 @@ class AudioCapture:
             finally:
                 # 无论如何退出/重开都释放音频资源
                 try:
-                    if resampler is not None:
-                        # ResampleStream 持有 nanobind 的 CSoxr 对象；显式
-                        # clear + 丢引用，避免解释器退出时报告 leaked instance。
-                        resampler.clear()
-                        resampler = None
+                    # ResampleStream 持有 nanobind 的 CSoxr 对象。注意这条路径
+                    # **在停止时基本走不到**（线程多半卡在 read() 里），真正兜底的
+                    # 是 stop() 里那次 _release_resampler；这里管的是"重开流"。
+                    self._release_resampler()
                     if stream is not None:
                         stream.stop_stream()
                         stream.close()
