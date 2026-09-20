@@ -846,10 +846,12 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     - `screen_scale_factor()` 在 Qt6 下**自己就归 1.0**，不会双重缩放。
       Qt 接管缩放后把 `logicalDotsPerInch` 报成 96，缩放那份由 Qt 出，总倍率
       不变。实测（PyQt5 开/关 `AA_EnableHighDpiScaling` + `QT_SCALE_FACTOR`
-      模拟 150% 屏）：Qt5@100% 报 96 / DPR 1.0；Qt5@150% 报 144 / DPR 1.0
-      （我们乘 1.5）；Qt6@150% 报 96 / DPR 1.5（Qt 乘）。**别"顺手修"成除以
-      devicePixelRatio**——那会把该有的 1.0 改成 0.67。
-      `tests/test_hidpi_scaling.py` 把这三行钉住了。
+      模拟 150% 屏）——**缩放关时倍率进 logicalDPI、DPR 恒为 1；缩放开时倍率
+      进 DPR、logicalDPI 停在基线不动**。**别"顺手修"成除以 devicePixelRatio**
+      ——那会把该有的 1.0 改成 0.67。`tests/test_hidpi_scaling.py` 钉住了这条
+      不变式。⚠️ 钉的是不变式不是数字：**基线 logicalDPI 并非到处都是 96**
+      （本机 96，GitHub 的 Windows runner 是 100），写死数字会让 CI 在没人改
+      代码的日子变红——第一版就是这么红的。
     - `nativeEvent` 的命中测试**与 Qt 坐标空间无关**：坐标来自 `lParam`、
       窗口矩形来自 `GetWindowRect`，两边都是 Win32 屏幕物理像素，全程没有
       一个数来自 Qt。唯一副作用是 `RESIZE_MARGIN`/`BTN_RESERVE` 是物理像素

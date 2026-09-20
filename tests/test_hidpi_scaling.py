@@ -47,17 +47,39 @@ def _probe(hidpi, env_extra):
     return json.loads(proc.stdout.strip().splitlines()[-1])
 
 
-@pytest.mark.parametrize("label, hidpi, env, want_factor, want_dpr", [
-    ("Qt5 @100%", "off", {}, 1.0, 1.0),
-    ("Qt5 @150%", "off", {"QT_FONT_DPI": "144"}, 1.5, 1.0),
-    ("Qt6 @150%", "on", {"QT_SCALE_FACTOR": "1.5"}, 1.0, 1.5),
-])
-def test_scale_factor_semantics(label, hidpi, env, want_factor, want_dpr):
-    """☠️ 这三行是整个迁移设计的地基：Qt 接管缩放后我们这边必须自动归 1。"""
-    got = _probe(hidpi, env)
-    factor = min(max(got["logical_dpi"] / 96.0, 1.0), 2.0)
-    assert factor == pytest.approx(want_factor, abs=0.01), f"{label}: {got}"
-    assert got["dpr"] == pytest.approx(want_dpr, abs=0.01), f"{label}: {got}"
+def _factor(probe):
+    """screen_scale_factor() 的算法，喂探针数据。"""
+    return min(max(probe["logical_dpi"] / 96.0, 1.0), 2.0)
+
+
+def test_scale_factor_semantics():
+    """☠️ 整个迁移设计的地基：Qt 接管缩放后，我们这边的倍率必须**不受影响**。
+
+    断言的是不变式而不是具体数字。☠️ 第一版写死了"基线 logicalDPI = 96"，
+    结果 GitHub 的 Windows runner 报 100，`100/96 = 1.04` 让 CI 当场变红——
+    而代码一行问题都没有。真正要钉住的是「缩放出现在哪个量里」：
+
+        缩放关（Qt5）：倍率进 logicalDPI，DPR 恒为 1.0   → 我们自己乘
+        缩放开（Qt6）：倍率进 DPR，logicalDPI 不动       → Qt 替我们乘
+    """
+    base = _probe("off", {})
+    qt5_scaled = _probe("off", {"QT_FONT_DPI": "144"})
+    qt6_scaled = _probe("on", {"QT_SCALE_FACTOR": "1.5"})
+
+    # Qt5：不开缩放时 DPR 恒为 1，倍率只体现在 logicalDPI 上
+    assert base["dpr"] == pytest.approx(1.0, abs=0.01), base
+    assert qt5_scaled["dpr"] == pytest.approx(1.0, abs=0.01), qt5_scaled
+    assert qt5_scaled["logical_dpi"] > base["logical_dpi"], (base, qt5_scaled)
+
+    # Qt6：倍率跑进 DPR，logicalDPI 停在基线不动
+    assert qt6_scaled["dpr"] == pytest.approx(1.5, abs=0.01), qt6_scaled
+    assert qt6_scaled["logical_dpi"] == pytest.approx(base["logical_dpi"], abs=0.5), \
+        (base, qt6_scaled)
+
+    # 于是 screen_scale_factor() 在 Qt6 下和不缩放时完全一样——不会双重缩放，
+    # 这个公式不需要为迁移改动
+    assert _factor(qt6_scaled) == pytest.approx(_factor(base), abs=0.01)
+    assert _factor(qt5_scaled) > _factor(base)
 
 
 # --- 存档换算 -----------------------------------------------------------
