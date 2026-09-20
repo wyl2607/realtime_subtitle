@@ -103,9 +103,13 @@ def main(argv=None) -> int:
         return 0
 
     if args.check:
+        # ☠️ 这句话是印给最终用户看的，**只许提真实存在的入口**。原文写的是
+        # "更新字幕时加 -Prune 参数"，而 2026-09-20 合并桌面入口之后
+        # 「更新字幕.bat」已经不在桌面上了（第 4 节第 45 条）——照那句话做的人
+        # 会先去找一个不存在的图标。这里只留一条任何人都能照抄的命令。
         print(f"ℹ️ venv 里有 {len(orphans)} 个包已经不在依赖清单里了"
-              f"（{', '.join(orphans[:3])} 等）。想清掉："
-              f"更新字幕时加 -Prune 参数，或直接跑 "
+              f"（{', '.join(orphans[:3])} 等），留着不影响使用，只占磁盘。"
+              f"想清掉就在程序目录里跑："
               f"venv\\Scripts\\python scripts\\prune_venv.py --yes")
         return 0
 
