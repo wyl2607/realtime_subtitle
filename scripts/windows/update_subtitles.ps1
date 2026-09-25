@@ -55,7 +55,23 @@ if (-not $env:GIT_HTTP_LOW_SPEED_TIME) { $env:GIT_HTTP_LOW_SPEED_TIME = "20" }
 # 黑窗口里是 Hidden 进程没人能输入，只会永远挂着——直接失败
 $env:GIT_TERMINAL_PROMPT = "0"
 $env:GCM_INTERACTIVE = "never"
-git pull --ff-only
+# fetch 和 merge 分开做（以前是一句 git pull）：两种失败原因完全不同，用户该做的
+# 事也不同——连不上是网络问题，合不上是本地改过文件。混成一句提示只会误导。
+git fetch --quiet
+if ($LASTEXITCODE -ne 0) {
+    Write-Host ""
+    Write-Host "❌ 检查更新失败：连不上 GitHub（断网、被墙或网络很慢）。这次先不更新。"
+    Write-Host "   中国大陆网络可以给 git 配代理，或者过一会儿再试。"
+    exit 1
+}
+$upstream = git rev-parse --verify --quiet '@{u}'
+if ($LASTEXITCODE -ne 0 -or -not $upstream) {
+    Write-Host ""
+    Write-Host "❌ 当前分支没有跟踪远端分支，不知道该更新到哪里。"
+    Write-Host "   处理办法：git checkout master 回到主分支后重试（或把这行发给 AI 助手）。"
+    exit 1
+}
+git merge --ff-only --quiet '@{u}'
 if ($LASTEXITCODE -ne 0) {
     Write-Host ""
     Write-Host "❌ 更新失败。最常见原因：本地直接改过仓库文件，与新版本冲突。"
@@ -74,6 +90,31 @@ $codeChanged = $old -ne $new
 if (-not $codeChanged -and -not $needDeps) {
     Write-Host "✅ 已经是最新版本（代码和依赖都无需更新）。"
     exit 0
+}
+
+# ☠️ 依赖没装成就不许把代码留在新版本上。以前 pip 失败（断网、被离线任务挡住）
+# 时代码已经 pull 下来了，启动字幕.bat 接着就用「新代码 + 旧依赖」把字幕拉起来：
+# 新代码 import 一个还没装的包，或者撞上改了 API 的旧版本包，字幕直接起不来，
+# 而且"更新失败就用现有版本照常启动"这条退路恰恰被它自己堵死了。
+# 退回的是 HEAD，不碰工作区里的本地改动（--keep；merge --ff-only 能成功就说明
+# 本地改动和这次更新不重叠，退回去也一定不重叠）。指纹没写，下次启动会重来一遍。
+function Undo-CodeUpdate {
+    param([string]$Why)
+    if (-not $codeChanged) {
+        Write-Host "❌ $Why"
+        Write-Host "   下次即使提交不变也会重试依赖。"
+        return
+    }
+    git reset --keep --quiet $old
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "❌ $Why"
+        Write-Host "   代码已退回 v$oldVer ($($old.Substring(0,7)))，和已装好的依赖保持一致，"
+        Write-Host "   字幕照常能用。下次运行会自动重试这次更新。"
+    } else {
+        Write-Host "❌ $Why"
+        Write-Host "   ⚠️ 代码没能退回旧版本，新代码配旧依赖可能起不来。"
+        Write-Host "   处理办法：把这几行发给 AI 助手，或手动运行 git reset --keep $old"
+    }
 }
 
 $newVer = Read-LocalVersion
@@ -108,9 +149,8 @@ if ($needDeps) {
     $release = Request-VenvForPip -RepoRoot $RepoRoot
     $stoppedForDeps = $release.StoppedRealtime
     if (-not $release.Ok) {
-        Write-Host "❌ 这个 venv 还被别的 python 进程占着（PID: $($release.Blockers -join ', ')），"
-        Write-Host "   多半是还在跑的「YouTube下载加字幕」离线任务。强行装依赖会半路失败，"
-        Write-Host "   所以这次先不装——代码已经更新好了，等那个任务跑完再重跑一次即可。"
+        Undo-CodeUpdate ("这个 venv 还被别的 python 进程占着（PID: $($release.Blockers -join ', ')），" +
+            "多半是还在跑的「YouTube下载加字幕」离线任务，强行装依赖会半路失败，这次先不更新。")
         exit 1
     }
     $reqFile = Get-RequirementsFileForTier -RepoRoot $RepoRoot -Tier $tier
@@ -123,8 +163,10 @@ if ($needDeps) {
     if ($Mirror) { $pipArgs += @("-i", "https://pypi.tuna.tsinghua.edu.cn/simple") }
     & $vpy @pipArgs
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "❌ 依赖安装失败，请检查网络后重跑本脚本（大陆网络加 -Mirror 参数）"
-        Write-Host "   代码若已更新会保留；下次即使提交不变也会重试依赖。"
+        # 最常见的失败（断网/镜像不可用）发生在 pip 的下载阶段，那时还一个包都
+        # 没换，退回代码就是完全一致的旧状态。安装阶段才失败（磁盘满等）时可能
+        # 已换掉一部分包，退回代码只能尽力而为——但仍比新代码配旧依赖更接近能跑。
+        Undo-CodeUpdate "依赖安装失败，请检查网络后重试（大陆网络加 -Mirror 参数）。"
         exit 1
     }
     Write-DepsFingerprint -RepoRoot $RepoRoot -Tier $tier

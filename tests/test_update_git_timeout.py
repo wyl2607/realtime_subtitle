@@ -103,8 +103,8 @@ def test_git_pull_gives_up_on_stalled_connection(tmp_path, stalling_server):
 
 def test_update_script_disables_interactive_credential_prompts():
     text = (WIN / "update_subtitles.ps1").read_text(encoding="utf-8-sig")
-    pull = text.index("git pull --ff-only")
+    pull = text.index("git fetch --quiet")
     for needle in ('$env:GIT_TERMINAL_PROMPT = "0"', '$env:GCM_INTERACTIVE = "never"',
                    "GIT_HTTP_LOW_SPEED_LIMIT", "GIT_HTTP_LOW_SPEED_TIME"):
         pos = text.find(needle)
-        assert 0 <= pos < pull, f"{needle} 必须在 git pull 之前设好"
+        assert 0 <= pos < pull, f"{needle} 必须在 git fetch 之前设好"
