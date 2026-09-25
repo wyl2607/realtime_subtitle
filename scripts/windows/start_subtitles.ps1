@@ -25,6 +25,16 @@ if (Test-Path $pidFile) {
     }
     Remove-Item $pidFile -ErrorAction SilentlyContinue  # 残留的过期pid文件
 }
+# ☠️ pid 文件没了不等于没在运行（跑测试误删过、用户手删过）。以前这里直接往下走：
+# 先把正在写的 subtitle.log 截断，再起一个被单实例 mutex 挡下秒退的新进程，
+# 最后照样打印"已启动 (PID …)"。按进程身份再查一遍，查到就顺手把 pid 文件补上，
+# 这样停止/更新脚本也重新认得它。
+$running = Find-RealtimeInstances $RepoRoot
+if ($running.Count -gt 0) {
+    Write-SubtitleIdentity -Proc $running[0] -PidFile $pidFile -RepoRoot $RepoRoot
+    Write-Host "已经在运行中（PID $($running[0].Id)，已补回 subtitle.pid），不用重复启动。要重启请先运行 停止字幕.bat"
+    exit
+}
 
 # venv 没建 = 还没跑安装（zip拷贝/只clone就双击）。给人话别给红字堆栈
 if (-not (Test-Path "$RepoRoot\venv\Scripts\python.exe")) {
@@ -155,6 +165,25 @@ $proc = Start-Process -FilePath "$RepoRoot\venv\Scripts\python.exe" `
     -RedirectStandardOutput "$RepoRoot\subtitle.log" `
     -RedirectStandardError "$RepoRoot\subtitle.err.log"
 Write-SubtitleIdentity -Proc $proc -PidFile $pidFile -RepoRoot $RepoRoot
+# ☠️ 起来了不等于跑起来了：import 期的致命错误、以及单实例 mutex（另一份装在
+# 别处的副本在跑——mutex 是全机的，上面的进程身份检查只认本仓库）都会让它
+# 一两秒内就退出。以前不看，照样打印"已启动"，用户只看到窗口自动关掉、字幕没出现。
+# 正常启动时这里只多等 2 秒（模型在后台加载，远没到会退出的时候）。
+for ($i = 0; $i -lt 8 -and -not $proc.HasExited; $i++) { Start-Sleep -Milliseconds 250 }
+if ($proc.HasExited) {
+    Remove-Item $pidFile -ErrorAction SilentlyContinue
+    $out = @(Get-Content "$RepoRoot\subtitle.log" -Encoding UTF8 -ErrorAction SilentlyContinue)
+    $err = @(Get-Content "$RepoRoot\subtitle.err.log" -Encoding UTF8 -ErrorAction SilentlyContinue)
+    if (($out -join "`n") -match "已经在运行") {
+        Write-Host "实时字幕已经在运行了（可能是装在别的目录的另一份），没有启动第二个。"
+        exit 0
+    }
+    Write-Host "❌ 字幕程序启动后立刻退出了。最后几行输出："
+    @($out + $err) | Where-Object { "$_".Trim() } | Select-Object -Last 12 |
+        ForEach-Object { Write-Host "   $_" }
+    Write-Host "   完整日志：subtitle.log / subtitle.err.log（可以直接发给 AI 排查）"
+    exit 1
+}
 Write-Host "已启动 (PID $($proc.Id))，运行日志: subtitle.log"
 if ($firstRun) {
     Write-Host ""

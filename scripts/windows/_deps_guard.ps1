@@ -29,17 +29,12 @@ function Request-VenvForPip {
         [int]$SettleSeconds = 5
     )
     $stopped = $false
-    $pidFile = Join-Path $RepoRoot "subtitle.pid"
-    if (Test-Path $pidFile) {
-        $identity = Read-SubtitleIdentity $pidFile
-        $proc = if ($identity -and $identity.pid) {
-            Get-Process -Id $identity.pid -ErrorAction SilentlyContinue
-        } else { $null }
-        if (Test-RealtimeInstance $proc $identity $RepoRoot) {
-            Write-Host "依赖要更新，而字幕正在运行（它占着 torch/PyQt6 等文件，pip 替换不了）——先停掉字幕..."
-            & (Join-Path $PSHOME $(if ($PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' })) -NoProfile -ExecutionPolicy Bypass -File $StopScript | Out-Host
-            $stopped = $true
-        }
+    # pid 文件丢了也要认得出来（见 _identity.ps1 的 Get-RunningRealtimeInstance），
+    # 否则实时字幕会被当成"别的进程"挡住 pip，而不是被停掉
+    if (Get-RunningRealtimeInstance $RepoRoot) {
+        Write-Host "依赖要更新，而字幕正在运行（它占着 torch/PyQt6 等文件，pip 替换不了）——先停掉字幕..."
+        & (Join-Path $PSHOME $(if ($PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' })) -NoProfile -ExecutionPolicy Bypass -File $StopScript | Out-Host
+        $stopped = $true
     }
     # 停止脚本自己会等残留退干净；这里再给一小段宽限，别被收尾中的进程误报
     $users = @()

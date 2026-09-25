@@ -92,14 +92,9 @@ $codeChanged = $before -and $after -and ($before -ne $after)
 # main.py 入口 + 创建时间三项，光看 PID 会被系统回收复用坑到。
 . "$PSScriptRoot\_identity.ps1"
 
-$pidFile = "$RepoRoot\subtitle.pid"
-$running = $false
-if (Test-Path $pidFile) {
-    $identity = Read-SubtitleIdentity $pidFile
-    $runPid = if ($identity) { $identity.pid } else { $null }
-    $runProc = if ($runPid) { Get-Process -Id $runPid -ErrorAction SilentlyContinue } else { $null }
-    $running = Test-RealtimeInstance $runProc $identity $RepoRoot
-}
+# pid 文件丢了也要认得出来：否则拉到新代码时旧实例不会被停，而启动脚本又
+# 会因为"已经在运行"拒绝启动——新代码永远上不去（见 Get-RunningRealtimeInstance）
+$running = [bool](Get-RunningRealtimeInstance $RepoRoot)
 
 if ($codeChanged -and $running) {
     Write-Host ""

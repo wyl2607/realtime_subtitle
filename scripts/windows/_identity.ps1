@@ -174,3 +174,40 @@ function Write-SubtitleIdentity {
     }
     ($obj | ConvertTo-Json) | Set-Content -Path $PidFile -Encoding ascii
 }
+
+# 按**进程身份**找正在运行的实时字幕（不依赖 subtitle.pid，也不依赖窗口标题）。
+# 返回 venv 启动器存根的 Process 对象（镜像 = venv\Scripts\python.exe，命令行 =
+# main.py）。真正的解释器是它的子进程，存根活着 ⇔ 子进程活着，停它就够了。
+#
+# ☠️ 以前兜底是"按窗口标题找"，而那条路**永远停不掉真实例**：悬浮窗属于子进程，
+# 子进程的镜像是基础 Python（AppData\...\Python313\python.exe），不是 venv 里的那个，
+# 解释器校验必判"不是本仓库实例"而跳过（2026-09-26 真机撞上）。
+# ☠️ pid 文件会丢（跑测试误删过、用户手删、异常退出没写成），所以 start 也要用
+# 这个查，否则 pid 文件一丢就会"判定没在运行"又起一个、还把正在跑的日志截断。
+function Find-RealtimeInstances {
+    param($RepoRoot)
+    return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            ($_.Name -eq 'python.exe' -or $_.Name -eq 'pythonw.exe') -and
+            $_.ExecutablePath -and (Test-OurInterpreter $_.ExecutablePath $RepoRoot) -and
+            (Test-RealtimeCommandLine $_.CommandLine $RepoRoot)
+        } |
+        ForEach-Object { Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue } |
+        Where-Object { $_ })
+}
+
+# 当前运行着的实时实例（先认 pid 文件，丢了再按进程身份找）。没有返回 $null。
+function Get-RunningRealtimeInstance {
+    param($RepoRoot)
+    $pidFile = Join-Path $RepoRoot "subtitle.pid"
+    if (Test-Path $pidFile) {
+        $identity = Read-SubtitleIdentity $pidFile
+        $proc = if ($identity -and $identity.pid) {
+            Get-Process -Id $identity.pid -ErrorAction SilentlyContinue
+        } else { $null }
+        if (Test-RealtimeInstance $proc $identity $RepoRoot) { return $proc }
+    }
+    $found = Find-RealtimeInstances $RepoRoot
+    if ($found.Count -gt 0) { return $found[0] }
+    return $null
+}

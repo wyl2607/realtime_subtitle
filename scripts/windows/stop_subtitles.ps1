@@ -61,27 +61,25 @@ if (Test-Path $pidFile) {
 }
 
 if (-not $stopped) {
-    # 窗口标题只用于发现候选，命中后仍要验证解释器和 main.py 入口。
-    $procs = Get-Process python -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -like "*实时字幕*" }
-    $verified = @()
-    foreach ($proc in $procs) {
-        if (Test-RealtimeInstance $proc $null $RepoRoot) {
-            $verified += $proc
+    # pid 文件丢了/对不上：按进程身份找（解释器 = 本仓库 venv + 入口 = main.py）。
+    # 以前这里按窗口标题找，但窗口属于子进程、子进程镜像是基础 Python，身份
+    # 校验必然不过——这条兜底从来没停下过真实例（见 Find-RealtimeInstances）。
+    $found = Find-RealtimeInstances $RepoRoot
+    foreach ($proc in $found) {
+        $bornAt = Get-ProcessStartFileTime $proc
+        Write-Host "subtitle.pid 缺失，按进程身份找到实时字幕 (PID $($proc.Id))，正在请求优雅退出..."
+        New-Item -ItemType File -Path $stopFlag -Force | Out-Null
+        if (Wait-ProcessExit -ProcessId $proc.Id -Seconds $graceSeconds) {
+            Write-Host "已优雅停止实时字幕程序 (PID $($proc.Id))"
         } else {
-            Write-Host "窗口标题像实时字幕但不是本仓库实例（PID $($proc.Id)），跳过。"
-        }
-    }
-    if ($verified) {
-        foreach ($proc in $verified) {
-            New-Item -ItemType File -Path $stopFlag -Force | Out-Null
-            if (-not (Wait-ProcessExit -ProcessId $proc.Id -Seconds $graceSeconds)) {
-                $live = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
-                if (Test-RealtimeInstance $live $null $RepoRoot) {
-                    Stop-Process -Id $proc.Id -Force
-                }
+            # 强杀前再确认一次还是同一个进程（PID 复用：创建时间必须对得上）
+            $live = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
+            if ($live -and (Get-ProcessStartFileTime $live) -eq $bornAt -and
+                    (Test-RealtimeInstance $live $null $RepoRoot)) {
+                Stop-Process -Id $proc.Id -Force
+                Write-Host "优雅退出超时，已强制停止 (PID $($proc.Id))"
             }
         }
-        Write-Host "已按窗口标题停止实时字幕程序"
         $stopped = $true
     }
 }
