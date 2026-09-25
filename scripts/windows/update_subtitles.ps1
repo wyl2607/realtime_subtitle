@@ -15,6 +15,8 @@ $RepoRoot = (Get-Item $PSScriptRoot).Parent.Parent.FullName
 Set-Location $RepoRoot
 . "$PSScriptRoot\_identity.ps1"
 . "$PSScriptRoot\_update_deps.ps1"
+. "$PSScriptRoot\_deps_guard.ps1"
+$stoppedForDeps = $false
 
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
     Write-Host "❌ 没有安装 git，无法自动更新。"
@@ -91,6 +93,15 @@ if ($needDeps) {
         Write-Host "   powershell -ExecutionPolicy Bypass -File `"$PSScriptRoot\install.ps1`""
         exit 1
     }
+    # 先把 venv 腾出来再动依赖（为什么见 _deps_guard.ps1）
+    $release = Request-VenvForPip -RepoRoot $RepoRoot
+    $stoppedForDeps = $release.StoppedRealtime
+    if (-not $release.Ok) {
+        Write-Host "❌ 这个 venv 还被别的 python 进程占着（PID: $($release.Blockers -join ', ')），"
+        Write-Host "   多半是还在跑的「YouTube下载加字幕」离线任务。强行装依赖会半路失败，"
+        Write-Host "   所以这次先不装——代码已经更新好了，等那个任务跑完再重跑一次即可。"
+        exit 1
+    }
     $reqFile = Get-RequirementsFileForTier -RepoRoot $RepoRoot -Tier $tier
     if ($tier -eq "cpu") {
         Write-Host "CPU 模式：跳过 CUDA 运行库（nvidia-*），正在同步依赖..."
@@ -140,7 +151,10 @@ if ($changed -match 'install\.ps1$') {
 
 # 字幕正在运行的话提醒重启
 $pidFile = "$RepoRoot\subtitle.pid"
-if (Test-Path $pidFile) {
+if ($stoppedForDeps) {
+    # start_and_update_subtitles.ps1 接着会把它拉起来；单独跑本脚本时要告诉用户
+    Write-Host "ℹ️ 为了更新依赖已停掉字幕，双击 启动字幕.bat 即可用上新版本。"
+} elseif (Test-Path $pidFile) {
     $identity = Read-SubtitleIdentity $pidFile
     $runPid = if ($identity) { $identity.pid } else { $null }
     if ($runPid -and (Get-Process -Id $runPid -ErrorAction SilentlyContinue)) {
