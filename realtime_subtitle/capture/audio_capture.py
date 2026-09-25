@@ -49,6 +49,9 @@ class AudioCapture:
     # 症状是"偶尔吞词"且日志里一个字都没有）。
     # 暂停的响应粒度只需要一个提交周期就够——反正恢复/暂停本来就有秒级延迟。
     PAUSE_CHECK_INTERVAL = 0.5
+    # 上次报过"找不到指定设备"的 (设备名子串, 回退到的默认设备)。类属性：
+    # _resolve_loopback 是 staticmethod，采集线程和探测线程都会调它
+    _missing_warned = None
 
     def __init__(self, callback, on_status=None):
         """
@@ -116,8 +119,15 @@ class AudioCapture:
                     matches.append(dev)
 
         if matches:
+            AudioCapture._missing_warned = None  # 找到了：下次再丢要重新报
             return matches[0]
-        print(f"⚠️  未找到名称包含「{preferred}」的 loopback 设备，回退系统默认: {default.get('name')}")
+        # ☠️ 只在"状态变化"时报一次。探测线程每 DEVICE_CHECK_INTERVAL(5秒)
+        # 调一次这里，设备名填错/设备拔了的话，以前是每 5 秒一行、一天一万七千行
+        # 灌进 subtitle.log——而这个文件正是出问题时要发给 AI 看的那一份。
+        key = (preferred, default.get("name"))
+        if AudioCapture._missing_warned != key:
+            AudioCapture._missing_warned = key
+            print(f"⚠️  未找到名称包含「{preferred}」的 loopback 设备，回退系统默认: {default.get('name')}")
         return default
 
     @staticmethod
