@@ -11,8 +11,8 @@ param([switch]$CleanCache)
 $ErrorActionPreference = "Stop"
 $target = Join-Path $PSScriptRoot "scripts\windows\uninstall.ps1"
 if ($CleanCache) {
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $target -CleanCache
+    & (Join-Path $PSHOME $(if ($PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' })) -NoProfile -ExecutionPolicy Bypass -File $target -CleanCache
 } else {
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $target
+    & (Join-Path $PSHOME $(if ($PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' })) -NoProfile -ExecutionPolicy Bypass -File $target
 }
 exit $LASTEXITCODE

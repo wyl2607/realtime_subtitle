@@ -9,5 +9,5 @@
 # 新装的用户不会走到这里：新 install.ps1 生成的 .bat 直接指向 scripts\windows\。
 $ErrorActionPreference = "Stop"
 $target = Join-Path $PSScriptRoot "scripts\windows\start_subtitles.ps1"
-& powershell -NoProfile -ExecutionPolicy Bypass -File $target
+& (Join-Path $PSHOME $(if ($PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' })) -NoProfile -ExecutionPolicy Bypass -File $target
 exit $LASTEXITCODE

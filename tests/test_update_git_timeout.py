@@ -22,7 +22,10 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WIN = REPO_ROOT / "scripts" / "windows"
-POWERSHELL = shutil.which("powershell") or shutil.which("powershell.exe")
+# REALTIME_SUBTITLE_TEST_POWERSHELL=pwsh 可以把整套 PowerShell 用例切到 7 上跑：
+# 桌面 bat 有 pwsh 就优先用它（见 install.ps1 的 $psPick），两个版本都得绿
+POWERSHELL = (os.environ.get("REALTIME_SUBTITLE_TEST_POWERSHELL")
+              or shutil.which("powershell") or shutil.which("powershell.exe"))
 GIT = shutil.which("git")
 
 pytestmark = pytest.mark.skipif(

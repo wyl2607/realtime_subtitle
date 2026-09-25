@@ -37,7 +37,7 @@ function Request-VenvForPip {
         } else { $null }
         if (Test-RealtimeInstance $proc $identity $RepoRoot) {
             Write-Host "依赖要更新，而字幕正在运行（它占着 torch/PyQt6 等文件，pip 替换不了）——先停掉字幕..."
-            & powershell -NoProfile -ExecutionPolicy Bypass -File $StopScript | Out-Host
+            & (Join-Path $PSHOME $(if ($PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' })) -NoProfile -ExecutionPolicy Bypass -File $StopScript | Out-Host
             $stopped = $true
         }
     }

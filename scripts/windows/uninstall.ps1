@@ -182,7 +182,7 @@ Write-Host ""
 Write-Host "[1/6] 停止正在运行的字幕..."
 if (Test-Path "$RepoRoot\subtitle.pid") {
     try {
-        & powershell -NoProfile -ExecutionPolicy Bypass -File "$PSScriptRoot\stop_subtitles.ps1" | Out-Null
+        & (Join-Path $PSHOME $(if ($PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' })) -NoProfile -ExecutionPolicy Bypass -File "$PSScriptRoot\stop_subtitles.ps1" | Out-Null
         Write-Host "  ✅ 已停止"
     } catch {
         Write-Host "  ⚠️  停止脚本报错，继续（如果后面删 venv 失败，先手动关掉字幕）"

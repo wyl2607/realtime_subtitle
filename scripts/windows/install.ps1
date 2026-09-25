@@ -336,8 +336,15 @@ $batTemplate = @(
     @("暂停继续字幕.bat", "scripts\windows\pause_subtitles.ps1"),
     @("卸载字幕.bat", "scripts\windows\uninstall.ps1")
 )
+# 装了 PowerShell 7（pwsh）就用它，没装退回系统自带的 Windows PowerShell 5.1。
+# 脚本两边都兼容（tests 里的 PowerShell 用例两个版本都跑过），所以这只是"有更好的就用"，
+# 不是依赖——分享给没装 pwsh 的朋友照样能跑。
+# ☠️ 不能写成 `where pwsh && pwsh ... || powershell ...`：pwsh 那次运行本身返回
+# 非 0（比如启动脚本报错 exit 1）时，|| 会再用 5.1 把整个脚本重跑一遍。
+# 同样必须纯 ASCII（见下面 ⚠️ 那条）。
+$psPick = "set `"RS_PS=powershell`"`r`nwhere pwsh >nul 2>nul && set `"RS_PS=pwsh`"`r`n"
 foreach ($pair in $batTemplate) {
-    $head = "@echo off`r`nchcp 65001 >nul`r`npowershell -NoProfile -ExecutionPolicy Bypass -File `"$RepoRoot\$($pair[1])`"`r`n"
+    $head = "@echo off`r`nchcp 65001 >nul`r`n$psPick%RS_PS% -NoProfile -ExecutionPolicy Bypass -File `"$RepoRoot\$($pair[1])`"`r`n"
     if ($pair[0] -eq "启动字幕.bat") {
         # 成功≈3秒自动关；失败保留窗口让人看得到报错（报错文本由ps1打印）。
         # ⚠️ bat 必须纯 ASCII：chcp 65001 下 cmd 解析含中文的行会把下一行开头吃掉。

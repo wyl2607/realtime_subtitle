@@ -57,11 +57,12 @@ function Get-HeadCommit {
 function Invoke-Sibling {
     param([string]$Name, [string[]]$Extra = @())
     $script = Join-Path $PSScriptRoot $Name
+    # 用**当前这个解释器**起子脚本：bat 挑了 pwsh 就一路 pwsh，别半路掉回 5.1
     # ☠️ 子脚本的输出必须 Out-Host，不能让它留在管道里。PowerShell 函数的
     # 返回值是"管道里的所有东西"，直接 return $LASTEXITCODE 拿到的会是
     # 「几十行文本 + 退出码」的数组，后面 `-ne 0` 的判断随即失效——而且
     # 失效方向是"永远认为失败"，正常更新也会被报成更新失败。
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $script @Extra | Out-Host
+    & (Join-Path $PSHOME $(if ($PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' })) -NoProfile -ExecutionPolicy Bypass -File $script @Extra | Out-Host
     return $LASTEXITCODE
 }
 

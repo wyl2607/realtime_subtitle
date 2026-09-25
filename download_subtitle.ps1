@@ -12,5 +12,5 @@
 # 加参数都得同步改这里，而漏改**只在用到那个参数时才暴露**。
 $ErrorActionPreference = "Stop"
 $Target = Join-Path $PSScriptRoot "scripts\windows\download_subtitle.ps1"
-& powershell -NoProfile -ExecutionPolicy Bypass -File $Target @args
+& (Join-Path $PSHOME $(if ($PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' })) -NoProfile -ExecutionPolicy Bypass -File $Target @args
 exit $LASTEXITCODE

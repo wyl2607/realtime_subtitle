@@ -8,6 +8,7 @@
 跳过条件：没有 powershell.exe，或本仓库还没建 venv（拿不到 python.exe 当桩）。
 """
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -17,7 +18,10 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PS1 = REPO_ROOT / "scripts" / "windows" / "download_subtitle.ps1"
 VENV_PYTHON = REPO_ROOT / "venv" / "Scripts" / "python.exe"
-POWERSHELL = shutil.which("powershell") or shutil.which("powershell.exe")
+# REALTIME_SUBTITLE_TEST_POWERSHELL=pwsh 可以把整套 PowerShell 用例切到 7 上跑：
+# 桌面 bat 有 pwsh 就优先用它（见 install.ps1 的 $psPick），两个版本都得绿
+POWERSHELL = (os.environ.get("REALTIME_SUBTITLE_TEST_POWERSHELL")
+              or shutil.which("powershell") or shutil.which("powershell.exe"))
 
 pytestmark = pytest.mark.skipif(
     not POWERSHELL or not VENV_PYTHON.is_file(),
