@@ -292,8 +292,11 @@ if (-not (Test-OllamaReady)) {
 }
 # 模型名从「最终生效的配置」里读（config.py + 刚生成的 config_local.py），
 # 保证脚本和程序运行时用的一定是同一个模型，不会各说各话
-$txModel = (& $vpy -c "from realtime_subtitle import config; print(config.OLLAMA_MODEL)").Trim()
-$gameModel = (& $vpy -c "from realtime_subtitle import config; print(config.GAME_MODE_OLLAMA_MODEL or '')").Trim()
+# 只认 RSCFG: 前缀行：config_local.py 里的 print 会混进 stdout（见 start_subtitles.ps1）
+$cfgOut = & $vpy -c "from realtime_subtitle import config; print('RSCFG:' + str(config.OLLAMA_MODEL)); print('RSCFG:' + str(config.GAME_MODE_OLLAMA_MODEL or ''))"
+$cfg = @(@($cfgOut) | ForEach-Object { "$_".Trim() } | Where-Object { $_.StartsWith("RSCFG:") } | ForEach-Object { $_.Substring(6) })
+$txModel = if ($cfg.Count -ge 1) { $cfg[0] } else { "" }
+$gameModel = if ($cfg.Count -ge 2) { $cfg[1] } else { "" }
 $installed = @()
 try { $installed = (Invoke-RestMethod -Uri "http://127.0.0.1:11434/api/tags").models.name } catch { }
 foreach ($m in @($txModel, $gameModel) | Where-Object { $_ } | Select-Object -Unique) {

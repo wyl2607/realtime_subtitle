@@ -75,7 +75,18 @@ if (-not (Test-OllamaReady)) {
 
 # 模型名从 config 读（config_local.py 里可能配了小模型），不要硬编码。
 # 一次 python 调用读两个值：venv python 冷启动约0.5秒，起两次纯浪费
-$cfg = @((& "$RepoRoot\venv\Scripts\python.exe" -c "from realtime_subtitle import config; print(config.OLLAMA_MODEL); print(config.WHISPER_MODEL)") -split "`n" | ForEach-Object { $_.Trim() })
+# ☠️ 只认带 RSCFG: 前缀的行：config_local.py 是 exec 进来的，里面随手一个
+# print 就会混进 stdout。以前直接取第 1/2 行，混进来的文字会被当成模型名
+# 拿去 `ollama pull`，报出"网络/模型名过期"，真正的原因反而被盖住。
+$cfgOut = & "$RepoRoot\venv\Scripts\python.exe" -c "from realtime_subtitle import config; print('RSCFG:' + str(config.OLLAMA_MODEL)); print('RSCFG:' + str(config.WHISPER_MODEL))"
+$cfgExit = $LASTEXITCODE
+$cfg = @(@($cfgOut) | ForEach-Object { "$_".Trim() } | Where-Object { $_.StartsWith("RSCFG:") } | ForEach-Object { $_.Substring(6) })
+if ($cfgExit -ne 0 -or $cfg.Count -lt 2 -or -not $cfg[0]) {
+    Write-Host "❌ 读取配置失败（上面几行是 Python 的原始报错）。"
+    Write-Host "   最常见原因：config_local.py 写坏了（语法错误/拼写错误）。"
+    Write-Host "   修好它、或暂时改名成 config_local.py.bak 之后再启动。"
+    exit 1
+}
 $txModel = $cfg[0]
 
 # 首次启动检测：Whisper 模型还没下载过（HF 缓存里没有）就明确告知要等几分钟。

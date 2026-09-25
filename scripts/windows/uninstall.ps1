@@ -145,7 +145,12 @@ if ($CleanCache) {
 $txModel = $null
 $vpy = "$RepoRoot\venv\Scripts\python.exe"
 if (Test-Path $vpy) {
-    try { $txModel = (& $vpy -c "from realtime_subtitle import config; print(config.OLLAMA_MODEL)" 2>$null).Trim() } catch { }
+    # 只认 RSCFG: 前缀行：config_local.py 里的 print 会混进 stdout（见 start_subtitles.ps1）
+    try {
+        $txModel = @(& $vpy -c "from realtime_subtitle import config; print('RSCFG:' + str(config.OLLAMA_MODEL))" 2>$null) |
+            ForEach-Object { "$_".Trim() } | Where-Object { $_.StartsWith("RSCFG:") } |
+            ForEach-Object { $_.Substring(6) } | Select-Object -First 1
+    } catch { }
 }
 if (-not $txModel) {
     Write-Host "  ℹ️ 读不到配置里的翻译模型名（venv 可能已删），到时候手动选"

@@ -560,6 +560,13 @@ try:
         _spec.loader.exec_module(_mod)
         globals().update({k: v for k, v in vars(_mod).items() if not k.startswith("_")})
 except Exception as _e:
+    # ☠️ 必须写 stderr 不能写 stdout：start/stop_subtitles.ps1 是靠
+    # `python -c "from realtime_subtitle import config; print(...)"` 的 stdout
+    # 读模型名的。写 stdout 时这两行警告会被当成模型名，于是启动脚本去
+    # `ollama pull "⚠️ config_local.py 加载失败…"`，再报"网络/模型名过期"——
+    # 真正的原因（配置文件写坏了）反而被盖住。主程序的 stderr 进 subtitle.err.log。
+    import sys as _sys
     print(f"⚠️  config_local.py 加载失败，本机配置【未生效】，正在使用 config.py 默认值: "
-          f"{_e.__class__.__name__}: {_e}")
-    print("   （没有显卡的机器会因此按 CUDA 档启动并在加载模型时报错——先修这个文件）")
+          f"{_e.__class__.__name__}: {_e}", file=_sys.stderr)
+    print("   （没有显卡的机器会因此按 CUDA 档启动并在加载模型时报错——先修这个文件）",
+          file=_sys.stderr)
