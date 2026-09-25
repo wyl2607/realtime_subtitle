@@ -215,9 +215,14 @@ def test_repeat_perf_toggle_stable():
         _restore(snap)
 
 
-def test_stop_releases_startup_warm_when_translator_is_none(monkeypatch):
+def test_stop_releases_startup_warm_when_translator_is_none(monkeypatch, tmp_path):
     """加载中点❌：self.translator 仍是 None，stop() 也必须收掉预热租期。"""
     import realtime_subtitle.translate.translator_queue as tq
+
+    # ☠️ stop() 会按路径删 subtitle.pid 和 .stop。不换到 tmp_path 的话删的是
+    # **仓库根的真文件**——字幕开着时跑一次测试就把它的 pid 文件删了（见 conftest）
+    monkeypatch.setattr(main, "repo_path", lambda *parts: str(tmp_path.joinpath(*parts)))
+    monkeypatch.setattr(main, "STOP_FLAG_FILE", str(tmp_path / ".stop"))
 
     posts = []
 
