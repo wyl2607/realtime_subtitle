@@ -1319,7 +1319,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
     # ------------------------------------------------------------------
     # Ollama 端口身份校验
     # ------------------------------------------------------------------
-    def _check_ollama_identity(self, timeout=2):
+    def _check_ollama_identity(self, timeout=2, session=None):
         """11434 后面到底是不是 Ollama。返回 (状态, version)。
 
         状态取值 'ok' / 'impostor' / 'unreachable'。
@@ -1328,9 +1328,12 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
         抢先 bind 它。那样我们会把**系统全部声音的转录**连同上下文一路 POST
         给它，再把它返回的任意文本当字幕上屏并写进 transcripts。校验响应体里
         确实有 version 字段，成本一次 JSON 解析，就能把两者分开。
+
+        session：调用方线程自己的 Session。查词/AI 分析线程必须传自己的，
+        不能借 ollama_session——那是翻译线程的，requests.Session 跨线程并发不安全。
         """
         try:
-            resp = self.ollama_session.get(
+            resp = (session or self.ollama_session).get(
                 f"{ollama_url()}/api/version", timeout=timeout)
         except (requests.RequestException, OllamaUnverified):
             return "unreachable", ""
@@ -1348,8 +1351,12 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
         if self.on_status:
             self.on_status("🚨 11434 端口上的程序不像 Ollama，已暂停翻译（只显原文）")
 
-    def _ollama_identity_ok(self):
-        """发翻译请求前的门禁。返回 False 表示这一句不要发出去。
+    def _ollama_identity_ok(self, session=None):
+        """发请求前的门禁。返回 False 表示这一句不要发出去。
+
+        ☠️ 翻译、查词、🤖 AI 分析**三条路径都要过这道门**。以前只有翻译过：
+        端口已经被判成冒牌货、翻译已暂停时，点一下 🤖 照样把最近 5 分钟的
+        转录（最多 2000 字）整段 POST 过去——那是三条路径里单次外发量最大的。
 
         ☠️ 启动时校验一次是不够的：Ollama 是独立安装的服务、会自动更新并重启
         （CLAUDE.md 第 4 节第 6 条自己记着这事），重启的窗口期里端口是空的，
@@ -1371,7 +1378,10 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin):
         if now < self._ollama_verify_next:
             return not self._ollama_impostor  # 节流期内沿用上次结论
         self._ollama_verify_next = now + 30
-        state, _version = self._check_ollama_identity()
+        if session is not None:
+            state, _version = self._check_ollama_identity(session=session)
+        else:
+            state, _version = self._check_ollama_identity()
         if state != "unreachable":
             self._ollama_recheck_pending = False  # 有明确结论了
         was_impostor = self._ollama_impostor

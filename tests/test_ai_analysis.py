@@ -1109,3 +1109,110 @@ def test_ai_web_confirm_defaults_to_on_in_repo_config():
     m = re.search(r"^AI_WEB_CONFIRM\s*=\s*(\w+)", src, re.M)
     assert m, "config.py 里找不到 AI_WEB_CONFIRM"
     assert m.group(1) == "True", f"仓库默认被改成了 {m.group(1)}"
+
+
+# ------------------------------------------------------------------
+# 端口身份门禁：查词 / AI 分析也必须过（以前只有翻译过）
+# ------------------------------------------------------------------
+
+class _VersionSession:
+    """假 Session：/api/version 返回给定的 JSON，记下所有 post。"""
+
+    def __init__(self, version_body):
+        self._body = version_body
+        self.gets = []
+        self.posts = []
+
+    def get(self, url, timeout=None):
+        self.gets.append(url)
+        body = self._body
+
+        class _R:
+            def json(self):
+                return body
+        return _R()
+
+    def post(self, url, json=None, stream=False, timeout=None):
+        self.posts.append(json)
+        if stream:
+            return _FakeStreamResponse(["结果"])
+
+        class _R:
+            status_code = 200
+
+            def json(self):
+                return {"response": "分析结果"}
+        return _R()
+
+
+class _ExplodingSession:
+    """翻译线程的 Session：查词/分析线程绝不能碰它（跨线程并发不安全）。"""
+
+    def get(self, *a, **k):
+        raise AssertionError("身份校验借用了翻译线程的 ollama_session")
+
+    post = get
+
+
+def _gated_translator(monkeypatch, version_body):
+    from realtime_subtitle.translate import translator_queue as tq
+    monkeypatch.setattr(tq, "_pinned_ollama_url", "http://127.0.0.1:11434")
+    t = _lookup_translator()
+    t.on_status = None
+    t._ollama_recheck_pending = True     # 断过连 / 启动时没验成：需要重验
+    t._ollama_verify_next = 0.0
+    t.ollama_session = _ExplodingSession()
+    t.lookup_session = _VersionSession(version_body)
+    t.analysis_session = _VersionSession(version_body)
+    return t
+
+
+def test_lookup_blocked_when_port_is_not_ollama(monkeypatch):
+    """☠️ 端口被冒牌货占了：查词一个字节的句境都不许发出去，弹窗要说清楚。"""
+    from realtime_subtitle.translate.lookup import IMPOSTOR_BLOCKED_TEXT
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
+
+    t = _gated_translator(monkeypatch, {"hello": "not ollama"})
+    results = []
+    WhisperQueueTranslator._lookup_worker(
+        t, "Wort", "ein geheimer Kontext", lambda w, txt: results.append(txt), seq=1)
+
+    assert t.lookup_session.posts == [], "冒牌端口上不许 POST 句境"
+    assert results == [IMPOSTOR_BLOCKED_TEXT]
+    assert t._lookup_inflight is False
+
+
+def test_ai_analysis_blocked_when_port_is_not_ollama(monkeypatch):
+    """☠️ 🤖 一次外发最近 5 分钟转录，是三条路径里最该拦的。"""
+    from realtime_subtitle.translate.lookup import IMPOSTOR_BLOCKED_TEXT
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
+
+    t = _gated_translator(monkeypatch, {})
+    results = []
+    WhisperQueueTranslator._run_ai_analysis_request(
+        t, "最近五分钟的全部转录……", results.append)
+
+    assert t.analysis_session.posts == [], "冒牌端口上不许 POST 转录"
+    assert results == [IMPOSTOR_BLOCKED_TEXT]
+    assert t._lookup_inflight is False
+
+
+def test_lookup_and_analysis_pass_gate_with_own_session(monkeypatch):
+    """真是 Ollama 时照常发请求；校验用的是各自线程的 Session，不是翻译的。"""
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
+
+    t = _gated_translator(monkeypatch, {"version": "0.33.1"})
+    looked = []
+    WhisperQueueTranslator._lookup_worker(
+        t, "Wort", "ctx", lambda w, txt: looked.append(txt), seq=1)
+    assert t.lookup_session.gets, "重验必须走查词自己的 Session"
+    assert len(t.lookup_session.posts) == 1
+    assert looked == ["结果"]
+
+    t._ollama_recheck_pending = True
+    t._ollama_verify_next = 0.0
+    analysed = []
+    WhisperQueueTranslator._run_ai_analysis_request(t, "p", analysed.append)
+    assert t.analysis_session.gets, "重验必须走 AI 分析自己的 Session"
+    assert len(t.analysis_session.posts) == 1
+    assert analysed == ["分析结果"]

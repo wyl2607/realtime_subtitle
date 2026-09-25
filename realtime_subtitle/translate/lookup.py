@@ -47,6 +47,8 @@ import realtime_subtitle.config as config
 # 不返回。一条字幕的中文再长也就几百字，20000 是留足余量的保险丝。
 _MAX_STREAM_CHARS = 20000
 LOOKUP_CACHE_VERSION = 2
+# 端口身份门禁拦下请求时给弹窗的文案（和翻译侧 _warn_ollama_impostor 同一件事）
+IMPOSTOR_BLOCKED_TEXT = "🚨 11434 端口上的程序不像 Ollama，已拦截（没有发送任何内容）"
 
 
 def normalize_lookup_context(context):
@@ -509,6 +511,12 @@ class LookupMixin:
         # 地址必须走 ollama_url() 而不是 config.OLLAMA_BASE_URL——启动校验会把主机名
         # 钉成 IP 字面量，绕过它等于绕过那道隐私闸门（见 _assert_local_ollama）
         from realtime_subtitle.translate.translator_queue import ollama_url
+        # 端口身份门禁：和翻译同一道（见 _ollama_identity_ok）。句境也是转录内容
+        if not self._ollama_identity_ok(
+                session=getattr(self, "lookup_session", None)):
+            if not self._lookup_stale(seq):
+                _emit_lookup(callback, word, IMPOSTOR_BLOCKED_TEXT, request_id)
+            return
         self._enter_inflight()  # 草稿翻译看这个让路，见 translator_queue._maybe_draft
         try:
             t0 = time.time()
@@ -612,6 +620,12 @@ class LookupMixin:
     def _run_ai_analysis_request(self, prompt, callback, num_predict=400, label="分析"):
         """共用 Ollama /api/generate 路径：失败只改弹窗文案，不重试、不打扰主链路。"""
         from realtime_subtitle.translate.translator_queue import ollama_url  # 同上：防循环 import
+        # ☠️ 这条路径一次外发最近 5 分钟的转录，是最该过门禁的一条
+        if not self._ollama_identity_ok(
+                session=getattr(self, "analysis_session", None)):
+            if not getattr(self, "closing", False):
+                callback(IMPOSTOR_BLOCKED_TEXT)
+            return
         self._enter_inflight()  # 草稿翻译看这个让路，见 translator_queue._maybe_draft
         try:
             t0 = time.time()
