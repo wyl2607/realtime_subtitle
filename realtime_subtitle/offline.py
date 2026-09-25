@@ -1263,7 +1263,78 @@ def _parse_ollama_payload(payload) -> str:
     return cleaned
 
 
+# 翻译阶段断点落盘的最小间隔（秒），见 translate_segments 里 persist 的注释
+PERSIST_MIN_INTERVAL = 2.0
+
+# 本进程真正打过的 (Ollama 地址, 模型名)。任务结束时只卸这些——用户自己在
+# Ollama 里跑的别的模型不归我们管（和实时侧 _unload_our_models 同一条规矩）
+_models_used: set[tuple[str, str]] = set()
+
+# 实时字幕的单实例 mutex 名，必须和 app.py 里 CreateMutexW 的那个逐字一致
+_REALTIME_MUTEX = "realtime_subtitle_single_instance"
+
+
+def _realtime_subtitle_running() -> bool:
+    """实时字幕开着吗？看它持有的那个命名 mutex 在不在（只读，不占用）。
+
+    用 mutex 而不是 subtitle.pid：pid 文件会残留、PID 会被复用，而 mutex
+    随进程生死，内核替我们维护，不会说谎。
+    """
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenMutexW.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_wchar_p)
+    kernel32.OpenMutexW.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    SYNCHRONIZE = 0x00100000
+    handle = kernel32.OpenMutexW(SYNCHRONIZE, False, _REALTIME_MUTEX)
+    if not handle:
+        return False
+    kernel32.CloseHandle(handle)
+    return True
+
+
+def release_offline_models(timeout: float = 5.0) -> list[str]:
+    """任务结束：卸掉本进程装进显存的翻译模型。返回卸掉的名字（给测试/日志）。
+
+    ☠️ 实时字幕开着时**一个都不卸**：两边用的就是同一个翻译模型，卸掉等于
+    让正在看直播的人下一句中文白付一次冷加载（9b 要 5~30 秒）。那种情况下
+    模型本来就该常驻，由实时字幕自己的退出路径负责卸。
+
+    只卸"/api/ps 里确实加载着、且是本进程用过的"模型：对没加载的模型发
+    keep_alive=0 会先触发一次完整加载，纯浪费。失败一律静默——最坏情况是
+    模型按 OFFLINE_OLLAMA_KEEP_ALIVE 到期自己走。
+    """
+    used = set(_models_used)
+    _models_used.clear()
+    if not used or _realtime_subtitle_running():
+        return []
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
+    unloaded = []
+    for url in sorted({u for u, _ in used}):
+        mine = [m for u, m in used if u == url]
+        try:
+            with requests.Session() as session:
+                loaded = session.get(f"{url}/api/ps", timeout=timeout).json().get("models", [])
+                for item in loaded:
+                    name = item.get("name")
+                    if any(WhisperQueueTranslator._model_name_matches(name, m) for m in mine):
+                        session.post(
+                            f"{url}/api/generate",
+                            json={"model": name, "prompt": "", "keep_alive": 0},
+                            timeout=timeout,
+                        ).close()
+                        unloaded.append(name)
+        except Exception:
+            continue
+    for name in unloaded:
+        print(f"🧹 已卸载翻译模型 {name}（释放显存）", flush=True)
+    return unloaded
+
+
 def _ollama_request(session: requests.Session, url: str, model: str, prompt: str, num_predict: int = 512) -> str:
+    _models_used.add((url, model))
     response = session.post(
         f"{url}/api/generate",
         json={
@@ -1271,7 +1342,8 @@ def _ollama_request(session: requests.Session, url: str, model: str, prompt: str
             "prompt": prompt,
             "stream": False,
             "think": False,
-            "keep_alive": "2h",
+            # 短租期 + 任务结束主动卸载，见 config.OFFLINE_OLLAMA_KEEP_ALIVE
+            "keep_alive": getattr(config, "OFFLINE_OLLAMA_KEEP_ALIVE", "10m"),
             "options": {
                 "temperature": 0.2,
                 "top_p": 0.9,
@@ -1310,8 +1382,16 @@ def translate_segments(
     if fallback and fallback not in models:
         models.append(fallback)
 
-    def persist():
-        """每写一条就落盘。☠️ rows 和当前语言的 translations 表**必须一起更新**。
+    # ☠️ 以前是**每翻一条就把整份断点重写一遍**：断点里有全部 rows 外加各
+    # 目标语言的译文表，体积随条数线性涨，于是整个任务的写盘量是 O(n²)——
+    # 两小时视频两三千条，累计要写好几个 GB，还跟翻译抢着做 JSON 序列化。
+    # 改成最多 PERSIST_MIN_INTERVAL 秒落一次；失败、中断（含 Ctrl+C）和正常
+    # 结束都强制落一次，所以最坏只丢最后两秒的译文，重跑时补上即可。
+    last_saved = [float("-inf")]
+    dirty = [False]
+
+    def persist(force=False):
+        """落盘断点（节流）。☠️ rows 和当前语言的 translations 表**必须一起更新**。
 
         以前这里只写 rows，translations 只有任务正常跑完时才由 build_checkpoint
         更新一次。于是中断/失败路径上：磁盘里 rows[0].translation 有译文，
@@ -1319,6 +1399,10 @@ def translate_segments(
         以那张空表为准，把已经翻好的行又清掉重翻。断点等于白存。
         """
         if not checkpoint_path:
+            return
+        now = time.monotonic()
+        if not force and now - last_saved[0] < PERSIST_MIN_INTERVAL:
+            dirty[0] = True
             return
         payload = dict(checkpoint_meta or {})
         payload["version"] = payload.get("version", CHECKPOINT_VERSION)
@@ -1332,57 +1416,66 @@ def translate_segments(
         payload["translations"] = stash_translations(
             payload, source_language, target_language, rows)
         save_checkpoint(checkpoint_path, payload)
+        last_saved[0] = now
+        dirty[0] = False
 
     review_rows = []
-    with requests.Session() as session:
-        for index, row in enumerate(rows, 1):
-            if (row.get("translation") or "").strip():
-                continue
-            previous_text = rows[index - 2]["text"] if index > 1 else None
-            prompt = _translation_prompt(
-                source_language, target_language, row["text"],
-                previous_text=previous_text,
-            )
-            result = ""
-            last_error = None
-            for model in models:
-                if not model:
+    try:
+        with requests.Session() as session:
+            for index, row in enumerate(rows, 1):
+                if (row.get("translation") or "").strip():
                     continue
-                num_predict = 512
-                expanded = False
-                for attempt in range(2):
-                    try:
-                        result = _ollama_request(
-                            session, ollama_url, model, prompt, num_predict)
-                        if result:
-                            break
-                    except TruncatedModelOutput as exc:
-                        last_error = exc
-                        if not expanded:
-                            fits, bigger = _can_expand_output(prompt, num_predict)
-                            if fits:
-                                num_predict = bigger
-                                expanded = True
-                                continue
-                    except Exception as exc:
-                        last_error = exc
-                    time.sleep(1.0)
-                if result:
-                    break
-            if not result:
+                previous_text = rows[index - 2]["text"] if index > 1 else None
+                prompt = _translation_prompt(
+                    source_language, target_language, row["text"],
+                    previous_text=previous_text,
+                )
+                result = ""
+                last_error = None
+                for model in models:
+                    if not model:
+                        continue
+                    num_predict = 512
+                    expanded = False
+                    for attempt in range(2):
+                        try:
+                            result = _ollama_request(
+                                session, ollama_url, model, prompt, num_predict)
+                            if result:
+                                break
+                        except TruncatedModelOutput as exc:
+                            last_error = exc
+                            if not expanded:
+                                fits, bigger = _can_expand_output(prompt, num_predict)
+                                if fits:
+                                    num_predict = bigger
+                                    expanded = True
+                                    continue
+                        except Exception as exc:
+                            last_error = exc
+                        time.sleep(1.0)
+                    if result:
+                        break
+                if not result:
+                    persist(force=True)
+                    raise OfflineSubtitleError(f"第 {index} 条字幕翻译失败：{last_error or '本地模型没有返回译文'}")
+                row["translation"] = result
+                row.pop("needs_review", None)  # 重译过就不再挂着上一轮的旧标记
+                # 疑似拒答只是给人看的复核提示，不是失败：见 _looks_like_refusal
+                if _looks_like_refusal(result):
+                    row["needs_review"] = True
+                    review_rows.append(index)
+                    print(f"⚠️  第 {index} 条译文疑似模型拒答，已保留，建议人工复核："
+                          f"{result.strip()[:40]}", flush=True)
                 persist()
-                raise OfflineSubtitleError(f"第 {index} 条字幕翻译失败：{last_error or '本地模型没有返回译文'}")
-            row["translation"] = result
-            row.pop("needs_review", None)  # 重译过就不再挂着上一轮的旧标记
-            # 疑似拒答只是给人看的复核提示，不是失败：见 _looks_like_refusal
-            if _looks_like_refusal(result):
-                row["needs_review"] = True
-                review_rows.append(index)
-                print(f"⚠️  第 {index} 条译文疑似模型拒答，已保留，建议人工复核："
-                      f"{result.strip()[:40]}", flush=True)
-            persist()
-            if index % 20 == 0 or index == 1:
-                print(f"翻译进度：{index}/{len(rows)}", flush=True)
+                if index % 20 == 0 or index == 1:
+                    print(f"翻译进度：{index}/{len(rows)}", flush=True)
+    except BaseException:
+        if dirty[0]:
+            persist(force=True)  # 中断（含 Ctrl+C）：已经翻好的那几条别丢
+        raise
+    if dirty[0]:
+        persist(force=True)
     if review_rows:
         print(f"ℹ️  共 {len(review_rows)} 条译文疑似拒答（第 "
               f"{'、'.join(str(i) for i in review_rows[:10])} 条"
@@ -1948,6 +2041,9 @@ def main(argv: list[str] | None = None) -> int:
     except OfflineSubtitleError as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 1
+    finally:
+        # 成功、失败、Ctrl+C 都要走：这个进程马上就退了，没人会替它卸模型
+        release_offline_models()
     return 0
 
 

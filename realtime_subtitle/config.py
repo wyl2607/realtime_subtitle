@@ -539,6 +539,14 @@ STATS_SUMMARY_INTERVAL = 60
 OFFLINE_COOKIES_FILE = None
 OFFLINE_COOKIES_FROM_BROWSER = None
 
+# 离线任务打 Ollama 的 keep_alive。☠️ 不能照抄实时字幕的 "2h"：离线任务是
+# 独立进程，跑完就退，没有人会替它卸模型——以前每跑一个视频，翻译模型
+# （9b 约 5.6GB 显存）都要白占两小时。任务正常结束时会主动卸载（实时字幕
+# 开着时除外，见 offline.release_offline_models）；这个短租期兜的是"直接关
+# 窗口、进程被杀、finally 没机会跑"的情况。任务进行中请求是连续的，10 分钟
+# 足够不中途掉出显存。
+OFFLINE_OLLAMA_KEEP_ALIVE = "10m"
+
 # ============ 本机覆盖（放最后，能覆盖上面所有配置）============
 # install.ps1 在没有NVIDIA显卡的机器上会生成 config_local.py
 # （WHISPER_DEVICE="cpu" 等降级配置）；个人调参也可以写在那里，
