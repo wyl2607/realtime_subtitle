@@ -58,12 +58,19 @@ function Invoke-Sibling {
     param([string]$Name, [string[]]$Extra = @())
     $script = Join-Path $PSScriptRoot $Name
     # 用**当前这个解释器**起子脚本：bat 挑了 pwsh 就一路 pwsh，别半路掉回 5.1
-    # ☠️ 子脚本的输出必须 Out-Host，不能让它留在管道里。PowerShell 函数的
-    # 返回值是"管道里的所有东西"，直接 return $LASTEXITCODE 拿到的会是
-    # 「几十行文本 + 退出码」的数组，后面 `-ne 0` 的判断随即失效——而且
-    # 失效方向是"永远认为失败"，正常更新也会被报成更新失败。
-    & (Join-Path $PSHOME $(if ($PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' })) -NoProfile -ExecutionPolicy Bypass -File $script @Extra | Out-Host
-    return $LASTEXITCODE
+    $exe = Join-Path $PSHOME $(if ($PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' })
+    # ☠️ 不许经过管道（以前是 `& $exe -File $script | Out-Host`）。pwsh 7 下
+    # start_subtitles.ps1 用 Start-Process 拉起的 python 会**继承这根管道的写端**，
+    # 于是 Out-Host 要等到字幕程序退出才读到 EOF——启动字幕.bat 的黑窗口在字幕
+    # 开着的整个期间都关不掉（2026-09-26 切到 pwsh 当天真机撞上；5.1 不继承，
+    # 所以以前没暴露）。现在子脚本直接写控制台，函数的管道里只剩退出码。
+    # ☠️ 也不能用 Start-Process -Wait：它等的是**整棵进程树**，常驻的字幕进程
+    # 同样会把它挂住。WaitForExit() 只等子脚本自己。
+    $argLine = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$script`"") + $Extra
+    $proc = Start-Process -FilePath $exe -ArgumentList $argLine -NoNewWindow -PassThru
+    $null = $proc.Handle  # 5.1：不先摸一下 Handle，退出后 ExitCode 读出来是 $null
+    $proc.WaitForExit()
+    return $proc.ExitCode
 }
 
 # ---------- 1. 更新 ----------
