@@ -44,6 +44,17 @@ $oldVer = Read-LocalVersion
 $old = (git rev-parse HEAD).Trim()
 Write-Host "当前版本：v$oldVer ($($old.Substring(0,7)))"
 Write-Host "正在检查更新..."
+# ☠️ git pull 默认**没有任何超时**：GitHub 被墙/网络半通时 HTTPS 连上了却一直
+# 不给数据，curl 就无限等下去。而启动字幕.bat = 更新 + 启动，每次双击都先走
+# 这里——用户看到的是"双击没反应"，字幕永远起不来（更新失败本来是能跳过的）。
+# 低速阈值：连续 N 秒低于 1KB/s 就放弃。git 只在 LIMIT 和 TIME 都设了时才启用，
+# 用户自己设过的值不覆盖。
+if (-not $env:GIT_HTTP_LOW_SPEED_LIMIT) { $env:GIT_HTTP_LOW_SPEED_LIMIT = "1000" }
+if (-not $env:GIT_HTTP_LOW_SPEED_TIME) { $env:GIT_HTTP_LOW_SPEED_TIME = "20" }
+# 公开仓库不需要凭据；真弹出用户名/密码提示（仓库地址被改、代理劫持）时，
+# 黑窗口里是 Hidden 进程没人能输入，只会永远挂着——直接失败
+$env:GIT_TERMINAL_PROMPT = "0"
+$env:GCM_INTERACTIVE = "never"
 git pull --ff-only
 if ($LASTEXITCODE -ne 0) {
     Write-Host ""
