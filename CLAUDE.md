@@ -276,7 +276,7 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
 
 改代码（如果用户让你改功能）：
 
-15. 改完跑测试：`venv\Scripts\python -m pytest`（573 项，以实际输出为准）。
+15. 改完跑测试：`venv\Scripts\python -m pytest`（条数以实际输出为准，别在文档里写死）。
     ☠️ **pytest 不在 requirements.txt 里**（那份是给最终用户装的，install.ps1
     不会装 pytest），新环境上第一次跑会报 `No module named pytest`，先装：
     `venv\Scripts\python -m pip install -r requirements-dev.txt`。test_hittest /
@@ -661,7 +661,8 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     - faster-whisper 的词级时间戳给每个词都带前导空格，拉丁语系需要它，中文
       照抄就成了「另外,软件方面的 更 新同 样值得 关注。」。`_ts_words` 按语言剥。
     - 拼接残句/合并批次时的 `" ".join` 同理，无空格语言要用空串。
-    统一入口是 `translator_queue._no_space_language()`，语言集合在
+    统一入口是 `_no_space_language()`（在 `translate/text_rules.py`，translator_queue
+    里 re-export 了同名），语言集合在
     `config.NO_SPACE_LANGUAGES`。加韩语/泰语往那里补，别再散着判。
 
     **☠️ 2026-08-13 补：当时这条只改了一半，另外五处漏到第二轮才发现。**
@@ -681,6 +682,12 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     **规律**：凡是出现 `.split()` / `" ".join` / 按字符数定的阈值，都要问一句
     "换成中文还成立吗"。反过来，`_squash_repeats` 是唯一一个"代码是死的但
     没死出后果"的，别顺手改（理由见第 20 条）。
+
+33. **`GLOSSARY` 和感叹词表是「德→中」的，两端都要判。** 感叹词表原来只判
+    `SOURCE_LANGUAGE != "de"`，漏了目标语言那一半——中→德时 "Ja." 会命中词典
+    把"是"直接上屏，而这次要的是德语输出。同理点词查词：中→德时德语在**译文
+    行**上，按 `SOURCE_LANGUAGE`(zh) 去查会让 prompt 变成"你是中文汉词典。
+    简明解释中文单词 Kameraqualität"。现在按被点词的字符集判（`lookup_language_for`）。
 
 34. **☠️ `transcripts/` 和 `downloads/` 是私有数据，内容一个字都不进仓库。**
     这份存档抓的是**系统全部声音**（可能含语音通话），config.py 里已经反复
@@ -704,12 +711,6 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     同一类还有 `subtitle.log`（`SHOW_PERFORMANCE=True` 时会打识别原文和译文）
     和 `lookup_cache.json`。贴 issue 前扫一眼，README 的 FAQ 让你贴日志尾部，
     那也是同一个坑。
-
-33. **`GLOSSARY` 和感叹词表是「德→中」的，两端都要判。** 感叹词表原来只判
-    `SOURCE_LANGUAGE != "de"`，漏了目标语言那一半——中→德时 "Ja." 会命中词典
-    把"是"直接上屏，而这次要的是德语输出。同理点词查词：中→德时德语在**译文
-    行**上，按 `SOURCE_LANGUAGE`(zh) 去查会让 prompt 变成"你是中文汉词典。
-    简明解释中文单词 Kameraqualität"。现在按被点词的字符集判（`lookup_language_for`）。
 
 35. **☠️ 语言这件事有两条"单一入口"，都别绕。**（2026-09-10 审核 B01/B03）
     - **配置怎么解析**：`realtime_subtitle/language_policy.py`。UI 面板和识别
@@ -944,7 +945,7 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     PyQt5 / PyQt5-Qt5 / PyQt5_sip 三个，没误伤别的包。留着也不影响运行，
     只是白占 100 多 MB。
 
-    **这次验到哪一步**（别把没验的当验过了）：544 项 pytest 全绿、ruff 全绿、
+    **这次验到哪一步**（别把没验的当验过了）：当时的 544 项 pytest 全绿、ruff 全绿、
     三个独立 GUI 脚本（含 WM_NCHITTEST 那套）退出码全 0、install.ps1 的自检
     代码走通——而且**以上都是在 venv 里已经彻底没有 PyQt5 的前提下跑的**。
     真机也起过一次完整程序：悬浮窗置顶/半透明/几何恢复正常，德语识别 +
@@ -1041,13 +1042,16 @@ realtime_subtitle/paths.py    运行时文件落点的唯一真相源（REPO_ROO
 realtime_subtitle/language_policy.py  语言对配置的唯一解析入口（UI+识别线程共用，零 Qt 依赖，见第4节第35条）
 realtime_subtitle/offline.py  离线批处理实现；导入层(plan_media/resolve_media，唯一碰网站)
                       与处理层(process_media，只认本地媒体)分开，见第4节第38条
+realtime_subtitle/offline_checkpoint.py  离线缓存身份与落盘（checkpoint/指纹/多目标翻译表，第4节第37条）
 realtime_subtitle/capture/audio_capture.py      WASAPI Loopback 采集 + 设备热切换
 realtime_subtitle/asr/streaming_asr.py      local agreement 增量识别（词级前缀提交）
-realtime_subtitle/translate/translator_queue.py   Whisper/Ollama 持有者：切句、翻译队列、草稿、术语表
+realtime_subtitle/translate/translator_queue.py   Whisper/Ollama 持有者：识别主循环、翻译队列、草稿、术语表
+realtime_subtitle/translate/text_rules.py   切句 + 无空格语言规则（纯函数，第4节第32条那一套）
+realtime_subtitle/translate/language_switch.py  语言对转发/投票/自愈 + 切换消费端（LanguageSwitchMixin，第31/35/41/42条）
 realtime_subtitle/translate/lookup.py    点词查词 + 🤖AI分析（LookupMixin）
 realtime_subtitle/translate/transcript.py     字幕存档 + 保留期清理（TranscriptMixin）
 realtime_subtitle/translate/runtime_stats.py  分钟级性能概况（StatsMixin）
-                      ☠️ 这三个 mixin 都不自己 __init__，字段由
+                      ☠️ 这四个 mixin 都不自己 __init__，字段由
                       WhisperQueueTranslator.__init__ 建；契约写在各自模块 docstring 里
 realtime_subtitle/ui/subtitle_window.py    悬浮窗主类（+ window_frame/window_chrome/subtitle_render/
                       window_geometry/settings_window/popups 拆分模块）

@@ -20,13 +20,16 @@ realtime_subtitle/                  # clone root
 │   ├── paths.py                    # single source of truth for runtime file locations
 │   ├── language_policy.py          # single parse point for language pairs (zero Qt deps)
 │   ├── offline.py                  # import layer (network) + processing layer (local only)
+│   ├── offline_checkpoint.py       # offline cache identity: checkpoint schema, fingerprints
 │   ├── deps_fingerprint.py         # "did requirements change?" + orphan detection
 │   ├── instance_identity.py        # single-instance mutex identity
 │   ├── migrate_legacy.py           # moves runtime files left by pre-package versions
 │   ├── capture/audio_capture.py    # WASAPI loopback + device hot-swap
 │   ├── asr/streaming_asr.py        # local-agreement streaming ASR (word-level commits)
 │   ├── translate/
-│   │   ├── translator_queue.py     # Whisper/Ollama owner: sentence split, queue, drafts
+│   │   ├── translator_queue.py     # Whisper/Ollama owner: ASR loop, queue, drafts
+│   │   ├── text_rules.py           # sentence split + no-space-language rules (pure)
+│   │   ├── language_switch.py      # language pairs, vote, rescue, switching (mixin)
 │   │   ├── lookup.py               # click-a-word lookup + AI analysis   (mixin)
 │   │   ├── transcript.py           # daily archive + retention           (mixin)
 │   │   └── runtime_stats.py        # per-minute performance summary      (mixin)
