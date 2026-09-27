@@ -1042,6 +1042,7 @@ realtime_subtitle/paths.py    运行时文件落点的唯一真相源（REPO_ROO
 realtime_subtitle/language_policy.py  语言对配置的唯一解析入口（UI+识别线程共用，零 Qt 依赖，见第4节第35条）
 realtime_subtitle/offline.py  离线批处理实现；导入层(plan_media/resolve_media，唯一碰网站)
                       与处理层(process_media，只认本地媒体)分开，见第4节第38条
+realtime_subtitle/offline_checkpoint.py  离线缓存身份与落盘（checkpoint/指纹/多目标翻译表，第4节第37条）
 realtime_subtitle/capture/audio_capture.py      WASAPI Loopback 采集 + 设备热切换
 realtime_subtitle/asr/streaming_asr.py      local agreement 增量识别（词级前缀提交）
 realtime_subtitle/translate/translator_queue.py   Whisper/Ollama 持有者：识别主循环、翻译队列、草稿、术语表

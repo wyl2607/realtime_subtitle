@@ -20,6 +20,7 @@ realtime_subtitle/                  # clone root
 │   ├── paths.py                    # single source of truth for runtime file locations
 │   ├── language_policy.py          # single parse point for language pairs (zero Qt deps)
 │   ├── offline.py                  # import layer (network) + processing layer (local only)
+│   ├── offline_checkpoint.py       # offline cache identity: checkpoint schema, fingerprints
 │   ├── deps_fingerprint.py         # "did requirements change?" + orphan detection
 │   ├── instance_identity.py        # single-instance mutex identity
 │   ├── migrate_legacy.py           # moves runtime files left by pre-package versions
