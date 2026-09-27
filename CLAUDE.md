@@ -661,7 +661,8 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     - faster-whisper 的词级时间戳给每个词都带前导空格，拉丁语系需要它，中文
       照抄就成了「另外,软件方面的 更 新同 样值得 关注。」。`_ts_words` 按语言剥。
     - 拼接残句/合并批次时的 `" ".join` 同理，无空格语言要用空串。
-    统一入口是 `translator_queue._no_space_language()`，语言集合在
+    统一入口是 `_no_space_language()`（在 `translate/text_rules.py`，translator_queue
+    里 re-export 了同名），语言集合在
     `config.NO_SPACE_LANGUAGES`。加韩语/泰语往那里补，别再散着判。
 
     **☠️ 2026-08-13 补：当时这条只改了一半，另外五处漏到第二轮才发现。**
@@ -1043,11 +1044,13 @@ realtime_subtitle/offline.py  离线批处理实现；导入层(plan_media/resol
                       与处理层(process_media，只认本地媒体)分开，见第4节第38条
 realtime_subtitle/capture/audio_capture.py      WASAPI Loopback 采集 + 设备热切换
 realtime_subtitle/asr/streaming_asr.py      local agreement 增量识别（词级前缀提交）
-realtime_subtitle/translate/translator_queue.py   Whisper/Ollama 持有者：切句、翻译队列、草稿、术语表
+realtime_subtitle/translate/translator_queue.py   Whisper/Ollama 持有者：识别主循环、翻译队列、草稿、术语表
+realtime_subtitle/translate/text_rules.py   切句 + 无空格语言规则（纯函数，第4节第32条那一套）
+realtime_subtitle/translate/language_switch.py  语言对转发/投票/自愈 + 切换消费端（LanguageSwitchMixin，第31/35/41/42条）
 realtime_subtitle/translate/lookup.py    点词查词 + 🤖AI分析（LookupMixin）
 realtime_subtitle/translate/transcript.py     字幕存档 + 保留期清理（TranscriptMixin）
 realtime_subtitle/translate/runtime_stats.py  分钟级性能概况（StatsMixin）
-                      ☠️ 这三个 mixin 都不自己 __init__，字段由
+                      ☠️ 这四个 mixin 都不自己 __init__，字段由
                       WhisperQueueTranslator.__init__ 建；契约写在各自模块 docstring 里
 realtime_subtitle/ui/subtitle_window.py    悬浮窗主类（+ window_frame/window_chrome/subtitle_render/
                       window_geometry/settings_window/popups 拆分模块）
