@@ -276,7 +276,7 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
 
 改代码（如果用户让你改功能）：
 
-15. 改完跑测试：`venv\Scripts\python -m pytest`（573 项，以实际输出为准）。
+15. 改完跑测试：`venv\Scripts\python -m pytest`（条数以实际输出为准，别在文档里写死）。
     ☠️ **pytest 不在 requirements.txt 里**（那份是给最终用户装的，install.ps1
     不会装 pytest），新环境上第一次跑会报 `No module named pytest`，先装：
     `venv\Scripts\python -m pip install -r requirements-dev.txt`。test_hittest /
@@ -682,6 +682,12 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     "换成中文还成立吗"。反过来，`_squash_repeats` 是唯一一个"代码是死的但
     没死出后果"的，别顺手改（理由见第 20 条）。
 
+33. **`GLOSSARY` 和感叹词表是「德→中」的，两端都要判。** 感叹词表原来只判
+    `SOURCE_LANGUAGE != "de"`，漏了目标语言那一半——中→德时 "Ja." 会命中词典
+    把"是"直接上屏，而这次要的是德语输出。同理点词查词：中→德时德语在**译文
+    行**上，按 `SOURCE_LANGUAGE`(zh) 去查会让 prompt 变成"你是中文汉词典。
+    简明解释中文单词 Kameraqualität"。现在按被点词的字符集判（`lookup_language_for`）。
+
 34. **☠️ `transcripts/` 和 `downloads/` 是私有数据，内容一个字都不进仓库。**
     这份存档抓的是**系统全部声音**（可能含语音通话），config.py 里已经反复
     警告过它的敏感性——但一直没人写下"所以它也不能进 commit"，而第 2 节又
@@ -704,12 +710,6 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     同一类还有 `subtitle.log`（`SHOW_PERFORMANCE=True` 时会打识别原文和译文）
     和 `lookup_cache.json`。贴 issue 前扫一眼，README 的 FAQ 让你贴日志尾部，
     那也是同一个坑。
-
-33. **`GLOSSARY` 和感叹词表是「德→中」的，两端都要判。** 感叹词表原来只判
-    `SOURCE_LANGUAGE != "de"`，漏了目标语言那一半——中→德时 "Ja." 会命中词典
-    把"是"直接上屏，而这次要的是德语输出。同理点词查词：中→德时德语在**译文
-    行**上，按 `SOURCE_LANGUAGE`(zh) 去查会让 prompt 变成"你是中文汉词典。
-    简明解释中文单词 Kameraqualität"。现在按被点词的字符集判（`lookup_language_for`）。
 
 35. **☠️ 语言这件事有两条"单一入口"，都别绕。**（2026-09-10 审核 B01/B03）
     - **配置怎么解析**：`realtime_subtitle/language_policy.py`。UI 面板和识别
@@ -944,7 +944,7 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     PyQt5 / PyQt5-Qt5 / PyQt5_sip 三个，没误伤别的包。留着也不影响运行，
     只是白占 100 多 MB。
 
-    **这次验到哪一步**（别把没验的当验过了）：544 项 pytest 全绿、ruff 全绿、
+    **这次验到哪一步**（别把没验的当验过了）：当时的 544 项 pytest 全绿、ruff 全绿、
     三个独立 GUI 脚本（含 WM_NCHITTEST 那套）退出码全 0、install.ps1 的自检
     代码走通——而且**以上都是在 venv 里已经彻底没有 PyQt5 的前提下跑的**。
     真机也起过一次完整程序：悬浮窗置顶/半透明/几何恢复正常，德语识别 +
