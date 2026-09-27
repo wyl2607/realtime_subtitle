@@ -44,8 +44,10 @@ System audio ──WASAPI loopback──▶ Faster-Whisper (CUDA or CPU)
 - **Bidirectional (DE↔ZH)** — `Ctrl+Alt+L` cycles the *language pair*, so Chinese
   audio gets German subtitles. Optional auto-detect (`AUTO_DETECT_LANGUAGE`, off by
   default) switches for you after it sees the same new language 3 times in a row;
-  expect ~12s of garbage subtitles before it commits, since the audio in that window
-  is still being decoded with the old language.
+  while it is confirming, new subtitles are held back (`LANGUAGE_HOLD_OUTPUT`, on by
+  default) — dropped if the switch happens (they were decoded with the old language),
+  released unchanged if it doesn't. The few seconds before the first detection (up to
+  one detection interval) can still show garbage.
 - **Click-through mode** — `Ctrl+Alt+M` so the overlay ignores mouse hits over video/games
 - **Cinema bar** — transparent Netflix-style caption strip at the bottom of fullscreen video (`Ctrl+Alt+C` / 🎞); always click-through so it never steals player clicks
 - **TV fullscreen** — opaque large-type window on another screen (📺)

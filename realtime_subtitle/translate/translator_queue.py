@@ -572,6 +572,11 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             self._lang_in_cooldown = False  # 切语言后的冷却，不是检测间隔
             self._lang_vote = LanguageVote()
             self._lang_log = LanguageDetectLogger()
+            # 确认期间暂停出字幕（LANGUAGE_HOLD_OUTPUT），字段含义见 language_switch 文件头
+            self._lang_hold_since = 0.0
+            self._lang_held = []
+            self._lang_hold_lang = None
+            self._lang_hold_spent = False
             # 误切自愈：解码质量连击 + "正在抢救"标志。同样只在 ASR 线程读写。
             # _lang_rescue 期间检测改用更短的 LANGUAGE_RESCUE_STREAK
             self._decode_health = DecodeHealth()
@@ -756,7 +761,9 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         """live行的白色部分 = 翻译中 + 待翻译 + 未成句残句"""
         with self._tx_lock:
             parts = list(self._tx_inflight) + list(self._tx_queue)
-        if self.pending_text:
+        # 确认换语言期间残句不上屏：它正是拿旧语言参数解码出来的那段废话。
+        # 翻译中/待翻译的是扣住之前就成句的，照常显示
+        if self.pending_text and not self._lang_hold_active():
             parts.append(self.pending_text)
         # ☠️ 无空格语言不能插分隔符，和 _append_committed 里同一条规则：
         # 中文 live 行会长成「这是第一句。 然后还有一句？ 残句」。那边加中→德
@@ -766,7 +773,9 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
 
     def _emit_display(self):
         if self.on_display:
-            self.on_display(self._live_text(), self._last_unstable)
+            hint = self._lang_hold_hint()
+            self.on_display(self._live_text(),
+                            self._last_unstable if hint is None else hint)
 
     # ------------------------------------------------------------------
     # 带语言代数的 UI 事件（O04）
@@ -792,6 +801,8 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         """完整句子进翻译队列，唤醒worker"""
         if self.closing or not sentences:
             return
+        if self._lang_hold_capture(sentences):
+            return  # 确认换语言期间先扣住，见 LanguageSwitchMixin._update_lang_hold
         sentences = _squash_repeats(sentences)  # 压缩Whisper复读伪影
         with self._tx_lock:
             self._tx_queue.extend(sentences)
@@ -1122,6 +1133,8 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         只在正式翻译队列完全空闲时做，绝不和正式句对抢Ollama。"""
         if not getattr(config, "DRAFT_TRANSLATION", False) or not self.on_draft:
             return
+        if self._lang_hold_active():
+            return  # 残句此刻是疑似废话，草稿翻它纯属白占 Ollama
         text = self.pending_text
         # ☠️ 不能一律 .split()：中文残句整段恒等于 1 个"词"，这道门对中文永远
         # 关着，草稿翻译一次都不会触发。和 _pending_too_long 是同一个坑，
@@ -1714,6 +1727,8 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         # ☠️ 语言检测必须在这里（ASR 线程内、识别刚跑完）：WhisperModel 不是
         # 线程安全的，见 streaming_asr.detect_language 的注释
         self._maybe_detect_language()
+        # 必须紧跟检测：扣不扣住看的就是这一轮检测之后的连击数
+        self._update_lang_hold()
 
         elapsed = time.time() - start_time
         self._stat_note_asr(elapsed, self.processor.buffer_seconds(), len(items),
@@ -1733,6 +1748,9 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         """空闲兜底：一段话说完后没有新音频，未提交尾部/未成句残句会一直挂着。
         main的定时器每秒调这里：距上次音频超过IDLE_FLUSH_SEC才动手。
         和translate()跑在同一个单线程池里，天然串行。"""
+        # 说话人停了就不会再有检测，连击既不涨也不断——扣住的句子只能靠
+        # 这里按超时放行，否则要一直挂到下一次有声音
+        self._update_lang_hold()
         if time.time() - self.last_audio_time < config.IDLE_FLUSH_SEC:
             # 还没到收尾时机，但被扣留的句尾到点了就先放行（只动文字不碰音频缓冲）
             self._release_held_boundary()

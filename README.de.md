@@ -45,9 +45,12 @@ Systemton ──WASAPI-Loopback──▶ Faster-Whisper (CUDA oder CPU)
 - **Beide Richtungen (DE↔ZH)** — `Ctrl+Alt+L` wechselt das *Sprachpaar*, bei
   chinesischem Ton also deutsche Untertitel. Optionale automatische
   Sprachumschaltung (`AUTO_DETECT_LANGUAGE`, standardmäßig aus) greift erst,
-  wenn dreimal hintereinander dieselbe neue Sprache erkannt wird; bis dahin sind
-  die Untertitel rund 12 Sekunden lang unbrauchbar, weil der Ton in diesem
-  Zeitraum noch mit der alten Sprache transkribiert wird.
+  wenn dreimal hintereinander dieselbe neue Sprache erkannt wird. Während der
+  Bestätigung werden neue Untertitel zurückgehalten (`LANGUAGE_HOLD_OUTPUT`,
+  standardmäßig an): verworfen, wenn umgeschaltet wird (sie wurden noch mit der
+  alten Sprache transkribiert), unverändert nachgereicht, wenn nicht. Die wenigen
+  Sekunden vor der ersten Erkennung (höchstens ein Erkennungsintervall) können
+  weiterhin unbrauchbar sein.
 - **Klick-durchlässig** — `Ctrl+Alt+M` für Vollbild-Video/Spiele
 - **Kinoleiste** — transparenter Netflix-ähnlicher Streifen am unteren Bildrand (`Ctrl+Alt+C` / 🎞); immer klick-durchlässig
 - **TV-Vollbild** — undurchsichtiges Großschrift-Fenster auf einem zweiten Bildschirm (📺)

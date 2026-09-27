@@ -30,9 +30,17 @@
     self._lang_in_cooldown    当前等待是不是切换后的冷却（只影响日志）
     self._lang_revision       语言对代数，真切了才 +1（第 42 条）
     self._lang_log            LanguageDetectLogger（_lang_logger() 懒建兜底）
+    self._lang_hold_since     确认期间扣住字幕的起点时刻，0.0 = 没在扣
+    self._lang_held           扣住的句子（只在 ASR 线程读写，不需要锁）
+    self._lang_hold_lang      正在确认的候选语言（给提示文案用）
+    self._lang_hold_spent     这一轮连击已经超时放行过，别再扣
     self.on_status / on_language_applied   UI 回调，可为 None
 
-反向依赖宿主类的方法：`clear_context()`、`_process_inbox()`。
+以上 _lang_hold_* 四个字段都按 getattr 默认值读：测试里大量用
+`object.__new__(WhisperQueueTranslator)` 造裸实例，不会有这些字段。
+
+反向依赖宿主类的方法：`clear_context()`、`_process_inbox()`、
+`_enqueue_sentences()`、`_emit_display()`。
 `_process_inbox` 里"每批边界先取 pending 再识别"的那段消费逻辑**仍在宿主类**
 ——它和识别主循环是一体的，拆开反而要跨文件对锁。
 
@@ -499,6 +507,9 @@ class LanguageSwitchMixin:
                 new_lang, old_source, old_target)
         changed = (new_lang != old_source or new_target != old_target)
         if changed:
+            # 先丢扣住的句子再清上下文：clear_context 会重绘 live 行，那时
+            # 扣住状态必须已经解除，否则"确认中"的提示会在新语言画面上多挂一轮
+            self._discard_lang_hold()
             self.clear_context()
             # 语言对已经变了：这个代数之前发出的 UI 事件都属于旧语言，
             # 消费端（UI 槽）按它拒收，见 O04
@@ -530,3 +541,105 @@ class LanguageSwitchMixin:
         if cb:
             cb(new_lang, new_target, getattr(self, "_lang_revision", 0))
         return changed
+
+    # ------------------------------------------------------------------
+    # 确认期间暂停出字幕（config.LANGUAGE_HOLD_OUTPUT）
+    # ------------------------------------------------------------------
+    # CLAUDE.md 第 31 条原来记的取舍是"暂停 = 投票没走完会白丢几秒真字幕"。
+    # 这里用"扣住"代替"丢弃"绕开了它：扣住的句子只有在切换**真的生效**时
+    # 才丢（_discard_lang_hold），连击中断/超时一律原样放行。
+    #
+    # ☠️ 全部跑在 ASR 线程：_enqueue_sentences 的所有调用点（_process_items /
+    # flush_pending / _release_held_boundary）都在识别线程池里，_lang_held
+    # 因此不需要锁。以后若有别的线程调 _enqueue_sentences，这里要一起加锁。
+    def _lang_hold_active(self):
+        return getattr(self, "_lang_hold_since", 0.0) > 0.0
+
+    def _lang_hold_max_sec(self):
+        v = getattr(config, "LANGUAGE_HOLD_MAX_SEC", None)
+        if v is not None:
+            return float(v)
+        interval = float(getattr(config, "LANGUAGE_DETECT_INTERVAL", 6.0))
+        streak = int(getattr(config, "LANGUAGE_SWITCH_STREAK", 3))
+        return interval * (streak + 1)
+
+    def _lang_hold_capture(self, sentences):
+        """_enqueue_sentences 入口调它。返回 True = 已扣住，调用方别再送翻译。"""
+        if not self._lang_hold_active():
+            return False
+        held = getattr(self, "_lang_held", None)
+        if held is None:
+            held = self._lang_held = []
+        held.extend(sentences)
+        return True
+
+    def _lang_hold_hint(self):
+        """扣住期间 live 行灰色部分显示的提示；没在扣返回 None。
+
+        ☠️ 不走 on_status：状态行在下一次 live 刷新时就会被清掉，而识别线程
+        每 0.5 秒刷一次，提示会一闪而过。放进 unstable 那一格，扣多久就挂多久，
+        放行/丢弃后自然消失，UI 一行都不用改。
+        """
+        if not self._lang_hold_active():
+            return None
+        name = language_name(getattr(self, "_lang_hold_lang", None) or "?")
+        return f"⏸ 疑似换成{name}，确认中…"
+
+    def _update_lang_hold(self, now=None):
+        """每轮识别末尾（检测之后）和空闲兜底里调：决定开始扣 / 继续扣 / 放行。"""
+        now = time.time() if now is None else now
+        vote = getattr(self, "_lang_vote", None)
+        streak = getattr(vote, "streak", 0) if vote is not None else 0
+        if streak == 0:
+            self._lang_hold_spent = False  # 这一轮连击结束了，下一轮可以重新扣
+        active = self._lang_hold_active()
+
+        enabled = (getattr(config, "AUTO_DETECT_LANGUAGE", False)
+                   and getattr(config, "LANGUAGE_HOLD_OUTPUT", True))
+        # ☠️ 投票达成的那一轮 feed() 会把连击清零，但切换要到下一批边界才由
+        # _process_inbox 执行。这段空档必须继续扣——否则刚确认是废话的那些句子
+        # 会在切换前一刻被放行上屏。pending 字段按第 35 条只在 _asr_lock 内读。
+        switch_pending = False
+        lock = getattr(self, "_asr_lock", None)
+        if active and lock is not None:
+            with lock:
+                switch_pending = getattr(self, "_pending_lang_switch", None) is not None
+        want = enabled and (streak > 0 or switch_pending)
+
+        if active:
+            if not want:
+                self._release_lang_hold("连击中断，仍按当前语言")
+            elif now - self._lang_hold_since > self._lang_hold_max_sec():
+                self._release_lang_hold("确认超时")
+                self._lang_hold_spent = True
+            return
+        if enabled and streak > 0 and not getattr(self, "_lang_hold_spent", False):
+            self._lang_hold_since = now
+            self._lang_hold_lang = getattr(vote, "lang", None)
+            self._lang_held = []
+            print(f"⏸️  疑似换成{language_name(self._lang_hold_lang or '?')}"
+                  f"（连击 {streak}），确认期间字幕暂停")
+            # 残句不上屏了，挂在它旁边的灰色草稿（翻的正是那段疑似废话）也撤掉。
+            # UI 只在 live 行整个变空时才自己清草稿，这里 live 行往往还有待翻译
+            # 的正常句子，得显式发一个空草稿
+            self._draft_last_text = ""
+            self._emit_draft("")
+            self._emit_display()
+
+    def _release_lang_hold(self, reason):
+        held = list(getattr(self, "_lang_held", None) or [])
+        self._lang_held = []
+        self._lang_hold_since = 0.0
+        print(f"▶️  {reason}：放行确认期间扣住的 {len(held)} 句")
+        if held:
+            self._enqueue_sentences(held)
+        self._emit_display()
+
+    def _discard_lang_hold(self):
+        """切换真的生效了：扣住的句子是拿旧语言参数解码的，丢掉。"""
+        held = getattr(self, "_lang_held", None) or []
+        if held:
+            print(f"🧹 换语言已确认，丢弃确认期间扣住的 {len(held)} 句")
+        self._lang_held = []
+        self._lang_hold_since = 0.0
+        self._lang_hold_spent = False
