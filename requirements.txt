@@ -23,7 +23,7 @@ numpy>=2.2.0,<3.0.0            # 数值计算。下限必须停在 2.2：2.3 起
 # Windows下ctranslate2按名字LoadLibraryA加载cublas64_12.dll，
 # translator_queue.py 会把 nvidia.cublas 包的 bin 目录塞进 PATH
 nvidia-cublas-cu12>=12.9.2.10
-nvidia-cudnn-cu12>=9.24.0.43
+nvidia-cudnn-cu12>=9.26.0.51
 
 # 音频处理
 pyaudiowpatch>=0.2.12.8,<1.0.0     # Windows 系统音频捕获 (WASAPI Loopback)
