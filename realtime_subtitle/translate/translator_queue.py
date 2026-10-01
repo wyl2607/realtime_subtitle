@@ -426,15 +426,25 @@ _WhisperModel = None  # set by _ensure_ml_deps()
 
 
 def _ensure_ml_deps():
-    """Load torch + faster-whisper only when the translator is constructed.
+    """按平台加载 Whisper 后端，返回模型类（首次调用时加载，后续复用缓存）。
 
-    Keeps lightweight imports (e.g. _SENTENCE_END for unit tests) free of
-    torch/ctranslate2. On Windows, torch must load before PATH cublas injection
-    and before ctranslate2 (via faster-whisper), or c10.dll can fail (WinError 1114).
+    Windows：faster-whisper（ctranslate2 + CUDA）；
+    macOS：mlx-whisper（Apple Silicon Metal），见 asr/backend.py。
+
+    ☠️ 保持懒加载：本函数在 translator 构造时才被调用，让轻量 import（单元测试
+    等场景）不必拉起 torch/ctranslate2/mlx 等重型依赖。
     """
     global _WhisperModel
     if _WhisperModel is not None:
         return _WhisperModel
+
+    # ── macOS：返回 MLX-Whisper 适配器类（不需要 torch/ctranslate2）──────────
+    if sys.platform == "darwin":
+        from realtime_subtitle.asr.backend import MlxWhisperModel
+        _WhisperModel = MlxWhisperModel
+        return _WhisperModel
+
+    # ── Windows（及其他 Linux）：faster-whisper 路径，行为零改动 ─────────────
 
     # torch本身在这个项目里没用（faster-whisper走ctranslate2），但venv里的
     # ctranslate2版本会在内部无条件import torch。必须在下面往PATH里注入
@@ -1863,6 +1873,13 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         if t is not None and t.is_alive():
             t.join(timeout=min(3.0, remaining))
 
+        # ── macOS：清 MLX Metal 缓存（无 Ollama 模型，不发 HTTP 请求）────────
+        if sys.platform == "darwin":
+            if hasattr(self, "model") and hasattr(self.model, "unload"):
+                self.model.unload()
+            return
+
+        # ── Windows：向 Ollama 发 keep_alive=0 请求卸载翻译模型 ─────────────
         ours = [m for m in (config.OLLAMA_MODEL,
                             getattr(config, "GAME_MODE_OLLAMA_MODEL", None)) if m]
         session = requests.Session()
@@ -1896,3 +1913,4 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
                 self.ollama_session.close()
         except Exception:
             pass
+

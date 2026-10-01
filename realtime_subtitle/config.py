@@ -298,6 +298,24 @@ DRAFT_TEXT_COLOR = "#8fb8e0"  # 草稿中文颜色（和正式中文区分）
 # install.ps1 会这么写，防止反向升到大模型）
 GAME_MODE_OLLAMA_MODEL = "qwen3.5:4b"
 
+# ============ macOS（Apple Silicon）专属配置 ============
+# 在 darwin 下翻译模型基线改用 GAME_MODE_OLLAMA_MODEL（qwen3.5:4b）：
+#   - M4 16GB 统一内存同时跑 MLX-Whisper（large-v3-turbo ~800MB float16）和
+#     Ollama 翻译模型，9b（~5.6GB）会让系统内存有压力；4b（~2.4GB）更合适。
+#   - 「性能」模式切回的"基线模型"也是这个值，不能比默认基线还大。
+# ☠️ config_local.py 可以覆盖 OLLAMA_MODEL，但 GAME_MODE_OLLAMA_MODEL 是「性能」
+# 模式的固定落脚点，不要把它换成比 OLLAMA_MODEL 更大的模型——那样切「性能」
+# 反而会升模型，和功能语义相反。
+import sys as _sys
+if _sys.platform == "darwin":
+    OLLAMA_MODEL = "qwen3.5:4b"  # macOS 基线：和 GAME_MODE_OLLAMA_MODEL 相同
+
+# MLX-Whisper 模型覆盖（macOS 专用）。None = 跟随 WHISPER_MODEL 自动映射，
+# 由 asr/backend.py 的 _MODEL_MAP 把 faster-whisper 名字转成 mlx-community repo。
+# 若想指定别的 HF repo（如量化版 whisper-large-v3-turbo-q4），在 config_local.py
+# 里写 MLX_WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo-q4"。
+MLX_WHISPER_MODEL = None
+
 # ============ 字幕窗口配置 ============
 # 位置/大小/字号在用户拖过之后就以 window_state.json 为准，下面这组只在
 # 「首次运行」生效，而且不是直接用：window_geometry.default_geometry() 拿

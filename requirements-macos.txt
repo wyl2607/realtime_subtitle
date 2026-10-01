@@ -1,0 +1,30 @@
+# macOS (Apple Silicon) 专用依赖
+# 安装方式：pip install -r requirements-macos.txt
+# ☠️ 不要同时安装 requirements.txt（里面有 torch/faster-whisper/ctranslate2，
+#    macOS 上用不了 CUDA，装了也是浪费）
+
+# ─── Whisper 推理（MLX，Apple Silicon Metal）───────────────────────────────
+# 0.4.3 API 已在 M4 16GB 上验证；<0.5 防止上游 API 变动（beam_size 支持等）
+mlx-whisper>=0.4.3,<0.5
+mlx>=0.24.0,<1.0           # mlx-whisper 的 Metal 后端
+
+# HuggingFace 模型解析（把 HF repo 名解析成本地缓存路径，避免改 os.environ）
+huggingface_hub>=0.20.0,<1.0
+
+# ─── 翻译（和 Windows 相同：本地 Ollama HTTP）────────────────────────────────
+requests>=2.31.0,<3.0
+
+# ─── 音频采集（macOS 用 PyAudio + CoreAudio，不用 WASAPI Loopback）──────────
+# ☠️ 音频采集 Lane 负责，这里只列依赖不改采集代码
+pyaudio>=0.2.14
+
+# ─── macOS 系统集成（屏幕录制权限、音频权限弹框等）─────────────────────────
+# >=11 对应 macOS 11+（Big Sur 起），<13 避免 pyobjc 重大 API 变动
+pyobjc-framework-Cocoa>=11.0,<13.0
+pyobjc-framework-AVFoundation>=11.0,<13.0
+
+# ─── UI（和 Windows 相同）───────────────────────────────────────────────────
+PyQt6>=6.6.0,<7.0.0
+
+# ─── 音频处理（streaming_asr / audio_capture 共用）──────────────────────────
+numpy>=1.24.0,<3.0
