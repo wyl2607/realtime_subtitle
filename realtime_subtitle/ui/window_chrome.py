@@ -4,6 +4,7 @@ Ctrl+滚轮调字号、样式表刷新。以mixin形式并入 SubtitleWindow。
 """
 from PyQt6.QtCore import Qt
 import realtime_subtitle.config as config
+from realtime_subtitle.ui.platform_fonts import platform_font_family
 from realtime_subtitle.ui.window_frame import ResizableFramelessWidget
 
 
@@ -41,7 +42,7 @@ class WindowChromeMixin:
         if getattr(self, "_drag_bar_pad", None) == left_px:
             return  # 样式表重设会触发重排，宽度没变就别动
         self._drag_bar_pad = left_px
-        self.drag_bar.setStyleSheet("""
+        self.drag_bar.setStyleSheet(platform_font_family("""
             QLabel {
                 background-color: rgba(28, 28, 28, 210);
                 color: rgba(220, 220, 220, 200);
@@ -52,7 +53,7 @@ class WindowChromeMixin:
                 border-top-right-radius: 8px;
                 border-bottom: 1px solid rgba(255, 255, 255, 0.12);
             }
-        """ % int(left_px))
+        """ % int(left_px)))
 
     def _set_controls_visible(self, visible):
         """drag_bar / btn_bar 淡入淡出。ct_indicator 不走这里（穿透可靠性优先）。
@@ -133,7 +134,7 @@ class WindowChromeMixin:
                 background-color: rgba(0, 0, 0, {int(config.BACKGROUND_OPACITY)});
                 color: {config.TEXT_COLOR};
                 font-size: {config.FONT_SIZE}px;
-                font-family: {config.FONT_FAMILY};
+                font-family: {platform_font_family(config.FONT_FAMILY)};
                 padding: {config.PADDING};
                 border-radius: {config.BORDER_RADIUS}px;
                 border: 1px solid {config.BORDER_COLOR};
@@ -145,7 +146,7 @@ class WindowChromeMixin:
                     background-color: rgb(20, 20, 20);
                     color: white;
                     font-size: {config.FONT_SIZE - 4}px;
-                    font-family: {config.FONT_FAMILY};
+                    font-family: {platform_font_family(config.FONT_FAMILY)};
                     border: none;
                     padding: 8px;
                 }}

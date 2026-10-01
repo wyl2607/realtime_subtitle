@@ -30,6 +30,7 @@ from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel
 from PyQt6.QtCore import Qt, QTimer
 
 import realtime_subtitle.config as config
+from realtime_subtitle.ui.platform_fonts import platform_font_family
 
 
 class CinemaBar(QWidget):
@@ -161,7 +162,7 @@ class CinemaBar(QWidget):
         zh = int(config.CINEMA_FONT_SIZE)
         de = max(12, int(zh * float(getattr(config, "CINEMA_GERMAN_RATIO", 0.62))))
         alpha = int(getattr(config, "CINEMA_BG_ALPHA", 150))
-        fam = config.FONT_FAMILY
+        fam = platform_font_family(config.FONT_FAMILY)
         draft_color = getattr(config, "DRAFT_TEXT_COLOR", "#8fb8e0")
 
         def block(size, color, italic=False):
@@ -242,6 +243,10 @@ class CinemaBar(QWidget):
         照 subtitle_window._toggle_click_through 的同一套写法，区别是本窗只
         开不关（理由见模块 docstring 第 1 条）。
         """
+        if sys.platform == "darwin":
+            from realtime_subtitle.macos.windows import configure_overlay
+            self._ct_applied = configure_overlay(self, click_through=True)
+            return
         if sys.platform != "win32" or self._ct_applied:
             return
         GWL_EXSTYLE = -20
@@ -272,3 +277,5 @@ class CinemaBar(QWidget):
         """
         self._relayout()
         super().showEvent(event)
+        if sys.platform == "darwin":
+            self._apply_click_through()

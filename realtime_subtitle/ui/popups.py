@@ -2,11 +2,13 @@
 轻量弹窗：字幕历史回看窗 + 点词查词小窗 + AI 分析弹窗。
 """
 import html
+import sys
 import time
 from PyQt6.QtWidgets import QLabel, QWidget, QVBoxLayout, QTextEdit, QPushButton
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QTextCursor
 import realtime_subtitle.config as config
+from realtime_subtitle.ui.platform_fonts import platform_font_family
 from realtime_subtitle.ui.window_geometry import _screen_area_at
 
 
@@ -45,6 +47,10 @@ _POPUP_LABEL_STYLE = """
 """
 
 
+_POPUP_BTN_STYLE = platform_font_family(_POPUP_BTN_STYLE)
+_POPUP_LABEL_STYLE = platform_font_family(_POPUP_LABEL_STYLE)
+
+
 class HistoryWindow(QWidget):
     """本场字幕历史（可滚动回看，精听时往上翻错过的句子）
 
@@ -68,7 +74,7 @@ class HistoryWindow(QWidget):
                 background-color: rgb(20, 20, 20);
                 color: white;
                 font-size: {config.FONT_SIZE - 4}px;
-                font-family: {config.FONT_FAMILY};
+                font-family: {platform_font_family(config.FONT_FAMILY)};
                 border: none;
                 padding: 8px;
             }}
@@ -145,6 +151,12 @@ class _AnalysisPopupBase(QWidget):
         self.on_open_web = None       # () -> None，用弹窗已记住的 web 问句
         self._context = ""            # 点词时的整句，给深度解释
         self._web_query = ""          # 跳网页用的自然语言问题
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if sys.platform == "darwin":
+            from realtime_subtitle.macos.windows import configure_overlay
+            configure_overlay(self)
 
     def _restart_hide_timer(self, timeout_ms=None):
         """内容变化或用户点了操作按钮时重置——防止分析还在跑弹窗先被关掉。"""

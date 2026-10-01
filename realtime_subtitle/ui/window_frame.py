@@ -3,7 +3,7 @@
 """
 import sys
 from PyQt6.QtWidgets import QWidget, QApplication
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QEvent, QRect
 
 if sys.platform == "win32":
     import ctypes
@@ -20,6 +20,8 @@ class DraggableWidget(QWidget):
         self.drag_position = None
         self._press_global = None
         self.on_click = None  # 原地单击回调 (widget坐标QPoint) -> None
+        self._drag_started = False
+        self._system_moving = False
 
     # ☠️ Qt6 删掉了 QMouseEvent.globalPos()/x()/y()，只剩 QPointF 版的
     # globalPosition()（pos() 侥幸还在，但同一个文件里不留两种写法）。
@@ -37,6 +39,9 @@ class DraggableWidget(QWidget):
             press = self._global_pos(event)
             self.drag_position = press - self.frameGeometry().topLeft()
             self._press_global = press
+            if sys.platform == "darwin":
+                self._drag_started = False
+                self._system_moving = False
             event.accept()
 
     def mouseMoveEvent(self, event):
@@ -44,6 +49,17 @@ class DraggableWidget(QWidget):
         实测能把窗口拖出屏幕顶部，按钮行被切一半就再也够不着了）"""
         if self.dragging and event.buttons() == Qt.MouseButton.LeftButton:
             here = self._global_pos(event)
+            if sys.platform == "darwin":
+                if not self._drag_started:
+                    if (here - self._press_global).manhattanLength() < 6:
+                        event.accept()
+                        return
+                    self._drag_started = True
+                    handle = self.windowHandle()
+                    self._system_moving = bool(handle and handle.startSystemMove())
+                if self._system_moving:
+                    event.accept()
+                    return
             target = here - self.drag_position
             screen = QApplication.screenAt(here)
             if screen:
@@ -58,6 +74,7 @@ class DraggableWidget(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             self.dragging = False
             if (self.on_click and self._press_global is not None
+                    and (sys.platform != "darwin" or not self._drag_started)
                     and (self._global_pos(event) - self._press_global).manhattanLength() < 6):
                 self.on_click(event.position().toPoint())
             self._press_global = None
@@ -124,6 +141,94 @@ class ResizableFramelessWidget(DraggableWidget):
         self._underlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self._underlay.setStyleSheet("#hitUnderlay { background: rgba(0, 0, 0, 2); }")
         self._underlay.lower()
+        if sys.platform == "darwin":
+            self.setMouseTracking(True)
+            self._resize_edges = Qt.Edge(0)
+            self._resize_origin = None
+            self._resize_geometry = None
+            self._system_resizing = False
+            # 子控件（尤其按钮）也可能覆盖边缘，统一过滤后再交给原有点击逻辑。
+            QApplication.instance().installEventFilter(self)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if sys.platform == "darwin":
+            from realtime_subtitle.macos.windows import configure_overlay
+            configure_overlay(self, getattr(self, "_macos_click_through", False))
+
+    def _macos_edges_at(self, pos):
+        edges = Qt.Edge(0)
+        m = self.RESIZE_MARGIN  # Qt 逻辑像素，Retina 不要再乘 DPR
+        if pos.x() < m:
+            edges |= Qt.Edge.LeftEdge
+        elif pos.x() >= self.width() - m:
+            edges |= Qt.Edge.RightEdge
+        if pos.y() < m:
+            edges |= Qt.Edge.TopEdge
+        elif pos.y() >= self.height() - m:
+            edges |= Qt.Edge.BottomEdge
+        return edges
+
+    @staticmethod
+    def _macos_resize_cursor(edges):
+        horizontal = edges & (Qt.Edge.LeftEdge | Qt.Edge.RightEdge)
+        vertical = edges & (Qt.Edge.TopEdge | Qt.Edge.BottomEdge)
+        if horizontal and vertical:
+            if edges in (Qt.Edge.LeftEdge | Qt.Edge.TopEdge, Qt.Edge.RightEdge | Qt.Edge.BottomEdge):
+                return Qt.CursorShape.SizeFDiagCursor
+            return Qt.CursorShape.SizeBDiagCursor
+        if horizontal:
+            return Qt.CursorShape.SizeHorCursor
+        if vertical:
+            return Qt.CursorShape.SizeVerCursor
+        return Qt.CursorShape.ArrowCursor
+
+    def eventFilter(self, obj, event):
+        if sys.platform != "darwin" or not isinstance(obj, QWidget) or obj.window() is not self:
+            return super().eventFilter(obj, event)
+        kind = event.type()
+        if kind not in (QEvent.Type.MouseMove, QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease):
+            return super().eventFilter(obj, event)
+        here = self._global_pos(event)
+        pos = self.mapFromGlobal(here)
+        edges = self._macos_edges_at(pos)
+        if kind == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton and edges:
+            self.dragging = False
+            self._press_global = None
+            self._resize_edges = edges
+            self._resize_origin = here
+            self._resize_geometry = self.geometry()
+            handle = self.windowHandle()
+            # ☠️ Cocoa 的 startSystemResize 可能返回 False，必须有 Qt 几何兜底。
+            self._system_resizing = bool(handle and handle.startSystemResize(edges))
+            return True
+        if kind == QEvent.Type.MouseMove:
+            obj.setCursor(self._macos_resize_cursor(edges))
+            if self._resize_origin is not None:
+                if not self._system_resizing:
+                    self._macos_resize_to(here)
+                return True
+        if kind == QEvent.Type.MouseButtonRelease and self._resize_origin is not None:
+            self._resize_origin = None
+            self._resize_edges = Qt.Edge(0)
+            return True
+        return super().eventFilter(obj, event)
+
+    def _macos_resize_to(self, here):
+        delta = here - self._resize_origin
+        g = self._resize_geometry
+        left, top, right, bottom = g.left(), g.top(), g.right(), g.bottom()
+        minimum_w = max(1, self.minimumWidth())
+        minimum_h = max(1, self.minimumHeight())
+        if self._resize_edges & Qt.Edge.LeftEdge:
+            left = min(right - minimum_w + 1, max(right - self.maximumWidth() + 1, left + delta.x()))
+        if self._resize_edges & Qt.Edge.RightEdge:
+            right = max(left + minimum_w - 1, min(left + self.maximumWidth() - 1, right + delta.x()))
+        if self._resize_edges & Qt.Edge.TopEdge:
+            top = min(bottom - minimum_h + 1, max(bottom - self.maximumHeight() + 1, top + delta.y()))
+        if self._resize_edges & Qt.Edge.BottomEdge:
+            bottom = max(top + minimum_h - 1, min(top + self.maximumHeight() - 1, bottom + delta.y()))
+        self.setGeometry(QRect(left, top, right - left + 1, bottom - top + 1))
 
     def resizeEvent(self, event):
         self._underlay.setGeometry(self.rect())
@@ -161,6 +266,7 @@ class ResizableFramelessWidget(DraggableWidget):
                 and rect.left + m <= x < rect.right - self.BTN_RESERVE)
 
     def nativeEvent(self, eventType, message):
+        # macOS 不接 Win32 消息：移动走 Qt 鼠标事件，边缘缩放走 eventFilter。
         if sys.platform != "win32" or eventType not in (b"windows_generic_MSG", b"windows_dispatcher_MSG"):
             return False, 0
         msg = wintypes.MSG.from_address(int(message))
@@ -218,5 +324,3 @@ class ResizableFramelessWidget(DraggableWidget):
             event.accept()
             return
         super().closeEvent(event)
-
-

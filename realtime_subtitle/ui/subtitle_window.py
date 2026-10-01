@@ -28,6 +28,7 @@ from PyQt6.QtCore import (
     Qt, pyqtSignal, QObject, QTimer, QPropertyAnimation, QEasingCurve,
 )
 import realtime_subtitle.config as config
+from realtime_subtitle.ui.platform_fonts import platform_font_family
 from realtime_subtitle.paths import repo_path
 from realtime_subtitle.ui.window_geometry import (
     _screen_area_at, _clamp_geo_to_area, _clamp_geo_to_any_screen,
@@ -53,7 +54,7 @@ from realtime_subtitle.ui.window_chrome import WindowChromeMixin
 from realtime_subtitle.ui.subtitle_render import LiveTextRenderMixin
 
 if sys.platform == "win32":
-    import ctypes
+    import ctypes  # macOS 窗口属性走 macos.windows 的 PyObjC，不加载 Win32 API。
 
 # 窗口位置/大小/字号的持久化文件（重启后恢复用户调好的布局）。
 # 仓库根：uninstall.ps1 / update_subtitles.ps1 都按这个位置跟用户讲
@@ -112,6 +113,9 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         # 复用已有 QApplication（测试会先建并持模块级引用，防 GC 触发 qFatal）
         self.app = QApplication.instance() or QApplication(sys.argv)
         self.app.setQuitOnLastWindowClosed(False)
+        if sys.platform == "darwin":
+            from realtime_subtitle.macos.windows import accessory_app
+            accessory_app()
 
         # 恢复上次的窗口布局（字号/不透明度/tuning 要在建字幕标签之前生效）
         self._state = self._load_state()
@@ -265,7 +269,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         self.drag_bar.setFixedHeight(ResizableFramelessWidget.DRAG_BAR_HEIGHT)
         self.drag_bar.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.drag_bar.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.drag_bar.setStyleSheet("""
+        self.drag_bar.setStyleSheet(platform_font_family("""
             QLabel {
                 background-color: rgba(28, 28, 28, 210);
                 color: rgba(220, 220, 220, 200);
@@ -276,13 +280,13 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
                 border-top-right-radius: 8px;
                 border-bottom: 1px solid rgba(255, 255, 255, 0.12);
             }
-        """)
+        """))
 
         # 模式常驻指示器（左上角）：不接 _set_controls_visible 的 hover 淡入淡出，
         # 一直显示当前模式——用户要能随时一眼看出现在是哪套参数在跑
         self.mode_indicator = QLabel("⚙️ 自定义", self.container)
         self.mode_indicator.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.mode_indicator.setStyleSheet("""
+        self.mode_indicator.setStyleSheet(platform_font_family("""
             QLabel {
                 background-color: rgba(20, 20, 20, 210);
                 color: rgba(235, 235, 235, 230);
@@ -292,12 +296,14 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
                 border-radius: 4px;
                 border: 1px solid rgba(255, 255, 255, 0.15);
             }
-        """)
+        """))
 
         # 鼠标穿透常驻指示器：穿透时 hover 全失效，必须无条件常显（不走 _set_controls_visible）
         self.ct_indicator = QLabel("👻 Ctrl+Alt+M 恢复", self.container)
+        if sys.platform == "darwin":
+            self.ct_indicator.setText("👻 Ctrl+Option+M 恢复")
         self.ct_indicator.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.ct_indicator.setStyleSheet("""
+        self.ct_indicator.setStyleSheet(platform_font_family("""
             QLabel {
                 background-color: rgba(20, 20, 20, 210);
                 color: rgba(235, 235, 235, 230);
@@ -307,7 +313,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
                 border-radius: 4px;
                 border: 1px solid rgba(255, 255, 255, 0.15);
             }
-        """)
+        """))
         self.ct_indicator.hide()
 
         # 按钮改成悬浮工具条：平时隐藏（看剧零遮挡），鼠标移入窗口才出现。
@@ -586,6 +592,10 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
                  # 这些数字属于哪个坐标空间。Qt5 下恒为 1.0；换到 Qt6 之后
                  # 下次加载会拿它和当时的 DPR 比，按比例换算（见 _load_state）
                  "coord_dpr": qt_hidpi_scale()}
+        if sys.platform == "darwin":
+            # Qt6/macOS 全程保存逻辑坐标；混合 DPR 多屏之间不能再按主屏缩放。
+            state["coord_platform"] = "darwin"
+            state["coord_dpr"] = float(self.container.devicePixelRatioF())
         # 辅助窗：本会话显示过则写当前几何；否则保留上次文件里的值（从未显示过不写新值）
         if self._settings_ever_shown:
             sg = self.settings_window.geometry()
@@ -678,6 +688,25 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         """穿透开：字幕窗对鼠标完全隐形（点击/滚轮全落到下面的视频/游戏上），
         适合全屏看剧不挡操作。用原生 WS_EX_TRANSPARENT——窗口本来就是
         WS_EX_LAYERED（半透明窗），加这个标志即可，不用重建窗口"""
+        if sys.platform == "darwin":
+            from realtime_subtitle.macos.windows import set_click_through
+            enabled = not self._click_through
+            if not set_click_through(self.container, enabled):
+                return
+            self._click_through = enabled
+            self.container._macos_click_through = enabled
+            if enabled:
+                self._set_controls_visible(False)
+                self.ct_indicator.show()
+                self._position_chrome()
+                self.show_status("👻 鼠标穿透已开启：字幕窗点不到了（Ctrl+Option+M 恢复）")
+                print("👻 [热键] 鼠标穿透开启")
+            else:
+                self.ct_indicator.hide()
+                self._set_controls_visible(self.container.underMouse())
+                self.show_status("🖱️ 鼠标穿透已关闭，字幕窗恢复可点击")
+                print("🖱️ [热键] 鼠标穿透关闭")
+            return
         if sys.platform != "win32":
             return
         GWL_EXSTYLE = -20
@@ -726,6 +755,9 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
                 self._settings_positioned = True
             self._settings_ever_shown = True
             self.settings_window.show()
+            if sys.platform == "darwin":
+                from realtime_subtitle.macos.windows import focus_window
+                focus_window(self.settings_window)
 
     def _toggle_history(self):
         """切换历史窗口显示"""
@@ -737,6 +769,9 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
                 self._history_positioned = True
             self._history_ever_shown = True
             self.history_window.show()
+            if sys.platform == "darwin":
+                from realtime_subtitle.macos.windows import focus_window
+                focus_window(self.history_window)
             sb = self.history_window.text.verticalScrollBar()
             sb.setValue(sb.maximum())
 
