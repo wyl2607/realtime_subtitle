@@ -21,7 +21,7 @@
 > 嫌烦可以 `AI_WEB_CONFIRM = False` 关掉。把那个模板设成空串即可让按钮彻底消失。
 > 注意本程序抓的是**系统全部声音**，可能包含语音通话内容。
 
-[English](README.en.md) · [Deutsch](README.de.md) · [目录结构](docs/STRUCTURE.md) · [Windows 操作清单](docs/zh/WINDOWS-RUNBOOK.md)
+[English](README.en.md) · [Deutsch](README.de.md) · [目录结构](docs/STRUCTURE.md) · [Windows 操作清单](docs/zh/WINDOWS-RUNBOOK.md) · [macOS 使用说明](docs/macos.md)
 
 ```text
 系统声音 ──WASAPI Loopback──▶ Faster-Whisper (large-v3-turbo, CUDA/CPU)
@@ -68,6 +68,9 @@
 | Python | 3.10–3.13 | 同左 |
 | 其它 | [Ollama](https://ollama.com/) | 同左 |
 
+macOS（14+ / Apple Silicon）走同一套流程，音频采集换成 ScreenCaptureKit、
+识别跑 CPU，脚本在 `scripts/macos/`：见 [macOS 使用说明](docs/macos.md)。
+
 ## 安装
 
 请克隆到**纯英文路径**（如 `C:\realtime_subtitle`）。桌面快捷方式会内嵌绝对路径，非 ASCII 用户目录会弄坏生成的 `.bat`。
@@ -89,6 +92,24 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
 首次启动会下载 Whisper 模型（约 1.6GB）。
 
 **交给 AI 装**：克隆本仓库并按 [CLAUDE.md](CLAUDE.md) 的硬件分档与避坑清单操作。
+
+### macOS（Apple Silicon / Intel 均可，14+）
+
+```bash
+git clone https://github.com/wyl2607/realtime_subtitle.git
+cd realtime_subtitle
+bash scripts/macos/install.sh            # 国内镜像：加 --mirror
+```
+
+装完桌面会生成「德语实时字幕」文件夹，里面是五个 `.command` 启动器
+（启动 / YouTube 下载加字幕 / 停止 / 暂停继续 / 卸载），
+双击「启动字幕.command」即可。
+
+☠️ **macOS 首次使用必须先给音频权限**（脚本给不了这个权限）：
+「系统设置 → 隐私与安全性 → 屏幕与系统音频录制」里打开你启动它的那个程序
+（一般是「终端」），没看到就先双击一次启动器让系统弹框，然后再启一次字幕。
+没给权限的症状是"悬浮窗正常但一个字都不出"。其余注意事项见
+[macOS 使用说明](docs/macos.md)。
 
 ## 更新与卸载
 
