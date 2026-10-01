@@ -77,9 +77,11 @@ logging.basicConfig(level=logging.ERROR)
 # 只是把那次 import 提前到一个确定的位置。拿一行零成本的保险，去换一个
 # 只在"本机 + 这个 PyQt6/Qt/torch 版本组合"上验过一次的结论，不划算。
 # 真要删，先在别的机器上把两个方向都复现一遍。见 CLAUDE.md 第 4 节第 1 条。
-import torch  # noqa: F401
+# macOS 走 mlx-whisper，根本不装 torch/ctranslate2，这条保险只对 Windows 有意义。
+if sys.platform == "win32":
+    import torch  # noqa: F401
 from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
-from realtime_subtitle.capture.audio_capture import AudioCapture, PAUSE_FLAG_FILE, STOP_FLAG_FILE
+from realtime_subtitle.capture import make_audio_capture, PAUSE_FLAG_FILE, STOP_FLAG_FILE
 from realtime_subtitle.ui.subtitle_window import SubtitleWindow
 from realtime_subtitle.ui.settings_window import MODE_ICONS as _MODE_ICON
 from PyQt6.QtCore import QTimer
@@ -187,7 +189,7 @@ class SubtitleApp:
 
             # 音频捕获（设备名/设备切换提示直接上悬浮窗）。构造要开WASAPI流，
             # 有几百毫秒窗口，之后再查一次 _closing 才真正启动采集/热键
-            audio_capture = AudioCapture(
+            audio_capture = make_audio_capture(
                 callback=self.on_audio_received,
                 on_status=self.subtitle_window.show_status)
             if self._closing:
