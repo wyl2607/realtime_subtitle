@@ -306,12 +306,15 @@ GAME_MODE_OLLAMA_MODEL = "qwen3.5:4b"
 # 2026-10-01 M4 16GB 实测（7 秒德语新闻句，识别+翻译各跑冷/热两次）：
 #   turbo 全精度 + 9b → 两模型 ~6.7GB，跑完只剩 1.6GB、swap 涨到 4.3GB，不用；
 #   turbo-q4 + 4b    → ~3.4GB，剩 3.9GB；识别逐字同全精度，热识别 1.7s、热翻译 0.75s；
-#   turbo-q4 + 2b    → ~2.7GB，翻译略生硬，只给「性能」模式。
+#   turbo-q4 + 2b    → ~2.7GB，剩 4.6GB；热翻译 0.46s，措辞略生硬但意思准确。
 #   turbo-german-q4 会把 Maßnahmen 写成瑞士拼法 Massnahmen，没选。
 import sys as _sys
 if _sys.platform == "darwin":
-    OLLAMA_MODEL = "qwen3.5:4b"            # macOS 基线
-    GAME_MODE_OLLAMA_MODEL = "qwen3.5:2b"  # 「性能」模式仍要比基线轻一档
+    # 用户 2026-10-01 选了「性能版本」：基线直接用 2b，「性能」模式同为 2b
+    # （不能比基线大；再小的模型译文质量掉得太多）。想要更好的译文，在
+    # config_local.py 写 OLLAMA_MODEL = "qwen3.5:4b"（需先 ollama pull）。
+    OLLAMA_MODEL = "qwen3.5:2b"
+    GAME_MODE_OLLAMA_MODEL = "qwen3.5:2b"
 
 # MLX-Whisper 模型覆盖（macOS 专用）。None = 跟随 WHISPER_MODEL 自动映射，
 # 由 asr/backend.py 的 _MODEL_MAP 把 faster-whisper 名字转成 mlx-community repo。
