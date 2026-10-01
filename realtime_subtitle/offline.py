@@ -990,6 +990,8 @@ def _realtime_subtitle_running() -> bool:
     用 mutex 而不是 subtitle.pid：pid 文件会残留、PID 会被复用，而 mutex
     随进程生死，内核替我们维护，不会说谎。
     """
+    if sys.platform == "darwin":
+        return _realtime_lock_held()
     if sys.platform != "win32":
         return False
     import ctypes
@@ -1003,6 +1005,24 @@ def _realtime_subtitle_running() -> bool:
         return False
     kernel32.CloseHandle(handle)
     return True
+
+
+def _realtime_lock_held() -> bool:
+    """macOS：实时字幕持有仓库根 .subtitle.lock 的 flock（见 instance_identity）。
+    试着非阻塞地抢一下，抢不到 = 它开着；抢到了立刻放掉。和 Windows 的 mutex
+    一样随进程生死，不会因为 pid 残留而说谎。"""
+    import fcntl
+    from realtime_subtitle.paths import repo_path
+    path = repo_path(".subtitle.lock")
+    if not os.path.exists(path):
+        return False
+    with open(path, "a") as fh:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    return False
 
 
 def release_offline_models(timeout: float = 5.0) -> list[str]:

@@ -53,7 +53,9 @@ LAUNCHER_NAMES = [
     "卸载字幕.command",
 ]
 SHORTCUT_DIR_NAME = "德语实时字幕"
-TX_MODEL = "qwen3.5:4b"
+# 跟随真实的 macOS 默认翻译模型（config.py 里按平台定），别写死——默认值改过一次就红一片
+import realtime_subtitle.config as _rs_config  # noqa: E402
+TX_MODEL = _rs_config.OLLAMA_MODEL
 WHISPER_MODEL = "large-v3-turbo"
 
 
@@ -516,7 +518,7 @@ def test_start_ignores_junk_printed_by_config_local(env):
     不存在的模型，报出"网络/模型名过期"，真正的原因反而被盖住。
     """
     (env.repo / "config_local.py").write_text(
-        'print("正在加载本机配置…")\nOLLAMA_MODEL = "qwen3.5:4b"\n', encoding="utf-8"
+        f'print("正在加载本机配置…")\nOLLAMA_MODEL = "{TX_MODEL}"\n', encoding="utf-8"
     )
     result = env.start()
     pid = _pid_from(env)

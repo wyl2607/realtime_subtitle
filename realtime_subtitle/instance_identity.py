@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import re
 from pathlib import Path
 
@@ -57,6 +58,14 @@ def is_our_interpreter(exe_path: str | None, repo_root) -> bool:
         root = Path(repo_root).resolve()
     except OSError:
         return False
+    if sys.platform == "darwin":
+        # ☠️ 不能 resolve()：uv/brew 建的 venv 里 bin/python 是指向基础解释器的
+        # 符号链接，resolve 之后 venv_backup 兄弟目录也会指到同一个文件。
+        lexical = Path(os.path.abspath(exe_path))
+        bin_dir = Path(os.path.abspath(repo_root)) / "venv" / "bin"
+        if lexical.parent == bin_dir and lexical.name.startswith("python"):
+            return True
+        # 其余照 Windows 规则判（pid 文件可能是 Windows 那边写的，测试也这么喂）
     expected = {
         (root / "venv" / "Scripts" / "python.exe").resolve(),
         (root / "venv" / "Scripts" / "pythonw.exe").resolve(),
