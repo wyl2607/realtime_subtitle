@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QFont
 import realtime_subtitle.config as config
+from realtime_subtitle.ui.platform_fonts import platform_font_family
 from realtime_subtitle import language_policy
 from realtime_subtitle.ui.window_frame import DraggableWidget
 from realtime_subtitle.ui.window_geometry import (
@@ -442,7 +443,7 @@ class SettingsWindow(DraggableWidget):
         self._fit_label_width(font_label)
         self.font_combo = QFontComboBox()
         self.font_combo.setMaxVisibleItems(20)
-        primary = (config.FONT_FAMILY or "Microsoft YaHei").split(",")[0].strip()
+        primary = platform_font_family(config.FONT_FAMILY or "Microsoft YaHei").split(",")[0].strip()
         self.font_combo.setCurrentFont(QFont(primary))
         self.font_combo.currentFontChanged.connect(self._on_font_family_changed)
         font_layout.addWidget(font_label)
@@ -520,7 +521,7 @@ class SettingsWindow(DraggableWidget):
     def _apply_panel_chrome(self, scale):
         """面板字体 + 受屏幕约束的初始几何。不开全局 DPI 缩放。"""
         px = self._panel_font_px
-        font = QFont("Microsoft YaHei")
+        font = QFont(platform_font_family("Microsoft YaHei"))
         font.setPixelSize(px)
         self.setFont(font)
         self.setStyleSheet(
@@ -811,7 +812,7 @@ class SettingsWindow(DraggableWidget):
             config.TRANSLATION_STYLE = self._defaults['TRANSLATION_STYLE']
 
         if 'FONT_FAMILY' in self._defaults:
-            primary = (self._defaults['FONT_FAMILY'] or "Microsoft YaHei").split(",")[0].strip()
+            primary = platform_font_family(self._defaults['FONT_FAMILY'] or "Microsoft YaHei").split(",")[0].strip()
             self.font_combo.blockSignals(True)
             self.font_combo.setCurrentFont(QFont(primary))
             self.font_combo.blockSignals(False)
@@ -884,7 +885,7 @@ class SettingsWindow(DraggableWidget):
         ):
             _style_color_button(btn, getattr(config, key, "#ffffff"))
 
-        primary = (getattr(config, "FONT_FAMILY", "Microsoft YaHei") or "Microsoft YaHei").split(",")[0].strip()
+        primary = platform_font_family(getattr(config, "FONT_FAMILY", "Microsoft YaHei") or "Microsoft YaHei").split(",")[0].strip()
         self.font_combo.blockSignals(True)
         self.font_combo.setCurrentFont(QFont(primary))
         self.font_combo.blockSignals(False)
@@ -893,5 +894,4 @@ class SettingsWindow(DraggableWidget):
         self.auto_detect_cb.setChecked(bool(getattr(config, "AUTO_DETECT_LANGUAGE", False)))
         self.auto_detect_cb.blockSignals(False)
         self._sync_language_buttons()
-
 

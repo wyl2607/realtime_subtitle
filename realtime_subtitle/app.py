@@ -44,6 +44,21 @@ if sys.platform == "win32" and not os.environ.get("REALTIME_SUBTITLE_NO_SINGLETO
             pass
         sys.exit(0)
 
+if sys.platform == "darwin" and not os.environ.get("REALTIME_SUBTITLE_NO_SINGLETON"):
+    from realtime_subtitle.instance_identity import acquire_macos_instance_lock
+    _single_instance_lock = acquire_macos_instance_lock()
+    if _single_instance_lock is None:
+        print("⚠️  实时字幕已经在运行了，不再启动第二个实例")
+        try:
+            from AppKit import NSAlert
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("实时字幕")
+            alert.setInformativeText_("实时字幕已经在运行了，没有启动第二个。")
+            alert.runModal()
+        except Exception:
+            pass
+        sys.exit(0)
+
 # 在导入其他模块前先禁用所有警告和日志
 warnings.filterwarnings("ignore")
 os.environ['PYTHONWARNINGS'] = 'ignore'
@@ -368,6 +383,9 @@ class SubtitleApp:
         注册和消息循环必须在同一个线程（热键投递到注册线程的消息队列）。
         回调跑在热键线程里：文件操作+Qt信号都线程安全。
         """
+        if sys.platform == "darwin":
+            self._setup_macos_hotkey()
+            return
         import threading
         import ctypes
         from ctypes import wintypes
@@ -414,6 +432,27 @@ class SubtitleApp:
 
         self._hotkey_tid = None
         threading.Thread(target=hotkey_loop, name="HotkeyLoop", daemon=True).start()
+
+    def _setup_macos_hotkey(self):
+        from realtime_subtitle.macos.hotkeys import CarbonHotkeys
+        handlers = {
+            1: ("P", self._toggle_pause),
+            2: ("L", self._switch_language),
+            3: ("M", self.subtitle_window.toggle_click_through),
+            4: ("G", self._toggle_perf_hotkey),
+            5: ("C", self.subtitle_window.toggle_cinema),
+        }
+        self._hotkey_tid = None
+        try:
+            self._macos_hotkeys = CarbonHotkeys(handlers, parent=self.subtitle_window.app)
+            self._macos_hotkeys.register()
+            self.subtitle_window.app.aboutToQuit.connect(self._macos_hotkeys.close)
+        except Exception as exc:
+            hotkeys = getattr(self, "_macos_hotkeys", None)
+            if hotkeys is not None:
+                hotkeys.close()
+            for letter, _ in handlers.values():
+                print(f"⚠️  快捷键 Ctrl+Option+{letter} 注册失败（可能被其它程序占用）: {exc}")
 
     def _flush_check(self):
         """定时兜底：一段话说完后没有新音频，识别不会再被触发，

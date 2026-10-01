@@ -14,6 +14,20 @@ _OFFLINE_ENTRY = "download_subtitle.py"
 _MAIN_ENTRY = "main.py"
 
 
+def acquire_macos_instance_lock(path=None):
+    """非阻塞 flock；返回的文件必须持有到进程退出，竞争失败返回 None。"""
+    import fcntl
+    from realtime_subtitle.paths import repo_path
+    lock = open(path if path is not None else repo_path(".subtitle.lock"), "a+")
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        return None
+    # ☠️ 不删除锁文件：unlink 后新实例可锁到另一个 inode，导致双开。
+    return lock
+
+
 def parse_pid_file(raw: str) -> dict:
     """Accept JSON identity or a legacy bare PID."""
     text = (raw or "").strip()

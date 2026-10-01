@@ -2,6 +2,7 @@
 窗口几何工具：屏幕定位 + 坐标钳制 + 首次运行的默认布局。
 被 popups.py（WordPopup 定位）和 subtitle_window.py（主窗/辅助窗定位）共用。
 """
+import sys
 from PyQt6.QtWidgets import QApplication
 
 import realtime_subtitle.config as config
@@ -132,6 +133,10 @@ def rescale_state_for_dpr(state, current_dpr, saved_dpr=None):
     _clamp_geo_to_any_screen 会把它拽回某块屏内，不会丢窗。
     """
     if not isinstance(state, dict):
+        return state
+    if sys.platform == "darwin" and state.get("coord_platform") == "darwin":
+        # ☠️ Retina 与外接 1x 屏共享 Qt 逻辑坐标，缩放会把负坐标/字号也改坏。
+        # 只对旧 Windows 物理坐标存档沿用下方迁移，macOS 自己的存档保持逻辑尺寸。
         return state
     if saved_dpr is None:
         saved_dpr = state.get("coord_dpr", 1.0)

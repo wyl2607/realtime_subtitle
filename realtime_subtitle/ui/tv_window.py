@@ -7,6 +7,7 @@
 本窗不需要自己的信号层。
 """
 import html
+import sys
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QTextEdit, QPushButton,
 )
@@ -14,6 +15,7 @@ from PyQt6.QtCore import Qt, QEvent, QTimer
 # QShortcut 在 Qt6 里从 QtWidgets 搬到了 QtGui（它不是控件，本来就不该在那）
 from PyQt6.QtGui import QTextCursor, QTextBlockFormat, QKeySequence, QShortcut
 import realtime_subtitle.config as config
+from realtime_subtitle.ui.platform_fonts import platform_font_family
 class TVWindow(QWidget):
     """全屏滚动大字窗：新句从底部进入自动上滚；上翻回看时不打扰。"""
 
@@ -191,7 +193,7 @@ class TVWindow(QWidget):
                 background-color: rgb(0, 0, 0);
                 color: #f0f0f0;
                 font-size: {int(config.TV_FONT_SIZE)}px;
-                font-family: {config.FONT_FAMILY};
+                font-family: {platform_font_family(config.FONT_FAMILY)};
                 border: none;
                 padding: 24px 48px;
             }}
@@ -239,10 +241,23 @@ class TVWindow(QWidget):
         # 已全屏时直接 setGeometry 不会跨屏：先退回普通态再全屏到目标屏
         self.showNormal()
         self.setGeometry(geo)
-        self.showFullScreen()
+        if sys.platform == "darwin":
+            # macOS 原生全屏会新建独占 Space；覆盖层用屏幕几何模拟全屏。
+            self.show()
+            from realtime_subtitle.macos.windows import configure_overlay, focus_window
+            configure_overlay(self)
+            focus_window(self)
+        else:
+            self.showFullScreen()
         # 全屏几何生效在事件循环里，滚到底要排在它之后
         QTimer.singleShot(0, lambda: self.text.verticalScrollBar().setValue(
             self.text.verticalScrollBar().maximum()))
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if sys.platform == "darwin":
+            from realtime_subtitle.macos.windows import configure_overlay
+            configure_overlay(self)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -266,6 +281,8 @@ class TVWindow(QWidget):
         开机时用 opacity=0 把这笔账提前付掉（用户全程看不到任何画面），
         真正点📺时就落在快速区间，不会感觉"卡住"。
         """
+        if sys.platform == "darwin":
+            return  # DWM 首次全屏预热只对 Windows 有效，macOS 不创建独占 Space。
         screen = QApplication.primaryScreen()
         if screen is None:
             return

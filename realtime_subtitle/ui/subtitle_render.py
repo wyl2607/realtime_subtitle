@@ -7,6 +7,7 @@ import time
 import uuid
 from PyQt6.QtCore import Qt
 import realtime_subtitle.config as config
+from realtime_subtitle.ui.platform_fonts import platform_font_family
 class LiveTextRenderMixin:
 
     def update_live(self, committed, unstable):
@@ -155,7 +156,7 @@ class LiveTextRenderMixin:
         from PyQt6.QtGui import QTextDocument, QFont
         doc = QTextDocument()
         doc.setDocumentMargin(0)
-        font = QFont(config.FONT_FAMILY.split(",")[0].strip())
+        font = QFont(platform_font_family(config.FONT_FAMILY).split(",")[0].strip())
         font.setPixelSize(config.FONT_SIZE)
         doc.setDefaultFont(font)
         doc.setTextWidth(max(100, self.window.width() - 46))
@@ -166,7 +167,7 @@ class LiveTextRenderMixin:
     def _doc_for_render(self):
         """_render 测高用：font/size/width 未变则复用同一 QTextDocument。"""
         from PyQt6.QtGui import QTextDocument, QFont
-        family = config.FONT_FAMILY.split(",")[0].strip()
+        family = platform_font_family(config.FONT_FAMILY).split(",")[0].strip()
         size = config.FONT_SIZE
         text_width = max(100, self.window.width() - 46)
         key = (family, size, text_width)
