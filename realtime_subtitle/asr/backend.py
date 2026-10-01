@@ -259,8 +259,17 @@ class MlxWhisperModel:
             initial_prompt=initial_prompt or None,
             task=task,
         )
+        # 自动语言：先用 detect_language 做一次真检测（一次编码器前向，M4 上
+        # ~0.1 秒），再把结果锁进 transcribe。☠️ mlx-whisper 0.4.3 的 transcribe
+        # 结果里只有 "language"，**没有**语言概率字段——不先检测就只能报 0.0
+        # 或编一个常量，离线工具的"自动识别源语言"就没有置信度可看。
+        auto_probs = {}
         if language:
             kwargs["language"] = language
+        else:
+            det_lang, det_prob, auto_probs = self.detect_language(audio=audio_np, vad_filter=False)
+            if det_lang and det_lang != "und":
+                kwargs["language"] = det_lang
 
         # temperature：调用方不传时用 mlx-whisper 默认多步退火序列
         if temperature is not None:
@@ -278,12 +287,10 @@ class MlxWhisperModel:
         # 自动语言检测时从结果里取语言概率
         detected_lang = result.get("language", language or "und")
         if language:
-            # 语言已锁定：概率标为 1.0（行为与旧实现一致）
+            # 语言已锁定：概率标为 1.0（与 faster-whisper 锁定语言时一致）
             lang_prob = 1.0
         else:
-            # 自动检测：取 mlx-whisper 报的 language_probs（0.4.3 有时不带此字段）
-            all_probs = result.get("language_probs") or {}
-            lang_prob = float(all_probs.get(detected_lang, 0.0))
+            lang_prob = float(auto_probs.get(detected_lang, 0.0))
 
         # 音频时长（秒）
         duration = len(audio_np) / 16000
@@ -292,7 +299,7 @@ class MlxWhisperModel:
             language=detected_lang,
             language_probability=lang_prob,
             duration=duration,
-            all_probs=result.get("language_probs") or {},
+            all_probs=auto_probs,
         )
 
         # 把 mlx-whisper 返回的 dict-list 转成 _Segment 对象迭代器
@@ -335,26 +342,23 @@ class MlxWhisperModel:
             return "und", 0.0, {}
 
         try:
-            from mlx_whisper import load_models, decoding, audio as mlx_audio
+            from mlx_whisper import decoding, audio as mlx_audio
 
-            # ☠️ 必须用 load_models.load_model（不是 mlx_whisper.whisper.load_model，
-            # 那个路径在 0.4.3 不存在）；传字符串路径，从 ModelHolder 缓存里拿
-            model = load_models.load_model(self.model_path, dtype=mx.float16)
+            # 走 ModelHolder 的缓存（和 transcribe 同一份权重），不要 load_model
+            # 重新读盘——实测每次多 0.6 秒，而这条路径在识别线程里定期跑。
+            model = _ModelHolder.get_model(self.model_path, mx.float16)
+            n_mels = model.dims.n_mels  # large-v3/turbo = 128，其他大多数 = 80
 
-            # MEL：channels-last (n_frames, n_mels)；n_mels 由模型 dims 决定
-            # （large-v3/turbo = 128，其他大多数 = 80）
-            n_mels = model.dims.n_mels
-
-            # pad_or_trim 到 30s 窗口，再做 log-mel
-            audio_30s = mlx_audio.pad_or_trim(audio_np.astype(np.float32), 16000 * 30)
-            mel = mlx_audio.log_mel_spectrogram(audio_30s, n_mels=n_mels)
-            # mlx-whisper 返回 (n_mels, n_frames) or (n_frames, n_mels)：
-            # 按 0.4.3 的 audio.py 实现，log_mel_spectrogram 返回 (n_mels, n_frames)，
-            # detect_language 内部需要 (1, n_mels, n_frames)——直接传 mel
-            # ☠️ 不要手动 transpose：detect_language 内部自己处理维度
+            # ☠️ 顺序是「先算 mel，再按帧补齐/截断」：mlx 的 pad_or_trim 只接受
+            # mx.array，直接喂 numpy 音频会 TypeError（被下面的 except 吞成
+            # ("und", 0.0)，自动切语言就悄无声息地永远不触发——2026-10-01 在 M4
+            # 上实测踩到）。mel 是 channels-last (n_frames, n_mels)，所以沿
+            # axis=-2 补到 N_FRAMES（30 秒窗口）；dtype 要和 float16 权重一致。
+            mel = mlx_audio.log_mel_spectrogram(audio_np.astype(np.float32), n_mels=n_mels)
+            mel = mlx_audio.pad_or_trim(mel, mlx_audio.N_FRAMES, axis=-2).astype(mx.float16)
 
             _tokens, probs_list = decoding.detect_language(model, mel)
-            all_probs = probs_list[0] if probs_list else {}
+            all_probs = probs_list if isinstance(probs_list, dict) else (probs_list[0] if probs_list else {})
 
             if not all_probs:
                 return "und", 0.0, {}

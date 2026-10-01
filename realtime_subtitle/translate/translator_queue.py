@@ -1873,13 +1873,17 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         if t is not None and t.is_alive():
             t.join(timeout=min(3.0, remaining))
 
-        # ── macOS：清 MLX Metal 缓存（无 Ollama 模型，不发 HTTP 请求）────────
+        # macOS：先放掉 MLX 的 Whisper 权重并清 Metal 缓存（faster-whisper 没有
+        # unload，靠引用计数释放）。☠️ 不能就此 return——翻译在 macOS 上同样
+        # 走本地 Ollama，下面的 keep_alive=0 卸载两个平台都要发。
         if sys.platform == "darwin":
-            if hasattr(self, "model") and hasattr(self.model, "unload"):
-                self.model.unload()
-            return
+            model = getattr(self, "model", None)
+            if hasattr(model, "unload"):
+                try:
+                    model.unload()
+                except Exception:
+                    pass
 
-        # ── Windows：向 Ollama 发 keep_alive=0 请求卸载翻译模型 ─────────────
         ours = [m for m in (config.OLLAMA_MODEL,
                             getattr(config, "GAME_MODE_OLLAMA_MODEL", None)) if m]
         session = requests.Session()
@@ -1913,4 +1917,3 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
                 self.ollama_session.close()
         except Exception:
             pass
-

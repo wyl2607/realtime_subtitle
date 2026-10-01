@@ -45,7 +45,8 @@ def _make_fake_mlx_whisper():
             if cls.model_path != path:
                 # 模拟"路径变了才重新加载"
                 cls.model_path = path
-                cls.model = object()  # 哑对象代表已加载的模型
+                # 哑模型：detect_language 要读 dims.n_mels（turbo = 128）
+                cls.model = types.SimpleNamespace(dims=types.SimpleNamespace(n_mels=128))
             return cls.model
 
     transcribe_mod.ModelHolder = ModelHolder
@@ -53,21 +54,31 @@ def _make_fake_mlx_whisper():
     # ── mlx_whisper.audio 子模块 ─────────────────────────────────────────────
     audio_mod = types.ModuleType("mlx_whisper.audio")
 
-    def log_mel_spectrogram(audio, n_mels=80):
-        # 返回 (n_mels, n_frames) 形状的 numpy 数组（mlx-whisper 实际行为）
-        n_frames = max(1, len(audio) // 160)
-        return np.zeros((n_mels, n_frames), dtype=np.float32)
+    class _Arr(np.ndarray):
+        """mlx 数组替身：只补 .astype 已有；pad_or_trim 只认它，numpy 进来就
+        TypeError——和真 mlx 一样（真库对 numpy 输入直接报 pad() 参数不兼容）。"""
 
-    def pad_or_trim(audio, length):
-        if len(audio) >= length:
-            return audio[:length]
-        return np.pad(audio, (0, length - len(audio)))
+    def log_mel_spectrogram(audio, n_mels=80):
+        # 真 mlx-whisper 0.4.3：channels-last (n_frames, n_mels)，返回 mx.array
+        n_frames = max(1, len(audio) // 160)
+        return np.zeros((n_frames, n_mels), dtype=np.float32).view(_Arr)
+
+    def pad_or_trim(array, length=480000, *, axis=-1):
+        if not isinstance(array, _Arr):
+            raise TypeError("pad(): incompatible function arguments")
+        n = array.shape[axis]
+        if n >= length:
+            return np.take(array, range(length), axis=axis).view(_Arr)
+        widths = [(0, 0)] * array.ndim
+        widths[axis] = (0, length - n)
+        return np.pad(array, widths).view(_Arr)
 
     def load_audio(path):
         return np.zeros(16000, dtype=np.float32)
 
     audio_mod.log_mel_spectrogram = log_mel_spectrogram
     audio_mod.pad_or_trim = pad_or_trim
+    audio_mod.N_FRAMES = 3000
     audio_mod.load_audio = load_audio
 
     # ── mlx_whisper.decoding 子模块 ──────────────────────────────────────────
@@ -127,7 +138,6 @@ def _make_fake_mlx_whisper():
             "text": " Hallo Welt",
             "segments": [seg],
             "language": language or "de",
-            "language_probs": {"de": 0.92, "en": 0.05},
         }
 
     pkg.transcribe = transcribe
@@ -371,8 +381,9 @@ def test_detect_language_mel_shape(fake_mlx, backend_module, monkeypatch):
 
     assert len(received_mels) == 1
     mel = received_mels[0]
-    # log_mel_spectrogram 返回 (n_mels, n_frames)；fake model.dims.n_mels = 128
-    assert mel.shape[0] == 128, f"mel 第一维应是 n_mels=128，实际 {mel.shape}"
+    # channels-last：(N_FRAMES, n_mels)，n_mels 取自模型 dims（turbo = 128）
+    assert mel.shape == (3000, 128), f"mel 应是 (3000, 128)，实际 {mel.shape}"
+    assert lang == "de" and abs(prob - 0.92) < 1e-6
 
 
 @pytestmark_darwin
@@ -396,7 +407,7 @@ def test_auto_language_prob_is_real(model, fake_mlx, monkeypatch):
     monkeypatch.setattr(config, "ENERGY_THRESHOLD_SPEECH", 0.0, raising=False)
 
     audio = (np.random.randn(16000) * 0.1).astype(np.float32)
-    # fake transcribe 返回 language_probs = {"de": 0.92, "en": 0.05}
+    # 真 transcribe 结果里没有概率字段；0.92 来自 detect_language 的假分布
     segs, info = model.transcribe(audio, language=None)
     list(segs)
 

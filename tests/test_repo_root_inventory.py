@@ -23,6 +23,7 @@ _ALLOWED_ROOT_FILES = {
 
     # --- 依赖与工具配置（构建/工具只认根） ---
     "requirements.txt": "依赖唯一真相源：install.ps1、deps_fingerprint、CI 的 deps-resolve 都只认它",
+    "requirements-macos.txt": "macOS（Apple Silicon）依赖：mlx-whisper 代替 faster-whisper/torch/CUDA，ScreenCaptureKit 辅助程序代替 pyaudiowpatch",
     "requirements-dev.txt": "测试依赖，和上面分开是为了不让最终用户白装 pytest",
     "pyproject.toml": "pytest + ruff 配置（2026-09-21 由 pytest.ini + ruff.toml 合并而来）",
 
