@@ -3,13 +3,14 @@
 > 运行时代码在包 `realtime_subtitle/`（capture / asr / translate / ui / offline）。实时入口是根目录 `main.py`，离线视频入口是 `download_subtitle.py`。
 
 
-> 目录分级见 [docs/STRUCTURE.md](docs/STRUCTURE.md)；Windows 脚本在 `scripts/windows/`。
+> 目录分级见 [docs/STRUCTURE.md](docs/STRUCTURE.md)；Windows 脚本在 `scripts/windows/`，macOS 脚本在 `scripts/macos/`（见第 7 节）。
  — 给接手这台电脑的 AI 助手（Claude Code 等）
 
 这是一个**完全本地运行**的实时字幕系统：捕获 Windows 正在播放的声音（直播/视频/
 语音聊天），Faster-Whisper 实时识别德语，Ollama 本地大模型翻译成中文，PyQt6
-置顶悬浮窗双语显示。不向任何云端发送音频或文本。**仅支持 Windows**（音频捕获
-用 WASAPI Loopback）。
+置顶悬浮窗双语显示。不向任何云端发送音频或文本。**支持 Windows**（音频捕获
+用 WASAPI Loopback）**和 Apple Silicon macOS**（识别走 MLX，抓系统声音靠
+BlackHole 虚拟声卡；差异和坑见第 7 节——在 Mac 上干活先读第 7 节）。
 
 如果用户让你"帮我装上/配好这个字幕"，你的任务是：**按本文件把系统装好、
 按这台电脑的硬件把模型档位配对、验证能跑，并把坑绕开**。本文件就是为此写的，
@@ -86,6 +87,7 @@ config.py 同名项）。**永远不要为了适配这台机器去改 config.py*
 | 可以直接写 | 用途 |
 |---|---|
 | `WHISPER_MODEL` / `WHISPER_DEVICE` / `WHISPER_COMPUTE_TYPE` | 显存分档 |
+| `WHISPER_BACKEND` / `WHISPER_MLX_REPO` | macOS 识别后端与模型（第 7 节） |
 | `OLLAMA_MODEL` / `GAME_MODE_OLLAMA_MODEL` | 显存分档 |
 | `CHUNK_SUBMIT_SECONDS` / `WHISPER_BEAM_SIZE` | 识别跟不上时降档 |
 | `LANGUAGE_PAIRS` / `AUTO_DETECT_LANGUAGE` 及其滞回参数 | 用户明说了要哪几种语言时（同一个源语言可以配多条，如 `("zh","en")` 和 `("zh","de")`，面板会各出一个按钮，见第 4 节第 41 条） |
@@ -1106,3 +1108,79 @@ downloads/            离线视频、原文/双语 SRT 和学习笔记（gitigno
 
 装完把第 2 节的微调原则留给用户一句话："嫌慢或嫌翻译质量差，让你的 AI 按
 CLAUDE.md 第 2 节调 config_local.py。"
+
+## 7. macOS（Apple Silicon）
+
+**装法**：`brew install uv ollama` → `bash scripts/macos/install.sh`（`--mirror`
+走清华镜像，`--lean` 给硬盘紧张的机器）→ `bash scripts/macos/start.sh` /
+`stop.sh`。install.sh 按 `hw.memsize` 写 `config_local.py`（已存在不覆盖）。
+抓系统声音必须 `brew install blackhole-2ch` 并在「音频 MIDI 设置」建「多输出
+设备」；不装时程序退回默认麦克风并提示一次。Intel Mac 不支持。
+
+**档位与实测**（2026-10-05，M2 16GB，FLEURS 德语 60 条人工转写；翻译用
+FLEURS 德中平行句 chrF。复测脚本在 `scripts/bench/`）：
+
+| 识别（MLX） | WER | 12 秒缓冲单次 | 内存峰值 | 结论 |
+|---|---|---|---|---|
+| turbo fp16 `mlx-community/whisper-large-v3-turbo` | 4.05% | 2.4s | 2.1GB | 12GB 以上默认 |
+| turbo q8（本地量化） | 3.83% | 3.5s | 1.5GB | 词时间戳在量化模型上慢 1.8s，不做默认 |
+| turbo q4 `mlx-community/whisper-large-v3-turbo-q4` | 4.84% | 3.4s | 1.1GB | <12GB / `--lean` |
+| medium | 5.28% | 2.9s | 2.2GB | 全面劣于 turbo，别用 |
+| small | 9.76% | 1.1s | 1.2GB | 只在 turbo 实在跑不动时 |
+| faster-whisper CPU turbo int8（对照） | 4.84% | **10.0s** | 2.7GB | Mac 上不能用 faster-whisper |
+
+| 翻译 | chrF | 单句 | 内存 |
+|---|---|---|---|
+| qwen3.5:2b | 26.7 | 1.6s | 2.4GB |
+| qwen3.5:4b | 27.9 | 4.3s | 3.2GB |
+| qwen3.5:9b | 29.8 | 7.5s | 6.2GB，16GB 机器上**单独跑就把内存压力推到警告**——16GB 别用 |
+
+macOS 避坑（每一条都是这次迁移真实踩过的）：
+
+1. **Mac 上识别更新一次约 2.4 秒，这是现有架构的下限，不是 bug。**
+   `CHUNK_SUBMIT_SECONDS=0.5` 在 Mac 上实际不成立：收件箱积压的块会被
+   `_process_inbox` 整批合并成一次识别，节奏自动退化成"每轮识别耗时"。
+   缩短缓冲**省不了时间**（6 秒缓冲 2.57s vs 12 秒 2.37s）——和第 4 节第 20 条
+   同理，编码器每次都补到 30 秒，M2 上这块固定 ~1.7s；词时间戳再加 ~0.6s。
+   词时间戳是 local agreement 的前提，不能关。
+2. **mlx-community 上同名模型有两种格式。** `-8bit`/`-4bit` 后缀的是
+   mlx-audio-plus 格式（`model.safetensors`），mlx_whisper 加载直接报
+   `[load_npz] Input must be a zip file`；能用的是 `weights.safetensors` /
+   `weights.npz` 的（如 `-q4`）。要别的量化档就从 fp16 本地 `nn.quantize` +
+   config.json 加 `quantization` 字段。德语微调版 `-german-f16` 实测**比原版差**
+   （6.22% vs 4.05%），别"好心"换上。
+3. **mlx_whisper 没有 beam search 也没有 VAD。** `asr/mlx_backend.py` 接受
+   `beam_size` 但忽略；`vad_filter` 复用 `faster_whisper.vad` + `SpeechTimestampsMap`
+   映回原时间轴——它是防幻觉主力（第 4 节第 20 条），别为了"Mac 上少一个依赖"删掉。
+4. **mlx_whisper 是第一次 transcribe 才惰性加载权重**，而且默认每次加载都去 HF
+   做 etag 检查。`load_mlx_model()` 在后台加载阶段就预加载（否则"✅已就绪"之后
+   第一轮卡 17 秒），并先 `local_files_only`。`ModelHolder` 按**路径字符串**缓存：
+   transcribe 和 detect_language 必须传同一个解析后的本地路径，另 `load_model`
+   一份等于 turbo 再占 2GB。
+5. **mlx 的 `model.detect_language(mel)` 返回 `(语言 token 的 mx.array, {码: 概率})`**，
+   第一个不是字符串。拿它当语言码，置信度永远是 0、自动切语言静默失效——
+   单测里的假模型返回 None 正好绕过了这条分支，所以测试一直绿。
+6. **词的前导空格原样保留**：Whisper 的词本来就带对的空格，中文源语言（zh→de）
+   的词没有空格。给每个词补空格会把中文句子拆成"你 好"。
+7. **采集按平台判，别按接口判。** pyaudiowpatch 是 PyAudio 的分支，也有
+   `get_default_input_device_info`；`sounddevice.default.device` 初值是 `(-1, -1)`
+   （"交给 PortAudio"），不是设备号，真默认输入要 `query_devices(kind="input")`。
+   sounddevice 的设备表在 PortAudio 初始化时冻结——macOS 上**暂不支持设备热插拔**。
+8. **Carbon 热键必须主线程注册**（`ui/macos_hotkeys.py`），所以 macOS 在构造期就
+   注册，`running` 之前的按键忽略（等价于 Windows"加载完才注册"）。用
+   `RegisterEventHotKey` 是因为它**不要辅助功能权限**；ssh 会话里拿不到 GUI 事件
+   目标会注册失败（-9868），要在桌面会话里测。
+9. **macOS 自带 bash 是 3.2**：`set -u` 下展开空数组 `"${arr[@]}"` 直接
+   unbound variable。scripts/macos/*.sh 不用空数组。
+10. **在 Codex/沙箱里跑会被误导**：沙箱拦 `sysctl kern.memorystatus_vm_pressure_level`
+    / `hw.memsize`，于是代理会"好心"加 `memory_pressure` 空闲百分比映射、
+    `system_profiler` 之类的回退——真机上 sysctl 都正常，那些回退是凭空编的阈值，
+    已删，别加回来。
+11. **内存压力降档只动翻译模型，且只往下降到 `AUTO_TIER_MAX`（默认＝启动时的
+    模型）以内**（`resources/memory.py::TierGovernor`）：警告持续才降、严重立即降，
+    升档要压力正常持续 5 分钟 + 可用内存够 + 冷却——升降不对称就是为了防第 4 节
+    第 25 条那种震荡。Whisper 不在运行中换档（换模型要重载 2GB，得不偿失）。
+12. **测量 Mac 性能前**先 `snapshot_download` 全部模型、`HF_HUB_OFFLINE=1
+    caffeinate -i` 跑，期间别跑别的重活。第一轮 P0 就是被 Wi-Fi 抖动 + 系统睡眠
+    污染的（单次识别测出 2631 秒）。
+
