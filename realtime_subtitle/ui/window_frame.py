@@ -33,11 +33,17 @@ class DraggableWidget(QWidget):
     def mousePressEvent(self, event):
         """鼠标按下 - 开始拖动"""
         if event.button() == Qt.MouseButton.LeftButton:
+            if self._try_start_system_interaction(event):
+                event.accept()
+                return
             self.dragging = True
             press = self._global_pos(event)
             self.drag_position = press - self.frameGeometry().topLeft()
             self._press_global = press
             event.accept()
+
+    def _try_start_system_interaction(self, event):
+        return False
 
     def mouseMoveEvent(self, event):
         """鼠标移动 - 拖动窗口（钳制在屏幕可用区域内。
@@ -157,8 +163,53 @@ class ResizableFramelessWidget(DraggableWidget):
     def _in_title_bar_region(self, x, y, rect):
         """物理像素坐标是否落在标题拖动条（非边缘缩放带、非右上按钮保留区）。"""
         m = self.RESIZE_MARGIN
-        return (rect.top + m <= y < rect.top + self.DRAG_BAR_HEIGHT
-                and rect.left + m <= x < rect.right - self.BTN_RESERVE)
+        top = self._rect_value(rect, "top")
+        left = self._rect_value(rect, "left")
+        right = self._rect_value(rect, "right")
+        return (top + m <= y < top + self.DRAG_BAR_HEIGHT
+                and left + m <= x < right - self.BTN_RESERVE)
+
+    @staticmethod
+    def _rect_value(rect, name):
+        value = getattr(rect, name)
+        return value() if callable(value) else value
+
+    def _edge_tuple(self, x, y, rect):
+        m = self.RESIZE_MARGIN
+        top = self._rect_value(rect, "top")
+        bottom = self._rect_value(rect, "bottom")
+        left = self._rect_value(rect, "left")
+        right = self._rect_value(rect, "right")
+        return (y < top + m, y > bottom - m, x < left + m, x > right - m)
+
+    def _qt_resize_edges(self, edges):
+        top, bottom, left, right = edges
+        qt_edges = Qt.Edge(0)
+        if top:
+            qt_edges |= Qt.Edge.TopEdge
+        if bottom:
+            qt_edges |= Qt.Edge.BottomEdge
+        if left:
+            qt_edges |= Qt.Edge.LeftEdge
+        if right:
+            qt_edges |= Qt.Edge.RightEdge
+        return qt_edges
+
+    def _try_start_system_interaction(self, event):
+        if sys.platform == "win32":
+            return False
+        window = self.windowHandle()
+        if window is None:
+            return False
+        press = self._global_pos(event)
+        rect = self.frameGeometry()
+        edges = self._edge_tuple(press.x(), press.y(), rect)
+        qt_edges = self._qt_resize_edges(edges)
+        if qt_edges:
+            return bool(window.startSystemResize(qt_edges))
+        if self._drag_bar_is_visible() and self._in_title_bar_region(press.x(), press.y(), rect):
+            return bool(window.startSystemMove())
+        return False
 
     def nativeEvent(self, eventType, message):
         if sys.platform != "win32" or eventType not in (b"windows_generic_MSG", b"windows_dispatcher_MSG"):
@@ -190,9 +241,7 @@ class ResizableFramelessWidget(DraggableWidget):
         y = ctypes.c_short((msg.lParam >> 16) & 0xFFFF).value
         rect = wintypes.RECT()
         ctypes.windll.user32.GetWindowRect(int(self.winId()), ctypes.byref(rect))
-        m = self.RESIZE_MARGIN
-        edges = (y < rect.top + m, y > rect.bottom - m,
-                 x < rect.left + m, x > rect.right - m)
+        edges = self._edge_tuple(x, y, rect)
         hit = self._HIT_CODES.get(edges, 0)
         if hit:
             return True, hit
@@ -218,5 +267,3 @@ class ResizableFramelessWidget(DraggableWidget):
             event.accept()
             return
         super().closeEvent(event)
-
-

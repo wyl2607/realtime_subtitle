@@ -6,6 +6,7 @@ import warnings
 import logging
 import sys
 import os
+from realtime_subtitle.paths import SINGLETON_LOCK_FILE, repo_path
 
 # 控制台可能默认使用非UTF-8编码（如cp1252），会导致emoji/中文print崩溃
 if sys.platform == "win32":
@@ -20,6 +21,22 @@ if sys.platform == "win32":
 # 静默退出"）。以前靠在 import 前 monkeypatch ctypes.windll.kernel32 绕开，
 # 那既脆（换 ctypes 调用方式就失效）又要写进 CLAUDE.md 让人记住；现在改成
 # 环境变量开关，tests/ 里设一次即可，也不会真去占那个 mutex。
+_single_instance_lock = None
+
+
+def _acquire_macos_singleton_lock(lock_file=SINGLETON_LOCK_FILE):
+    import fcntl
+
+    lock = open(lock_file, "w", encoding="utf-8")
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("⚠️  实时字幕已经在运行了，不再启动第二个实例")
+        lock.close()
+        sys.exit(0)
+    return lock
+
+
 if sys.platform == "win32" and not os.environ.get("REALTIME_SUBTITLE_NO_SINGLETON"):
     import ctypes
     # ☠️ 错误码必须走 use_last_error=True 的独立句柄 + ctypes.get_last_error()。
@@ -43,6 +60,8 @@ if sys.platform == "win32" and not os.environ.get("REALTIME_SUBTITLE_NO_SINGLETO
         except Exception:
             pass
         sys.exit(0)
+elif sys.platform == "darwin" and not os.environ.get("REALTIME_SUBTITLE_NO_SINGLETON"):
+    _single_instance_lock = _acquire_macos_singleton_lock()
 
 # 在导入其他模块前先禁用所有警告和日志
 warnings.filterwarnings("ignore")
@@ -72,7 +91,6 @@ import realtime_subtitle.config as config
 # 纯常量模块，没有任何 import，放这里不影响上面那条 torch/PyQt6 的顺序约束
 from realtime_subtitle.version import version_string
 # 同样是纯 stdlib（pathlib），不影响 DLL 顺序
-from realtime_subtitle.paths import repo_path
 from realtime_subtitle.migrate_legacy import migrate_legacy_runtime_files
 
 class SubtitleApp:
@@ -368,6 +386,9 @@ class SubtitleApp:
         注册和消息循环必须在同一个线程（热键投递到注册线程的消息队列）。
         回调跑在热键线程里：文件操作+Qt信号都线程安全。
         """
+        if sys.platform != "win32":
+            print("macOS 暂不支持全局快捷键，请用窗口按钮/⚙️面板")
+            return
         import threading
         import ctypes
         from ctypes import wintypes
@@ -493,7 +514,7 @@ class SubtitleApp:
             self._stop_timer.stop()
 
         # 让热键线程退出消息循环并注销热键（WM_QUIT = 0x0012）
-        if getattr(self, '_hotkey_tid', None):
+        if sys.platform == "win32" and getattr(self, '_hotkey_tid', None):
             import ctypes
             ctypes.windll.user32.PostThreadMessageW(self._hotkey_tid, 0x0012, 0, 0)
 

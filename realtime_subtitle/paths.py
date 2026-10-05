@@ -21,6 +21,7 @@ from pathlib import Path
 
 # realtime_subtitle/paths.py -> realtime_subtitle/ -> <仓库根>
 REPO_ROOT = Path(__file__).resolve().parents[1]
+SINGLETON_LOCK_FILE = REPO_ROOT / "realtime_subtitle.lock"
 
 
 def repo_path(*parts):

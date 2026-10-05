@@ -678,28 +678,42 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         """穿透开：字幕窗对鼠标完全隐形（点击/滚轮全落到下面的视频/游戏上），
         适合全屏看剧不挡操作。用原生 WS_EX_TRANSPARENT——窗口本来就是
         WS_EX_LAYERED（半透明窗），加这个标志即可，不用重建窗口"""
-        if sys.platform != "win32":
-            return
-        GWL_EXSTYLE = -20
-        WS_EX_TRANSPARENT = 0x20
-        hwnd = int(self.container.winId())
-        ex = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
         self._click_through = not self._click_through
+        self._apply_click_through_native(self._click_through)
+        restore_hint = "Ctrl+Alt+M 恢复" if sys.platform == "win32" else "用⚙️面板恢复"
         if self._click_through:
-            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT)
             # 穿透后 hover 全失效：藏掉 chrome，只留右上角常驻指示器
             self._set_controls_visible(False)
             self.ct_indicator.show()
             self._position_chrome()
-            self.show_status("👻 鼠标穿透已开启：字幕窗点不到了（Ctrl+Alt+M 恢复）")
+            self.show_status(f"👻 鼠标穿透已开启：字幕窗点不到了（{restore_hint}）")
             print("👻 [热键] 鼠标穿透开启")
         else:
-            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex & ~WS_EX_TRANSPARENT)
             self.ct_indicator.hide()
             # 恢复后按当前 hover 状态决定是否显示 chrome
             self._set_controls_visible(self.container.underMouse())
             self.show_status("🖱️ 鼠标穿透已关闭，字幕窗恢复可点击")
             print("🖱️ [热键] 鼠标穿透关闭")
+
+    def _apply_click_through_native(self, on):
+        if sys.platform != "win32":
+            # macOS：Qt 的 WindowTransparentForInput 对应 NSWindow.ignoresMouseEvents。
+            # 改 windowFlags 会把顶层窗口藏起来，必须重新 show 并保持置顶
+            flags = self.container.windowFlags()
+            transparent = Qt.WindowType.WindowTransparentForInput
+            flags = (flags | transparent) if on else (flags & ~transparent)
+            self.container.setWindowFlags(flags | Qt.WindowType.WindowStaysOnTopHint)
+            self.container.show()
+            self.container.raise_()
+            return
+        GWL_EXSTYLE = -20
+        WS_EX_TRANSPARENT = 0x20
+        hwnd = int(self.container.winId())
+        ex = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        if on:
+            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT)
+        else:
+            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex & ~WS_EX_TRANSPARENT)
         # 改扩展样式后通知系统重算：部分Windows/合成路径下不发
         # SWP_FRAMECHANGED样式会延迟生效甚至不生效
         SWP_FLAGS = 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020  # NOSIZE|NOMOVE|NOZORDER|NOACTIVATE|FRAMECHANGED
