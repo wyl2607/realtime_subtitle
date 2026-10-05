@@ -132,6 +132,8 @@ class SubtitleApp:
         # 面板四个按钮 / 手动拨滑块 → 都回到 _apply_mode 这唯一入口
         self.subtitle_window.settings_window.on_mode_change = self._apply_mode
         self.subtitle_window.settings_window.on_language_change = self._request_language_pair
+        if sys.platform == "darwin":
+            self._setup_hotkey()
 
     def _load_models(self):
         """后台线程：加载 Whisper/Ollama + 音频采集，完成后接线并启动。
@@ -202,7 +204,8 @@ class SubtitleApp:
             self.running = True
             self.audio_capture.start()
             self._print_usage()
-            self._setup_hotkey()
+            if sys.platform != "darwin":
+                self._setup_hotkey()
         except Exception as e:
             print(f"❌ 初始化失败: {e}")
             import traceback
@@ -386,8 +389,26 @@ class SubtitleApp:
         注册和消息循环必须在同一个线程（热键投递到注册线程的消息队列）。
         回调跑在热键线程里：文件操作+Qt信号都线程安全。
         """
-        if sys.platform != "win32":
-            print("macOS 暂不支持全局快捷键，请用窗口按钮/⚙️面板")
+        if sys.platform not in ("win32", "darwin"):
+            print("当前平台暂不支持全局快捷键，请用窗口按钮/⚙️面板")
+            return
+        callbacks = {
+            "Ctrl+Alt+P": self._toggle_pause,
+            "Ctrl+Alt+L": self._switch_language,
+            "Ctrl+Alt+M": self.subtitle_window.toggle_click_through,
+            "Ctrl+Alt+G": self._toggle_perf_hotkey,
+            "Ctrl+Alt+C": self.subtitle_window.toggle_cinema,
+        }
+        if sys.platform == "darwin":
+            # Carbon 热键必须在主线程注册，所以比 Windows 早（构造期就注册）；
+            # 模型加载完（running）之前按键一律忽略，和 Windows"加载完才注册"等价——
+            # 否则加载期间按 Ctrl+Alt+L 会撞上还没建好的 translator
+            from realtime_subtitle.ui import macos_hotkeys
+            gated = {label: (lambda f=f: f() if self.running else None)
+                     for label, f in callbacks.items()}
+            registered = macos_hotkeys.register(gated)
+            if registered:
+                print(f"⌨️  全局快捷键已注册(系统级): {', '.join(registered)}")
             return
         import threading
         import ctypes
@@ -396,11 +417,11 @@ class SubtitleApp:
         MOD_ALT, MOD_CONTROL, MOD_NOREPEAT = 0x1, 0x2, 0x4000
         WM_HOTKEY = 0x0312
         handlers = {
-            1: ("Ctrl+Alt+P", ord('P'), self._toggle_pause),
-            2: ("Ctrl+Alt+L", ord('L'), self._switch_language),
-            3: ("Ctrl+Alt+M", ord('M'), self.subtitle_window.toggle_click_through),
-            4: ("Ctrl+Alt+G", ord('G'), self._toggle_perf_hotkey),
-            5: ("Ctrl+Alt+C", ord('C'), self.subtitle_window.toggle_cinema),
+            1: ("Ctrl+Alt+P", ord('P'), callbacks["Ctrl+Alt+P"]),
+            2: ("Ctrl+Alt+L", ord('L'), callbacks["Ctrl+Alt+L"]),
+            3: ("Ctrl+Alt+M", ord('M'), callbacks["Ctrl+Alt+M"]),
+            4: ("Ctrl+Alt+G", ord('G'), callbacks["Ctrl+Alt+G"]),
+            5: ("Ctrl+Alt+C", ord('C'), callbacks["Ctrl+Alt+C"]),
         }
 
         def hotkey_loop():
@@ -517,6 +538,9 @@ class SubtitleApp:
         if sys.platform == "win32" and getattr(self, '_hotkey_tid', None):
             import ctypes
             ctypes.windll.user32.PostThreadMessageW(self._hotkey_tid, 0x0012, 0, 0)
+        elif sys.platform == "darwin":
+            from realtime_subtitle.ui import macos_hotkeys
+            macos_hotkeys.unregister_all()
 
         # 先停止音频捕获，避免向已关闭的线程池提交新任务
         if self.audio_capture is not None:

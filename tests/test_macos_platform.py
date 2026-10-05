@@ -25,7 +25,8 @@ def test_second_singleton_lock_exits(tmp_path):
 
 
 def test_setup_hotkey_skips_win32_api_off_windows(monkeypatch, capsys):
-    monkeypatch.setattr(app.sys, "platform", "darwin")
+    # darwin 已有 Carbon 热键（见 test_macos_hotkeys）；这里测其它平台的兜底
+    monkeypatch.setattr(app.sys, "platform", "linux")
 
     class _Boom:
         def __getattr__(self, name):
