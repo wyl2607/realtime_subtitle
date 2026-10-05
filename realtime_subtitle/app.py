@@ -6,6 +6,8 @@ import warnings
 import logging
 import sys
 import os
+import platform
+import time
 from realtime_subtitle.paths import SINGLETON_LOCK_FILE, repo_path
 
 # 控制台可能默认使用非UTF-8编码（如cp1252），会导致emoji/中文print崩溃
@@ -86,12 +88,23 @@ from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 from realtime_subtitle.capture.audio_capture import AudioCapture, PAUSE_FLAG_FILE, STOP_FLAG_FILE
 from realtime_subtitle.ui.subtitle_window import SubtitleWindow
 from realtime_subtitle.ui.settings_window import MODE_ICONS as _MODE_ICON
+from realtime_subtitle.resources.memory import TierGovernor, read_memory_snapshot
 from PyQt6.QtCore import QTimer
 import realtime_subtitle.config as config
 # 纯常量模块，没有任何 import，放这里不影响上面那条 torch/PyQt6 的顺序约束
 from realtime_subtitle.version import version_string
 # 同样是纯 stdlib（pathlib），不影响 DLL 顺序
 from realtime_subtitle.migrate_legacy import migrate_legacy_runtime_files
+
+
+def _translation_tiers_from_start(start_model, tiers, max_model=None):
+    if start_model not in tiers:
+        return []
+    cap = max_model or start_model
+    if cap not in tiers:
+        return []
+    return list(tiers)[list(tiers).index(cap):]
+
 
 class SubtitleApp:
     """实时字幕应用主类"""
@@ -116,6 +129,9 @@ class SubtitleApp:
         # 这台机器的"正常档位"翻译模型：必须在任何模式切换之前拍快照
         # （此时 config_local 的显存分档已经生效）。非性能模式统一切回它
         self._baseline_ollama_model = config.OLLAMA_MODEL
+        self._memory_tier_stop = None
+        self._memory_tier_thread = None
+        self._memory_tier_error_printed = False
 
         # 初始化字幕窗口（必须在主线程；QApplication 也在这里面建）
         try:
@@ -132,6 +148,36 @@ class SubtitleApp:
         # 面板四个按钮 / 手动拨滑块 → 都回到 _apply_mode 这唯一入口
         self.subtitle_window.settings_window.on_mode_change = self._apply_mode
         self.subtitle_window.settings_window.on_language_change = self._request_language_pair
+
+    def _auto_tier_enabled(self):
+        enabled = getattr(config, "AUTO_TIER_ENABLED", None)
+        if enabled is None:
+            return platform.system() == "Darwin"
+        return bool(enabled)
+
+    def _build_memory_governor(self):
+        if not self._auto_tier_enabled():
+            return None
+        tiers = _translation_tiers_from_start(
+            self._baseline_ollama_model,
+            list(getattr(config, "TRANSLATION_TIERS", [])),
+            getattr(config, "AUTO_TIER_MAX", None),
+        )
+        if not tiers:
+            print(f"🧠 启动翻译模型 {self._baseline_ollama_model} 不在自动分档列表，自动降档未启用")
+            return None
+        gb = 1024 ** 3
+        costs = {
+            model: int(cost_gb * gb)
+            for model, cost_gb in getattr(config, "TRANSLATION_TIER_COST_GB", {}).items()
+        }
+        current_tier = self._baseline_ollama_model if self._baseline_ollama_model in tiers else tiers[0]
+        return TierGovernor(
+            tiers,
+            current_tier,
+            tier_cost_bytes=costs,
+            headroom_bytes=int(getattr(config, "AUTO_TIER_HEADROOM_GB", 1.5) * gb),
+        )
 
     def _load_models(self):
         """后台线程：加载 Whisper/Ollama + 音频采集，完成后接线并启动。
@@ -348,14 +394,7 @@ class SubtitleApp:
         # 不同机器 config_local 里的 OLLAMA_MODEL 不一样，写死会覆盖显存分档）
         target_model = (getattr(config, "GAME_MODE_OLLAMA_MODEL", None) if name == "性能"
                         else self._baseline_ollama_model)
-        if target_model and target_model != config.OLLAMA_MODEL:
-            old_model = config.OLLAMA_MODEL
-            config.OLLAMA_MODEL = target_model
-            # ☠️ 模型还在后台加载时（窗口先显示的那十几秒）translator 是 None，
-            # 这时只改 config 就够了：翻译器构造后自然用新名字，退出时的
-            # _unload_our_models 也会把两个模型名都覆盖到，不会漏显存
-            if self.translator is not None:
-                self.translator.request_warm_model(old_model=old_model, new_model=target_model)
+        self._switch_ollama_model(target_model)
         self._current_mode = name
         self.subtitle_window.notify_mode_applied(name)
         self.subtitle_window.show_status(f"{_MODE_ICON.get(name, '⚙️')} 已切换到「{name}」模式")
@@ -364,6 +403,52 @@ class SubtitleApp:
               f"草稿{'开' if config.DRAFT_TRANSLATION else '关'} "
               f"语域{config.TRANSLATION_STYLE} 模型{config.OLLAMA_MODEL}")
         return True
+
+    def _switch_ollama_model(self, target_model):
+        if target_model and target_model != config.OLLAMA_MODEL:
+            old_model = config.OLLAMA_MODEL
+            config.OLLAMA_MODEL = target_model
+            # ☠️ 模型还在后台加载时（窗口先显示的那十几秒）translator 是 None，
+            # 这时只改 config 就够了：翻译器构造后自然用新名字，退出时的
+            # _unload_our_models 也会把两个模型名都覆盖到，不会漏显存
+            if self.translator is not None:
+                self.translator.request_warm_model(old_model=old_model, new_model=target_model)
+
+    def _on_memory_tier(self, model):
+        old_baseline = self._baseline_ollama_model
+        self._baseline_ollama_model = model
+        if self._current_mode != "性能":
+            self._switch_ollama_model(model)
+        tiers = list(getattr(config, "TRANSLATION_TIERS", []))
+        try:
+            action = "降到" if tiers.index(model) > tiers.index(old_baseline) else "恢复"
+        except ValueError:
+            action = "恢复"
+        msg = f"🧠 内存{'紧张' if action == '降到' else '充足'}，翻译模型{action} {model}"
+        self.subtitle_window.show_status(msg)
+        print(msg)
+
+    def _start_memory_tier_loop(self):
+        governor = self._build_memory_governor()
+        if governor is None:
+            return
+        import threading
+        self._memory_tier_stop = threading.Event()
+
+        def _loop():
+            poll = float(getattr(config, "AUTO_TIER_POLL_SEC", 2.0))
+            while not self._memory_tier_stop.wait(poll):
+                try:
+                    model = governor.observe(read_memory_snapshot(), time.monotonic())
+                    if model is not None:
+                        self._on_memory_tier(model)
+                except Exception as e:
+                    if not self._memory_tier_error_printed:
+                        self._memory_tier_error_printed = True
+                        print(f"⚠️  内存自动分档监控失败，已暂停日志刷屏: {e}")
+
+        self._memory_tier_thread = threading.Thread(target=_loop, daemon=True, name="MemoryTierLoop")
+        self._memory_tier_thread.start()
 
     def _toggle_perf_hotkey(self):
         """Ctrl+Alt+G：跳到「性能」模式；已经在性能模式则跳回进入前那个模式
@@ -475,6 +560,7 @@ class SubtitleApp:
         # 后台加载模型（daemon：用户加载期间退出时不挡进程结束）
         import threading
         threading.Thread(target=self._load_models, daemon=True, name="ModelLoader").start()
+        self._start_memory_tier_loop()
 
         # 尾句兜底定时器（跑在Qt主线程）。0.5秒一次：除了收尾 flush，它还负责
         # 放行"被扣留等下文"的句尾（config.SENTENCE_HOLD_SEC），粒度太粗会让
@@ -512,6 +598,10 @@ class SubtitleApp:
             self._flush_timer.stop()
         if hasattr(self, '_stop_timer'):
             self._stop_timer.stop()
+        if getattr(self, '_memory_tier_stop', None) is not None:
+            self._memory_tier_stop.set()
+        if getattr(self, '_memory_tier_thread', None) is not None:
+            self._memory_tier_thread.join(timeout=1)
 
         # 让热键线程退出消息循环并注销热键（WM_QUIT = 0x0012）
         if sys.platform == "win32" and getattr(self, '_hotkey_tid', None):

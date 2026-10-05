@@ -130,6 +130,14 @@ WHISPER_BEAM_SIZE = 3  # beam search 大小。whisper_streaming作者用5，这�
 # 回退：先 `ollama pull qwen3:8b`（本地已删），再 config_local.py 写
 # OLLAMA_MODEL="qwen3:8b"。qwen3:14b 精听选项已被 9b 事实取代（也已删）。
 OLLAMA_MODEL = "qwen3.5:9b"  # Ollama 模型名称
+# 自动分档默认只在 macOS 开启：这台 M2 16GB 上 9b 单独运行就会把内存压力推到
+# warning，和 Whisper turbo fp16 同跑时需要按压力临时降翻译模型，压力恢复后再升。
+AUTO_TIER_ENABLED = None  # None=自动：仅 macOS 开启；True/False 强制
+TRANSLATION_TIERS = ["qwen3.5:9b", "qwen3.5:4b", "qwen3.5:2b"]  # 从高到低
+TRANSLATION_TIER_COST_GB = {"qwen3.5:9b": 6.2, "qwen3.5:4b": 3.2, "qwen3.5:2b": 2.4}
+AUTO_TIER_HEADROOM_GB = 1.5
+AUTO_TIER_POLL_SEC = 2.0
+AUTO_TIER_MAX = None  # None=启动时的 OLLAMA_MODEL，不自动升到比用户/安装器选择更大的模型
 # ☠️ 必须写 127.0.0.1，不要写 localhost。Ollama 只监听 IPv4 127.0.0.1:11434
 # （`netstat -ano | findstr 11434` 可验证，没有 IPv6 监听），而 Windows 上
 # getaddrinfo("localhost") 返回 ::1 在前、127.0.0.1 在后，于是每次新建连接都要
