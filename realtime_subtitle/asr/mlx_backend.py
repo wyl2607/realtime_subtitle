@@ -43,6 +43,10 @@ def load_mlx_model(repo: str) -> "MlxWhisperModel":
     except Exception:
         print(f"   本地没有 {repo}，从网络下载（首次需要几分钟）...")
         path = snapshot_download(repo)
+    # MLX 默认把释放的缓冲留在自己的缓存里复用：turbo 每轮识别后常驻 0.61GB
+    # 不还给系统。上限设 0 实测每轮只慢 ~4%（2.36→2.45s），省下的和降一档
+    # 8bit 差不多，而且不损准确度——内存压力正是 Mac 上降档的触发源
+    _set_mlx_cache_limit(mx, 0)
     # 在后台加载阶段就把权重装进来：mlx_whisper 是第一次 transcribe 才
     # 惰性加载，否则"✅已就绪"之后第一轮识别会卡十几秒（M2 实测 17 秒）。
     # ModelHolder 按路径缓存，transcribe/detect_language 传同一个 path 才命中
@@ -224,3 +228,9 @@ def _clear_mlx_cache(mx) -> None:
         clear = getattr(getattr(mx, "metal", None), "clear_cache", None)
     if clear is not None:
         clear()
+
+
+def _set_mlx_cache_limit(mx, limit) -> None:
+    setter = getattr(mx, "set_cache_limit", None) or mx.metal.set_cache_limit
+    setter(limit)
+
