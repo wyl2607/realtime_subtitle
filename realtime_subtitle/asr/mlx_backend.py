@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import SimpleNamespace
+import gc
+import time
 
 import numpy as np
 
@@ -53,6 +55,45 @@ class MlxWhisperModel:
 
     def __init__(self, repo: str):
         self.repo = repo
+        self.bits = 16
+
+    def set_bits(self, bits: int) -> float:
+        bits = int(bits)
+        if bits not in (4, 8, 16):
+            raise ValueError(f"unsupported Whisper bits: {bits}")
+        if bits == self.bits:
+            return 0.0
+
+        import mlx.core as mx
+        import mlx.nn as nn
+        from mlx_whisper.transcribe import ModelHolder, load_model
+
+        started = time.perf_counter()
+        if self.bits == 16 and bits < 16:
+            # MLX 的 nn.quantize 只会处理未量化层；fp16 向下可直接改
+            # ModelHolder 里的同一份模型，transcribe/detect_language 继续按路径命中。
+            model = ModelHolder.get_model(self.repo, mx.float16)
+            nn.quantize(model, group_size=64, bits=bits)
+            mx.eval(model.parameters())
+        else:
+            # 8bit→4bit 或升精度都不能在已量化层上再 quantize，必须从 fp16 重载。
+            # ☠️ 先放掉旧模型再载新的：降档时内存本来就紧，先载后放会让峰值
+            # 多出一整份（q8 0.87GB + fp16 1.6GB），把"警告"推成"严重"。
+            # 这里是 ASR 线程的批边界，模型此刻没有别的使用者
+            ModelHolder.model = None
+            gc.collect()
+            _clear_mlx_cache(mx)
+            new_model = load_model(self.repo, dtype=mx.float16)
+            if bits < 16:
+                nn.quantize(new_model, group_size=64, bits=bits)
+            mx.eval(new_model.parameters())
+            # 保持 model_path == self.repo：transcribe/detect_language 按路径命中缓存
+            ModelHolder.model = new_model
+            ModelHolder.model_path = self.repo
+        self.bits = bits
+        gc.collect()
+        _clear_mlx_cache(mx)
+        return time.perf_counter() - started
 
     def transcribe(
         self,
@@ -175,3 +216,11 @@ def _duration_seconds(audio) -> float:
         return len(audio) / SAMPLING_RATE
     except TypeError:
         return 0.0
+
+
+def _clear_mlx_cache(mx) -> None:
+    clear = getattr(mx, "clear_cache", None)
+    if clear is None:
+        clear = getattr(getattr(mx, "metal", None), "clear_cache", None)
+    if clear is not None:
+        clear()

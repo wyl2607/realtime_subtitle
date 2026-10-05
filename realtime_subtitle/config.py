@@ -133,11 +133,19 @@ OLLAMA_MODEL = "qwen3.5:9b"  # Ollama 模型名称
 # 自动分档默认只在 macOS 开启：这台 M2 16GB 上 9b 单独运行就会把内存压力推到
 # warning，和 Whisper turbo fp16 同跑时需要按压力临时降翻译模型，压力恢复后再升。
 AUTO_TIER_ENABLED = None  # None=自动：仅 macOS 开启；True/False 强制
-TRANSLATION_TIERS = ["qwen3.5:9b", "qwen3.5:4b", "qwen3.5:2b"]  # 从高到低
-TRANSLATION_TIER_COST_GB = {"qwen3.5:9b": 6.2, "qwen3.5:4b": 3.2, "qwen3.5:2b": 2.4}
+# (Whisper 精度位数, 翻译模型)，从高到低，按"准确度代价"排序，依据见 CLAUDE.md 第 7 节
+AUTO_TIERS = [
+    (16, "qwen3.5:9b"),
+    (16, "qwen3.5:4b"),
+    (8, "qwen3.5:4b"),
+    (8, "qwen3.5:2b"),
+    (4, "qwen3.5:2b"),
+]
+WHISPER_BITS_COST_GB = {16: 1.6, 8: 0.9, 4: 0.5}
+OLLAMA_MODEL_COST_GB = {"qwen3.5:9b": 6.2, "qwen3.5:4b": 3.2, "qwen3.5:2b": 2.4}
 AUTO_TIER_HEADROOM_GB = 1.5
 AUTO_TIER_POLL_SEC = 2.0
-AUTO_TIER_MAX = None  # None=启动时的 OLLAMA_MODEL，不自动升到比用户/安装器选择更大的模型
+AUTO_TIER_MAX = None  # None=启动时的 (Whisper 位数, OLLAMA_MODEL)，不自动升到更高档
 # ☠️ 必须写 127.0.0.1，不要写 localhost。Ollama 只监听 IPv4 127.0.0.1:11434
 # （`netstat -ano | findstr 11434` 可验证，没有 IPv6 监听），而 Windows 上
 # getaddrinfo("localhost") 返回 ::1 在前、127.0.0.1 在后，于是每次新建连接都要

@@ -97,13 +97,37 @@ from realtime_subtitle.version import version_string
 from realtime_subtitle.migrate_legacy import migrate_legacy_runtime_files
 
 
-def _translation_tiers_from_start(start_model, tiers, max_model=None):
-    if start_model not in tiers:
+def _auto_tiers_from_start(start_tier, tiers, max_tier=None, mlx_backend=True):
+    if not mlx_backend:
+        # faster-whisper 不能运行中改精度：只留 16 位的项（只降翻译）
+        usable = [tier for tier in tiers if tier[0] == 16]
+    elif start_tier[0] != 16:
+        # 预量化仓库（如 --lean 的 turbo-q4）：权重本身就是低位，原地量化是空操作、
+        # "升回 fp16"重载的也还是它——识别这一维固定，只降翻译
+        models = list(dict.fromkeys(model for _, model in tiers))
+        usable = [(start_tier[0], model) for model in models]
+    else:
+        usable = list(tiers)
+    if start_tier not in usable:
         return []
-    cap = max_model or start_model
-    if cap not in tiers:
+    cap = max_tier or start_tier
+    if cap not in usable:
         return []
-    return list(tiers)[list(tiers).index(cap):]
+    return list(usable)[usable.index(cap):]
+
+
+def _tier_name(tier):
+    bits, model = tier
+    return f"fp{bits}+{model}" if bits == 16 else f"{bits}bit+{model}"
+
+
+def _startup_whisper_bits():
+    repo = str(getattr(config, "WHISPER_MLX_REPO", "")).lower()
+    if "q4" in repo or "4bit" in repo or "4-bit" in repo:
+        return 4
+    if "q8" in repo or "8bit" in repo or "8-bit" in repo:
+        return 8
+    return 16
 
 
 class SubtitleApp:
@@ -129,6 +153,8 @@ class SubtitleApp:
         # 这台机器的"正常档位"翻译模型：必须在任何模式切换之前拍快照
         # （此时 config_local 的显存分档已经生效）。非性能模式统一切回它
         self._baseline_ollama_model = config.OLLAMA_MODEL
+        self._baseline_whisper_bits = _startup_whisper_bits()
+        self._memory_tier_by_name = {}
         self._memory_tier_stop = None
         self._memory_tier_thread = None
         self._memory_tier_error_printed = False
@@ -160,23 +186,33 @@ class SubtitleApp:
     def _build_memory_governor(self):
         if not self._auto_tier_enabled():
             return None
-        tiers = _translation_tiers_from_start(
+        from realtime_subtitle.asr.backends import selected_whisper_backend
+        mlx_backend = selected_whisper_backend() == "mlx"
+        start_tier = (
+            self._baseline_whisper_bits if mlx_backend else 16,
             self._baseline_ollama_model,
-            list(getattr(config, "TRANSLATION_TIERS", [])),
+        )
+        tiers = _auto_tiers_from_start(
+            start_tier,
+            list(getattr(config, "AUTO_TIERS", [])),
             getattr(config, "AUTO_TIER_MAX", None),
+            mlx_backend=mlx_backend,
         )
         if not tiers:
-            print(f"🧠 启动翻译模型 {self._baseline_ollama_model} 不在自动分档列表，自动降档未启用")
+            print(f"🧠 启动档位 {start_tier} 不在自动分档列表，自动降档未启用")
             return None
         gb = 1024 ** 3
+        self._memory_tier_by_name = {_tier_name(tier): tier for tier in tiers}
         costs = {
-            model: int(cost_gb * gb)
-            for model, cost_gb in getattr(config, "TRANSLATION_TIER_COST_GB", {}).items()
+            _tier_name((bits, model)): int((
+                getattr(config, "WHISPER_BITS_COST_GB", {}).get(bits, 0)
+                + getattr(config, "OLLAMA_MODEL_COST_GB", {}).get(model, 0)
+            ) * gb)
+            for bits, model in tiers
         }
-        current_tier = self._baseline_ollama_model if self._baseline_ollama_model in tiers else tiers[0]
         return TierGovernor(
-            tiers,
-            current_tier,
+            list(self._memory_tier_by_name),
+            _tier_name(start_tier if start_tier in tiers else tiers[0]),
             tier_cost_bytes=costs,
             headroom_bytes=int(getattr(config, "AUTO_TIER_HEADROOM_GB", 1.5) * gb),
         )
@@ -421,17 +457,41 @@ class SubtitleApp:
             if self.translator is not None:
                 self.translator.request_warm_model(old_model=old_model, new_model=target_model)
 
-    def _on_memory_tier(self, model):
-        old_baseline = self._baseline_ollama_model
+    def _on_memory_tier(self, name):
+        bits, model = self._memory_tier_by_name.get(name, (None, None))
+        if bits is None:
+            print(f"⚠️  未知内存档位: {name}")
+            return
+        old_bits = self._baseline_whisper_bits
+        old_model = self._baseline_ollama_model
+        self._baseline_whisper_bits = bits
         self._baseline_ollama_model = model
         if self._current_mode != "性能":
             self._switch_ollama_model(model)
-        tiers = list(getattr(config, "TRANSLATION_TIERS", []))
+        if bits != old_bits and self.translator is not None:
+            self.translator.request_whisper_bits(bits)
+        # 内存监控在模型加载完成后才启动；这里保留 None 分支不补队列，避免
+        # 加载期虚构一条从未被 TierGovernor 观测到的精度切换。
+        parts = []
+        if bits != old_bits:
+            desc = "fp16" if bits == 16 else f"{bits}bit"
+            if bits < old_bits:
+                suffix = "（准确度不变）" if bits == 8 else ""
+                parts.append(f"识别精度降到 {desc}{suffix}")
+            else:
+                parts.append(f"识别精度恢复 {desc}")
+        all_tiers = list(getattr(config, "AUTO_TIERS", []))
         try:
-            action = "降到" if tiers.index(model) > tiers.index(old_baseline) else "恢复"
+            old_index = all_tiers.index((old_bits, old_model))
+            new_index = all_tiers.index((bits, model))
         except ValueError:
-            action = "恢复"
-        msg = f"🧠 内存{'紧张' if action == '降到' else '充足'}，翻译模型{action} {model}"
+            old_index = new_index = 0
+        if model != old_model:
+            parts.append(f"翻译模型{'降到' if new_index > old_index else '恢复'} {model}")
+        if bits >= old_bits and model == old_model:
+            parts.append(f"恢复 {_tier_name((bits, model))}")
+        tight = new_index > old_index
+        msg = f"🧠 内存{'紧张' if tight else '充足'}：" + "，".join(parts)
         self.subtitle_window.show_status(msg)
         print(msg)
 

@@ -550,6 +550,8 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             # 循环不返回时 submit(task) 永远排在后面饿死）
             self._pending_lang_switch = None
             self._pending_lang_source = None  # manual / auto / rescue
+            self._pending_whisper_bits = None
+            self._whisper_bits_warned = False
             # 自动语言检测（默认关，见 config.AUTO_DETECT_LANGUAGE）：
             # 下次允许检测的时刻 + 滞回投票状态。都只在 ASR 线程里读写
             self._lang_detect_next = 0.0
@@ -1550,6 +1552,12 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         except RuntimeError:
             pass  # 程序正在退出
 
+    def request_whisper_bits(self, bits):
+        # WhisperModel/MLX 不是线程安全的，真正 set_bits 必须在 ASR 线程
+        # 批边界执行；这里和语言切换一样只登记最后一次请求。
+        with self._asr_lock:
+            self._pending_whisper_bits = int(bits)
+
     def _warm_model_worker(self, old_model=None, new_model=None):
         model = new_model if new_model is not None else config.OLLAMA_MODEL
         # ☠️ 启动预热若还在飞，必须先等它落地再卸旧模型：卸载先到、预热后到的话
@@ -1594,6 +1602,9 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         while True:
             with self._asr_lock:
                 pending_lang = self._pending_lang_switch
+                pending_bits = getattr(self, "_pending_whisper_bits", None)
+                if pending_bits is not None:
+                    self._pending_whisper_bits = None
                 pending_source = None
                 pending_target = None
                 if pending_lang is not None:
@@ -1607,9 +1618,24 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
                 items = self._audio_inbox
                 self._audio_inbox = []
                 self._asr_backlog_n = 0  # 已全部取走，积压清零
-                if not items and pending_lang is None:
+                if not items and pending_lang is None and pending_bits is None:
                     self._asr_scheduled = False
                     return
+            if pending_bits is not None:
+                model = getattr(self, "model", None)
+                set_bits = getattr(model, "set_bits", None)
+                if set_bits is None:
+                    if not getattr(self, "_whisper_bits_warned", False):
+                        self._whisper_bits_warned = True
+                        print("🧠 当前识别后端不支持运行中切换精度，忽略自动识别降档")
+                else:
+                    old_bits = getattr(model, "bits", None)
+                    try:
+                        elapsed = set_bits(pending_bits)
+                        new_bits = getattr(model, "bits", pending_bits)
+                        print(f"🧠 Whisper 精度 {old_bits}→{new_bits}bit（{elapsed:.2f}秒）")
+                    except Exception as e:
+                        print(f"⚠️  Whisper 精度切换失败: {e}")
             if pending_lang is not None:
                 switched = False
                 try:
