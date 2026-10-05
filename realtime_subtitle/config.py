@@ -210,6 +210,15 @@ CHUNK_SIZE = 4096  # 每次读取的帧数（减少处理频率）
 # 非空则按设备名子串匹配（不区分大小写），例如 "FiiO" / "Speakers" / "Headphones"。
 # 可在 config_local.py 里写，或运行中在 ⚙️ 面板改（约 5 秒内热切换）。
 LOOPBACK_DEVICE_NAME = ""
+# macOS 系统音频捕获模式：
+# "auto"：macOS 14.2+ 先尝试 Core Audio Process Tap；失败后回退 BlackHole/默认输入。
+# "tap"：只用 Process Tap，失败就不再回退到 BlackHole/默认输入；需要在系统设置的
+#        “屏幕与系统音频录制/系统音频录制”里允许终端或 Python。
+# "input"：保持旧行为，只枚举普通输入设备（BlackHole、麦克风等），完全不碰 tap。
+# 默认先用 "input"：没授权时 tap 往往不报错、只交出全零静音——"auto" 会让已经
+# 配好 BlackHole 的用户静默变成抓静音。tests/test_macos_tap.py 的真机冒烟
+# （RS_TAP_SMOKE=1，桌面会话里授权后跑）确认能录到声音之后再改成 "auto"
+MACOS_CAPTURE_MODE = "input"
 
 # ============ 流式识别配置（streaming_asr.py / audio_capture.py）============
 # local agreement 增量识别（2026-07-06 重写）：不再由能量VAD切"语音片段"，

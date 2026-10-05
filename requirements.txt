@@ -29,6 +29,7 @@ nvidia-cudnn-cu12>=9.24.0.43; sys_platform == "win32"
 # 音频处理
 pyaudiowpatch>=0.2.12.8,<1.0.0; sys_platform == "win32"     # Windows 系统音频捕获 (WASAPI Loopback)
 sounddevice>=0.5; sys_platform == "darwin"                  # macOS 输入设备捕获（BlackHole 等虚拟声卡）
+pyobjc-framework-CoreAudio>=10.0; sys_platform == "darwin"  # macOS 14.2+ Process Tap 系统音频捕获
 soxr>=1.1.0,<2.0.0              # 音频重采样（librosa太重，只用得到resample，底层就是soxr）
                                 # 0.5→1.1 是大版本跳但对本项目无感：ResampleStream
                                 # 的构造签名/resample_chunk/clear 都没变，96k→16k

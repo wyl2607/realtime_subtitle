@@ -86,6 +86,8 @@ class AudioCapture:
         # 源采样率恰好==目标时不需要重采样器，此时 None 代表"原样透传"而不是
         # "已经放掉了"，两者对 _resample() 的含义相反，用这个标志区分
         self._passthrough = False
+        self._macos_tap_handle = None
+        self._macos_tap_required = False
 
         print(f"🎤 音频捕获模块已初始化（连续流式提交）")
         print(f"   提交节奏: {config.CHUNK_SUBMIT_SECONDS}秒/块")
@@ -144,13 +146,22 @@ class AudioCapture:
     def _resolve_macos_input(p):
         """解析 macOS 上要打开的输入设备。
 
-        macOS 没有系统 loopback；P1 只读输入设备。未指定设备名时优先 BlackHole，
+        macOS 的 Process Tap 会以聚合输入设备出现；没有 tap 时优先 BlackHole，
         再回退系统默认输入，并只提示一次需要配置虚拟声卡/多输出设备。
         """
         preferred_raw = (getattr(config, "LOOPBACK_DEVICE_NAME", "") or "").strip()
         preferred = preferred_raw.lower()
+        tap_name = (getattr(AudioCapture, "_macos_tap_device_name", "") or "").strip()
         default = p.get_default_input_device_info()
         inputs = list(p.get_input_device_info_generator())
+
+        if tap_name:
+            for dev in inputs:
+                if (dev.get("name") or "") == tap_name:
+                    AudioCapture._mac_default_warned = None
+                    return dev
+            if getattr(AudioCapture, "_macos_tap_required", False):
+                raise RuntimeError(f"Process Tap 聚合设备未出现在 PortAudio 输入设备列表: {tap_name}")
 
         if preferred:
             for dev in inputs:
@@ -194,6 +205,36 @@ class AudioCapture:
             finally:
                 p.terminate()
 
+    def _prepare_macos_tap(self):
+        if sys.platform != "darwin":
+            return True
+        mode = (getattr(config, "MACOS_CAPTURE_MODE", "auto") or "auto").strip().lower()
+        AudioCapture._macos_tap_device_name = None
+        if mode == "input":
+            AudioCapture._macos_tap_required = False
+            return True
+        if mode not in {"auto", "tap"}:
+            print(f"⚠️  未知 MACOS_CAPTURE_MODE={mode!r}，按 input 旧行为处理。")
+            AudioCapture._macos_tap_required = False
+            return True
+        from realtime_subtitle.capture.macos_tap import create_system_audio_tap
+        handle = create_system_audio_tap()
+        if handle is None:
+            if mode == "tap":
+                print("❌ MACOS_CAPTURE_MODE='tap' 要求 Process Tap 可用，音频捕获未启动。")
+                return False
+            AudioCapture._macos_tap_required = False
+            return True
+        self._macos_tap_handle = handle
+        AudioCapture._macos_tap_required = mode == "tap"
+        AudioCapture._macos_tap_device_name = handle.device_name
+        # sounddevice/PortAudio 的设备表在初始化时冻结。tap 建好后、开流前刷新一次，
+        # 此时还没有任何音频流，且外层持有同一把 Pa_Initialize/Terminate 互斥锁。
+        if hasattr(pyaudio, "reinit_portaudio"):
+            with _PYAUDIO_LOCK:
+                pyaudio.reinit_portaudio()
+        return True
+
     def _probe_loop(self):
         """独立线程：每 DEVICE_CHECK_INTERVAL 秒探一次「应该抓哪个设备」。
 
@@ -229,6 +270,9 @@ class AudioCapture:
             return
 
         self.running = True
+        if not self._prepare_macos_tap():
+            self.running = False
+            return
 
         # 启动捕获线程
         self.capture_thread = Thread(
@@ -318,6 +362,11 @@ class AudioCapture:
         # "🔇 音频流已关闭"（那是 _capture_loop 退出时才打的）。
         # 所以在这里补一次释放，线程展不展开都不影响。
         self._release_resampler()
+        if self._macos_tap_handle is not None:
+            self._macos_tap_handle.destroy()
+            self._macos_tap_handle = None
+            AudioCapture._macos_tap_device_name = None
+            AudioCapture._macos_tap_required = False
 
         print("✅ 音频捕获已停止")
 

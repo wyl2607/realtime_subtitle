@@ -6,6 +6,12 @@ import sounddevice as sd
 paInt16 = "int16"
 
 
+def reinit_portaudio():
+    """Refresh PortAudio's frozen device table after creating a CoreAudio tap."""
+    sd._terminate()
+    sd._initialize()
+
+
 class _InputStream:
     def __init__(self, stream):
         self._stream = stream
