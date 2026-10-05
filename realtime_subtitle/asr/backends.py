@@ -20,9 +20,9 @@ def selected_whisper_backend() -> str:
 def create_whisper_model():
     backend = selected_whisper_backend()
     if backend == "mlx":
-        from realtime_subtitle.asr.mlx_backend import MlxWhisperModel
+        from realtime_subtitle.asr.mlx_backend import load_mlx_model
 
-        return MlxWhisperModel(config.WHISPER_MLX_REPO)
+        return load_mlx_model(config.WHISPER_MLX_REPO)
     if backend != "faster-whisper":
         raise ValueError(f"未知 Whisper 后端: {backend}")
 

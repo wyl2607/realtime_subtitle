@@ -28,6 +28,26 @@ class MlxSegment:
     avg_logprob: float = 0.0
 
 
+def load_mlx_model(repo: str) -> "MlxWhisperModel":
+    """解析本地路径并预加载权重，再包成 MlxWhisperModel。"""
+    import mlx.core as mx
+    from huggingface_hub import snapshot_download
+    from mlx_whisper.transcribe import ModelHolder
+
+    # 先只认本地缓存，和 faster-whisper 路径同理：mlx_whisper 默认每次
+    # 加载都去 HF 做 etag 检查，网络差时是十几秒超时。本地没有才下载
+    try:
+        path = snapshot_download(repo, local_files_only=True)
+    except Exception:
+        print(f"   本地没有 {repo}，从网络下载（首次需要几分钟）...")
+        path = snapshot_download(repo)
+    # 在后台加载阶段就把权重装进来：mlx_whisper 是第一次 transcribe 才
+    # 惰性加载，否则"✅已就绪"之后第一轮识别会卡十几秒（M2 实测 17 秒）。
+    # ModelHolder 按路径缓存，transcribe/detect_language 传同一个 path 才命中
+    ModelHolder.get_model(path, mx.float16)
+    return MlxWhisperModel(path)
+
+
 class MlxWhisperModel:
     """Small compatibility wrapper for the faster-whisper calls this app uses."""
 

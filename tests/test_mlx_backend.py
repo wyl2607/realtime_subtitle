@@ -178,6 +178,8 @@ def test_create_whisper_model_auto_uses_mlx_on_apple_silicon(monkeypatch):
     monkeypatch.setattr(config, "WHISPER_MLX_REPO", "mlx-repo", raising=False)
     monkeypatch.setattr(backends.sys, "platform", "darwin")
     monkeypatch.setattr(backends.platform, "machine", lambda: "arm64")
+    from realtime_subtitle.asr import mlx_backend
+    monkeypatch.setattr(mlx_backend, "load_mlx_model", lambda repo: mlx_backend.MlxWhisperModel(repo))
 
     model = backends.create_whisper_model()
 

@@ -56,17 +56,18 @@ def main():
     chunk = int(16000 * config.CHUNK_SUBMIT_SECONDS)
     blocks = [audio[i:i + chunk] for i in range(0, len(audio), chunk)]
 
-    committed, iters, sim_clock, next_block = [], [], 0.0, 0
+    committed, iters, batch_sizes, sim_clock, next_block = [], [], [], 0.0, 0
     while next_block < len(blocks):
         # 模拟时钟：识别期间"实时"到达的块全部进这一批
         arrived = max(next_block + 1, min(len(blocks), int(sim_clock / config.CHUNK_SUBMIT_SECONDS) + 1))
         for b in blocks[next_block:arrived]:
             proc.insert_audio_chunk(b)
-        next_block = arrived
+        prev_block, next_block = next_block, arrived
         t = time.time()
         done, _unstable = proc.process_iter()
         dt = time.time() - t
         iters.append(dt)
+        batch_sizes.append(arrived - prev_block)
         sim_clock = max(sim_clock, next_block * config.CHUNK_SUBMIT_SECONDS) + dt
         if done:
             committed.append(done if isinstance(done, str) else " ".join(w for *_, w in done))
@@ -76,9 +77,12 @@ def main():
 
     hyp = norm(" ".join(committed))
     ref = norm(" ".join(refs))
-    print(f"总耗时 {time.time() - t0:.1f}s（首轮含 MLX 惰性加载模型）；识别 {len(iters)} 轮，"
+    print(f"总耗时 {time.time() - t0:.1f}s（含模型加载）；识别 {len(iters)} 轮，"
           f"单轮 p50 {np.median(iters):.2f}s / max {max(iters):.2f}s；"
           f"模拟时钟 {sim_clock:.1f}s 消化 {total_s:.1f}s 音频（落后 {sim_clock - total_s:+.1f}s）")
+    worst = int(np.argmax(iters))
+    print(f"最慢一轮：第 {worst} 轮 {iters[worst]:.2f}s，该批 {batch_sizes[worst]} 块；"
+          f"各轮耗时 {[round(x, 1) for x in iters]}")
     print(f"流式 WER: {jiwer.wer(ref, hyp):.4f}")
     print("REF:", ref[:300])
     print("HYP:", hyp[:300])
