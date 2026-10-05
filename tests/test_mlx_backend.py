@@ -80,6 +80,8 @@ def test_beam_size_is_accepted_and_ignored(monkeypatch):
 
 
 def test_vad_maps_timestamps_back_to_original_axis(monkeypatch):
+    import pytest
+    pytest.importorskip("faster_whisper")  # CI 只装轻量依赖；VAD 复用 faster_whisper.vad
     from realtime_subtitle.asr.mlx_backend import MlxWhisperModel
 
     calls = []
@@ -104,6 +106,8 @@ def test_vad_maps_timestamps_back_to_original_axis(monkeypatch):
 
 
 def test_all_silence_returns_empty_segments_without_calling_mlx(monkeypatch):
+    import pytest
+    pytest.importorskip("faster_whisper")  # CI 只装轻量依赖；VAD 复用 faster_whisper.vad
     from realtime_subtitle.asr.mlx_backend import MlxWhisperModel
 
     calls = []
