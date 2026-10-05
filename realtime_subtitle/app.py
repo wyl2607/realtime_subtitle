@@ -249,6 +249,10 @@ class SubtitleApp:
             print("✅ 所有组件初始化完成")
             self.running = True
             self.audio_capture.start()
+            # 模型加载完才开始盯内存：加载 Whisper + 预热翻译模型时压力本来就会
+            # 冲高，算进去的话一启动就被降档（M2 e2e 实测：启动即 4b→2b，之后
+            # 要 5 分钟以上才升回，这段时间中文明显更差）
+            self._start_memory_tier_loop()
             self._print_usage()
             if sys.platform != "darwin":
                 self._setup_hotkey()
@@ -281,7 +285,7 @@ class SubtitleApp:
         # 版本号读 version.py（单一真相源）——以前这里写死 "v2.0"，
         # 和 git tag 对不上，用户报 bug 只能贴 commit hash
         print(" " * 15 + f"🎬 实时字幕软件 {version_string()}")
-        print(" " * 12 + "基于 Faster-Whisper")
+        print(" " * 12 + "基于 Whisper + Ollama")
         print("=" * 60)
         print()
     
@@ -581,7 +585,6 @@ class SubtitleApp:
         # 后台加载模型（daemon：用户加载期间退出时不挡进程结束）
         import threading
         threading.Thread(target=self._load_models, daemon=True, name="ModelLoader").start()
-        self._start_memory_tier_loop()
 
         # 尾句兜底定时器（跑在Qt主线程）。0.5秒一次：除了收尾 flush，它还负责
         # 放行"被扣留等下文"的句尾（config.SENTENCE_HOLD_SEC），粒度太粗会让
@@ -685,11 +688,11 @@ class SubtitleApp:
         print("   6. 点击 ❌ 按钮可退出程序")
         print("   7. 或按 Ctrl+C 中断程序")
         print("\n⚙️  当前配置：")
-        print(f"   - Whisper模型: {config.WHISPER_MODEL}")
+        from realtime_subtitle.asr.backends import describe_whisper_backend
+        print(f"   - 识别: {describe_whisper_backend()}")
         print(f"   - 处理模式: local agreement 增量识别 (每{config.CHUNK_SUBMIT_SECONDS}秒一块, 缓冲上限{config.BUFFER_TRIM_SEC:.0f}秒)")
         print(f"   - 收尾静音: {config.IDLE_FLUSH_SEC}秒")
         print(f"   - 翻译: Qwen + Whisper (Ollama {config.OLLAMA_MODEL})")
-        print(f"   - 设备: {config.WHISPER_DEVICE.upper()}")
         print(f"   - 源语言: {config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)}")
         from realtime_subtitle.translate.translator_queue import log_language_startup
         log_language_startup()

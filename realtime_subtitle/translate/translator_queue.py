@@ -496,9 +496,12 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         # 抛出的异常由 app._load_models 接住，报错会持久显示在悬浮窗上
         _assert_local_ollama(config.OLLAMA_BASE_URL)
 
-        print("🔄 正在加载 Faster-Whisper 模型...")
-        print(f"   模型: {config.WHISPER_MODEL}")
-        print(f"   计算类型: {config.WHISPER_COMPUTE_TYPE}")
+        from realtime_subtitle.asr.backends import describe_whisper_backend, selected_whisper_backend
+        print("🔄 正在加载 Whisper 模型...")
+        print(f"   {describe_whisper_backend()}")
+        # "GPU繁忙"提示阈值（块数）。CUDA 上单次识别 ~0.26s，攒 6 块就是真落后；
+        # Mac(MLX) 单次 ~2.4s，每轮本来就攒 ~5 块，6 块是稳态——按 6 报会刷屏
+        self._backlog_warn_at = (12, 24) if selected_whisper_backend() == "mlx" else (6, 12)
 
         start_time = time.time()
 
@@ -703,7 +706,6 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             elapsed = time.time() - start_time
             print(f"✅ Whisper 模型加载完成！({elapsed:.1f}秒)")
             print(f"✅ local agreement 增量识别已启用（缓冲上限 {config.BUFFER_TRIM_SEC:.0f}秒）")
-            print(f"   设备: {config.WHISPER_DEVICE.upper()}")
 
         except Exception as e:
             print(f"❌ 模型加载失败: {e}")
@@ -1504,7 +1506,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             n = len(self._audio_inbox)
             self._asr_backlog_n = n  # 给翻译线程看的无锁快照
             if self._asr_scheduled:
-                if n in (6, 12):  # GPU被抢时的提示，不丢数据
+                if n in getattr(self, "_backlog_warn_at", (6, 12)):  # GPU被抢时的提示，不丢数据
                     print(f"⚠️  GPU繁忙，字幕滞后约{n * config.CHUNK_SUBMIT_SECONDS:.0f}秒（攒了{n}块待识别，会自动追上）")
                 return
             self._asr_scheduled = True

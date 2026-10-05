@@ -17,6 +17,14 @@ def selected_whisper_backend() -> str:
     return "faster-whisper"
 
 
+def describe_whisper_backend() -> str:
+    """启动日志用：一眼看出实际走的是哪条识别路径（排障时 AI 读的就是这行）。"""
+    if selected_whisper_backend() == "mlx":
+        return f"MLX（Apple GPU）· {config.WHISPER_MLX_REPO}"
+    return (f"faster-whisper · {config.WHISPER_DEVICE.upper()} · "
+            f"{config.WHISPER_COMPUTE_TYPE} · {config.WHISPER_MODEL}")
+
+
 def create_whisper_model():
     backend = selected_whisper_backend()
     if backend == "mlx":

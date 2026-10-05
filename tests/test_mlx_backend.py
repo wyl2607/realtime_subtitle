@@ -222,3 +222,14 @@ def test_create_whisper_model_explicit_backend_wins(monkeypatch):
     monkeypatch.setattr(translator_queue, "_ensure_ml_deps", lambda: FakeWhisper)
 
     assert isinstance(backends.create_whisper_model(), FakeWhisper)
+
+
+def test_describe_backend_names_the_real_path(monkeypatch):
+    """启动日志要写实际走的识别路径：Mac 上以前照抄 "设备: CUDA"，排障会被带偏。"""
+    from realtime_subtitle.asr import backends
+
+    monkeypatch.setattr(config, "WHISPER_BACKEND", "mlx", raising=False)
+    monkeypatch.setattr(config, "WHISPER_MLX_REPO", "mlx-community/whisper-large-v3-turbo", raising=False)
+    assert backends.describe_whisper_backend() == "MLX（Apple GPU）· mlx-community/whisper-large-v3-turbo"
+    monkeypatch.setattr(config, "WHISPER_BACKEND", "faster-whisper", raising=False)
+    assert "CUDA" in backends.describe_whisper_backend().upper() or "CPU" in backends.describe_whisper_backend().upper()
