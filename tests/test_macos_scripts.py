@@ -1,6 +1,7 @@
 import os
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -8,7 +9,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MACOS = REPO_ROOT / "scripts" / "macos"
 
-pytestmark = pytest.mark.skipif(os.uname().sysname != "Darwin", reason="macOS 脚本只在 darwin 上测试")
+pytestmark = pytest.mark.skipif(sys.platform != "darwin", reason="macOS 脚本只在 darwin 上测试")
 
 
 def _write_exe(path, body):
