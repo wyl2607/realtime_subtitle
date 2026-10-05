@@ -95,6 +95,11 @@ class MlxWhisperModel:
 
 
 def _apply_vad(audio, vad_filter: bool):
+    if isinstance(audio, str):
+        # 离线字幕传的是音频文件路径（faster-whisper 也接受路径）
+        from faster_whisper.audio import decode_audio
+
+        audio = decode_audio(audio, sampling_rate=SAMPLING_RATE)
     audio = np.asarray(audio, dtype=np.float32)
     if not vad_filter:
         return audio, None
