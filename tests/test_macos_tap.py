@@ -46,9 +46,12 @@ class _FakeCoreAudio:
             raise macos_tap.CoreAudioError("uid failed")
         return "tap-uid"
 
-    def create_aggregate_device(self, name, uid, tap_uid):
+    def default_output_uid(self):
+        return "BuiltInSpeakerDevice"
+
+    def create_aggregate_device(self, name, uid, tap_uid, main_uid):
         self.calls.append(("create_aggregate", name, tap_uid))
-        self.aggregate_desc = {"name": name, "uid": uid, "tap_uid": tap_uid}
+        self.aggregate_desc = {"name": name, "uid": uid, "tap_uid": tap_uid, "main_uid": main_uid}
         if self.fail == "aggregate":
             raise macos_tap.CoreAudioError("aggregate failed")
         return 22
@@ -110,6 +113,7 @@ def test_success_creates_tap_then_public_aggregate():
     desc = fake.aggregate_desc
     assert desc["name"] == "Tap Device"
     assert desc["tap_uid"] == "tap-uid"
+    assert desc["main_uid"] == "BuiltInSpeakerDevice"
 
 
 def test_destroy_destroys_aggregate_then_tap():
@@ -205,14 +209,20 @@ def test_process_tap_smoke_records_system_audio():
     import numpy as np
     import sounddevice as sd
 
+    vol = subprocess.run(["osascript", "-e", "get volume settings"], capture_output=True, text=True).stdout
+    if "output muted:true" in vol or "output volume:0," in vol:
+        pytest.skip(f"系统输出是静音（{vol.strip()}）：tap 抓的是实际发声，静音下必然全零，判不了授权")
+
     handle = macos_tap.create_system_audio_tap()
     assert handle is not None
     try:
         sd._terminate()
         sd._initialize()
-        dev = next(i for i, d in enumerate(sd.query_devices()) if d.get("name") == handle.device_name)
+        devs = sd.query_devices()
+        dev = next(i for i, d in enumerate(devs) if d.get("name") == handle.device_name)
+        sr = int(devs[dev]["default_samplerate"])
         player = subprocess.Popen(["afplay", "/System/Library/Sounds/Glass.aiff"])
-        rec = sd.rec(int(48000 * 2), samplerate=48000, channels=2, device=dev, dtype="float32")
+        rec = sd.rec(sr * 2, samplerate=sr, channels=devs[dev]["max_input_channels"], device=dev, dtype="float32")
         sd.wait()
         player.wait()
         peak = float(np.abs(rec).max())
@@ -233,11 +243,16 @@ def test_real_backend_builds_aggregate_dict_with_sdk_keys():
         kAudioAggregateDeviceNameKey=b"name", kAudioAggregateDeviceUIDKey=b"uid",
         kAudioAggregateDeviceIsPrivateKey=b"private", kAudioAggregateDeviceTapListKey=b"taps",
         kAudioAggregateDeviceTapAutoStartKey=b"tapautostart", kAudioSubTapUIDKey=b"uid",
+        kAudioAggregateDeviceIsStackedKey=b"stacked", kAudioAggregateDeviceMainSubDeviceKey=b"master",
+        kAudioAggregateDeviceSubDeviceListKey=b"subdevices", kAudioSubDeviceUIDKey=b"uid",
+        kAudioSubTapDriftCompensationKey=b"drift",
         AudioHardwareCreateAggregateDevice=lambda d, _: (seen.update(d) or (0, 42)),
     )
     backend = macos_tap._CoreAudio.__new__(macos_tap._CoreAudio)
     backend._ca = ca
 
-    assert backend.create_aggregate_device("Tap", "u-1", "tap-uid") == 42
-    assert seen == {"name": "Tap", "uid": "u-1", "private": False,
-                    "taps": [{"uid": "tap-uid"}], "tapautostart": True}
+    assert backend.create_aggregate_device("Tap", "u-1", "tap-uid", "Spk") == 42
+    # 私有 tap 只能挂进私有聚合设备（非私有的输入流是 0）；要主子设备当时钟 + 漂移补偿
+    assert seen == {"name": "Tap", "uid": "u-1", "private": True, "stacked": False,
+                    "master": "Spk", "subdevices": [{"uid": "Spk"}],
+                    "taps": [{"uid": "tap-uid", "drift": True}], "tapautostart": True}

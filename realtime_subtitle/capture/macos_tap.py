@@ -62,9 +62,12 @@ def create_system_audio_tap(name: str = DEFAULT_TAP_DEVICE_NAME, _coreaudio=None
         tap_id = coreaudio.create_process_tap(desc)
         tap_uid = coreaudio.get_tap_uid(tap_id)
         aggregate_uid = f"com.realtimesubtitle.tap.{uuid.uuid4()}"
-        # 必须非私有：私有 aggregate 只对创建进程可见，PortAudio/sounddevice
-        # 枚举不到，也就无法复用现有输入采集路径。
-        aggregate_id = coreaudio.create_aggregate_device(name, aggregate_uid, tap_uid)
+        # 真机试出来的唯一可用配方（M2/macOS 27，四种组合逐个建、看输入流数）：
+        # 私有 tap 只能挂进**私有**聚合设备（非私有的建得出来但输入流是 0）；
+        # 还要以默认输出设备为主子设备当时钟、开漂移补偿。私有设备对本进程
+        # 可见——PortAudio 就跑在本进程里，"私有会让 PortAudio 枚举不到"是错的
+        aggregate_id = coreaudio.create_aggregate_device(
+            name, aggregate_uid, tap_uid, coreaudio.default_output_uid())
         handle = TapHandle(tap_id, aggregate_id, name, coreaudio)
         # 异常退出时尽量收尾；残留的聚合设备会一直挂在用户的“音频 MIDI 设置”里。
         atexit.register(handle.destroy)
@@ -152,19 +155,30 @@ class _CoreAudio:
     def destroy_process_tap(self, tap_id: int) -> None:
         self._check(self._ca.AudioHardwareDestroyProcessTap(tap_id), "AudioHardwareDestroyProcessTap")
 
-    def create_aggregate_device(self, name: str, uid: str, tap_uid: str) -> int:
+    def create_aggregate_device(self, name: str, uid: str, tap_uid: str, main_uid: str) -> int:
         ca = self._ca
         key = lambda k: k.decode() if isinstance(k, bytes) else k  # noqa: E731  pyobjc 给的是 bytes
         desc = {
             key(ca.kAudioAggregateDeviceNameKey): name,
             key(ca.kAudioAggregateDeviceUIDKey): uid,
-            key(ca.kAudioAggregateDeviceIsPrivateKey): False,
-            key(ca.kAudioAggregateDeviceTapListKey): [{key(ca.kAudioSubTapUIDKey): tap_uid}],
+            key(ca.kAudioAggregateDeviceIsPrivateKey): True,
+            key(ca.kAudioAggregateDeviceIsStackedKey): False,
+            key(ca.kAudioAggregateDeviceMainSubDeviceKey): main_uid,
+            key(ca.kAudioAggregateDeviceSubDeviceListKey): [{key(ca.kAudioSubDeviceUIDKey): main_uid}],
+            key(ca.kAudioAggregateDeviceTapListKey): [{
+                key(ca.kAudioSubTapUIDKey): tap_uid,
+                key(ca.kAudioSubTapDriftCompensationKey): True,
+            }],
             key(ca.kAudioAggregateDeviceTapAutoStartKey): True,
         }
         status, aggregate_id = ca.AudioHardwareCreateAggregateDevice(desc, None)
         self._check(status, "AudioHardwareCreateAggregateDevice")
         return int(aggregate_id)
+
+    def default_output_uid(self) -> str:
+        ca = self._ca
+        dev = struct.unpack("I", self._get(ca.kAudioObjectSystemObject, ca.kAudioHardwarePropertyDefaultOutputDevice))[0]
+        return self._get_cfstring(dev, ca.kAudioDevicePropertyDeviceUID)
 
     def destroy_aggregate_device(self, aggregate_id: int) -> None:
         self._check(self._ca.AudioHardwareDestroyAggregateDevice(aggregate_id),
