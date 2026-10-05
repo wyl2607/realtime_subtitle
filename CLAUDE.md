@@ -1176,10 +1176,18 @@ macOS 避坑（每一条都是这次迁移真实踩过的）：
     / `hw.memsize`，于是代理会"好心"加 `memory_pressure` 空闲百分比映射、
     `system_profiler` 之类的回退——真机上 sysctl 都正常，那些回退是凭空编的阈值，
     已删，别加回来。
-11. **内存压力降档只动翻译模型，且只往下降到 `AUTO_TIER_MAX`（默认＝启动时的
-    模型）以内**（`resources/memory.py::TierGovernor`）：警告持续才降、严重立即降，
-    升档要压力正常持续 5 分钟 + 可用内存够 + 冷却——升降不对称就是为了防第 4 节
-    第 25 条那种震荡。Whisper 不在运行中换档（换模型要重载 2GB，得不偿失）。
+11. **内存降档是"识别精度 × 翻译模型"组合阶梯**（`config.AUTO_TIERS`，
+    `resources/memory.py::TierGovernor` + `app.py::_on_memory_tier`）：
+    (fp16,4b) → (8bit,4b) → (8bit,2b) → (4bit,2b)，按**准确度代价**排序。
+    ~~"先降翻译模型、Whisper 不在运行中换档"~~ 已被 e2e 推翻：日常负载的 M2 16GB
+    上 fp16+4b 稳态压力 2，4b→2b 只省 0.8GB 压力不解、中文明显错译；而已加载的
+    turbo 原地 `nn.quantize` 到 8bit 只要 0.19s、1.62→0.87GB、WER 不变。
+    重载（8→4、升精度）**先放旧模型再载**——降档时先载后放会把警告推成严重。
+    切换只在 ASR 线程批边界做（`request_whisper_bits` 只登记）。预量化仓库
+    （`--lean` 的 turbo-q4）识别维固定只降翻译。只往下降到 `AUTO_TIER_MAX`
+    （默认＝启动档）以内；警告持续才降、严重立即降，升档要压力正常 5 分钟 +
+    可用内存够 + 冷却——升降不对称防第 4 节第 25 条那种震荡。
+    num_ctx 不是杠杆（4096→2048 只省 0.07GB，qwen3.5 KV 很小）。
 12. **测量 Mac 性能前**先 `snapshot_download` 全部模型、`HF_HUB_OFFLINE=1
     caffeinate -i` 跑，期间别跑别的重活。第一轮 P0 就是被 Wi-Fi 抖动 + 系统睡眠
     污染的（单次识别测出 2631 秒）。
