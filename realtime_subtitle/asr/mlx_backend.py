@@ -128,6 +128,12 @@ class MlxWhisperModel:
             initial_prompt=initial_prompt,
             word_timestamps=word_timestamps,
             condition_on_previous_text=condition_on_previous_text,
+            # 温度回退最多到 0.2：默认 0.0→1.0 每档都把整段重解一遍，命中时单轮
+            # 4~6 倍耗时（M4 实测 11.7s，正是"偶发卡顿"）。流式每轮本来就重识别
+            # 整个缓冲、只提交两轮一致的前缀，不靠回退纠错。M4 上 187 轮对照：
+            # WER 三者相同；上限 0.2 最慢 6.6s、p99 不变；完全不回退 p99 反而
+            # 变差（重复解码一路生成到上限）
+            temperature=(0.0, 0.2),
             verbose=None,
         )
         segments = [_segment_from_dict(s, ts_map) for s in result.get("segments", [])]

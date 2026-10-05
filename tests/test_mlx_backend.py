@@ -233,3 +233,13 @@ def test_describe_backend_names_the_real_path(monkeypatch):
     assert backends.describe_whisper_backend() == "MLX（Apple GPU）· mlx-community/whisper-large-v3-turbo"
     monkeypatch.setattr(config, "WHISPER_BACKEND", "faster-whisper", raising=False)
     assert "CUDA" in backends.describe_whisper_backend().upper() or "CPU" in backends.describe_whisper_backend().upper()
+
+
+def test_temperature_fallback_capped(monkeypatch):
+    """默认回退一路到 1.0，命中时单轮 4~6 倍耗时；流式下上限 0.2 准确度不变。"""
+    from realtime_subtitle.asr.mlx_backend import MlxWhisperModel
+
+    calls = []
+    _fake_mlx(monkeypatch, calls)
+    list(MlxWhisperModel("repo").transcribe(np.ones(16000, dtype=np.float32), vad_filter=False)[0])
+    assert calls[0][1]["temperature"] == (0.0, 0.2)
