@@ -90,6 +90,55 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
 
 **交给 AI 装**：克隆本仓库并按 [CLAUDE.md](CLAUDE.md) 的硬件分档与避坑清单操作。
 
+## macOS（Apple Silicon）
+
+macOS 版**仅支持 Apple Silicon（M1 及以后）**，Intel Mac 不支持。识别走 MLX（Apple GPU），不用 CUDA；翻译仍由本地 Ollama 完成。音频与文本都在本机处理，不上传。
+
+前置依赖：
+
+```bash
+brew install uv ollama
+```
+
+安装：
+
+```bash
+git clone https://github.com/wyl2607/realtime_subtitle.git
+cd realtime_subtitle
+bash scripts/macos/install.sh
+# 中国大陆网络：bash scripts/macos/install.sh --mirror
+# 硬盘紧张：bash scripts/macos/install.sh --lean
+```
+
+`--lean` 会把 Whisper 换成 4bit 量化版，准确度略降（德语词错率 4.05% → 4.84%），节省约 1.1GB。安装脚本按内存自动选档：
+
+| 内存 | Whisper | 翻译模型 |
+|---|---|---|
+| <12GB | turbo-q4 | qwen3.5:2b |
+| 12–31GB | turbo | qwen3.5:4b |
+| ≥32GB | turbo | qwen3.5:9b |
+
+机器相关配置写入 `config_local.py`，不要改 `config.py`；这和 Windows 是同一机制。运行中如果内存紧张，程序会按准确度代价从小到大自动降档：先把识别从 fp16 降到 8bit（准确度不变，刷新约慢 1 秒），仍紧张再把翻译模型降一档（如 4b → 2b），最后才把识别降到 4bit；压力长期正常后再逐级升回，但不会超过安装时选的档位。
+
+macOS 没有系统内录。要抓系统声音：
+
+```bash
+brew install blackhole-2ch
+```
+
+然后打开「音频 MIDI 设置」创建「多输出设备」，同时勾选扬声器和 BlackHole 2ch，并把系统输出切到这个多输出设备。不安装 BlackHole 时，程序会退回默认麦克风并提示；⚙️ 面板里的「设备名包含」可以指定输入设备。
+
+启动 / 停止：
+
+```bash
+bash scripts/macos/start.sh
+bash scripts/macos/stop.sh
+```
+
+日志仍写到 `subtitle.log` / `subtitle.err.log`。快捷键和 Windows 相同：`Ctrl+Alt+P/L/M/G/C`；在 Mac 上按物理 **Control + Option** 键。
+
+已知差异：Mac 上字幕刷新节奏约 2–3 秒一次（M2 实测识别单次约 2.4 秒），比 NVIDIA 显卡慢；翻译单句 4b 约 4 秒、2b 约 1.6 秒。预计硬盘占用：Python 环境约 1.5GB + Whisper 1.6GB（`--lean` 为 0.5GB）+ 翻译模型 2.7–6.6GB。
+
 ## 更新与卸载
 
 | 动作 | 方式 |
