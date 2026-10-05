@@ -92,6 +92,55 @@ Beim ersten Start wird das Whisper-Modell geladen (~1,6 GB).
 
 **KI-gestützte Installation:** Agent anweisen, dieses Repo zu klonen und [CLAUDE.md](CLAUDE.md) (Hardware-Stufen, Fallstricke) zu folgen.
 
+## macOS (Apple Silicon)
+
+Die macOS-Version unterstützt **nur Apple Silicon (M1 und neuer)**. Intel-Macs werden nicht unterstützt. Die Erkennung nutzt MLX auf der Apple-GPU, kein CUDA; die Übersetzung läuft weiterhin lokal über Ollama. Audio und Text bleiben auf dem Rechner.
+
+Voraussetzungen:
+
+```bash
+brew install uv ollama
+```
+
+Installation:
+
+```bash
+git clone https://github.com/wyl2607/realtime_subtitle.git
+cd realtime_subtitle
+bash scripts/macos/install.sh
+# Spiegel für Festlandchina: bash scripts/macos/install.sh --mirror
+# Wenig Speicherplatz: bash scripts/macos/install.sh --lean
+```
+
+`--lean` nutzt die 4-Bit-quantisierte Whisper-Version. Die Genauigkeit sinkt leicht (deutsche WER 4,05% → 4,84%), spart aber etwa 1,1 GB. Das Installationsskript wählt nach Arbeitsspeicher:
+
+| RAM | Whisper | Übersetzungsmodell |
+|---|---|---|
+| <12 GB | turbo-q4 | qwen3.5:2b |
+| 12–31 GB | turbo | qwen3.5:4b |
+| ≥32 GB | turbo | qwen3.5:9b |
+
+Rechnerspezifische Einstellungen landen in `config_local.py`; `config.py` nicht ändern. Das ist derselbe Mechanismus wie unter Windows. Wenn der Arbeitsspeicher während des Betriebs knapp wird, stuft das Programm nach Genauigkeitskosten herunter: zuerst die Spracherkennung von fp16 auf 8 Bit (gleiche Genauigkeit, pro Aktualisierung etwa 1 s langsamer), dann das Übersetzungsmodell um eine Stufe (z. B. 4b → 2b) und erst zuletzt die Erkennung auf 4 Bit. Bei länger normalem Druck geht es stufenweise zurück, aber nie über die bei der Installation gewählte Stufe hinaus.
+
+macOS hat keine eingebaute Systemton-Aufnahme. Für Systemton:
+
+```bash
+brew install blackhole-2ch
+```
+
+Danach in Audio-MIDI-Setup ein Multi-Output-Gerät erstellen, Lautsprecher und BlackHole 2ch anhaken und die Systemausgabe darauf umstellen. Ohne BlackHole fällt das Programm auf das Standardmikrofon zurück und zeigt einen Hinweis. Im ⚙️-Panel kann "device name contains" ein Eingabegerät auswählen.
+
+Start / Stopp:
+
+```bash
+bash scripts/macos/start.sh
+bash scripts/macos/stop.sh
+```
+
+Logs: `subtitle.log` / `subtitle.err.log`. Die Hotkeys sind wie unter Windows: `Ctrl+Alt+P/L/M/G/C`; auf dem Mac sind das die physischen Tasten **Control + Option**.
+
+Bekannte Unterschiede: Auf dem Mac aktualisieren Untertitel etwa alle 2–3 Sekunden (M2-Messung: Erkennung pro Lauf ca. 2,4 Sekunden), langsamer als mit NVIDIA-GPU. Eine einzelne Übersetzung dauert mit 4b ca. 4 Sekunden, mit 2b ca. 1,6 Sekunden. Erwarteter Speicherbedarf: Python-Umgebung ca. 1,5 GB + Whisper 1,6 GB (`--lean`: 0,5 GB) + Übersetzungsmodell 2,7–6,6 GB.
+
 ## Update & Deinstallation
 
 | Aktion | Befehl |
