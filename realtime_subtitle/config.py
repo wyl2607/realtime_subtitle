@@ -7,6 +7,10 @@
 # large-v3-turbo: large-v3的加速蒸馏版，德语准确率明显好于medium，
 # 速度与medium相当，int8下显存占用差不多（~2GB）
 WHISPER_MODEL = "large-v3-turbo"  # tiny, base, small, medium, large-v3, large-v3-turbo
+# auto：Apple Silicon 上默认走 MLX，用 Apple GPU；其它平台保持 faster-whisper。
+# faster-whisper 在 Mac 上只能走 CPU，实时链路会被拖慢。
+WHISPER_BACKEND = "auto"  # auto, mlx, faster-whisper
+WHISPER_MLX_REPO = "mlx-community/whisper-large-v3-turbo"
 WHISPER_DEVICE = "cuda"  # cuda 或 cpu
 WHISPER_COMPUTE_TYPE = "float16"  # float16, int8, int8_float16
 # 源语言（Whisper语言代码）。运行中可用 Ctrl+Alt+L 在 LANGUAGE_PAIRS 里循环切换，

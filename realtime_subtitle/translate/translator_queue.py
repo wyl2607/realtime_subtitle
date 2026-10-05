@@ -511,29 +511,10 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         # 选的），并行加载不会推高稳态峰值，小显存档也不用禁用并行
         _spawn_startup_warm()
 
-        WhisperModel = _ensure_ml_deps()
-
         try:
-            # 先只认本地缓存：默认路径每次启动都去 HuggingFace 做一轮
-            # etag 检查（实测热缓存下多花 1.4 秒，网络差时是十几秒超时）。
-            # 只有本地没有模型（首次运行）才回落到网络下载
-            try:
-                self.model = WhisperModel(
-                    config.WHISPER_MODEL,
-                    device=config.WHISPER_DEVICE,
-                    compute_type=config.WHISPER_COMPUTE_TYPE,
-                    local_files_only=True,
-                )
-            except Exception as e:
-                # 不只是"没缓存"会走到这（CUDA错/缓存损坏也会），把真实原因
-                # 带上——否则驱动问题会被误报成"在下载"，排障方向全错
-                print(f"   本地缓存不可用({e.__class__.__name__}: {e})，"
-                      f"尝试从网络下载模型（首次需要几分钟）...")
-                self.model = WhisperModel(
-                    config.WHISPER_MODEL,
-                    device=config.WHISPER_DEVICE,
-                    compute_type=config.WHISPER_COMPUTE_TYPE,
-                )
+            from realtime_subtitle.asr.backends import create_whisper_model
+
+            self.model = create_whisper_model()
             self.processor = OnlineASRProcessor(self.model)
 
             # committed 但还没凑成完整句子的德语残句
