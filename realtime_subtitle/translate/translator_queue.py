@@ -496,9 +496,12 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         # 抛出的异常由 app._load_models 接住，报错会持久显示在悬浮窗上
         _assert_local_ollama(config.OLLAMA_BASE_URL)
 
-        print("🔄 正在加载 Faster-Whisper 模型...")
-        print(f"   模型: {config.WHISPER_MODEL}")
-        print(f"   计算类型: {config.WHISPER_COMPUTE_TYPE}")
+        from realtime_subtitle.asr.backends import describe_whisper_backend, selected_whisper_backend
+        print("🔄 正在加载 Whisper 模型...")
+        print(f"   {describe_whisper_backend()}")
+        # "GPU繁忙"提示阈值（块数）。CUDA 上单次识别 ~0.26s，攒 6 块就是真落后；
+        # Mac(MLX) 单次 ~2.4s，每轮本来就攒 ~5 块，6 块是稳态——按 6 报会刷屏
+        self._backlog_warn_at = (12, 24) if selected_whisper_backend() == "mlx" else (6, 12)
 
         start_time = time.time()
 
@@ -511,29 +514,10 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         # 选的），并行加载不会推高稳态峰值，小显存档也不用禁用并行
         _spawn_startup_warm()
 
-        WhisperModel = _ensure_ml_deps()
-
         try:
-            # 先只认本地缓存：默认路径每次启动都去 HuggingFace 做一轮
-            # etag 检查（实测热缓存下多花 1.4 秒，网络差时是十几秒超时）。
-            # 只有本地没有模型（首次运行）才回落到网络下载
-            try:
-                self.model = WhisperModel(
-                    config.WHISPER_MODEL,
-                    device=config.WHISPER_DEVICE,
-                    compute_type=config.WHISPER_COMPUTE_TYPE,
-                    local_files_only=True,
-                )
-            except Exception as e:
-                # 不只是"没缓存"会走到这（CUDA错/缓存损坏也会），把真实原因
-                # 带上——否则驱动问题会被误报成"在下载"，排障方向全错
-                print(f"   本地缓存不可用({e.__class__.__name__}: {e})，"
-                      f"尝试从网络下载模型（首次需要几分钟）...")
-                self.model = WhisperModel(
-                    config.WHISPER_MODEL,
-                    device=config.WHISPER_DEVICE,
-                    compute_type=config.WHISPER_COMPUTE_TYPE,
-                )
+            from realtime_subtitle.asr.backends import create_whisper_model
+
+            self.model = create_whisper_model()
             self.processor = OnlineASRProcessor(self.model)
 
             # committed 但还没凑成完整句子的德语残句
@@ -566,6 +550,8 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             # 循环不返回时 submit(task) 永远排在后面饿死）
             self._pending_lang_switch = None
             self._pending_lang_source = None  # manual / auto / rescue
+            self._pending_whisper_bits = None
+            self._whisper_bits_warned = False
             # 自动语言检测（默认关，见 config.AUTO_DETECT_LANGUAGE）：
             # 下次允许检测的时刻 + 滞回投票状态。都只在 ASR 线程里读写
             self._lang_detect_next = 0.0
@@ -722,7 +708,6 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             elapsed = time.time() - start_time
             print(f"✅ Whisper 模型加载完成！({elapsed:.1f}秒)")
             print(f"✅ local agreement 增量识别已启用（缓冲上限 {config.BUFFER_TRIM_SEC:.0f}秒）")
-            print(f"   设备: {config.WHISPER_DEVICE.upper()}")
 
         except Exception as e:
             print(f"❌ 模型加载失败: {e}")
@@ -1523,7 +1508,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             n = len(self._audio_inbox)
             self._asr_backlog_n = n  # 给翻译线程看的无锁快照
             if self._asr_scheduled:
-                if n in (6, 12):  # GPU被抢时的提示，不丢数据
+                if n in getattr(self, "_backlog_warn_at", (6, 12)):  # GPU被抢时的提示，不丢数据
                     print(f"⚠️  GPU繁忙，字幕滞后约{n * config.CHUNK_SUBMIT_SECONDS:.0f}秒（攒了{n}块待识别，会自动追上）")
                 return
             self._asr_scheduled = True
@@ -1566,6 +1551,12 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             self._tx_executor.submit(self._warm_model_worker, old_model, new_model)
         except RuntimeError:
             pass  # 程序正在退出
+
+    def request_whisper_bits(self, bits):
+        # WhisperModel/MLX 不是线程安全的，真正 set_bits 必须在 ASR 线程
+        # 批边界执行；这里和语言切换一样只登记最后一次请求。
+        with self._asr_lock:
+            self._pending_whisper_bits = int(bits)
 
     def _warm_model_worker(self, old_model=None, new_model=None):
         model = new_model if new_model is not None else config.OLLAMA_MODEL
@@ -1611,6 +1602,9 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         while True:
             with self._asr_lock:
                 pending_lang = self._pending_lang_switch
+                pending_bits = getattr(self, "_pending_whisper_bits", None)
+                if pending_bits is not None:
+                    self._pending_whisper_bits = None
                 pending_source = None
                 pending_target = None
                 if pending_lang is not None:
@@ -1624,9 +1618,24 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
                 items = self._audio_inbox
                 self._audio_inbox = []
                 self._asr_backlog_n = 0  # 已全部取走，积压清零
-                if not items and pending_lang is None:
+                if not items and pending_lang is None and pending_bits is None:
                     self._asr_scheduled = False
                     return
+            if pending_bits is not None:
+                model = getattr(self, "model", None)
+                set_bits = getattr(model, "set_bits", None)
+                if set_bits is None:
+                    if not getattr(self, "_whisper_bits_warned", False):
+                        self._whisper_bits_warned = True
+                        print("🧠 当前识别后端不支持运行中切换精度，忽略自动识别降档")
+                else:
+                    old_bits = getattr(model, "bits", None)
+                    try:
+                        elapsed = set_bits(pending_bits)
+                        new_bits = getattr(model, "bits", pending_bits)
+                        print(f"🧠 Whisper 精度 {old_bits}→{new_bits}bit（{elapsed:.2f}秒）")
+                    except Exception as e:
+                        print(f"⚠️  Whisper 精度切换失败: {e}")
             if pending_lang is not None:
                 switched = False
                 try:

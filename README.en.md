@@ -95,6 +95,55 @@ First launch downloads the Whisper model (~1.6 GB).
 
 **AI-assisted install:** ask an agent to clone this repo and follow [CLAUDE.md](CLAUDE.md) for hardware tiers and known pitfalls.
 
+## macOS (Apple Silicon)
+
+The macOS build supports **Apple Silicon only (M1 and later)**. Intel Macs are not supported. Recognition uses MLX on the Apple GPU, not CUDA; translation still uses local Ollama. Audio and text stay on your machine.
+
+Prerequisites:
+
+```bash
+brew install uv ollama
+```
+
+Install:
+
+```bash
+git clone https://github.com/wyl2607/realtime_subtitle.git
+cd realtime_subtitle
+bash scripts/macos/install.sh
+# Mainland China mirror: bash scripts/macos/install.sh --mirror
+# Low disk space: bash scripts/macos/install.sh --lean
+```
+
+`--lean` uses the 4-bit quantized Whisper model. Accuracy is slightly lower (German WER 4.05% → 4.84%) and saves about 1.1 GB. The installer chooses a tier by memory:
+
+| RAM | Whisper | Translation model |
+|---|---|---|
+| <12 GB | turbo-q4 | qwen3.5:2b |
+| 12–31 GB | turbo | qwen3.5:4b |
+| ≥32 GB | turbo | qwen3.5:9b |
+
+Machine-specific settings are written to `config_local.py`; do not edit `config.py`. This is the same mechanism as on Windows. If memory gets tight while running, the app steps down in order of accuracy cost: first speech recognition goes from fp16 to 8-bit (same accuracy, about 1 s slower per update), then the translation model drops one tier (for example 4b → 2b), and only last does recognition go to 4-bit. It steps back up once pressure stays normal, but never above the tier chosen at install time.
+
+macOS has no built-in system loopback capture. To capture system audio:
+
+```bash
+brew install blackhole-2ch
+```
+
+Then open Audio MIDI Setup, create a Multi-Output Device, tick both your speakers and BlackHole 2ch, and switch system output to that device. Without BlackHole, the app falls back to the default microphone and shows a prompt. The ⚙️ panel's "device name contains" field can select an input device.
+
+Start / stop:
+
+```bash
+bash scripts/macos/start.sh
+bash scripts/macos/stop.sh
+```
+
+Logs are `subtitle.log` / `subtitle.err.log`. Hotkeys are the same as Windows: `Ctrl+Alt+P/L/M/G/C`; on Mac, press the physical **Control + Option** keys.
+
+Known differences: on Mac, subtitle refresh is about once every 2–3 seconds (M2 measured recognition at about 2.4 seconds per pass), slower than an NVIDIA GPU. Single-sentence translation is about 4 seconds with 4b and 1.6 seconds with 2b. Expected disk use: Python environment about 1.5 GB + Whisper 1.6 GB (`--lean`: 0.5 GB) + translation model 2.7–6.6 GB.
+
 ## Update & uninstall
 
 | Action | Command |

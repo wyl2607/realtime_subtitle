@@ -9,6 +9,7 @@
 # 3.12/3.13 上各 dry-run 解析一遍。改任何一行的钉法之前，先想清楚最低那档
 # Python 上有没有轮子——numpy 那条注释就是踩过之后写的。
 faster-whisper>=1.2.1,<2.0.0   # Whisper 语音识别
+mlx-whisper>=0.4.3; sys_platform == "darwin" and platform_machine == "arm64"
 ctranslate2>=4.8.1,<5.0.0      # RTX 50系(Blackwell/sm_120)最低要 4.6.2：旧版int8路径
                                # 直接CUBLAS_STATUS_NOT_SUPPORTED崩溃，4.6.2起自动禁用。
                                # 下限现在是 4.8.1（dependabot 提的，RTX 5060 实测过）
@@ -22,11 +23,13 @@ numpy>=2.2.0,<3.0.0            # 数值计算。下限必须停在 2.2：2.3 起
 # CUDA 运行库（缺了程序起不来！）
 # Windows下ctranslate2按名字LoadLibraryA加载cublas64_12.dll，
 # translator_queue.py 会把 nvidia.cublas 包的 bin 目录塞进 PATH
-nvidia-cublas-cu12>=12.9.2.10
-nvidia-cudnn-cu12>=9.24.0.43
+nvidia-cublas-cu12>=12.9.2.10; sys_platform == "win32"
+nvidia-cudnn-cu12>=9.24.0.43; sys_platform == "win32"
 
 # 音频处理
-pyaudiowpatch>=0.2.12.8,<1.0.0     # Windows 系统音频捕获 (WASAPI Loopback)
+pyaudiowpatch>=0.2.12.8,<1.0.0; sys_platform == "win32"     # Windows 系统音频捕获 (WASAPI Loopback)
+sounddevice>=0.5; sys_platform == "darwin"                  # macOS 输入设备捕获（BlackHole 等虚拟声卡）
+pyobjc-framework-CoreAudio>=10.0; sys_platform == "darwin"  # macOS 14.2+ Process Tap 系统音频捕获
 soxr>=1.1.0,<2.0.0              # 音频重采样（librosa太重，只用得到resample，底层就是soxr）
                                 # 0.5→1.1 是大版本跳但对本项目无感：ResampleStream
                                 # 的构造签名/resample_chunk/clear 都没变，96k→16k

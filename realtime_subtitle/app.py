@@ -6,6 +6,9 @@ import warnings
 import logging
 import sys
 import os
+import platform
+import time
+from realtime_subtitle.paths import SINGLETON_LOCK_FILE, repo_path
 
 # 控制台可能默认使用非UTF-8编码（如cp1252），会导致emoji/中文print崩溃
 if sys.platform == "win32":
@@ -20,6 +23,22 @@ if sys.platform == "win32":
 # 静默退出"）。以前靠在 import 前 monkeypatch ctypes.windll.kernel32 绕开，
 # 那既脆（换 ctypes 调用方式就失效）又要写进 CLAUDE.md 让人记住；现在改成
 # 环境变量开关，tests/ 里设一次即可，也不会真去占那个 mutex。
+_single_instance_lock = None
+
+
+def _acquire_macos_singleton_lock(lock_file=SINGLETON_LOCK_FILE):
+    import fcntl
+
+    lock = open(lock_file, "w", encoding="utf-8")
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("⚠️  实时字幕已经在运行了，不再启动第二个实例")
+        lock.close()
+        sys.exit(0)
+    return lock
+
+
 if sys.platform == "win32" and not os.environ.get("REALTIME_SUBTITLE_NO_SINGLETON"):
     import ctypes
     # ☠️ 错误码必须走 use_last_error=True 的独立句柄 + ctypes.get_last_error()。
@@ -43,6 +62,8 @@ if sys.platform == "win32" and not os.environ.get("REALTIME_SUBTITLE_NO_SINGLETO
         except Exception:
             pass
         sys.exit(0)
+elif sys.platform == "darwin" and not os.environ.get("REALTIME_SUBTITLE_NO_SINGLETON"):
+    _single_instance_lock = _acquire_macos_singleton_lock()
 
 # 在导入其他模块前先禁用所有警告和日志
 warnings.filterwarnings("ignore")
@@ -62,18 +83,55 @@ logging.basicConfig(level=logging.ERROR)
 # 只是把那次 import 提前到一个确定的位置。拿一行零成本的保险，去换一个
 # 只在"本机 + 这个 PyQt6/Qt/torch 版本组合"上验过一次的结论，不划算。
 # 真要删，先在别的机器上把两个方向都复现一遍。见 CLAUDE.md 第 4 节第 1 条。
-import torch  # noqa: F401
+# 只在 Windows 上做：macOS 走 MLX，ctranslate2 不会去拉 torch，"零成本"的前提
+# 不成立——无条件 import 实测白占 ~180MB 常驻内存，而 Mac 上内存正是降档的触发源
+if sys.platform == "win32":
+    import torch  # noqa: F401
 from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
 from realtime_subtitle.capture.audio_capture import AudioCapture, PAUSE_FLAG_FILE, STOP_FLAG_FILE
 from realtime_subtitle.ui.subtitle_window import SubtitleWindow
 from realtime_subtitle.ui.settings_window import MODE_ICONS as _MODE_ICON
+from realtime_subtitle.resources.memory import TierGovernor, read_memory_snapshot
 from PyQt6.QtCore import QTimer
 import realtime_subtitle.config as config
 # 纯常量模块，没有任何 import，放这里不影响上面那条 torch/PyQt6 的顺序约束
 from realtime_subtitle.version import version_string
 # 同样是纯 stdlib（pathlib），不影响 DLL 顺序
-from realtime_subtitle.paths import repo_path
 from realtime_subtitle.migrate_legacy import migrate_legacy_runtime_files
+
+
+def _auto_tiers_from_start(start_tier, tiers, max_tier=None, mlx_backend=True):
+    if not mlx_backend:
+        # faster-whisper 不能运行中改精度：只留 16 位的项（只降翻译）
+        usable = [tier for tier in tiers if tier[0] == 16]
+    elif start_tier[0] != 16:
+        # 预量化仓库（如 --lean 的 turbo-q4）：权重本身就是低位，原地量化是空操作、
+        # "升回 fp16"重载的也还是它——识别这一维固定，只降翻译
+        models = list(dict.fromkeys(model for _, model in tiers))
+        usable = [(start_tier[0], model) for model in models]
+    else:
+        usable = list(tiers)
+    if start_tier not in usable:
+        return []
+    cap = max_tier or start_tier
+    if cap not in usable:
+        return []
+    return list(usable)[usable.index(cap):]
+
+
+def _tier_name(tier):
+    bits, model = tier
+    return f"fp{bits}+{model}" if bits == 16 else f"{bits}bit+{model}"
+
+
+def _startup_whisper_bits():
+    repo = str(getattr(config, "WHISPER_MLX_REPO", "")).lower()
+    if "q4" in repo or "4bit" in repo or "4-bit" in repo:
+        return 4
+    if "q8" in repo or "8bit" in repo or "8-bit" in repo:
+        return 8
+    return 16
+
 
 class SubtitleApp:
     """实时字幕应用主类"""
@@ -98,6 +156,11 @@ class SubtitleApp:
         # 这台机器的"正常档位"翻译模型：必须在任何模式切换之前拍快照
         # （此时 config_local 的显存分档已经生效）。非性能模式统一切回它
         self._baseline_ollama_model = config.OLLAMA_MODEL
+        self._baseline_whisper_bits = _startup_whisper_bits()
+        self._memory_tier_by_name = {}
+        self._memory_tier_stop = None
+        self._memory_tier_thread = None
+        self._memory_tier_error_printed = False
 
         # 初始化字幕窗口（必须在主线程；QApplication 也在这里面建）
         try:
@@ -114,6 +177,48 @@ class SubtitleApp:
         # 面板四个按钮 / 手动拨滑块 → 都回到 _apply_mode 这唯一入口
         self.subtitle_window.settings_window.on_mode_change = self._apply_mode
         self.subtitle_window.settings_window.on_language_change = self._request_language_pair
+        if sys.platform == "darwin":
+            self._setup_hotkey()
+
+    def _auto_tier_enabled(self):
+        enabled = getattr(config, "AUTO_TIER_ENABLED", None)
+        if enabled is None:
+            return platform.system() == "Darwin"
+        return bool(enabled)
+
+    def _build_memory_governor(self):
+        if not self._auto_tier_enabled():
+            return None
+        from realtime_subtitle.asr.backends import selected_whisper_backend
+        mlx_backend = selected_whisper_backend() == "mlx"
+        start_tier = (
+            self._baseline_whisper_bits if mlx_backend else 16,
+            self._baseline_ollama_model,
+        )
+        tiers = _auto_tiers_from_start(
+            start_tier,
+            list(getattr(config, "AUTO_TIERS", [])),
+            getattr(config, "AUTO_TIER_MAX", None),
+            mlx_backend=mlx_backend,
+        )
+        if not tiers:
+            print(f"🧠 启动档位 {start_tier} 不在自动分档列表，自动降档未启用")
+            return None
+        gb = 1024 ** 3
+        self._memory_tier_by_name = {_tier_name(tier): tier for tier in tiers}
+        costs = {
+            _tier_name((bits, model)): int((
+                getattr(config, "WHISPER_BITS_COST_GB", {}).get(bits, 0)
+                + getattr(config, "OLLAMA_MODEL_COST_GB", {}).get(model, 0)
+            ) * gb)
+            for bits, model in tiers
+        }
+        return TierGovernor(
+            list(self._memory_tier_by_name),
+            _tier_name(start_tier if start_tier in tiers else tiers[0]),
+            tier_cost_bytes=costs,
+            headroom_bytes=int(getattr(config, "AUTO_TIER_HEADROOM_GB", 1.5) * gb),
+        )
 
     def _load_models(self):
         """后台线程：加载 Whisper/Ollama + 音频采集，完成后接线并启动。
@@ -183,8 +288,13 @@ class SubtitleApp:
             print("✅ 所有组件初始化完成")
             self.running = True
             self.audio_capture.start()
+            # 模型加载完才开始盯内存：加载 Whisper + 预热翻译模型时压力本来就会
+            # 冲高，算进去的话一启动就被降档（M2 e2e 实测：启动即 4b→2b，之后
+            # 要 5 分钟以上才升回，这段时间中文明显更差）
+            self._start_memory_tier_loop()
             self._print_usage()
-            self._setup_hotkey()
+            if sys.platform != "darwin":
+                self._setup_hotkey()
         except Exception as e:
             print(f"❌ 初始化失败: {e}")
             import traceback
@@ -214,7 +324,7 @@ class SubtitleApp:
         # 版本号读 version.py（单一真相源）——以前这里写死 "v2.0"，
         # 和 git tag 对不上，用户报 bug 只能贴 commit hash
         print(" " * 15 + f"🎬 实时字幕软件 {version_string()}")
-        print(" " * 12 + "基于 Faster-Whisper")
+        print(" " * 12 + "基于 Whisper + Ollama")
         print("=" * 60)
         print()
     
@@ -330,14 +440,7 @@ class SubtitleApp:
         # 不同机器 config_local 里的 OLLAMA_MODEL 不一样，写死会覆盖显存分档）
         target_model = (getattr(config, "GAME_MODE_OLLAMA_MODEL", None) if name == "性能"
                         else self._baseline_ollama_model)
-        if target_model and target_model != config.OLLAMA_MODEL:
-            old_model = config.OLLAMA_MODEL
-            config.OLLAMA_MODEL = target_model
-            # ☠️ 模型还在后台加载时（窗口先显示的那十几秒）translator 是 None，
-            # 这时只改 config 就够了：翻译器构造后自然用新名字，退出时的
-            # _unload_our_models 也会把两个模型名都覆盖到，不会漏显存
-            if self.translator is not None:
-                self.translator.request_warm_model(old_model=old_model, new_model=target_model)
+        self._switch_ollama_model(target_model)
         self._current_mode = name
         self.subtitle_window.notify_mode_applied(name)
         self.subtitle_window.show_status(f"{_MODE_ICON.get(name, '⚙️')} 已切换到「{name}」模式")
@@ -346,6 +449,76 @@ class SubtitleApp:
               f"草稿{'开' if config.DRAFT_TRANSLATION else '关'} "
               f"语域{config.TRANSLATION_STYLE} 模型{config.OLLAMA_MODEL}")
         return True
+
+    def _switch_ollama_model(self, target_model):
+        if target_model and target_model != config.OLLAMA_MODEL:
+            old_model = config.OLLAMA_MODEL
+            config.OLLAMA_MODEL = target_model
+            # ☠️ 模型还在后台加载时（窗口先显示的那十几秒）translator 是 None，
+            # 这时只改 config 就够了：翻译器构造后自然用新名字，退出时的
+            # _unload_our_models 也会把两个模型名都覆盖到，不会漏显存
+            if self.translator is not None:
+                self.translator.request_warm_model(old_model=old_model, new_model=target_model)
+
+    def _on_memory_tier(self, name):
+        bits, model = self._memory_tier_by_name.get(name, (None, None))
+        if bits is None:
+            print(f"⚠️  未知内存档位: {name}")
+            return
+        old_bits = self._baseline_whisper_bits
+        old_model = self._baseline_ollama_model
+        self._baseline_whisper_bits = bits
+        self._baseline_ollama_model = model
+        if self._current_mode != "性能":
+            self._switch_ollama_model(model)
+        if bits != old_bits and self.translator is not None:
+            self.translator.request_whisper_bits(bits)
+        # 内存监控在模型加载完成后才启动；这里保留 None 分支不补队列，避免
+        # 加载期虚构一条从未被 TierGovernor 观测到的精度切换。
+        parts = []
+        if bits != old_bits:
+            desc = "fp16" if bits == 16 else f"{bits}bit"
+            if bits < old_bits:
+                suffix = "（准确度不变）" if bits == 8 else ""
+                parts.append(f"识别精度降到 {desc}{suffix}")
+            else:
+                parts.append(f"识别精度恢复 {desc}")
+        all_tiers = list(getattr(config, "AUTO_TIERS", []))
+        try:
+            old_index = all_tiers.index((old_bits, old_model))
+            new_index = all_tiers.index((bits, model))
+        except ValueError:
+            old_index = new_index = 0
+        if model != old_model:
+            parts.append(f"翻译模型{'降到' if new_index > old_index else '恢复'} {model}")
+        if bits >= old_bits and model == old_model:
+            parts.append(f"恢复 {_tier_name((bits, model))}")
+        tight = new_index > old_index
+        msg = f"🧠 内存{'紧张' if tight else '充足'}：" + "，".join(parts)
+        self.subtitle_window.show_status(msg)
+        print(msg)
+
+    def _start_memory_tier_loop(self):
+        governor = self._build_memory_governor()
+        if governor is None:
+            return
+        import threading
+        self._memory_tier_stop = threading.Event()
+
+        def _loop():
+            poll = float(getattr(config, "AUTO_TIER_POLL_SEC", 2.0))
+            while not self._memory_tier_stop.wait(poll):
+                try:
+                    model = governor.observe(read_memory_snapshot(), time.monotonic())
+                    if model is not None:
+                        self._on_memory_tier(model)
+                except Exception as e:
+                    if not self._memory_tier_error_printed:
+                        self._memory_tier_error_printed = True
+                        print(f"⚠️  内存自动分档监控失败，已暂停日志刷屏: {e}")
+
+        self._memory_tier_thread = threading.Thread(target=_loop, daemon=True, name="MemoryTierLoop")
+        self._memory_tier_thread.start()
 
     def _toggle_perf_hotkey(self):
         """Ctrl+Alt+G：跳到「性能」模式；已经在性能模式则跳回进入前那个模式
@@ -368,6 +541,27 @@ class SubtitleApp:
         注册和消息循环必须在同一个线程（热键投递到注册线程的消息队列）。
         回调跑在热键线程里：文件操作+Qt信号都线程安全。
         """
+        if sys.platform not in ("win32", "darwin"):
+            print("当前平台暂不支持全局快捷键，请用窗口按钮/⚙️面板")
+            return
+        callbacks = {
+            "Ctrl+Alt+P": self._toggle_pause,
+            "Ctrl+Alt+L": self._switch_language,
+            "Ctrl+Alt+M": self.subtitle_window.toggle_click_through,
+            "Ctrl+Alt+G": self._toggle_perf_hotkey,
+            "Ctrl+Alt+C": self.subtitle_window.toggle_cinema,
+        }
+        if sys.platform == "darwin":
+            # Carbon 热键必须在主线程注册，所以比 Windows 早（构造期就注册）；
+            # 模型加载完（running）之前按键一律忽略，和 Windows"加载完才注册"等价——
+            # 否则加载期间按 Ctrl+Alt+L 会撞上还没建好的 translator
+            from realtime_subtitle.ui import macos_hotkeys
+            gated = {label: (lambda f=f: f() if self.running else None)
+                     for label, f in callbacks.items()}
+            registered = macos_hotkeys.register(gated)
+            if registered:
+                print(f"⌨️  全局快捷键已注册(系统级): {', '.join(registered)}")
+            return
         import threading
         import ctypes
         from ctypes import wintypes
@@ -375,11 +569,11 @@ class SubtitleApp:
         MOD_ALT, MOD_CONTROL, MOD_NOREPEAT = 0x1, 0x2, 0x4000
         WM_HOTKEY = 0x0312
         handlers = {
-            1: ("Ctrl+Alt+P", ord('P'), self._toggle_pause),
-            2: ("Ctrl+Alt+L", ord('L'), self._switch_language),
-            3: ("Ctrl+Alt+M", ord('M'), self.subtitle_window.toggle_click_through),
-            4: ("Ctrl+Alt+G", ord('G'), self._toggle_perf_hotkey),
-            5: ("Ctrl+Alt+C", ord('C'), self.subtitle_window.toggle_cinema),
+            1: ("Ctrl+Alt+P", ord('P'), callbacks["Ctrl+Alt+P"]),
+            2: ("Ctrl+Alt+L", ord('L'), callbacks["Ctrl+Alt+L"]),
+            3: ("Ctrl+Alt+M", ord('M'), callbacks["Ctrl+Alt+M"]),
+            4: ("Ctrl+Alt+G", ord('G'), callbacks["Ctrl+Alt+G"]),
+            5: ("Ctrl+Alt+C", ord('C'), callbacks["Ctrl+Alt+C"]),
         }
 
         def hotkey_loop():
@@ -491,11 +685,18 @@ class SubtitleApp:
             self._flush_timer.stop()
         if hasattr(self, '_stop_timer'):
             self._stop_timer.stop()
+        if getattr(self, '_memory_tier_stop', None) is not None:
+            self._memory_tier_stop.set()
+        if getattr(self, '_memory_tier_thread', None) is not None:
+            self._memory_tier_thread.join(timeout=1)
 
         # 让热键线程退出消息循环并注销热键（WM_QUIT = 0x0012）
-        if getattr(self, '_hotkey_tid', None):
+        if sys.platform == "win32" and getattr(self, '_hotkey_tid', None):
             import ctypes
             ctypes.windll.user32.PostThreadMessageW(self._hotkey_tid, 0x0012, 0, 0)
+        elif sys.platform == "darwin":
+            from realtime_subtitle.ui import macos_hotkeys
+            macos_hotkeys.unregister_all()
 
         # 先停止音频捕获，避免向已关闭的线程池提交新任务
         if self.audio_capture is not None:
@@ -550,11 +751,11 @@ class SubtitleApp:
         print("   6. 点击 ❌ 按钮可退出程序")
         print("   7. 或按 Ctrl+C 中断程序")
         print("\n⚙️  当前配置：")
-        print(f"   - Whisper模型: {config.WHISPER_MODEL}")
+        from realtime_subtitle.asr.backends import describe_whisper_backend
+        print(f"   - 识别: {describe_whisper_backend()}")
         print(f"   - 处理模式: local agreement 增量识别 (每{config.CHUNK_SUBMIT_SECONDS}秒一块, 缓冲上限{config.BUFFER_TRIM_SEC:.0f}秒)")
         print(f"   - 收尾静音: {config.IDLE_FLUSH_SEC}秒")
         print(f"   - 翻译: Qwen + Whisper (Ollama {config.OLLAMA_MODEL})")
-        print(f"   - 设备: {config.WHISPER_DEVICE.upper()}")
         print(f"   - 源语言: {config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)}")
         from realtime_subtitle.translate.translator_queue import log_language_startup
         log_language_startup()

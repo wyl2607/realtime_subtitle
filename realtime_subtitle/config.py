@@ -7,6 +7,10 @@
 # large-v3-turbo: large-v3的加速蒸馏版，德语准确率明显好于medium，
 # 速度与medium相当，int8下显存占用差不多（~2GB）
 WHISPER_MODEL = "large-v3-turbo"  # tiny, base, small, medium, large-v3, large-v3-turbo
+# auto：Apple Silicon 上默认走 MLX，用 Apple GPU；其它平台保持 faster-whisper。
+# faster-whisper 在 Mac 上只能走 CPU，实时链路会被拖慢。
+WHISPER_BACKEND = "auto"  # auto, mlx, faster-whisper
+WHISPER_MLX_REPO = "mlx-community/whisper-large-v3-turbo"
 WHISPER_DEVICE = "cuda"  # cuda 或 cpu
 WHISPER_COMPUTE_TYPE = "float16"  # float16, int8, int8_float16
 # 源语言（Whisper语言代码）。运行中可用 Ctrl+Alt+L 在 LANGUAGE_PAIRS 里循环切换，
@@ -126,6 +130,22 @@ WHISPER_BEAM_SIZE = 3  # beam search 大小。whisper_streaming作者用5，这�
 # 回退：先 `ollama pull qwen3:8b`（本地已删），再 config_local.py 写
 # OLLAMA_MODEL="qwen3:8b"。qwen3:14b 精听选项已被 9b 事实取代（也已删）。
 OLLAMA_MODEL = "qwen3.5:9b"  # Ollama 模型名称
+# 自动分档默认只在 macOS 开启：这台 M2 16GB 上 9b 单独运行就会把内存压力推到
+# warning，和 Whisper turbo fp16 同跑时需要按压力临时降翻译模型，压力恢复后再升。
+AUTO_TIER_ENABLED = None  # None=自动：仅 macOS 开启；True/False 强制
+# (Whisper 精度位数, 翻译模型)，从高到低，按"准确度代价"排序，依据见 CLAUDE.md 第 7 节
+AUTO_TIERS = [
+    (16, "qwen3.5:9b"),
+    (16, "qwen3.5:4b"),
+    (8, "qwen3.5:4b"),
+    (8, "qwen3.5:2b"),
+    (4, "qwen3.5:2b"),
+]
+WHISPER_BITS_COST_GB = {16: 1.6, 8: 0.9, 4: 0.5}
+OLLAMA_MODEL_COST_GB = {"qwen3.5:9b": 6.2, "qwen3.5:4b": 3.2, "qwen3.5:2b": 2.4}
+AUTO_TIER_HEADROOM_GB = 1.5
+AUTO_TIER_POLL_SEC = 2.0
+AUTO_TIER_MAX = None  # None=启动时的 (Whisper 位数, OLLAMA_MODEL)，不自动升到更高档
 # ☠️ 必须写 127.0.0.1，不要写 localhost。Ollama 只监听 IPv4 127.0.0.1:11434
 # （`netstat -ano | findstr 11434` 可验证，没有 IPv6 监听），而 Windows 上
 # getaddrinfo("localhost") 返回 ::1 在前、127.0.0.1 在后，于是每次新建连接都要
@@ -190,6 +210,15 @@ CHUNK_SIZE = 4096  # 每次读取的帧数（减少处理频率）
 # 非空则按设备名子串匹配（不区分大小写），例如 "FiiO" / "Speakers" / "Headphones"。
 # 可在 config_local.py 里写，或运行中在 ⚙️ 面板改（约 5 秒内热切换）。
 LOOPBACK_DEVICE_NAME = ""
+# macOS 系统音频捕获模式：
+# "auto"：macOS 14.2+ 先尝试 Core Audio Process Tap；失败后回退 BlackHole/默认输入。
+# "tap"：只用 Process Tap，失败就不再回退到 BlackHole/默认输入；需要在系统设置的
+#        “屏幕与系统音频录制/系统音频录制”里允许终端或 Python。
+# "input"：保持旧行为，只枚举普通输入设备（BlackHole、麦克风等），完全不碰 tap。
+# 默认先用 "input"：没授权时 tap 往往不报错、只交出全零静音——"auto" 会让已经
+# 配好 BlackHole 的用户静默变成抓静音。tests/test_macos_tap.py 的真机冒烟
+# （RS_TAP_SMOKE=1，桌面会话里授权后跑）确认能录到声音之后再改成 "auto"
+MACOS_CAPTURE_MODE = "input"
 
 # ============ 流式识别配置（streaming_asr.py / audio_capture.py）============
 # local agreement 增量识别（2026-07-06 重写）：不再由能量VAD切"语音片段"，

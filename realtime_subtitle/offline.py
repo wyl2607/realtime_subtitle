@@ -724,15 +724,10 @@ def _extract_audio(video: Path, audio: Path) -> None:
 
 
 def transcribe_audio(audio: Path, source_language: str = "auto") -> tuple[list[dict], str, float]:
-    """Use the project's Faster-Whisper bootstrap and model configuration."""
-    from realtime_subtitle.translate import translator_queue
+    """Use the project's Whisper backend selection and model configuration."""
+    from realtime_subtitle.asr.backends import create_whisper_model
 
-    whisper_model = translator_queue._ensure_ml_deps()
-    model = whisper_model(
-        config.WHISPER_MODEL,
-        device=config.WHISPER_DEVICE,
-        compute_type=config.WHISPER_COMPUTE_TYPE,
-    )
+    model = create_whisper_model()
     source_language = (source_language or "auto").strip().lower()
     locked_language = None if source_language == "auto" else source_language
     prompt = getattr(config, "LANGUAGE_SEED_PROMPTS", {}).get(source_language, "")

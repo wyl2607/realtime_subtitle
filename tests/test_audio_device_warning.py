@@ -7,6 +7,7 @@
 import pytest
 
 from realtime_subtitle import config
+from realtime_subtitle.capture import audio_capture
 from realtime_subtitle.capture.audio_capture import AudioCapture
 
 
@@ -27,6 +28,8 @@ class _FakePyAudio:
 def _reset(monkeypatch):
     monkeypatch.setattr(AudioCapture, "_missing_warned", None, raising=False)
     monkeypatch.setattr(config, "LOOPBACK_DEVICE_NAME", "FiiO", raising=False)
+    # 这里测的是 WASAPI loopback 分支；在 macOS 上跑也要固定走它
+    monkeypatch.setattr(audio_capture.sys, "platform", "win32")
 
 
 def _warnings(capsys):
