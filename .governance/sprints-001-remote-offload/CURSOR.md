@@ -3,8 +3,8 @@
 ## 当前状态
 <!-- Machine fields: new writes must use "- key: `value`". Legacy variants are read-only compatibility. -->
 - current_phase: `review`
-- current_tk: `TK-001b`
-- current_cr: `CR-004`
+- current_tk: `TK-003`
+- current_cr: `—`
 - current_round: `1`
 - escalated: `false`
 
@@ -13,7 +13,7 @@
 | TK | 标题 | 状态 |
 |----|------|------|
 | TK-001 | 节点 worker：VAD 分段 + 整段识别 + 可插拔翻译 | done |
-| TK-001b | worker：会话结束滑动更新 rtf | recheck |
+| TK-001b | worker：会话结束滑动更新 rtf | done |
 | TK-002 | 节点 gateway：生命周期 + 协议 v2 + 鉴权与上限 | done |
 | TK-003 | 一键安装 install_node.sh | planned |
 | TK-004 | rslite：带时间句子 + AudioFanout + 混合替换 + 单实例 | done |
@@ -22,6 +22,7 @@
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 08:25 CST: CR-004 round3 approve → **TK-001b done**，合并进 feat/macos-native。下一批：TK-003 install_node.sh（安全类，单独一批）
 - 2026-10-09 08:15 CST: CR-004 round2 approve（F1/F2 fixed，R2-D1 low rejected）→ round3（opus，整体通读 + 端到端）
 - 2026-10-09 08:08 CST: TK-001b repair round1 回收 18b9595（192/818 passed）→ recheck，CR-004 round2（opus）
 - 2026-10-09 08:00 CST: CR-004 round1：派审前疑点被真 gateway+真 worker 复现证实（会话→断开→回收不写 asr_state.json）→ F1/F2 accepted、F3 rejected → TK-001b fixing，repair round1（sonnet）
