@@ -12,7 +12,7 @@
 
 | TK | 标题 | 状态 |
 |----|------|------|
-| TK-001 | 节点 worker：VAD 分段 + 整段识别 + 可插拔翻译 | recheck |
+| TK-001 | 节点 worker：VAD 分段 + 整段识别 + 可插拔翻译 | fixing |
 | TK-002 | 节点 gateway：生命周期 + 协议 v2 + 鉴权与上限 | reviewing |
 | TK-003 | 一键安装 install_node.sh | planned |
 | TK-004 | rslite：带时间句子 + AudioFanout + 混合替换 + 单实例 | blocked（待 Mac 构建） |
@@ -21,6 +21,7 @@
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 05:34 CST: CR-002 round3 回收：两路 approve；R3-D1（BaseException 让 worker 半死）accepted + faulthandler 测试缺口 accepted，R3-S1 rejected → TK-001 fixing，repair round3（sonnet）
 - 2026-10-09 05:26 CST: TK-001 repair round2 回收 e2ed51b（复核 80/692 passed）→ recheck，CR-002 round3 两路派出；CR-003 round1 两路派出（default 含真 worker 联调）
 - 2026-10-09 05:22 CST: TK-002 回报 2593886（write_scope 内，Coordinator 复核 50/662 passed、ruff 通过，已 push feat/tk-002）→ reviewing，CR-003 round1 派出（default=opus + security=sonnet）
 - 2026-10-09 05:16 CST: CR-002 round2 回收：security approve（S-F1 实打无泄漏）；default F1–F5 fixed，新 R2-D1（崩溃零痕迹）accepted → TK-001 fixing，repair round2（sonnet）
