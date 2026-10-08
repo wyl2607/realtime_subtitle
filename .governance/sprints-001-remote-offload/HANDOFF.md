@@ -37,7 +37,7 @@
 | TK | 状态 | 执行者 / worktree | 说明 |
 |---|---|---|---|
 | TK-001 节点 worker | **reviewing：CR-002 已建，第 1 轮评审员尚未派出** | Claude sonnet 子代理（已完成）· `~/projects/rs-tk-001`，提交 **3e87063** | 在范围内。M2 真模型冒烟：WER **0.88%**，每段说完到出结果的延迟中位数 **3.25s**。下一步：并行派 default（opus）和 security（sonnet）两个评审员 |
-| TK-004 rslite 时间+混合+单实例 | **fixing：CR-001 第 1 轮 needs_fix，6 条全部接受（F5 转给 TK-005）；修复者（sonnet）正在跑** | `~/projects/rs-tk-004`，提交 ecb7a20 + 0cdd5c7（coordinator-direct 编译适配） | 修复者完成后会在 feat/tk-004 上提交 `fix(native):`；若额度耗尽导致修复中断，先看 `git status`/`git log`，再按 `reviews/CR-001.md` 的 Round 1 表格继续修 F1–F4、F6，然后派第 2 轮复查（opus） |
+| TK-004 rslite 时间+混合+单实例 | **recheck：CR-001 修复已完成，提交 c53ef12（F1–F4、F6），待派第 2 轮复查（opus）** | 分支 feat/tk-004（本机 worktree `~/projects/rs-tk-004`） | F5 已转交 TK-005；F1 的丢块重打时间戳没有用真 SpeechAnalyzer 做端到端验证（需要 Mac） |
 | TK-002 gateway | planned | — | 安全类，单独一批 |
 | TK-003 install_node.sh | planned | — | 涉及 token，单独一批 |
 | TK-005 NodeClient+Router | planned | 等 TK-004 | |

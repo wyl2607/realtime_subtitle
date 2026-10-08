@@ -15,3 +15,4 @@
 {"ts":"2026-10-09T04:18:57+08:00","sprint":"sprints-001-remote-offload","tk":"TK-004","cr":"CR-001","phase":"review","action":"repair-dispatched","agent_role":"repairer","round":1,"notes":"claude sonnet subagent"}
 {"ts":"2026-10-09T04:20:17+08:00","sprint":"sprints-001-remote-offload","tk":"TK-001","phase":"execution","action":"returned","agent_role":"executor","notes":"3e87063 in scope; WER 0.88% median lag 3.25s M2"}
 {"ts":"2026-10-09T04:20:17+08:00","sprint":"sprints-001-remote-offload","tk":"TK-001","cr":"CR-002","phase":"review","action":"dispatched","agent_role":"reviewer","round":1,"notes":"default=opus, security=sonnet"}
+{"ts":"2026-10-09T04:24:09+08:00","sprint":"sprints-001-remote-offload","tk":"TK-004","cr":"CR-001","phase":"review","action":"repair-returned","agent_role":"repairer","round":1,"notes":"c53ef12 F1-F4,F6 fixed"}
