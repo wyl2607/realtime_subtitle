@@ -1,7 +1,14 @@
 import sys
 import textwrap
 
+import pytest
+
 from realtime_subtitle.translate.apple_translate import AppleTranslator
+
+# 假 helper 靠 shebang 被直接 exec，Windows 上是 WinError 193 起不来；
+# 剩下几条只是因为「起不来也返回 None」才碰巧通过，等于什么都没测。
+# Apple Translation 本来就只有 macOS 有，所以整份文件按平台关掉。
+pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="Apple Translation helper 只在 macOS 上存在")
 
 
 def _helper(tmp_path, body):
