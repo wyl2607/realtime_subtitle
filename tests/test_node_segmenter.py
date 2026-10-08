@@ -107,6 +107,18 @@ def test_audio_carries_padding_and_audio_t0():
     assert float(np.abs(s.audio).max()) <= 1.0
 
 
+def test_force_cut_boundary_has_no_padding_on_either_side():
+    dip_at = win(406)
+    parts = [tone(dip_at), silence(0.1), tone(20.0 - dip_at - 0.1), silence(1.0)]
+    _, out = run(np.concatenate(parts))
+    first, second = out
+    # 强切边界：前段不带后垫、后段不带前垫，音频首尾相接
+    assert abs(first.audio_t0 + len(first.audio) / SR - first.a1) <= 1e-6
+    assert abs(second.audio_t0 - second.a0) <= 1e-6
+    # 自然静音边界仍然带垫：后段尾部有后垫
+    assert abs(second.audio_t0 + len(second.audio) / SR - (second.a1 + 0.2)) <= 0.02
+
+
 def test_force_cut_at_15s_picks_lowest_energy_point():
     # 20s 连续说话，13.0s 处有 0.1s 的低能量凹口（短于 0.6s，不会触发静音收尾）
     dip_at = win(406)  # ≈13.0s，落在 12–15s 的搜索区内

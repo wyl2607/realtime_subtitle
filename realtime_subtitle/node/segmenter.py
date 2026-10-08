@@ -97,6 +97,7 @@ class Segmenter:
         self._pos = 0       # 下一个待判窗口的绝对起点
         self._start: int | None = None      # 当前段第一个语音窗口的起点
         self._last_speech_end = 0           # 最后一个语音窗口的终点
+        self._start_is_cut = False          # 当前段的起点是上一次强切的切点
 
     @property
     def samples_received(self) -> int:
@@ -135,11 +136,13 @@ class Segmenter:
         self._trim(self._pos - self._pre)
         return out
 
-    def _make(self, a0: int, a1: int) -> Segment | None:
+    def _make(self, a0: int, a1: int, *, pre: bool = True, post: bool = True) -> Segment | None:
+        """pre/post=False：该侧是强切边界。垫只加在自然静音边界上，强切两侧
+        的音频必须首尾相接，否则同一段声音被识别两次、a0/a1 还会重叠。"""
         if a1 - a0 < self._min_speech:
             return None
-        lo = max(self._off, a0 - self._pre)
-        hi = min(self.samples_received, a1 + self._post)
+        lo = max(self._off, a0 - self._pre) if pre else a0
+        hi = min(self.samples_received, a1 + self._post) if post else a1
         return Segment(
             a0=a0 / self._sr,
             a1=a1 / self._sr,
@@ -148,8 +151,9 @@ class Segmenter:
         )
 
     def _close(self) -> list[Segment]:
-        seg = self._make(self._start, self._last_speech_end)
+        seg = self._make(self._start, self._last_speech_end, pre=not self._start_is_cut)
         self._start = None
+        self._start_is_cut = False
         # 收尾后立刻丢掉这一段的音频，只留前垫：长会话不能无限涨内存
         self._trim(self._pos + WINDOW - self._pre)
         return [seg] if seg else []
@@ -167,8 +171,9 @@ class Segmenter:
             rms = np.sqrt((frames ** 2).mean(axis=1))
             smooth = np.convolve(rms, np.ones(3) / 3, mode="same")
             cut = lo + int(np.argmin(smooth)) * CUT_FRAME + CUT_FRAME // 2
-        seg = self._make(self._start, cut)
+        seg = self._make(self._start, cut, pre=not self._start_is_cut, post=False)
         self._start = cut
+        self._start_is_cut = True
         self._last_speech_end = max(self._last_speech_end, cut)
         self._trim(cut - self._pre)
         return [seg] if seg else []

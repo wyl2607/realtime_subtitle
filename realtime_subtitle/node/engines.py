@@ -211,19 +211,26 @@ class OllamaBackend(Translator):
     """
 
     def __init__(self):
+        import requests
+
         from realtime_subtitle.translate import translator_queue
 
+        # S1：节点是服务端，没有「允许远端 Ollama」的逃生口。该开关会让下面的
+        # 校验放行且不钉地址，转录可能发往远端，所以开着就直接拒绝构造
+        if getattr(config, "ALLOW_REMOTE_OLLAMA", False):
+            raise RuntimeError("remote_ollama_not_allowed_on_node")
         # 非本机会抛 RemoteOllamaRefused；解析失败返回 False，此时 ollama_url()
         # 会拒绝给出地址，所以这里直接失败比等到首个请求再失败更早暴露
         if not translator_queue._assert_local_ollama(config.OLLAMA_BASE_URL):
             raise RuntimeError("ollama_not_verified_local")
         self._tq = translator_queue
+        # trust_env=False：不读 HTTP(S)_PROXY / 系统代理，回环请求不经任何代理
+        self._session = requests.Session()
+        self._session.trust_env = False
         self._model = config.OLLAMA_MODEL
         self.name = f"ollama:{self._model}"
 
     def translate(self, text: str, src: str, dst: str) -> str | None:
-        import requests
-
         s, d = _LANG_NAMES.get(src, src), _LANG_NAMES.get(dst, dst)
         prompt = (
             f"你是{s}字幕翻译。请把下面这一条字幕翻译成自然、准确的{d}。\n"
@@ -232,7 +239,7 @@ class OllamaBackend(Translator):
             f"{s}原文：\n{text}\n\n{d}译文："
         )
         try:
-            resp = requests.post(
+            resp = self._session.post(
                 f"{self._tq.ollama_url()}/api/generate",
                 json={
                     "model": self._model,
@@ -252,6 +259,9 @@ class OllamaBackend(Translator):
         except Exception:
             return None
         return out or None
+
+    def close(self) -> None:
+        self._session.close()
 
 
 def select_translator(src: str, dst: str, apple_factory=AppleTranslator,

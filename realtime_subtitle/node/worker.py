@@ -54,6 +54,17 @@ SAMPLE_RATE = 16000
 MAX_LINE = 4096
 
 _CODE = re.compile(r"^[A-Za-z0-9_.:-]{1,48}$")
+# hello 的语言代号白名单（S5）：它会原样进 Whisper `language=` 与 Ollama prompt，
+# 所以只放 ISO 639 风格的 "de" / "zh" / "zh-Hans"，其余一律按 bad_hello 拒绝
+# （用 fullmatch：`$` 会放过结尾的换行）
+_LANG = re.compile(r"^[a-z]{2,3}(-[A-Za-z]{2,4})?$")
+
+# 队列上限（RFC S4：入队有上限、丢最旧并告警）。
+# asr 队列按「段」计：一段 ≤15s，8 段 ≈ 最多落后 2 分钟音频、约 8MB float32；
+# 落后超过两分钟的字幕对直播已无意义，宁可丢旧段让新语音能及时出字。
+# tx 队列按「句」计：一段通常 1–10 句，64 句 ≈ 6–8 段的译文量，只占几十 KB。
+MAX_ASR_BACKLOG = 8
+MAX_TX_BACKLOG = 64
 
 
 class ProtocolError(Exception):
@@ -96,6 +107,7 @@ class Worker:
         self._seg: Segmenter | None = None
         self._asr_q: queue.Queue = queue.Queue()
         self._tx_q: queue.Queue = queue.Queue()
+        self._put_lock = threading.Lock()
         self._threads_started = False
         self._pipe_dead = False
 
@@ -104,10 +116,20 @@ class Worker:
     def _emit(self, event: dict) -> None:
         if self._pipe_dead:
             return
-        data = (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
+        # errors="replace"：ASR/翻译偶尔吐出孤立 surrogate，strict 会抛错丢掉整句
+        data = (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8", errors="replace")
         with self._emit_lock:
             try:
-                self._out.write(data)
+                # 管道上的 write 可能只写出一部分（fd 是无缓冲 FileIO）：写满为止，
+                # 否则事件帧被截断，gateway 会读到半行 JSON
+                view = memoryview(data)
+                while view:
+                    n = self._out.write(view)
+                    if n is None:
+                        n = len(view)
+                    if n <= 0:
+                        raise OSError("zero_write")
+                    view = view[n:]
                 self._out.flush()
             except (BrokenPipeError, ValueError, OSError):
                 # gateway 已经走了：不再写，主循环会在读到 EOF 时正常退出
@@ -201,9 +223,15 @@ class Worker:
         if (msg.get("v") != 2 or msg.get("sample_rate") != SAMPLE_RATE
                 or msg.get("format") != "s16le"
                 or not isinstance(msg.get("src"), str)
-                or not isinstance(msg.get("dst"), str)):
+                or not isinstance(msg.get("dst"), str)
+                or not _LANG.fullmatch(msg["src"]) or not _LANG.fullmatch(msg["dst"])):
             raise ProtocolError("bad_hello")
         src, dst = msg["src"], msg["dst"]
+
+        # 先递增代数再动翻译器/引擎：此后 tx/asr 线程里属于旧会话的结果在
+        # 「查代数 + 发事件」那把锁里一律被拒，不会挂到新会话 id 上
+        with self._state_lock:
+            self._gen += 1
 
         cold = not self._loaded
         load_s = 0.0
@@ -223,12 +251,14 @@ class Worker:
             if self._translator is not None:
                 self._translator.close()
                 self._translator = None
+            self._tr_pair = None
             try:
                 self._translator = self._translator_factory(src, dst)
+                self._tr_pair = (src, dst)
             except Exception as e:  # noqa: BLE001
+                # 构造失败不记语言对：同语言对的下一次 hello 要重试并再报告
                 self.log("translator_unavailable", err=type(e).__name__)
                 tr_note = ("translator_unavailable", "翻译不可用，只输出原文")
-            self._tr_pair = (src, dst)
 
         with self._state_lock:
             self._gen += 1
@@ -252,9 +282,25 @@ class Worker:
         pcm = np.frombuffer(data, dtype="<i2")
         self._enqueue(self._seg.feed(pcm))
 
+    def _put_bounded(self, q: queue.Queue, item, cap: int, what: str) -> None:
+        """入队；超过上限就丢最旧的（task_done 补账，join 才不会卡住）并告警。"""
+        dropped = 0
+        with self._put_lock:
+            while q.qsize() >= cap:
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
+                q.task_done()
+                dropped += 1
+            q.put(item)
+        if dropped:
+            self.log("backlog_dropped", queue=what, dropped=dropped, cap=cap)
+            self._status("backlog_dropped", "处理积压，已丢弃最旧内容")
+
     def _enqueue(self, segments: list[Segment]) -> None:
         for s in segments:
-            self._asr_q.put((self._gen, s))
+            self._put_bounded(self._asr_q, (self._gen, s), MAX_ASR_BACKLOG, "asr")
 
     def _drain(self) -> None:
         # asr 线程先放空（它会往 tx 队列里放东西），再等 tx 放空，顺序不能反
@@ -276,20 +322,24 @@ class Worker:
         while True:
             gen, seg = self._asr_q.get()
             try:
-                if gen == self._gen:
-                    self._recognize(gen, seg)
+                with self._state_lock:
+                    live = gen == self._gen
+                    src = self._src
+                if live:
+                    self._recognize(gen, seg, src)
             except Exception as e:  # noqa: BLE001
                 self.log("asr_error", err=type(e).__name__)
                 self._status("asr_error", "识别失败，已跳过一段")
             finally:
                 self._asr_q.task_done()
 
-    def _recognize(self, gen: int, seg: Segment) -> None:
+    def _recognize(self, gen: int, seg: Segment, src: str) -> None:
         t0 = time.perf_counter()
-        utts = self._asr.transcribe(seg.audio, self._src)
+        utts = self._asr.transcribe(seg.audio, src)
         asr_s = time.perf_counter() - t0
-        lo = seg.audio_t0
-        hi = seg.audio_t0 + len(seg.audio) / SAMPLE_RATE
+        # 夹到不含垫的 [a0, a1]：垫只为多喂一点上下文，不是语音的一部分；
+        # 夹到含垫边界会让强切相邻两段的 final 时间重叠（P5 按时间替换会吃掉邻行）
+        lo, hi = seg.a0, seg.a1
         with self._state_lock:
             # 识别期间如果来了新 hello，这批结果属于已结束的会话，丢弃
             if gen != self._gen:
@@ -301,40 +351,58 @@ class Worker:
                 self._next_id += 1
                 self._emit({"ev": "final", "id": sid, "a0": round(a0, 3),
                             "a1": round(a1, 3), "text": u.text})
-                self._tx_q.put((gen, sid, u.text))
+                self._put_bounded(self._tx_q, (gen, sid, u.text), MAX_TX_BACKLOG, "tx")
         self.log("segment", seg_s=seg.a1 - seg.a0, asr_s=asr_s, sentences=len(utts))
 
     def _tx_loop(self) -> None:
         while True:
             gen, sid, text = self._tx_q.get()
             try:
-                if gen == self._gen and self._translator is not None:
-                    t0 = time.perf_counter()
-                    out = self._translator.translate(text, self._src, self._dst)
+                with self._state_lock:
+                    if gen != self._gen or self._translator is None:
+                        continue
+                    tr, src, dst = self._translator, self._src, self._dst
+                t0 = time.perf_counter()
+                out = tr.translate(text, src, dst)
+                # 「查代数 + 发事件」必须在同一把锁里：翻译期间 hello 可能已开新会话
+                with self._state_lock:
                     if gen != self._gen:
                         continue
                     if out:
                         self._emit({"ev": "translation", "id": sid, "text": out})
-                        self.log("translated", id=sid, tx_s=time.perf_counter() - t0)
                     else:
                         self._status("translate_failed", "一句翻译失败，已跳过")
-                        self.log("translate_failed", id=sid)
+                if out:
+                    self.log("translated", id=sid, tx_s=time.perf_counter() - t0)
+                else:
+                    self.log("translate_failed", id=sid)
             except Exception as e:  # noqa: BLE001
                 self.log("translate_error", id=sid, err=type(e).__name__)
-                self._status("translate_failed", "一句翻译失败，已跳过")
+                with self._state_lock:
+                    if gen == self._gen:
+                        self._status("translate_failed", "一句翻译失败，已跳过")
             finally:
                 self._tx_q.task_done()
 
 
 def main() -> None:
-    # 先保住协议通道：fd 1 复制给事件流专用，再把 fd 1 / sys.stdout 都指向 stderr，
-    # 之后任何库（含子进程继承 fd 1）的 print 都只会落到日志里
+    # 先保住协议通道：fd 1 复制给事件流专用；fd 2 复制出来仅供 `_log` 使用；
+    # 然后 fd 1 / fd 2 / sys.stdout / sys.stderr 全部指向 /dev/null——第三方库的
+    # print 和子进程（如 Apple helper，继承 fd 2）的输出都落空，不可能把转录或
+    # 译文正文带进日志（S7）。dup 出来的 fd 默认不可继承，子进程拿不到这两个。
     out = os.fdopen(os.dup(1), "wb", buffering=0)
-    os.dup2(2, 1)
-    sys.stdout = sys.stderr
+    err = os.fdopen(os.dup(2), "w", buffering=1, encoding="utf-8", errors="replace")
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 1)
+    os.dup2(devnull, 2)
+    os.close(devnull)
+    sys.stdout = sys.stderr = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
 
     def _term(_signum, _frame):
-        sys.stderr.flush()
+        try:
+            err.flush()
+        except Exception:  # noqa: BLE001
+            pass
         os._exit(EXIT_OK)
 
     signal.signal(signal.SIGTERM, _term)
@@ -342,7 +410,7 @@ def main() -> None:
     from realtime_subtitle.node.engines import WhisperEngine
     from realtime_subtitle.node.segmenter import SileroVad
 
-    worker = Worker(sys.stdin.buffer, out, WhisperEngine(), SileroVad())
+    worker = Worker(sys.stdin.buffer, out, WhisperEngine(), SileroVad(), err=err)
     sys.exit(worker.run())
 
 

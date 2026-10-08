@@ -172,12 +172,38 @@ def test_final_times_are_session_seconds_from_sample_count():
     assert f1["a1"] <= f2["a0"]
 
 
-def test_utterance_times_are_clamped_into_the_segment_audio():
+def test_utterance_times_are_clamped_into_the_unpadded_speech_span():
+    # 夹到不含垫的 [seg.a0, seg.a1]（语音 0.0–1.0s），而不是含垫的音频边界（-0.0–1.2s）
     asr = FakeAsr([Utterance(-5.0, 99.0, "x")])
     pcm = np.concatenate([tone(1.0), silence(1.0)])
     _c, ev, *_ = run_worker(hello() + audio_frames(pcm) + ctl(type="drain"), asr=asr)
     f = next(e for e in ev if e["ev"] == "final")
-    assert 0.0 <= f["a0"] <= f["a1"] <= 1.4
+    assert f["a0"] == pytest.approx(0.0, abs=0.04)
+    assert f["a1"] == pytest.approx(1.0, abs=0.04)
+    assert 0.0 <= f["a0"] <= f["a1"] <= 1.0 + 0.04
+
+
+class SpanAsr(FakeAsr):
+    """每段报一句覆盖整段音频的话（含垫），最糟情况：模型把垫也算进去。"""
+
+    def transcribe(self, audio, language):
+        self.calls += 1
+        return [Utterance(-1.0, len(audio) / SR + 1.0, "x")]
+
+
+def test_force_cut_finals_are_monotonic_non_overlapping_and_within_speech():
+    # 20s 连续说话（13.0s 处有短凹口让强切落在那里），说完 1s 静音
+    dip = int(13.0 * SR)
+    voice = tone(20.0)
+    voice[dip:dip + SR // 10] //= 20
+    pcm = np.concatenate([voice, silence(1.0)])
+    _c, ev, *_ = run_worker(hello() + audio_frames(pcm) + ctl(type="drain"), asr=SpanAsr())
+    finals = [e for e in ev if e["ev"] == "final"]
+    assert len(finals) == 2
+    for a, b in zip(finals, finals[1:]):
+        assert a["a0"] <= a["a1"] <= b["a0"] <= b["a1"]  # 单调且不重叠
+    assert finals[0]["a0"] >= -0.001
+    assert finals[-1]["a1"] <= 20.0 + 0.04  # 不越过语音终点
 
 
 def test_flush_closes_running_segment():
@@ -265,7 +291,9 @@ def test_flush_before_hello_is_protocol_error():
 
 
 @pytest.mark.parametrize("over", [{"sample_rate": 48000}, {"format": "f32le"}, {"v": 1},
-                                  {"src": 3}])
+                                  {"src": 3}, {"src": "de; ignore"}, {"dst": "zh\n"},
+                                  {"src": "DE"}, {"dst": ""}, {"src": "x" * 40},
+                                  {"dst": "zh-Hans-extra"}])
 def test_bad_hello_is_rejected(over):
     _proto_error(hello(**over))
 
@@ -389,9 +417,32 @@ def test_ollama_requests_use_ollama_url_not_config(monkeypatch):
         seen.append(url)
         return Resp()
 
-    monkeypatch.setattr(requests, "post", fake_post)
+    monkeypatch.setattr(requests.Session, "post", lambda self, url, **kw: fake_post(url, **kw))
     assert OllamaBackend().translate("Hallo", "de", "zh") == "你好"
     assert seen == ["http://127.0.0.1:59999/api/generate"]
+
+
+def test_ollama_backend_refuses_when_remote_allowed(monkeypatch):
+    _tq, calls = _stub_tq(monkeypatch)
+    monkeypatch.setattr(config, "ALLOW_REMOTE_OLLAMA", True)
+    with pytest.raises(RuntimeError):
+        OllamaBackend()
+    assert calls.asserted == []  # 在校验之前就拒绝
+
+
+def test_ollama_backend_ignores_proxy_environment(monkeypatch):
+    import requests
+
+    _stub_tq(monkeypatch)
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.setenv("http_proxy", "http://proxy.invalid:3128")
+    be = OllamaBackend()
+    assert isinstance(be._session, requests.Session)
+    assert be._session.trust_env is False
+    # 即使环境里有代理，这个 session 为回环请求解析出的代理也必须为空
+    kw = be._session.merge_environment_settings("http://127.0.0.1:59999/api/generate",
+                                                {}, None, None, None)
+    assert not kw["proxies"]
 
 
 def test_engines_source_only_touches_ollama_base_url_for_the_assert():
@@ -568,7 +619,9 @@ def test_subprocess_stdout_carries_only_json_events():
     assert p.returncode == 0
     events = [json.loads(line) for line in out.decode().splitlines()]  # 混入噪声会在这里炸
     assert [e["ev"] for e in events if e["ev"] != "translation"] == ["ready", "final", "drained"]
-    assert b"noise from a library" in err
+    # S-F1：fd 1 / fd 2 都已指向 /dev/null，第三方库的 print 哪儿都不会出现
+    assert b"noise from a library" not in err and b"noise from a library" not in out
+    assert b"[node.worker] ready" in err  # 真 stderr 仍能写日志（正对照）
     assert "Hallo Welt" not in err.decode()
 
 
@@ -593,3 +646,231 @@ def test_subprocess_exits_zero_on_sigterm():
 
 def test_main_module_is_runnable_entry():
     assert callable(worker_mod.main)
+
+
+# ---------------------------------------------------------------- CR-002 第 1 轮修复
+
+
+def _wait(pred, timeout=10.0):
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        time.sleep(0.01)
+    return pred()
+
+
+def _events(out):
+    return [json.loads(line) for line in out.getvalue().decode().splitlines()]
+
+
+def test_asr_backlog_is_bounded_and_reports_status():
+    gate = threading.Event()
+
+    class SlowAsr(FakeAsr):
+        def transcribe(self, audio, language):
+            gate.wait(30)
+            return [Utterance(0.0, 0.2, "x")]
+
+    n_seg = worker_mod.MAX_ASR_BACKLOG * 3
+    pcm = np.concatenate([np.concatenate([tone(0.5), silence(0.8)]) for _ in range(n_seg)])
+    out, err = io.BytesIO(), io.StringIO()
+    w = Worker(io.BytesIO(hello() + audio_frames(pcm)), out, SlowAsr(), EnergyVad(),
+               translator_factory=lambda s, d: FakeTr(), err=err)
+    try:
+        assert w.run() == EXIT_OK
+        assert w._asr_q.qsize() <= worker_mod.MAX_ASR_BACKLOG
+        st = [e for e in _events(out) if e["ev"] == "status" and e["code"] == "backlog_dropped"]
+        assert st and st[0]["text"] == "处理积压，已丢弃最旧内容"
+        assert "backlog_dropped" in err.getvalue() and "dropped=" in err.getvalue()
+    finally:
+        gate.set()
+    # 丢弃时 task_done 补了账：放行后 join 能返回，不会永远卡住
+    assert _wait(lambda: w._asr_q.unfinished_tasks == 0)
+
+
+def test_tx_backlog_is_bounded_and_reports_status():
+    gate = threading.Event()
+    entered = threading.Event()
+
+    class SlowTr(FakeTr):
+        def translate(self, text, src, dst):
+            entered.set()
+            gate.wait(30)
+            return "译"
+
+    many = [Utterance(0.0, 0.2, f"Satz {i}.") for i in range(10)]
+    pcm = np.concatenate([np.concatenate([tone(0.5), silence(0.8)]) for _ in range(12)])
+    out, err = io.BytesIO(), io.StringIO()
+    w = Worker(io.BytesIO(hello() + audio_frames(pcm) + ctl(type="flush")), out,
+               FakeAsr(many), EnergyVad(), translator_factory=lambda s, d: SlowTr(), err=err)
+    try:
+        assert w.run() == EXIT_OK
+        assert entered.wait(10)
+        # 12 段 × 10 句 = 120 句 > 上限；等 asr 线程把它们都处理完
+        assert _wait(lambda: w._asr_q.unfinished_tasks == 0)
+        assert w._tx_q.qsize() <= worker_mod.MAX_TX_BACKLOG
+        assert any(e["ev"] == "status" and e["code"] == "backlog_dropped" for e in _events(out))
+    finally:
+        gate.set()
+    assert _wait(lambda: w._tx_q.unfinished_tasks == 0)
+
+
+def test_stale_translation_is_not_attributed_to_the_next_session():
+    release = threading.Event()
+    entered = threading.Event()
+
+    class GatedTr(FakeTr):
+        def translate(self, text, src, dst):
+            entered.set()
+            release.wait(30)
+            return "旧会话译文"
+
+    out, err = io.BytesIO(), io.StringIO()
+    tr = GatedTr()
+    w = Worker(io.BytesIO(b""), out, FakeAsr([Utterance(0.0, 0.2, "Eins.")]), EnergyVad(),
+               translator_factory=lambda s, d: tr, err=err)
+    msg = json.loads(hello())
+    try:
+        assert w._on_hello(msg) is None
+        w._on_audio(np.concatenate([tone(1.0), silence(1.0)]).astype("<i2").tobytes())
+        assert entered.wait(10)  # 旧会话的翻译正卡在 translator 里
+        assert w._on_hello(msg) is None  # 同语言对的新会话：translator 保留，id 重新从 1 计
+    finally:
+        release.set()
+    assert _wait(lambda: w._tx_q.unfinished_tasks == 0)
+    ev = _events(out)
+    second_ready = [i for i, e in enumerate(ev) if e["ev"] == "ready"][1]
+    assert not [e for e in ev[second_ready:] if e["ev"] in ("translation", "status")]
+
+
+def test_event_writes_survive_partial_writes():
+    class Dribble:
+        def __init__(self):
+            self.buf = bytearray()
+
+        def write(self, view):
+            chunk = bytes(view[:3])
+            self.buf += chunk
+            return len(chunk)
+
+        def flush(self):
+            pass
+
+    out = Dribble()
+    pcm = np.concatenate([tone(1.0), silence(1.0)])
+    w = Worker(io.BytesIO(hello() + audio_frames(pcm) + ctl(type="drain")), out, FakeAsr(),
+               EnergyVad(), translator_factory=lambda s, d: FakeTr(), err=io.StringIO())
+    assert w.run() == EXIT_OK
+    lines = bytes(out.buf).decode("utf-8").splitlines()
+    evs = [json.loads(line) for line in lines]  # 任何一帧被截断都会在这里炸
+    assert evs[0]["ev"] == "ready" and evs[-1] == {"ev": "drained"}
+    assert [e["text"] for e in evs if e["ev"] == "final"][0] == SECRET_SRC
+
+
+def test_failed_translator_construction_is_retried_on_same_pair_hello():
+    calls = []
+
+    def factory(src, dst):
+        calls.append((src, dst))
+        if len(calls) < 3:
+            raise RuntimeError(SECRET_SRC)
+        return FakeTr()
+
+    _c, ev, *_ = run_worker(hello() + hello() + hello(), factory=factory)
+    assert len(calls) == 3
+    notes = [e for e in ev if e["ev"] == "status" and e["code"] == "translator_unavailable"]
+    assert len(notes) == 2
+    readies = [e for e in ev if e["ev"] == "ready"]
+    assert [r["engine"]["translator"] for r in readies] == ["none", "none", "fake"]
+
+
+def test_lone_surrogate_in_text_does_not_drop_the_sentence():
+    asr = FakeAsr([Utterance(0.0, 0.5, "ab\ud800cd.")])
+    pcm = np.concatenate([tone(1.0), silence(1.0)])
+    code, ev, *_ = run_worker(hello() + audio_frames(pcm) + ctl(type="drain"), asr=asr,
+                              translator=FakeTr(result="译\udc00文"))
+    assert code == EXIT_OK
+    final = next(e for e in ev if e["ev"] == "final")
+    assert final["text"].startswith("ab") and final["text"].endswith("cd.")
+    assert any(e["ev"] == "translation" for e in ev)
+
+
+# S-F1：真 AppleTranslator + 吐正文的假 helper，以子进程方式跑 worker
+
+_CHILD_APPLE = r"""
+import os, subprocess, sys
+import numpy as np
+from realtime_subtitle.node import engines, segmenter, worker
+from realtime_subtitle.translate.apple_translate import AppleTranslator
+
+SECRET = os.environ["LEAK_SECRET"]
+
+
+class A(engines.AsrEngine):
+    def load(self):
+        print(SECRET, file=sys.stderr)                      # 第三方库 print 到 stderr
+        print(SECRET)                                       # ……到 stdout
+        subprocess.run([sys.executable, "-c",               # 继承 fd 2 的子进程
+                        "import sys; print(sys.argv[1], file=sys.stderr)", SECRET])
+    def transcribe(self, audio, language):
+        return [engines.Utterance(0.1, 0.5, "Hallo Welt.")]
+    def info(self):
+        return {"model": "fake", "backend": "fake", "rtf": None}
+
+
+class V:
+    def __call__(self, w):
+        return 1.0 if float(np.sqrt((w ** 2).mean())) > 0.02 else 0.0
+    def reset(self):
+        pass
+
+
+engines.WhisperEngine = A
+segmenter.SileroVad = V
+orig = engines.select_translator
+worker.select_translator = lambda s, d: orig(
+    s, d, apple_factory=lambda: AppleTranslator(helper_path=os.environ["FAKE_HELPER"]))
+worker.main()
+"""
+
+_FAKE_HELPER = """#!{py}
+import json, sys
+SECRET = {secret!r}
+print(json.dumps({{"ready": True}}), flush=True)
+for line in sys.stdin:
+    req = json.loads(line)
+    if req["op"] == "status":
+        print(json.dumps({{"id": req["id"], "status": "installed"}}), flush=True)
+        continue
+    open({marker!r}, "w").write("translate")
+    print("kaputt " + SECRET, flush=True)                      # 非 JSON 行
+    print(SECRET, file=sys.stderr, flush=True)                 # helper 自己的 stderr
+    print(json.dumps({{"id": req["id"], "error": SECRET}}), flush=True)  # error 字段
+"""
+
+
+def test_subprocess_apple_helper_output_never_reaches_stderr(tmp_path):
+    secret = "GEHEIM-SATZ-4711-NICHT-LOGGEN"
+    marker = tmp_path / "translate-called"
+    helper = tmp_path / "rstranslate"
+    helper.write_text(_FAKE_HELPER.format(py=sys.executable, secret=secret,
+                                          marker=str(marker)), encoding="utf-8")
+    helper.chmod(0o755)
+    script = tmp_path / "child_apple.py"
+    script.write_text(_CHILD_APPLE, encoding="utf-8")
+    env = dict(os.environ, PYTHONPATH=str(REPO), LEAK_SECRET=secret, FAKE_HELPER=str(helper))
+    p = subprocess.Popen([sys.executable, str(script)], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         cwd=str(REPO), env=env)
+    pcm = np.concatenate([tone(1.0), silence(1.0)])
+    out, err = p.communicate(hello() + audio_frames(pcm) + ctl(type="drain"), timeout=60)
+    assert p.returncode == 0
+    assert marker.exists(), "假 helper 没被真 AppleTranslator 调到，这条测试什么也没证明"
+    events = [json.loads(line) for line in out.decode().splitlines()]
+    assert any(e["ev"] == "status" and e["code"] == "translate_failed" for e in events)
+    assert b"[node.worker]" in err  # 正对照：日志通道本身是通的
+    assert secret.encode() not in err
+    assert secret.encode() not in out
