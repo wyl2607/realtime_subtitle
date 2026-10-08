@@ -29,6 +29,7 @@ stderr，避免依赖库的 print 污染事件流。
 """
 from __future__ import annotations
 
+import faulthandler
 import json
 import os
 import queue
@@ -407,10 +408,30 @@ def main() -> None:
 
     signal.signal(signal.SIGTERM, _term)
 
-    from realtime_subtitle.node.engines import WhisperEngine
-    from realtime_subtitle.node.segmenter import SileroVad
+    # fd 2 已指向 /dev/null，未捕获异常 / 线程异常 / 原生崩溃的默认输出都会消失。
+    # 这里只经 `_log` 写异常类名与线程代号，绝不写 str(e) / traceback 文本（S7：
+    # 异常消息可能含正文）；faulthandler 只输出帧位置（文件/行/函数名）。
+    def _excepthook(exc_type, _exc, _tb):
+        _log(err, "uncaught_exception", err=exc_type.__name__)
 
-    worker = Worker(sys.stdin.buffer, out, WhisperEngine(), SileroVad(), err=err)
+    def _thread_excepthook(args):
+        _log(err, "thread_exception", err=args.exc_type.__name__,
+             thread=getattr(args.thread, "name", None) or "")
+
+    sys.excepthook = _excepthook
+    threading.excepthook = _thread_excepthook
+    faulthandler.enable(file=err)
+
+    try:
+        from realtime_subtitle.node.engines import WhisperEngine
+        from realtime_subtitle.node.segmenter import SileroVad
+
+        asr, vad = WhisperEngine(), SileroVad()
+    except Exception as e:  # noqa: BLE001
+        _log(err, "engine_load_failed", err=type(e).__name__)
+        sys.exit(EXIT_ENGINE)
+
+    worker = Worker(sys.stdin.buffer, out, asr, vad, err=err)
     sys.exit(worker.run())
 
 

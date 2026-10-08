@@ -874,3 +874,80 @@ def test_subprocess_apple_helper_output_never_reaches_stderr(tmp_path):
     assert b"[node.worker]" in err  # 正对照：日志通道本身是通的
     assert secret.encode() not in err
     assert secret.encode() not in out
+
+
+# ---------------------------------------------------------------- CR-002 第 2 轮 R2-D1：崩溃留痕
+
+_SECRET = "SECRET-TRANSCRIPT-TEXT"
+
+_CHILD_FAIL = r"""
+import sys, threading
+from realtime_subtitle.node import engines, segmenter, worker
+
+mode = sys.argv[1]
+
+
+class A(engines.AsrEngine):
+    def __init__(self):
+        if mode == "ctor":
+            raise ValueError("%(s)s")
+        import faulthandler
+        if mode == "fh":
+            assert faulthandler.is_enabled()
+            raise SystemExit(0)
+    def load(self): pass
+    def transcribe(self, audio, language): return []
+    def info(self): return {}
+
+
+class V:
+    def __call__(self, w): return 0.0
+    def reset(self): pass
+
+
+def boom():
+    raise KeyError("%(s)s")
+
+
+def run_and_crash(self):
+    t = threading.Thread(target=boom, name="w1")
+    t.start(); t.join()
+    raise ZeroDivisionError("%(s)s")
+
+
+if mode == "thread":
+    worker.Worker.run = run_and_crash
+
+engines.WhisperEngine = A
+segmenter.SileroVad = V
+worker.main()
+""" % {"s": _SECRET}
+
+
+def _run_fail(mode):
+    env = dict(os.environ, PYTHONPATH=str(REPO))
+    p = subprocess.run([sys.executable, "-c", _CHILD_FAIL, mode], input=b"",
+                       capture_output=True, cwd=str(REPO), env=env, timeout=60)
+    return p.returncode, p.stdout.decode(), p.stderr.decode()
+
+
+def test_engine_construction_failure_is_logged_with_engine_exit_code():
+    code, out, err = _run_fail("ctor")
+    assert code == EXIT_ENGINE
+    assert "engine_load_failed" in err and "ValueError" in err
+    assert _SECRET not in err and _SECRET not in out
+    assert "Traceback" not in err
+
+
+def test_thread_and_main_uncaught_exceptions_leave_class_name_only():
+    code, out, err = _run_fail("thread")
+    assert code == 1
+    assert "thread_exception" in err and "KeyError" in err and "w1" in err
+    assert "uncaught_exception" in err and "ZeroDivisionError" in err
+    assert _SECRET not in err and _SECRET not in out
+    assert "Traceback" not in err
+
+
+def test_faulthandler_is_enabled_in_main():
+    code, _out, err = _run_fail("fh")
+    assert code == 0 and "AssertionError" not in err
