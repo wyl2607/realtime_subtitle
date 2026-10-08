@@ -134,8 +134,8 @@ struct RSLite {
                 onVolatile: { text in
                     writeEvent(clock: clock, startedAt: startedAt, ev: "volatile", id: nil, text: text)
                 },
-                onFinal: { id, text in
-                    writeEvent(clock: clock, startedAt: startedAt, ev: "final", id: id, text: text)
+                onFinal: { id, text, t0, t1 in
+                    writeEvent(clock: clock, startedAt: startedAt, ev: "final", id: id, text: text, t0: t0, t1: t1)
                 },
                 onTranslation: { id, text in
                     writeEvent(clock: clock, startedAt: startedAt, ev: "translation", id: id, text: text)
@@ -192,8 +192,8 @@ struct RSLite {
                 onVolatile: { text in
                     Task { @MainActor in overlay.setVolatile(text) }
                 },
-                onFinal: { id, text in
-                    Task { @MainActor in overlay.addFinal(id: id, text: text) }
+                onFinal: { id, text, t0, t1 in
+                    Task { @MainActor in overlay.addFinal(id: id, text: text, t0: t0, t1: t1) }
                 },
                 onTranslation: { id, text in
                     Task { @MainActor in overlay.addTranslation(id: id, text: text) }
@@ -229,7 +229,9 @@ struct RSLite {
         startedAt: ContinuousClock.Instant,
         ev: String,
         id: Int?,
-        text: String
+        text: String,
+        t0: Double? = nil,
+        t1: Double? = nil
     ) {
         var object: [String: Any] = [
             "t": round3(startedAt.duration(to: clock.now).seconds),
@@ -239,6 +241,8 @@ struct RSLite {
         if let id {
             object["id"] = id
         }
+        if let t0 { object["t0"] = round3(t0) }
+        if let t1 { object["t1"] = round3(t1) }
         guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else {
             return
         }

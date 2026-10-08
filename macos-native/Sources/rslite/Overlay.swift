@@ -3,11 +3,6 @@ import Foundation
 
 @MainActor
 final class OverlayController: NSObject {
-    private struct Line {
-        var original: String
-        var translation: String?
-    }
-
     private let panel: NSPanel
     private let stack = NSStackView()
     private let volatileLabel = NSTextField(labelWithString: "")
@@ -15,8 +10,8 @@ final class OverlayController: NSObject {
     private let pauseItem = NSMenuItem(title: "暂停", action: #selector(togglePause), keyEquivalent: "")
     private let clickThroughItem = NSMenuItem(title: "鼠标穿透", action: #selector(toggleClickThrough), keyEquivalent: "")
 
-    private var lines: [Int: Line] = [:]
-    private var order: [Int] = []
+    // 字幕历史（含已滚出屏幕的行）；界面只画末尾两行。节点精修结果按 P5 在这里替换本机行。
+    private var store = LineStore()
     private var isPaused = false
     private let onPauseChanged: (Bool) -> Void
     private let onQuit: () -> Void
@@ -60,19 +55,19 @@ final class OverlayController: NSObject {
         fitHeight()
     }
 
-    func addFinal(id: Int, text: String) {
-        lines[id] = Line(original: text, translation: nil)
-        order.append(id)
-        trim()
+    func addFinal(id: Int, text: String, t0: Double? = nil, t1: Double? = nil) {
+        store.addLocal(key: id, t0: t0, t1: t1, text: text)
         render()
     }
 
     func addTranslation(id: Int, text: String) {
-        guard var line = lines[id] else {
-            return
-        }
-        line.translation = text
-        lines[id] = line
+        store.setTranslation(key: id, text: text)
+        render()
+    }
+
+    /// 节点的精修句到达（P5）：整体替换被它覆盖的本机行，找不到就按时间插入。
+    func addNodeFinal(nodeID: String, t0: Double?, t1: Double?, src: String, dst: String?) {
+        store.applyNode(nodeID: nodeID, t0: t0, t1: t1, srcText: src, dstText: dst)
         render()
     }
 
@@ -83,7 +78,11 @@ final class OverlayController: NSObject {
 
     /// 菜单栏标题显示当前识别在哪里：音频是否正在离开本机，用户要能一眼看出来。
     func setMode(_ mode: SubtitleMode) {
-        statusItem.button?.title = "字·\(mode.label)"
+        setModeLabel(mode.label)
+    }
+
+    func setModeLabel(_ label: String) {
+        statusItem.button?.title = "字·\(label)"
     }
 
     private func configurePanel() {
@@ -149,12 +148,9 @@ final class OverlayController: NSObject {
             view.removeFromSuperview()
         }
 
-        for id in order.suffix(2) {
-            guard let line = lines[id] else {
-                continue
-            }
-            stack.addArrangedSubview(label(line.original, color: .white, size: 22))
-            if let translation = line.translation, !translation.isEmpty {
+        for line in store.lines.suffix(2) {
+            stack.addArrangedSubview(label(line.srcText, color: .white, size: 22))
+            if let translation = line.dstText, !translation.isEmpty {
                 stack.addArrangedSubview(label(translation, color: NSColor(calibratedRed: 1.0, green: 0.91, blue: 0.58, alpha: 1), size: 22))
             }
         }
@@ -186,13 +182,6 @@ final class OverlayController: NSObject {
         field.maximumNumberOfLines = 3
         field.preferredMaxLayoutWidth = textWidth
         return field
-    }
-
-    private func trim() {
-        while order.count > 2 {
-            let id = order.removeFirst()
-            lines.removeValue(forKey: id)
-        }
     }
 
     @objc private func togglePause() {

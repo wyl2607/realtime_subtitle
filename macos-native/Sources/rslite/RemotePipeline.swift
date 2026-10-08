@@ -529,7 +529,7 @@ final class RemotePipeline: SubtitleEngine, @unchecked Sendable {
                     finalsAfterFlush += 1
                 }
             }
-            callbacks.onFinal(id, body)
+            callbacks.onFinal(id, body, nil, nil)
         case "translation":
             guard let id else { return }
             locked {
