@@ -81,6 +81,19 @@ _STUBS = {
              '  echo $! >> "$STUB_LOG_DIR/nohup.pids"\n'
              'fi\n',
     "sleep": "#!/bin/bash\nexit 0\n",
+    # pgrep（C2 测试隔离）：只在「本测试自己起的进程」里找（pid 清单由 spawn / nohup 桩写），
+    # 仍用真 ps 取命令行、按脚本传来的模式做真实 grep -E；永远看不到测试之外的进程
+    # （例如 mini2 上正在服务的真 v1）。ps / kill 用真的，匹配与复核逻辑照样被真实输出验证。
+    "pgrep": '#!/bin/bash\n'
+             'pat="${@: -1}"\n'
+             'for f in "$STUB_LOG_DIR/spawned.pids" "$STUB_LOG_DIR/nohup.pids"; do\n'
+             '  [ -f "$f" ] || continue\n'
+             '  while read -r p; do\n'
+             '    c=$(ps -o command= -p "$p" 2>/dev/null) || continue\n'
+             '    printf "%s\\n" "$c" | grep -Eq -- "$pat" && echo "$p"\n'
+             '  done < "$f"\n'
+             'done\n'
+             'exit 0\n',
     # mv：STUB_MV_FAIL_PREV=1 时 rs-node → rs-node.prev 失败（F7）
     "mv": '#!/bin/bash\n'
           'if [ -n "${STUB_MV_FAIL_PREV:-}" ] && [ "${1:-}" = "$HOME/rs-node" ] && [ "${2:-}" = "$HOME/rs-node.prev" ]; then exit 1; fi\n'
@@ -416,9 +429,29 @@ V1_ARGS = "--host 100.105.163.59 --port 8791 --token-file /Users/x/.config/rs-re
 V1_CMD = f"/Users/x/rs-remote/venv/bin/python3.13 -m realtime_subtitle.remote.server {V1_ARGS}"
 
 
+MINI2_DECOY = ("venv/bin/python -u -m realtime_subtitle.remote.server --host 100.105.163.59 "
+               "--port 8791 --token-file /Users/yilinwang/.config/rs-remote/token")
+
+
+@pytest.fixture(autouse=True)
+def _real_v1_decoy():
+    """C2 守卫：每个用例期间都有一个「会命中模式的无关进程」（逐字模拟 mini2 上真 v1），
+    它不在任何 pid 清单里；用例结束时必须还活着，否则说明测试碰到了测试之外的进程。"""
+    d = subprocess.Popen(["bash", "-c", 'exec -a "$0" cat', MINI2_DECOY], stdin=subprocess.PIPE,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(0.2)
+    yield d
+    alive = d.poll() is None
+    d.kill()
+    d.wait()
+    d.stdin.close()
+    assert alive, "测试杀掉了测试之外的（模拟真 v1 的）进程"
+
+
 @pytest.fixture
-def spawn():
+def spawn(env):
     procs = []
+    pidfile = env[2] / "spawned.pids"
 
     def _spawn(cmdline):
         # 用 os.environ 而不是桩 PATH：这里要真的 sleep
@@ -427,6 +460,8 @@ def spawn():
         p = subprocess.Popen(["bash", "-c", 'exec -a "$0" cat', cmdline], stdin=subprocess.PIPE,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         procs.append(p)
+        with pidfile.open("a") as f:
+            f.write(f"{p.pid}\n")
         time.sleep(0.3)  # 等 exec 完成，否则 argv 还是 bash 的
         return p
 
@@ -957,3 +992,15 @@ def test_interpreter_options_with_values_are_not_matched(env, spawn, tmp_path, c
     r = _run_stop_v1(e)
     assert "未在运行" in r.stdout
     assert p.poll() is None
+
+
+def test_decoy_real_v1_survives_stop_and_rollback(env, _real_v1_decoy, spawn, tmp_path):
+    """C2：跑一遍 stop + 回滚重拉，与模式相符的无关进程（模拟 mini2 真 v1）必须毫发无损。"""
+    e, home, _l = env
+    e["STUB_V1_CWD"] = str(_make_v1_cwd(tmp_path))
+    e["STUB_NOHUP_SPAWN"] = "1"
+    mine = spawn(V1_CMD)
+    assert "已记录 v1" in _run_stop_v1(e).stdout
+    assert mine.wait(timeout=5) is not None
+    assert "已恢复 v1" in _run_restore(e, home).stdout
+    assert _real_v1_decoy.poll() is None
