@@ -22,6 +22,7 @@
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 10:05 CST: TK-003 C1 修复 c8ec1ca（97 passed）；Coordinator 并发跑两份测试复现 4 failed → C2 blocker：测试会杀掉同用户匹配进程（在 mini2 上跑会杀真 v1）→ 同一 repairer 续修
 - 2026-10-09 09:40 CST: TK-003 repair round2 回收 236531d（91/909 passed，注入复现消失，已 push）；Coordinator 复核发现 C1 blocker：v1 匹配不兼容 mini2 实际的 `python -u -m ...`（NO-MATCH）→ 同一 repairer 续修
 - 2026-10-09 09:25 CST: CR-005 round2：security 实打证实 v1 重拉 `sh -c` 可执行 `$(...)`（R2-S1），default 发现重拉不验存活就报已恢复（R2-D1）→ 统一修法：固定入口 + 白名单参数 + 数组传参 + 存活复核；4 accepted → TK-003 fixing，repair round2
 - 2026-10-09 09:15 CST: TK-003 repair round1 回收 ae49421（68/886 passed，主工作树干净）→ recheck，CR-005 round2 两路派出（security 重点：v1 重拉的 sh -c 注入面）
