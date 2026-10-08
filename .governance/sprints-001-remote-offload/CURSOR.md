@@ -13,7 +13,7 @@
 | TK | 标题 | 状态 |
 |----|------|------|
 | TK-001 | 节点 worker：VAD 分段 + 整段识别 + 可插拔翻译 | done |
-| TK-002 | 节点 gateway：生命周期 + 协议 v2 + 鉴权与上限 | fixing |
+| TK-002 | 节点 gateway：生命周期 + 协议 v2 + 鉴权与上限 | recheck |
 | TK-003 | 一键安装 install_node.sh | planned |
 | TK-004 | rslite：带时间句子 + AudioFanout + 混合替换 + 单实例 | blocked（待 Mac 构建） |
 | TK-005 | rslite：NodeClient v2 + NodeRouter + 本机档门槛 | planned |
@@ -21,6 +21,7 @@
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 06:05 CST: TK-002 repair round1 回收 fd1e75b；主线合进 feat/tk-002（ec6b3e0）使真 worker 联调用例实跑；复核 gateway 100 / 全量 794 passed、ruff 通过 → recheck，CR-003 round2 两路派出。用户告知可用 MacBook Air/mini2（Tailscale）：本云端容器无 tailscale/ssh、100.x 不可达，Mac 侧验证仍需用户在本机起会话
 - 2026-10-09 05:55 CST: CR-002 round4 approve → **TK-001 done**，b2c697e 合并进 feat/macos-native（合并后全量 694 passed、ruff 通过）；待 Mac 回归冒烟。TK-002 repair round1 进行中（sonnet）
 - 2026-10-09 05:48 CST: CR-003 round1 两路回收（default 含真 worker 联调；security 真起 gateway 实打）→ 9 accepted / 3 rejected（F4/F5/S-F5）；F2 用补零 PCM 保持样本时钟，不改冻结的 RFC；node_id/asr_state 归 TK-003，rtf 滑动更新归 TK-001 后续小项 → TK-002 fixing，repair round1（sonnet）
 - 2026-10-09 05:42 CST: TK-001 repair round3 回收 b2c697e（复核 82/694 passed；R3-D1 复现修复前 20.08s 挂起→修复后 0.35s 退出）→ recheck，定向 round4（opus）。CR-003 default 路回收（F1–F6），等 security 路一起分诊
