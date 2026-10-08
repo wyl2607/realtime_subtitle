@@ -5,8 +5,8 @@
 
 | CR | TK | rounds | status | last_action |
 |----|----|--------|--------|-------------|
-| CR-002 | TK-001 | 0 | open | 2026-10-09 04:20 CST: created；executor 3e87063（M2 冒烟 WER 0.88%、延迟中位 3.25s）|
-| CR-001 | TK-004 | 1 | needs_fix | 2026-10-09 04:24 CST: repair 完成 c53ef12（F1–F4、F6），待 round2 复查 |
+| CR-002 | TK-001 | 0 | open | 2026-10-09 04:46 CST: round1 派出（云端）default=opus + security=sonnet |
+| CR-001 | TK-004 | 1 | needs_fix | 2026-10-09 04:46 CST: round2 复查派出（opus，云端仅代码层，待 Mac 构建） |
 
 ## 字段说明
 - **rounds**：已完成的 review 轮数（initial = 1，第一次 recheck = 2，以此类推）
