@@ -12,3 +12,8 @@ python ../scripts/bench/native_score.py --asr-native /tmp/native_asr.jsonl --asr
 rstranslate（常驻翻译服务）：stdin 每行一个 JSON 请求，stdout 每行一个 JSON 响应。
 `swift build -c release --product rstranslate`，然后 `echo '{"id":1,"op":"translate","src":"de","dst":"zh-Hans","text":"Guten Morgen"}' | .build/release/rstranslate`。
 op 为 `translate` 或 `status`；失败返回 `{"id":..,"error":..}` 且进程不退出；启动先输出 `{"ready":true}`。
+
+rslite（实时字幕）：`swift build -c release --product rslite`。
+真机界面：`.build/release/rslite --source tap --src de-DE --dst zh-Hans`；当前分支 `tap/mic` 会提示“采集模块未接入”。
+文件压测：`.build/release/rslite --headless --source file:/path/to/audio.wav --src de-DE --dst zh-Hans`。
+headless 输出 JSONL：`volatile/final/translation/status`，文件结束后等待最后一句翻译完成再退出。
