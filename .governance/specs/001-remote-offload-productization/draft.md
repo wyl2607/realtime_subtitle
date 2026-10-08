@@ -210,3 +210,27 @@
 9. **混合档的错误率评估**：
    - 「最终文本」的定义：精修覆盖到的部分用节点的结果，没覆盖到的保留 B。
    - 用 67s 回放计算，要在评审中确认这个口径。
+
+---
+
+## Review Decision（2026-10-08，Coordinator）
+
+13 条 finding 全部**接受**，没有驳回。理由：每条都有具体证据，修改成本低，而且会直接影响需求里的 Done criteria 或隐私约束。RFC 阶段按以下方式落实：
+
+| ID | 决定 | 落实到 RFC 的改动 |
+|---|---|---|
+| F01 | 接受 | 定义带时间的句子契约：`PipelineCallbacks.onFinal(id, text, t0, t1)`，Overlay 每行记 `{t0,t1,source}`。B 侧开启 `attributeOptions: [.audioTimeRange]`。拿不到时间的句子不参与替换，只按顺序显示。补对齐的单元测试。 |
+| F02 | 接受 | 补「当前节点故障」状态机：会话断线、ping 超时或 1013 时，把节点标记为离线并冷却 60s，然后按分数接入次优节点；都不可用就只保留本机 B。故障期间缺精修的句子留用 B 的版本。验收用例：会话中 kill 掉 mini2 的 worker 或 gateway。 |
+| F03 | 接受 | 拆成两个文件：配置 `nodes.json`（`{id, node_id, url, token_file}`，由安装脚本写入）和运行状态 `node-state.json`（最近的 info、rtf、离线冷却到期时间，仅缓存，可以删）。都是 0600，写临时文件再 rename，保证原子写。节点地址用 Tailscale **MagicDNS 名**，配合 `node_id` 校验（同时处理 S5）。 |
+| F04 | 接受 | 安装分三步：preflight（磁盘、uv、swift、Tailscale、ssh 主机白名单）→ 部署到 `~/rs-node.new`，自检通过后原子换名，旧目录保留为 `~/rs-node.prev`，旧的 `~/rs-remote` 只停进程、不删 → launchd 启动失败或自检失败就回滚到 `.prev`，并打印告警。 |
+| F05 | 接受 | `power_compare.sh` 扩展为空闲、B、C、A、混合五组，A 版用 `start.sh` 加文件回放注入；结果写进文档。列入影响面和验收。 |
+| S1 | 接受 | 节点的 Ollama 适配器在构造时就调用 `_assert_local_ollama()`，地址取自 `ollama_url()`，并补测试。 |
+| S2 | 接受 | plist 不再写死 IP。gateway 每次启动用 `tailscale ip -4` 查本机地址，再经 `validate_host` 校验；bind 失败时指数退避（最长 60s）并打日志；任何情况下都不绑通配地址。 |
+| S3 | 接受 | 套接字目录 `~/Library/Application Support/rs-node/` 设为 0700 并检查属主；启动时用 lstat 拒绝 symlink 后再 unlink；每次 accept 后用 `getpeereid` 校验调用方 uid 是本人。 |
+| S4 | 接受 | 单帧 `max_size` 64KB；握手到 hello 5s 超时；只接受 sample_rate 16000、s16le 格式；单次会话最长 4h；音频入队有上限，超出就丢最旧的并告警。 |
+| S5 | 接受 | 建立会话前先比对 `/v1/info` 返回的 `node_id`；每个节点用独立的 token。 |
+| S6 | 接受 | 主机名用白名单 `^[A-Za-z0-9._@-]+$` 校验，传给 ssh 时前面加 `--`。 |
+| S7 | 接受 | 日志规范：gateway、worker、LaunchAgent 只记事件类型、时长、字节数和错误码，不记转录或翻译正文；补测试断言日志里不出现正文。 |
+| S8 | 接受 | `/v1/info` 返回 `node_id`（安装时随机生成）和 `hw_hash`（hw_uuid 的 sha256 前 16 位，只用于判断「是不是我自己」），用 `in_use: bool` 取代 `user_idle_s`。 |
+
+另外，评审之后实测到一个事实：mini2 **没有开自动登录**。这印证了 §4 第 2 条风险。RFC 里明确两点：节点依赖用户已登录；mini2 重启后、用户登录之前，节点不可用，客户端会按 F02 自动回退。是否开自动登录由用户决定。
