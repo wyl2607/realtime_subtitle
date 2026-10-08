@@ -204,19 +204,102 @@ struct LineStore {
         return overlap >= duration * replaceRatio - epsilon
     }
 
-    /// 按 t0 升序插入；同 t0 排在后面；没有时间的行放末尾（只会是本机行，按到达顺序）。
+    /// 本机行一律按到达顺序追加（Pipeline 自己保证顺序，且可能没有时间）；
+    /// 只有节点行按 t0 定位：插在第一条 t0 更大的「有时间的行」之前，找不到就插在最后一条
+    /// 有时间的行之后；t0 为 nil 的行不参与定位（它们的位置只由到达顺序决定）。
     private mutating func insert(_ line: SubtitleLine) {
-        if let t0 = line.t0 {
-            let index = lines.firstIndex { other in
-                guard let o = other.t0 else { return true }
-                return o > t0
-            } ?? lines.count
-            lines.insert(line, at: index)
+        if case .node = line.source, let t0 = line.t0 {
+            if let index = lines.firstIndex(where: { ($0.t0 ?? -Double.infinity) > t0 }) {
+                lines.insert(line, at: index)
+            } else if let last = lines.lastIndex(where: { $0.t0 != nil }) {
+                lines.insert(line, at: last + 1)
+            } else {
+                lines.append(line)
+            }
         } else {
             lines.append(line)
         }
         if lines.count > capacity {
             lines.removeFirst(lines.count - capacity)
         }
+    }
+
+    /// 静态自检：返回失败描述，全部通过返回空数组。入口（--selftest）由 TK-005 接线。
+    static func selfTest() -> [String] {
+        var failures: [String] = []
+        func check(_ ok: Bool, _ name: String) {
+            if !ok { failures.append(name) }
+        }
+        func keys(_ s: LineStore) -> [Int] { s.lines.map(\.key) }
+
+        // 刚好 50%：本机 [0,10]，节点 [5,20] 重叠 5 = 50% -> 替换
+        do {
+            var s = LineStore()
+            s.addLocal(key: 1, t0: 0, t1: 10, text: "a")
+            let r = s.applyNode(nodeID: "n", t0: 5, t1: 20, srcText: "x", dstText: nil)
+            check(r == [1], "刚好50%应替换")
+            check(s.lines.count == 1 && s.lines[0].key < 0, "刚好50%后只剩节点行")
+        }
+        // 略低于 50%：节点 [5.01,20] 重叠 4.99 -> 不替换，节点行插在本机行之后
+        do {
+            var s = LineStore()
+            s.addLocal(key: 1, t0: 0, t1: 10, text: "a")
+            let r = s.applyNode(nodeID: "n", t0: 5.01, t1: 20, srcText: "x", dstText: nil)
+            check(r.isEmpty, "略低于50%不应替换")
+            check(s.lines.count == 2 && s.lines[0].key == 1 && s.lines[1].key < 0, "略低于50%应并存且节点在后")
+        }
+        // 一行替换多行：节点 [0,30] 覆盖三条本机行
+        do {
+            var s = LineStore()
+            s.addLocal(key: 1, t0: 0, t1: 8, text: "a")
+            s.addLocal(key: 2, t0: 9, t1: 18, text: "b")
+            s.addLocal(key: 3, t0: 19, t1: 29, text: "c")
+            s.addLocal(key: 4, t0: 40, t1: 50, text: "d")
+            let r = s.applyNode(nodeID: "n", t0: 0, t1: 30, srcText: "x", dstText: "y")
+            check(Set(r) == [1, 2, 3], "一行替换多行：被替换集合")
+            check(s.lines.count == 2 && s.lines[0].key < 0 && s.lines[1].key == 4, "一行替换多行：剩余顺序")
+        }
+        // 无匹配时按 t0 插入到两条有时间行之间，且避开 nil 行
+        do {
+            var s = LineStore()
+            s.addLocal(key: 1, t0: 0, t1: 5, text: "a")
+            s.addLocal(key: 2, t0: nil, t1: nil, text: "n")
+            s.addLocal(key: 3, t0: 30, t1: 35, text: "c")
+            s.applyNode(nodeID: "n", t0: 10, t1: 12, srcText: "x", dstText: nil)
+            check(keys(s).count == 4 && keys(s)[0] == 1 && keys(s)[1] == 2 && keys(s)[2] < 0 && keys(s)[3] == 3,
+                  "无匹配插入应在有时间行之间且不被 nil 行打乱")
+        }
+        // 无匹配且比所有有时间行都晚：插在最后一条有时间行之后（nil 行之前）
+        do {
+            var s = LineStore()
+            s.addLocal(key: 1, t0: 0, t1: 5, text: "a")
+            s.addLocal(key: 2, t0: nil, t1: nil, text: "n")
+            s.applyNode(nodeID: "n", t0: 50, t1: 52, srcText: "x", dstText: nil)
+            check(keys(s).count == 3 && keys(s)[0] == 1 && keys(s)[1] < 0 && keys(s)[2] == 2,
+                  "最晚节点行应紧跟最后一条有时间行")
+        }
+        // 本机行按到达顺序追加，即使 t0 更小
+        do {
+            var s = LineStore()
+            s.addLocal(key: 1, t0: 10, t1: 12, text: "a")
+            s.addLocal(key: 2, t0: 3, t1: 4, text: "b")
+            check(keys(s) == [1, 2], "本机行应按到达顺序追加")
+        }
+        // 节点行不会被二次替换
+        do {
+            var s = LineStore()
+            s.applyNode(nodeID: "n1", t0: 0, t1: 10, srcText: "x", dstText: nil)
+            let first = keys(s)
+            let r = s.applyNode(nodeID: "n2", t0: 0, t1: 10, srcText: "y", dstText: nil)
+            check(r.isEmpty && s.lines.count == 2 && s.lines.contains { $0.key == first[0] }, "节点行不应被二次替换")
+        }
+        // 无时间的本机行不会被替换
+        do {
+            var s = LineStore()
+            s.addLocal(key: 1, t0: nil, t1: nil, text: "a")
+            let r = s.applyNode(nodeID: "n", t0: 0, t1: 10, srcText: "x", dstText: nil)
+            check(r.isEmpty, "无时间本机行不应被替换")
+        }
+        return failures
     }
 }

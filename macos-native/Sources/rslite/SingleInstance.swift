@@ -17,11 +17,14 @@ enum SingleInstance {
         guard heldDescriptor < 0 else {
             return true
         }
+        let directory = lockURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(
-            at: lockURL.deletingLastPathComponent(),
+            at: directory,
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
+        // 目录可能是更早以别的权限建出来的；无论新建还是已存在，都收紧到 0700
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
         let fd = open(lockURL.path, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
         guard fd >= 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)

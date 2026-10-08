@@ -364,19 +364,27 @@ struct AnalyzerInputSequence: AsyncSequence, Sendable {
         var sourceIterator: AsyncStream<TimedAudio>.Iterator
         let converter: AVAudioConverter?
         let analyzerFormat: AVAudioFormat
-        // 只有第一块显式带起点（统一样本时钟）：之后让 analyzer 自己顺着数，
-        // 重采样每块的帧数会差几个样本，逐块都标时间反而会出现微小重叠/空洞
-        var isFirst = true
+        // 第一块显式带起点（统一样本时钟）；之后让 analyzer 自己顺着数，
+        // 重采样每块的帧数会差几个样本，逐块都标时间反而会出现微小重叠/空洞。
+        // 例外：B 路订阅是 bufferingNewest，慢了会丢块，analyzer 照旧顺着数就会把
+        // 之后所有时间整体前移（t0/t1 与节点对不上）。所以用 ContinuityTracker 检测
+        // 跳变，跳变的那一块重新显式打起点。
+        var continuity = ContinuityTracker()
 
         mutating func next() async throws -> AnalyzerInput? {
             guard let converter else {
                 throw PipelineError.unavailable("无法创建音频格式转换器")
             }
             while let timed = await sourceIterator.next() {
+                let verdict = continuity.observe(start: timed.startSeconds, duration: timed.duration)
                 let converted = try Pipeline.convert(timed.buffer, using: converter, to: analyzerFormat)
                 if converted.frameLength > 0 {
-                    if isFirst {
-                        isFirst = false
+                    if verdict.needsExplicitStart {
+                        if let gap = verdict.gapSeconds {
+                            // 只打时长，不含任何识别文字
+                            FileHandle.standardError.write(Data(
+                                "rslite: B 路丢块，重设时间戳（跳变 \(String(format: "%.3f", gap))s）\n".utf8))
+                        }
                         let start = CMTime(seconds: timed.startSeconds, preferredTimescale: 1_000_000)
                         return AnalyzerInput(buffer: converted, bufferStartTime: start)
                     }
@@ -385,6 +393,35 @@ struct AnalyzerInputSequence: AsyncSequence, Sendable {
             }
             return nil
         }
+    }
+}
+
+/// 检测送进 analyzer 的音频块在统一样本时钟上是否连续。
+/// 预期起点 = 上一块起点 + 上一块时长（都在源采样率侧算，不受重采样帧数误差影响）。
+/// 容差取 10ms（一个 10ms 帧）：样本时钟是整数帧累加，正常连续时偏差只有浮点误差
+/// （远小于 1ms）；真正丢一块至少丢掉一个 10ms 以上的缓冲，容差再大就会漏检短丢块，
+/// 再小则可能被浮点噪声误报。
+struct ContinuityTracker {
+    static let tolerance = 0.010
+
+    struct Verdict {
+        var needsExplicitStart: Bool
+        /// 仅当检测到跳变时有值：实际起点 - 预期起点（秒）。
+        var gapSeconds: Double?
+    }
+
+    private var expectedNext: Double?
+
+    mutating func observe(start: Double, duration: Double) -> Verdict {
+        defer { expectedNext = start + duration }
+        guard let expected = expectedNext else {
+            return Verdict(needsExplicitStart: true, gapSeconds: nil)
+        }
+        let gap = start - expected
+        if abs(gap) > Self.tolerance {
+            return Verdict(needsExplicitStart: true, gapSeconds: gap)
+        }
+        return Verdict(needsExplicitStart: false, gapSeconds: nil)
     }
 }
 

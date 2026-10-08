@@ -29,6 +29,10 @@ final class AudioFanout: @unchecked Sendable {
     private let lock = NSLock()
     private var source: AudioSource?
     private var pump: Task<Void, Never>?
+    /// 轮次号：每次 start() +1。订阅者记录自己归属的轮次（订阅时的 generation + 1，即紧随其后的那次 start）；pump 自然退出时只结束
+    /// 归属本轮及更早的订阅者，不误伤下一轮 start 前新订阅的。
+    private var generation = 0
+    private var subscriberGeneration: [UUID: Int] = [:]
     private var subscribers: [UUID: AsyncStream<TimedAudio>.Continuation] = [:]
     /// 之前所有运行累计的时长（秒）。
     private var elapsedBeforeRun = 0.0
@@ -71,6 +75,7 @@ final class AudioFanout: @unchecked Sendable {
         }
         lock.lock()
         subscribers[id] = continuation
+        subscriberGeneration[id] = generation + 1 // 归属于下一次 start() 的那一轮
         lock.unlock()
         return stream
     }
@@ -84,17 +89,26 @@ final class AudioFanout: @unchecked Sendable {
         // 来源自然结束（文件放完）时不会走 stop()，在这里把上一轮的时长并进时钟
         elapsedBeforeRun += runSeconds
         runSeconds = 0
+        generation += 1
+        let myGeneration = generation
         lock.unlock()
 
-        pump = Task.detached(priority: .userInitiated) { [weak self, stream] in
+        let newPump = Task.detached(priority: .userInitiated) { [weak self, stream] in
             for await buffer in stream {
                 guard let self else {
                     return
                 }
                 self.dispatch(buffer)
             }
-            self?.finishSubscribers()
+            // 被 cancel 退出说明是 stop() 在收尾，清理交给 stop；自然结束才在这里清
+            guard !Task.isCancelled else {
+                return
+            }
+            self?.finishSubscribers(upToGeneration: myGeneration)
         }
+        lock.lock()
+        pump = newPump
+        lock.unlock()
     }
 
     func stop() {
@@ -109,7 +123,7 @@ final class AudioFanout: @unchecked Sendable {
 
         source?.stop()
         pump?.cancel()
-        finishSubscribers()
+        finishSubscribers(upToGeneration: nil)
     }
 
     private func dispatch(_ buffer: AVAudioPCMBuffer) {
@@ -125,10 +139,18 @@ final class AudioFanout: @unchecked Sendable {
         }
     }
 
-    private func finishSubscribers() {
+    /// generation 为 nil 结束全部；否则只结束订阅轮次 <= 该值的（即本轮 start 时已在的）。
+    private func finishSubscribers(upToGeneration generation: Int?) {
         lock.lock()
-        let targets = Array(subscribers.values)
-        subscribers.removeAll()
+        var targets: [AsyncStream<TimedAudio>.Continuation] = []
+        for (id, continuation) in subscribers {
+            if let generation, let g = subscriberGeneration[id], g > generation {
+                continue
+            }
+            targets.append(continuation)
+            subscribers.removeValue(forKey: id)
+            subscriberGeneration.removeValue(forKey: id)
+        }
         lock.unlock()
         for target in targets {
             target.finish()
@@ -138,6 +160,7 @@ final class AudioFanout: @unchecked Sendable {
     private func removeSubscriber(_ id: UUID) {
         lock.lock()
         subscribers.removeValue(forKey: id)
+        subscriberGeneration.removeValue(forKey: id)
         lock.unlock()
     }
 }
