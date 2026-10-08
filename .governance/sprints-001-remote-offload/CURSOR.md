@@ -4,7 +4,7 @@
 <!-- Machine fields: new writes must use "- key: `value`". Legacy variants are read-only compatibility. -->
 - current_phase: `review`
 - current_tk: `TK-003`
-- current_cr: `—`
+- current_cr: `CR-005`
 - current_round: `1`
 - escalated: `false`
 
@@ -15,13 +15,14 @@
 | TK-001 | 节点 worker：VAD 分段 + 整段识别 + 可插拔翻译 | done |
 | TK-001b | worker：会话结束滑动更新 rtf | done |
 | TK-002 | 节点 gateway：生命周期 + 协议 v2 + 鉴权与上限 | done |
-| TK-003 | 一键安装 install_node.sh | executing |
+| TK-003 | 一键安装 install_node.sh | reviewing |
 | TK-004 | rslite：带时间句子 + AudioFanout + 混合替换 + 单实例 | done |
 | TK-005 | rslite：NodeClient v2 + NodeRouter + 本机档门槛 | planned |
 | TK-006 | 清理 v1 + 文档 | planned |
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 08:45 CST: TK-003 回报 34ef67b（52/870 passed、shellcheck 通过，已 push）→ reviewing，CR-005 round1 两路派出
 - 2026-10-09 08:28 CST: TK-003 → executing（sonnet，分支 feat/tk-003，单独一批）；write_scope 增补 tests/test_install_node.py；安装自检 rtf 用目标机 `say`+`afconvert` 合成德语样音
 - 2026-10-09 08:25 CST: CR-004 round3 approve → **TK-001b done**，合并进 feat/macos-native。下一批：TK-003 install_node.sh（安全类，单独一批）
 - 2026-10-09 08:15 CST: CR-004 round2 approve（F1/F2 fixed，R2-D1 low rejected）→ round3（opus，整体通读 + 端到端）

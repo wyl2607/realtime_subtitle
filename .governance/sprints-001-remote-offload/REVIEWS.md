@@ -5,6 +5,7 @@
 
 | CR | TK | rounds | status | last_action |
 |----|----|--------|--------|-------------|
+| CR-005 | TK-003 | 0 | open | 2026-10-09 08:45 CST: created；executor 34ef67b（52/870 passed，bash -n/shellcheck 通过）→ round1 default=opus + security=sonnet |
 | CR-004 | TK-001b | 3 | resolved | 2026-10-09 08:25 CST: round3 approve（端到端 rtf None→0.0101→0.037 滑动）；三轮收敛，已合并 |
 | CR-003 | TK-002 | 4 | resolved | 2026-10-09 07:30 CST: round4 approve；四轮收敛（15 accepted / 6 rejected），已合并（PR #62） |
 | CR-002 | TK-001 | 4 | resolved | 2026-10-09 05:55 CST: round4 approve；四轮收敛（14 accepted / 2 rejected），b2c697e 已合进 feat/macos-native |
