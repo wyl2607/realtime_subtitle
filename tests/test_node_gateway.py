@@ -1574,3 +1574,34 @@ def test_stale_worker_events_and_exit_do_not_leak_into_new_session(tmp_path, mon
 
     asyncio.run(scenario())
     assert "session_worker_exit" not in caplog.text
+
+
+def test_real_worker_keepalive_reap_by_sigterm_still_updates_rtf(tmp_path, monkeypatch):
+    """CR-004 F1：gateway 结束会话不发 drain、不关 stdin，保温到期只 SIGTERM 回收；
+    最常见路径「一个会话 -> 空闲 -> 回收」也必须把 rtf 落盘。"""
+    child = REAL_WORKER_CHILD.replace(
+        "worker.main()",
+        "from pathlib import Path\nworker.STATE_DIR = Path(os.environ['RTF_DIR'])\nworker.main()")
+    monkeypatch.setattr(sys.modules[__name__], "REAL_WORKER_CHILD", child)
+    monkeypatch.setattr(gw_mod, "WORKER_KEEPALIVE_S", 0.5)
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setenv("RTF_DIR", str(state))
+
+    async def scenario():
+        async with running_real_worker(tmp_path, monkeypatch) as gw:
+            ws = await uds_connect(gw)
+            await ws.send(json.dumps(HELLO))
+            audio = _tone(6.0) + _silence(0.4)  # 一段 >=5s
+            for i in range(0, len(audio), 3200):
+                await ws.send(audio[i:i + 3200])
+            await ws.send(json.dumps({"type": "flush"}))
+            await _recv_until(ws, lambda e: e["ev"] == "translation", 30)
+            await ws.close()
+            await until(lambda: not gw._session_active)
+            await until(lambda: gw.worker.state == "cold", timeout=15, what="keepalive reap")
+
+    asyncio.run(scenario())
+    f = state / "asr_state.json"
+    assert f.exists()
+    assert 0 <= json.loads(f.read_text(encoding="utf-8"))["rtf"] < 1

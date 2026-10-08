@@ -309,14 +309,26 @@ class Worker:
 
     # ------------------------------------------------------------ rtf 持久化
 
-    def _finish_session(self) -> None:
+    def _finish_session(self, lock_timeout: float | None = None) -> None:
         """会话结束（下一条 hello / stdin EOF）：把本会话 rtf 滑动并入 asr_state.json。
 
         任何失败只记日志：这只是给 /v1/info 的路由提示，不能影响会话与退出码。
+
+        lock_timeout 仅供 SIGTERM 处理函数用：handler 跑在主线程，可能打断持锁中的
+        主线程，普通 `with` 会死锁，所以限时拿锁，拿不到就放弃收口。累计值在锁内
+        取走并清零，这同时是防重入：EOF / hello 路径已在收口时，handler 读到 0
+        会因样本不足而跳过，不会重复写。
         """
-        with self._state_lock:
+        if lock_timeout is None:
+            self._state_lock.acquire()
+        elif not self._state_lock.acquire(timeout=lock_timeout):
+            self.log("rtf_skipped", reason="lock_busy_on_term")
+            return
+        try:
             audio_s, asr_s = self._sess_audio_s, self._sess_asr_s
             self._sess_audio_s = self._sess_asr_s = 0.0
+        finally:
+            self._state_lock.release()
         if self._seg is None:
             return  # 还没有过会话
         if audio_s < RTF_MIN_AUDIO_S:
@@ -495,7 +507,20 @@ def main() -> None:
     os.close(devnull)
     sys.stdout = sys.stderr = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
 
+    holder: list = []  # Worker 在 main 末尾才建；handler 经此访问，建好前为空
+
     def _term(_signum, _frame):
+        # gateway 保温到期只发 SIGTERM（不 drain、不关 stdin），EOF 路径走不到，
+        # 所以在这里尽力收口当前会话的 rtf；只用已累计数据，不等在飞识别，
+        # 限时拿锁（0.5s）远小于 gateway 的 3s 宽限，任何异常吞掉照常退出。
+        if holder:
+            try:
+                holder[0]._finish_session(lock_timeout=0.5)
+            except BaseException as e:  # noqa: BLE001
+                try:
+                    _log(err, "rtf_write_failed", err=type(e).__name__)
+                except BaseException:  # noqa: BLE001
+                    pass
         try:
             err.flush()
         except Exception:  # noqa: BLE001
@@ -536,6 +561,7 @@ def main() -> None:
         sys.exit(EXIT_ENGINE)
 
     worker = Worker(sys.stdin.buffer, out, asr, vad, err=err)
+    holder.append(worker)
     sys.exit(worker.run())
 
 

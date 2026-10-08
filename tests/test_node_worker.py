@@ -1192,3 +1192,60 @@ def test_write_failure_is_logged_and_does_not_change_exit_code(tmp_path, monkeyp
     assert "rtf_write_failed err=PermissionError" in err
     assert SECRET_SRC not in err
     assert list(tmp_path.iterdir()) == []  # 临时文件已清理
+
+
+# ---------------------------------------------------------------- SIGTERM 回收也要收口 rtf（CR-004 F1/F2）
+
+_CHILD_RTF = _CHILD.replace(
+    "worker.main()",
+    "from pathlib import Path\nworker.STATE_DIR = Path(os.environ['RTF_DIR'])\nworker.main()",
+).replace("import sys\n", "import os, sys\n", 1)
+
+
+def _read_events_until(p, pred, timeout=30.0):
+    """从子进程 stdout 逐行读事件直到 pred 满足；用读线程 + 事件，不靠固定 sleep。"""
+    got, done = [], threading.Event()
+
+    def reader():
+        for line in p.stdout:
+            ev = json.loads(line)
+            got.append(ev)
+            if pred(got):
+                done.set()
+                return
+
+    threading.Thread(target=reader, daemon=True).start()
+    assert done.wait(timeout), f"timeout; got {got}"
+    return got
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows 的 terminate() 没有 SIGTERM 处理函数")
+def test_subprocess_sigterm_mid_session_still_updates_rtf(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    env = dict(os.environ, PYTHONPATH=str(REPO), RTF_DIR=str(state))
+    p = subprocess.Popen([sys.executable, "-c", _CHILD_RTF], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         cwd=str(REPO), env=env)
+    try:
+        pcm = np.concatenate([tone(6.0), silence(0.4)])  # 一段 >=5s，flush 后识别并累计
+        p.stdin.write(hello() + audio_frames(pcm) + ctl(type="flush"))
+        p.stdin.flush()  # 不关 stdin：模拟 gateway 保温到期只发 SIGTERM
+        _read_events_until(
+            p, lambda evs: any(e["ev"] == "translation" for e in evs))
+        p.send_signal(signal.SIGTERM)
+        assert p.wait(10) == 0
+        err = p.stderr.read().decode()
+    finally:
+        p.kill()
+        p.stdin.close()
+        p.stdout.close()
+        p.stderr.close()
+    f = state / info_mod.ASR_STATE_FILENAME
+    assert f.exists()
+    assert (f.stat().st_mode & 0o777) == 0o600
+    data = json.loads(f.read_text(encoding="utf-8"))
+    assert 0 <= data["rtf"] < 1
+    assert set(data) == {"model", "backend", "rtf", "translator"}
+    assert "Hallo Welt" not in f.read_text(encoding="utf-8") + err
+    assert "你好世界" not in f.read_text(encoding="utf-8") + err
