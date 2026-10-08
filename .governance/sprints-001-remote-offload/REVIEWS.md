@@ -6,7 +6,7 @@
 | CR | TK | rounds | status | last_action |
 |----|----|--------|--------|-------------|
 | CR-002 | TK-001 | 0 | open | 2026-10-09 04:46 CST: round1 派出（云端）default=opus + security=sonnet |
-| CR-001 | TK-004 | 1 | needs_fix | 2026-10-09 04:46 CST: round2 复查派出（opus，云端仅代码层，待 Mac 构建） |
+| CR-001 | TK-004 | 2 | needs_fix | 2026-10-09 04:52 CST: round2 approve（代码层），N1/N2/N3 accepted → repair round2 派出（sonnet，待 Mac 构建） |
 
 ## 字段说明
 - **rounds**：已完成的 review 轮数（initial = 1，第一次 recheck = 2，以此类推）
