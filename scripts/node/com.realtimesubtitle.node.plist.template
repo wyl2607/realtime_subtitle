@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  节点 gateway 的 LaunchAgent 模板（install_node.sh 把 @HOME@ 替换成目标机的家目录）。
+  - 用 LaunchAgent 而不是 LaunchDaemon：Metal 和系统翻译都需要用户登录会话（RFC 架构选择第 1 条）。
+  - 不写 IP：gateway 每次启动自己 `tailscale ip -4`（S2），IP 变了重启即可。
+  - 不放 token：只给 token 文件路径（S5），plist 是 0644 可读的。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.realtimesubtitle.node</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@HOME@/rs-node/venv/bin/python</string>
+        <string>-m</string>
+        <string>realtime_subtitle.node.gateway</string>
+        <string>--token-file</string>
+        <string>@HOME@/.config/rs-node/token</string>
+    </array>
+
+    <!-- python -m 靠工作目录把仓库根放进 sys.path -->
+    <key>WorkingDirectory</key>
+    <string>@HOME@/rs-node</string>
+
+    <!-- launchd 的默认 PATH 只有 /usr/bin:/bin:...，找不到 tailscale 命令行 -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>@HOME@/Library/Logs/rs-node/gateway.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>@HOME@/Library/Logs/rs-node/gateway.err.log</string>
+</dict>
+</plist>
