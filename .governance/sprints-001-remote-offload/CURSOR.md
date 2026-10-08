@@ -22,6 +22,7 @@
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 08:15 CST: CR-004 round2 approve（F1/F2 fixed，R2-D1 low rejected）→ round3（opus，整体通读 + 端到端）
 - 2026-10-09 08:08 CST: TK-001b repair round1 回收 18b9595（192/818 passed）→ recheck，CR-004 round2（opus）
 - 2026-10-09 08:00 CST: CR-004 round1：派审前疑点被真 gateway+真 worker 复现证实（会话→断开→回收不写 asr_state.json）→ F1/F2 accepted、F3 rejected → TK-001b fixing，repair round1（sonnet）
 - 2026-10-09 07:50 CST: TK-001b 回报 ce63a76（190/816 passed，已 push）→ reviewing，CR-004 round1（opus）；派审前发现疑点：SIGTERM 回收路径不 finish_session，常见路径可能不更新 rtf
