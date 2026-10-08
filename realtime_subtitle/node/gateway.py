@@ -399,15 +399,19 @@ class WorkerManager:
                 line = await proc.stdout.readline()
                 if not line:
                     break
-                self._deliver(line)
+                self._deliver(proc, line)
         except ValueError:
             # 单行超过上限：worker 坏了，掐掉它，走下面统一的退出处理
             log.error("worker_line_too_long limit_bytes=%d", _WORKER_LINE_LIMIT)
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
         rc = await proc.wait()
-        if self._proc is proc:
-            self._proc = None
+        if self._proc is not proc:
+            # 旧 worker 已被新 worker 取代（returncode 已置但 stdout 被孙进程占住、
+            # 迟迟没 EOF）：它的退出码不属于当前会话，不能报给新会话。
+            log.debug("worker_exit_stale code=%d", rc)
+            return
+        self._proc = None
         if self._reaping is proc:
             return  # 我们自己回收的，不是崩溃
         if rc != 0:
@@ -418,7 +422,10 @@ class WorkerManager:
         if sink is not None:
             sink.on_worker_exit(rc)
 
-    def _deliver(self, line: bytes) -> None:
+    def _deliver(self, proc: asyncio.subprocess.Process, line: bytes) -> None:
+        if proc is not self._proc:
+            log.debug("worker_event_stale bytes=%d", len(line))
+            return  # 旧 worker 迟到的事件：不属于当前 worker 的会话与计数
         try:
             ev = json.loads(line)
         except (ValueError, RecursionError):

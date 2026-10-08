@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import socket
+import signal
 import stat
 import subprocess
 import sys
@@ -1527,3 +1528,49 @@ def test_real_worker_disconnect_during_cold_load_then_new_session_gets_one_own_r
     assert readies[0]["cold"] is False  # 会话 1 的 ready 是 cold=True，不能漏给会话 2
     final = next(e for e in evs if e["ev"] == "final")
     assert final["text"] == "Hallo Welt." and final["id"] == 1
+
+
+def test_stale_worker_events_and_exit_do_not_leak_into_new_session(tmp_path, monkeypatch, caplog):
+    """R3-D1：旧 worker 被 SIGKILL（returncode 已置）但 stdout 被孙进程占住没 EOF 时，
+    新会话 spawn 了新 worker；旧读事件协程迟到的 EOF/退出码不得断开新会话。"""
+    monkeypatch.setattr(gw_mod, "WORKER_KEEPALIVE_S", 30)
+    script = tmp_path / "fake_worker.py"
+    script.write_text(FAKE_WORKER)
+    rec = tmp_path / "worker.rec"
+
+    async def scenario():
+        gw = Gateway(
+            token=TOKEN,
+            uds_dir=make_dir(tmp_path),
+            port=0,
+            # 孙进程 sleep 继承 stdout 管道，worker 被杀后管道仍不 EOF
+            worker_argv=["sh", "-c", 'sleep 2 & exec "$0" "$@"', sys.executable, str(script), "echo", str(rec)],
+            resolve_host=lambda: "127.0.0.1",
+            allow_non_tailscale_for_tests=True,
+        )
+        await gw.start()
+        await asyncio.wait_for(gw.tcp_ready.wait(), 5)
+        try:
+            ws1 = await uds_connect(gw)
+            assert (await hello_ready(ws1))["ev"] == "ready"
+            old_pid, old_reader = gw.worker.pid, gw.worker._reader
+            await ws1.close()
+            await until(lambda: not gw._session_active)
+            os.kill(old_pid, signal.SIGKILL)  # 保温期内被杀
+            await until(lambda: gw.worker.state == "cold", what="old worker cold")
+            assert not old_reader.done()  # 孙进程占着 stdout：旧协程还没收到 EOF
+
+            ws2 = await uds_connect(gw)
+            assert (await hello_ready(ws2))["ev"] == "ready"
+            assert gw.worker.pid not in (None, old_pid)
+            await until(old_reader.done, timeout=10, what="old reader EOF")
+            await ws2.send(json.dumps({"type": "flush"}))
+            evs = [json.loads(await asyncio.wait_for(ws2.recv(), 8)) for _ in range(2)]
+            assert [e["ev"] for e in evs] == ["final", "translation"]
+            assert ws2.close_code is None
+            await ws2.close()
+        finally:
+            await gw.stop()
+
+    asyncio.run(scenario())
+    assert "session_worker_exit" not in caplog.text
