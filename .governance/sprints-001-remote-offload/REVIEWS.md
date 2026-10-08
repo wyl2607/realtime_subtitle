@@ -5,7 +5,7 @@
 
 | CR | TK | rounds | status | last_action |
 |----|----|--------|--------|-------------|
-| CR-002 | TK-001 | 0 | open | 2026-10-09 04:46 CST: round1 派出（云端）default=opus + security=sonnet |
+| CR-002 | TK-001 | 1 | needs_fix | 2026-10-09 05:00 CST: round1 两路 needs_fix，11 accepted / 0 rejected → repair round1（sonnet） |
 | CR-001 | TK-004 | 2 | needs_fix | 2026-10-09 04:52 CST: round2 approve（代码层），N1/N2/N3 accepted → repair round2 派出（sonnet，待 Mac 构建） |
 
 ## 字段说明
