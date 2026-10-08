@@ -627,6 +627,7 @@ def test_subprocess_stdout_carries_only_json_events():
     assert "Hallo Welt" not in err.decode()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows 的 terminate() 是 TerminateProcess，没有 SIGTERM 处理函数可测")
 def test_subprocess_exits_zero_on_sigterm():
     p = _spawn()
     p.stdin.write(hello())
@@ -854,6 +855,7 @@ for line in sys.stdin:
 """
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="假 rstranslate helper 靠 shebang 启动，Windows 上 exec 不了")
 def test_subprocess_apple_helper_output_never_reaches_stderr(tmp_path):
     secret = "GEHEIM-SATZ-4711-NICHT-LOGGEN"
     marker = tmp_path / "translate-called"
