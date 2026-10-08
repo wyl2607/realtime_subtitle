@@ -17,3 +17,5 @@ rslite（实时字幕）：`swift build -c release --product rslite`。
 真机界面：`.build/release/rslite --source tap --src de-DE --dst zh-Hans`；当前分支 `tap/mic` 会提示“采集模块未接入”。
 文件压测：`.build/release/rslite --headless --source file:/path/to/audio.wav --src de-DE --dst zh-Hans`。
 headless 输出 JSONL：`volatile/final/translation/status`，文件结束后等待最后一句翻译完成再退出。
+远程识别：`.build/release/rslite --remote ws://<mini2 Tailscale IP>:8790/v1 --token-file ~/.config/rslite/remote-token`，本机只抓声音和显示，识别翻译在 mini2 上做；菜单栏显示「字·远程」。
+token 文件权限须为 600（否则打印警告）；连不上远程（鉴权失败、busy、5 秒无 ready、中途断线）会回退到本机识别，菜单栏变「字·本机」，headless 的 status 行同步输出「模式：远程/本机」。

@@ -72,6 +72,11 @@ final class OverlayController: NSObject {
         volatileLabel.stringValue = text
     }
 
+    /// 菜单栏标题显示当前识别在哪里：音频是否正在离开本机，用户要能一眼看出来。
+    func setMode(_ mode: SubtitleMode) {
+        statusItem.button?.title = "字·\(mode.label)"
+    }
+
     private func configurePanel() {
         panel.level = .statusBar
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]

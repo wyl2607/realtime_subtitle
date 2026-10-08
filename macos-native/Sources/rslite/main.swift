@@ -18,6 +18,8 @@ struct Options {
     var src = "de-DE"
     var dst = "zh-Hans"
     var headless = false
+    var remote: URL?
+    var tokenFile = "~/.config/rslite/remote-token"
 }
 
 @main
@@ -51,17 +53,26 @@ struct RSLite {
             case "--headless":
                 options.headless = true
                 i += 1
-            case "--source", "--src", "--dst":
+            case "--source", "--src", "--dst", "--remote", "--token-file":
                 guard i + 1 < args.count else {
                     throw RSLiteError.usage("missing value for \(key)")
                 }
                 let value = args[i + 1]
-                if key == "--source" {
+                switch key {
+                case "--source":
                     options.source = value
-                } else if key == "--src" {
+                case "--src":
                     options.src = value
-                } else {
+                case "--dst":
                     options.dst = value
+                case "--token-file":
+                    options.tokenFile = value
+                default:
+                    guard let url = URL(string: value), let scheme = url.scheme,
+                          ["ws", "wss"].contains(scheme), url.host != nil else {
+                        throw RSLiteError.usage("--remote 需要 ws:// 或 wss:// 地址，例如 ws://100.x.y.z:8790/v1")
+                    }
+                    options.remote = url
                 }
                 i += 2
             default:
@@ -71,19 +82,39 @@ struct RSLite {
         return options
     }
 
-    private static let usage = "usage: rslite [--source tap|mic|file:PATH] [--src de-DE] [--dst zh-Hans] [--headless]"
+    private static let usage = "usage: rslite [--source tap|mic|file:PATH] [--src de-DE] [--dst zh-Hans] [--headless] [--remote ws://HOST:PORT/v1] [--token-file PATH]"
+
+    /// 给了 --remote 才走远程；否则和原来一样直接用本机 Pipeline。
+    @available(macOS 27.0, *)
+    private static func makeEngine(
+        _ options: Options,
+        callbacks: PipelineCallbacks,
+        onMode: @escaping @Sendable (SubtitleMode) -> Void
+    ) -> SubtitleEngine {
+        let base = PipelineConfig(
+            sourceSpec: options.source,
+            sourceLocaleID: options.src,
+            targetLanguageID: options.dst
+        )
+        guard let remote = options.remote else {
+            return Pipeline(config: base, callbacks: callbacks)
+        }
+        let config = RemoteConfig(
+            url: remote,
+            token: RemoteTokenFile.read(path: options.tokenFile),
+            tokenPath: options.tokenFile,
+            base: base
+        )
+        return RemotePipeline(config: config, callbacks: callbacks, onMode: onMode)
+    }
 
     @available(macOS 27.0, *)
     private static func runHeadless(_ options: Options) async throws {
         let startedAt = ContinuousClock().now
         let clock = ContinuousClock()
 
-        let pipeline = Pipeline(
-            config: PipelineConfig(
-                sourceSpec: options.source,
-                sourceLocaleID: options.src,
-                targetLanguageID: options.dst
-            ),
+        let pipeline = makeEngine(
+            options,
             callbacks: PipelineCallbacks(
                 onVolatile: { text in
                     writeEvent(clock: clock, startedAt: startedAt, ev: "volatile", id: nil, text: text)
@@ -97,7 +128,10 @@ struct RSLite {
                 onStatus: { text in
                     writeEvent(clock: clock, startedAt: startedAt, ev: "status", id: nil, text: text)
                 }
-            )
+            ),
+            onMode: { mode in
+                writeEvent(clock: clock, startedAt: startedAt, ev: "status", id: nil, text: "模式：\(mode.label)")
+            }
         )
 
         try await pipeline.start()
@@ -109,7 +143,7 @@ struct RSLite {
     private static func runApp(_ options: Options) {
         NSApplication.shared.setActivationPolicy(.accessory)
 
-        var pipeline: Pipeline?
+        var pipeline: SubtitleEngine?
         let app = NSApplication.shared
 
         let overlay = OverlayController(
@@ -137,12 +171,8 @@ struct RSLite {
             }
         )
 
-        pipeline = Pipeline(
-            config: PipelineConfig(
-                sourceSpec: options.source,
-                sourceLocaleID: options.src,
-                targetLanguageID: options.dst
-            ),
+        pipeline = makeEngine(
+            options,
             callbacks: PipelineCallbacks(
                 onVolatile: { text in
                     Task { @MainActor in overlay.setVolatile(text) }
@@ -159,7 +189,10 @@ struct RSLite {
                 onFinished: {
                     Task { @MainActor in overlay.setStatus("音频来源已结束") }
                 }
-            )
+            ),
+            onMode: { mode in
+                Task { @MainActor in overlay.setMode(mode) }
+            }
         )
 
         overlay.show()
