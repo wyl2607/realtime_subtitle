@@ -82,3 +82,4 @@
 {"ts": "2026-10-09T08:15:00+08:00", "sprint": "sprints-001-remote-offload", "tk": "TK-001b", "cr": "CR-004", "phase": "review", "action": "dispatched", "agent_role": "reviewer", "round": 3, "notes": "opus final pass"}
 {"ts": "2026-10-09T08:25:00+08:00", "sprint": "sprints-001-remote-offload", "tk": "TK-001b", "cr": "CR-004", "phase": "review", "action": "returned", "agent_role": "reviewer", "round": 3, "notes": "approve; e2e rtf None->0.0101->0.037"}
 {"ts": "2026-10-09T08:25:00+08:00", "sprint": "sprints-001-remote-offload", "tk": "TK-001b", "cr": "CR-004", "phase": "merge", "action": "merged", "agent_role": "coordinator", "round": 3, "notes": "18b9595 into feat/macos-native"}
+{"ts": "2026-10-09T08:28:00+08:00", "sprint": "sprints-001-remote-offload", "tk": "TK-003", "phase": "execution", "action": "dispatched", "agent_role": "executor", "notes": "claude sonnet, branch feat/tk-003, solo batch (security)"}
