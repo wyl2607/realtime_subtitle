@@ -13,7 +13,7 @@
 | TK | 标题 | 状态 |
 |----|------|------|
 | TK-001 | 节点 worker：VAD 分段 + 整段识别 + 可插拔翻译 | done |
-| TK-001b | worker：会话结束滑动更新 rtf | reviewing |
+| TK-001b | worker：会话结束滑动更新 rtf | fixing |
 | TK-002 | 节点 gateway：生命周期 + 协议 v2 + 鉴权与上限 | done |
 | TK-003 | 一键安装 install_node.sh | planned |
 | TK-004 | rslite：带时间句子 + AudioFanout + 混合替换 + 单实例 | done |
@@ -22,6 +22,7 @@
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 08:00 CST: CR-004 round1：派审前疑点被真 gateway+真 worker 复现证实（会话→断开→回收不写 asr_state.json）→ F1/F2 accepted、F3 rejected → TK-001b fixing，repair round1（sonnet）
 - 2026-10-09 07:50 CST: TK-001b 回报 ce63a76（190/816 passed，已 push）→ reviewing，CR-004 round1（opus）；派审前发现疑点：SIGTERM 回收路径不 finish_session，常见路径可能不更新 rtf
 - 2026-10-09 07:33 CST: TK-001b → executing（sonnet，分支 feat/tk-001b，单独一批）；PR #62 已取消订阅
 - 2026-10-09 07:30 CST: CR-003 round4 approve → **TK-002 done**，合并进 feat/macos-native（PR #62）。下一批：TK-001b（rtf 滑动更新，依赖 info.STATE_DIR，现已在主线）

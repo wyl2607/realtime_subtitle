@@ -72,3 +72,6 @@
 {"ts": "2026-10-09T07:33:00+08:00", "sprint": "sprints-001-remote-offload", "tk": "TK-001b", "phase": "execution", "action": "dispatched", "agent_role": "executor", "notes": "claude sonnet, branch feat/tk-001b"}
 {"ts": "2026-10-09T07:50:00+08:00", "sprint": "sprints-001-remote-offload", "tk": "TK-001b", "phase": "execution", "action": "returned", "agent_role": "executor", "notes": "ce63a76; 190 node / 816 full"}
 {"ts": "2026-10-09T07:50:00+08:00", "sprint": "sprints-001-remote-offload", "tk": "TK-001b", "cr": "CR-004", "phase": "review", "action": "dispatched", "agent_role": "reviewer", "round": 1, "notes": "opus; flagged SIGTERM reap path"}
+{"ts": "2026-10-09T08:00:00+08:00", "sprint": "sprints-001-remote-offload", "tk": "TK-001b", "cr": "CR-004", "phase": "review", "action": "returned", "agent_role": "reviewer", "round": 1, "notes": "REQUEST_CHANGES; F1 high reproduced"}
+{"ts": "2026-10-09T08:00:00+08:00", "sprint": "sprints-001-remote-offload", "tk": "TK-001b", "cr": "CR-004", "phase": "review", "action": "triage", "agent_role": "coordinator", "round": 1, "notes": "2 accepted (F1,F2), 1 rejected (F3)"}
+{"ts": "2026-10-09T08:00:00+08:00", "sprint": "sprints-001-remote-offload", "tk": "TK-001b", "cr": "CR-004", "phase": "review", "action": "repair-dispatched", "agent_role": "repairer", "round": 1, "notes": "claude sonnet"}
