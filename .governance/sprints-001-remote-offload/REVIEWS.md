@@ -5,7 +5,7 @@
 
 | CR | TK | rounds | status | last_action |
 |----|----|--------|--------|-------------|
-| CR-002 | TK-001 | 1 | needs_fix | 2026-10-09 05:00 CST: round1 两路 needs_fix，11 accepted / 0 rejected → repair round1（sonnet） |
+| CR-002 | TK-001 | 1 | needs_fix | 2026-10-09 05:10 CST: repair b89886e 回收并复核（77/689 passed）→ round2 两路派出 |
 | CR-001 | TK-004 | 3 | resolved | 2026-10-09 05:05 CST: round3 approve（代码层）；M1/M2 rejected（理由见 CR-001.md）；**待 Mac 构建验证后才能合并** |
 
 ## 字段说明
