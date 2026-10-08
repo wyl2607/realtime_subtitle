@@ -10,3 +10,6 @@
 {"ts":"2026-10-09T04:16:02+08:00","sprint":"sprints-001-remote-offload","tk":"TK-004","phase":"execution","action":"coordinator-direct","agent_role":"coordinator","notes":"0cdd5c7 onFinal signature adapter main/RemotePipeline"}
 {"ts":"2026-10-09T04:16:02+08:00","sprint":"sprints-001-remote-offload","tk":"TK-004","cr":"CR-001","phase":"review","action":"enter","agent_role":"coordinator","round":1}
 {"ts":"2026-10-09T04:16:02+08:00","sprint":"sprints-001-remote-offload","tk":"TK-004","cr":"CR-001","phase":"review","action":"dispatched","agent_role":"reviewer","round":1,"notes":"claude opus subagent, lens default"}
+{"ts":"2026-10-09T04:18:57+08:00","sprint":"sprints-001-remote-offload","tk":"TK-004","cr":"CR-001","phase":"review","action":"returned","agent_role":"reviewer","round":1,"notes":"needs_fix 2 major 3 minor 1 nit"}
+{"ts":"2026-10-09T04:18:57+08:00","sprint":"sprints-001-remote-offload","tk":"TK-004","cr":"CR-001","phase":"review","action":"triage","agent_role":"coordinator","round":1,"notes":"6 accepted (F5 transferred to TK-005), 0 rejected"}
+{"ts":"2026-10-09T04:18:57+08:00","sprint":"sprints-001-remote-offload","tk":"TK-004","cr":"CR-001","phase":"review","action":"repair-dispatched","agent_role":"repairer","round":1,"notes":"claude sonnet subagent"}

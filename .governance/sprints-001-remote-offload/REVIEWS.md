@@ -5,7 +5,7 @@
 
 | CR | TK | rounds | status | last_action |
 |----|----|--------|--------|-------------|
-| CR-001 | TK-004 | 0 | open | 2026-10-09 04:16 CST: created；executor ecb7a20 + coordinator-direct 编译适配 0cdd5c7 |
+| CR-001 | TK-004 | 1 | needs_fix | 2026-10-09 04:18 CST: round1 opus 6 findings 全部 accepted（F5 转交 TK-005），已派 repairer |
 
 ## 字段说明
 - **rounds**：已完成的 review 轮数（initial = 1，第一次 recheck = 2，以此类推）
