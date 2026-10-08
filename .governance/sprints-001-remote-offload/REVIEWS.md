@@ -5,7 +5,7 @@
 
 | CR | TK | rounds | status | last_action |
 |----|----|--------|--------|-------------|
-| CR-005 | TK-003 | 2 | needs_fix | 2026-10-09 09:25 CST: round2 两路 needs_fix（v1 重拉注入/假成功）；4 accepted / 0 rejected → repair round2 |
+| CR-005 | TK-003 | 2 | needs_fix | 2026-10-09 10:20 CST: repair 236531d + C1 c8ec1ca + C2 74fe494（三份并发各 98 passed）→ round3 两路派出 |
 | CR-004 | TK-001b | 3 | resolved | 2026-10-09 08:25 CST: round3 approve（端到端 rtf None→0.0101→0.037 滑动）；三轮收敛，已合并 |
 | CR-003 | TK-002 | 4 | resolved | 2026-10-09 07:30 CST: round4 approve；四轮收敛（15 accepted / 6 rejected），已合并（PR #62） |
 | CR-002 | TK-001 | 4 | resolved | 2026-10-09 05:55 CST: round4 approve；四轮收敛（14 accepted / 2 rejected），b2c697e 已合进 feat/macos-native |
