@@ -1,1 +1,6 @@
 {"ts":"2026-10-08T20:05:46Z","sprint":"sprints-001-remote-offload","tk":null,"phase":"sprint-init","action":"enter","agent_role":"coordinator"}
+{"ts":"2026-10-09T04:06:21+08:00","sprint":"sprints-001-remote-offload","tk":null,"phase":"scheduler","action":"enter","agent_role":"coordinator"}
+{"ts":"2026-10-09T04:06:21+08:00","sprint":"sprints-001-remote-offload","tk":null,"phase":"scheduler","action":"exit","agent_role":"coordinator","notes":"batch1=TK-001,TK-004; security/remote TKs serialized"}
+{"ts":"2026-10-09T04:06:21+08:00","sprint":"sprints-001-remote-offload","tk":null,"phase":"execution","action":"enter","agent_role":"coordinator"}
+{"ts":"2026-10-09T04:06:21+08:00","sprint":"sprints-001-remote-offload","tk":"TK-001","phase":"execution","action":"dispatched","agent_role":"executor","notes":"codex gpt-5.5 high, worktree ~/projects/rs-tk-001"}
+{"ts":"2026-10-09T04:06:21+08:00","sprint":"sprints-001-remote-offload","tk":"TK-004","phase":"execution","action":"dispatched","agent_role":"executor","notes":"claude sonnet subagent, worktree ~/projects/rs-tk-004"}
