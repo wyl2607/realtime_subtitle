@@ -1200,3 +1200,10 @@ macOS 避坑（每一条都是这次迁移真实踩过的）：
     40 句里出现过 1 句繁体，已经在 helper 里做繁转简兜底，Python 不再处理。
     点词查词和 🤖AI 分析仍然需要 Ollama；Ollama 没开时主字幕可照常走 Apple，
     但查词/AI 分析会不可用或变慢。
+14. **远程识别服务端只是外包算力验证版。**
+    `python -m realtime_subtitle.remote.server --host <Tailscale IP> --port 8790
+    --token-file <path>` 把现有 `WhisperQueueTranslator` 包成 WebSocket 服务，
+    给轻客户端抓声音/显示字幕用。隐私边界按 PoC 从严：只绑定明确的内网/Tailscale
+    IP（拒绝 `0.0.0.0`/`::`）、请求头必须带 bearer token、音频只进内存队列不落盘、
+    服务端启动时强制 `SAVE_TRANSCRIPT=False`（不改 config.py）。它只服务一个在线
+    客户端，第二个连接会收到 1013/busy；断开后清识别上下文，但模型继续驻留等下次连接。
