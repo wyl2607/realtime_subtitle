@@ -1,7 +1,9 @@
 """MLX Whisper adapter that presents the faster-whisper model surface."""
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import wraps
 from types import SimpleNamespace
 import gc
 import time
@@ -10,6 +12,21 @@ import numpy as np
 
 
 SAMPLING_RATE = 16000
+
+# ☠️ 所有 MLX 调用（加载/识别/测语言/换精度）都必须在**同一个**线程里跑。
+# MLX 的 GPU stream 是线程局部的：权重在后台加载线程里建、识别线程里用，会
+# 不定期报 "There is no Stream(gpu, 1) in current thread"，那一轮识别直接失败。
+# 2026-10-08 实跑撞上：每轮都失败、一句字幕都没有；最小复现（线程 A 加载、
+# 线程 B transcribe）同一份代码时好时坏，在加载线程里 mx.eval 权重也挡不住。
+# 所以不去猜哪个数组挂在哪个 stream 上，直接让 MLX 只见到一个线程。
+_MLX_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx")
+
+
+def _on_mlx_thread(fn):
+    @wraps(fn)
+    def run(*args, **kwargs):
+        return _MLX_EXECUTOR.submit(fn, *args, **kwargs).result()
+    return run
 
 
 @dataclass
@@ -30,6 +47,7 @@ class MlxSegment:
     avg_logprob: float = 0.0
 
 
+@_on_mlx_thread
 def load_mlx_model(repo: str) -> "MlxWhisperModel":
     """解析本地路径并预加载权重，再包成 MlxWhisperModel。"""
     import mlx.core as mx
@@ -61,6 +79,7 @@ class MlxWhisperModel:
         self.repo = repo
         self.bits = 16
 
+    @_on_mlx_thread
     def set_bits(self, bits: int) -> float:
         bits = int(bits)
         if bits not in (4, 8, 16):
@@ -99,6 +118,7 @@ class MlxWhisperModel:
         _clear_mlx_cache(mx)
         return time.perf_counter() - started
 
+    @_on_mlx_thread
     def transcribe(
         self,
         audio,
@@ -143,6 +163,7 @@ class MlxWhisperModel:
         )
         return iter(segments), info
 
+    @_on_mlx_thread
     def detect_language(self, audio, vad_filter=True):
         mlx_audio, _ts_map = _apply_vad(audio, vad_filter=vad_filter)
         if vad_filter and len(mlx_audio) == 0:
