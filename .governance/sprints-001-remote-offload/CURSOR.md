@@ -21,6 +21,7 @@
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 06:25 CST: 用户要求开 PR 保全进展：draft PR #62（feat/tk-002 → feat/macos-native）、#63（feat/tk-004 → feat/macos-native，待 Mac 构建）；不向 master 开 PR。已订阅两个 PR 的事件。Mac 通道：已向本机原 Coordinator 会话（Remote Control）发只读探路请求，等回复
 - 2026-10-09 06:15 CST: CR-003 round2 回收：security approve（R2-S1 rejected）；default approve_with_minor，R2-D1（上一会话 ready 串入）/R2-D2（audio_dropped 先于 ready）/R2-D3（冷加载期 flush 误杀）+ code 命名 nit accepted，RFC 同步 nit rejected → TK-002 fixing，repair round2（sonnet）
 - 2026-10-09 06:05 CST: TK-002 repair round1 回收 fd1e75b；主线合进 feat/tk-002（ec6b3e0）使真 worker 联调用例实跑；复核 gateway 100 / 全量 794 passed、ruff 通过 → recheck，CR-003 round2 两路派出。用户告知可用 MacBook Air/mini2（Tailscale）：本云端容器无 tailscale/ssh、100.x 不可达，Mac 侧验证仍需用户在本机起会话
 - 2026-10-09 05:55 CST: CR-002 round4 approve → **TK-001 done**，b2c697e 合并进 feat/macos-native（合并后全量 694 passed、ruff 通过）；待 Mac 回归冒烟。TK-002 repair round1 进行中（sonnet）
