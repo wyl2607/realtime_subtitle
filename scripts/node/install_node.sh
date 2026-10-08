@@ -91,21 +91,63 @@ cat "$f"
 EOF
 
 # 停掉 v1 远程服务：只杀进程，不动 ~/rs-remote 目录。
-# 方括号写法让模式不匹配 pgrep 自己的命令行。
+# v1 在 mini2 上以 --port 8791 运行，和 v2 抢同一端口，所以必须在 bootstrap 之前停。
+# 为了让「v2 装失败」不等于「什么都没在跑」，停之前先把 v1 的完整命令行与 cwd 记到
+# 状态目录（0600；只含命令行与路径，v1 用 --token-file，路径不是秘密），
+# SWAP_SH 回滚时据此重新拉起。
+# 匹配刻意收紧（CR-005 S-F1）：只认「本人」的 `python* -m realtime_subtitle.remote.server`，
+# 点号转义（否则 `tail -f .../realtime_subtitle/remote/server.py` 也会命中），
+# 且每次动手（TERM / KILL）前都用 ps 的完整命令行再确认一遍。
+# Python 首字母大小写都认：macOS 框架版 Python 的进程名是 `Python`。
 IFS= read -r -d '' STOP_V1_SH <<'EOF' || true
-pids=$(pgrep -f '[r]ealtime_subtitle.remote.server' || true)
+export PATH=/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH
+umask 077
+state="$HOME/Library/Application Support/rs-node"
+rec="$state/v1.restart"
+uid_n=$(id -u)
+pat='[Pp]ython[0-9.]* -m [r]ealtime_subtitle\.remote\.server'
+ere='(^|/)[Pp]ython[0-9.]* -m realtime_subtitle\.remote\.server( |$)'
+
+is_v1() {
+    c=$(ps -o command= -p "$1" 2>/dev/null </dev/null) || return 1
+    printf '%s\n' "$c" | grep -Eq "$ere"
+}
+find_v1() {
+    for p in $(pgrep -u "$uid_n" -f "$pat" 2>/dev/null </dev/null || true); do
+        if is_v1 "$p"; then printf '%s\n' "$p"; fi
+    done
+}
+
+pids=$(find_v1)
 if [ -z "$pids" ]; then
+    rm -f "$rec"
     echo "v1 远程服务：未在运行"
     exit 0
 fi
-# shellcheck disable=SC2086
-kill -TERM $pids 2>/dev/null || true
+
+first=$(printf '%s\n' "$pids" | head -n 1)
+cmd=$(ps -o command= -p "$first" 2>/dev/null </dev/null | sed 's/^ *//')
+cwd=$(lsof -a -p "$first" -d cwd -Fn 2>/dev/null </dev/null | sed -n 's/^n//p' | head -n 1)
+if [ -n "$cmd" ] && [ -n "$cwd" ]; then
+    mkdir -p "$state"
+    chmod 700 "$state"
+    printf '%s\n%s\n' "$cwd" "$cmd" > "$rec.tmp.$$" && chmod 600 "$rec.tmp.$$" && mv "$rec.tmp.$$" "$rec"
+    echo "已记录 v1 的命令行与工作目录（v2 安装失败时用来恢复 v1）"
+else
+    rm -f "$rec"
+    echo "⚠️ 没能记录 v1 的命令行或工作目录：如果 v2 安装失败，v1 需要手动重新启动"
+fi
+
+for p in $pids; do
+    if is_v1 "$p"; then kill -TERM "$p" 2>/dev/null || true; fi
+done
 for _ in 1 2 3 4 5; do
-    pgrep -f '[r]ealtime_subtitle.remote.server' >/dev/null || { echo "v1 远程服务：已停止（~/rs-remote 目录保留）"; exit 0; }
+    [ -z "$(find_v1)" ] && { echo "v1 远程服务：已停止（~/rs-remote 目录保留）"; exit 0; }
     sleep 1
 done
-# shellcheck disable=SC2046
-kill -KILL $(pgrep -f '[r]ealtime_subtitle.remote.server' || true) 2>/dev/null || true
+for p in $(find_v1); do
+    kill -KILL "$p" 2>/dev/null || true
+done
 echo "v1 远程服务：已强制停止（~/rs-remote 目录保留）"
 EOF
 
@@ -219,7 +261,12 @@ print("RTF=" + str(rtf))
 PYEOF
 EOF
 
-# 换名 + 启动 LaunchAgent + 经 UDS 验 /v1/info；任何一步失败都回滚到 .prev。
+# 换名 + 启动 LaunchAgent + 经 UDS 验 /v1/info；任何一步失败都回滚。
+# 回滚的目标是「不留下半个 v2」：
+#   有 .prev → 恢复 .prev 并重新 bootstrap；
+#   无 .prev → bootout 并删掉 plist（RunAtLoad+KeepAlive 的 plist 指向不存在的 venv 会在每次登录反复拉起失败），
+#              失败版改名 ~/rs-node.failed 留着排查。
+# 两种情况都按 STOP_V1_SH 记下的命令行把 v1 重新拉起（v1 原本就是 nohup 起的）。
 IFS= read -r -d '' SWAP_SH <<'EOF' || true
 export PATH=/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH
 uid_n=$(id -u)
@@ -227,32 +274,73 @@ label=$1
 plist="$HOME/Library/LaunchAgents/$label.plist"
 state="$HOME/Library/Application Support/rs-node"
 sock="$state/gw.sock"
+rec="$state/v1.restart"
+boot_tries=${RS_BOOT_TRIES:-5}
+info_wait=${RS_INFO_WAIT:-40}
+
+restore_v1() {
+    [ -f "$rec" ] || return 0
+    v1_cwd=$(sed -n 1p "$rec")
+    v1_cmd=$(sed -n 2p "$rec")
+    rm -f "$rec"
+    if [ -n "$v1_cwd" ] && [ -n "$v1_cmd" ] && [ -d "$v1_cwd" ]; then
+        ( cd "$v1_cwd" && nohup /bin/sh -c "exec $v1_cmd" >/dev/null 2>&1 </dev/null & )
+        echo "⚠️ v2 安装失败，已恢复 v1：在 $v1_cwd 重新拉起 $v1_cmd"
+    else
+        echo "⚠️ v2 安装失败，但 v1 的记录不完整，没能恢复 v1，请手动重新启动"
+    fi
+}
+
+restart_old_agent() {
+    if [ -f "$plist" ] && launchctl bootstrap "gui/$uid_n" "$plist" 2>/dev/null; then
+        launchctl kickstart -k "gui/$uid_n/$label" 2>/dev/null || true
+        return 0
+    fi
+    return 1
+}
 
 rollback() {
     echo "ROLLBACK：$1"
     launchctl bootout "gui/$uid_n/$label" 2>/dev/null || true
-    rm -rf "$HOME/rs-node"
     if [ -d "$HOME/rs-node.prev" ]; then
+        rm -rf "$HOME/rs-node"
         mv "$HOME/rs-node.prev" "$HOME/rs-node"
-        if [ -f "$plist" ] && launchctl bootstrap "gui/$uid_n" "$plist" 2>/dev/null; then
-            launchctl kickstart -k "gui/$uid_n/$label" 2>/dev/null || true
+        if restart_old_agent; then
             echo "已回滚到上一版并重新启动"
         else
             echo "已回滚到上一版目录，但 LaunchAgent 没能重新启动，请手动检查"
         fi
     else
-        echo "没有上一版可回滚：节点未安装"
+        rm -f "$plist"
+        if [ -d "$HOME/rs-node" ]; then
+            rm -rf "$HOME/rs-node.failed"
+            mv "$HOME/rs-node" "$HOME/rs-node.failed"
+            echo "没有上一版可回滚：节点未安装；失败版保留在 ~/rs-node.failed 供排查，LaunchAgent plist 已删除"
+        else
+            echo "没有上一版可回滚：节点未安装；LaunchAgent plist 已删除"
+        fi
     fi
+    restore_v1
 }
 
 launchctl bootout "gui/$uid_n/$label" 2>/dev/null || true
 rm -rf "$HOME/rs-node.prev"
 if [ -d "$HOME/rs-node" ]; then
-    mv "$HOME/rs-node" "$HOME/rs-node.prev" || { echo "无法把旧版换名为 .prev"; exit 1; }
+    mv "$HOME/rs-node" "$HOME/rs-node.prev" || {
+        echo "无法把旧版换名为 .prev"
+        if restart_old_agent; then
+            echo "已重新启动旧版 LaunchAgent"
+        else
+            echo "旧版 LaunchAgent 没能重新启动，请手动检查"
+        fi
+        restore_v1
+        exit 1
+    }
 fi
 mv "$HOME/rs-node.new" "$HOME/rs-node" || { rollback "换名失败"; exit 1; }
 
 mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/rs-node"
+chmod 700 "$HOME/Library/Logs/rs-node"
 content=$(cat "$HOME/rs-node/scripts/node/com.realtimesubtitle.node.plist.template") \
     || { rollback "读不到 plist 模板"; exit 1; }
 content=${content//@HOME@/$HOME}
@@ -262,7 +350,7 @@ mv "$plist.tmp.$$" "$plist" || { rollback "plist 落盘失败"; exit 1; }
 
 # bootout 是异步的，紧接着 bootstrap 偶发 I/O error，重试几次
 booted=0
-for _ in 1 2 3 4 5; do
+for _ in $(seq 1 "$boot_tries"); do
     if launchctl bootstrap "gui/$uid_n" "$plist" 2>/dev/null; then booted=1; break; fi
     sleep 1
 done
@@ -271,8 +359,8 @@ launchctl kickstart -k "gui/$uid_n/$label" || { rollback "launchctl kickstart �
 
 node_id=$(cat "$state/node_id" 2>/dev/null || true)
 ok=0
-for _ in $(seq 1 40); do
-    body=$(curl -fsS --max-time 3 --unix-socket "$sock" http://localhost/v1/info 2>/dev/null || true)
+for _ in $(seq 1 "$info_wait"); do
+    body=$(curl -fsS --max-time 3 --unix-socket "$sock" http://localhost/v1/info 2>/dev/null </dev/null || true)
     if [ -n "$body" ] && printf '%s' "$body" | "$HOME/rs-node/venv/bin/python" -c \
         'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("v")==2 and d.get("node_id")==sys.argv[1] and d["node_id"] else 1)' "$node_id"; then
         ok=1
@@ -280,7 +368,8 @@ for _ in $(seq 1 40); do
     fi
     sleep 1
 done
-[ "$ok" = 1 ] || { rollback "gateway 40 秒内没有通过 /v1/info 自检（v==2 且 node_id 匹配）；日志见 ~/Library/Logs/rs-node/"; exit 1; }
+[ "$ok" = 1 ] || { rollback "gateway ${info_wait} 秒内没有通过 /v1/info 自检（v==2 且 node_id 匹配）；日志见 ~/Library/Logs/rs-node/"; exit 1; }
+rm -f "$rec"
 echo "gateway-ok：/v1/info 返回 200，v=2"
 EOF
 
@@ -412,10 +501,10 @@ print_dry_run() {
     plan "4. git archive HEAD（不含 .git / 用户数据）→ ${where}:~/rs-node.new"
     plan "5. 在 ~/rs-node.new 运行 scripts/macos/install.sh --skip-models，并安装 realtime_subtitle/node/requirements.txt"
     plan "6. 自检：翻译语言包 de→zh 状态；say -v Anna 现场合成德语 → 测 rtf → 写 asr_state.json；音频只在临时目录，测完删除"
-    plan "7. 停止 v1 realtime_subtitle.remote.server 进程（保留 ~/rs-remote 目录）"
+    plan "7. 停止 v1 realtime_subtitle.remote.server 进程（精确匹配本人进程；先记录其命令行与 cwd；保留 ~/rs-remote 目录）"
     plan "8. 原子换名：~/rs-node → ~/rs-node.prev，~/rs-node.new → ~/rs-node"
     plan "9. 渲染 plist（不含 IP、不含 token）→ ~/Library/LaunchAgents/${LABEL}.plist；launchctl bootstrap gui/\$UID + kickstart -k"
-    plan "10. 经 UDS 请求 /v1/info，要求 200 且 v=2、node_id 匹配；失败 → 回滚到 ~/rs-node.prev 并告警"
+    plan "10. 经 UDS 请求 /v1/info，要求 200 且 v=2、node_id 匹配；失败 → 回滚（有 .prev 则恢复；无则删 plist、失败版留作 ~/rs-node.failed），并按记录重新拉起 v1、告警"
     if [[ "${LOCAL}" -eq 0 ]]; then
         plan "11. 写 ~/.config/rslite/nodes.json（0600、按 id=${HOST##*@} 去重、原子写）：url=ws://<MagicDNS 名>:${NODE_PORT}"
     else
@@ -455,18 +544,23 @@ step_token() {
         client_file="${HOME}/.config/rslite/tokens/${HOST##*@}.token"
     fi
     existing="$(tgt_run 'cat "$HOME/.config/rs-node/token" 2>/dev/null || true')"
-    if [[ "${#existing}" -ge 32 ]]; then
+    # 必须是 openssl rand -hex 32 的形状：只验长度的话，远端 shell 启动输出或多行文件会被当成 token
+    if [[ "${existing}" =~ ^[0-9a-f]{64}$ ]]; then
         NODE_TOKEN="${existing}"
-    elif [[ -n "${client_file}" && -f "${client_file}" && "$(wc -c < "${client_file}")" -ge 32 ]]; then
+    elif [[ -n "${client_file}" && -f "${client_file}" && "$(cat "${client_file}")" =~ ^[0-9a-f]{64}$ ]]; then
         NODE_TOKEN="$(cat "${client_file}")"
     else
         NODE_TOKEN="$(openssl rand -hex 32)"
     fi
-    [[ "${#NODE_TOKEN}" -ge 32 ]] || die "token 生成失败"
+    [[ "${NODE_TOKEN}" =~ ^[0-9a-f]{64}$ ]] || die "token 生成失败"
 
     if [[ "${existing}" != "${NODE_TOKEN}" ]]; then
         printf '%s' "${NODE_TOKEN}" | tgt_run 'umask 077; d="$HOME/.config/rs-node"; mkdir -p "$d"; chmod 700 "$d"; cat > "$d/token.tmp.$$"; chmod 600 "$d/token.tmp.$$"; mv "$d/token.tmp.$$" "$d/token"' \
             || die "token 写入目标机失败"
+    else
+        # 沿用时也收紧权限：过宽的话 gateway 的 load_token 会拒绝，40 秒后才以笼统的报错回滚
+        tgt_run 'chmod 700 "$HOME/.config/rs-node" && chmod 600 "$HOME/.config/rs-node/token"' \
+            || die "无法收紧目标机 token 的权限"
     fi
     if [[ -n "${client_file}" ]]; then
         write_secret_file "${client_file}" "${NODE_TOKEN}"
@@ -500,10 +594,14 @@ step_selfcheck() {
         die "目标机自检失败（旧版未受影响）"
     }
     printf '%s\n' "${out}" | sed 's/^/  /'
-    if ! grep -q '^TRANSLATION_STATUS=installed$' <<<"${out}"; then
+    if grep -q '^TRANSLATION_STATUS=None$' <<<"${out}"; then
+        warn "rstranslate 不可用（构建失败？helper 没有响应），节点会退回 Ollama。"
+        warn "  请查看上面 [5/9] 的构建输出，修好后重跑 install_node.sh（重跑会重写 asr_state.json）"
+        warn "  （退回 Ollama 时还需要目标机已 ollama pull 对应翻译模型）"
+    elif ! grep -q '^TRANSLATION_STATUS=installed$' <<<"${out}"; then
         warn "系统翻译的 德语→中文 语言包还没装好，节点会退回 Ollama。请在目标机手动下载："
         warn "  系统设置 → 通用 → 语言与地区 → 翻译语言 → 下载「德语」和「中文（简体）」"
-        warn "  装好后重启节点：launchctl kickstart -k gui/\$UID/${LABEL}"
+        warn "  装好后重跑 install_node.sh（worker 只在安装时写入翻译器名称，kickstart 不会更新）"
         warn "  （退回 Ollama 时还需要目标机已 ollama pull 对应翻译模型）"
     fi
 }

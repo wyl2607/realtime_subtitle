@@ -19,6 +19,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -53,13 +54,46 @@ _STUBS = {
     "swift": "#!/bin/bash\nexit 0\n",
     "sysctl": "#!/bin/bash\necho 17179869184\n",
     "uv": '#!/bin/bash\n'
-          'if [ "${1:-}" = "venv" ]; then mkdir -p venv/bin; ln -sf "$STUB_PYTHON" venv/bin/python; fi\n'
+          'if [ "${1:-}" = "venv" ]; then mkdir -p venv/bin; ln -sf "$STUB_FAKE_PYTHON" venv/bin/python; fi\n'
           'exit 0\n',
     "tailscale": '#!/bin/bash\n'
                  'if [ "${1:-}" = "ip" ]; then [ -n "${TS_IP-100.64.0.7}" ] && echo "${TS_IP-100.64.0.7}"; exit 0; fi\n'
-                 'if [ "${1:-}" = "status" ]; then echo \'{"Self":{"DNSName":"mini2.tail1234.ts.net."}}\'; exit 0; fi\n'
+                 'if [ "${1:-}" = "status" ]; then echo "{\\"Self\\":{\\"DNSName\\":\\"${TS_DNS:-mini2.tail1234.ts.net}.\\"}}"; exit 0; fi\n'
                  'exit 1\n',
+    # launchctl：只记录调用；STUB_BOOTSTRAP_FAIL=1 时 bootstrap 一律失败
+    "launchctl": '#!/bin/bash\n'
+                 'echo "$*" >> "$STUB_LOG_DIR/launchctl.log"\n'
+                 'if [ "${1:-}" = "bootstrap" ] && [ -n "${STUB_BOOTSTRAP_FAIL:-}" ]; then exit 5; fi\n'
+                 'exit 0\n',
+    "plutil": "#!/bin/bash\nexit 0\n",
+    # curl：模拟 gateway 的 /v1/info；STUB_INFO_FAIL=1 时拿不到响应
+    "curl": '#!/bin/bash\n'
+            '[ -n "${STUB_INFO_FAIL:-}" ] && exit 22\n'
+            'nid=$(cat "$HOME/Library/Application Support/rs-node/node_id")\n'
+            'echo "{\\"v\\":2,\\"node_id\\":\\"$nid\\"}"\n',
+    # lsof：v1 的 cwd 由测试指定
+    "lsof": '#!/bin/bash\nprintf \'p1\\nfcwd\\nn%s\\n\' "${STUB_V1_CWD:-}"\n',
+    # nohup：不真的起进程，只记下「在哪个目录、跑什么」
+    "nohup": '#!/bin/bash\necho "PWD=$PWD ARGS=$*" >> "$STUB_LOG_DIR/nohup.log"\n',
+    "sleep": "#!/bin/bash\nexit 0\n",
+    # mv：STUB_MV_FAIL_PREV=1 时 rs-node → rs-node.prev 失败（F7）
+    "mv": '#!/bin/bash\n'
+          'if [ -n "${STUB_MV_FAIL_PREV:-}" ] && [ "${1:-}" = "$HOME/rs-node" ] && [ "${2:-}" = "$HOME/rs-node.prev" ]; then exit 1; fi\n'
+          'exec "$STUB_REAL_MV" "$@"\n',
 }
+
+# 假 venv python：自检那段（`python - <wav>`，脚本走 stdin）按环境变量给出可控结果，
+# 其余调用（/v1/info 校验的 -c 单行）转给真 python
+_FAKE_PYTHON = r"""#!/bin/bash
+if [ "${1:-}" = "-" ]; then
+    cat >/dev/null
+    if [ -n "${STUB_SELFCHECK_FAIL:-}" ]; then echo "ENGINE_LOAD_FAILED=Boom"; exit 3; fi
+    echo "TRANSLATION_STATUS=${STUB_TRANSLATION:-installed}"
+    echo "RTF=0.1"
+    exit 0
+fi
+exec "$STUB_PYTHON" "$@"
+"""
 
 
 @pytest.fixture
@@ -70,6 +104,9 @@ def env(tmp_path):
         p = bindir / name
         p.write_text(body)
         p.chmod(0o755)
+    fake = tmp_path / "fakepython"
+    fake.write_text(_FAKE_PYTHON)
+    fake.chmod(0o755)
     home = tmp_path / "home"
     home.mkdir()
     logdir = tmp_path / "log"
@@ -80,6 +117,8 @@ def env(tmp_path):
         "PATH": f"{bindir}:{e['PATH']}",
         "STUB_LOG_DIR": str(logdir),
         "STUB_PYTHON": sys.executable,
+        "STUB_FAKE_PYTHON": str(fake),
+        "STUB_REAL_MV": shutil.which("mv"),
     })
     return e, home, logdir
 
@@ -300,10 +339,11 @@ def test_token_stays_out_of_argv_and_selfcheck_failure_keeps_old_version(env):
     old.mkdir()
     (old / "MARK").write_text("old")
 
+    e["STUB_SELFCHECK_FAIL"] = "1"  # 假 python 的自检段报 ENGINE_LOAD_FAILED=Boom
     r = _run(["mini2"], e, timeout=300)
-    # Linux 上没有 MLX / rstranslate，自检必然失败：要的就是这条回滚主干
     assert r.returncode != 0, r.stdout
-    assert "自检失败" in r.stderr
+    assert "目标机自检失败" in r.stderr
+    assert "ENGINE_LOAD_FAILED=Boom" in r.stdout + r.stderr
 
     assert (old / "MARK").read_text() == "old", "自检失败不许碰旧版"
     assert not (home / "rs-node.new").exists(), ".new 要清理掉"
@@ -349,3 +389,293 @@ def test_node_id_is_reused_on_rerun(env):
     first = f.read_text()
     _run(["mini2"], e, timeout=300)
     assert f.read_text() == first
+
+
+# ------------------------------------------------------------ CR-005 修复：成功 / 回滚路径（桩）
+#
+# 目标机行为（launchctl / plutil / curl / lsof / nohup）全是桩；venv python 是假的，
+# 自检与 /v1/info 的结果由环境变量控制，所以每个失败都有「具体原因」可断言。
+# v1 进程是真进程（bash exec -a 伪装 argv），pgrep / ps / kill 用真的，
+# 这样 S-F1 的匹配规则测的是真实行为而不是桩。
+
+V1_CMD = "/Users/x/rs-remote/venv/bin/python3.13 -m realtime_subtitle.remote.server --port 8791 --token-file /Users/x/t.token"
+
+
+@pytest.fixture
+def spawn():
+    procs = []
+
+    def _spawn(cmdline):
+        # 用 os.environ 而不是桩 PATH：这里要真的 sleep
+        p = subprocess.Popen(["bash", "-c", 'exec -a "$0" sleep 300', cmdline],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        procs.append(p)
+        time.sleep(0.3)  # 等 exec 完成，否则 argv 还是 bash 的
+        return p
+
+    yield _spawn
+    for p in procs:
+        if p.poll() is None:
+            p.kill()
+        p.wait()
+
+
+def _launchctl_calls(logdir: Path):
+    f = logdir / "launchctl.log"
+    return f.read_text().splitlines() if f.exists() else []
+
+
+def _wait_for(path: Path, needle: str, secs=5.0) -> str:
+    end = time.time() + secs
+    while time.time() < end:
+        if path.exists() and needle in path.read_text():
+            return path.read_text()
+        time.sleep(0.05)
+    return path.read_text() if path.exists() else ""
+
+
+def test_success_twice_keeps_single_nodes_json_entry_and_updates_it(env):
+    e, home, logdir = env
+    r = _run(["mini2"], e, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "gateway-ok" in r.stdout
+
+    nodes = home / ".config" / "rslite" / "nodes.json"
+    first = json.loads(nodes.read_text())
+    assert len(first) == 1 and first[0]["id"] == "mini2"
+    assert first[0]["url"] == "ws://mini2.tail1234.ts.net:8791"
+
+    plist = home / "Library" / "LaunchAgents" / "com.realtimesubtitle.node.plist"
+    assert plist.exists() and str(home) in plist.read_text()
+    assert _mode(home / "Library" / "Logs" / "rs-node") == 0o700  # S-F4
+    assert not (home / "rs-node.prev").exists() and not (home / "rs-node.failed").exists()
+
+    e["TS_DNS"] = "mini2-b.tail1234.ts.net"
+    r = _run(["mini2"], e, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
+    second = json.loads(nodes.read_text())
+    assert len(second) == 1, "重跑不许重复追加"
+    assert second[0]["url"] == "ws://mini2-b.tail1234.ts.net:8791", "同 id 原位更新"
+    assert second[0]["node_id"] == first[0]["node_id"]
+    assert (home / "rs-node.prev").is_dir(), "第二次成功后上一版保留为 .prev"
+    assert _mode(nodes) == 0o600
+    assert not (home / "Library/Application Support/rs-node/v1.restart").exists()
+
+
+def test_no_prev_bootstrap_failure_removes_plist_keeps_failed_and_relaunches_v1(env, spawn, tmp_path):
+    e, home, logdir = env
+    v1 = spawn(V1_CMD)
+    v1_cwd = tmp_path / "rs-remote"
+    v1_cwd.mkdir()
+    e["STUB_V1_CWD"] = str(v1_cwd)
+    e["STUB_BOOTSTRAP_FAIL"] = "1"
+
+    r = _run(["mini2"], e, timeout=300)
+    out = r.stdout + r.stderr
+    assert r.returncode != 0
+    assert "ROLLBACK：launchctl bootstrap 失败" in out
+    assert "没有上一版可回滚" in out
+    assert "v2 安装失败，已恢复 v1" in out
+
+    plist = home / "Library" / "LaunchAgents" / "com.realtimesubtitle.node.plist"
+    assert not plist.exists(), "留着指向不存在 venv 的 plist 会在每次登录反复拉起失败"
+    assert not (home / "rs-node").exists()
+    assert (home / "rs-node.failed" / "venv" / "bin" / "python").exists(), "失败版要留着排查"
+    assert not (home / ".config" / "rslite" / "nodes.json").exists()
+
+    # v1 在 bootstrap 之前被停（抢同一个 8791 端口），然后按记录重拉
+    assert v1.wait(timeout=5) is not None
+    calls = _launchctl_calls(logdir)
+    assert any(c.startswith("bootstrap") for c in calls)
+    log = _wait_for(logdir / "nohup.log", "realtime_subtitle.remote.server")
+    assert f"PWD={v1_cwd}" in log
+    assert "-m realtime_subtitle.remote.server --port 8791 --token-file /Users/x/t.token" in log
+    assert not (home / "Library/Application Support/rs-node/v1.restart").exists()
+
+
+def test_failed_dir_from_earlier_attempt_is_replaced(env):
+    e, home, _l = env
+    old_failed = home / "rs-node.failed"
+    old_failed.mkdir()
+    (old_failed / "OLD").write_text("x")
+    e["STUB_BOOTSTRAP_FAIL"] = "1"
+    r = _run(["mini2"], e, timeout=300)
+    assert r.returncode != 0
+    assert not (old_failed / "OLD").exists(), "旧的 .failed 先删再改名"
+    assert (old_failed / "venv").is_dir()
+
+
+def test_with_prev_info_failure_restores_old_dir_and_rebootstraps(env, spawn, tmp_path):
+    e, home, logdir = env
+    assert _run(["mini2"], e, timeout=300).returncode == 0
+    (home / "rs-node" / "MARK").write_text("good-v2")
+    nodes = home / ".config" / "rslite" / "nodes.json"
+    nodes_before = nodes.read_text()
+
+    v1 = spawn(V1_CMD)
+    v1_cwd = tmp_path / "rs-remote"
+    v1_cwd.mkdir()
+    e["STUB_V1_CWD"] = str(v1_cwd)
+    e["STUB_INFO_FAIL"] = "1"
+    (logdir / "launchctl.log").unlink()
+
+    r = _run(["mini2"], e, timeout=300)
+    out = r.stdout + r.stderr
+    assert r.returncode != 0
+    assert "ROLLBACK：gateway 40 秒内没有通过 /v1/info 自检" in out
+    assert "已回滚到上一版并重新启动" in out
+
+    assert (home / "rs-node" / "MARK").read_text() == "good-v2", "旧目录要原样回来"
+    assert not (home / "rs-node.prev").exists()
+    assert not (home / "rs-node.failed").exists()
+    assert (home / "Library" / "LaunchAgents" / "com.realtimesubtitle.node.plist").exists()
+    assert nodes.read_text() == nodes_before, "失败不许改清单"
+
+    calls = _launchctl_calls(logdir)
+    boot_idx = [i for i, c in enumerate(calls) if c.startswith("bootstrap")]
+    assert len(boot_idx) == 2, calls  # 新版一次 + 回滚后旧版一次
+    last_bootout = max(i for i, c in enumerate(calls) if c.startswith("bootout"))
+    assert last_bootout < boot_idx[-1], "回滚要先 bootout 失败版再 bootstrap 旧版"
+
+    assert v1.wait(timeout=5) is not None
+    assert "PWD=" + str(v1_cwd) in _wait_for(logdir / "nohup.log", "remote.server")
+
+
+def test_prev_rename_failure_rebootstraps_old_plist(env):
+    """F7：bootout 旧版之后 mv rs-node → .prev 失败，不能让旧版就此停着。"""
+    e, home, logdir = env
+    assert _run(["mini2"], e, timeout=300).returncode == 0
+    (home / "rs-node" / "MARK").write_text("good-v2")
+    (logdir / "launchctl.log").unlink()
+    e["STUB_MV_FAIL_PREV"] = "1"
+
+    r = _run(["mini2"], e, timeout=300)
+    out = r.stdout + r.stderr
+    assert r.returncode != 0
+    assert "无法把旧版换名为 .prev" in out
+    assert "已重新启动旧版 LaunchAgent" in out
+    assert (home / "rs-node" / "MARK").read_text() == "good-v2"
+
+    calls = _launchctl_calls(logdir)
+    kinds = [c.split()[0] for c in calls]
+    assert kinds.index("bootout") < kinds.index("bootstrap"), calls
+    assert "kickstart" in kinds
+
+
+@pytest.mark.parametrize("status,must,must_not", [
+    ("None", "rstranslate 不可用", "系统设置"),
+    ("supported", "重跑 install_node.sh", "kickstart -k"),
+])
+def test_language_pack_hints(env, status, must, must_not):
+    """F4 / F5：status 为 None 是构建问题，不是语言包问题；语言包提示是「重跑」而不是 kickstart。"""
+    e, _home, _l = env
+    e["STUB_TRANSLATION"] = status
+    r = _run(["mini2"], e, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert must in r.stderr
+    assert must_not not in r.stderr
+    if status == "None":
+        assert "重跑 install_node.sh" in r.stderr
+
+
+# ---- token 校验与权限（F3 / S-F2 / S-F3）
+
+
+def test_existing_token_reuse_tightens_permissions(env):
+    e, home, _l = env
+    d = home / ".config" / "rs-node"
+    d.mkdir(parents=True)
+    tok = d / "token"
+    existing = "0f" * 32
+    tok.write_text(existing)
+    d.chmod(0o755)
+    tok.chmod(0o644)
+    r = _run(["mini2"], e, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert tok.read_text() == existing
+    assert _mode(d) == 0o700 and _mode(tok) == 0o600
+
+
+@pytest.mark.parametrize("bad", ["x" * 40, "ab" * 32 + "\n" + "cd" * 32, "A" * 64, "ab" * 31])
+def test_malformed_existing_token_is_regenerated_on_both_sides(env, bad):
+    e, home, logdir = env
+    tgt = home / ".config" / "rs-node" / "token"
+    tgt.parent.mkdir(parents=True)
+    tgt.write_text(bad)
+    r = _run(["mini2"], e, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
+    new = tgt.read_text()
+    assert re.fullmatch(r"[0-9a-f]{64}", new), "新 token 必须是 64 位小写十六进制"
+    assert new != bad
+    assert (home / ".config/rslite/tokens/mini2.token").read_text() == new
+    assert new not in r.stdout + r.stderr
+    assert new.encode() not in (logdir / "ssh.argv").read_bytes()
+    assert _mode(tgt) == 0o600 and _mode(tgt.parent) == 0o700
+
+
+def test_malformed_client_token_is_not_adopted(env):
+    e, home, _l = env
+    cli = home / ".config" / "rslite" / "tokens" / "mini2.token"
+    cli.parent.mkdir(parents=True)
+    cli.write_text("short-but-" + "z" * 40)
+    r = _run(["mini2"], e, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert re.fullmatch(r"[0-9a-f]{64}", cli.read_text())
+    assert (home / ".config/rs-node/token").read_text() == cli.read_text()
+
+
+# ---- 停 v1 的精确匹配（S-F1）
+
+
+def _run_stop_v1(e):
+    return subprocess.run(
+        ["bash", "-c", 'source "$1"; printf "%s\\n" "$STOP_V1_SH" | bash -s', "x", str(SCRIPT)],
+        env=e, capture_output=True, text=True, timeout=60)
+
+
+def test_stop_v1_matches_only_real_v1_and_records_it(env, spawn, tmp_path):
+    e, home, _l = env
+    cwd = tmp_path / "rs-remote"
+    cwd.mkdir()
+    e["STUB_V1_CWD"] = str(cwd)
+    decoys = [
+        spawn("tail -f /x/realtime_subtitle/remote/server.py"),          # `.` 通配 `/` 的旧 bug
+        spawn("vim /x/realtime_subtitle/remote/server.py"),
+        spawn("python3 -m realtime_subtitle.remote.serverx --x"),         # pgrep 会命中，ps 复核必须拒绝
+        spawn("python3 -m realtime_subtitleXremote.server"),
+        spawn("grep realtime_subtitle.remote.server"),
+    ]
+    mac_v1 = spawn("/opt/homebrew/Cellar/python@3.13/3.13.1/Frameworks/Python.framework/"
+                   "Versions/3.13/Resources/Python.app/Contents/MacOS/Python "
+                   "-m realtime_subtitle.remote.server --port 8791")
+    r = _run_stop_v1(e)
+    assert r.returncode == 0, r.stderr
+    assert mac_v1.wait(timeout=5) is not None, "框架版 Python（大写 P）的 v1 要能被识别并停掉"
+    assert all(p.poll() is None for p in decoys), "无关进程不许被杀"
+
+    rec = home / "Library" / "Application Support" / "rs-node" / "v1.restart"
+    lines = rec.read_text().splitlines()
+    assert lines[0] == str(cwd)
+    assert "-m realtime_subtitle.remote.server --port 8791" in lines[1]
+    assert _mode(rec) == 0o600 and _mode(rec.parent) == 0o700
+    assert "已记录 v1" in r.stdout and "已停止" in r.stdout
+
+
+def test_stop_v1_with_only_decoys_does_nothing(env, spawn):
+    e, home, _l = env
+    d = spawn("tail -f /x/realtime_subtitle/remote/server.py")
+    stale = home / "Library" / "Application Support" / "rs-node" / "v1.restart"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("/old\nold-cmd\n")
+    r = _run_stop_v1(e)
+    assert r.returncode == 0
+    assert "未在运行" in r.stdout
+    assert d.poll() is None
+    assert not stale.exists(), "v1 没在跑就不该留着过期记录"
+
+
+def test_stop_v1_pattern_is_anchored_in_source():
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert r"realtime_subtitle\.remote\.server" in text
+    assert 'pgrep -u "$uid_n"' in text
+    assert "pgrep -f '[r]ealtime_subtitle.remote.server'" not in text
