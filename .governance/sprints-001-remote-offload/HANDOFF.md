@@ -1,6 +1,6 @@
 # 交接包 — realtime_subtitle 外包算力版（sprints-001-remote-offload）
 
-> 写于 2026-10-08 22:15 CEST，由 Claude（Coordinator）在额度可能耗尽前写成。接手的 AI 读完本文件，不需要再找用户补充背景。
+> 写于 2026-10-08 22:15 CEST，**最后更新 2026-10-08 22:45 CEST**，由 Claude（Coordinator）在额度可能耗尽前写成。接手的 AI 读完本文件，不需要再找用户补充背景。
 > 本文件有三份副本：本机仓库 `~/projects/rs-mac-native/.governance/sprints-001-remote-offload/HANDOFF.md`、mini2 上的 `~/rs-HANDOFF.md`、本机记忆 `~/.claude/projects/-/memory/handoff-2026-10-08-rs-remote-offload.md`。
 
 ## 1. Goal
@@ -14,7 +14,7 @@
 
 | 项 | 值 |
 |---|---|
-| 主仓库 / 分支 | `~/projects/rs-mac-native`（git worktree），分支 `feat/macos-native`，HEAD `1ca42d0`，**没有 push 过** |
+| 主仓库 / 分支 | `~/projects/rs-mac-native`（git worktree），分支 `feat/macos-native`，HEAD 以 `git log -1` 为准，**从未 push** |
 | 原始仓库 | `~/projects/realtime_subtitle`（master，GitHub wyl2607/realtime_subtitle） |
 | 需求 / 设计 / 评审 | `.governance/specs/001-remote-offload-productization/{requirement,draft,draft.review}.md` |
 | Sprint 五件套 | `.governance/sprints-001-remote-offload/{RFC,PLAN,TASKS,CURSOR,REVIEWS}.md`，`tasks/TK-00*.md`，`metrics/phase-trace.jsonl` |
@@ -36,8 +36,8 @@
 
 | TK | 状态 | 执行者 / worktree | 说明 |
 |---|---|---|---|
-| TK-001 节点 worker | **executing** | Claude sonnet 子代理，`~/projects/rs-tk-001`（feat/tk-001） | codex 额度耗尽、零产出后改派。写本文件时子代理刚开工，worktree 里还没有改动 |
-| TK-004 rslite 时间+混合+单实例 | **reviewing（CR-001 第 1 轮，Opus 评审中）** | `~/projects/rs-tk-004`，提交 ecb7a20 + 0cdd5c7 | 实现在 write_scope 之内；main/RemotePipeline 只由 coordinator-direct 改了 onFinal 签名（0cdd5c7），单实例接线和模式文案留给 TK-005。看 `reviews/CR-001.md`，评审员结论出来后由 Coordinator 分诊 |
+| TK-001 节点 worker | **reviewing：CR-002 已建，第 1 轮评审员尚未派出** | Claude sonnet 子代理（已完成）· `~/projects/rs-tk-001`，提交 **3e87063** | 在范围内。M2 真模型冒烟：WER **0.88%**，每段说完到出结果的延迟中位数 **3.25s**。下一步：并行派 default（opus）和 security（sonnet）两个评审员 |
+| TK-004 rslite 时间+混合+单实例 | **fixing：CR-001 第 1 轮 needs_fix，6 条全部接受（F5 转给 TK-005）；修复者（sonnet）正在跑** | `~/projects/rs-tk-004`，提交 ecb7a20 + 0cdd5c7（coordinator-direct 编译适配） | 修复者完成后会在 feat/tk-004 上提交 `fix(native):`；若额度耗尽导致修复中断，先看 `git status`/`git log`，再按 `reviews/CR-001.md` 的 Round 1 表格继续修 F1–F4、F6，然后派第 2 轮复查（opus） |
 | TK-002 gateway | planned | — | 安全类，单独一批 |
 | TK-003 install_node.sh | planned | — | 涉及 token，单独一批 |
 | TK-005 NodeClient+Router | planned | 等 TK-004 | |
@@ -93,24 +93,11 @@
 
 ## 5. Next steps（按顺序）
 
-1. **回收 TK-001 和 TK-004**：
-   - 检查有没有越界写入（TK-004 的 `main.swift`、`RemotePipeline.swift` 必须给出理由；可以放行最小的编译适配，或者移到 TK-005 处理）。
-   - 运行验证命令。
-   - TASKS 改为 reviewing，CURSOR 的 phase 改为 review，metrics 记一行。
-2. **评审**（`self-healing-execution` 的 8 步闭环）：
-   - 每个 TK 建一份 `reviews/CR-00N.md`。
-   - 按 reviewer_lanes 派评审员（default，以及需要时的 security），至少 2 轮。
-   - 由 Coordinator 分诊；接受的 finding 交给 Repairer 修，然后复查，直到收敛。
-3. **交付**：合进 `feat/macos-native`（`git merge --no-edit feat/tk-00N`），跑全量 pytest、ruff 和 Swift release 构建，TASKS 改为 done，CURSOR 记交付摘要。
-4. **下一批**：TK-002 单独一批 → TK-003 单独一批 → TK-005（依赖 TK-004）→ TK-006 → TK-007。
-   - 每批都从 `feat/macos-native` 的 HEAD 开新 worktree：`git worktree add -b feat/tk-00N ~/projects/rs-tk-00N feat/macos-native`。
-   - 执行者的派活 prompt 可以照抄本次 TK-001、TK-004 的模板：读卡片、RFC、CLAUDE.md，严格限定 write_scope，按格式回报。
-5. **TK-007 验收**：
-   - 先用 `install_node.sh mini2` 装 v2 节点，并停掉 v1（PID 34924）。
-   - 再在本机用 `--local` 模拟第二个节点，测路由。
-   - 功耗请用户执行 `sudo bash scripts/bench/power_compare.sh …`（需要先扩成五组）。
-   - 结果写进 `docs/node-acceptance.md`。
-6. 全部 TK 完成后执行 `/sprint-exit`，并更新记忆。
+1. **TK-004 / CR-001**：等修复者回报（或者自己检查 `~/projects/rs-tk-004` 的 git log）→ 越界检查、构建、headless 回放 → 派第 2 轮复查（opus，lens=default，只看 F1–F4、F6 有没有修好、有没有引入新问题）→ 收敛后 `git merge --no-edit feat/tk-004` 合进 feat/macos-native → TASKS 改成 done，REVIEWS 改成 resolved。
+2. **TK-001 / CR-002**：并行派两个评审员（default 用 opus，security 用 sonnet；派活模板见 §8 的「工作方式」）。评审要核实执行者自己加的那几个细节（见 `reviews/CR-002.md` 第一段），以及 S1/S7；分诊、修复、第 2 轮复查（这个 TK 涉及生命周期，必要时做第 3 轮）；收敛后合并。
+3. **下一批**：TK-002（gateway，安全类，单独一批）→ TK-003（install_node.sh，单独一批）→ TK-005（依赖 TK-004，**包括 CR-001 的 F5：在 main 里接上单实例，以及 `--selftest` 入口调用 `LineStore.selfTest()`**）→ TK-006 → TK-007（验收，远程操作单独一批）。每批都从 feat/macos-native 的 HEAD 开新的 worktree。
+4. **TK-007 验收**：先用 `install_node.sh mini2` 装 v2 节点，并停掉 v1（PID 34924）；再在本机用 `--local` 模拟第二个节点测路由；功耗请用户执行 `sudo bash scripts/bench/power_compare.sh …`（需要先扩到 5 组）；结果写进 `docs/node-acceptance.md`。
+5. 全部完成后执行 `/sprint-exit`，并更新记忆。
 
 ## 6. Verify（最小验证集）
 
@@ -134,16 +121,34 @@ cd macos-native && swift build -c release --product rslite
 - 五组功耗都有数据。
 - 测试和文档齐全。
 
-## 8. Ready-to-paste prompt（给接手的 AI，另一个 Claude 账号或 Codex）
+## 8. Ready-to-paste prompt（给接手的 AI：另一个 Claude 账号，或 00:25 之后的 Codex）
 
 ```text
-你接手一个进行中的 SDD Sprint。先完整读这份交接包，再按里面的第 5 节「Next steps」继续：
-  ~/projects/rs-mac-native/.governance/sprints-001-remote-offload/HANDOFF.md
-（如果在 mini2 上看，路径是 ~/rs-HANDOFF.md，内容相同。）
+你接手一个进行中的 SDD Sprint，按原 Coordinator 的工作方式继续开发，全程用中文回复。
 
-然后读同一目录下的 CURSOR.md、TASKS.md、RFC.md，以及仓库根目录 CLAUDE.md 的第 4 节和第 7 节。
-你的角色是 Coordinator，只做调度、评审和合并，业务代码交给子代理或 codex 写；codex 额度在 2026-10-09 00:25 之后才恢复。
-契约 P1–P8 已冻结；不 push、不开 PR；在 mini2 上做远程操作前，先告诉用户你要做什么。
-第一步：检查 ~/projects/rs-tk-001 和 ~/projects/rs-tk-004 两个 worktree 的 git status 和 git log，判断 TK-001、TK-004 进行到哪一步，再继续评审或重新派活。
-回复用中文。
+【先读，按顺序】
+1. ~/projects/rs-mac-native/.governance/sprints-001-remote-offload/HANDOFF.md（交接包。在 mini2 上读时，路径是 ~/rs-HANDOFF.md）
+2. 同一目录下的 CURSOR.md、TASKS.md、REVIEWS.md、RFC.md、reviews/CR-*.md
+3. 仓库根目录的 CLAUDE.md 第 4 节和第 7 节（踩过的坑），以及 ~/.claude/CLAUDE.md
+4. 记忆：~/.claude/projects/-/memory/project_rs-macos-native-lowpower.md
+
+【你的角色：Coordinator】
+- 你只负责调度、分诊、合并和验收；业务代码交给子代理写。只有一两行、又必须依赖本会话上下文的改动，才由你自己直接改，并且单独提交，commit 标题标 [coordinator-direct]。
+- RFC 里的契约 P1–P8 已经冻结，不许改。不 push、不开 PR。在 mini2 上做远程操作之前，先告诉用户你要做什么，用户已经批准过 TK-007。
+- 不要杀用户正在运行的 rslite 或 main.py；每次跑之前先 pgrep。
+
+【工作方式（照做）】
+- 每个 TK 一个 worktree：git worktree add -b feat/tk-00N ~/projects/rs-tk-00N feat/macos-native
+- Executor：Claude sonnet 子代理（在真机上跑，可以用 Speech/MLX/Translation）。codex 在 2026-10-09 00:25 之后恢复，只能用 `codex exec -c model=gpt-5.5 -c model_reasoning_effort=high -s workspace-write -C <worktree> - < packet`，不要在末尾加 </dev/null；codex 的沙箱不能 commit，要由你来代提交。不要派 agy。
+- 派给 Executor 的 prompt 必须包含：TK 卡片路径、RFC 里对应的契约编号、write_scope 白名单、禁止修改的路径、必须实际跑的验证命令（pytest、ruff、swift build、headless 回放 ~/projects/rs-mac-native-data/concat5.wav）、回报格式（文件清单、验证原文、有没有越界、遗留风险），以及「不许声称跑过没跑的东西」。
+- Reviewer：用一个和实现模型不同、更强的模型（实现用 sonnet，评审就用 opus）；涉及安全的 TK 另派一路 security 评审。评审员只读，按 id/severity/category/location/evidence/suggested_fix 格式输出，最后给 verdict，篇幅不超过 600 字。
+- 每个 TK 至少评审 2 轮；涉及鉴权、生命周期或状态机的（TK-001/002/005），要准备第 3 轮。由你逐条分诊每个 finding：accepted 还是 rejected，并写明理由。Repairer 用 sonnet，只修 accepted 的 finding。
+- 每次 phase 切换、每次派出或回收子代理，都要同步：TASKS.md 的状态、CURSOR.md（current_phase/tk/cr/round，以及「最近动作」时间线）、REVIEWS.md，并往 metrics/phase-trace.jsonl 追加一行 JSON；然后 git commit。
+- 合并前跑一遍：pytest 全量、ruff、swift build -c release --product rslite。
+- 每完成一步，就更新 HANDOFF.md（同时 scp 一份到 mini2 的 ~/rs-HANDOFF.md）和记忆文件，写清这次推翻了哪个假设、纠正了什么。
+
+【第一步】
+查看 ~/projects/rs-tk-004 和 ~/projects/rs-tk-001 两个 worktree 的 git status 和 git log，再按 HANDOFF 第 5 节继续：
+(1) TK-004 等待或检查 CR-001 的修复结果，然后派第 2 轮复查；
+(2) TK-001 派 CR-002 第 1 轮评审（default 用 opus、security 用 sonnet，两路并行）。
 ```
