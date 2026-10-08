@@ -5,8 +5,9 @@
 
 | CR | TK | rounds | status | last_action |
 |----|----|--------|--------|-------------|
-| CR-002 | TK-001 | 0 | open | 2026-10-09 04:20 CST: created；executor 3e87063（M2 冒烟 WER 0.88%、延迟中位 3.25s）|
-| CR-001 | TK-004 | 1 | needs_fix | 2026-10-09 04:24 CST: repair 完成 c53ef12（F1–F4、F6），待 round2 复查 |
+| CR-003 | TK-002 | 1 | needs_fix | 2026-10-09 05:48 CST: round1 两路要求修改；9 accepted / 3 rejected → repair round1（sonnet） |
+| CR-002 | TK-001 | 4 | resolved | 2026-10-09 05:55 CST: round4 approve；四轮收敛（14 accepted / 2 rejected），b2c697e 已合进 feat/macos-native |
+| CR-001 | TK-004 | 3 | resolved | 2026-10-09 05:05 CST: round3 approve（代码层）；M1/M2 rejected（理由见 CR-001.md）；**待 Mac 构建验证后才能合并** |
 
 ## 字段说明
 - **rounds**：已完成的 review 轮数（initial = 1，第一次 recheck = 2，以此类推）
