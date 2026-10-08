@@ -1,4 +1,5 @@
 @preconcurrency import AVFoundation
+import CoreMedia
 import Foundation
 @preconcurrency import Speech
 @preconcurrency import Translation
@@ -23,10 +24,14 @@ struct PipelineConfig: Sendable {
 
 struct PipelineCallbacks: Sendable {
     var onVolatile: @Sendable (String) -> Void = { _ in }
-    var onFinal: @Sendable (Int, String) -> Void = { _, _ in }
+    /// t0/t1：句子在统一样本时钟（AudioFanout）上的起止秒数；拿不到时为 nil，这样的句子不参与替换（RFC P4）。
+    var onFinal: @Sendable (Int, String, Double?, Double?) -> Void = { _, _, _, _ in }
     var onTranslation: @Sendable (Int, String) -> Void = { _, _ in }
     var onStatus: @Sendable (String) -> Void = { _ in }
     var onFinished: @Sendable () -> Void = {}
+    /// 每轮识别启动前调用：NodeClient 在这里 subscribe，必须赶在 fanout.start() 之前订阅，
+    /// 否则漏掉开头的音频；暂停/恢复会重新创建订阅，所以每轮都会回调。
+    var onFanoutReady: @Sendable (AudioFanout) -> Void = { _ in }
 }
 
 @available(macOS 27.0, *)
@@ -35,7 +40,8 @@ final class Pipeline: @unchecked Sendable {
     private let callbacks: PipelineCallbacks
     private let translator: TranslationQueue
 
-    private var source: AudioSource?
+    /// 一路采集的统一出口。本机 B 和节点客户端都从这里订阅，共用同一个样本时钟。
+    let fanout: AudioFanout
     private var analyzer: SpeechAnalyzer?
     private var resultTask: Task<Void, Never>?
     private var analysisTask: Task<Void, Never>?
@@ -51,6 +57,7 @@ final class Pipeline: @unchecked Sendable {
     init(config: PipelineConfig, callbacks: PipelineCallbacks) {
         self.config = config
         self.callbacks = callbacks
+        fanout = AudioFanout(sourceSpec: config.sourceSpec)
         translator = TranslationQueue(
             sourceID: config.sourceLocaleID,
             targetID: config.targetLanguageID,
@@ -114,7 +121,8 @@ final class Pipeline: @unchecked Sendable {
             // fastResults：FLEURS 5 句实时回放，草稿首字 4–12s → 0.1–1.8s，定稿 4.8–6.7s → 2.2–4.4s，
             // 本进程 CPU 0.42s → 0.59s/71s。和 Whisper 版同时跑会抢资源而跟不上实时（实测 117s 才跑完 67s 音频）
             reportingOptions: [.volatileResults, .fastResults],
-            attributeOptions: []
+            // audioTimeRange：每个词带起止时间，换算成句子的 [t0,t1] 供混合替换使用
+            attributeOptions: [.audioTimeRange]
         )
 
         if !didCheckAssets {
@@ -122,19 +130,29 @@ final class Pipeline: @unchecked Sendable {
             didCheckAssets = true
         }
 
-        let source = try makeAudioSource(config.sourceSpec)
-        let stream = try source.start()
+        let stream = fanout.subscribe()
+        callbacks.onFanoutReady(fanout)
+        do {
+            try fanout.start()
+        } catch {
+            fanout.stop()
+            throw error
+        }
+        guard let sourceFormat = fanout.format else {
+            fanout.stop()
+            throw PipelineError.unavailable("音频来源没有给出格式")
+        }
         let modules: [any SpeechModule] = [transcriber]
         guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(
             compatibleWith: modules,
-            considering: source.format
+            considering: sourceFormat
         ) else {
+            fanout.stop()
             throw PipelineError.unavailable("找不到兼容的识别音频格式")
         }
 
         let analyzer = SpeechAnalyzer(modules: modules)
         committer = SentenceCommitter()
-        self.source = source
         self.analyzer = analyzer
 
         resultTask = Task { [weak self] in
@@ -150,7 +168,6 @@ final class Pipeline: @unchecked Sendable {
             }
         }
 
-        let sourceFormat = source.format
         analysisTask = Task { [weak self, stream, sourceFormat, analyzerFormat, analyzer] in
             guard let self else {
                 return
@@ -175,21 +192,19 @@ final class Pipeline: @unchecked Sendable {
     }
 
     private func stopCurrentRun() async {
-        source?.stop()
+        fanout.stop()
         analysisTask?.cancel()
         resultTask?.cancel()
         if let analyzer {
             await analyzer.cancelAndFinishNow()
         }
-        source = nil
         analyzer = nil
         analysisTask = nil
         resultTask = nil
     }
 
     private func finishRun() async {
-        source?.stop()
-        source = nil
+        fanout.stop()
         analyzer = nil
         analysisTask = nil
         await translator.waitUntilIdle()
@@ -208,29 +223,56 @@ final class Pipeline: @unchecked Sendable {
     }
 
     private func accept(_ result: SpeechTranscriber.Result) async {
-        let text = String(result.text.characters).trimmingCharacters(in: .whitespacesAndNewlines)
+        let raw = String(result.text.characters)
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else {
             return
         }
+        let spans = Self.timedSpans(of: result.text, trimmedLeading: raw.prefix { $0.isWhitespace || $0.isNewline }.count)
 
         if result.isFinal {
-            for sentence in committer.final(text) {
-                commit(sentence)
-            }
+            let sentences = committer.final(text)
+            commit(sentences, text: text, spans: spans)
             callbacks.onVolatile("")
         } else {
             let (sentences, remainder) = committer.volatile(text)
-            for sentence in sentences {
-                commit(sentence)
-            }
+            commit(sentences, text: text, spans: spans)
             callbacks.onVolatile(remainder)
         }
     }
 
-    private func commit(_ sentence: String) {
+    private func commit(_ sentences: [String], text: String, spans: [TimedSpan]) {
+        let times = SentenceTiming.times(for: sentences, in: text, spans: spans)
+        for (sentence, time) in zip(sentences, times) {
+            commit(sentence, t0: time?.t0, t1: time?.t1)
+        }
+    }
+
+    /// 把识别结果里每个带 audioTimeRange 的 run 转成字符偏移（相对去掉首部空白后的文字）+ 秒。
+    /// 时间基准：analyzer 的输入第一块带了 AudioFanout 的时钟读数，之后顺着数，
+    /// 所以这里读到的秒数本身就在统一样本时钟上，不需要再换算。
+    private static func timedSpans(of text: AttributedString, trimmedLeading: Int) -> [TimedSpan] {
+        var spans: [TimedSpan] = []
+        for run in text.runs {
+            guard let range = run.audioTimeRange else {
+                continue
+            }
+            let start = text.characters.distance(from: text.startIndex, to: run.range.lowerBound) - trimmedLeading
+            let length = text.characters.distance(from: run.range.lowerBound, to: run.range.upperBound)
+            let t0 = range.start.seconds
+            let t1 = range.end.seconds
+            guard t0.isFinite, t1.isFinite else {
+                continue
+            }
+            spans.append(TimedSpan(start: start, end: start + length, t0: t0, t1: t1))
+        }
+        return spans
+    }
+
+    private func commit(_ sentence: String, t0: Double?, t1: Double?) {
         let id = nextID
         nextID += 1
-        callbacks.onFinal(id, sentence)
+        callbacks.onFinal(id, sentence, t0, t1)
         translator.enqueue(id: id, text: sentence)
     }
 
@@ -300,12 +342,12 @@ struct AnalyzerInputSequence: AsyncSequence, Sendable {
     typealias Element = AnalyzerInput
     typealias AsyncIterator = Iterator
 
-    private let sourceStream: SendableAudioStream
+    private let sourceStream: SendableTimedStream
     private let sourceFormat: AVAudioFormat
     private let analyzerFormat: AVAudioFormat
 
-    init(sourceStream: AsyncStream<AVAudioPCMBuffer>, sourceFormat: AVAudioFormat, analyzerFormat: AVAudioFormat) {
-        self.sourceStream = SendableAudioStream(stream: sourceStream)
+    init(sourceStream: AsyncStream<TimedAudio>, sourceFormat: AVAudioFormat, analyzerFormat: AVAudioFormat) {
+        self.sourceStream = SendableTimedStream(stream: sourceStream)
         self.sourceFormat = sourceFormat
         self.analyzerFormat = analyzerFormat
     }
@@ -319,17 +361,25 @@ struct AnalyzerInputSequence: AsyncSequence, Sendable {
     }
 
     struct Iterator: AsyncIteratorProtocol {
-        var sourceIterator: AsyncStream<AVAudioPCMBuffer>.Iterator
+        var sourceIterator: AsyncStream<TimedAudio>.Iterator
         let converter: AVAudioConverter?
         let analyzerFormat: AVAudioFormat
+        // 只有第一块显式带起点（统一样本时钟）：之后让 analyzer 自己顺着数，
+        // 重采样每块的帧数会差几个样本，逐块都标时间反而会出现微小重叠/空洞
+        var isFirst = true
 
         mutating func next() async throws -> AnalyzerInput? {
             guard let converter else {
                 throw PipelineError.unavailable("无法创建音频格式转换器")
             }
-            while let sourceBuffer = await sourceIterator.next() {
-                let converted = try Pipeline.convert(sourceBuffer, using: converter, to: analyzerFormat)
+            while let timed = await sourceIterator.next() {
+                let converted = try Pipeline.convert(timed.buffer, using: converter, to: analyzerFormat)
                 if converted.frameLength > 0 {
+                    if isFirst {
+                        isFirst = false
+                        let start = CMTime(seconds: timed.startSeconds, preferredTimescale: 1_000_000)
+                        return AnalyzerInput(buffer: converted, bufferStartTime: start)
+                    }
                     return AnalyzerInput(buffer: converted)
                 }
             }
@@ -338,8 +388,8 @@ struct AnalyzerInputSequence: AsyncSequence, Sendable {
     }
 }
 
-struct SendableAudioStream: @unchecked Sendable {
-    let stream: AsyncStream<AVAudioPCMBuffer>
+struct SendableTimedStream: @unchecked Sendable {
+    let stream: AsyncStream<TimedAudio>
 }
 
 @available(macOS 26.0, *)

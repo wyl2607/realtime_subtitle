@@ -81,3 +81,142 @@ struct SentenceCommitter {
         return abbreviations.contains(token.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: ".")))
     }
 }
+
+// MARK: - 句子时间（RFC P4）
+
+/// 识别结果里一段带时间的文字：字符偏移（半开区间）+ 统一样本时钟上的起止秒数。
+struct TimedSpan: Equatable {
+    var start: Int
+    var end: Int
+    var t0: Double
+    var t1: Double
+}
+
+enum SentenceTiming {
+    /// 给每个句子算 [t0,t1]：句子在整段文字里的字符区间所碰到的所有 span 的并集。
+    /// 句子由 SentenceCommitter.split 从同一段文字切出，按顺序出现，所以顺序查找即可；
+    /// 找不到或没碰到任何 span 就给 nil（P4：拿不到时间的句子不参与替换）。
+    static func times(
+        for sentences: [String],
+        in text: String,
+        spans: [TimedSpan]
+    ) -> [(t0: Double, t1: Double)?] {
+        let chars = Array(text)
+        var cursor = 0
+        return sentences.map { sentence in
+            let needle = Array(sentence)
+            guard let a = find(needle, in: chars, from: cursor) else {
+                return nil
+            }
+            let b = a + needle.count
+            cursor = b
+            let hit = spans.filter { $0.end > a && $0.start < b }
+            guard let t0 = hit.map(\.t0).min(), let t1 = hit.map(\.t1).max() else {
+                return nil
+            }
+            return (t0, t1)
+        }
+    }
+
+    private static func find(_ needle: [Character], in haystack: [Character], from: Int) -> Int? {
+        guard !needle.isEmpty, haystack.count >= needle.count else {
+            return nil
+        }
+        var i = from
+        while i + needle.count <= haystack.count {
+            if haystack[i] == needle[0], Array(haystack[i..<(i + needle.count)]) == needle {
+                return i
+            }
+            i += 1
+        }
+        return nil
+    }
+}
+
+// MARK: - 字幕行与混合替换（RFC P5）
+
+enum LineSource: Equatable {
+    case local
+    case node(String)
+}
+
+struct SubtitleLine: Equatable {
+    /// 行的唯一键：本机行用 Pipeline 的句子 id，节点行由 LineStore 分配（负数，避免撞车）。
+    var key: Int
+    var t0: Double?
+    var t1: Double?
+    var source: LineSource
+    var srcText: String
+    var dstText: String?
+}
+
+/// 字幕历史。纯逻辑，不碰界面，方便脱离 AppKit 测试。
+/// 界面只显示末尾几行；已经滚出屏幕的行也留在这里（P5：只更新内存里的历史，不回滚画面）。
+struct LineStore {
+    private(set) var lines: [SubtitleLine] = []
+    private var nextNodeKey = -1
+    private let capacity: Int
+
+    /// 重叠占本机行自身时长的比例达到这个值就整行替换（含等于）。
+    static let replaceRatio = 0.5
+    private static let epsilon = 1e-9
+
+    init(capacity: Int = 200) {
+        self.capacity = capacity
+    }
+
+    mutating func addLocal(key: Int, t0: Double?, t1: Double?, text: String) {
+        insert(SubtitleLine(key: key, t0: t0, t1: t1, source: .local, srcText: text, dstText: nil))
+    }
+
+    mutating func setTranslation(key: Int, text: String) {
+        guard let index = lines.firstIndex(where: { $0.key == key }) else {
+            return
+        }
+        lines[index].dstText = text
+    }
+
+    /// 节点的 final 到达：替换所有被它覆盖的本机行，没有可替换的就按 t0 插入。
+    /// 返回被替换掉的行的 key（调用方据此决定界面要不要重画）。
+    @discardableResult
+    mutating func applyNode(
+        nodeID: String, t0: Double?, t1: Double?, srcText: String, dstText: String?
+    ) -> [Int] {
+        let replaced = lines.filter { Self.shouldReplace($0, byNodeT0: t0, t1: t1) }.map(\.key)
+        lines.removeAll { replaced.contains($0.key) }
+        let key = nextNodeKey
+        nextNodeKey -= 1
+        insert(SubtitleLine(key: key, t0: t0, t1: t1, source: .node(nodeID), srcText: srcText, dstText: dstText))
+        return replaced
+    }
+
+    /// 只有带时间的本机行才可能被替换；节点行永远不会被再次替换。
+    static func shouldReplace(_ line: SubtitleLine, byNodeT0 n0: Double?, t1 n1: Double?) -> Bool {
+        guard line.source == .local, let n0, let n1,
+              let l0 = line.t0, let l1 = line.t1 else {
+            return false
+        }
+        let duration = max(l1 - l0, 0)
+        if duration <= epsilon {
+            return l0 >= n0 - epsilon && l0 <= n1 + epsilon
+        }
+        let overlap = min(l1, n1) - max(l0, n0)
+        return overlap >= duration * replaceRatio - epsilon
+    }
+
+    /// 按 t0 升序插入；同 t0 排在后面；没有时间的行放末尾（只会是本机行，按到达顺序）。
+    private mutating func insert(_ line: SubtitleLine) {
+        if let t0 = line.t0 {
+            let index = lines.firstIndex { other in
+                guard let o = other.t0 else { return true }
+                return o > t0
+            } ?? lines.count
+            lines.insert(line, at: index)
+        } else {
+            lines.append(line)
+        }
+        if lines.count > capacity {
+            lines.removeFirst(lines.count - capacity)
+        }
+    }
+}
