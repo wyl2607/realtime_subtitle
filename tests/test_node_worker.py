@@ -1031,3 +1031,164 @@ def test_faulthandler_dumps_frames_without_locals_on_native_crash():
     assert "Fatal Python error" in err
     assert 'File "' in err
     assert _SECRET not in err and _SECRET not in out.decode()
+
+
+# ---------------------------------------------------------------- rtf 滑动更新（TK-001b）
+
+from realtime_subtitle.node import info as info_mod  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _no_real_state_dir(monkeypatch, tmp_path):
+    # 没显式注入目录的用例不许碰真实的 ~/Library/Application Support/rs-node
+    monkeypatch.setattr(worker_mod, "STATE_DIR", tmp_path / "no-such-state-dir")
+
+
+class ClockAsr(FakeAsr):
+    """每次识别让假时钟前进 cost 秒，rtf 因此是确定值，不靠真实耗时/sleep。"""
+
+    def __init__(self, clock, cost, **kw):
+        super().__init__(**kw)
+        self.clock, self.cost = clock, cost
+
+    def transcribe(self, audio, language):
+        self.clock[0] += self.cost
+        return super().transcribe(audio, language)
+
+
+class RecordingWorker(Worker):
+    """记录每个被识别段的语音时长（a1-a0），用来独立推出期望的 rtf。"""
+
+    seg_durations: list
+
+    def _recognize(self, gen, seg, src):
+        self.seg_durations.append(seg.a1 - seg.a0)
+        super()._recognize(gen, seg, src)
+
+
+def speech_session(n_segments, speech_s=3.0):
+    """hello 之后 n 段「语音+静音」，最后 drain 保证识别全部落地。"""
+    pcm = np.concatenate([np.concatenate([tone(speech_s), silence(1.0)])
+                          for _ in range(n_segments)])
+    return hello() + audio_frames(pcm) + ctl(type="drain")
+
+
+def run_rtf(stream, state_dir, cost=0.5, utterances=None, tr_name="fake"):
+    clock = [0.0]
+    asr = ClockAsr(clock, cost, utterances=utterances)
+    out, err = io.BytesIO(), io.StringIO()
+    tr = FakeTr()
+    tr.name = tr_name
+    w = RecordingWorker(io.BytesIO(stream), out, asr, EnergyVad(),
+                        translator_factory=lambda s, d: tr, err=err,
+                        state_dir=state_dir)
+    w.seg_durations = []
+    worker_mod_time = worker_mod.time
+    worker_mod.time = SimpleNamespace(perf_counter=lambda: clock[0])
+    try:
+        code = w.run()
+    finally:
+        worker_mod.time = worker_mod_time
+    return code, w, err.getvalue()
+
+
+def read_state(d):
+    return json.loads((d / info_mod.ASR_STATE_FILENAME).read_text(encoding="utf-8"))
+
+
+def test_session_end_creates_state_file_with_session_rtf(tmp_path):
+    code, w, _ = run_rtf(speech_session(3), tmp_path, cost=0.5)
+    assert code == EXIT_OK
+    audio_s = sum(w.seg_durations)
+    assert audio_s >= worker_mod.RTF_MIN_AUDIO_S
+    expected = 0.5 * len(w.seg_durations) / audio_s
+    state = read_state(tmp_path)
+    assert state["rtf"] == pytest.approx(expected, abs=1e-3)
+    assert state["model"] == "fake" and state["backend"] == "fake"
+    assert state["translator"] == "fake"
+
+
+def test_next_hello_also_ends_session_and_blends_with_old(tmp_path):
+    (tmp_path / info_mod.ASR_STATE_FILENAME).write_text(
+        json.dumps({"model": "m0", "backend": "b0", "rtf": 0.8, "translator": "apple"}))
+    # 第一会话由第二条 hello 结束；第二会话只有 hello，没音频 → 不再更新
+    stream = speech_session(3) + hello()
+    _, w, _ = run_rtf(stream, tmp_path, cost=0.5)
+    session = 0.5 * len(w.seg_durations) / sum(w.seg_durations)
+    state = read_state(tmp_path)
+    assert state["rtf"] == pytest.approx(0.7 * 0.8 + 0.3 * session, abs=1e-3)
+    # 已有的 model/backend/translator 保留，不被当前引擎覆盖
+    assert (state["model"], state["backend"], state["translator"]) == ("m0", "b0", "apple")
+
+
+@pytest.mark.parametrize("old", ['not json', '[]', '{"rtf": -1}', '{"rtf": "0.3"}',
+                                 '{"rtf": true}', '{"rtf": NaN}', '{}'])
+def test_invalid_old_value_is_overwritten_by_session_rtf(tmp_path, old):
+    (tmp_path / info_mod.ASR_STATE_FILENAME).write_text(old)
+    _, w, _ = run_rtf(speech_session(3), tmp_path, cost=0.5)
+    session = 0.5 * len(w.seg_durations) / sum(w.seg_durations)
+    assert read_state(tmp_path)["rtf"] == pytest.approx(session, abs=1e-3)
+
+
+def test_session_shorter_than_threshold_does_not_update(tmp_path):
+    path = tmp_path / info_mod.ASR_STATE_FILENAME
+    path.write_text(json.dumps({"rtf": 0.8}))
+    _, w, err = run_rtf(speech_session(1, speech_s=2.0), tmp_path)
+    assert sum(w.seg_durations) < worker_mod.RTF_MIN_AUDIO_S
+    assert json.loads(path.read_text()) == {"rtf": 0.8}
+    assert "rtf_skipped" in err
+    # 没有旧文件时也不凭空创建
+    other = tmp_path / "other"
+    other.mkdir()
+    run_rtf(speech_session(1, speech_s=2.0), other)
+    assert not (other / info_mod.ASR_STATE_FILENAME).exists()
+
+
+def test_sessions_do_not_leak_samples_into_each_other(tmp_path):
+    # 第一会话 3 段（够长）、第二会话 1 段（太短）：第二会话不得带着第一会话的累计更新
+    stream = speech_session(3) + speech_session(1, speech_s=2.0)
+    _, w, _ = run_rtf(stream, tmp_path, cost=0.5)
+    first = w.seg_durations[:-1]
+    assert read_state(tmp_path)["rtf"] == pytest.approx(
+        0.5 * len(first) / sum(first), abs=1e-3)
+
+
+def test_state_file_has_no_transcript_text_and_is_0600(tmp_path):
+    utts = [Utterance(0.1, 0.5, SECRET_SRC)]
+    _, _, err = run_rtf(speech_session(3), tmp_path, utterances=utts)
+    path = tmp_path / info_mod.ASR_STATE_FILENAME
+    raw = path.read_text(encoding="utf-8")
+    assert SECRET_SRC not in raw and SECRET_DST not in raw
+    assert set(json.loads(raw)) == {"model", "backend", "rtf", "translator"}
+    assert (path.stat().st_mode & 0o777) == 0o600
+    assert SECRET_SRC not in err and SECRET_DST not in err
+    # 不留临时文件
+    assert [p.name for p in tmp_path.iterdir()] == [info_mod.ASR_STATE_FILENAME]
+
+
+def test_gateway_info_reader_reads_back_what_worker_wrote(tmp_path):
+    # 假名字 "fake" 不合 info 的 translator 白名单，换成真实格式才能证明两端对齐
+    _, w, _ = run_rtf(speech_session(3), tmp_path, cost=0.5, tr_name="ollama:fake")
+    asr, translator = info_mod.NodeInfo(state_dir=tmp_path).asr_and_translator()
+    assert asr["rtf"] == pytest.approx(read_state(tmp_path)["rtf"])
+    assert asr["rtf"] > 0 and translator == "ollama:fake"
+    assert asr["model"] == "fake"
+
+
+def test_missing_state_dir_is_logged_and_keeps_exit_code(tmp_path):
+    missing = tmp_path / "nope"
+    code, _, err = run_rtf(speech_session(3), missing)
+    assert code == EXIT_OK
+    assert not missing.exists()  # worker 不负责建目录
+    assert "rtf_state_dir_missing" in err
+
+
+def test_write_failure_is_logged_and_does_not_change_exit_code(tmp_path, monkeypatch):
+    def boom(*a, **k):
+        raise PermissionError(SECRET_SRC)
+    monkeypatch.setattr(worker_mod.os, "replace", boom)
+    code, _, err = run_rtf(speech_session(3), tmp_path)
+    assert code == EXIT_OK
+    assert "rtf_write_failed err=PermissionError" in err
+    assert SECRET_SRC not in err
+    assert list(tmp_path.iterdir()) == []  # 临时文件已清理

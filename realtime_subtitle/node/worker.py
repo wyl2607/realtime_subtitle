@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import faulthandler
 import json
+import math
 import os
 import queue
 import re
@@ -38,10 +39,16 @@ import signal
 import sys
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 
 from realtime_subtitle.node.engines import AsrEngine, Translator, select_translator
+from realtime_subtitle.node.info import (
+    ASR_STATE_FILENAME,
+    DEFAULT_TRANSLATOR,
+    STATE_DIR,
+)
 from realtime_subtitle.node.segmenter import Segmenter, Segment, VadFn
 
 EXIT_OK = 0
@@ -67,6 +74,15 @@ _LANG = re.compile(r"^[a-z]{2,3}(-[A-Za-z]{2,4})?$")
 MAX_ASR_BACKLOG = 8
 MAX_TX_BACKLOG = 64
 
+# 会话被识别音频不足 5 秒就不更新 rtf：样本太少时，一次模型预热抖动或一段
+# 极短的段就能把比值带偏几倍，而旧值是在更长的音频上攒出来的，不该被它冲掉。
+RTF_MIN_AUDIO_S = 5.0
+# 滑动合并 new = 0.7*old + 0.3*session：与 WhisperEngine 内部的段间平滑同一套
+# 系数——单个会话的负载（别的程序占 GPU、音频内容）有偶然性，只给 30% 权重，
+# 既能在几个会话内跟上硬件的真实变化，又不会被一次异常会话拉走。
+RTF_OLD_WEIGHT = 0.7
+RTF_NEW_WEIGHT = 0.3
+
 
 class ProtocolError(Exception):
     """协议违规。消息是固定短语，不夹带输入内容。"""
@@ -88,7 +104,7 @@ def _log(stream, event: str, **fields) -> None:
 
 class Worker:
     def __init__(self, inp, out, asr: AsrEngine, vad: VadFn,
-                 translator_factory=None, err=None):
+                 translator_factory=None, err=None, state_dir=None):
         self._in = inp
         self._out = out
         self._err = err if err is not None else sys.stderr
@@ -98,6 +114,11 @@ class Worker:
         self._translator: Translator | None = None
         self._tr_pair: tuple[str, str] | None = None
         self._loaded = False
+        # 测试注入点；None 表示用 info.STATE_DIR（运行时以它为准，读取时才解析）
+        self._state_dir = Path(state_dir) if state_dir is not None else None
+        # 本会话累计：被识别的音频秒数与识别耗时，受 _state_lock 保护
+        self._sess_audio_s = 0.0
+        self._sess_asr_s = 0.0
 
         self._emit_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -197,6 +218,7 @@ class Worker:
             msg = self._read_message()
             if msg is None:
                 self.log("stdin_closed")
+                self._finish_session()
                 return EXIT_OK
             kind, body = msg
             if kind == "pcm":
@@ -228,6 +250,10 @@ class Worker:
                 or not _LANG.fullmatch(msg["src"]) or not _LANG.fullmatch(msg["dst"])):
             raise ProtocolError("bad_hello")
         src, dst = msg["src"], msg["dst"]
+
+        # 上一会话在这里结束：先收口它的 rtf（hello 校验通过之后再收，
+        # 协议错误的坏 hello 不算会话边界）
+        self._finish_session()
 
         # 先递增代数再动翻译器/引擎：此后 tx/asr 线程里属于旧会话的结果在
         # 「查代数 + 发事件」那把锁里一律被拒，不会挂到新会话 id 上
@@ -264,6 +290,8 @@ class Worker:
         with self._state_lock:
             self._gen += 1
             self._next_id = 1
+            # 第一次递增之后旧会话的识别结果已被拒收，这里清零才不会混进新会话
+            self._sess_audio_s = self._sess_asr_s = 0.0
             self._src, self._dst = src, dst
             if hasattr(self._vad, "reset"):
                 self._vad.reset()
@@ -278,6 +306,72 @@ class Worker:
         if tr_note:
             self._status(*tr_note)
         return None
+
+    # ------------------------------------------------------------ rtf 持久化
+
+    def _finish_session(self) -> None:
+        """会话结束（下一条 hello / stdin EOF）：把本会话 rtf 滑动并入 asr_state.json。
+
+        任何失败只记日志：这只是给 /v1/info 的路由提示，不能影响会话与退出码。
+        """
+        with self._state_lock:
+            audio_s, asr_s = self._sess_audio_s, self._sess_asr_s
+            self._sess_audio_s = self._sess_asr_s = 0.0
+        if self._seg is None:
+            return  # 还没有过会话
+        if audio_s < RTF_MIN_AUDIO_S:
+            self.log("rtf_skipped", reason="short_session", audio_s=audio_s)
+            return
+        try:
+            self._update_rtf_file(asr_s / audio_s, audio_s)
+        except Exception as e:  # noqa: BLE001 - 只记类名
+            self.log("rtf_write_failed", err=type(e).__name__)
+
+    def _update_rtf_file(self, session_rtf: float, audio_s: float) -> None:
+        state_dir = self._state_dir if self._state_dir is not None else STATE_DIR
+        # 目录由安装脚本 / gateway 建（权限也由它们定），worker 不越俎代庖
+        if not state_dir.is_dir():
+            self.log("rtf_state_dir_missing")
+            return
+        path = state_dir / ASR_STATE_FILENAME
+        old: dict = {}
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                old = raw
+        except (OSError, ValueError):
+            pass
+        old_rtf = old.get("rtf")
+        valid = (isinstance(old_rtf, int | float) and not isinstance(old_rtf, bool)
+                 and math.isfinite(old_rtf) and old_rtf >= 0)
+        new_rtf = (RTF_OLD_WEIGHT * old_rtf + RTF_NEW_WEIGHT * session_rtf
+                   if valid else session_rtf)
+
+        engine = self._asr.info()
+        state = {}
+        for key in ("model", "backend"):
+            val = old.get(key)
+            state[key] = val if isinstance(val, str) and val else engine.get(key)
+        state["rtf"] = round(new_rtf, 4)
+        tr = old.get("translator")
+        state["translator"] = (tr if isinstance(tr, str) and tr else
+                               self._translator.name if self._translator else DEFAULT_TRANSLATOR)
+
+        # 同目录临时文件 + replace：gateway 随时在读，不能让它读到写了一半的 JSON
+        tmp = state_dir / f".{ASR_STATE_FILENAME}.{os.getpid()}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(state, f, allow_nan=False)
+            os.chmod(tmp, 0o600)  # 临时文件若是上次崩溃遗留，open 不会改它的权限
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        self.log("rtf_updated", rtf=new_rtf, session_rtf=session_rtf, audio_s=audio_s)
 
     def _on_audio(self, data: bytes) -> None:
         pcm = np.frombuffer(data, dtype="<i2")
@@ -345,6 +439,8 @@ class Worker:
             # 识别期间如果来了新 hello，这批结果属于已结束的会话，丢弃
             if gen != self._gen:
                 return
+            self._sess_audio_s += max(seg.a1 - seg.a0, 0.0)
+            self._sess_asr_s += asr_s
             for u in utts:
                 a0 = min(max(seg.audio_t0 + u.start, lo), hi)
                 a1 = min(max(seg.audio_t0 + u.end, a0), hi)
