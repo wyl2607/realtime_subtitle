@@ -49,6 +49,7 @@ FAKE_WORKER = textwrap.dedent(
     if mode == "ignore-term":
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
     stdin, out = sys.stdin.buffer, sys.stdout.buffer
+    total = 0  # 收到的 PCM 字节数：worker 按它算样本时钟（F2）
     def emit(d):
         out.write((json.dumps(d, ensure_ascii=False) + "\\n").encode()); out.flush()
     while True:
@@ -64,17 +65,22 @@ FAKE_WORKER = textwrap.dedent(
                 emit({{"ev": "ready", "cold": True, "load_s": 0.0, "engine": {{}}}})
                 if mode == "stall":
                     time.sleep(3600)
+                if mode == "gate":  # 慢 worker：门文件出现之前一个字节都不读
+                    while not os.path.exists(rec + ".gate"):
+                        time.sleep(0.02)
             elif t == "flush":
-                emit({{"ev": "final", "id": 1, "a0": 0.0, "a1": 1.0, "text": "{FEATURE}"}})
+                emit({{"ev": "final", "id": 1, "a0": 0.0, "a1": 1.0,
+                       "text": str(total) if mode == "gate" else "{FEATURE}"}})
                 emit({{"ev": "translation", "id": 1, "text": "{FEATURE}-zh"}})
             elif t == "drain":
                 emit({{"ev": "drained"}})
         else:
             n = int.from_bytes(b + stdin.read(3), "big")
             stdin.read(n)
+            total += n
             record("pcm %d" % n)
-            if mode == "crash":
-                sys.exit(3)
+            if mode.startswith("crash"):
+                sys.exit(int(mode.partition(":")[2] or 3))
     '''
 )
 
@@ -119,6 +125,7 @@ async def running(tmp_path: Path, mode: str = "echo", **kw):
     script.write_text(FAKE_WORKER)
     rec = tmp_path / "worker.rec"
     kw.setdefault("resolve_host", lambda: "127.0.0.1")
+    kw.setdefault("allow_non_tailscale_for_tests", True)  # 测试在 127.0.0.1 上监听
     gw = Gateway(
         token=TOKEN,
         uds_dir=make_dir(tmp_path) if not (tmp_path / "rs-node").exists() else tmp_path / "rs-node",
@@ -197,6 +204,44 @@ def test_validate_host_rejects_wildcards_and_non_ips(host):
 
 def test_validate_host_accepts_tailscale_ip():
     assert gw_mod.validate_host("100.101.102.103") == "100.101.102.103"
+    assert gw_mod.validate_host("100.64.0.1") == "100.64.0.1"
+    assert gw_mod.validate_host("100.127.255.254") == "100.127.255.254"
+
+
+@pytest.mark.parametrize("host", [
+    "8.8.8.8", "192.168.1.20", "10.0.0.5", "127.0.0.1", "100.63.255.255", "100.128.0.1",
+    "fd7a:115c:a1e0::1", " 100.64.0.1", "100.64.0.1 ", "100.64.0.1\n", "\t100.64.0.1",
+])
+def test_validate_host_rejects_non_tailscale_and_whitespace(host):
+    with pytest.raises(ValueError):
+        gw_mod.validate_host(host)
+
+
+def test_non_tailscale_escape_hatch_is_explicit_and_still_rejects_wildcards():
+    assert gw_mod.validate_host("127.0.0.1", allow_non_tailscale_for_tests=True) == "127.0.0.1"
+    for bad in ("0.0.0.0", "::", " 127.0.0.1"):
+        with pytest.raises(ValueError):
+            gw_mod.validate_host(bad, allow_non_tailscale_for_tests=True)
+
+
+def test_gateway_default_refuses_loopback_bind(tmp_path):
+    """不带测试开关的 Gateway 不会在 127.0.0.1 上监听（取到非 Tailscale 地址只会退避重试）。"""
+    delays: list[float] = []
+
+    async def fake_sleep(d):
+        delays.append(d)
+        if len(delays) >= 2:
+            await asyncio.Event().wait()
+
+    async def scenario():
+        gw = Gateway(token=TOKEN, uds_dir=make_dir(tmp_path), port=0,
+                     resolve_host=lambda: "127.0.0.1", sleep=fake_sleep)
+        await gw.start()
+        await until(lambda: len(delays) >= 2, what="retries")
+        assert not gw.tcp_ready.is_set() and gw.tcp_port is None
+        await gw.stop()
+
+    asyncio.run(scenario())
 
 
 def test_tailscale_ip_runner_is_injected():
@@ -231,7 +276,8 @@ def test_never_binds_wildcard_and_backs_off(tmp_path, monkeypatch, caplog, bad):
 
     async def scenario():
         gw = Gateway(token=TOKEN, uds_dir=make_dir(tmp_path), port=0,
-                     resolve_host=lambda: bad, sleep=fake_sleep)
+                     resolve_host=lambda: bad, sleep=fake_sleep,
+                     allow_non_tailscale_for_tests=True)  # 开了测试开关也必须拒绝通配
         await gw.start()
         await until(lambda: len(delays) >= 8, what="8 retries")
         assert not gw.tcp_ready.is_set()
@@ -258,7 +304,8 @@ def test_bind_retries_until_port_free(tmp_path):
 
     async def scenario():
         gw = Gateway(token=TOKEN, uds_dir=make_dir(tmp_path), port=port,
-                     resolve_host=lambda: "127.0.0.1", sleep=fake_sleep)
+                     resolve_host=lambda: "127.0.0.1", sleep=fake_sleep,
+                     allow_non_tailscale_for_tests=True)
         await gw.start()
         await asyncio.wait_for(gw.tcp_ready.wait(), 5)
         assert gw.tcp_port == port and gw.tcp_host == "127.0.0.1"
@@ -312,11 +359,20 @@ def test_unknown_path_is_404(tmp_path):
     asyncio.run(scenario())
 
 
-def test_token_comes_from_file_or_stdin_never_argv(tmp_path):
+LONG_TOKEN = "k" * 40
+
+
+def _token_file(tmp_path, text, mode=0o600):
     f = tmp_path / "token"
-    f.write_text("  abc123 \n")
-    assert gw_mod.load_token(f) == "abc123"
-    f.write_text("\n")
+    f.write_text(text)
+    f.chmod(mode)
+    return f
+
+
+def test_token_comes_from_file_or_stdin_never_argv(tmp_path):
+    f = _token_file(tmp_path, f"  {LONG_TOKEN} \n")
+    assert gw_mod.load_token(f) == LONG_TOKEN
+    f = _token_file(tmp_path, "\n")
     with pytest.raises(ValueError):
         gw_mod.load_token(f)
     with pytest.raises(SystemExit):
@@ -351,7 +407,8 @@ def test_second_session_gets_1013(tmp_path):
 
 def test_uds_dir_must_be_0700_and_owned(tmp_path):
     async def start(uds_dir, **kw):
-        gw = Gateway(token=TOKEN, uds_dir=uds_dir, port=0, resolve_host=lambda: "127.0.0.1", **kw)
+        gw = Gateway(token=TOKEN, uds_dir=uds_dir, port=0, resolve_host=lambda: "127.0.0.1",
+                     allow_non_tailscale_for_tests=True, **kw)
         await gw.start()
         await gw.stop()
 
@@ -379,7 +436,8 @@ def test_uds_dir_is_created_0700_when_missing(tmp_path):
     d = tmp_path / "fresh" / "rs-node"
 
     async def scenario():
-        gw = Gateway(token=TOKEN, uds_dir=d, port=0, resolve_host=lambda: "127.0.0.1")
+        gw = Gateway(token=TOKEN, uds_dir=d, port=0, resolve_host=lambda: "127.0.0.1",
+                     allow_non_tailscale_for_tests=True)
         await gw.start()
         assert stat.S_IMODE(os.lstat(d).st_mode) == 0o700
         assert stat.S_IMODE(os.lstat(gw.uds_path).st_mode) == 0o600
@@ -390,7 +448,8 @@ def test_uds_dir_is_created_0700_when_missing(tmp_path):
 
 def test_uds_socket_path_symlink_and_stale(tmp_path):
     async def start(d):
-        gw = Gateway(token=TOKEN, uds_dir=d, port=0, resolve_host=lambda: "127.0.0.1")
+        gw = Gateway(token=TOKEN, uds_dir=d, port=0, resolve_host=lambda: "127.0.0.1",
+                     allow_non_tailscale_for_tests=True)
         await gw.start()
         ok = (await http_get("/v1/info", uds=gw.uds_path))[0] == 200
         await gw.stop()
@@ -470,6 +529,14 @@ def test_default_peer_uid_reads_real_peercred():
     ({"src": ""}, 1008),
     ({"dst": "zh cn; rm"}, 1008),
     ({"src": None}, 1008),
+    ({"src": "DE"}, 1008),            # F1：与 worker 同一正则，大写不行
+    ({"src": "de\n"}, 1008),          # F1：`$` 会放过结尾换行，必须 fullmatch
+    ({"dst": "zh\n"}, 1008),
+    ({"src": "de_DE"}, 1008),
+    ({"src": "d"}, 1008),
+    ({"src": "deutsch"}, 1008),
+    ({"dst": "zh-"}, 1008),
+    ({"dst": "zh-CNNNN"}, 1008),
 ])
 def test_bad_hello_is_rejected_without_spawning_worker(tmp_path, patch, code):
     async def scenario():
@@ -479,6 +546,38 @@ def test_bad_hello_is_rejected_without_spawning_worker(tmp_path, patch, code):
             await asyncio.wait_for(ws.wait_closed(), 5)
             assert ws.close_code == code
             assert _starts(rec) == [] and gw.worker.pid is None
+
+    asyncio.run(scenario())
+
+
+def test_lang_regex_matches_worker_and_accepts_real_codes():
+    for ok in ("de", "zh", "eng", "zh-CN", "pt-BR", "zh-Hans"):
+        assert gw_mod._LANG_RE.fullmatch(ok), ok
+    assert gw_mod._LANG_RE.pattern == r"^[a-z]{2,3}(-[A-Za-z]{2,4})?$"  # TK-001 worker._LANG 原文
+
+
+def test_bad_language_does_not_disturb_a_warm_worker(tmp_path):
+    async def scenario():
+        async with running(tmp_path) as (gw, rec):
+            ws = await uds_connect(gw)
+            await hello_ready(ws)
+            await ws.close()
+            await until(lambda: not gw._session_active)
+            pid = gw.worker.pid
+            assert pid and gw.worker.state == "warm"
+            for bad in ("DE", "de\n"):
+                ws = await uds_connect(gw)
+                await ws.send(json.dumps({**HELLO, "src": bad}))
+                await asyncio.wait_for(ws.wait_closed(), 5)
+                assert ws.close_code == 1008
+                await until(lambda: not gw._session_active)
+            # 保温中的 worker 没被碰：同一个进程、没有新 spawn、没收到第二个 hello
+            assert gw.worker.pid == pid and _alive(pid)
+            assert _starts(rec) == [pid] and _rec_lines(rec).count("hello") == 1
+            ws = await uds_connect(gw)
+            assert (await hello_ready(ws, {**HELLO, "src": "zh-CN", "dst": "de"}))["ev"] == "ready"
+            assert gw.worker.pid == pid
+            await ws.close()
 
     asyncio.run(scenario())
 
@@ -526,19 +625,82 @@ def test_frame_size_limit_and_alignment(tmp_path):
     asyncio.run(scenario())
 
 
-def test_audio_queue_drops_oldest_and_never_drops_control():
+def test_audio_queue_replaces_dropped_frames_with_gap_in_place():
     async def scenario():
         q = gw_mod.AudioQueue(3)
         q.put_pcm(b"a0")
         q.put_ctl({"type": "flush"})
         q.put_pcm(b"b0")
         q.put_pcm(b"c0")
-        assert q.put_pcm(b"d0") == (1, 2)  # 丢最旧的 a0
-        assert q.put_pcm(b"e0") == (1, 2)  # 丢 b0；中间那条 flush 还在
-        got = [await q.get() for _ in range(4)]
-        assert got == [("ctl", {"type": "flush"}), ("pcm", b"c0"), ("pcm", b"d0"), ("pcm", b"e0")]
+        assert q.put_pcm(b"d0") == (1, 2)  # 丢最旧的 a0，原位换成 2 字节的 gap
+        assert q.put_pcm(b"e0") == (1, 2)  # 丢 b0；gap 与前一个 gap 隔着 flush，不合并
+        got = [await q.get() for _ in range(6)]
+        assert got == [("gap", 2), ("ctl", {"type": "flush"}), ("gap", 2),
+                       ("pcm", b"c0"), ("pcm", b"d0"), ("pcm", b"e0")]
 
     asyncio.run(scenario())
+
+
+def test_audio_queue_gap_markers_merge_and_total_bytes_are_conserved():
+    async def scenario():
+        q = gw_mod.AudioQueue(2)
+        sent = 0
+        for i in range(500):
+            frame = bytes(2 * (i % 7 + 1))
+            sent += len(frame)
+            q.put_pcm(frame)
+        assert len(q) == 3  # 一个合并后的 gap + 2 帧：丢帧不会让队列变长
+        got = []
+        while len(q):
+            got.append(await q.get())
+        assert sum(len(p) if k == "pcm" else p for k, p in got) == sent  # 一个字节都不少
+        assert [k for k, _ in got] == ["gap", "pcm", "pcm"]
+
+    asyncio.run(scenario())
+
+
+def test_audio_queue_control_messages_are_bounded_and_flushes_merge():
+    async def scenario():
+        q = gw_mod.AudioQueue(10)
+        for _ in range(100_000):  # 海量连续 flush：合并成一条，队列不增长
+            assert q.put_ctl({"type": "flush"}) is True
+        assert len(q) == 1
+        # 夹着音频的 flush 无法合并，到上限就拒收（调用方断开连接）
+        accepted = 0
+        for _ in range(10_000):
+            q.put_pcm(b"\x00\x00")
+            if not q.put_ctl({"type": "flush"}):
+                break
+            accepted += 1
+        assert accepted == gw_mod.CTL_QUEUE_MAX - 1
+        assert len(q) <= gw_mod.CTL_QUEUE_MAX + 10 + gw_mod.CTL_QUEUE_MAX + 1  # ctl + 音频上限 + gap
+        # 取走后名额回收
+        while len(q):
+            await q.get()
+        assert q.put_ctl({"type": "drain"}) is True
+
+    asyncio.run(scenario())
+
+
+def test_control_message_flood_closes_connection_with_bounded_queue(tmp_path, caplog):
+    async def scenario():
+        async with running(tmp_path, "stall") as (gw, _rec):
+            ws = await uds_connect(gw)
+            await hello_ready(ws)
+            frame = b"\x01\x00" * 1600
+            flush = json.dumps({"type": "flush"})
+            try:
+                for _ in range(2000):  # worker 不读 stdin：管道塞满后 flush 只能留在队列里
+                    await ws.send(frame)
+                    await ws.send(flush)
+            except Exception:  # noqa: BLE001 - 服务端先关了连接
+                pass
+            await asyncio.wait_for(ws.wait_closed(), 8)
+            assert ws.close_code == 1008
+            await until(lambda: not gw._session_active)
+
+    asyncio.run(scenario())
+    assert "control_queue_overflow" in caplog.text
 
 
 def test_stalled_worker_overflows_queue_with_warning(tmp_path, monkeypatch, caplog):
@@ -663,10 +825,10 @@ def test_new_session_during_reap_waits_and_respawns(tmp_path, monkeypatch):
 
 def test_worker_crash_notifies_client(tmp_path, caplog):
     async def scenario():
-        async with running(tmp_path, "crash") as (gw, rec):
+        async with running(tmp_path, "crash:9") as (gw, rec):
             ws = await uds_connect(gw)
             await hello_ready(ws)
-            await ws.send(b"\x01\x00" * 100)  # 假 worker 收到第一帧就 exit(3)
+            await ws.send(b"\x01\x00" * 100)  # 假 worker 收到第一帧就 exit(9)
             ev = json.loads(await asyncio.wait_for(ws.recv(), 8))
             assert ev["ev"] == "status" and ev["code"] == "worker_crashed"
             await asyncio.wait_for(ws.wait_closed(), 5)
@@ -679,13 +841,35 @@ def test_worker_crash_notifies_client(tmp_path, caplog):
             await ws.close()
 
     asyncio.run(scenario())
-    assert "worker_exit code=3" in caplog.text
+    assert "worker_exit code=9" in caplog.text
+
+
+@pytest.mark.parametrize("rc,code", [
+    (2, "protocol_error"), (3, "engine_load_failed"), (4, "internal"),
+    (1, "worker_crashed"), (9, "worker_crashed"), (0, "worker_crashed"),  # 会话中自行退出，含 0
+])
+def test_worker_exit_code_maps_to_status_code(tmp_path, caplog, rc, code):
+    async def scenario():
+        async with running(tmp_path, f"crash:{rc}") as (gw, _rec):
+            ws = await uds_connect(gw)
+            await hello_ready(ws)
+            await ws.send(b"\x01\x00" * 100)
+            ev = json.loads(await asyncio.wait_for(ws.recv(), 8))
+            assert ev["ev"] == "status" and ev["code"] == code and ev["text"]
+            await asyncio.wait_for(ws.wait_closed(), 5)
+            assert ws.close_code == 1011
+            await until(lambda: not gw._session_active)
+
+    asyncio.run(scenario())
+    assert f"session_worker_exit rc={rc} status={code}" in caplog.text
+    assert FEATURE not in caplog.text
 
 
 def test_worker_spawn_failure_is_reported(tmp_path):
     async def scenario():
         gw = Gateway(token=TOKEN, uds_dir=make_dir(tmp_path), port=0,
-                     worker_argv=["/nonexistent/worker-binary"], resolve_host=lambda: "127.0.0.1")
+                     worker_argv=["/nonexistent/worker-binary"], resolve_host=lambda: "127.0.0.1",
+                     allow_non_tailscale_for_tests=True)
         await gw.start()
         try:
             ws = await uds_connect(gw)
@@ -859,3 +1043,321 @@ def test_logs_never_contain_transcripts_or_tokens(tmp_path, caplog, capfd):
         assert needle not in caplog.text, needle
         assert needle not in err, needle
     assert "session_end" in caplog.text  # 日志本身是有内容的：记的是事件和字节数
+
+
+# ------------------------------------------------------------------ S-F6：token 文件权限与长度
+
+@pytest.mark.parametrize("mode", [0o640, 0o604, 0o660, 0o644, 0o666, 0o602])
+def test_token_file_with_group_or_other_bits_is_refused(tmp_path, mode):
+    f = _token_file(tmp_path, LONG_TOKEN, mode)
+    with pytest.raises(ValueError) as ei:
+        gw_mod.load_token(f)
+    assert LONG_TOKEN not in str(ei.value)
+
+
+@pytest.mark.parametrize("mode", [0o600, 0o400])
+def test_token_file_owner_only_is_accepted(tmp_path, mode):
+    assert gw_mod.load_token(_token_file(tmp_path, LONG_TOKEN, mode)) == LONG_TOKEN
+
+
+def test_short_token_is_refused_and_never_echoed(tmp_path):
+    short = "s" * 31
+    f = _token_file(tmp_path, f" {short}\n")  # 去空白后 31 < 32
+    with pytest.raises(ValueError) as ei:
+        gw_mod.load_token(f)
+    assert short not in str(ei.value)
+    assert gw_mod.check_token("x" * 32) == "x" * 32
+    with pytest.raises(ValueError):
+        gw_mod.check_token(" " * 40)
+
+
+def test_main_refuses_bad_tokens_without_leaking_them(tmp_path, monkeypatch):
+    import io
+
+    async def fake_run(token):  # 不真起服务，只看 token 走到了这里
+        seen.append(token)
+
+    seen: list[str] = []
+    monkeypatch.setattr(gw_mod, "run_gateway", fake_run)
+    secret = "short-secret-token"
+    monkeypatch.setattr(sys, "stdin", io.StringIO(secret + "\n"))
+    with pytest.raises(SystemExit) as ei:
+        gw_mod.main(["--token-stdin"])
+    assert secret not in str(ei.value) and not seen
+    loose = _token_file(tmp_path, LONG_TOKEN, 0o644)
+    with pytest.raises(SystemExit) as ei:
+        gw_mod.main(["--token-file", str(loose)])
+    assert LONG_TOKEN not in str(ei.value) and not seen
+    monkeypatch.setattr(sys, "stdin", io.StringIO(f"  {LONG_TOKEN}  \n"))
+    gw_mod.main(["--token-stdin"])
+    assert seen == [LONG_TOKEN]
+    gw_mod.main(["--token-file", str(_token_file(tmp_path, LONG_TOKEN + "\n"))])
+    assert seen == [LONG_TOKEN, LONG_TOKEN]
+
+
+# ------------------------------------------------------------------ S-F2：重复 Authorization 头
+
+def test_duplicate_authorization_headers_are_401(tmp_path):
+    async def raw(gw, headers: str) -> int:
+        r, w = await asyncio.open_connection("127.0.0.1", gw.tcp_port)
+        w.write(f"GET /v1/info HTTP/1.1\r\nHost: x\r\nConnection: close\r\n{headers}\r\n".encode())
+        await w.drain()
+        data = await asyncio.wait_for(r.read(), 5)
+        w.close()
+        return int(data.split(b" ", 2)[1])
+
+    async def scenario():
+        async with running(tmp_path) as (gw, rec):
+            good = f"Authorization: Bearer {TOKEN}\r\n"
+            assert await raw(gw, good) == 200
+            assert await raw(gw, good + good) == 401  # 两个都对也不行
+            assert await raw(gw, good + "Authorization: Bearer nope\r\n") == 401
+            assert await raw(gw, "Authorization: Bearer nope\r\n" + good) == 401
+            assert await raw(gw, "") == 401
+            assert _starts(rec) == []
+
+    asyncio.run(scenario())
+
+
+# ------------------------------------------------------------------ S-F4：深嵌套 JSON
+
+DEEP = "[" * 60000  # < 64KB，不会先被 max_size 拦下；json.loads 会抛 RecursionError
+
+
+def test_deeply_nested_json_in_hello_closes_1003_with_log(tmp_path, caplog):
+    async def scenario():
+        async with running(tmp_path) as (gw, rec):
+            ws = await uds_connect(gw)
+            await ws.send(DEEP)
+            await asyncio.wait_for(ws.wait_closed(), 5)
+            assert ws.close_code == 1003
+            assert _starts(rec) == []
+
+    asyncio.run(scenario())
+    assert "bad_control" in caplog.text and "RecursionError" in caplog.text
+
+
+def test_deeply_nested_json_mid_session_closes_1003_with_log(tmp_path, caplog):
+    async def scenario():
+        async with running(tmp_path) as (gw, _rec):
+            ws = await uds_connect(gw)
+            await hello_ready(ws)
+            await ws.send(DEEP)
+            await asyncio.wait_for(ws.wait_closed(), 5)
+            assert ws.close_code == 1003  # 不是 1000：不能被吞成正常关闭
+            await until(lambda: not gw._session_active)
+
+    asyncio.run(scenario())
+    assert "bad_control" in caplog.text and "RecursionError" in caplog.text
+
+
+# ------------------------------------------------------------------ F2：丢帧后样本时钟不漂移
+
+def test_dropped_audio_is_padded_so_worker_clock_matches_client(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(gw_mod, "AUDIO_QUEUE_MAX_FRAMES", 5)
+    frame_bytes = 3200  # 100ms
+    n_frames = 300
+
+    async def scenario():
+        async with running(tmp_path, "gate") as (gw, rec):
+            ws = await uds_connect(gw)
+            await hello_ready(ws)
+            sent = 0
+            for i in range(n_frames):  # 慢 worker 一个字节都不读：队列只有 5 帧，大量丢帧
+                await ws.send(bytes([i % 100 + 1, 0]) * (frame_bytes // 2))
+                sent += frame_bytes
+            await until(lambda: "audio_queue_drop" in caplog.text, what="drops happened")
+            Path(str(rec) + ".gate").write_text("go")  # 放 worker 读
+            await ws.send(json.dumps({"type": "flush"}))
+            statuses, final = [], None
+            while final is None:
+                ev = json.loads(await asyncio.wait_for(ws.recv(), 15))
+                if ev["ev"] == "status":
+                    statuses.append(ev)
+                elif ev["ev"] == "final":
+                    final = ev
+            await ws.close()
+            return sent, final, statuses
+
+    sent, final, statuses = asyncio.run(scenario())
+    assert int(final["text"]) == sent  # worker 收到的总字节数 == 客户端发出的总字节数
+    audio_dropped = [e for e in statuses if e["code"] == "audio_dropped"]
+    assert audio_dropped and all(e["text"] for e in audio_dropped)
+    assert len(audio_dropped) < 20  # 按 1s 合并，不是每个被丢的帧一条
+    assert len({e["text"] for e in audio_dropped}) == 1  # 固定短语，不带内容
+
+
+def test_audio_dropped_status_is_coalesced_per_second(tmp_path, monkeypatch):
+    monkeypatch.setattr(gw_mod, "AUDIO_QUEUE_MAX_FRAMES", 1)
+
+    async def scenario():
+        gw = Gateway(token=TOKEN, uds_dir=make_dir(tmp_path), port=0)
+        sess = gw_mod._Session(gw, ws=None, hello=HELLO, transport="uds")
+        for _ in range(1000):
+            sess._note_drop(1, 3200)
+        return [sess.out_q.get_nowait() for _ in range(sess.out_q.qsize())]
+
+    evs = asyncio.run(scenario())
+    assert evs == [{"ev": "status", "code": "audio_dropped", "text": gw_mod.AUDIO_DROPPED_TEXT}]
+
+
+# ------------------------------------------------------------------ F6：真 TK-001 worker 联调
+
+# 子进程里跑真 worker，只把三个重依赖（Whisper / Silero VAD / 翻译）换成假的：
+# 握手、长度前缀帧、分段、事件编号、退出码全是 TK-001 的真代码。
+REAL_WORKER_CHILD = textwrap.dedent(
+    '''
+    import os, sys
+    sys.path.insert(0, sys.argv[1])
+    import numpy as np
+    from realtime_subtitle.node import engines, segmenter, worker
+
+    class FakeAsr(engines.AsrEngine):
+        def load(self):
+            import time
+            time.sleep(float(os.environ.get("FAKE_LOAD_S", "0")))
+        def transcribe(self, audio, language):
+            return [engines.Utterance(0.1, 0.5, "Hallo Welt.")]
+        def info(self):
+            return {"model": "fake", "backend": "fake", "rtf": None}
+
+    class FakeTranslator(engines.Translator):
+        name = "fake"
+        def translate(self, text, src, dst):
+            return "你好世界。"
+
+    class FakeVad:
+        def __call__(self, w):
+            return 1.0 if float(np.sqrt((w.astype(np.float32) ** 2).mean())) > 0.02 else 0.0
+        def reset(self):
+            pass
+
+    engines.WhisperEngine = FakeAsr
+    segmenter.SileroVad = FakeVad
+    worker.select_translator = lambda s, d: FakeTranslator()
+    worker.main()
+    '''
+)
+
+
+def _tone(seconds: float) -> bytes:
+    np = pytest.importorskip("numpy")
+    t = np.arange(int(seconds * 16000)) / 16000
+    return (0.3 * np.sin(2 * np.pi * 440 * t) * 32767).astype("<i2").tobytes()
+
+
+def _silence(seconds: float) -> bytes:
+    return bytes(int(seconds * 16000) * 2)
+
+
+@contextlib.asynccontextmanager
+async def running_real_worker(tmp_path: Path, monkeypatch, load_s: float = 0.0):
+    worker_mod = pytest.importorskip("realtime_subtitle.node.worker")
+    pytest.importorskip("realtime_subtitle.node.segmenter")
+    pytest.importorskip("realtime_subtitle.node.engines")
+    child = tmp_path / "real_worker_child.py"
+    child.write_text(REAL_WORKER_CHILD)
+    pkg_root = Path(worker_mod.__file__).resolve().parents[2]  # 真 worker 所在的包根，原样给子进程
+    monkeypatch.setenv("FAKE_LOAD_S", str(load_s))
+    gw = Gateway(
+        token=TOKEN, uds_dir=make_dir(tmp_path), port=0, resolve_host=lambda: "127.0.0.1",
+        allow_non_tailscale_for_tests=True,
+        worker_argv=[sys.executable, str(child), str(pkg_root)],
+    )
+    await gw.start()
+    try:
+        yield gw
+    finally:
+        await gw.stop()
+
+
+async def _recv_until(ws, stop, timeout: float = 15.0) -> list[dict]:
+    evs: list[dict] = []
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        ev = json.loads(await asyncio.wait_for(ws.recv(), max(0.1, deadline - time.monotonic())))
+        evs.append(ev)
+        if stop(ev):
+            return evs
+    raise AssertionError(f"timeout; got {evs}")
+
+
+def test_real_worker_session_hello_audio_flush_final_and_reuse(tmp_path, monkeypatch):
+    async def scenario():
+        async with running_real_worker(tmp_path, monkeypatch) as gw:
+            ws = await uds_connect(gw)
+            await ws.send(json.dumps(HELLO))
+            audio = _tone(1.0) + _silence(0.3)
+            for i in range(0, len(audio), 3200):
+                await ws.send(audio[i:i + 3200])
+            await ws.send(json.dumps({"type": "flush"}))
+            evs = await _recv_until(ws, lambda e: e["ev"] == "translation")
+            await ws.close()
+            await until(lambda: not gw._session_active)
+            pid = gw.worker.pid
+            assert pid and gw.worker.state == "warm"
+
+            # 非法 src：gateway 在 spawn 之前就拒绝，保温中的真 worker 不受影响
+            for bad in ("DE", "de\n"):
+                ws = await uds_connect(gw)
+                await ws.send(json.dumps({**HELLO, "src": bad}))
+                await asyncio.wait_for(ws.wait_closed(), 5)
+                assert ws.close_code == 1008
+                await until(lambda: not gw._session_active)
+                assert gw.worker.pid == pid and _alive(pid)
+
+            ws = await uds_connect(gw)  # 复用同一个 worker：cold=False、事件 id 重新从 1 起
+            await ws.send(json.dumps(HELLO))
+            audio = _tone(1.0) + _silence(0.3)
+            for i in range(0, len(audio), 3200):
+                await ws.send(audio[i:i + 3200])
+            await ws.send(json.dumps({"type": "drain"}))
+            evs2 = await _recv_until(ws, lambda e: e["ev"] == "drained")
+            await ws.close()
+            assert gw.worker.pid == pid
+            return evs, evs2
+
+    evs, evs2 = asyncio.run(scenario())
+    assert evs[0]["ev"] == "ready" and evs[0]["cold"] is True
+    final = next(e for e in evs if e["ev"] == "final")
+    assert final["text"] == "Hallo Welt." and final["id"] == 1
+    assert next(e for e in evs if e["ev"] == "translation")["text"] == "你好世界。"
+    assert evs2[0]["ev"] == "ready" and evs2[0]["cold"] is False
+    assert next(e for e in evs2 if e["ev"] == "final")["id"] == 1
+
+
+def test_real_worker_bad_language_never_reaches_worker(tmp_path, monkeypatch):
+    """冷状态下发非法 src：不 spawn（worker 没有被拉起，更不会 bad_hello 退出）。"""
+    async def scenario():
+        async with running_real_worker(tmp_path, monkeypatch) as gw:
+            ws = await uds_connect(gw)
+            await ws.send(json.dumps({**HELLO, "src": "DE"}))
+            await asyncio.wait_for(ws.wait_closed(), 5)
+            assert ws.close_code == 1008
+            assert gw.worker.pid is None and gw.worker.state == "cold"
+
+    asyncio.run(scenario())
+
+
+def test_real_worker_time_axis_survives_dropped_audio(tmp_path, monkeypatch):
+    """F2 复现：队列只有 5 帧 + 模型冷加载 1.5s，客户端 8s 静音后才有 1s 音调。
+    修复前 worker 只收到末尾几帧，音调被记在 1s 附近；补零之后应在 8~9s。"""
+    monkeypatch.setattr(gw_mod, "AUDIO_QUEUE_MAX_FRAMES", 5)
+
+    async def scenario():
+        async with running_real_worker(tmp_path, monkeypatch, load_s=1.5) as gw:
+            ws = await uds_connect(gw)
+            await ws.send(json.dumps(HELLO))
+            audio = _silence(8.0) + _tone(1.0) + _silence(0.3)
+            for i in range(0, len(audio), 3200):
+                await ws.send(audio[i:i + 3200])
+            await ws.send(json.dumps({"type": "drain"}))
+            evs = await _recv_until(ws, lambda e: e["ev"] == "drained", timeout=30)
+            await ws.close()
+            return evs
+
+    evs = asyncio.run(scenario())
+    assert any(e["ev"] == "status" and e["code"] == "audio_dropped" for e in evs)  # 确实丢过帧
+    final = next(e for e in evs if e["ev"] == "final")
+    # 音调占客户端时钟的 [8.0, 9.0]；worker 的时间轴必须落在它附近（修复前整体偏早 8s）
+    assert 7.5 <= final["a0"] and abs(final["a1"] - 9.0) < 0.5, final

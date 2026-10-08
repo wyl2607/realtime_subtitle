@@ -68,6 +68,14 @@ SUPPORTED_FORMAT = "s16le"
 # 每帧约 100ms：200 帧 ≈ 20s 缓冲，够盖住冷启动加载模型的那一段，又不会无限吃内存
 AUDIO_QUEUE_MAX_FRAMES = 200
 _DROP_LOG_INTERVAL_S = 1.0
+# 控制消息（flush/drain/hello）也要有上限（S4）：它们不占音频名额，不设限的话
+# 客户端连发 flush 就能把队列撑到内存耗尽。连续的 flush 先合并，仍超限就断开。
+CTL_QUEUE_MAX = 64
+# 补零 PCM 单次写入的块大小：与客户端单帧上限同量级，惰性生成，不在队列里囤积
+_GAP_CHUNK_BYTES = 64 * 1024
+AUDIO_DROPPED_TEXT = "音频积压，部分音频已丢弃"
+MIN_TOKEN_CHARS = 32
+TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
 
 # --- worker 生命周期（架构选择 1）---
 WORKER_KEEPALIVE_S = 120.0
@@ -80,7 +88,18 @@ _WORKER_LINE_LIMIT = 1024 * 1024
 BIND_BACKOFF_FIRST_S = 1.0
 BIND_BACKOFF_MAX_S = 60.0
 
-_LANG_RE = re.compile(r"^[A-Za-z0-9_-]{1,16}$")
+# 与 TK-001 worker 的 hello 校验逐字一致（worker.py 的 _LANG），而且必须 fullmatch：
+# `$` 会放过结尾换行。gateway 比 worker 宽的话，worker 收到 hello 后会 bad_hello 退出，
+# 把保温中的 worker 白白杀掉。
+_LANG_RE = re.compile(r"^[a-z]{2,3}(-[A-Za-z]{2,4})?$")
+# worker 退出码（P3）→ 给客户端的 status.code；其它非 0 与会话中的 0 一律 worker_crashed
+_EXIT_STATUS = {2: "protocol_error", 3: "engine_load_failed", 4: "internal"}
+_STATUS_TEXT = {
+    "worker_crashed": "识别进程异常退出",
+    "protocol_error": "识别进程协议错误",
+    "engine_load_failed": "识别引擎加载失败",
+    "internal": "识别进程内部错误",
+}
 _CLIENT_EVENTS = frozenset({"ready", "final", "translation", "status", "drained"})
 
 
@@ -92,14 +111,26 @@ class GatewayStartError(RuntimeError):
 # 地址与 token
 # --------------------------------------------------------------------------
 
-def validate_host(host: str) -> str:
-    """只允许明确的单播 IP。通配地址（含 `0:0:0:0:0:0:0:0` 之类的变体）一律拒绝。"""
+def validate_host(host: str, *, allow_non_tailscale_for_tests: bool = False) -> str:
+    """监听地址必须是 Tailscale 的 IPv4（100.64.0.0/10），且不带任何空白（S2）。
+
+    只拒通配不够：`tailscale ip -4` 的输出若被污染，任意单播地址（8.8.8.8、LAN IP）
+    都会被绑上去。`allow_non_tailscale_for_tests` 仅供测试在 127.0.0.1 上起监听，
+    生产路径（Gateway 默认）永远不开；开了也照样拒绝通配/组播。
+    """
+    raw = host or ""
+    if raw != raw.strip():
+        raise ValueError("监听地址不能带空白")
     try:
-        addr = ipaddress.ip_address((host or "").strip())
+        addr = ipaddress.ip_address(raw)
     except ValueError:
         raise ValueError("监听地址必须是明确的 IP（Tailscale IP），不能为空或主机名") from None
     if addr.is_unspecified or addr.is_multicast:
         raise ValueError("监听地址不允许通配/组播地址；节点只绑定到 Tailscale IP")
+    if not allow_non_tailscale_for_tests and not (
+        isinstance(addr, ipaddress.IPv4Address) and addr in TAILSCALE_CGNAT
+    ):
+        raise ValueError("监听地址必须落在 Tailscale 地址段 100.64.0.0/10")
     return str(addr)
 
 
@@ -112,11 +143,24 @@ def resolve_tailscale_ipv4(run: node_info.Runner = node_info.run_command) -> str
     return lines[0].strip()
 
 
-def load_token(path: str | Path) -> str:
-    token = Path(path).read_text(encoding="utf-8").strip()
+def check_token(token: str) -> str:
+    """去空白后校验长度（S5）。错误信息里绝不带 token 本身。"""
+    token = token.strip()
     if not token:
-        raise ValueError("token 文件为空：节点必须显式配置 bearer token")
+        raise ValueError("token 为空：节点必须显式配置 bearer token")
+    if len(token) < MIN_TOKEN_CHARS:
+        raise ValueError(f"token 太短：至少 {MIN_TOKEN_CHARS} 个字符")
     return token
+
+
+def load_token(path: str | Path) -> str:
+    """读 token 文件；权限含 group/other 位就拒绝（S5 要求 0600）。"""
+    with open(path, encoding="utf-8") as f:
+        # 用 fstat 而不是先 stat 再 open：检查与读取是同一个文件
+        mode = os.fstat(f.fileno()).st_mode
+        if mode & 0o077:
+            raise ValueError(f"token 文件权限过宽（{stat.S_IMODE(mode):04o}），需要 0600")
+        return check_token(f.read())
 
 
 # --------------------------------------------------------------------------
@@ -146,15 +190,29 @@ def default_peer_uid(sock: socket.socket) -> int:
 class AudioQueue:
     """音频帧与控制消息共用一条队列以保序（flush 必须排在它之前的音频之后）。
 
-    只有音频帧计入上限；满了丢**最旧**的音频帧——字幕要的是最新的内容，
-    积压的陈旧音频就算识别出来也已经没用。控制消息（hello/flush/drain）永不丢。
+    只有音频帧计入音频上限；满了丢**最旧**的音频帧——字幕要的是最新的内容，
+    积压的陈旧音频就算识别出来也已经没用。
+
+    ☠️ 丢帧不能让 worker 的样本时钟前移：worker 按「收到的样本数」算 a0/a1，
+    少收一帧，之后所有段的时间戳就整体偏早，客户端按自己的样本时钟替换字幕行
+    时会替换到错的行。所以被丢的帧**原位换成一个 `gap` 标记**（只记字节数，
+    相邻的合并），喂 worker 时再惰性展开成等长的零 PCM。位置不变，flush 与音频的
+    相对顺序不变；队列里囤的只是几个整数，不是零。
+
+    控制消息（hello/flush/drain）不丢，但有个数上限（`CTL_QUEUE_MAX`）：连续的
+    flush 合并成一条，仍然超限由调用方断开连接。
     """
 
-    def __init__(self, max_frames: int) -> None:
+    def __init__(self, max_frames: int, max_ctl: int | None = None) -> None:
         self._max = max_frames
+        self._max_ctl = max_ctl
         self._items: deque[tuple[str, Any]] = deque()
         self._pcm = 0
+        self._ctl = 0
         self._wake = asyncio.Event()
+
+    def __len__(self) -> int:
+        return len(self._items)
 
     def put_pcm(self, data: bytes) -> tuple[int, int]:
         """返回本次丢掉的 (帧数, 字节数)。"""
@@ -162,8 +220,9 @@ class AudioQueue:
         if self._pcm >= self._max:
             for i, (kind, payload) in enumerate(self._items):
                 if kind == "pcm":
-                    del self._items[i]
                     self._pcm -= 1
+                    self._items[i] = ("gap", len(payload))
+                    self._merge_gap(i)
                     dropped = (1, len(payload))
                     break
         self._items.append(("pcm", data))
@@ -171,9 +230,28 @@ class AudioQueue:
         self._wake.set()
         return dropped
 
-    def put_ctl(self, msg: dict[str, Any]) -> None:
+    def _merge_gap(self, i: int) -> None:
+        """把 i 位置的 gap 与左右相邻的 gap 合并，队列里的 gap 个数因此不超过 ctl 个数 + 1。"""
+        if i + 1 < len(self._items) and self._items[i + 1][0] == "gap":
+            self._items[i] = ("gap", self._items[i][1] + self._items[i + 1][1])
+            del self._items[i + 1]
+        if i > 0 and self._items[i - 1][0] == "gap":
+            self._items[i - 1] = ("gap", self._items[i - 1][1] + self._items[i][1])
+            del self._items[i]
+
+    def put_ctl(self, msg: dict[str, Any]) -> bool:
+        """入队一条控制消息。超过个数上限返回 False（调用方应断开连接）。"""
+        if msg.get("type") == "flush" and self._items:
+            kind, last = self._items[-1]
+            if kind == "ctl" and last.get("type") == "flush":
+                return True  # 紧挨着的 flush 合并：再 flush 一次什么也不会多出来
+        limit = CTL_QUEUE_MAX if self._max_ctl is None else self._max_ctl
+        if self._ctl >= limit:
+            return False
         self._items.append(("ctl", msg))
+        self._ctl += 1
         self._wake.set()
+        return True
 
     async def get(self) -> tuple[str, Any]:
         while not self._items:
@@ -182,6 +260,8 @@ class AudioQueue:
         kind, payload = self._items.popleft()
         if kind == "pcm":
             self._pcm -= 1
+        elif kind == "ctl":
+            self._ctl -= 1
         return kind, payload
 
 
@@ -291,7 +371,7 @@ class WorkerManager:
     def _deliver(self, line: bytes) -> None:
         try:
             ev = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):
             log.warning("worker_bad_line bytes=%d", len(line))
             return
         if not isinstance(ev, dict) or ev.get("ev") not in _CLIENT_EVENTS:
@@ -353,7 +433,8 @@ class _Session:
         self.dropped_frames = 0
         self.dropped_bytes = 0
         self._drop_pending = [0, 0]
-        self._drop_logged_at = 0.0
+        self._drop_logged_at = float("-inf")
+        self._drop_notified_at = float("-inf")
 
     # ---- worker 回调（都在事件循环线程里，不需要 threadsafe）----
 
@@ -427,7 +508,9 @@ class _Session:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
         if crash_rc is not None:
-            await self._fail("worker_crashed", flush_pending=True)
+            code = _EXIT_STATUS.get(crash_rc, "worker_crashed")
+            log.error("session_worker_exit rc=%d status=%s", crash_rc, code)
+            await self._fail(code, flush_pending=True)
 
     async def _fail(self, code: str, *, flush_pending: bool = False) -> None:
         """告诉客户端出了什么事再关；先把 worker 崩溃前已经产出的事件发完。"""
@@ -435,7 +518,7 @@ class _Session:
             if flush_pending:
                 while not self.out_q.empty():
                     await self.ws.send(_dump(self.out_q.get_nowait()))
-            await self.ws.send(_dump({"ev": "status", "code": code, "text": "识别进程异常退出"}))
+            await self.ws.send(_dump({"ev": "status", "code": code, "text": _STATUS_TEXT.get(code, _STATUS_TEXT["worker_crashed"])}))
         await self._safe_close(1011, code)
 
     async def _safe_close(self, code: int, reason: str) -> None:
@@ -456,7 +539,15 @@ class _Session:
         try:
             while True:
                 kind, payload = await self.aq.get()
-                await self.gw.worker.send(kind, payload)
+                if kind == "gap":
+                    # 被丢弃的音频换成等长静音，worker 的样本时钟才与客户端一致
+                    left = payload
+                    while left > 0:
+                        n = min(left, _GAP_CHUNK_BYTES)
+                        await self.gw.worker.send("pcm", bytes(n))
+                        left -= n
+                else:
+                    await self.gw.worker.send(kind, payload)
         except (BrokenPipeError, ConnectionResetError, OSError):
             return False
 
@@ -494,17 +585,24 @@ class _Session:
             log.warning("audio_queue_drop frames=%d bytes=%d", *self._drop_pending)
             self._drop_pending = [0, 0]
             self._drop_logged_at = now
+        if now - self._drop_notified_at >= _DROP_LOG_INTERVAL_S:
+            # 告诉客户端：这段时间的识别结果可能缺内容（已用静音补齐时间轴）。按 1s 合并
+            self._drop_notified_at = now
+            self.out_q.put_nowait({"ev": "status", "code": "audio_dropped", "text": AUDIO_DROPPED_TEXT})
 
     async def _on_text(self, text: str) -> bool:
         try:
             msg = json.loads(text)
-        except ValueError:
-            log.warning("bad_control bytes=%d reason=not_json", len(text))
+        except (ValueError, RecursionError) as e:
+            log.warning("bad_control bytes=%d reason=not_json err=%s", len(text), type(e).__name__)
             await self._safe_close(1003, "bad json")
             return False
         typ = msg.get("type") if isinstance(msg, dict) else None
         if typ in ("flush", "drain"):
-            self.aq.put_ctl({"type": typ})
+            if not self.aq.put_ctl({"type": typ}):
+                log.warning("control_queue_overflow limit=%d", CTL_QUEUE_MAX)
+                await self._safe_close(1008, "too many control messages")
+                return False
             return True
         if typ == "hello":
             await self._safe_close(1008, "duplicate hello")
@@ -530,6 +628,7 @@ class Gateway:
         uid: int | None = None,
         info: node_info.NodeInfo | None = None,
         sleep: Callable[[float], Any] = asyncio.sleep,
+        allow_non_tailscale_for_tests: bool = False,
     ) -> None:
         if not token:
             raise ValueError("token 不能为空")
@@ -541,6 +640,8 @@ class Gateway:
         self._uid = os.getuid() if uid is None else uid
         self._info = info or node_info.NodeInfo(state_dir=self._uds_dir)
         self._sleep = sleep
+        # ☠️ 仅测试用：允许监听 127.0.0.1 等非 Tailscale 地址。生产入口（run_gateway）不传。
+        self._allow_non_tailscale = allow_non_tailscale_for_tests
         self.worker = WorkerManager(worker_argv if worker_argv is not None else WORKER_ARGV)
         self._session_active = False
         self._uds_server = None
@@ -620,7 +721,10 @@ class Gateway:
         while True:
             try:
                 # tailscale 命令会阻塞，放线程池，别卡住已经在服务的 UDS
-                host = validate_host(await loop.run_in_executor(None, self._resolve_host))
+                host = validate_host(
+                    await loop.run_in_executor(None, self._resolve_host),
+                    allow_non_tailscale_for_tests=self._allow_non_tailscale,
+                )
                 self._tcp_server = await serve(
                     self._handle_tcp, host, self._port,
                     process_request=self._process_request_tcp, **self._common,
@@ -641,7 +745,11 @@ class Gateway:
     # ---- HTTP 层：鉴权 / 路由 ----
 
     def _authorized(self, headers: Any) -> bool:
-        got = headers.get("Authorization", "") or ""
+        # 重复的 Authorization 头一律不认（get() 遇到多个会抛 MultipleValuesError → 500）
+        values = headers.get_all("Authorization")
+        if len(values) != 1:
+            return False
+        got = values[0] or ""
         expected = f"Bearer {self._token}"
         # 常量时间比较；先转 bytes，str 里有非 ASCII 时 compare_digest 会抛 TypeError
         return hmac.compare_digest(got.encode("utf-8"), expected.encode("utf-8"))
@@ -717,7 +825,8 @@ class Gateway:
             return None
         try:
             msg = json.loads(raw)
-        except ValueError:
+        except (ValueError, RecursionError) as e:
+            log.warning("bad_control bytes=%d reason=not_json err=%s phase=hello", len(raw), type(e).__name__)
             await ws.close(1003, "bad json")
             return None
         if not isinstance(msg, dict) or msg.get("type") != "hello":
@@ -732,7 +841,8 @@ class Gateway:
             await ws.close(1003, "unsupported audio")
             return None
         src, dst = msg.get("src"), msg.get("dst")
-        if not (isinstance(src, str) and isinstance(dst, str) and _LANG_RE.match(src) and _LANG_RE.match(dst)):
+        if not (isinstance(src, str) and isinstance(dst, str) and _LANG_RE.fullmatch(src) and _LANG_RE.fullmatch(dst)):
+            log.warning("hello_rejected reason=bad_language")
             await ws.close(1008, "bad language")
             return None
         return msg
@@ -768,9 +878,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    token = load_token(args.token_file) if args.token_file else sys.stdin.readline().strip()
-    if not token:
-        raise SystemExit("token 为空")
+    try:
+        token = load_token(args.token_file) if args.token_file else check_token(sys.stdin.readline())
+    except (ValueError, OSError) as e:
+        # 只报原因，不带 token；OSError 的文本里只有路径
+        raise SystemExit(f"token 不可用：{e}") from None
     logging.basicConfig(
         stream=sys.stderr, level=logging.INFO, format="%(asctime)s [node.gateway] %(levelname)s %(message)s"
     )
