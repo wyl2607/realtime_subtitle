@@ -97,8 +97,9 @@ EOF
 # 同一份库会拼进 STOP_V1_SH（记录）和 SWAP_SH（重拉），读记录时再校验一遍。
 IFS= read -r -d '' V1_LIB_SH <<'EOF' || true
 uid_n=$(id -u)
-pat='[Pp]ython[0-9.]* -m [r]ealtime_subtitle\.remote\.server'
-ere='(^|/)[Pp]ython[0-9.]* -m realtime_subtitle\.remote\.server( |$)'
+# python 与 -m 之间只容许「无取值的单字母短选项」(如真实 v1 的 -u)；-X dev / -c 之类带值的不匹配
+pat='[Pp]ython[0-9.]*( -[uBEsIOq]+)* -m [r]ealtime_subtitle\.remote\.server'
+ere='(^|/)[Pp]ython[0-9.]*( -[uBEsIOq]+)* -m realtime_subtitle\.remote\.server( |$)'
 
 is_v1() {
     c=$(ps -o command= -p "$1" 2>/dev/null </dev/null) || return 1

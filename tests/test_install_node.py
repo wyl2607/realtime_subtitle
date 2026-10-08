@@ -737,7 +737,12 @@ def _nohup_log(logdir: Path) -> str:
     return f.read_text() if f.exists() else ""
 
 
-@pytest.mark.parametrize("interp", ["/Users/x/rs-remote/venv/bin/python3.13", MAC_FRAMEWORK_PY])
+MINI2_REAL_V1 = ("venv/bin/python -u -m realtime_subtitle.remote.server --host 100.105.163.59 "
+                 "--port 8791 --token-file /Users/yilinwang/.config/rs-remote/token")
+
+
+@pytest.mark.parametrize("interp", ["/Users/x/rs-remote/venv/bin/python3.13", MAC_FRAMEWORK_PY,
+                                    "venv/bin/python -u", "/x/venv/bin/python -uB"])
 def test_v1_record_then_restore_uses_fixed_venv_entry(env, spawn, tmp_path, interp):
     e, home, logdir = env
     cwd = _make_v1_cwd(tmp_path)
@@ -919,3 +924,36 @@ def test_v1_restore_never_goes_through_sh_c():
     text = SCRIPT.read_text(encoding="utf-8")
     assert "/bin/sh -c" not in text and "sh -c \"exec" not in text
     assert '"${v1_args[@]}"' in text
+
+
+def test_mini2_real_v1_cmdline_is_found_stopped_recorded_and_relaunched(env, spawn, tmp_path):
+    """C1：mini2 上真实的 v1 命令行带 -u，必须能被找到、停掉、记录，回滚时用固定入口重拉。"""
+    e, home, logdir = env
+    cwd = _make_v1_cwd(tmp_path)
+    e["STUB_V1_CWD"] = str(cwd)
+    e["STUB_NOHUP_SPAWN"] = "1"
+    v1 = spawn(MINI2_REAL_V1)
+    r = _run_stop_v1(e)
+    assert "已记录 v1" in r.stdout and "已停止" in r.stdout, r.stdout
+    assert v1.wait(timeout=5) is not None
+    r = _run_restore(e, home)
+    assert "已恢复 v1" in r.stdout, r.stdout
+    assert _nohup_log(logdir).strip() == (
+        f"PWD={cwd} ARGS={cwd}/venv/bin/python -m realtime_subtitle.remote.server "
+        "--host 100.105.163.59 --port 8791 --token-file /Users/yilinwang/.config/rs-remote/token")
+
+
+@pytest.mark.parametrize("cmdline", [
+    'python -c "import x  # -m realtime_subtitle.remote.server"',
+    "python -X dev -m realtime_subtitle.remote.server --host 100.105.163.59 --token-file /x/t",
+    "python -u -c x -m realtime_subtitle.remote.server --host 100.105.163.59 --token-file /x/t",
+])
+def test_interpreter_options_with_values_are_not_matched(env, spawn, tmp_path, cmdline):
+    """带值/-c 的解释器选项一律不匹配（选「不匹配」而非「匹配但拒绝记录」：
+    那不是我们的 v1 启动形状，宁可不碰别人的进程）。"""
+    e, home, _l = env
+    e["STUB_V1_CWD"] = str(_make_v1_cwd(tmp_path))
+    p = spawn(cmdline)
+    r = _run_stop_v1(e)
+    assert "未在运行" in r.stdout
+    assert p.poll() is None
