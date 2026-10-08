@@ -5,6 +5,7 @@
 
 | CR | TK | rounds | status | last_action |
 |----|----|--------|--------|-------------|
+| CR-003 | TK-002 | 0 | open | 2026-10-09 05:22 CST: created；executor 2593886（50 gateway / 662 全量 passed）→ round1 派出 default=opus + security=sonnet |
 | CR-002 | TK-001 | 2 | needs_fix | 2026-10-09 05:16 CST: round2 security approve / default needs_fix（R2-D1 accepted）→ repair round2 |
 | CR-001 | TK-004 | 3 | resolved | 2026-10-09 05:05 CST: round3 approve（代码层）；M1/M2 rejected（理由见 CR-001.md）；**待 Mac 构建验证后才能合并** |
 

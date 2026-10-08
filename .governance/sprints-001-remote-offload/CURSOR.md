@@ -4,7 +4,7 @@
 <!-- Machine fields: new writes must use "- key: `value`". Legacy variants are read-only compatibility. -->
 - current_phase: `review`
 - current_tk: `TK-001,TK-004,TK-002`
-- current_cr: `CR-002,CR-001`
+- current_cr: `CR-002,CR-003`
 - current_round: `1`
 - escalated: `false`
 
@@ -13,7 +13,7 @@
 | TK | 标题 | 状态 |
 |----|------|------|
 | TK-001 | 节点 worker：VAD 分段 + 整段识别 + 可插拔翻译 | fixing |
-| TK-002 | 节点 gateway：生命周期 + 协议 v2 + 鉴权与上限 | executing |
+| TK-002 | 节点 gateway：生命周期 + 协议 v2 + 鉴权与上限 | reviewing |
 | TK-003 | 一键安装 install_node.sh | planned |
 | TK-004 | rslite：带时间句子 + AudioFanout + 混合替换 + 单实例 | blocked（待 Mac 构建） |
 | TK-005 | rslite：NodeClient v2 + NodeRouter + 本机档门槛 | planned |
@@ -21,6 +21,7 @@
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 05:22 CST: TK-002 回报 2593886（write_scope 内，Coordinator 复核 50/662 passed、ruff 通过，已 push feat/tk-002）→ reviewing，CR-003 round1 派出（default=opus + security=sonnet）
 - 2026-10-09 05:16 CST: CR-002 round2 回收：security approve（S-F1 实打无泄漏）；default F1–F5 fixed，新 R2-D1（崩溃零痕迹）accepted → TK-001 fixing，repair round2（sonnet）
 - 2026-10-09 05:10 CST: TK-001 repair round1 回收 b89886e，Coordinator 复核（node 77 / 全量 689 passed，ruff 通过，F1 复现已消失）→ recheck，CR-002 round2 派出（default=opus + security=sonnet）
 - 2026-10-09 05:05 CST: CR-001 round3 回收（opus）：N1/N2/N3 fixed，approve（代码层）；M1/M2 rejected → CR-001 resolved（代码层），TK-004 blocked=待 Mac 构建（857a2d3，云端不合并）
