@@ -93,12 +93,12 @@ BIND_BACKOFF_MAX_S = 60.0
 # 把保温中的 worker 白白杀掉。
 _LANG_RE = re.compile(r"^[a-z]{2,3}(-[A-Za-z]{2,4})?$")
 # worker 退出码（P3）→ 给客户端的 status.code；其它非 0 与会话中的 0 一律 worker_crashed
-_EXIT_STATUS = {2: "protocol_error", 3: "engine_load_failed", 4: "internal"}
+_EXIT_STATUS = {2: "protocol_error", 3: "engine_load_failed", 4: "internal_error"}
 _STATUS_TEXT = {
     "worker_crashed": "识别进程异常退出",
     "protocol_error": "识别进程协议错误",
     "engine_load_failed": "识别引擎加载失败",
-    "internal": "识别进程内部错误",
+    "internal_error": "识别进程内部错误",
 }
 _CLIENT_EVENTS = frozenset({"ready", "final", "translation", "status", "drained"})
 
@@ -199,8 +199,10 @@ class AudioQueue:
     相邻的合并），喂 worker 时再惰性展开成等长的零 PCM。位置不变，flush 与音频的
     相对顺序不变；队列里囤的只是几个整数，不是零。
 
-    控制消息（hello/flush/drain）不丢，但有个数上限（`CTL_QUEUE_MAX`）：连续的
-    flush 合并成一条，仍然超限由调用方断开连接。
+    控制消息（hello/flush/drain）有个数上限（`CTL_QUEUE_MAX`）：紧挨着的 flush
+    （中间至多隔着 gap，没有真实 PCM）合并成一条；仍然超限就丢**最旧的一条 flush**
+    并告警（flush 只是「尽快出结果」的提示，丢了不影响正确性），drain 永不丢——
+    只有超限部分全是 drain/hello 时才返回 False 让调用方断开。内存仍然有界。
     """
 
     def __init__(self, max_frames: int, max_ctl: int | None = None) -> None:
@@ -210,6 +212,9 @@ class AudioQueue:
         self._pcm = 0
         self._ctl = 0
         self._wake = asyncio.Event()
+        self.flush_dropped = 0
+        self._flush_drop_pending = 0
+        self._flush_drop_logged_at = float("-inf")
 
     def __len__(self) -> int:
         return len(self._items)
@@ -240,18 +245,49 @@ class AudioQueue:
             del self._items[i]
 
     def put_ctl(self, msg: dict[str, Any]) -> bool:
-        """入队一条控制消息。超过个数上限返回 False（调用方应断开连接）。"""
-        if msg.get("type") == "flush" and self._items:
-            kind, last = self._items[-1]
-            if kind == "ctl" and last.get("type") == "flush":
-                return True  # 紧挨着的 flush 合并：再 flush 一次什么也不会多出来
+        """入队一条控制消息。返回 False 表示超限且无 flush 可丢（调用方应断开连接）。"""
+        if msg.get("type") == "flush":
+            # 从队尾往前跳过 gap（没有真实音频）：碰到 flush 就把它换成这条新的
+            # （新 flush 在 gap 之后，语义上覆盖旧的），不增加个数
+            for i in range(len(self._items) - 1, -1, -1):
+                kind, payload = self._items[i]
+                if kind == "gap":
+                    continue
+                if kind == "ctl" and payload.get("type") == "flush":
+                    del self._items[i]
+                    self._ctl -= 1
+                    self._merge_around(i)
+                break
         limit = CTL_QUEUE_MAX if self._max_ctl is None else self._max_ctl
-        if self._ctl >= limit:
+        if self._ctl >= limit and not self._drop_oldest_flush():
             return False
         self._items.append(("ctl", msg))
         self._ctl += 1
         self._wake.set()
         return True
+
+    def _merge_around(self, i: int) -> None:
+        """删掉 i 位置的元素后，若左右都是 gap 则合并（保持 gap 个数有界）。"""
+        if 0 < i < len(self._items) and self._items[i - 1][0] == "gap" and self._items[i][0] == "gap":
+            self._items[i - 1] = ("gap", self._items[i - 1][1] + self._items[i][1])
+            del self._items[i]
+
+    def _drop_oldest_flush(self) -> bool:
+        for i, (kind, payload) in enumerate(self._items):
+            if kind == "ctl" and payload.get("type") == "flush":
+                del self._items[i]
+                self._ctl -= 1
+                self._merge_around(i)
+                self.flush_dropped += 1
+                self._flush_drop_pending += 1
+                now = time.monotonic()
+                if now - self._flush_drop_logged_at >= _DROP_LOG_INTERVAL_S:
+                    log.warning("control_queue_flush_dropped count=%d limit=%d",
+                                self._flush_drop_pending, CTL_QUEUE_MAX)
+                    self._flush_drop_pending = 0
+                    self._flush_drop_logged_at = now
+                return True
+        return False
 
     async def get(self) -> tuple[str, Any]:
         while not self._items:
@@ -281,6 +317,11 @@ class WorkerManager:
         self._idle_gen = 0
         self._idle_task: asyncio.Task | None = None
         self._reaping: asyncio.subprocess.Process | None = None
+        # 保温 worker 跨会话：按 hello/ready 一一对应的序号过滤事件（见 _deliver）。
+        # 三个计数都随 worker 进程重置。
+        self._hellos_written = 0
+        self._readies_seen = 0
+        self._sink_hello_no: int | None = None
 
     @property
     def state(self) -> str:
@@ -298,11 +339,13 @@ class WorkerManager:
             if not reused:
                 await self._spawn()
             self._sink = sink
+            self._sink_hello_no = None  # 本会话的 hello 还没写出，之前的事件都不属于它
             return reused
 
     def detach(self) -> None:
         """会话结束：worker 继续保温，到期再回收。"""
         self._sink = None
+        self._sink_hello_no = None
         self._idle_gen += 1
         self._idle_task = asyncio.create_task(self._reap_later(self._idle_gen))
 
@@ -322,6 +365,10 @@ class WorkerManager:
         if kind == "pcm":
             data = len(payload).to_bytes(4, "big") + payload
         else:
+            if payload.get("type") == "hello":
+                # 与 write 之间没有 await：记账与「已写出」同步，取消也不会错位
+                self._hellos_written += 1
+                self._sink_hello_no = self._hellos_written
             data = (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
         # 一次 write 把整帧塞进缓冲：drain 中途被取消也不会留下半帧
         proc.stdin.write(data)
@@ -339,6 +386,9 @@ class WorkerManager:
             limit=_WORKER_LINE_LIMIT,
         )
         self._proc = proc
+        self._hellos_written = 0
+        self._readies_seen = 0
+        self._sink_hello_no = None
         self._reader = asyncio.create_task(self._read_events(proc))
         log.info("worker_spawned spawn_s=%.3f", time.monotonic() - t0)
 
@@ -376,6 +426,14 @@ class WorkerManager:
             return
         if not isinstance(ev, dict) or ev.get("ev") not in _CLIENT_EVENTS:
             log.warning("worker_unknown_event bytes=%d", len(line))
+            return
+        # worker 对每条 hello 恰好回一个 ready，且按序处理。已写出但尚未收到 ready 的
+        # hello 对应的 ready 及其间事件属于更早的会话（它在冷加载中断开了），丢弃；
+        # 只有本会话那次 hello 的 ready 到达之后的事件才交给本会话。
+        if ev.get("ev") == "ready":
+            self._readies_seen += 1
+        no = self._sink_hello_no
+        if no is None or self._readies_seen < no:
             return
         sink = self._sink
         if sink is not None:
@@ -435,17 +493,27 @@ class _Session:
         self._drop_pending = [0, 0]
         self._drop_logged_at = float("-inf")
         self._drop_notified_at = float("-inf")
+        self._dropped_before_ready = False
 
     # ---- worker 回调（都在事件循环线程里，不需要 threadsafe）----
 
     def on_worker_event(self, ev: dict[str, Any]) -> None:
-        # worker 按顺序处理：新会话的 `ready` 一定排在上一会话遗留事件之后。
-        # 在见到 ready 之前收到的全是旧会话的尾巴，丢掉，免得串到新客户端。
+        # WorkerManager 已按 hello/ready 序号过滤，交到这里的第一个事件就是本会话的
+        # ready；这里再兜一道：ready 之前的非 ready 事件不外发。
         if not self.ready:
             if ev.get("ev") != "ready":
                 return
             self.ready = True
+            self.out_q.put_nowait(ev)
+            if self._dropped_before_ready:
+                # 冷加载期间的丢帧只记了账：ready 送达后合并通知一次
+                self._drop_notified_at = time.monotonic()
+                self._emit_audio_dropped()
+            return
         self.out_q.put_nowait(ev)
+
+    def _emit_audio_dropped(self) -> None:
+        self.out_q.put_nowait({"ev": "status", "code": "audio_dropped", "text": AUDIO_DROPPED_TEXT})
 
     def on_worker_exit(self, rc: int) -> None:
         if not self.exit_fut.done():
@@ -585,10 +653,13 @@ class _Session:
             log.warning("audio_queue_drop frames=%d bytes=%d", *self._drop_pending)
             self._drop_pending = [0, 0]
             self._drop_logged_at = now
+        if not self.ready:
+            self._dropped_before_ready = True  # ready 前不给客户端发任何东西，只记账
+            return
         if now - self._drop_notified_at >= _DROP_LOG_INTERVAL_S:
             # 告诉客户端：这段时间的识别结果可能缺内容（已用静音补齐时间轴）。按 1s 合并
             self._drop_notified_at = now
-            self.out_q.put_nowait({"ev": "status", "code": "audio_dropped", "text": AUDIO_DROPPED_TEXT})
+            self._emit_audio_dropped()
 
     async def _on_text(self, text: str) -> bool:
         try:

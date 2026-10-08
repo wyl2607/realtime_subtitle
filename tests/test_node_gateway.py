@@ -659,40 +659,132 @@ def test_audio_queue_gap_markers_merge_and_total_bytes_are_conserved():
     asyncio.run(scenario())
 
 
-def test_audio_queue_control_messages_are_bounded_and_flushes_merge():
+def test_audio_queue_control_messages_are_bounded_and_flushes_merge(caplog):
     async def scenario():
         q = gw_mod.AudioQueue(10)
         for _ in range(100_000):  # 海量连续 flush：合并成一条，队列不增长
             assert q.put_ctl({"type": "flush"}) is True
         assert len(q) == 1
-        # 夹着音频的 flush 无法合并，到上限就拒收（调用方断开连接）
-        accepted = 0
+        # R2-D3：夹着音频的 flush 无法合并，到上限后丢最旧的 flush（不再拒收），队列长度有界
         for _ in range(10_000):
             q.put_pcm(b"\x00\x00")
-            if not q.put_ctl({"type": "flush"}):
-                break
-            accepted += 1
-        assert accepted == gw_mod.CTL_QUEUE_MAX - 1
+            assert q.put_ctl({"type": "flush"}) is True
+        assert q._ctl <= gw_mod.CTL_QUEUE_MAX
         assert len(q) <= gw_mod.CTL_QUEUE_MAX + 10 + gw_mod.CTL_QUEUE_MAX + 1  # ctl + 音频上限 + gap
+        assert q.flush_dropped > 9000
         # 取走后名额回收
         while len(q):
             await q.get()
         assert q.put_ctl({"type": "drain"}) is True
 
     asyncio.run(scenario())
+    assert "control_queue_flush_dropped" in caplog.text
+    # 告警按 1s 合并：上万次丢弃不会刷出上万行
+    assert caplog.text.count("control_queue_flush_dropped") < 20
 
 
-def test_control_message_flood_closes_connection_with_bounded_queue(tmp_path, caplog):
+def test_audio_queue_flushes_separated_only_by_gap_merge():
+    async def scenario():
+        q = gw_mod.AudioQueue(1)
+        q.put_pcm(b"aa")
+        q.put_ctl({"type": "flush"})
+        q.put_pcm(b"bb")        # 把 aa 挤成 gap
+        q.put_pcm(b"cc")        # 把 bb 挤成 gap（与前一个 gap 隔着 flush，不合并）
+        assert q.put_ctl({"type": "flush"}) is True
+        # flush, gap, pcm(cc), flush：cc 是真实 PCM，不合并
+        assert [k for k, _ in q._items] == ["gap", "ctl", "gap", "pcm", "ctl"]
+        # 在 gap 后面的新 flush 之前没有真实 PCM 的情况：flush, gap, flush
+        q3 = gw_mod.AudioQueue(1)
+        q3.put_ctl({"type": "flush"})
+        q3.put_pcm(b"aa")
+        q3.put_pcm(b"bb")       # aa -> gap
+        # 队列：flush, gap, pcm(bb) —— 取走 bb 之外的路径：直接构造 flush, gap
+        q3._items.pop()
+        q3._pcm -= 1
+        assert q3.put_ctl({"type": "flush"}) is True
+        assert [k for k, _ in q3._items] == ["gap", "ctl"]  # 旧 flush 被换到 gap 之后
+        assert q3._ctl == 1
+
+    asyncio.run(scenario())
+
+
+def test_audio_queue_never_drops_drain_and_rejects_when_only_drains_overflow(monkeypatch):
+    monkeypatch.setattr(gw_mod, "CTL_QUEUE_MAX", 6)
+
+    async def scenario():
+        q = gw_mod.AudioQueue(10)
+        assert q.put_ctl({"type": "hello"}) is True
+        for _ in range(5):
+            q.put_pcm(b"\x00\x00")
+            assert q.put_ctl({"type": "drain"}) is True
+        assert q._ctl == 6
+        assert q.put_ctl({"type": "drain"}) is False      # 全是 drain/hello：没有 flush 可丢
+        assert q.put_ctl({"type": "flush"}) is False
+        # 队列里夹着 flush 时：丢 flush 让位，但 drain 一条不少
+        q = gw_mod.AudioQueue(10)
+        for _ in range(3):
+            q.put_pcm(b"\x00\x00")
+            q.put_ctl({"type": "drain"})
+        for _ in range(100):
+            q.put_pcm(b"\x00\x00")
+            assert q.put_ctl({"type": "flush"}) is True
+        drains = [1 for k, p in q._items if k == "ctl" and p["type"] == "drain"]
+        assert len(drains) == 3
+        assert q.put_ctl({"type": "drain"}) is True       # 还能顶掉 flush 入队
+        assert q.put_ctl({"type": "drain"}) is True
+        assert q.put_ctl({"type": "drain"}) is True       # 此时 6 条全是 drain
+        assert q.put_ctl({"type": "drain"}) is False
+
+    asyncio.run(scenario())
+
+
+def test_flush_flood_with_stalled_worker_keeps_connection_and_bounded_queue(tmp_path, monkeypatch, caplog):
+    """S-F1 在 R2-D3 之后的新语义：flush/pcm 交错洪水不再断开合规客户端，
+    而是丢最旧的 flush + 告警，队列长度有界。"""
+    made: list = []
+
+    class Spy(gw_mod.AudioQueue):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            made.append(self)
+
+    monkeypatch.setattr(gw_mod, "AudioQueue", Spy)
+    monkeypatch.setattr(gw_mod, "CTL_QUEUE_MAX", 8)
+
     async def scenario():
         async with running(tmp_path, "stall") as (gw, _rec):
             ws = await uds_connect(gw)
             await hello_ready(ws)
             frame = b"\x01\x00" * 1600
             flush = json.dumps({"type": "flush"})
+            for _ in range(2000):  # worker 不读 stdin：管道塞满后 flush 只能留在队列里
+                await ws.send(frame)
+                await ws.send(flush)
+            q = made[-1]
+            await until(lambda: q.flush_dropped > 0, what="flush dropped")
+            assert ws.close_code is None  # 没被断开
+            assert q._ctl <= 8 and len(q) <= 8 + gw_mod.AUDIO_QUEUE_MAX_FRAMES + 8 + 1
+            await ws.close()
+            await until(lambda: not gw._session_active)
+
+    asyncio.run(scenario())
+    assert "control_queue_flush_dropped" in caplog.text
+    assert "control_queue_overflow" not in caplog.text
+
+
+def test_drain_flood_closes_connection_with_bounded_queue(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(gw_mod, "CTL_QUEUE_MAX", 8)
+
+    async def scenario():
+        async with running(tmp_path, "stall") as (gw, _rec):
+            ws = await uds_connect(gw)
+            await hello_ready(ws)
+            frame = b"\x01\x00" * 1600
+            drain = json.dumps({"type": "drain"})
             try:
-                for _ in range(2000):  # worker 不读 stdin：管道塞满后 flush 只能留在队列里
+                for _ in range(2000):
                     await ws.send(frame)
-                    await ws.send(flush)
+                    await ws.send(drain)
             except Exception:  # noqa: BLE001 - 服务端先关了连接
                 pass
             await asyncio.wait_for(ws.wait_closed(), 8)
@@ -845,7 +937,7 @@ def test_worker_crash_notifies_client(tmp_path, caplog):
 
 
 @pytest.mark.parametrize("rc,code", [
-    (2, "protocol_error"), (3, "engine_load_failed"), (4, "internal"),
+    (2, "protocol_error"), (3, "engine_load_failed"), (4, "internal_error"),
     (1, "worker_crashed"), (9, "worker_crashed"), (0, "worker_crashed"),  # 会话中自行退出，含 0
 ])
 def test_worker_exit_code_maps_to_status_code(tmp_path, caplog, rc, code):
@@ -1193,6 +1285,7 @@ def test_audio_dropped_status_is_coalesced_per_second(tmp_path, monkeypatch):
     async def scenario():
         gw = Gateway(token=TOKEN, uds_dir=make_dir(tmp_path), port=0)
         sess = gw_mod._Session(gw, ws=None, hello=HELLO, transport="uds")
+        sess.ready = True
         for _ in range(1000):
             sess._note_drop(1, 3200)
         return [sess.out_q.get_nowait() for _ in range(sess.out_q.qsize())]
@@ -1361,3 +1454,76 @@ def test_real_worker_time_axis_survives_dropped_audio(tmp_path, monkeypatch):
     final = next(e for e in evs if e["ev"] == "final")
     # 音调占客户端时钟的 [8.0, 9.0]；worker 的时间轴必须落在它附近（修复前整体偏早 8s）
     assert 7.5 <= final["a0"] and abs(final["a1"] - 9.0) < 0.5, final
+
+
+def test_real_worker_cold_load_flush_per_half_second_not_disconnected(tmp_path, monkeypatch):
+    """R2-D3：冷加载期间客户端每 0.5s 音频发一次 flush，不得被断开（旧上限下第 72 条被 1008）。"""
+    monkeypatch.setattr(gw_mod, "AUDIO_QUEUE_MAX_FRAMES", 3)
+    monkeypatch.setattr(gw_mod, "CTL_QUEUE_MAX", 8)
+
+    async def scenario():
+        async with running_real_worker(tmp_path, monkeypatch, load_s=1.5) as gw:
+            ws = await uds_connect(gw)
+            await ws.send(json.dumps(HELLO))
+            half = _silence(0.5)
+            for _ in range(40):  # 20s 音频，每 0.5s 一次 flush，远超 CTL_QUEUE_MAX
+                await ws.send(half)
+                await ws.send(json.dumps({"type": "flush"}))
+            await ws.send(json.dumps({"type": "drain"}))
+            evs = await _recv_until(ws, lambda e: e["ev"] == "drained", timeout=30)
+            assert ws.close_code is None
+            await ws.close()
+            return evs
+
+    evs = asyncio.run(scenario())
+    assert evs[0]["ev"] == "ready"
+
+
+def test_real_worker_cold_load_drops_are_reported_after_ready(tmp_path, monkeypatch):
+    """R2-D2：冷加载期间丢帧，客户端收到的第一个事件必须是 ready，随后才是 audio_dropped。"""
+    monkeypatch.setattr(gw_mod, "AUDIO_QUEUE_MAX_FRAMES", 3)
+
+    async def scenario():
+        async with running_real_worker(tmp_path, monkeypatch, load_s=1.0) as gw:
+            ws = await uds_connect(gw)
+            await ws.send(json.dumps(HELLO))
+            for _ in range(30):
+                await ws.send(_silence(0.1))
+            await ws.send(json.dumps({"type": "drain"}))
+            evs = await _recv_until(ws, lambda e: e["ev"] == "drained", timeout=30)
+            await ws.close()
+            return evs
+
+    evs = asyncio.run(scenario())
+    assert evs[0]["ev"] == "ready"
+    drops = [i for i, e in enumerate(evs) if e["ev"] == "status" and e["code"] == "audio_dropped"]
+    assert drops and drops[0] == 1  # ready 之后合并发一条
+
+
+def test_real_worker_disconnect_during_cold_load_then_new_session_gets_one_own_ready(tmp_path, monkeypatch):
+    """R2-D1：会话 1 在冷加载中断开、会话 2 随即连上 → 会话 2 恰好一个 ready，且是自己的（cold=False）。"""
+    async def scenario():
+        async with running_real_worker(tmp_path, monkeypatch, load_s=1.0) as gw:
+            ws1 = await uds_connect(gw)
+            await ws1.send(json.dumps(HELLO))
+            await until(lambda: gw.worker._hellos_written >= 1, what="hello 1 written")
+            await ws1.close()
+            await until(lambda: not gw._session_active)
+            assert gw.worker.state == "warm"
+
+            ws2 = await uds_connect(gw)
+            await ws2.send(json.dumps(HELLO))
+            audio = _tone(1.0) + _silence(0.3)
+            for i in range(0, len(audio), 3200):
+                await ws2.send(audio[i:i + 3200])
+            await ws2.send(json.dumps({"type": "drain"}))
+            evs = await _recv_until(ws2, lambda e: e["ev"] == "drained", timeout=30)
+            await ws2.close()
+            return evs
+
+    evs = asyncio.run(scenario())
+    readies = [e for e in evs if e["ev"] == "ready"]
+    assert len(readies) == 1 and evs[0]["ev"] == "ready"
+    assert readies[0]["cold"] is False  # 会话 1 的 ready 是 cold=True，不能漏给会话 2
+    final = next(e for e in evs if e["ev"] == "final")
+    assert final["text"] == "Hallo Welt." and final["id"] == 1
