@@ -152,3 +152,57 @@ cd macos-native && swift build -c release --product rslite
 (1) TK-004 等待或检查 CR-001 的修复结果，然后派第 2 轮复查；
 (2) TK-001 派 CR-002 第 1 轮评审（default 用 opus、security 用 sonnet，两路并行）。
 ```
+
+---
+
+## 9. 云端接手须知（claude.ai/code 等 Linux 容器）
+
+> 2026-10-08 23:00 用户要求推到 GitHub，在云端继续。以下分支已推送：`feat/macos-native`（主线，含全部 .governance）、`feat/tk-001`、`feat/tk-004`。
+
+**云端做不了的事：**
+- 编译不了 macOS/Swift（rslite），跑不了 MLX、Apple Speech、Apple Translation。
+- 访问不到 mini2（Tailscale/ssh），也访问不到本机的 `~/projects/...` 和 `rs-mac-native-data`。
+- 用不了子代理以外的本机 lane（codex、本机 venv）。
+
+所以上文里所有 `~/projects/rs-…` 路径，在云端都要换成仓库内的相对路径，worktree 一律换成 **git 分支**。
+
+**各 TK 在云端能做到什么程度：**
+
+| TK | 云端可做？ | 怎么做 |
+|---|---|---|
+| CR-002（TK-001 评审） | ✅ | 读 `git diff 88d9355..origin/feat/tk-001` 做评审；pytest 中依赖 MLX、Speech 的用例会被 skip，其余可以跑（需要先 `pip install -r requirements-dev.txt numpy websockets`，再看 `faster_whisper` 能不能装上） |
+| TK-002 gateway | ✅ | 用假 worker 测；`tailscale ip`、`ioreg`、`IOPS` 都放在可注入的接口后面，单测里 mock 掉 |
+| TK-003 install_node.sh | ⚠️ 部分 | `bash -n`、shellcheck、`--dry-run` 能跑；真正装到 mini2 必须回到 Mac 上做 |
+| TK-004 / CR-001 修复与复查 | ⚠️ 只能做代码评审 | `swift build` 必须在 Mac 上跑；复查结论标成「待 Mac 构建验证」 |
+| TK-005 Swift 路由 | ⚠️ 可以写，但不能编译 | 写完必须回 Mac 跑 `swift build` 和 headless 冒烟，之后才能合并 |
+| TK-006 文档 / 删 v1 | ✅ | |
+| TK-007 验收 | ❌ | 必须在 Mac 和 mini2 上做 |
+
+**云端的合并规则：**
+- 在 GitHub 分支上工作，按 TK 开 `feat/tk-00N` 分支，从 `origin/feat/macos-native` 切出。
+- 评审收敛后合进 `feat/macos-native` 并 push。
+- **只有 Python 部分在云端跑过全量 pytest 的才允许合并；Swift TK 回 Mac 验证之后才能合并。**
+- 不向 master 开 PR，也不合并到 master。
+
+**TK-004 的状态：** 本机修复者推送时可能还没修完。以 `origin/feat/tk-004` 最新的提交为准，对照 `reviews/CR-001.md` Round 1 的表格，检查 F1–F4、F6 哪些已经修了。
+
+### 云端版提示词
+
+```text
+你在云端接手 GitHub 仓库 wyl2607/realtime_subtitle 里进行中的 SDD Sprint，按原 Coordinator 的工作方式继续，全程用中文回复。
+先 checkout 分支 feat/macos-native，按顺序读完：
+1. .governance/sprints-001-remote-offload/HANDOFF.md（重点是第 9 节「云端接手须知」，它的优先级高于前文里的本机路径）
+2. 同一目录下的 CURSOR.md、TASKS.md、REVIEWS.md、RFC.md、reviews/CR-*.md
+3. CLAUDE.md 第 4 节和第 7 节
+
+你的角色是 Coordinator：只负责调度、分诊、合并；业务代码交给子代理写。RFC 里的契约 P1–P8 已经冻结，不能改。不向 master 开 PR，也不合并到 master。
+
+云端做不了 Swift、MLX、Apple Speech、mini2 相关的工作，凡是需要 Mac 的验证，一律标成「待 Mac 验证」，不要假装已经跑过。
+
+工作流程：每个 TK 开一个分支；Executor 用 sonnet 子代理，Reviewer 用 opus，涉及安全的另加一路 security 评审。每个 TK 至少评审 2 轮，涉及鉴权、生命周期、状态机的要做第 3 轮。由你逐条分诊每个 finding：accepted 还是 rejected，写明理由。每次 phase 切换都要同步 TASKS、CURSOR、REVIEWS 和 metrics，然后 commit 并 push。
+
+第一步：
+(1) CR-002：评审 origin/feat/tk-001（diff 基线是 88d9355），default 用 opus、security 用 sonnet，两路并行；
+(2) TK-004：检查 origin/feat/tk-004 上 CR-001 的修复进度，代码复查后标成「待 Mac 构建」；
+(3) 接着做 TK-002 gateway（单独一批）。
+```
