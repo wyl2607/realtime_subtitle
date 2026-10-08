@@ -4,7 +4,7 @@
 <!-- Machine fields: new writes must use "- key: `value`". Legacy variants are read-only compatibility. -->
 - current_phase: `review`
 - current_tk: `TK-001b`
-- current_cr: `—`
+- current_cr: `CR-004`
 - current_round: `1`
 - escalated: `false`
 
@@ -13,7 +13,7 @@
 | TK | 标题 | 状态 |
 |----|------|------|
 | TK-001 | 节点 worker：VAD 分段 + 整段识别 + 可插拔翻译 | done |
-| TK-001b | worker：会话结束滑动更新 rtf | executing |
+| TK-001b | worker：会话结束滑动更新 rtf | reviewing |
 | TK-002 | 节点 gateway：生命周期 + 协议 v2 + 鉴权与上限 | done |
 | TK-003 | 一键安装 install_node.sh | planned |
 | TK-004 | rslite：带时间句子 + AudioFanout + 混合替换 + 单实例 | done |
@@ -22,6 +22,7 @@
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 07:50 CST: TK-001b 回报 ce63a76（190/816 passed，已 push）→ reviewing，CR-004 round1（opus）；派审前发现疑点：SIGTERM 回收路径不 finish_session，常见路径可能不更新 rtf
 - 2026-10-09 07:33 CST: TK-001b → executing（sonnet，分支 feat/tk-001b，单独一批）；PR #62 已取消订阅
 - 2026-10-09 07:30 CST: CR-003 round4 approve → **TK-002 done**，合并进 feat/macos-native（PR #62）。下一批：TK-001b（rtf 滑动更新，依赖 info.STATE_DIR，现已在主线）
 - 2026-10-09 07:20 CST: TK-002 repair round3 回收 0172626（107/801 passed）→ recheck，定向 round4（opus）。#62 CI 全绿（含 pytest-windows）；#63 已合并、已取消订阅
