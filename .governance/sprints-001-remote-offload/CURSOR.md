@@ -12,7 +12,7 @@
 
 | TK | 标题 | 状态 |
 |----|------|------|
-| TK-001 | 节点 worker：VAD 分段 + 整段识别 + 可插拔翻译 | executing |
+| TK-001 | 节点 worker：VAD 分段 + 整段识别 + 可插拔翻译 | reviewing |
 | TK-002 | 节点 gateway：生命周期 + 协议 v2 + 鉴权与上限 | planned |
 | TK-003 | 一键安装 install_node.sh | planned |
 | TK-004 | rslite：带时间句子 + AudioFanout + 混合替换 + 单实例 | fixing |
@@ -21,6 +21,7 @@
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 04:20 CST: TK-001 回报（3e87063，scope 内，WER 0.88%/延迟中位 3.25s @M2）→ reviewing，CR-002 round1：default=opus + security=sonnet 并行
 - 2026-10-09 04:18 CST: CR-001 round1 needs_fix（F1–F6 全部 accepted，F5 转交 TK-005）→ TK-004 fixing，已派 repairer（sonnet）
 - 2026-10-09 04:16 CST: TK-004 回报（ecb7a20，write_scope 内）；coordinator-direct 编译适配 0cdd5c7（main/RemotePipeline 只改 onFinal 签名）；→ review，CR-001 round 1（Opus 评审）。TK-001 仍 executing
 - 2026-10-09 04:08 CST: TK-001 codex 额度耗尽（至 10-09 00:25，零产出）→ 改派 Claude sonnet 子代理

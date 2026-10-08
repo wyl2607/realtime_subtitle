@@ -5,6 +5,7 @@
 
 | CR | TK | rounds | status | last_action |
 |----|----|--------|--------|-------------|
+| CR-002 | TK-001 | 0 | open | 2026-10-09 04:20 CST: created；executor 3e87063（M2 冒烟 WER 0.88%、延迟中位 3.25s）|
 | CR-001 | TK-004 | 1 | needs_fix | 2026-10-09 04:18 CST: round1 opus 6 findings 全部 accepted（F5 转交 TK-005），已派 repairer |
 
 ## 字段说明

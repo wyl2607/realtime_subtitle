@@ -13,3 +13,5 @@
 {"ts":"2026-10-09T04:18:57+08:00","sprint":"sprints-001-remote-offload","tk":"TK-004","cr":"CR-001","phase":"review","action":"returned","agent_role":"reviewer","round":1,"notes":"needs_fix 2 major 3 minor 1 nit"}
 {"ts":"2026-10-09T04:18:57+08:00","sprint":"sprints-001-remote-offload","tk":"TK-004","cr":"CR-001","phase":"review","action":"triage","agent_role":"coordinator","round":1,"notes":"6 accepted (F5 transferred to TK-005), 0 rejected"}
 {"ts":"2026-10-09T04:18:57+08:00","sprint":"sprints-001-remote-offload","tk":"TK-004","cr":"CR-001","phase":"review","action":"repair-dispatched","agent_role":"repairer","round":1,"notes":"claude sonnet subagent"}
+{"ts":"2026-10-09T04:20:17+08:00","sprint":"sprints-001-remote-offload","tk":"TK-001","phase":"execution","action":"returned","agent_role":"executor","notes":"3e87063 in scope; WER 0.88% median lag 3.25s M2"}
+{"ts":"2026-10-09T04:20:17+08:00","sprint":"sprints-001-remote-offload","tk":"TK-001","cr":"CR-002","phase":"review","action":"dispatched","agent_role":"reviewer","round":1,"notes":"default=opus, security=sonnet"}
