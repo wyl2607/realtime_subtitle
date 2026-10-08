@@ -22,23 +22,38 @@ struct Options {
 
 @main
 struct RSLite {
-    static func main() async {
+    // ☠️ main 必须是同步的。async main 里再 `app.run()`，NSApplication 的事件循环
+    // 是跑在一个主队列任务**里面**的：主队列是串行的，这个任务永不返回，于是之后
+    // 所有派到 MainActor 的任务（窗口显示、启动识别）都排在后面永远轮不到——
+    // 2026-10-08 真机：进程活着、CPU 0%、窗口不出现、也不弹权限。
+    // 同步 main 下 app.run()/dispatchMain() 自己就在排空主队列。
+    static func main() {
+        let options: Options
         do {
-            let options = try parse(Array(CommandLine.arguments.dropFirst()))
-            if #available(macOS 27.0, *) {
-                if options.headless {
-                    try await runHeadless(options)
-                } else {
-                    await MainActor.run {
-                        runApp(options)
-                    }
-                }
-            } else {
-                throw RSLiteError.unsupported("rslite 需要 macOS 27 或更新版本")
-            }
+            options = try parse(Array(CommandLine.arguments.dropFirst()))
         } catch {
             fputs("error: \(error)\n", stderr)
             exit(1)
+        }
+        guard #available(macOS 27.0, *) else {
+            fputs("error: rslite 需要 macOS 27 或更新版本\n", stderr)
+            exit(1)
+        }
+        if options.headless {
+            Task {
+                do {
+                    try await runHeadless(options)
+                    exit(0)
+                } catch {
+                    fputs("error: \(error)\n", stderr)
+                    exit(1)
+                }
+            }
+            dispatchMain()
+        } else {
+            MainActor.assumeIsolated {
+                runApp(options)
+            }
         }
     }
 
