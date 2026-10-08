@@ -15,12 +15,13 @@
 | TK-001 | 节点 worker：VAD 分段 + 整段识别 + 可插拔翻译 | fixing |
 | TK-002 | 节点 gateway：生命周期 + 协议 v2 + 鉴权与上限 | executing |
 | TK-003 | 一键安装 install_node.sh | planned |
-| TK-004 | rslite：带时间句子 + AudioFanout + 混合替换 + 单实例 | fixing |
+| TK-004 | rslite：带时间句子 + AudioFanout + 混合替换 + 单实例 | blocked（待 Mac 构建） |
 | TK-005 | rslite：NodeClient v2 + NodeRouter + 本机档门槛 | planned |
 | TK-006 | 清理 v1 + 文档 | planned |
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 05:05 CST: CR-001 round3 回收（opus）：N1/N2/N3 fixed，approve（代码层）；M1/M2 rejected → CR-001 resolved（代码层），TK-004 blocked=待 Mac 构建（857a2d3，云端不合并）
 - 2026-10-09 05:00 CST: CR-002 round1 default 路回收（opus，F1–F6）；与 security 路合并分诊：11 accepted / 0 rejected（F1 强切重叠已云端复现）→ TK-001 fixing，repair round1（sonnet）。TK-004 repair round2 回收 857a2d3（未编译）→ 已 push，CR-001 round3 代码复查派出（opus）
 - 2026-10-09 04:52 CST: CR-001 round2 回收（opus）：F4/F6 fixed，F1/F2/F3 partially/残余，verdict approve（代码层）；新 N1/N2/N3 全部 accepted → TK-004 fixing，repair round2（sonnet，云端写、待 Mac 构建）。CR-002 security 路回收（S-F1..S-F6），等 default 路一起分诊
 - 2026-10-09 04:46 CST: **云端接手**（claude.ai/code Linux 容器，HANDOFF §9）。Linux 测试基线：88d9355 = 612 passed / 46 skipped / 8 collection errors（pyaudiowpatch 仅 Windows），tk-001 = 672 passed（+60 node 用例，无回归）。CR-002 round1 实际派出：default=opus + security=sonnet 并行（04:20 那次本机派发未产出）；CR-001 round2 派出（opus，只做代码复查，结论标「待 Mac 构建」）；TK-002 → executing（sonnet，分支 feat/tk-002，单独一批：本批唯一 executor）
