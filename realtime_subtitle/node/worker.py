@@ -417,6 +417,14 @@ def main() -> None:
     def _thread_excepthook(args):
         _log(err, "thread_exception", err=args.exc_type.__name__,
              thread=getattr(args.thread, "name", None) or "")
+        # 工作线程被 BaseException（如库内 sys.exit）杀死后进程仍活着，
+        # _asr_q.join() 会永远卡住；立即以内部错误码退出，让 gateway 按退出码判崩溃。
+        if getattr(args.thread, "name", None) in ("node-asr", "node-tx"):
+            try:
+                err.flush()
+            except Exception:  # noqa: BLE001
+                pass
+            os._exit(EXIT_INTERNAL)
 
     sys.excepthook = _excepthook
     threading.excepthook = _thread_excepthook

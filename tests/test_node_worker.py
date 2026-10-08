@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -29,6 +30,7 @@ from realtime_subtitle.node.engines import (
 )
 from realtime_subtitle.node.worker import (
     EXIT_ENGINE,
+    EXIT_INTERNAL,
     EXIT_OK,
     EXIT_PROTOCOL,
     MAX_FRAME,
@@ -951,3 +953,79 @@ def test_thread_and_main_uncaught_exceptions_leave_class_name_only():
 def test_faulthandler_is_enabled_in_main():
     code, _out, err = _run_fail("fh")
     assert code == 0 and "AssertionError" not in err
+
+
+# ---------------------------------------------------------------- CR-002 第 3 轮 R3-D1：工作线程意外死亡
+
+_CHILD_DEATH = r"""
+import sys
+from realtime_subtitle.node import engines, segmenter, worker
+
+mode = sys.argv[1]
+
+
+class A(engines.AsrEngine):
+    def __init__(self):
+        secret_local = "%(s)s"  # noqa: F841  faulthandler 不得带出局部变量
+        if mode == "segv":
+            import faulthandler
+            faulthandler._sigsegv()
+    def load(self): pass
+    def transcribe(self, audio, language):
+        raise SystemExit(5)
+    def info(self): return {}
+
+
+class V:
+    def __call__(self, w): return 0.9
+    def reset(self): pass
+
+
+engines.WhisperEngine = A
+segmenter.SileroVad = V
+worker.main()
+""" % {"s": _SECRET}
+
+
+def _spawn_death(mode):
+    env = dict(os.environ, PYTHONPATH=str(REPO))
+    return subprocess.Popen([sys.executable, "-c", _CHILD_DEATH, mode],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, cwd=str(REPO), env=env)
+
+
+def test_asr_thread_baseexception_death_makes_worker_exit_internal():
+    p = _spawn_death("sysexit")
+    try:
+        pcm = tone(1.0)
+        # stdin 保持打开：退出必须来自线程死亡处理，而不是 EOF。
+        p.stdin.write(hello() + audio_frames(pcm) + ctl(type="flush") + ctl(type="drain"))
+        p.stdin.flush()
+        deadline = time.time() + 10
+        while p.poll() is None and time.time() < deadline:
+            time.sleep(0.05)
+        assert p.poll() is not None, "worker 在工作线程死亡后挂起"
+        assert p.returncode == EXIT_INTERNAL
+    finally:
+        if p.poll() is None:
+            p.kill()
+        p.stdin.close()
+        out, err = p.stdout.read().decode(), p.stderr.read().decode()
+        p.stdout.close(); p.stderr.close(); p.wait()
+    assert "thread_exception" in err and "SystemExit" in err and "node-asr" in err
+    assert "Traceback" not in err
+    assert _SECRET not in err and _SECRET not in out
+
+
+def test_faulthandler_dumps_frames_without_locals_on_native_crash():
+    p = _spawn_death("segv")
+    try:
+        out, err = p.communicate(b"", timeout=30)
+    finally:
+        if p.poll() is None:
+            p.kill()
+    err = err.decode()
+    assert p.returncode != 0
+    assert "Fatal Python error" in err
+    assert 'File "' in err
+    assert _SECRET not in err and _SECRET not in out.decode()
