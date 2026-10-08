@@ -49,7 +49,15 @@ final class OverlayController: NSObject {
     }
 
     func setVolatile(_ text: String) {
-        volatileLabel.stringValue = text
+        // 草稿只看最新的尾巴：两行放不下时从前面截，截在词边界上
+        let limit = 140
+        var shown = text
+        if shown.count > limit {
+            let tail = shown.suffix(limit)
+            shown = "…" + (tail.firstIndex(of: " ").map { String(tail[tail.index(after: $0)...]) } ?? String(tail))
+        }
+        volatileLabel.stringValue = shown
+        fitHeight()
     }
 
     func addFinal(id: Int, text: String) {
@@ -70,6 +78,7 @@ final class OverlayController: NSObject {
 
     func setStatus(_ text: String) {
         volatileLabel.stringValue = text
+        fitHeight()
     }
 
     private func configurePanel() {
@@ -96,8 +105,9 @@ final class OverlayController: NSObject {
 
         volatileLabel.textColor = .secondaryLabelColor
         volatileLabel.font = .systemFont(ofSize: 20)
-        volatileLabel.lineBreakMode = .byTruncatingTail
-        volatileLabel.maximumNumberOfLines = 1
+        volatileLabel.lineBreakMode = .byWordWrapping
+        volatileLabel.maximumNumberOfLines = 2
+        volatileLabel.preferredMaxLayoutWidth = textWidth
 
         root.addSubview(stack)
         panel.contentView = root
@@ -144,6 +154,23 @@ final class OverlayController: NSObject {
             }
         }
         stack.addArrangedSubview(volatileLabel)
+        fitHeight()
+    }
+
+    // 文字换行后高度会变：窗口跟着内容长高/变矮，底边不动（字幕贴着屏幕下方）
+    private func fitHeight() {
+        stack.layoutSubtreeIfNeeded()
+        let height = ceil(stack.fittingSize.height) + 36
+        var frame = panel.frame
+        guard abs(frame.height - height) > 1 else { return }
+        frame.origin.y += frame.height - height
+        frame.size.height = height
+        panel.setFrame(frame, display: true)
+    }
+
+    // NSTextField 在 StackView 里不给最大宽度就不会折行
+    private var textWidth: CGFloat {
+        panel.frame.width - 44
     }
 
     private func label(_ text: String, color: NSColor, size: CGFloat) -> NSTextField {
@@ -151,7 +178,8 @@ final class OverlayController: NSObject {
         field.textColor = color
         field.font = .systemFont(ofSize: size, weight: .semibold)
         field.lineBreakMode = .byWordWrapping
-        field.maximumNumberOfLines = 2
+        field.maximumNumberOfLines = 3
+        field.preferredMaxLayoutWidth = textWidth
         return field
     }
 

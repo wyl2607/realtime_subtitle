@@ -41,6 +41,8 @@ final class Pipeline: @unchecked Sendable {
     private var analysisTask: Task<Void, Never>?
     private var finishContinuation: CheckedContinuation<Void, Never>?
     private var nextID = 1
+    // 只在 resultTask 里串行读写
+    private var committer = SentenceCommitter()
     private var didCheckAssets = false
     private var isPaused = false
     private var isStopped = false
@@ -131,6 +133,7 @@ final class Pipeline: @unchecked Sendable {
         }
 
         let analyzer = SpeechAnalyzer(modules: modules)
+        committer = SentenceCommitter()
         self.source = source
         self.analyzer = analyzer
 
@@ -211,13 +214,24 @@ final class Pipeline: @unchecked Sendable {
         }
 
         if result.isFinal {
-            let id = nextID
-            nextID += 1
-            callbacks.onFinal(id, text)
-            translator.enqueue(id: id, text: text)
+            for sentence in committer.final(text) {
+                commit(sentence)
+            }
+            callbacks.onVolatile("")
         } else {
-            callbacks.onVolatile(text)
+            let (sentences, remainder) = committer.volatile(text)
+            for sentence in sentences {
+                commit(sentence)
+            }
+            callbacks.onVolatile(remainder)
         }
+    }
+
+    private func commit(_ sentence: String) {
+        let id = nextID
+        nextID += 1
+        callbacks.onFinal(id, sentence)
+        translator.enqueue(id: id, text: sentence)
     }
 
     private func ensureSpeechAssets(transcriber: SpeechTranscriber) async throws {
