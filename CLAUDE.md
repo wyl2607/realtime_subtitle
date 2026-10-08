@@ -1134,6 +1134,7 @@ FLEURS 德中平行句 chrF。复测脚本在 `scripts/bench/`）：
 | qwen3.5:2b | 26.7 | 1.6s | 2.4GB |
 | qwen3.5:4b | 27.9 | 4.3s | 3.2GB |
 | qwen3.5:9b | 29.8 | 7.5s | 6.2GB，16GB 机器上**单独跑就把内存压力推到警告**——16GB 别用 |
+| Apple Translation | 33.8 | 0.12s | 不占 Ollama 内存 |
 
 macOS 避坑（每一条都是这次迁移真实踩过的）：
 
@@ -1191,4 +1192,11 @@ macOS 避坑（每一条都是这次迁移真实踩过的）：
 12. **测量 Mac 性能前**先 `snapshot_download` 全部模型、`HF_HUB_OFFLINE=1
     caffeinate -i` 跑，期间别跑别的重活。第一轮 P0 就是被 Wi-Fi 抖动 + 系统睡眠
     污染的（单次识别测出 2631 秒）。
-
+13. **Apple Translation 后端是句子翻译，不是小模型 prompt 替代品。**
+    `TRANSLATE_BACKEND="auto"` 只有在 macOS、`macos-native/.build/release/rstranslate`
+    存在且 `status(de, zh-Hans)=installed` 时才用系统翻译；否则回退 Ollama。
+    取舍要记清：系统 Translation 没有术语表、没有语域 prompt、不看上下文，
+    但 FLEURS 德→中 40 句实测 chrF 33.8、单句 0.12s，且不占 Ollama 内存。
+    40 句里出现过 1 句繁体，已经在 helper 里做繁转简兜底，Python 不再处理。
+    点词查词和 🤖AI 分析仍然需要 Ollama；Ollama 没开时主字幕可照常走 Apple，
+    但查词/AI 分析会不可用或变慢。
