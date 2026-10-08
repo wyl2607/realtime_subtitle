@@ -8,9 +8,11 @@ let package = Package(
     products: [
         .executable(name: "rsbench", targets: ["rsbench"]),
         .executable(name: "rstranslate", targets: ["rstranslate"]),
+        .executable(name: "rslite", targets: ["rslite"]),
     ],
     targets: [
         .executableTarget(name: "rsbench"),
         .executableTarget(name: "rstranslate"),
+        .executableTarget(name: "rslite"),
     ]
 )
