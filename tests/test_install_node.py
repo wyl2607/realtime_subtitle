@@ -74,7 +74,12 @@ _STUBS = {
     # lsof：v1 的 cwd 由测试指定
     "lsof": '#!/bin/bash\nprintf \'p1\\nfcwd\\nn%s\\n\' "${STUB_V1_CWD:-}"\n',
     # nohup：不真的起进程，只记下「在哪个目录、跑什么」
-    "nohup": '#!/bin/bash\necho "PWD=$PWD ARGS=$*" >> "$STUB_LOG_DIR/nohup.log"\n',
+    # STUB_NOHUP_SPAWN=1 时再起一个 argv 与入参一致的假进程（模拟「v1 真的起来了」），pid 记下供清理
+    "nohup": '#!/bin/bash\necho "PWD=$PWD ARGS=$*" >> "$STUB_LOG_DIR/nohup.log"\n'
+             'if [ -n "${STUB_NOHUP_SPAWN:-}" ]; then\n'
+             '  ( exec -a "$*" "$STUB_REAL_SLEEP" 30 </dev/null >/dev/null 2>&1 ) &\n'
+             '  echo $! >> "$STUB_LOG_DIR/nohup.pids"\n'
+             'fi\n',
     "sleep": "#!/bin/bash\nexit 0\n",
     # mv：STUB_MV_FAIL_PREV=1 时 rs-node → rs-node.prev 失败（F7）
     "mv": '#!/bin/bash\n'
@@ -119,8 +124,17 @@ def env(tmp_path):
         "STUB_PYTHON": sys.executable,
         "STUB_FAKE_PYTHON": str(fake),
         "STUB_REAL_MV": shutil.which("mv"),
+        "STUB_REAL_SLEEP": shutil.which("sleep"),
+        "RS_V1_WAIT": "2",
     })
-    return e, home, logdir
+    yield e, home, logdir
+    pids = logdir / "nohup.pids"
+    if pids.exists():
+        for line in pids.read_text().split():
+            try:
+                os.kill(int(line), 9)
+            except OSError:
+                pass
 
 
 def _run(args, e, input_=None, timeout=120):
@@ -398,7 +412,8 @@ def test_node_id_is_reused_on_rerun(env):
 # v1 进程是真进程（bash exec -a 伪装 argv），pgrep / ps / kill 用真的，
 # 这样 S-F1 的匹配规则测的是真实行为而不是桩。
 
-V1_CMD = "/Users/x/rs-remote/venv/bin/python3.13 -m realtime_subtitle.remote.server --port 8791 --token-file /Users/x/t.token"
+V1_ARGS = "--host 100.105.163.59 --port 8791 --token-file /Users/x/.config/rs-remote/token"
+V1_CMD = f"/Users/x/rs-remote/venv/bin/python3.13 -m realtime_subtitle.remote.server {V1_ARGS}"
 
 
 @pytest.fixture
@@ -407,7 +422,9 @@ def spawn():
 
     def _spawn(cmdline):
         # 用 os.environ 而不是桩 PATH：这里要真的 sleep
-        p = subprocess.Popen(["bash", "-c", 'exec -a "$0" sleep 300', cmdline],
+        # cat 没有额外参数：ps 看到的命令行就恰好是 cmdline（sleep 300 会多出一个 "300"，
+        # 白名单解析会把它当未知参数拒掉）；stdin 开着管道，cat 就一直阻塞
+        p = subprocess.Popen(["bash", "-c", 'exec -a "$0" cat', cmdline], stdin=subprocess.PIPE,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         procs.append(p)
         time.sleep(0.3)  # 等 exec 完成，否则 argv 还是 bash 的
@@ -418,11 +435,22 @@ def spawn():
         if p.poll() is None:
             p.kill()
         p.wait()
+        p.stdin.close()
 
 
 def _launchctl_calls(logdir: Path):
     f = logdir / "launchctl.log"
     return f.read_text().splitlines() if f.exists() else []
+
+
+def _make_v1_cwd(tmp_path: Path) -> Path:
+    """v1 的工作目录：带 venv/bin/python（重拉的固定入口）。"""
+    cwd = tmp_path / "rs-remote"
+    py = cwd / "venv" / "bin" / "python"
+    py.parent.mkdir(parents=True)
+    py.write_text("#!/bin/sh\nexit 0\n")
+    py.chmod(0o755)
+    return cwd
 
 
 def _wait_for(path: Path, needle: str, secs=5.0) -> str:
@@ -465,10 +493,10 @@ def test_success_twice_keeps_single_nodes_json_entry_and_updates_it(env):
 def test_no_prev_bootstrap_failure_removes_plist_keeps_failed_and_relaunches_v1(env, spawn, tmp_path):
     e, home, logdir = env
     v1 = spawn(V1_CMD)
-    v1_cwd = tmp_path / "rs-remote"
-    v1_cwd.mkdir()
+    v1_cwd = _make_v1_cwd(tmp_path)
     e["STUB_V1_CWD"] = str(v1_cwd)
     e["STUB_BOOTSTRAP_FAIL"] = "1"
+    e["STUB_NOHUP_SPAWN"] = "1"
 
     r = _run(["mini2"], e, timeout=300)
     out = r.stdout + r.stderr
@@ -489,7 +517,8 @@ def test_no_prev_bootstrap_failure_removes_plist_keeps_failed_and_relaunches_v1(
     assert any(c.startswith("bootstrap") for c in calls)
     log = _wait_for(logdir / "nohup.log", "realtime_subtitle.remote.server")
     assert f"PWD={v1_cwd}" in log
-    assert "-m realtime_subtitle.remote.server --port 8791 --token-file /Users/x/t.token" in log
+    # 固定入口 <cwd>/venv/bin/python，而不是 ps 里记到的解释器路径
+    assert f"ARGS={v1_cwd}/venv/bin/python -m realtime_subtitle.remote.server {V1_ARGS}" in log
     assert not (home / "Library/Application Support/rs-node/v1.restart").exists()
 
 
@@ -513,10 +542,10 @@ def test_with_prev_info_failure_restores_old_dir_and_rebootstraps(env, spawn, tm
     nodes_before = nodes.read_text()
 
     v1 = spawn(V1_CMD)
-    v1_cwd = tmp_path / "rs-remote"
-    v1_cwd.mkdir()
+    v1_cwd = _make_v1_cwd(tmp_path)
     e["STUB_V1_CWD"] = str(v1_cwd)
     e["STUB_INFO_FAIL"] = "1"
+    e["STUB_NOHUP_SPAWN"] = "1"
     (logdir / "launchctl.log").unlink()
 
     r = _run(["mini2"], e, timeout=300)
@@ -635,8 +664,7 @@ def _run_stop_v1(e):
 
 def test_stop_v1_matches_only_real_v1_and_records_it(env, spawn, tmp_path):
     e, home, _l = env
-    cwd = tmp_path / "rs-remote"
-    cwd.mkdir()
+    cwd = _make_v1_cwd(tmp_path)
     e["STUB_V1_CWD"] = str(cwd)
     decoys = [
         spawn("tail -f /x/realtime_subtitle/remote/server.py"),          # `.` 通配 `/` 的旧 bug
@@ -647,16 +675,17 @@ def test_stop_v1_matches_only_real_v1_and_records_it(env, spawn, tmp_path):
     ]
     mac_v1 = spawn("/opt/homebrew/Cellar/python@3.13/3.13.1/Frameworks/Python.framework/"
                    "Versions/3.13/Resources/Python.app/Contents/MacOS/Python "
-                   "-m realtime_subtitle.remote.server --port 8791")
+                   "-m realtime_subtitle.remote.server --host 100.105.163.59 --port 8791 "
+                   "--token-file /Users/x/.config/rs-remote/token")
     r = _run_stop_v1(e)
     assert r.returncode == 0, r.stderr
     assert mac_v1.wait(timeout=5) is not None, "框架版 Python（大写 P）的 v1 要能被识别并停掉"
     assert all(p.poll() is None for p in decoys), "无关进程不许被杀"
 
     rec = home / "Library" / "Application Support" / "rs-node" / "v1.restart"
-    lines = rec.read_text().splitlines()
-    assert lines[0] == str(cwd)
-    assert "-m realtime_subtitle.remote.server --port 8791" in lines[1]
+    assert rec.read_text().splitlines() == [
+        f"cwd={cwd}", "host=100.105.163.59", "port=8791",
+        "token_file=/Users/x/.config/rs-remote/token"], "记录只存校验过的字段，不存原始命令行"
     assert _mode(rec) == 0o600 and _mode(rec.parent) == 0o700
     assert "已记录 v1" in r.stdout and "已停止" in r.stdout
 
@@ -679,3 +708,214 @@ def test_stop_v1_pattern_is_anchored_in_source():
     assert r"realtime_subtitle\.remote\.server" in text
     assert 'pgrep -u "$uid_n"' in text
     assert "pgrep -f '[r]ealtime_subtitle.remote.server'" not in text
+
+
+# ---- v1 记录/重拉：固定入口 + 白名单参数（CR-005 第 2 轮：R2-S1 / R2-D1 / R2-D2 / R2-S2）
+
+REAL_V1_ARGS = "--host 100.105.163.59 --port 8791 --token-file /Users/x/.config/rs-remote/token"
+MAC_FRAMEWORK_PY = ("/opt/homebrew/Cellar/python@3.13/3.13.1/Frameworks/Python.framework/"
+                    "Versions/3.13/Resources/Python.app/Contents/MacOS/Python")
+
+
+def _state_dir(home: Path) -> Path:
+    return home / "Library" / "Application Support" / "rs-node"
+
+
+def _run_restore(e, home: Path):
+    """只跑 SWAP_SH 里的 restore_v1（连同共用校验库），观察它的输出与副作用。"""
+    prog = (
+        'source "$1"; eval "$V1_LIB_SH"\n'
+        f'state="{_state_dir(home)}"; rec="$state/v1.restart"\n'
+        'eval "$(printf "%s\\n" "$SWAP_SH" | sed -n "/^restore_v1() {/,/^}/p")"\n'
+        'restore_v1\n')
+    return subprocess.run(["bash", "-c", prog, "x", str(SCRIPT)], env=e,
+                          capture_output=True, text=True, timeout=60)
+
+
+def _nohup_log(logdir: Path) -> str:
+    f = logdir / "nohup.log"
+    return f.read_text() if f.exists() else ""
+
+
+@pytest.mark.parametrize("interp", ["/Users/x/rs-remote/venv/bin/python3.13", MAC_FRAMEWORK_PY])
+def test_v1_record_then_restore_uses_fixed_venv_entry(env, spawn, tmp_path, interp):
+    e, home, logdir = env
+    cwd = _make_v1_cwd(tmp_path)
+    e["STUB_V1_CWD"] = str(cwd)
+    e["STUB_NOHUP_SPAWN"] = "1"
+    v1 = spawn(f"{interp} -m realtime_subtitle.remote.server {REAL_V1_ARGS}")
+    r = _run_stop_v1(e)
+    assert r.returncode == 0 and "已记录 v1" in r.stdout, r.stdout + r.stderr
+    assert v1.wait(timeout=5) is not None
+    rec_text = (_state_dir(home) / "v1.restart").read_text()
+    assert "python" not in rec_text.lower() and "-m" not in rec_text, "记录里不许有原始命令行"
+
+    r = _run_restore(e, home)
+    assert r.returncode == 0, r.stderr
+    assert "已恢复 v1" in r.stdout and "未能自动恢复" not in r.stdout
+    log = _nohup_log(logdir)
+    # 固定 <cwd>/venv/bin/python（框架版的 Python.app 路径不会被重放），参数逐个原样
+    assert log.strip() == (f"PWD={cwd} ARGS={cwd}/venv/bin/python "
+                           f"-m realtime_subtitle.remote.server {REAL_V1_ARGS}")
+    assert not (_state_dir(home) / "v1.restart").exists()
+
+
+@pytest.mark.parametrize("tail", [
+    "--port 8791 $(touch {tmp}/PWNED)",
+    "--port 8791 `touch {tmp}/PWNED`",
+    "--port 8791 ;touch {tmp}/PWNED",
+    "--port 8791;id",
+    "--port 8791 --evil 1",
+    "--port 8791 extra",
+    "--port 8791 --token-file",
+    "--port 70000",
+    "--port 0",
+    "--port abc",
+    "--host 0x7f.1 --port 1",
+    "--port 8791 --host 100.105.163.59",
+    "--port 8791 >/tmp/x",
+])
+def test_v1_unsafe_cmdline_is_not_recorded_and_never_relaunched(env, spawn, tmp_path, tail):
+    e, home, logdir = env
+    cwd = _make_v1_cwd(tmp_path)
+    e["STUB_V1_CWD"] = str(cwd)
+    e["STUB_NOHUP_SPAWN"] = "1"
+    base = "--host 100.105.163.59 --token-file /Users/x/.config/rs-remote/token"
+    if tail.startswith("--host"):
+        base = "--token-file /Users/x/t"
+    if tail.endswith("--token-file"):
+        base = "--host 100.105.163.59"
+    if "--port 8791 --host" in tail:
+        base = "--host 100.105.163.59 --token-file /Users/x/t"
+    v1 = spawn("/x/venv/bin/python -m realtime_subtitle.remote.server "
+               f"{base} {tail.format(tmp=tmp_path)}")
+    r = _run_stop_v1(e)
+    assert r.returncode == 0, r.stderr
+    assert "不记录 v1" in r.stdout, r.stdout
+    assert v1.wait(timeout=5) is not None, "拒绝记录不影响停掉 v1"
+    rec = _state_dir(home) / "v1.restart"
+    assert rec.read_text().strip() == "unrecorded=1"
+
+    r = _run_restore(e, home)
+    assert "没能恢复 v1，请手动重新启动" in r.stdout, r.stdout
+    assert "已恢复" not in r.stdout
+    assert _nohup_log(logdir) == "", "回滚不许重拉"
+    assert not (tmp_path / "PWNED").exists(), "注入的命令不许被执行"
+    assert not rec.exists()
+
+
+def test_v1_spaced_path_is_rejected_and_pwned_never_created(env, spawn, tmp_path):
+    e, home, logdir = env
+    e["STUB_V1_CWD"] = str(_make_v1_cwd(tmp_path))
+    v1 = spawn("/x/python -m realtime_subtitle.remote.server --host 100.105.163.59 "
+               "--token-file /Users/a b/token")
+    r = _run_stop_v1(e)
+    assert "不记录 v1" in r.stdout
+    v1.wait(timeout=5)
+    _run_restore(e, home)
+    assert _nohup_log(logdir) == ""
+
+
+def test_v1_record_hides_nothing_secret_and_accepts_ipv6_and_default_port(env, spawn, tmp_path):
+    e, home, _l = env
+    e["STUB_V1_CWD"] = str(_make_v1_cwd(tmp_path))
+    v1 = spawn("/x/python -m realtime_subtitle.remote.server --host=fd7a:115c::1 "
+               "--token-file=/Users/x/.config/rs-remote/token")
+    r = _run_stop_v1(e)
+    assert "已记录 v1" in r.stdout, r.stdout
+    v1.wait(timeout=5)
+    lines = (_state_dir(home) / "v1.restart").read_text().splitlines()
+    assert "host=fd7a:115c::1" in lines and "port=" in lines
+
+
+def test_restore_reports_failure_when_v1_does_not_come_back(env, spawn, tmp_path):
+    e, home, logdir = env
+    cwd = _make_v1_cwd(tmp_path)
+    e["STUB_V1_CWD"] = str(cwd)
+    e.pop("STUB_NOHUP_SPAWN", None)  # 桩 nohup 不会真起进程 = 重拉后进程没起来
+    e["RS_V1_WAIT"] = "1"
+    v1 = spawn(V1_CMD)
+    assert "已记录 v1" in _run_stop_v1(e).stdout
+    v1.wait(timeout=5)
+    t0 = time.time()
+    r = _run_restore(e, home)
+    assert time.time() - t0 < 5, "轮询必须有界"
+    assert "已恢复" not in r.stdout
+    assert "v1 未能自动恢复，请手动启动：" in r.stdout
+    manual = r.stdout.split("请手动启动：", 1)[1].strip()
+    assert manual == (f"cd {cwd} && ./venv/bin/python -m realtime_subtitle.remote.server {V1_ARGS}")
+    assert "ARGS=" in _nohup_log(logdir), "确实尝试过重拉"
+
+
+def test_restore_without_venv_python_gives_manual_command(env, spawn, tmp_path):
+    e, home, logdir = env
+    cwd = tmp_path / "rs-remote"
+    cwd.mkdir()
+    e["STUB_V1_CWD"] = str(cwd)
+    v1 = spawn(V1_CMD)
+    assert "已记录 v1" in _run_stop_v1(e).stdout
+    v1.wait(timeout=5)
+    r = _run_restore(e, home)
+    assert "未能自动恢复，请手动启动：" in r.stdout and "已恢复" not in r.stdout
+    assert _nohup_log(logdir) == ""
+
+
+def test_tampered_record_is_revalidated_on_restore(env, tmp_path):
+    e, home, logdir = env
+    cwd = _make_v1_cwd(tmp_path)
+    rec = _state_dir(home) / "v1.restart"
+    rec.parent.mkdir(parents=True)
+    for body in [
+        f"cwd={cwd}\nhost=100.105.163.59;id\nport=8791\ntoken_file=/x/t\n",
+        f"cwd={cwd}\nhost=100.105.163.59\nport=8791\ntoken_file=/x/t y\n",
+        f"cwd={cwd}\nhost=100.105.163.59\nport=8791\ntoken_file=/x/t\ncmd=touch PWNED\n",
+        f"cwd={tmp_path}/nope\nhost=100.105.163.59\nport=8791\ntoken_file=/x/t\n",
+    ]:
+        rec.write_text(body)
+        r = _run_restore(e, home)
+        assert "记录无效或不完整" in r.stdout, (body, r.stdout)
+    assert _nohup_log(logdir) == ""
+
+
+def test_state_dir_symlink_refuses_record_and_restore(env, spawn, tmp_path):
+    e, home, logdir = env
+    e["STUB_V1_CWD"] = str(_make_v1_cwd(tmp_path))
+    evil = tmp_path / "evil"
+    evil.mkdir()
+    sd = _state_dir(home)
+    sd.parent.mkdir(parents=True)
+    sd.symlink_to(evil)
+    v1 = spawn(V1_CMD)
+    r = _run_stop_v1(e)
+    assert r.returncode == 0
+    assert "符号链接" in r.stdout and "已记录 v1" not in r.stdout
+    assert v1.wait(timeout=5) is not None, "拒绝记录不影响停 v1"
+    assert list(evil.iterdir()) == [], "不许写进符号链接指向的目录"
+    (evil / "v1.restart").write_text(f"cwd={tmp_path}\nhost=1.2.3.4\ntoken_file=/x\n")
+    r = _run_restore(e, home)
+    assert "拒绝读取" in r.stdout
+    assert _nohup_log(logdir) == ""
+    assert (evil / "v1.restart").exists(), "拒绝读取也不能顺手删目标里的文件"
+
+
+def test_record_file_symlink_refused_on_write_and_read(env, spawn, tmp_path):
+    e, home, logdir = env
+    e["STUB_V1_CWD"] = str(_make_v1_cwd(tmp_path))
+    sd = _state_dir(home)
+    sd.mkdir(parents=True)
+    target = tmp_path / "target.txt"
+    target.write_text("keep\n")
+    (sd / "v1.restart").symlink_to(target)
+    v1 = spawn(V1_CMD)
+    r = _run_stop_v1(e)
+    assert "符号链接" in r.stdout and "已记录 v1" not in r.stdout
+    v1.wait(timeout=5)
+    assert target.read_text() == "keep\n"
+    r = _run_restore(e, home)
+    assert "拒绝读取" in r.stdout and _nohup_log(logdir) == ""
+
+
+def test_v1_restore_never_goes_through_sh_c():
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert "/bin/sh -c" not in text and "sh -c \"exec" not in text
+    assert '"${v1_args[@]}"' in text

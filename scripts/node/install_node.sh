@@ -90,20 +90,12 @@ fi
 cat "$f"
 EOF
 
-# 停掉 v1 远程服务：只杀进程，不动 ~/rs-remote 目录。
-# v1 在 mini2 上以 --port 8791 运行，和 v2 抢同一端口，所以必须在 bootstrap 之前停。
-# 为了让「v2 装失败」不等于「什么都没在跑」，停之前先把 v1 的完整命令行与 cwd 记到
-# 状态目录（0600；只含命令行与路径，v1 用 --token-file，路径不是秘密），
-# SWAP_SH 回滚时据此重新拉起。
-# 匹配刻意收紧（CR-005 S-F1）：只认「本人」的 `python* -m realtime_subtitle.remote.server`，
-# 点号转义（否则 `tail -f .../realtime_subtitle/remote/server.py` 也会命中），
-# 且每次动手（TERM / KILL）前都用 ps 的完整命令行再确认一遍。
-# Python 首字母大小写都认：macOS 框架版 Python 的进程名是 `Python`。
-IFS= read -r -d '' STOP_V1_SH <<'EOF' || true
-export PATH=/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH
-umask 077
-state="$HOME/Library/Application Support/rs-node"
-rec="$state/v1.restart"
+# v1 记录/重拉共用的校验库（CR-005 第 2 轮：R2-S1/R2-D1/R2-D2/R2-S2）。
+# 原则：绝不重放 ps 里的命令行，也不经 sh -c——只从命令行里按白名单抠出
+# --host / --port / --token-file 三个值（server.py 的 argparse 里一共就这三个参数），
+# 记录里只存校验过的字段，重拉时固定用 <cwd>/venv/bin/python + 数组 exec。
+# 同一份库会拼进 STOP_V1_SH（记录）和 SWAP_SH（重拉），读记录时再校验一遍。
+IFS= read -r -d '' V1_LIB_SH <<'EOF' || true
 uid_n=$(id -u)
 pat='[Pp]ython[0-9.]* -m [r]ealtime_subtitle\.remote\.server'
 ere='(^|/)[Pp]ython[0-9.]* -m realtime_subtitle\.remote\.server( |$)'
@@ -118,9 +110,131 @@ find_v1() {
     done
 }
 
+v1_valid_host() {
+    local h=$1 o
+    local re4='^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$'
+    local re6='^[0-9A-Fa-f:]{2,39}$'
+    if [[ $h =~ $re4 ]]; then
+        for o in "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"; do
+            [ $((10#$o)) -le 255 ] || return 1
+        done
+        return 0
+    fi
+    [[ $h =~ $re6 ]] && [[ $h == *:*:* ]]
+}
+v1_valid_port() {
+    local re='^[0-9]{1,5}$'
+    [[ $1 =~ $re ]] && [ $((10#$1)) -ge 1 ] && [ $((10#$1)) -le 65535 ]
+}
+v1_valid_tokfile() {
+    local re='^[A-Za-z0-9._/~][A-Za-z0-9._/~-]*$'
+    [ ${#1} -le 4096 ] && [[ $1 =~ $re ]]
+}
+# cwd：绝对路径、无控制字符、是普通目录且本身不是符号链接（路径里可以有空格，只会被加引号使用）
+v1_valid_cwd() {
+    local re='[[:cntrl:]]'
+    case "$1" in /?*) ;; *) return 1 ;; esac
+    if [[ $1 =~ $re ]]; then return 1; fi
+    [ -d "$1" ] && [ ! -L "$1" ]
+}
+# 从 `-m realtime_subtitle.remote.server` 之后的剩余命令行里按白名单解析参数。
+# 结果在 V_HOST / V_PORT / V_TOK；拒绝时 V_WHY 给原因（不回显 token 内容）。
+v1_parse_args() {
+    V_HOST='' V_PORT='' V_TOK='' V_WHY=''
+    local opt val
+    set -f
+    # shellcheck disable=SC2086
+    set -- $1
+    set +f
+    while [ $# -gt 0 ]; do
+        opt=$1
+        shift
+        case "$opt" in
+            --host=* | --port=* | --token-file=*)
+                val=${opt#*=}
+                opt=${opt%%=*}
+                ;;
+            --host | --port | --token-file)
+                if [ $# -eq 0 ]; then V_WHY="$opt 缺少取值"; return 1; fi
+                val=$1
+                shift
+                ;;
+            *)
+                V_WHY="含有不在白名单内的参数"
+                return 1
+                ;;
+        esac
+        case "$opt" in
+            --host)
+                [ -z "$V_HOST" ] || { V_WHY="--host 重复"; return 1; }
+                v1_valid_host "$val" || { V_WHY="--host 不是 IP 字面量"; return 1; }
+                V_HOST=$val
+                ;;
+            --port)
+                [ -z "$V_PORT" ] || { V_WHY="--port 重复"; return 1; }
+                v1_valid_port "$val" || { V_WHY="--port 不是 1-65535 的数字"; return 1; }
+                V_PORT=$val
+                ;;
+            --token-file)
+                [ -z "$V_TOK" ] || { V_WHY="--token-file 重复"; return 1; }
+                v1_valid_tokfile "$val" || { V_WHY="--token-file 含空白或特殊字符"; return 1; }
+                V_TOK=$val
+                ;;
+        esac
+    done
+    [ -n "$V_HOST" ] || { V_WHY="缺少 --host"; return 1; }
+    [ -n "$V_TOK" ] || { V_WHY="缺少 --token-file"; return 1; }
+    return 0
+}
+# 可复制的手动启动命令（只含 token 文件路径，不含 token 内容）；$1=cwd，其余读 V_*
+v1_manual_cmd() {
+    local out
+    out="cd $(printf '%q' "$1") && ./venv/bin/python -m realtime_subtitle.remote.server --host $V_HOST"
+    if [ -n "$V_PORT" ]; then out="$out --port $V_PORT"; fi
+    printf '%s' "$out --token-file $V_TOK"
+}
+EOF
+
+# 停掉 v1 远程服务：只杀进程，不动 ~/rs-remote 目录。
+# v1 在 mini2 上以 --port 8791 运行，和 v2 抢同一端口，所以必须在 bootstrap 之前停。
+# 为了让「v2 装失败」不等于「什么都没在跑」，停之前先把 v1 的 cwd 与白名单参数
+# （--host/--port/--token-file，值已校验）记到状态目录（0600；不存原始命令行，
+# token 只有文件路径），SWAP_SH 回滚时据此重新拉起。
+# 命令行里出现任何白名单外的东西就拒绝记录（回滚时不重拉，只提示手动启动）。
+# 状态目录或记录文件是符号链接时一律拒绝读写（R2-S2）。
+# 匹配刻意收紧（CR-005 S-F1）：只认「本人」的 `python* -m realtime_subtitle.remote.server`，
+# 点号转义（否则 `tail -f .../realtime_subtitle/remote/server.py` 也会命中），
+# 且每次动手（TERM / KILL）前都用 ps 的完整命令行再确认一遍。
+# Python 首字母大小写都认：macOS 框架版 Python 的进程名是 `Python`。
+IFS= read -r -d '' STOP_V1_SH <<'EOF' || true
+export PATH=/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH
+umask 077
+state="$HOME/Library/Application Support/rs-node"
+rec="$state/v1.restart"
+
+# 写记录：$1 为完整内容。状态目录/记录文件是符号链接或类型不对就拒绝
+write_rec() {
+    if [ -L "$state" ] || { [ -e "$state" ] && [ ! -d "$state" ]; }; then
+        echo "⚠️ 状态目录是符号链接或不是目录，拒绝写入 v1 记录"
+        return 1
+    fi
+    if [ -L "$rec" ] || { [ -e "$rec" ] && [ ! -f "$rec" ]; }; then
+        echo "⚠️ v1 记录文件是符号链接或不是普通文件，拒绝写入"
+        return 1
+    fi
+    mkdir -p "$state" && chmod 700 "$state" || return 1
+    tmp="$rec.tmp.$$"
+    # noclobber：临时文件名被人预置成符号链接/已存在时直接失败，不跟随
+    ( set -C; printf '%s\n' "$1" > "$tmp" ) || return 1
+    chmod 600 "$tmp" && mv "$tmp" "$rec"
+}
+drop_rec() {
+    if [ ! -L "$state" ] && [ ! -L "$rec" ] && [ -f "$rec" ]; then rm -f "$rec"; fi
+}
+
 pids=$(find_v1)
 if [ -z "$pids" ]; then
-    rm -f "$rec"
+    drop_rec
     echo "v1 远程服务：未在运行"
     exit 0
 fi
@@ -128,14 +242,31 @@ fi
 first=$(printf '%s\n' "$pids" | head -n 1)
 cmd=$(ps -o command= -p "$first" 2>/dev/null </dev/null | sed 's/^ *//')
 cwd=$(lsof -a -p "$first" -d cwd -Fn 2>/dev/null </dev/null | sed -n 's/^n//p' | head -n 1)
-if [ -n "$cmd" ] && [ -n "$cwd" ]; then
-    mkdir -p "$state"
-    chmod 700 "$state"
-    printf '%s\n%s\n' "$cwd" "$cmd" > "$rec.tmp.$$" && chmod 600 "$rec.tmp.$$" && mv "$rec.tmp.$$" "$rec"
-    echo "已记录 v1 的命令行与工作目录（v2 安装失败时用来恢复 v1）"
+mod='-m realtime_subtitle.remote.server'
+why=''
+if [ -z "$cmd" ] || [ -z "$cwd" ]; then
+    why="没能读到命令行或工作目录"
+elif ! v1_valid_cwd "$cwd"; then
+    why="工作目录不是普通目录（或是符号链接）"
+elif [ "${cmd#*"$mod"}" = "$cmd" ]; then
+    why="命令行形状无法识别"
+elif ! v1_parse_args "${cmd#*"$mod"}"; then
+    why=$V_WHY
+fi
+if [ -z "$why" ]; then
+    rec_body="cwd=$cwd
+host=$V_HOST
+port=$V_PORT
+token_file=$V_TOK"
+    if write_rec "$rec_body"; then
+        echo "已记录 v1 的启动参数与工作目录（v2 安装失败时用来恢复 v1）"
+    else
+        echo "⚠️ 没能写入 v1 记录：如果 v2 安装失败，v1 需要手动重新启动"
+    fi
 else
-    rm -f "$rec"
-    echo "⚠️ 没能记录 v1 的命令行或工作目录：如果 v2 安装失败，v1 需要手动重新启动"
+    echo "⚠️ 不记录 v1 的启动命令（$why）：如果 v2 安装失败，v1 需要手动重新启动"
+    drop_rec
+    write_rec "unrecorded=1" || true
 fi
 
 for p in $pids; do
@@ -150,6 +281,7 @@ for p in $(find_v1); do
 done
 echo "v1 远程服务：已强制停止（~/rs-remote 目录保留）"
 EOF
+STOP_V1_SH="${V1_LIB_SH}${STOP_V1_SH}"
 
 # 在 ~/rs-node.new 里建环境。install.sh 负责 venv / 依赖 / rstranslate；
 # 节点只多一个 websockets，单独装。--skip-models：节点默认用系统翻译，不拉 Ollama 模型。
@@ -266,7 +398,7 @@ EOF
 #   有 .prev → 恢复 .prev 并重新 bootstrap；
 #   无 .prev → bootout 并删掉 plist（RunAtLoad+KeepAlive 的 plist 指向不存在的 venv 会在每次登录反复拉起失败），
 #              失败版改名 ~/rs-node.failed 留着排查。
-# 两种情况都按 STOP_V1_SH 记下的命令行把 v1 重新拉起（v1 原本就是 nohup 起的）。
+# 两种情况都按 STOP_V1_SH 记下的白名单参数把 v1 重新拉起（见 restore_v1）。
 IFS= read -r -d '' SWAP_SH <<'EOF' || true
 export PATH=/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH
 uid_n=$(id -u)
@@ -278,17 +410,64 @@ rec="$state/v1.restart"
 boot_tries=${RS_BOOT_TRIES:-5}
 info_wait=${RS_INFO_WAIT:-40}
 
+# 按 STOP_V1_SH 的记录重拉 v1：固定入口 <cwd>/venv/bin/python -m realtime_subtitle.remote.server
+# + 白名单参数，bash 数组直接 exec，不经 sh -c；读记录时每个值再校验一遍。
+# 拉起后有界轮询（RS_V1_WAIT 秒，默认 5）用 find_v1 复核，没起来就给可复制的手动命令。
 restore_v1() {
-    [ -f "$rec" ] || return 0
-    v1_cwd=$(sed -n 1p "$rec")
-    v1_cmd=$(sed -n 2p "$rec")
-    rm -f "$rec"
-    if [ -n "$v1_cwd" ] && [ -n "$v1_cmd" ] && [ -d "$v1_cwd" ]; then
-        ( cd "$v1_cwd" && nohup /bin/sh -c "exec $v1_cmd" >/dev/null 2>&1 </dev/null & )
-        echo "⚠️ v2 安装失败，已恢复 v1：在 $v1_cwd 重新拉起 $v1_cmd"
-    else
-        echo "⚠️ v2 安装失败，但 v1 的记录不完整，没能恢复 v1，请手动重新启动"
+    if [ -L "$state" ]; then
+        echo "⚠️ 状态目录是符号链接，拒绝读取 v1 记录；v1 如已停止请手动重新启动"
+        return 0
     fi
+    if [ -L "$rec" ]; then
+        echo "⚠️ v1 记录文件是符号链接，拒绝读取；v1 如已停止请手动重新启动"
+        return 0
+    fi
+    [ -e "$rec" ] || return 0
+    if [ ! -f "$rec" ]; then
+        echo "⚠️ v1 记录不是普通文件，拒绝读取；v1 如已停止请手动重新启动"
+        return 0
+    fi
+    r_cwd='' r_host='' r_port='' r_tok='' r_unrec='' r_bad=''
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            cwd=*) r_cwd=${line#cwd=} ;;
+            host=*) r_host=${line#host=} ;;
+            port=*) r_port=${line#port=} ;;
+            token_file=*) r_tok=${line#token_file=} ;;
+            unrecorded=1) r_unrec=1 ;;
+            *) r_bad=1 ;;
+        esac
+    done < "$rec"
+    rm -f "$rec"
+    if [ -n "$r_unrec" ]; then
+        echo "⚠️ v2 安装失败；停 v1 时它的命令行不在白名单内、没有记录，没能恢复 v1，请手动重新启动"
+        return 0
+    fi
+    if [ -n "$r_bad" ] || ! v1_valid_cwd "$r_cwd" || ! v1_valid_host "$r_host" \
+        || ! v1_valid_tokfile "$r_tok" || { [ -n "$r_port" ] && ! v1_valid_port "$r_port"; }; then
+        echo "⚠️ v2 安装失败，但 v1 的记录无效或不完整，没能恢复 v1，请手动重新启动"
+        return 0
+    fi
+    V_HOST=$r_host V_PORT=$r_port V_TOK=$r_tok
+    manual=$(v1_manual_cmd "$r_cwd")
+    if [ ! -x "$r_cwd/venv/bin/python" ]; then
+        echo "⚠️ v2 安装失败；$r_cwd/venv/bin/python 不存在，v1 未能自动恢复，请手动启动：$manual"
+        return 0
+    fi
+    v1_args=("$r_cwd/venv/bin/python" -m realtime_subtitle.remote.server --host "$r_host")
+    if [ -n "$r_port" ]; then v1_args+=(--port "$r_port"); fi
+    v1_args+=(--token-file "$r_tok")
+    ( cd "$r_cwd" && nohup "${v1_args[@]}" >/dev/null 2>&1 </dev/null & )
+    v1_end=$((SECONDS + ${RS_V1_WAIT:-5}))
+    while :; do
+        if [ -n "$(find_v1)" ]; then
+            echo "⚠️ v2 安装失败，已恢复 v1：在 $r_cwd 重新拉起 $r_cwd/venv/bin/python -m realtime_subtitle.remote.server"
+            return 0
+        fi
+        [ "$SECONDS" -lt "$v1_end" ] || break
+        sleep 1
+    done
+    echo "⚠️ v2 安装失败，v1 未能自动恢复，请手动启动：$manual"
 }
 
 restart_old_agent() {
@@ -372,6 +551,7 @@ done
 rm -f "$rec"
 echo "gateway-ok：/v1/info 返回 200，v=2"
 EOF
+SWAP_SH="${V1_LIB_SH}${SWAP_SH}"
 
 # ------------------------------------------------------------
 # 控制端函数
