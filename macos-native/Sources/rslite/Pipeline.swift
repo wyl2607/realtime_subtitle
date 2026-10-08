@@ -109,7 +109,9 @@ final class Pipeline: @unchecked Sendable {
         let transcriber = SpeechTranscriber(
             locale: supported,
             transcriptionOptions: [],
-            reportingOptions: [.volatileResults],
+            // fastResults：FLEURS 5 句实时回放，草稿首字 4–12s → 0.1–1.8s，定稿 4.8–6.7s → 2.2–4.4s，
+            // 本进程 CPU 0.42s → 0.59s/71s。和 Whisper 版同时跑会抢资源而跟不上实时（实测 117s 才跑完 67s 音频）
+            reportingOptions: [.volatileResults, .fastResults],
             attributeOptions: []
         )
 

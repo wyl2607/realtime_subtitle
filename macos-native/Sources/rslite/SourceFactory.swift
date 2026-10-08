@@ -18,11 +18,11 @@ func makeAudioSource(_ spec: String) throws -> AudioSource {
     }
 
     if spec == "tap" {
-        throw SourceFactoryError.unsupported("采集模块未接入: tap") // 合并 Capture/ 后改成 ProcessTapSource()
+        return ProcessTapSource()
     }
 
     if spec == "mic" {
-        throw SourceFactoryError.unsupported("采集模块未接入: mic") // 合并 Capture/ 后改成 MicSource()
+        return MicSource()
     }
 
     throw SourceFactoryError.unsupported("未知音频来源：\(spec)")
