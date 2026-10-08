@@ -37,7 +37,7 @@
 | TK | 状态 | 执行者 / worktree | 说明 |
 |---|---|---|---|
 | TK-001 节点 worker | **executing** | Claude sonnet 子代理，`~/projects/rs-tk-001`（feat/tk-001） | codex 额度耗尽、零产出后改派。写本文件时子代理刚开工，worktree 里还没有改动 |
-| TK-004 rslite 时间+混合+单实例 | **executing** | Claude sonnet 子代理，`~/projects/rs-tk-004`（feat/tk-004） | 写本文件时已改动 Overlay/Pipeline/SentenceCommitter，新增 AudioFanout/SingleInstance。⚠️ **还改了不在 write_scope 内的 `main.swift`、`RemotePipeline.swift`**，评审时必须当作越界处理（大概率是回调签名改了之后要让编译通过） |
+| TK-004 rslite 时间+混合+单实例 | **reviewing（CR-001 第 1 轮，Opus 评审中）** | `~/projects/rs-tk-004`，提交 ecb7a20 + 0cdd5c7 | 实现在 write_scope 之内；main/RemotePipeline 只由 coordinator-direct 改了 onFinal 签名（0cdd5c7），单实例接线和模式文案留给 TK-005。看 `reviews/CR-001.md`，评审员结论出来后由 Coordinator 分诊 |
 | TK-002 gateway | planned | — | 安全类，单独一批 |
 | TK-003 install_node.sh | planned | — | 涉及 token，单独一批 |
 | TK-005 NodeClient+Router | planned | 等 TK-004 | |
@@ -145,6 +145,5 @@ cd macos-native && swift build -c release --product rslite
 你的角色是 Coordinator，只做调度、评审和合并，业务代码交给子代理或 codex 写；codex 额度在 2026-10-09 00:25 之后才恢复。
 契约 P1–P8 已冻结；不 push、不开 PR；在 mini2 上做远程操作前，先告诉用户你要做什么。
 第一步：检查 ~/projects/rs-tk-001 和 ~/projects/rs-tk-004 两个 worktree 的 git status 和 git log，判断 TK-001、TK-004 进行到哪一步，再继续评审或重新派活。
-TK-004 改了不在 write_scope 内的 main.swift 和 RemotePipeline.swift，要按越界处理。
 回复用中文。
 ```
