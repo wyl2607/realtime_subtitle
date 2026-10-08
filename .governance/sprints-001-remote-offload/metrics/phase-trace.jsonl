@@ -6,3 +6,7 @@
 {"ts":"2026-10-09T04:06:21+08:00","sprint":"sprints-001-remote-offload","tk":"TK-004","phase":"execution","action":"dispatched","agent_role":"executor","notes":"claude sonnet subagent, worktree ~/projects/rs-tk-004"}
 {"ts":"2026-10-09T04:08:39+08:00","sprint":"sprints-001-remote-offload","tk":"TK-001","phase":"execution","action":"returned","agent_role":"executor","notes":"codex quota exhausted until 2026-10-09 00:25, zero files written"}
 {"ts":"2026-10-09T04:08:39+08:00","sprint":"sprints-001-remote-offload","tk":"TK-001","phase":"execution","action":"dispatched","agent_role":"executor","notes":"re-routed to claude sonnet subagent (lane fallback), same worktree"}
+{"ts":"2026-10-09T04:16:02+08:00","sprint":"sprints-001-remote-offload","tk":"TK-004","phase":"execution","action":"returned","agent_role":"executor","notes":"ecb7a20 in scope; compile adapter needed"}
+{"ts":"2026-10-09T04:16:02+08:00","sprint":"sprints-001-remote-offload","tk":"TK-004","phase":"execution","action":"coordinator-direct","agent_role":"coordinator","notes":"0cdd5c7 onFinal signature adapter main/RemotePipeline"}
+{"ts":"2026-10-09T04:16:02+08:00","sprint":"sprints-001-remote-offload","tk":"TK-004","cr":"CR-001","phase":"review","action":"enter","agent_role":"coordinator","round":1}
+{"ts":"2026-10-09T04:16:02+08:00","sprint":"sprints-001-remote-offload","tk":"TK-004","cr":"CR-001","phase":"review","action":"dispatched","agent_role":"reviewer","round":1,"notes":"claude opus subagent, lens default"}
