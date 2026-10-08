@@ -7,8 +7,10 @@ let package = Package(
     platforms: [.macOS(.v26)],
     products: [
         .executable(name: "rsbench", targets: ["rsbench"]),
+        .executable(name: "rstranslate", targets: ["rstranslate"]),
     ],
     targets: [
         .executableTarget(name: "rsbench"),
+        .executableTarget(name: "rstranslate"),
     ]
 )
