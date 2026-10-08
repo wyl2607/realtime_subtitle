@@ -6,7 +6,7 @@
 | CR | TK | rounds | status | last_action |
 |----|----|--------|--------|-------------|
 | CR-003 | TK-002 | 0 | open | 2026-10-09 05:22 CST: created；executor 2593886（50 gateway / 662 全量 passed）→ round1 派出 default=opus + security=sonnet（05:26 实际派出，default 路含与真 TK-001 worker 联调） |
-| CR-002 | TK-001 | 3 | needs_fix | 2026-10-09 05:34 CST: round3 两路 approve；R3-D1(+测试 nit) accepted、R3-S1 rejected → repair round3，后接定向 round4 |
+| CR-002 | TK-001 | 3 | needs_fix | 2026-10-09 05:42 CST: repair b2c697e 复核（复现 20.08s→0.35s）→ 定向 round4（opus） |
 | CR-001 | TK-004 | 3 | resolved | 2026-10-09 05:05 CST: round3 approve（代码层）；M1/M2 rejected（理由见 CR-001.md）；**待 Mac 构建验证后才能合并** |
 
 ## 字段说明

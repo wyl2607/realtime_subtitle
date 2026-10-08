@@ -5,7 +5,7 @@
 
 | id | title | status | blocked_by | write_scope | reviewer_lanes | notes |
 |----|-------|--------|------------|-------------|----------------|-------|
-| TK-001 | 节点 worker：VAD 分段 + 整段识别 + 可插拔翻译 | fixing | — | realtime_subtitle/node/{worker,segmenter,engines}.py, tests/test_node_worker.py, tests/test_node_segmenter.py | default,security | 涉及 S1、S7；需准备第 3 轮评审；node/__init__.py（空文件）随本 TK 建包，CR-002 F6 登记 |
+| TK-001 | 节点 worker：VAD 分段 + 整段识别 + 可插拔翻译 | recheck | — | realtime_subtitle/node/{worker,segmenter,engines}.py, tests/test_node_worker.py, tests/test_node_segmenter.py | default,security | 涉及 S1、S7；需准备第 3 轮评审；node/__init__.py（空文件）随本 TK 建包，CR-002 F6 登记 |
 | TK-002 | 节点 gateway：生命周期 + 协议 v2 + 鉴权与上限 | reviewing | TK-001（只依赖 P3 契约，可以对照假 worker 并行写） | realtime_subtitle/node/{gateway,info,__init__}.py, realtime_subtitle/node/requirements.txt, tests/test_node_gateway.py | default,security | 涉及 S2/S3/S4/S8；鉴权和状态机，需准备第 3 轮评审；须并发读 worker stdout（worker 持锁写管道，CR-002 round2 记）；云端执行：tailscale/ioreg/IOPS 走可注入接口，RSS<50MB 待 Mac 实测 |
 | TK-003 | 一键安装 install_node.sh | planned | TK-002（只用于验收联调） | scripts/node/** | default,security | 涉及 F04、S5、S6 |
 | TK-004 | rslite：带时间句子 + AudioFanout + 混合替换 + 单实例 | blocked | — | macos-native/Sources/rslite/{Pipeline,Overlay,AudioFanout,SingleInstance,SentenceCommitter}.swift | default | 涉及 F01 和 P4/P5；云端只能代码复查，合并前须回 Mac swift build + headless 回放；**blocked=待 Mac 构建**：CR-001 代码层 3 轮收敛于 857a2d3，验证清单见 CR-001.md |
