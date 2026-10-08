@@ -69,3 +69,4 @@
 {"ts": "2026-10-09T07:20:00+08:00", "sprint": "sprints-001-remote-offload", "tk": "TK-002", "cr": "CR-003", "phase": "review", "action": "dispatched", "agent_role": "reviewer", "round": 4, "notes": "targeted R3-D1, opus"}
 {"ts": "2026-10-09T07:30:00+08:00", "sprint": "sprints-001-remote-offload", "tk": "TK-002", "cr": "CR-003", "phase": "review", "action": "returned", "agent_role": "reviewer", "round": 4, "notes": "approve; no new findings"}
 {"ts": "2026-10-09T07:30:00+08:00", "sprint": "sprints-001-remote-offload", "tk": "TK-002", "cr": "CR-003", "phase": "merge", "action": "merged", "agent_role": "coordinator", "round": 4, "notes": "637c329 into feat/macos-native; PR #62"}
+{"ts": "2026-10-09T07:33:00+08:00", "sprint": "sprints-001-remote-offload", "tk": "TK-001b", "phase": "execution", "action": "dispatched", "agent_role": "executor", "notes": "claude sonnet, branch feat/tk-001b"}
