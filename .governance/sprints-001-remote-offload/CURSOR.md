@@ -3,8 +3,8 @@
 ## 当前状态
 <!-- Machine fields: new writes must use "- key: `value`". Legacy variants are read-only compatibility. -->
 - current_phase: `review`
-- current_tk: `TK-002`
-- current_cr: `CR-003`
+- current_tk: `TK-001b`
+- current_cr: `—`
 - current_round: `1`
 - escalated: `false`
 
@@ -13,7 +13,7 @@
 | TK | 标题 | 状态 |
 |----|------|------|
 | TK-001 | 节点 worker：VAD 分段 + 整段识别 + 可插拔翻译 | done |
-| TK-002 | 节点 gateway：生命周期 + 协议 v2 + 鉴权与上限 | recheck |
+| TK-002 | 节点 gateway：生命周期 + 协议 v2 + 鉴权与上限 | done |
 | TK-003 | 一键安装 install_node.sh | planned |
 | TK-004 | rslite：带时间句子 + AudioFanout + 混合替换 + 单实例 | done |
 | TK-005 | rslite：NodeClient v2 + NodeRouter + 本机档门槛 | planned |
@@ -21,6 +21,7 @@
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 07:30 CST: CR-003 round4 approve → **TK-002 done**，合并进 feat/macos-native（PR #62）。下一批：TK-001b（rtf 滑动更新，依赖 info.STATE_DIR，现已在主线）
 - 2026-10-09 07:20 CST: TK-002 repair round3 回收 0172626（107/801 passed）→ recheck，定向 round4（opus）。#62 CI 全绿（含 pytest-windows）；#63 已合并、已取消订阅
 - 2026-10-09 07:10 CST: **Mac 验证三连**：TK-001 真模型回归（WER 0.88%、延迟中位 3.40s、6/6 译文）；TK-002 gateway 真机（RSS 33MB、只绑 Tailscale IP、LOCAL_PEERCRED 可用、401/200）；TK-004 Mac 构建 + 回放 A/B 一致 → **TK-004 done，已合并**（PR #63 随之合并）。TK-005 解锁
 - 2026-10-09 07:00 CST: CR-003 round3 两路 approve；R3-D1 accepted → TK-002 fixing，repair round3（sonnet）。Mac：TK-004 concat5 重跑一次，5 句全部翻译成功，首次 id1「Unable to Translate」判为系统翻译偶发（基线同句正常、重跑正常）
