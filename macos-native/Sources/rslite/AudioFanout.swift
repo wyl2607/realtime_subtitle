@@ -91,9 +91,9 @@ final class AudioFanout: @unchecked Sendable {
         runSeconds = 0
         generation += 1
         let myGeneration = generation
-        lock.unlock()
-
-        let newPump = Task.detached(priority: .userInitiated) { [weak self, stream] in
+        // 在同一次持锁内创建并赋值 pump：stop() 也要拿这把锁，
+        // 所以它要么看到完整的 source+pump 一起 cancel，要么在 start 之前完成（此时 source 尚未设置）。
+        pump = Task.detached(priority: .userInitiated) { [weak self, stream] in
             for await buffer in stream {
                 guard let self else {
                     return
@@ -106,8 +106,6 @@ final class AudioFanout: @unchecked Sendable {
             }
             self?.finishSubscribers(upToGeneration: myGeneration)
         }
-        lock.lock()
-        pump = newPump
         lock.unlock()
     }
 

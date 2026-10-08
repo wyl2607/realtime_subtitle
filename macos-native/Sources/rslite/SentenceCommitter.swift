@@ -166,7 +166,19 @@ struct LineStore {
     }
 
     mutating func addLocal(key: Int, t0: Double?, t1: Double?, text: String) {
-        insert(SubtitleLine(key: key, t0: t0, t1: t1, source: .local, srcText: text, dstText: nil))
+        let line = SubtitleLine(key: key, t0: t0, t1: t1, source: .local, srcText: text, dstText: nil)
+        // 节点行先到、同一时段的本机行后到：与 P5 同口径（重叠 ≥ 本机行自身时长 50%）判定已被覆盖。
+        // 本机行直接丢弃——LineStore 没有独立的历史区，节点行已经是这一时段的权威文本，
+        // 追加会造成顺序颠倒且同一句显示两遍（applyNode 的替换只发生在节点行到达那一刻）。
+        // 之后对该 key 的 setTranslation 找不到行，自然忽略。
+        let coveredByNode = lines.contains { existing in
+            guard case .node = existing.source else { return false }
+            return Self.shouldReplace(line, byNodeT0: existing.t0, t1: existing.t1)
+        }
+        if coveredByNode {
+            return
+        }
+        insert(line)
     }
 
     mutating func setTranslation(key: Int, text: String) {
@@ -299,6 +311,16 @@ struct LineStore {
             s.addLocal(key: 1, t0: nil, t1: nil, text: "a")
             let r = s.applyNode(nodeID: "n", t0: 0, t1: 10, srcText: "x", dstText: nil)
             check(r.isEmpty, "无时间本机行不应被替换")
+        }
+        // 节点先到、本机后到：覆盖 >=50% 的本机行丢弃；不覆盖/无时间的照常追加
+        do {
+            var s = LineStore()
+            s.applyNode(nodeID: "n", t0: 5, t1: 20, srcText: "x", dstText: nil)
+            s.addLocal(key: 1, t0: 0, t1: 10, text: "a") // 重叠 5 = 50% -> 丢弃
+            check(s.lines.count == 1 && s.lines[0].key < 0, "节点先到：被覆盖的本机行应丢弃")
+            s.addLocal(key: 2, t0: 5.01 - 10, t1: 5.01, text: "b") // 重叠 0.01 -> 保留
+            s.addLocal(key: 3, t0: nil, t1: nil, text: "c") // 无时间 -> 保留
+            check(s.lines.count == 3, "节点先到：未被覆盖/无时间的本机行应保留")
         }
         return failures
     }

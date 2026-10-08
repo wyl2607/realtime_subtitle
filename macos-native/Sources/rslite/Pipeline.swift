@@ -377,15 +377,18 @@ struct AnalyzerInputSequence: AsyncSequence, Sendable {
             }
             while let timed = await sourceIterator.next() {
                 let verdict = continuity.observe(start: timed.startSeconds, duration: timed.duration)
+                if let gap = verdict.gapSeconds {
+                    // 丢块后 converter 里可能还扣着丢块前的尾样本，不清掉会被打上丢块后的时间戳。
+                    // 只打时长，不含任何识别文字
+                    converter.reset()
+                    FileHandle.standardError.write(Data(
+                        "rslite: B 路丢块，重设时间戳（跳变 \(String(format: "%.3f", gap))s）\n".utf8))
+                }
                 let converted = try Pipeline.convert(timed.buffer, using: converter, to: analyzerFormat)
                 if converted.frameLength > 0 {
-                    if verdict.needsExplicitStart {
-                        if let gap = verdict.gapSeconds {
-                            // 只打时长，不含任何识别文字
-                            FileHandle.standardError.write(Data(
-                                "rslite: B 路丢块，重设时间戳（跳变 \(String(format: "%.3f", gap))s）\n".utf8))
-                        }
-                        let start = CMTime(seconds: timed.startSeconds, preferredTimescale: 1_000_000)
+                    // 待打的起点一直带到第一块非空输出（重采样器可能先扣着样本、输出为空）
+                    if let startSeconds = continuity.takePendingExplicitStart() {
+                        let start = CMTime(seconds: startSeconds, preferredTimescale: 1_000_000)
                         return AnalyzerInput(buffer: converted, bufferStartTime: start)
                     }
                     return AnalyzerInput(buffer: converted)
@@ -411,17 +414,29 @@ struct ContinuityTracker {
     }
 
     private var expectedNext: Double?
+    /// 下一块非空输出要显式设的 bufferStartTime（首块或跳变块的起点）。
+    /// 在 takePendingExplicitStart() 取走前一直保留：转换后若输出为空，这次重设不能丢。
+    /// 期间又检测到新跳变就以最新起点覆盖。
+    private var pendingExplicitStart: Double?
 
     mutating func observe(start: Double, duration: Double) -> Verdict {
         defer { expectedNext = start + duration }
         guard let expected = expectedNext else {
+            pendingExplicitStart = start
             return Verdict(needsExplicitStart: true, gapSeconds: nil)
         }
         let gap = start - expected
         if abs(gap) > Self.tolerance {
+            pendingExplicitStart = start
             return Verdict(needsExplicitStart: true, gapSeconds: gap)
         }
-        return Verdict(needsExplicitStart: false, gapSeconds: nil)
+        return Verdict(needsExplicitStart: pendingExplicitStart != nil, gapSeconds: nil)
+    }
+
+    /// 取走待设的显式起点（取一次清空）；没有待设就返回 nil。
+    mutating func takePendingExplicitStart() -> Double? {
+        defer { pendingExplicitStart = nil }
+        return pendingExplicitStart
     }
 }
 
