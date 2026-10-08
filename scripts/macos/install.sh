@@ -181,7 +181,20 @@ else
     fi
 fi
 
-echo "[5/5] 准备翻译模型..."
+echo "[5/6] 构建 Apple Translation helper..."
+if command -v swift >/dev/null 2>&1 && [[ -d "${REPO_ROOT}/macos-native" ]]; then
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "  [dry-run] (cd macos-native && swift build -c release --product rstranslate)"
+    elif (cd "${REPO_ROOT}/macos-native" && swift build -c release --product rstranslate); then
+        echo "  ✅ rstranslate 已构建"
+    else
+        echo "  ⚠️  rstranslate 构建失败，实时句子翻译会回退 Ollama"
+    fi
+else
+    echo "  ℹ️ 未找到 swift 或 macos-native/，跳过 rstranslate 构建（Ollama 路径仍可用）"
+fi
+
+echo "[6/6] 准备翻译模型..."
 if [[ "${SKIP_MODELS}" -eq 1 ]]; then
     echo "  ℹ️ 已跳过 ollama pull（--skip-models）"
 else

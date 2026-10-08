@@ -19,6 +19,7 @@ import time
 import re
 import socket
 import ipaddress
+import platform
 from urllib.parse import urlparse, urlunparse
 from threading import Event, Lock, Thread
 from concurrent.futures import ThreadPoolExecutor
@@ -33,6 +34,7 @@ from realtime_subtitle.asr.streaming_asr import OnlineASRProcessor
 from realtime_subtitle.translate.lookup import LookupMixin, _MAX_STREAM_CHARS
 from realtime_subtitle.translate.transcript import TranscriptMixin
 from realtime_subtitle.translate.runtime_stats import StatsMixin
+from realtime_subtitle.translate.apple_translate import AppleTranslator
 from realtime_subtitle.paths import repo_path
 import realtime_subtitle.config as config
 # 过滤所有警告信息
@@ -118,6 +120,34 @@ _warm_model = None
 # （2026-08-02 实测：开机冷读 5.6GB 模型花了 33.8 秒，其间两句翻译被超时丢弃）
 _warm_done = Event()
 _warm_ok = False  # 预热是否真的成功（失败也要 set 事件，但不能当模型已热）
+
+
+def _select_translate_backend():
+    """选择实时句子翻译后端，并在 auto 下复用已做 status 的 helper 实例。"""
+    configured = getattr(config, "TRANSLATE_BACKEND", "auto")
+    helper_path = repo_path("macos-native", ".build", "release", "rstranslate")
+    helper_exists = os.path.isfile(helper_path)
+    apple_status = None
+    apple = None
+    if (configured or "auto").strip().lower() == "auto" and sys.platform == "darwin" and helper_exists:
+        apple = AppleTranslator(helper_path=helper_path)
+        apple_status = apple.status(config.SOURCE_LANGUAGE, current_target_language(), timeout=5.0)
+    backend, reason = config.choose_translate_backend(
+        configured,
+        is_macos=platform.system() == "Darwin",
+        helper_exists=helper_exists,
+        apple_status=apple_status,
+    )
+    if backend == "apple":
+        if apple is None:
+            apple = AppleTranslator(helper_path=helper_path)
+        print(f"🍎 句子翻译使用 Apple Translation（{reason}）")
+        print("   ℹ️ 查词/AI 分析仍走 Ollama；系统翻译没有术语表、语域 prompt 和上下文。")
+        return backend, apple
+    if apple is not None:
+        apple.close()
+    print(f"🦙 句子翻译使用 Ollama（{reason}）")
+    return "ollama", None
 # 加载中途退出：translator 还没赋给 app，stop() 靠这个标志让预热收尾后自卸
 _warm_cancel = Event()
 # 启动预热用短租期。构造未完成就关窗时 shutdown 走不到，2h 会把 5.6GB
@@ -491,10 +521,12 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
 
     def __init__(self):
         """初始化翻译器"""
-        # ☠️ 第一件事：确认翻译地址在本机。放在所有 print / 模型加载 / 预热
-        # 之前，是为了"一个包都还没发出去"就把不合规的配置挡下来。
-        # 抛出的异常由 app._load_models 接住，报错会持久显示在悬浮窗上
-        _assert_local_ollama(config.OLLAMA_BASE_URL)
+        self._translate_backend, self.apple_translator = _select_translate_backend()
+        # ☠️ Ollama 后端的第一件事：确认翻译地址在本机。Apple 后端不把句子发给
+        # Ollama，启动时也不该因为 Ollama 没开而报"只显示德语"；查词/AI 分析
+        # 真要用 Ollama 时会通过 ollama_url() 自己过同一道本机校验。
+        if self._translate_backend != "apple":
+            _assert_local_ollama(config.OLLAMA_BASE_URL)
 
         from realtime_subtitle.asr.backends import describe_whisper_backend, selected_whisper_backend
         print("🔄 正在加载 Whisper 模型...")
@@ -505,14 +537,10 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
 
         start_time = time.time()
 
-        # 并行预热 Ollama 翻译模型：停止脚本会主动卸载模型，所以每次启动
-        # 第一句翻译都要付 5-9 秒冷加载费。趁 Whisper 加载的这十几秒让
-        # Ollama 同时把模型装进显存，首句翻译就是热的。独立线程+独立请求，
-        # 不碰 self（此时实例还没建完）；失败静默——Ollama 不可达时
-        # 下面的健康检查会给出明确提示，这里不重复报。
-        # 显存说明：两个模型在稳态本来就要同时驻留（各档位模型就是按这个
-        # 选的），并行加载不会推高稳态峰值，小显存档也不用禁用并行
-        _spawn_startup_warm()
+        if self._translate_backend != "apple":
+            # 并行预热 Ollama 翻译模型：停止脚本会主动卸载模型，所以每次启动
+            # 第一句翻译都要付 5-9 秒冷加载费。Apple 后端没有这笔内存/加载成本。
+            _spawn_startup_warm()
 
         try:
             from realtime_subtitle.asr.backends import create_whisper_model
@@ -679,27 +707,31 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
                     print(f"⚠️  字幕记录目录创建失败，记录功能关闭: {e}")
                     self._transcript_ok = False
 
-            _warn_if_ipv6_first_host(ollama_url())
-            # 端口身份校验（不可达只警告，不中断启动）。详见 _check_ollama_identity
-            state, version = self._check_ollama_identity()
-            self._ollama_impostor = (state == "impostor")
-            if state == "ok":
-                print(f"✅ Ollama 连接正常 (v{version}, {config.OLLAMA_MODEL})")
-            elif state == "impostor":
-                self._warn_ollama_impostor()
+            if self._translate_backend != "apple":
+                _warn_if_ipv6_first_host(ollama_url())
+                # 端口身份校验（不可达只警告，不中断启动）。详见 _check_ollama_identity
+                state, version = self._check_ollama_identity()
+                self._ollama_impostor = (state == "impostor")
+                if state == "ok":
+                    print(f"✅ Ollama 连接正常 (v{version}, {config.OLLAMA_MODEL})")
+                elif state == "impostor":
+                    self._warn_ollama_impostor()
+                else:
+                    # 现在没验成（Ollama 还没起来）：等它起来之后、第一次真要发
+                    # 转录之前补验一次，别在"没验过"的状态下把原文发出去
+                    self._ollama_recheck_pending = True
+                    print(f"⚠️  无法连接 Ollama ({ollama_url()})；句子翻译会暂时只显示原文")
+                    print(f"   请确认 Ollama 已启动: ollama serve")
             else:
-                # 现在没验成（Ollama 还没起来）：等它起来之后、第一次真要发
-                # 转录之前补验一次，别在"没验过"的状态下把原文发出去
                 self._ollama_recheck_pending = True
-                print(f"⚠️  无法连接 Ollama ({ollama_url()})，字幕将只显示德语原文")
-                print(f"   请确认 Ollama 已启动: ollama serve")
+                print("ℹ️  句子翻译走系统 Apple Translation；Ollama 未连接只影响查词和 AI 分析。")
 
             # ☠️ 和启动预热对账：窗口是秒开的，⚙️面板在 Whisper 加载的这十几秒
             # 里就能点。用户点「⚡性能」时 translator 还是 None，main._apply_mode
             # 只能改 config.OLLAMA_MODEL——而预热线程早在本函数开头就按**旧**
             # 名字把大模型往显存里装了。不对账的话两个模型同时驻留（8GB 卡上
             # 正是这套显存分档刻意要避免的情况），要等退出才卸。
-            if _warm_model and _warm_model != config.OLLAMA_MODEL:
+            if self._translate_backend != "apple" and _warm_model and _warm_model != config.OLLAMA_MODEL:
                 print(f"   ℹ️ 加载期间翻译模型已切换 {_warm_model} → {config.OLLAMA_MODEL}，"
                       f"卸掉预热的那个")
                 self.request_warm_model(old_model=_warm_model,
@@ -1140,7 +1172,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         if self._lookup_inflight:
             return  # 用户点了查词/AI分析在等结果，草稿让路（这类是一次性人工
                      # 请求，比"每1.5秒一次"的草稿更该优先拿到GPU）
-        if not self._ollama_hot:
+        if getattr(self, "_translate_backend", "ollama") != "apple" and not self._ollama_hot:
             return  # 模型还没进显存：那唯一一次冷加载要留给正式句子，草稿别去排队占坑
         with self._asr_lock:
             if len(self._audio_inbox) >= 2:
@@ -1219,6 +1251,21 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
                 prompt_context = _normalize_clock_times(german_context)
             else:
                 prompt_sentence, prompt_context = sentence, german_context
+
+            if getattr(self, "_translate_backend", "ollama") == "apple":
+                # Apple Translation 是句子级系统翻译：没有术语表、语域 prompt、
+                # 上下文窗口，所以只把当前句子的副本送进去；失败必须返回原句，
+                # 否则 _translation_worker 会把空译文当成"翻出来了"上屏/入档。
+                apple = getattr(self, "apple_translator", None)
+                translated = apple.translate(
+                    prompt_sentence,
+                    config.SOURCE_LANGUAGE,
+                    current_target_language(),
+                    timeout=float(getattr(config, "OLLAMA_TIMEOUT", 15)),
+                ) if apple is not None else None
+                ok = bool(translated and translated.strip())
+                self._note_tx_result(ok=ok)
+                return translated.strip() if ok else sentence
 
             # 术语表只注入当前句子/上下文里真出现的词条，prompt保持精简。
             # ☠️ GLOSSARY 是**德→中**的对照表，只在这个方向上有意义：中→德时
@@ -1547,6 +1594,8 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         toggle 改到别的值，worker 读到的就不是这次切换真正要的目标模型，
         会导致该卸载的没卸载/该保留的被误卸载（压测复现过：连按6次后
         ollama ps 里9b和4b同时常驻）。"""
+        if getattr(self, "_translate_backend", "ollama") == "apple":
+            return  # 系统翻译没有 Ollama 翻译模型可预热/热切换
         try:
             self._tx_executor.submit(self._warm_model_worker, old_model, new_model)
         except RuntimeError:
@@ -1824,6 +1873,9 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         self._shutdown_incomplete = not drained
         # 卸载用短生命 Session，不跟可能仍在 post 的 worker 并发复用。
         self._unload_our_models(deadline=deadline)
+        apple = getattr(self, "apple_translator", None)
+        if apple is not None:
+            apple.close()
         if not drained:
             print("⚠️  退出等待超时：工作线程仍在跑。无法保证硬上界，"
                   "会话留给它们收尾（停止脚本有进程级兜底）。")
@@ -1903,5 +1955,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
                 del self.model
             if hasattr(self, 'ollama_session'):
                 self.ollama_session.close()
+            if hasattr(self, 'apple_translator') and self.apple_translator is not None:
+                self.apple_translator.close()
         except Exception:
             pass

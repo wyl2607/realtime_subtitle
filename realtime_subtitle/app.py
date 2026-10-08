@@ -121,6 +121,8 @@ def _auto_tiers_from_start(start_tier, tiers, max_tier=None, mlx_backend=True):
 
 def _tier_name(tier):
     bits, model = tier
+    if model is None:
+        return f"fp{bits}" if bits == 16 else f"{bits}bit"
     return f"fp{bits}+{model}" if bits == 16 else f"{bits}bit+{model}"
 
 
@@ -191,16 +193,35 @@ class SubtitleApp:
             return None
         from realtime_subtitle.asr.backends import selected_whisper_backend
         mlx_backend = selected_whisper_backend() == "mlx"
-        start_tier = (
-            self._baseline_whisper_bits if mlx_backend else 16,
-            self._baseline_ollama_model,
-        )
-        tiers = _auto_tiers_from_start(
-            start_tier,
-            list(getattr(config, "AUTO_TIERS", [])),
-            getattr(config, "AUTO_TIER_MAX", None),
-            mlx_backend=mlx_backend,
-        )
+        apple_translation = self._apple_translation_active()
+        if apple_translation:
+            # Apple Translation 不驻留 Ollama 翻译模型，内存压力只剩 Whisper 精度。
+            # 仍从 AUTO_TIERS 取 bits，是为了沿用同一套排序/上限配置，不另开旋钮。
+            seen_bits = []
+            for bits, _model in getattr(config, "AUTO_TIERS", []):
+                if bits not in seen_bits:
+                    seen_bits.append(bits)
+            tier_source = [(bits, None) for bits in seen_bits]
+            start_tier = (self._baseline_whisper_bits if mlx_backend else 16, None)
+            max_tier = ((getattr(config, "AUTO_TIER_MAX", None) or (None, None))[0], None) \
+                if getattr(config, "AUTO_TIER_MAX", None) else None
+            tiers = _auto_tiers_from_start(
+                start_tier,
+                tier_source,
+                max_tier,
+                mlx_backend=mlx_backend,
+            )
+        else:
+            start_tier = (
+                self._baseline_whisper_bits if mlx_backend else 16,
+                self._baseline_ollama_model,
+            )
+            tiers = _auto_tiers_from_start(
+                start_tier,
+                list(getattr(config, "AUTO_TIERS", [])),
+                getattr(config, "AUTO_TIER_MAX", None),
+                mlx_backend=mlx_backend,
+            )
         if not tiers:
             print(f"🧠 启动档位 {start_tier} 不在自动分档列表，自动降档未启用")
             return None
@@ -209,7 +230,7 @@ class SubtitleApp:
         costs = {
             _tier_name((bits, model)): int((
                 getattr(config, "WHISPER_BITS_COST_GB", {}).get(bits, 0)
-                + getattr(config, "OLLAMA_MODEL_COST_GB", {}).get(model, 0)
+                + (0 if model is None else getattr(config, "OLLAMA_MODEL_COST_GB", {}).get(model, 0))
             ) * gb)
             for bits, model in tiers
         }
@@ -219,6 +240,12 @@ class SubtitleApp:
             tier_cost_bytes=costs,
             headroom_bytes=int(getattr(config, "AUTO_TIER_HEADROOM_GB", 1.5) * gb),
         )
+
+    def _apple_translation_active(self):
+        translator = getattr(self, "translator", None)
+        if getattr(translator, "_translate_backend", None) == "apple":
+            return True
+        return (getattr(config, "TRANSLATE_BACKEND", "auto") or "auto").strip().lower() == "apple"
 
     def _load_models(self):
         """后台线程：加载 Whisper/Ollama + 音频采集，完成后接线并启动。
@@ -468,8 +495,9 @@ class SubtitleApp:
         old_bits = self._baseline_whisper_bits
         old_model = self._baseline_ollama_model
         self._baseline_whisper_bits = bits
-        self._baseline_ollama_model = model
-        if self._current_mode != "性能":
+        if model is not None:
+            self._baseline_ollama_model = model
+        if model is not None and self._current_mode != "性能":
             self._switch_ollama_model(model)
         if bits != old_bits and self.translator is not None:
             self.translator.request_whisper_bits(bits)
@@ -484,16 +512,20 @@ class SubtitleApp:
             else:
                 parts.append(f"识别精度恢复 {desc}")
         all_tiers = list(getattr(config, "AUTO_TIERS", []))
+        old_tier_for_index = (old_bits, None) if model is None else (old_bits, old_model)
+        new_tier_for_index = (bits, model)
+        tight = bits < old_bits
         try:
-            old_index = all_tiers.index((old_bits, old_model))
-            new_index = all_tiers.index((bits, model))
+            old_index = all_tiers.index(old_tier_for_index)
+            new_index = all_tiers.index(new_tier_for_index)
         except ValueError:
             old_index = new_index = 0
-        if model != old_model:
+        else:
+            tight = new_index > old_index
+        if model is not None and model != old_model:
             parts.append(f"翻译模型{'降到' if new_index > old_index else '恢复'} {model}")
-        if bits >= old_bits and model == old_model:
+        if bits >= old_bits and (model is None or model == old_model):
             parts.append(f"恢复 {_tier_name((bits, model))}")
-        tight = new_index > old_index
         msg = f"🧠 内存{'紧张' if tight else '充足'}：" + "，".join(parts)
         self.subtitle_window.show_status(msg)
         print(msg)

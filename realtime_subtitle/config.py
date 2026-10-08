@@ -130,6 +130,36 @@ WHISPER_BEAM_SIZE = 3  # beam search 大小。whisper_streaming作者用5，这�
 # 回退：先 `ollama pull qwen3:8b`（本地已删），再 config_local.py 写
 # OLLAMA_MODEL="qwen3:8b"。qwen3:14b 精听选项已被 9b 事实取代（也已删）。
 OLLAMA_MODEL = "qwen3.5:9b"  # Ollama 模型名称
+# macOS 句子翻译后端。auto 在 macOS 上优先试系统 Translation helper：
+# FLEURS 德→中 40 句实测 Apple chrF 33.8 / 单句 0.12s / 不占 Ollama 内存，
+# qwen3.5:9b chrF 29.8 / 单句 7.5s / 6.2GB。取舍也写清楚：系统翻译没有
+# 术语表、没有语域 prompt、不看上下文；查词和 AI 分析仍然走 Ollama。
+TRANSLATE_BACKEND = "auto"  # auto / apple / ollama
+
+
+def choose_translate_backend(configured, *, is_macos, helper_exists, apple_status):
+    """按可测试的事实选句子翻译后端，返回 (backend, reason)。
+
+    纯函数本身不启动 helper、不摸文件系统；调用方负责把"是否 macOS / helper 是否
+    存在 / status 是什么"喂进来。auto 必须三项都满足才走 apple，避免 Windows
+    和没有 helper 的 Mac 被新路径影响。
+    """
+    configured = (configured or "auto").strip().lower()
+    if configured == "ollama":
+        return "ollama", "TRANSLATE_BACKEND=ollama"
+    if configured == "apple":
+        return "apple", "TRANSLATE_BACKEND=apple"
+    if configured != "auto":
+        return "ollama", f"未知 TRANSLATE_BACKEND={configured!r}，回退 Ollama"
+    if not is_macos:
+        return "ollama", "不是 macOS"
+    if not helper_exists:
+        return "ollama", "Apple Translation helper 不存在"
+    if apple_status != "installed":
+        return "ollama", f"Apple Translation status={apple_status or 'unknown'}"
+    return "apple", "Apple Translation 已安装"
+
+
 # 自动分档默认只在 macOS 开启：这台 M2 16GB 上 9b 单独运行就会把内存压力推到
 # warning，和 Whisper turbo fp16 同跑时需要按压力临时降翻译模型，压力恢复后再升。
 AUTO_TIER_ENABLED = None  # None=自动：仅 macOS 开启；True/False 强制

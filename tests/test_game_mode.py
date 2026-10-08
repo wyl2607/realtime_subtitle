@@ -165,6 +165,30 @@ def test_apply_mode_survives_translator_still_loading():
         _restore(snap)
 
 
+def test_apply_perf_mode_with_apple_backend_does_not_touch_warm_executor():
+    """Apple 后端下性能模式可以改 OLLAMA_MODEL，但 request_warm_model 必须 no-op。
+
+    这里故意不给裸 translator 装 _tx_executor：如果 no-op 失效，会在模式切换时
+    立刻碰到缺字段，等价于真实程序去触发 Ollama 预热。
+    """
+    from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
+
+    snap = _snapshot()
+    orig_game_model = config.GAME_MODE_OLLAMA_MODEL
+    try:
+        config.OLLAMA_MODEL = "test-main-model"
+        config.GAME_MODE_OLLAMA_MODEL = "test-perf-model"
+        app = _make_app()
+        app.translator = WhisperQueueTranslator.__new__(WhisperQueueTranslator)
+        app.translator._translate_backend = "apple"
+
+        assert app._apply_mode("性能") is True
+        assert config.OLLAMA_MODEL == "test-perf-model"
+    finally:
+        config.GAME_MODE_OLLAMA_MODEL = orig_game_model
+        _restore(snap)
+
+
 def test_perf_hotkey_jumps_and_returns_to_previous_mode():
     """Ctrl+Alt+G：跳「性能」，再按跳回进入前那个模式（不是固定回默认）。"""
     snap = _snapshot()
