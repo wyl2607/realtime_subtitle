@@ -5,7 +5,7 @@
 
 | CR | TK | rounds | status | last_action |
 |----|----|--------|--------|-------------|
-| CR-003 | TK-002 | 2 | needs_fix | 2026-10-09 06:15 CST: round2 security approve / default approve_with_minor；4 accepted / 2 rejected → repair round2，后接 round3 |
+| CR-003 | TK-002 | 2 | needs_fix | 2026-10-09 06:40 CST: repair 302c212 + 主线同步 d2b4651（106/800 passed）→ round3 两路派出 |
 | CR-002 | TK-001 | 4 | resolved | 2026-10-09 05:55 CST: round4 approve；四轮收敛（14 accepted / 2 rejected），b2c697e 已合进 feat/macos-native |
 | CR-001 | TK-004 | 3 | resolved | 2026-10-09 05:05 CST: round3 approve（代码层）；M1/M2 rejected（理由见 CR-001.md）；**待 Mac 构建验证后才能合并** |
 

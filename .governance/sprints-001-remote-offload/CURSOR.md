@@ -13,7 +13,7 @@
 | TK | 标题 | 状态 |
 |----|------|------|
 | TK-001 | 节点 worker：VAD 分段 + 整段识别 + 可插拔翻译 | done |
-| TK-002 | 节点 gateway：生命周期 + 协议 v2 + 鉴权与上限 | fixing |
+| TK-002 | 节点 gateway：生命周期 + 协议 v2 + 鉴权与上限 | recheck |
 | TK-003 | 一键安装 install_node.sh | planned |
 | TK-004 | rslite：带时间句子 + AudioFanout + 混合替换 + 单实例 | blocked（待 Mac 构建） |
 | TK-005 | rslite：NodeClient v2 + NodeRouter + 本机档门槛 | planned |
@@ -21,6 +21,7 @@
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 06:40 CST: **Mac 通道打通**：用户接入 Desktop Commander，可直接在 MacBook Air（yumeideMacBook-Air.local）与 mini2（YilindeMac-mini.local，v1 PID 34924 仍在跑、未动）执行命令。Mac 验证一律在独立 detached worktree（~/projects/rs-cloud-verify、~/projects/rs-cloud-base）里做，不碰用户原有 worktree。TK-004 @846ef66 `swift build -c release` 通过（TK-004 文件 0 warning）；concat5 headless 回放 5 句 t0/t1 与基线 c53ef12 完全一致。Windows CI（#62）4 条失败为 macOS/POSIX 专用机制 → [coordinator-direct] eb6bfa5 按平台 skipif，已合入 tk-002/tk-004 并在 #62 留言。TK-002 repair round2 回收 302c212 → recheck，CR-003 round3 两路派出
 - 2026-10-09 06:25 CST: 用户要求开 PR 保全进展：draft PR #62（feat/tk-002 → feat/macos-native）、#63（feat/tk-004 → feat/macos-native，待 Mac 构建）；不向 master 开 PR。已订阅两个 PR 的事件。Mac 通道：已向本机原 Coordinator 会话（Remote Control）发只读探路请求，等回复
 - 2026-10-09 06:15 CST: CR-003 round2 回收：security approve（R2-S1 rejected）；default approve_with_minor，R2-D1（上一会话 ready 串入）/R2-D2（audio_dropped 先于 ready）/R2-D3（冷加载期 flush 误杀）+ code 命名 nit accepted，RFC 同步 nit rejected → TK-002 fixing，repair round2（sonnet）
 - 2026-10-09 06:05 CST: TK-002 repair round1 回收 fd1e75b；主线合进 feat/tk-002（ec6b3e0）使真 worker 联调用例实跑；复核 gateway 100 / 全量 794 passed、ruff 通过 → recheck，CR-003 round2 两路派出。用户告知可用 MacBook Air/mini2（Tailscale）：本云端容器无 tailscale/ssh、100.x 不可达，Mac 侧验证仍需用户在本机起会话
