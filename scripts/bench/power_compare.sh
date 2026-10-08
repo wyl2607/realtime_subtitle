@@ -33,4 +33,6 @@ echo "每段约 ${SECS} 秒，共三段……"
 measure idle
 measure local "$BIN" --source "file:$WAV" --headless
 measure remote "$BIN" --remote "$REMOTE" --token-file "$TOKEN" --source "file:$WAV" --headless
+# 数据是 root 写的，交还给发起 sudo 的用户，否则事后读不了
+chown -R "${SUDO_USER:-$USER}" "$OUT"
 echo "原始数据: $OUT"
