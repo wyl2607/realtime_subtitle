@@ -1200,10 +1200,76 @@ macOS 避坑（每一条都是这次迁移真实踩过的）：
     40 句里出现过 1 句繁体，已经在 helper 里做繁转简兜底，Python 不再处理。
     点词查词和 🤖AI 分析仍然需要 Ollama；Ollama 没开时主字幕可照常走 Apple，
     但查词/AI 分析会不可用或变慢。
-14. **远程识别服务端只是外包算力验证版。**
-    `python -m realtime_subtitle.remote.server --host <Tailscale IP> --port 8790
-    --token-file <path>` 把现有 `WhisperQueueTranslator` 包成 WebSocket 服务，
-    给轻客户端抓声音/显示字幕用。隐私边界按 PoC 从严：只绑定明确的内网/Tailscale
-    IP（拒绝 `0.0.0.0`/`::`）、请求头必须带 bearer token、音频只进内存队列不落盘、
-    服务端启动时强制 `SAVE_TRANSCRIPT=False`（不改 config.py）。它只服务一个在线
-    客户端，第二个连接会收到 1013/busy；断开后清识别上下文，但模型继续驻留等下次连接。
+14. **外包算力走 v2 节点（gateway + worker），v1 已删除。**
+    节点跑在另一台 Apple Silicon Mac 上（目前是 mini2），给轻客户端（rslite）
+    抓声音/显示字幕用。两个进程：**gateway** 常驻（<50MB，不 import numpy/mlx），
+    只负责监听、鉴权、卡资源上限；**worker** 按需拉起（合法 hello 才 spawn）、
+    会话结束保温 120s 后回收，识别用 MLX、翻译优先 Apple Translation。
+    装法：`bash scripts/node/install_node.sh <ssh 别名>`（或 `--local`）——装到
+    内置盘 `~/rs-node`、写 token（0600）和 `node_id`、装 LaunchAgent
+    `com.realtimesubtitle.node`、自检失败自动回滚；v1 的进程会先被停掉（`~/rs-remote`
+    目录保留）。协议（`GET /v1/info`、`WS /v2/session`、gateway↔worker 管道）、
+    status 码值、与 v1 的差异、隐私边界全在 [docs/protocol-v2.md](docs/protocol-v2.md)，
+    **以代码为准**，改协议先改代码再改它。隐私边界不变且更严：只绑 Tailscale
+    IPv4（`100.64.0.0/10`）+ 本机 UDS，bearer token 只经文件或 stdin、不进命令行，
+    日志无正文无 token，音频只进内存不落盘。同时只服务一个会话，其余收到
+    close 1013/busy。
+
+15. **MLX 的所有调用必须在同一个线程里执行**（修于 d9d6f5d，2026-10-08；
+    节点 worker 复用同一个 `create_whisper_model`）。现象：权重在加载线程建、
+    在识别线程用时，MLX 不定期报 `There is no Stream(gpu, 1) in current thread`，
+    每轮识别失败；最小复现约一半失败，在加载线程 `mx.eval` 权重也挡不住。
+    根因：MLX 的 GPU stream 属于创建它的线程。做法：加载、transcribe、
+    detect_language 全部走 `asr/backends.create_whisper_model` 里那个专用单线程
+    执行器（改后 4 次 × 3 个调用线程 12/12 成功），别为了"并行"另开线程调模型。
+16. **rslite 的 `main` 必须是同步函数**（修于 5b1a3c5，2026-10-08 真机）。
+    现象：进程活着、CPU 0%、窗口不出现、也不弹权限。根因：async main 里再
+    `app.run()`，事件循环跑在一个主队列任务**里面**，该任务永不返回，之后派到
+    MainActor 的任务（窗口显示、启动识别）全排在后面轮不到。做法：`main.swift`
+    保持同步入口，同步 main 下 `app.run()`/`dispatchMain()` 自己就在排空主队列。
+17. **URLSession 的 WebSocket 把服务端 close 1013 报成 1005**（v1 客户端
+    RemotePipeline 实测，2026-10，经验搬进 TK-005 的节点路由）。现象：节点忙时
+    回 1013/busy，客户端 `closeCode` 却是 1005，busy 被误判成普通断线。根因：
+    URLSession 这条路径上丢了 code，真正的 code 在 `reason` 载荷的前两个字节
+    （大端，后面是文字原因如 "busy"）。做法：closeCode 为 1005 且 reason 至少
+    2 字节时，以载荷前两字节为准。另（TK-005 任务卡记录）：要确保真的发出
+    close 1000，须等 `didCloseWith` 回调。
+18. **mini2 的 `~/projects` 是悬空软链接**（指向没挂载的外置盘「Mac扩容」，
+    2026-10 ssh 实测）。现象：往 `~/projects` 下 clone/建 venv 失败，或"成功"
+    写进一个不存在的位置。根因：外置盘没挂载，链接目标不在。做法：节点
+    一律装内置盘 `~/rs-node`，临时目录用 `~/rs-*`；安装脚本遇到悬空软链接
+    直接不用它，写新脚本也别假设 `~/projects` 可用。
+19. **节点的 LaunchAgent 依赖「用户已登录」**（RFC 架构选择，2026-10 mini2
+    实测没开自动登录）。现象：mini2 重启后、没人登录前，`com.realtimesubtitle.node`
+    不会起来，客户端连不上节点。根因：LaunchAgent（`gui/<uid>` 域）随登录会话
+    才存在；而 Metal 和系统翻译本来也都需要用户会话，换成 LaunchDaemon 反而跑
+    不了。做法：节点机要么开自动登录（用户自己决定），要么重启后手动登录一次；
+    排查"节点没响应"先确认机器上有登录会话，再看 `launchctl print gui/$(id -u)/com.realtimesubtitle.node`。
+20. **两个 rslite 实例会互相删掉对方的 tap 聚合设备**（2026-10 实测）。
+    现象：同时开两个 rslite，其中一个的系统声音突然采不到。根因：第二个实例
+    会把第一个的 Process Tap 聚合设备一并清掉。做法：`SingleInstance.swift` 用
+    flock 做了单实例保护（进程崩溃或被 kill 时内核自动释放锁，不留假锁），
+    第二个实例必须退出；别绕过它，调试时确认只有一个 rslite 在跑。
+21. **测 B（rslite）时不能同时开着 A（Python 桌面字幕）**（2026-10，MacBook
+    Air M2 实测）。现象：A 的 Whisper 占满 GPU，本机明显过热，B 的延迟和 rtf
+    数据全被污染，测出来的数字无效。根因：两个版本都在本机跑识别，抢同一块
+    GPU 和同一路系统声音。做法：测 B 前先 `stop.sh` 停 A，测完再开；要比较
+    A/B 就分开各跑一次，别并行。
+22. **App Store 版 Tailscale 在 launchd 下进 GUI 模式，`tailscale ip -4` 会把
+    报错打到 stdout 且 rc=0**（2026-10-09 mini2 实测）。现象：gateway 的 TCP
+    监听起不来，日志只有 `tcp_bind_failed err=ValueError` 退避重试，UDS 一切正常，
+    远程客户端连不上；你 ssh 上去手跑 `tailscale ip -4` 却一直正常。根因：该
+    二进制靠环境里有没有 `SHLVL` 判 CLI/GUI 模式，launchd 的环境没有 `SHLVL`，
+    于是按 GUI 启动，stdout 打 "The Tailscale GUI failed to start: ..."，退出码 0，
+    被当成 IP 取了第一行，校验不过。做法：调 tailscale CLI 一律带环境变量
+    `TAILSCALE_BE_CLI=1`（官方强制 CLI 开关），并校验首行确实是 `100.64.0.0/10`
+    的 IPv4；复现要用 `env -i` + plist 里的 PATH，别用交互 shell；安装自检要验
+    TCP 真的在 Tailscale IP 上监听，只经 UDS 验 `/v1/info` 会把"TCP 没起来"
+    报成安装成功。
+23. **起真进程 + `pgrep` 的测试会互杀**（2026-10-09，CR-005）。现象：并发
+    跑两份测试，或在 mini2 这种真有 v1 在跑的机器上跑，一个测试的 `pkill`/`pgrep`
+    误杀别人起的进程，包括真正的 v1 服务；合成命令行的测试还测不出真实命令行
+    的形状（v1 真实命令行带 `-u`，端口是 8791 不是代码默认的 8790）。根因：
+    `pgrep -f` 按命令行子串匹配，不分是谁的进程。做法：测试里用桩 pgrep，
+    只返回自己起的 PID；涉及真实进程命令行的逻辑，用逐字的真实形状做用例；
+    并发跑两份测试是发现这类互杀的便宜办法。
