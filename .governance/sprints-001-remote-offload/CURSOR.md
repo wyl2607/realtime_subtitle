@@ -5,7 +5,7 @@
 - current_phase: `review`
 - current_tk: `TK-001c`
 - current_cr: `CR-006`
-- current_round: `1`
+- current_round: `2`
 - escalated: `false`
 
 ## 进度快照
@@ -17,12 +17,13 @@
 | TK-002 | 节点 gateway：生命周期 + 协议 v2 + 鉴权与上限 | done |
 | TK-003 | 一键安装 install_node.sh | done（真机装 mini2 待批准） |
 | TK-004 | rslite：带时间句子 + AudioFanout + 混合替换 + 单实例 | done |
-| TK-001c | worker：translator 写当前真实翻译器名 | fixing |
+| TK-001c | worker：translator 写当前真实翻译器名 | recheck |
 | TK-005 | rslite：NodeClient v2 + NodeRouter + 本机档门槛 | planned |
 | TK-006 | 清理 v1 + 文档 | planned |
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 11:45 CST: TK-001c repair 回收 8fc99ce（Coordinator 复跑 210/920 passed、ruff 通过）→ recheck，CR-006 round2（opus）
 - 2026-10-09 11:35 CST: CR-006 round1（opus）approve_with_minor：F1（换语言对用例）/F2（注释）accepted → repair（同一 sonnet executor）；F3 accepted 由 Coordinator 合并后改 install_node.sh 文案；F4 rejected（pre-existing）
 - 2026-10-09 11:20 CST: TK-001c 回报 4257dc2（scope 内；Coordinator 复核 209/919 passed、ruff 通过、并发跑无互扰）→ reviewing，CR-006 round1（opus）
 - 2026-10-09 11:05 CST: **云端会话 3 接手**。重建 /home/user/venv-rs，基线复跑 916 passed / 46 skipped / 8 errors（均为 pyaudiowpatch），ruff 通过；Desktop Commander 可见 MacBook Air 与 mini2 在线。新建 tasks/TK-001c 卡片 → TK-001c executing（sonnet，分支 feat/tk-001c，单独小批）

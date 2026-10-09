@@ -106,3 +106,5 @@
 {"ts": "2026-10-09T11:20:00+08:00", "sprint": "sprints-001-remote-offload", "tk": "TK-001c", "cr": "CR-006", "phase": "review", "action": "dispatched", "agent_role": "reviewer", "round": 1, "notes": "default=opus"}
 {"ts": "2026-10-09T11:35:00+08:00", "sprint": "sprints-001-remote-offload", "tk": "TK-001c", "cr": "CR-006", "phase": "review", "action": "returned", "agent_role": "reviewer", "round": 1, "notes": "approve_with_minor; F1/F2/F3 accepted, F4 rejected"}
 {"ts": "2026-10-09T11:35:00+08:00", "sprint": "sprints-001-remote-offload", "tk": "TK-001c", "cr": "CR-006", "phase": "review", "action": "dispatched", "agent_role": "repairer", "round": 1, "notes": "F1/F2 sonnet"}
+{"ts": "2026-10-09T11:45:00+08:00", "sprint": "sprints-001-remote-offload", "tk": "TK-001c", "cr": "CR-006", "phase": "review", "action": "repair-returned", "agent_role": "repairer", "round": 1, "notes": "8fc99ce; 210/920 passed"}
+{"ts": "2026-10-09T11:45:00+08:00", "sprint": "sprints-001-remote-offload", "tk": "TK-001c", "cr": "CR-006", "phase": "review", "action": "dispatched", "agent_role": "reviewer", "round": 2, "notes": "default=opus"}
