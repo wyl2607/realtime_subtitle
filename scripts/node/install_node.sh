@@ -57,6 +57,13 @@ plan() { printf '  [dry-run] %s\n' "$*"; }
 # ssh 非交互会话的 PATH 不含 /opt/homebrew/bin，也不含 Tailscale.app 里的命令行
 TGT_PATH_EXPORT='export PATH=/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH'
 
+IFS= read -r -d '' TS_IP_LIB_SH <<'EOF' || true
+is_ts_ipv4() {
+    local re='^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.(0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.(0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])$'
+    [[ $1 =~ $re ]]
+}
+EOF
+
 IFS= read -r -d '' PREFLIGHT_SH <<'EOF' || true
 export PATH=/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH
 min_gb=$1
@@ -72,13 +79,13 @@ done
 # TAILSCALE_BE_CLI=1：App Store 版二进制在环境里没有 SHLVL 时会按 GUI 启动，往 stdout 打报错且退出码 0
 ts_ip=$(TAILSCALE_BE_CLI=1 tailscale ip -4 2>/dev/null </dev/null | head -n 1 || true)
 [ -n "$ts_ip" ] || { echo "目标机没有 Tailscale IPv4（tailscale ip -4 无输出）。请先登录 Tailscale"; exit 1; }
-if ! printf '%s\n' "$ts_ip" | grep -Eq '^100\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$' \
-    || [ "$(printf '%s' "$ts_ip" | cut -d. -f2)" -lt 64 ] || [ "$(printf '%s' "$ts_ip" | cut -d. -f2)" -gt 127 ]; then
+if ! is_ts_ipv4 "$ts_ip"; then
     echo "目标机 tailscale ip -4 的首行不是 Tailscale IPv4（100.64.0.0/10）。请检查 Tailscale 是否已登录/运行"
     exit 1
 fi
 echo preflight-ok
 EOF
+PREFLIGHT_SH="${TS_IP_LIB_SH}${PREFLIGHT_SH}"
 
 # 目标机上生成/读取 node_id（info.py 的 STATE_DIR / NODE_ID_FILENAME），stdout 只输出 node_id
 IFS= read -r -d '' NODE_ID_SH <<'EOF' || true
@@ -565,7 +572,7 @@ case "$node_port" in
     ''|*[!0-9]*) rollback "内部错误：端口参数无效"; exit 1 ;;
 esac
 ts_ip=$(TAILSCALE_BE_CLI=1 tailscale ip -4 2>/dev/null </dev/null | head -n 1 || true)
-if ! printf '%s\n' "$ts_ip" | grep -Eq '^100\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$'; then
+if ! is_ts_ipv4 "$ts_ip"; then
     rollback "取不到 Tailscale IPv4，无法确认 gateway 的 TCP 监听"; exit 1
 fi
 tcp_end=$((SECONDS + tcp_wait))
@@ -596,7 +603,7 @@ rm -f "$rec"
 echo "gateway-ok：/v1/info 返回 200，v=2；TCP 已在 ${ts_ip}:${node_port} 监听"
 if [ -d "$HOME/rs-node.prev" ]; then echo "prev-kept"; fi
 EOF
-SWAP_SH="${V1_LIB_SH}${SWAP_SH}"
+SWAP_SH="${TS_IP_LIB_SH}${V1_LIB_SH}${SWAP_SH}"
 
 # ------------------------------------------------------------
 # 控制端函数
