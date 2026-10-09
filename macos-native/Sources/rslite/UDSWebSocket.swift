@@ -47,7 +47,7 @@ final class UDSWebSocketTask: @unchecked Sendable, NodeWebSocketTask {
                 do {
                     let fd = try openValidatedSocket(path: path, timeoutMS: timeoutMS)
                     defer { Darwin.close(fd) }
-                    let request = Data("GET /v1/info HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".utf8)
+                    let request = Data("GET /v1/info HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n".utf8)
                     try writeAll(fd: fd, data: request, timeoutMS: timeoutMS)
                     let response = try readHTTPResponse(fd: fd, timeoutMS: timeoutMS)
                     guard response.status == 200 else {
@@ -404,12 +404,11 @@ final class UDSWebSocketTask: @unchecked Sendable, NodeWebSocketTask {
             guard connected == 0 else {
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
-            var after = stat()
-            guard fstat(fd, &after) == 0 else {
-                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-            }
-            guard before.st_dev == after.st_dev, before.st_ino == after.st_ino else {
-                throw NodeClientError.connection("uds_socket_changed")
+            // fstat 已连接的 socket 拿到的是 socket 自己的 inode，比不了路径；改核对端进程属主（与 gateway 的 LOCAL_PEERCRED 对称）
+            var peerUID: uid_t = 0
+            var peerGID: gid_t = 0
+            guard getpeereid(fd, &peerUID, &peerGID) == 0, peerUID == getuid() else {
+                throw NodeClientError.unauthorized
             }
             return fd
         } catch {
@@ -420,6 +419,7 @@ final class UDSWebSocketTask: @unchecked Sendable, NodeWebSocketTask {
 
     private static func makeAddress(_ path: String) throws -> sockaddr_un {
         var addr = sockaddr_un()
+        addr.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
         addr.sun_family = sa_family_t(AF_UNIX)
         let capacity = MemoryLayout.size(ofValue: addr.sun_path)
         let copied = path.withCString { src in
