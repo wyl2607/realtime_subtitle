@@ -17,6 +17,8 @@
 | TK-005 | rslite：NodeClient v2 + NodeRouter + 本机档门槛 | done | TK-004 | macos-native/Sources/rslite/{NodeClient,NodeRouter,HybridEngine,Capability,main,RemotePipeline}.swift, macos-native/README.md | default,security | 涉及 F02、F03、S5 和 P6–P8；状态机，需准备第 3 轮评审；**另含 CR-001 F5：单实例接线进 main，并验收「第二个实例提示后以非 0 退出」，headless 的 file: 来源可以跳过**；若 NodeRouter 让 AudioFanout.start/stop 并发调用，须一并修 CR-001 M1（加锁前 source.start 的漏停窗口）并更正 AudioFanout.swift:94 注释 |
 | TK-005b | rslite：本机节点经 UDS 发现与连接（P6/P8） | done | TK-005 | macos-native/Sources/rslite/{NodeClient,NodeRouter,Capability,main}.swift, macos-native/README.md | default,security | CR-009 R3-3 拆出；RFC Done criteria 4 依赖；TK-007 前完成 |
 | TK-006 | 清理 v1 + 文档 | done | TK-001, TK-002, TK-005 | realtime_subtitle/remote/**, tests/test_remote_server.py, CLAUDE.md, docs/protocol-v2.md | default | 10-09 15:20 CEST 与 TK-005 并行开写（grok，文件不重叠），**合并顺序：TK-005 先于 TK-006**；v1 删除时 RemotePipeline.swift 由 TK-005 负责删；protocol-v2.md 须写明：会话中 worker 退出（含 0）→ worker_crashed，status code 映射 2/3/4 与 audio_dropped/backlog_dropped（CR-002/CR-003） |
+| TK-005c | rslite：CR-012 R3 延后的 6 条 minor（UDS close 不白等、死代码、自检走线上收帧、UDS id 同源、hw_hash 复用与空串不退避） | reviewing | TK-005b | macos-native/Sources/rslite/{NodeClient,NodeRouter,UDSWebSocket}.swift | default,security | codex 实现；build/selftest/UDS 冒烟 7/7 已过（10-09 22:36）；grok R1 评审中 |
+| TK-008 | 节点冷启动首条精修 ≤15s（mini2 实测 16.2s / 未出） | planned | TK-007 | 待定（realtime_subtitle/node/{gateway,worker}.py 预热或 TK-007 阈值复议） | default | **Sprint-001 遗留，用户 10-09 定：记已知问题、不卡收尾**；证据 /tmp/tk007/crit2_run{,2}.log：worker 2.3–3.4s 即起，慢在首次模型加载/首段出结果 |
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | executing（prep） | TK-001…TK-006 | scripts/bench/**, docs/node-acceptance.md | default | 涉及 F05；mini2 远程操作要先征得用户批准 |
 
 ## 字段说明
