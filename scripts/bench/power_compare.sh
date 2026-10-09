@@ -4,17 +4,14 @@
 # rslite 本机模式的识别跑在系统 daemon 里，进程级 CPU 看不到——只能看整机。
 #
 # 用法（需要 sudo，powermetrics 只能 root 跑）：
-#   sudo bash scripts/bench/power_compare.sh <wav> [ws://mini2:8791/v1]
+#   sudo bash scripts/bench/power_compare.sh <wav>
+# 远程段走 --mode hybrid，节点取自发起 sudo 的用户的 ~/.config/rslite/nodes.json（install_node.sh 写入）。
 # 测之前：停掉 Python 字幕、关掉看视频的浏览器标签，接不接电源都行但三段要一致。
 set -euo pipefail
 
-WAV=${1:?usage: power_compare.sh <wav> [remote-url]}
-REMOTE=${2:-ws://100.105.163.59:8791/v1}
+WAV=${1:?usage: power_compare.sh <wav>}
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 BIN="$ROOT/macos-native/.build/release/rslite"
-# sudo 下 HOME 是 root 的：token 要用发起 sudo 的那个用户的
-USER_HOME=$(eval echo "~${SUDO_USER:-$USER}")
-TOKEN="$USER_HOME/.config/rslite/remote-token"
 OUT=$(mktemp -d)
 SECS=$(python3 -c "import wave,sys; w=wave.open(sys.argv[1]); print(int(w.getnframes()/w.getframerate())+8)" "$WAV")
 
@@ -31,8 +28,9 @@ measure() {  # $1=名字 $2...=要跑的命令（空=只测空闲）
 
 echo "每段约 ${SECS} 秒，共三段……"
 measure idle
-measure local "$BIN" --source "file:$WAV" --headless
-measure remote "$BIN" --remote "$REMOTE" --token-file "$TOKEN" --source "file:$WAV" --headless
+measure local "$BIN" --mode local --source "file:$WAV" --headless
+measure remote "$BIN" --mode hybrid --source "file:$WAV" --headless
+grep -m1 "rslite.route select node=" "$OUT/remote.events" || echo "警告：remote 段没有选中节点（退回本机），remote 数据无效"
 # 数据是 root 写的，交还给发起 sudo 的用户，否则事后读不了
 chown -R "${SUDO_USER:-$USER}" "$OUT"
 echo "原始数据: $OUT"
