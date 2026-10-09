@@ -2,9 +2,9 @@
 
 ## 当前状态
 <!-- Machine fields: new writes must use "- key: `value`". Legacy variants are read-only compatibility. -->
-- current_phase: `execution+review`
+- current_phase: `awaiting-user`
 - current_tk: `TK-002b,TK-005,TK-006,TK-007(prep)`
-- current_cr: `CR-009`
+- current_cr: `—`
 - current_round: `0`
 - escalated: `false`
 
@@ -21,12 +21,13 @@
 | TK-003b | install 测试 macOS 密封 + bash 多字节 bug | done |
 | TK-002c | gateway 测试 1009 后重连时序 | done |
 | TK-001c | worker：translator 写当前真实翻译器名 | done |
-| TK-005 | rslite：NodeClient v2 + NodeRouter + 本机档门槛 | reviewing |
+| TK-005 | rslite：NodeClient v2 + NodeRouter + 本机档门槛 | done |
 | TK-005b | 本机节点 UDS 发现 | planned |
-| TK-006 | 清理 v1 + 文档 | reviewing |
+| TK-006 | 清理 v1 + 文档 | done |
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 17:30 CEST: **TK-005 done**（CR-009 五轮收敛，r5 Gemini approve 903201e）→ 合并 7a99c44；**TK-006 done** → 合并 d88bd7f；[coordinator-direct] 41b11ab protocol-v2 同步原因码/TAILSCALE_BE_CLI/P6 url 补路径。主线验证：swift build+selftest OK、本机回放 5 句、冒烟 24/24（主线构建）、安装测试 112 + 其余 898 passed / 0 failed、ruff 通过。**用户额度将尽，停在此处**。下一步：等用户批准 mini2 重装、S1 取舍；TK-005b（本机 UDS 节点）→ TK-007 验收
 - 2026-10-09 17:12 CEST: CR-009 round4 Gemini needs_fix：R4-1 发布门两次加锁覆盖新迁移意图、R4-2 补零无上限（睡眠唤醒 57MB）、R4-3 原子写忽略 fsync/fchmod 返回值 → 全 accepted（R4-2 改为断档>5s 结束会话且不罚节点）→ sonnet 修；Round 5 为熔断前最后一轮
 - 2026-10-09 17:10 CEST（**时间更正**：本机 `date` 实测 17:05；15:20 之后几条记录的时刻是 Coordinator 估算、偏晚约 1.5–2h，顺序无误）: TK-005 R3 修复 6eb2aa8（sonnet）→ Coordinator 复核 build/selftest/冒烟 24/24（含静默断网 17.1s 回退）→ CR-009 round4 Gemini pro（定向+安全，含补零无上限评估）
 - 2026-10-09 18:50 CEST: **TK-002c done**：CR-011 两轮 approve（Gemini flash / haiku）→ 合并 b7a55c8。**主线首次全绿：1019 passed（安装 112 + 其余 907）、0 failed、ruff 通过**。TK-005 R3 修复（sonnet）进行中

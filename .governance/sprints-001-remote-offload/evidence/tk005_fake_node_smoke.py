@@ -1,4 +1,4 @@
-import asyncio, json, logging, os, re, signal, sys, tempfile, textwrap
+import asyncio, json, logging, os, re, signal, sys, tempfile, textwrap, time
 from pathlib import Path
 
 REPO = Path(os.path.expanduser("~/projects/rs-tk-005"))
@@ -93,6 +93,48 @@ class FakeInfo:
         }
 
 SMOKE_HOME = None
+
+
+class BlackholeProxy:
+    """TCP 透传代理；blackhole=True 后双向丢弃字节但保持连接 -> 模拟「静默断网」（无 RST、无 FIN、无 pong）。"""
+    def __init__(self, target_port):
+        self.target_port = target_port
+        self.blackhole = False
+        self.server = None
+        self.port = None
+
+    async def start(self):
+        self.server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
+        self.port = self.server.sockets[0].getsockname()[1]
+
+    async def _pipe(self, r, w):
+        try:
+            while True:
+                data = await r.read(65536)
+                if not data:
+                    break
+                if not self.blackhole:
+                    w.write(data)
+                    await w.drain()
+        except Exception:
+            pass
+        finally:
+            try:
+                w.close()
+            except Exception:
+                pass
+
+    async def _handle(self, cr, cw):
+        try:
+            ur, uw = await asyncio.open_connection("127.0.0.1", self.target_port)
+        except Exception:
+            cw.close()
+            return
+        await asyncio.gather(self._pipe(cr, uw), self._pipe(ur, cw))
+
+    async def stop(self):
+        self.server.close()
+        await self.server.wait_closed()
 
 async def run_rslite(rslite, wav, out_f, err_f, timeout):
     with open(out_f, "w") as f_out, open(err_f, "w") as f_err:
@@ -274,6 +316,68 @@ async def run_smoke():
         for line in stderr2_text.strip().splitlines()[-3:]:
             print(f"    stderr: {line}")
 
+
+        print("--- 测试 3：中途静默断网（代理停止转发，不发 RST/FIN，无 pong）→ 心跳超时回退本机 ---")
+        proxy = BlackholeProxy(port)
+        await proxy.start()
+        nodes3 = [{
+            "id": "smoke", "node_id": NODE_ID,
+            "url": f"ws://127.0.0.1:{proxy.port}",
+            "token_file": str(token_file),
+        }]
+        default_nodes.write_text(json.dumps(nodes3))
+        os.chmod(str(default_nodes), 0o600)
+        out3_f = tmp / "out3.log"
+        err3_f = tmp / "err3.log"
+        with open(out3_f, "w") as f_out, open(err3_f, "w") as f_err:
+            proc3 = await asyncio.create_subprocess_exec(
+                rslite, "--headless", "--source", f"file:{wav}",
+                "--mode", "hybrid", "--src", "de-DE", "--dst", "zh-Hans",
+                stdout=f_out, stderr=f_err,
+                env={**os.environ, "RSLITE_CONFIG_DIR": str(SMOKE_HOME / ".config" / "rslite")},
+            )
+            t_hybrid = None
+            t_black = None
+            t_local = None
+            t_start = time.monotonic()
+            while proc3.returncode is None and time.monotonic() - t_start < 100:
+                modes3 = mode_texts(out3_f.read_text(errors="replace"))
+                now = time.monotonic()
+                if t_hybrid is None and any(m.startswith("混合·") for m in modes3):
+                    t_hybrid = now
+                if t_hybrid is not None and t_black is None and now - t_hybrid >= 3:
+                    proxy.blackhole = True
+                    t_black = now
+                if t_black is not None and t_local is None:
+                    idx = next((i for i, m in enumerate(modes3) if m.startswith("混合·")), None)
+                    if idx is not None and "本机" in modes3[idx:]:
+                        t_local = now
+                try:
+                    await asyncio.wait_for(proc3.wait(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    pass
+            if proc3.returncode is None:
+                proc3.send_signal(signal.SIGTERM)
+                await proc3.wait()
+                rc3 = 124
+            else:
+                rc3 = proc3.returncode
+        stderr3 = err3_f.read_text(errors="replace")
+        modes3 = mode_texts(out3_f.read_text(errors="replace"))
+        detect = (t_local - t_black) if (t_local and t_black) else None
+        print(f"    证据：模式序列={modes3}")
+        print(f"    证据：断网→回退本机耗时={'%.1fs' % detect if detect is not None else 'N/A'}")
+        for line in stderr3.strip().splitlines():
+            if "fallback" in line:
+                print(f"    stderr: {line}")
+        check(t_black is not None, "静默断网：先进入混合再断网")
+        check(detect is not None and detect <= 30, "静默断网：心跳超时后 ≤30s 回退到「本机」（P7 ping 超时）")
+        check("fallback failed_node=smoke" in stderr3 and ("err=ping_timeout" in stderr3 or "err=NSURLError" in stderr3),
+              "静默断网：stderr 记录 fallback（原因为心跳 ping_timeout 或 ping 传输层超时 NSURLError）")
+        check(stderr3.count("fallback failed_node=smoke") == 1, "静默断网：只回退一次（唯一回退入口，幂等）")
+        check(rc3 == 0, "静默断网：本机继续把回放跑完（退出码 0）")
+        check(TOKEN not in stderr3, "静默断网：token 未出现在 stderr")
+        await proxy.stop()
 
     finally:
         if default_nodes.exists():
