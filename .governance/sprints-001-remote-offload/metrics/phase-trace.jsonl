@@ -101,3 +101,4 @@
 {"ts": "2026-10-09T10:20:00+08:00", "sprint": "sprints-001-remote-offload", "tk": "TK-003", "cr": "CR-005", "phase": "review", "action": "dispatched", "agent_role": "reviewer", "round": 3, "notes": "default=opus, security=sonnet"}
 {"ts": "2026-10-09T10:40:00+08:00", "sprint": "sprints-001-remote-offload", "tk": "TK-003", "cr": "CR-005", "phase": "review", "action": "returned", "agent_role": "reviewer", "round": 3, "notes": "both approve"}
 {"ts": "2026-10-09T10:40:00+08:00", "sprint": "sprints-001-remote-offload", "tk": "TK-003", "cr": "CR-005", "phase": "merge", "action": "merged", "agent_role": "coordinator", "round": 3, "notes": "74fe494; 916 passed; mini2 real install pending user approval"}
+{"ts": "2026-10-09T11:05:00+08:00", "sprint": "sprints-001-remote-offload", "tk": "TK-001c", "cr": null, "phase": "execution", "action": "dispatched", "agent_role": "executor", "round": 0, "notes": "cloud session 3; baseline 916 passed/8 pyaudiowpatch errors; sonnet"}
