@@ -365,9 +365,16 @@ class Worker:
             val = old.get(key)
             state[key] = val if isinstance(val, str) and val else engine.get(key)
         state["rtf"] = round(new_rtf, 4)
+        # translator 以本会话真实在用的为准，不再沿用旧值：安装自检时语言包未装会写
+        # ollama:<model>，之后装好语言包 worker 实际走 apple，沿用旧值会让 /v1/info 永久报错。
+        # 本会话翻译器不可用（None）时才退回旧的合法值，再没有就用默认（不写 "none"，不在 P1 枚举内）。
+        # 注意：沿用的旧值可能来自别的语言对（P1 是节点级单值，契约冻结，不按语言对区分），
+        # 路由可能因此高估该节点的翻译能力。
         tr = old.get("translator")
-        state["translator"] = (tr if isinstance(tr, str) and tr else
-                               self._translator.name if self._translator else DEFAULT_TRANSLATOR)
+        if self._translator is not None:
+            state["translator"] = self._translator.name
+        else:
+            state["translator"] = tr if isinstance(tr, str) and tr else DEFAULT_TRANSLATOR
 
         # 同目录临时文件 + replace：gateway 随时在读，不能让它读到写了一半的 JSON
         tmp = state_dir / f".{ASR_STATE_FILENAME}.{os.getpid()}.tmp"

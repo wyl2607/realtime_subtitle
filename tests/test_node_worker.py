@@ -1073,14 +1073,14 @@ def speech_session(n_segments, speech_s=3.0):
     return hello() + audio_frames(pcm) + ctl(type="drain")
 
 
-def run_rtf(stream, state_dir, cost=0.5, utterances=None, tr_name="fake"):
+def run_rtf(stream, state_dir, cost=0.5, utterances=None, tr_name="fake", factory=None):
     clock = [0.0]
     asr = ClockAsr(clock, cost, utterances=utterances)
     out, err = io.BytesIO(), io.StringIO()
     tr = FakeTr()
     tr.name = tr_name
     w = RecordingWorker(io.BytesIO(stream), out, asr, EnergyVad(),
-                        translator_factory=lambda s, d: tr, err=err,
+                        translator_factory=factory or (lambda s, d: tr), err=err,
                         state_dir=state_dir)
     w.seg_durations = []
     worker_mod_time = worker_mod.time
@@ -1117,8 +1117,8 @@ def test_next_hello_also_ends_session_and_blends_with_old(tmp_path):
     session = 0.5 * len(w.seg_durations) / sum(w.seg_durations)
     state = read_state(tmp_path)
     assert state["rtf"] == pytest.approx(0.7 * 0.8 + 0.3 * session, abs=1e-3)
-    # 已有的 model/backend/translator 保留，不被当前引擎覆盖
-    assert (state["model"], state["backend"], state["translator"]) == ("m0", "b0", "apple")
+    # 已有的 model/backend 保留；translator 以本会话真实翻译器为准（FakeTr.name == "fake"），不再沿用旧值
+    assert (state["model"], state["backend"], state["translator"]) == ("m0", "b0", "fake")
 
 
 @pytest.mark.parametrize("old", ['not json', '[]', '{"rtf": -1}', '{"rtf": "0.3"}',
@@ -1173,6 +1173,68 @@ def test_gateway_info_reader_reads_back_what_worker_wrote(tmp_path):
     assert asr["rtf"] == pytest.approx(read_state(tmp_path)["rtf"])
     assert asr["rtf"] > 0 and translator == "ollama:fake"
     assert asr["model"] == "fake"
+
+
+def _write_old_state(d, translator):
+    (d / info_mod.ASR_STATE_FILENAME).write_text(json.dumps(
+        {"model": "m0", "backend": "b0", "rtf": 0.8, "translator": translator}))
+
+
+def test_session_translator_overrides_stale_old_value(tmp_path):
+    # 安装自检写了 ollama:x，之后装好语言包，本会话实际走 apple → 必须改写成 apple
+    _write_old_state(tmp_path, "ollama:x")
+    run_rtf(speech_session(3), tmp_path, tr_name="apple")
+    assert read_state(tmp_path)["translator"] == "apple"
+    _, translator = info_mod.NodeInfo(state_dir=tmp_path).asr_and_translator()
+    assert translator == "apple"
+
+
+def test_hello_with_new_pair_finishes_old_session_before_swapping_translator(tmp_path):
+    # 钉住 _finish_session 必须在翻译器替换之前：第二条 hello 收口的是第一会话，
+    # 写进去的应是刚结束那个会话的翻译器（ollama:old），而不是即将换上的 ollama:x。
+    # 第一会话的名字故意不取 DEFAULT_TRANSLATOR（apple）：否则收口晚于旧翻译器置 None
+    # 时写入的默认值也会碰巧等于它，用例就拦不住（CR-006 R2-F1）
+    seen = []
+
+    def factory(src, dst):
+        if src == "de":
+            tr = FakeTr()
+            tr.name = "ollama:old"
+            return tr
+        # 第二会话的翻译器是在第一会话收口之后才构造的：此刻文件应已写好
+        path = tmp_path / info_mod.ASR_STATE_FILENAME
+        seen.append(json.loads(path.read_text())["translator"] if path.exists() else None)
+        tr = FakeTr()
+        tr.name = "ollama:x"
+        return tr
+
+    pcm = np.concatenate([np.concatenate([tone(3.0), silence(1.0)]) for _ in range(3)])
+    sess = audio_frames(pcm) + ctl(type="drain")
+    stream = hello(src="de") + sess + hello(src="en") + sess
+    run_rtf(stream, tmp_path, factory=factory)
+    assert seen == ["ollama:old"]
+    # 第二会话 EOF 收口后，写的是第二会话的翻译器
+    assert read_state(tmp_path)["translator"] == "ollama:x"
+
+
+def test_failed_translator_construction_keeps_old_valid_value(tmp_path):
+    def boom(s, d):
+        raise RuntimeError("no language pack")
+    _write_old_state(tmp_path, "apple")
+    run_rtf(speech_session(3), tmp_path, factory=boom)
+    assert read_state(tmp_path)["translator"] == "apple"
+    _, translator = info_mod.NodeInfo(state_dir=tmp_path).asr_and_translator()
+    assert translator == "apple"
+
+
+def test_no_old_value_and_no_translator_writes_default(tmp_path):
+    def boom(s, d):
+        raise RuntimeError("no language pack")
+    (tmp_path / info_mod.ASR_STATE_FILENAME).write_text(json.dumps({"rtf": 0.8}))
+    run_rtf(speech_session(3), tmp_path, factory=boom)
+    assert read_state(tmp_path)["translator"] == info_mod.DEFAULT_TRANSLATOR
+    _, translator = info_mod.NodeInfo(state_dir=tmp_path).asr_and_translator()
+    assert translator == info_mod.DEFAULT_TRANSLATOR
 
 
 def test_missing_state_dir_is_logged_and_keeps_exit_code(tmp_path):
