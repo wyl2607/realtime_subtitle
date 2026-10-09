@@ -45,6 +45,7 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
     private var router: NodeRouter?
     private var currentFanout: AudioFanout?
     private var activeNodeSessions: [String: Int] = [:]
+    private var selectedNodeSession: NodeSessionKey?
     private var pendingNodeFinals: [NodeSessionKey: [Int: (String, Double?, Double?)]] = [:]
 
     private struct NodeSessionKey: Hashable {
@@ -132,20 +133,23 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
             },
             onFinal: { [weak self] nodeID, generation, id, text, t0, t1 in
                 guard let self else { return }
-                self.lock.withLockVoid {
+                let shouldShowRefining = self.lock.withLockValue { () -> Bool in
                     guard self.activeNodeSessions[nodeID] == generation else {
-                        return
+                        return false
                     }
                     let key = NodeSessionKey(nodeID: nodeID, generation: generation)
                     var node = self.pendingNodeFinals[key] ?? [:]
                     node[id] = (text, t0, t1)
                     self.pendingNodeFinals[key] = node
+                    return self.selectedNodeSession == key
                 }
-                self.onMode(.refining)
+                if shouldShowRefining {
+                    self.onMode(.refining)
+                }
             },
             onTranslation: { [weak self] nodeID, generation, id, translation in
                 guard let self else { return }
-                let final = self.lock.withLockValue { () -> (String, Double?, Double?)? in
+                let result = self.lock.withLockValue { () -> ((String, Double?, Double?), Bool)? in
                     guard activeNodeSessions[nodeID] == generation else {
                         return nil
                     }
@@ -154,27 +158,29 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
                         return nil
                     }
                     pendingNodeFinals[key] = node
-                    return final
+                    return (final, selectedNodeSession == key)
                 }
-                if let final {
+                if let (final, isSelected) = result {
                     self.onNodeFinal(nodeID, final.1, final.2, final.0, translation)
-                    self.onMode(.hybrid(nodeID))
+                    if isSelected {
+                        self.onMode(.hybrid(nodeID))
+                    }
                 }
             },
             onStatus: callbacks.onStatus,
-            onClosed: { [weak self, onMode] nodeID, generation, error in
+            onClosed: { [weak self] nodeID, generation, _ in
                 guard let self else { return }
-                let wasActive = self.lock.withLockValue { () -> Bool in
-                    self.pendingNodeFinals.removeValue(forKey: NodeSessionKey(nodeID: nodeID, generation: generation))
+                self.lock.withLockVoid {
+                    let key = NodeSessionKey(nodeID: nodeID, generation: generation)
+                    self.pendingNodeFinals.removeValue(forKey: key)
                     guard self.activeNodeSessions[nodeID] == generation else {
-                        return false
+                        return
                     }
                     self.activeNodeSessions.removeValue(forKey: nodeID)
                     self.clearPending(for: nodeID)
-                    return true
-                }
-                if wasActive, error != nil {
-                    onMode(.local)
+                    if self.selectedNodeSession == key {
+                        self.selectedNodeSession = nil
+                    }
                 }
             }
         )
@@ -182,7 +188,10 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
             sourceLocaleID: config.sourceLocaleID,
             targetLanguageID: config.targetLanguageID,
             callbacks: nodeCallbacks,
-            onMode: onMode
+            onMode: { [weak self, onMode] mode in
+                self?.recordRouterMode(mode)
+                onMode(mode)
+            }
         )
         lock.withLockVoid { self.router = router }
         router.start(fanout: fanout)
@@ -196,6 +205,7 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
                 currentFanout = nil
             }
             activeNodeSessions.removeAll()
+            selectedNodeSession = nil
             if clearPending {
                 pendingNodeFinals.removeAll()
             }
@@ -208,8 +218,48 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
         pendingNodeFinals = pendingNodeFinals.filter { $0.key.nodeID != nodeID }
     }
 
+    private func recordRouterMode(_ mode: SubtitleMode) {
+        lock.withLockVoid {
+            selectedNodeSession = Self.selectedSession(after: mode, activeSessions: activeNodeSessions, previous: selectedNodeSession)
+        }
+    }
+
     private static func shouldRunRouter(mode: RSLiteMode, hasFanout: Bool, hasRouter: Bool) -> Bool {
         mode != .local && hasFanout && !hasRouter
+    }
+
+    private static func selectedSession(
+        after mode: SubtitleMode,
+        activeSessions: [String: Int],
+        previous: NodeSessionKey?
+    ) -> NodeSessionKey? {
+        switch mode {
+        case .hybrid(let nodeID):
+            guard let generation = activeSessions[nodeID] else {
+                return previous
+            }
+            return NodeSessionKey(nodeID: nodeID, generation: generation)
+        case .local:
+            return nil
+        case .refining:
+            return previous
+        }
+    }
+
+    private static func closingSessionClearsSelection(
+        nodeID: String,
+        generation: Int,
+        activeSessions: inout [String: Int],
+        selectedSession: inout NodeSessionKey?
+    ) {
+        let key = NodeSessionKey(nodeID: nodeID, generation: generation)
+        guard activeSessions[nodeID] == generation else {
+            return
+        }
+        activeSessions.removeValue(forKey: nodeID)
+        if selectedSession == key {
+            selectedSession = nil
+        }
     }
 
     static func selfTest() -> [String] {
@@ -227,6 +277,30 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
               "无 fanout 时不应启动路由")
         check(!Self.shouldRunRouter(mode: .auto, hasFanout: true, hasRouter: true),
               "已有 router 时不应重复启动")
+        var sessions = ["A": 1, "B": 1]
+        var selected = Self.selectedSession(
+            after: .hybrid("B"),
+            activeSessions: sessions,
+            previous: Self.NodeSessionKey(nodeID: "A", generation: 1)
+        )
+        Self.closingSessionClearsSelection(
+            nodeID: "A",
+            generation: 1,
+            activeSessions: &sessions,
+            selectedSession: &selected
+        )
+        check(selected == Self.NodeSessionKey(nodeID: "B", generation: 1),
+              "旧会话关闭不应清除当前选中节点")
+        check(sessions["A"] == nil && sessions["B"] == 1,
+              "旧会话关闭只应清理自己的活跃缓存")
+        Self.closingSessionClearsSelection(
+            nodeID: "B",
+            generation: 1,
+            activeSessions: &sessions,
+            selectedSession: &selected
+        )
+        check(selected == nil,
+              "当前选中会话关闭才应清除选中状态")
         return failures
     }
 }

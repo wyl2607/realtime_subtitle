@@ -345,6 +345,9 @@ final class NodeRouter: @unchecked Sendable {
             do {
                 try await client?.send(audio)
             } catch {
+                if isCancellationOrStopped(error) {
+                    return
+                }
                 await markCurrentOfflineAndFallback(error: error)
             }
         }
@@ -433,6 +436,9 @@ final class NodeRouter: @unchecked Sendable {
                 await old?.close()
             }
         } catch {
+            if isCancellationOrStopped(error) {
+                return
+            }
             routeLog("select local reason=switch_failed node=\(node.id) err=\(routeErrorCode(error))")
             lock.withLockVoid {
                 states[node.id] = NodeStateRecord(info: nil, rtf: nil, offlineUntil: nowSeconds() + Self.offlineDuration)
@@ -446,6 +452,9 @@ final class NodeRouter: @unchecked Sendable {
     }
 
     private func markCurrentOfflineAndFallback(error: Error) async {
+        guard !isCancellationOrStopped(error) else {
+            return
+        }
         let failed = lock.withLockValue { currentNode }
         if let failed {
             routeLog("fallback failed_node=\(failed.id) offline_for_s=60 err=\(routeErrorCode(error))")
@@ -462,6 +471,14 @@ final class NodeRouter: @unchecked Sendable {
         }
         onMode(.local)
         await probeOnce()
+    }
+
+    private func isCancellationOrStopped(_ error: Error) -> Bool {
+        Self.isCancellationOrStopped(
+            error,
+            taskIsCancelled: Task.isCancelled,
+            routerStopped: lock.withLockValue { stopped }
+        )
     }
 
     private func updateSilence(_ audio: TimedAudio) {
@@ -620,7 +637,37 @@ final class NodeRouter: @unchecked Sendable {
             pendingMigrationID: "other",
             nodeID: "better"
         ), "pending 目标变化后旧 client 不得发布")
+        check(Self.isCancellationOrStopped(CancellationError(), taskIsCancelled: false, routerStopped: false),
+              "CancellationError 不应算节点故障")
+        check(Self.isCancellationOrStopped(URLError(.cancelled), taskIsCancelled: false, routerStopped: false),
+              "URLError.cancelled 不应算节点故障")
+        check(Self.isCancellationOrStopped(NSError(domain: NSURLErrorDomain, code: NSURLErrorCancelled), taskIsCancelled: false, routerStopped: false),
+              "NSURLErrorCancelled 不应算节点故障")
+        check(Self.isCancellationOrStopped(NodeClientError.connection("socket closed"), taskIsCancelled: true, routerStopped: false),
+              "Task 已取消时发送失败不应算节点故障")
+        check(Self.isCancellationOrStopped(NodeClientError.connection("socket closed"), taskIsCancelled: false, routerStopped: true),
+              "router stop 后发送失败不应算节点故障")
+        check(!Self.isCancellationOrStopped(NodeClientError.connection("close 1006"), taskIsCancelled: false, routerStopped: false),
+              "真实连接错误仍应算节点故障")
         return failures
+    }
+
+    private static func isCancellationOrStopped(
+        _ error: Error,
+        taskIsCancelled: Bool,
+        routerStopped: Bool
+    ) -> Bool {
+        if taskIsCancelled || routerStopped {
+            return true
+        }
+        if error is CancellationError {
+            return true
+        }
+        if let urlError = error as? URLError, urlError.code == .cancelled {
+            return true
+        }
+        let nsError = error as NSError
+        return nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled
     }
 
     private static func canPublishSwitch(
