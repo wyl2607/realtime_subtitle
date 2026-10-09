@@ -146,6 +146,7 @@ final class NodeRouter: @unchecked Sendable {
     private var silenceRun = 0.0
     private var latestClock = 0.0
     private var stopped = false
+    private var switching = false
 
     init(
         sourceLocaleID: String,
@@ -204,6 +205,15 @@ final class NodeRouter: @unchecked Sendable {
         }
     }
 
+    /// 音频源结束后收尾：等音频循环退出，对当前节点 drain（最多 5s）把尾部句子收回来再关闭。
+    func finish() async {
+        await audioTask?.value
+        let client = lock.withLockValue { stopped ? nil : currentClient }
+        probeTask?.cancel()
+        await client?.drain(timeout: .seconds(5))
+        await stop()
+    }
+
     private func probeLoop() async {
         await probeOnce()
         while !Task.isCancelled {
@@ -222,8 +232,14 @@ final class NodeRouter: @unchecked Sendable {
         for node in configs {
             let t0 = ContinuousClock().now
             do {
-                let (token, info) = try await NodeClient.prepare(config: node)
+                let (token, probed) = try await NodeClient.prepare(config: node)
                 let rtt = max(1, t0.duration(to: ContinuousClock().now).secondsValue * 1000)
+                // 节点同一时刻只服务一个会话：我们自己正占着的节点，/v1/info 必然报 busy=true。
+                // 这不是「被别人占用」，按未占用评分，否则 30s 探测会把正在用的节点判成不可用。
+                var info = probed
+                if lock.withLockValue({ currentNode?.id == node.id }) {
+                    info.busy = false
+                }
                 lock.withLockVoid {
                     states[node.id] = NodeStateRecord(info: info, rtf: info.asr.rtf, offlineUntil: nil)
                     if currentNode?.id == node.id {
@@ -289,21 +305,19 @@ final class NodeRouter: @unchecked Sendable {
         } else {
             routeLog("select local reason=no_available_node")
         }
-        let shouldSwitch = lock.withLockValue { () -> Bool in
+        // 切换一律由 audioLoop 在下一块音频到达时执行（首次连接立刻，迁移等静音点）：
+        // 这里若也直接切，会和 audioLoop 同时对同一节点开两个会话，后者吃 1013。
+        lock.withLockVoid {
             if currentNode == nil {
                 pendingMigrationID = best?.id
-                return best != nil
+                return
             }
             var gateCopy = gate
             let ok = gateCopy.observe(best: best, current: currentScore)
             gate = gateCopy
-            if ok {
-                pendingMigrationID = best?.id
+            if ok, let best, best.id != currentNode?.id {
+                pendingMigrationID = best.id
             }
-            return false
-        }
-        if shouldSwitch {
-            await switchToPending(atSilence: true)
         }
     }
 
@@ -322,14 +336,18 @@ final class NodeRouter: @unchecked Sendable {
                 await markCurrentOfflineAndFallback(error: error)
             }
         }
-        await lock.withLockValue { currentClient }?.flush()
     }
 
     private func switchToPending(atSilence: Bool) async {
-        let nodeID = lock.withLockValue { pendingMigrationID }
-        guard let nodeID, let node = lock.withLockValue({ nodes.first { $0.id == nodeID } }) else {
+        let target = lock.withLockValue { () -> NodeConfig? in
+            guard !switching, !stopped, let id = pendingMigrationID else { return nil }
+            switching = true
+            return nodes.first { $0.id == id }
+        }
+        guard let node = target else {
             return
         }
+        defer { lock.withLockVoid { switching = false } }
         do {
             let (token, info) = try await NodeClient.prepare(config: node)
             let client = NodeClient(
@@ -367,7 +385,9 @@ final class NodeRouter: @unchecked Sendable {
                 pendingMigrationID = nil
             }
             persistState()
-            onMode(.local)
+            if lock.withLockValue({ currentNode == nil }) {
+                onMode(.local)
+            }
         }
     }
 

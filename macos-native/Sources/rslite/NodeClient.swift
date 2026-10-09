@@ -377,7 +377,8 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
             if http.statusCode == 401 {
                 return .unauthorized
             }
-            if !(200..<300).contains(http.statusCode) {
+            // 101 = 升级成功（之后被 close 帧关掉，如 1013 busy），按 close 码分类，不是 HTTP 错误
+            if !(200..<300).contains(http.statusCode) && http.statusCode != 101 {
                 return .connection("http \(http.statusCode)")
             }
         }

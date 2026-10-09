@@ -139,6 +139,8 @@ struct RSLite {
     private static func runHeadless(_ options: Options) async throws {
         let startedAt = ContinuousClock().now
         let clock = ContinuousClock()
+        // 与 Overlay 同一套 P5 逻辑（LineStore），让 headless 也能观察到「节点句替换了几条本机句」
+        let store = HeadlessLineStore()
 
         let pipeline = makeEngine(
             options,
@@ -147,9 +149,11 @@ struct RSLite {
                     writeEvent(clock: clock, startedAt: startedAt, ev: "volatile", id: nil, text: text)
                 },
                 onFinal: { id, text, t0, t1 in
+                    store.addLocal(key: id, t0: t0, t1: t1, text: text)
                     writeEvent(clock: clock, startedAt: startedAt, ev: "final", id: id, text: text, t0: t0, t1: t1)
                 },
                 onTranslation: { id, text in
+                    store.setTranslation(key: id, text: text)
                     writeEvent(clock: clock, startedAt: startedAt, ev: "translation", id: id, text: text)
                 },
                 onStatus: { text in
@@ -160,6 +164,10 @@ struct RSLite {
                 writeEvent(clock: clock, startedAt: startedAt, ev: "status", id: nil, text: "模式：\(mode.label)")
             },
             onNodeFinal: { nodeID, t0, t1, src, dst in
+                let replaced = store.applyNode(nodeID: nodeID, t0: t0, t1: t1, src: src, dst: dst)
+                // 日志不带正文：只报替换了哪些本机句（id）
+                writeEvent(clock: clock, startedAt: startedAt, ev: "replace", id: nil,
+                           text: "P5 node=\(nodeID) replaced=\(replaced.count) ids=\(replaced.sorted())", t0: t0, t1: t1)
                 writeEvent(clock: clock, startedAt: startedAt, ev: "final", id: nil, text: "[\(nodeID)] \(src)", t0: t0, t1: t1)
                 if let dst {
                     writeEvent(clock: clock, startedAt: startedAt, ev: "translation", id: nil, text: "[\(nodeID)] \(dst)")
@@ -298,5 +306,23 @@ struct RSLite {
 extension Duration {
     var seconds: Double {
         Double(components.seconds) + Double(components.attoseconds) / 1e18
+    }
+}
+
+/// headless 用的 LineStore 线程安全包装（回调来自不同线程）。
+final class HeadlessLineStore: @unchecked Sendable {
+    private let lock = NSLock()
+    private var store = LineStore()
+
+    func addLocal(key: Int, t0: Double?, t1: Double?, text: String) {
+        lock.withLockVoid { store.addLocal(key: key, t0: t0, t1: t1, text: text) }
+    }
+
+    func setTranslation(key: Int, text: String) {
+        lock.withLockVoid { store.setTranslation(key: key, text: text) }
+    }
+
+    func applyNode(nodeID: String, t0: Double?, t1: Double?, src: String, dst: String?) -> [Int] {
+        lock.withLockValue { store.applyNode(nodeID: nodeID, t0: t0, t1: t1, srcText: src, dstText: dst) }
     }
 }

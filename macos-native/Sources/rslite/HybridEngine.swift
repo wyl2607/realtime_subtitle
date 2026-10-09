@@ -94,6 +94,7 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
 
     func waitUntilFinished() async {
         await local?.waitUntilFinished()
+        await router?.finish()
     }
 
     private func startRouterIfNeeded(fanout: AudioFanout) {
@@ -101,9 +102,8 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
             return
         }
         let nodeCallbacks = NodeCallbacks(
-            onReady: { [onMode] info in
-                onMode(.hybrid(info.nodeID))
-            },
+            // 模式标签由 NodeRouter 在切换成功后统一用清单里的 id 上报，这里不重复报
+            onReady: { _ in },
             onFinal: { [weak self] nodeID, id, text, t0, t1 in
                 self?.lock.withLockVoid {
                     var node = self?.pendingNodeFinals[nodeID] ?? [:]
