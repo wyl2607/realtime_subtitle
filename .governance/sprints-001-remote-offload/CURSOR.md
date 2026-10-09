@@ -27,6 +27,7 @@
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 17:10 CEST（**时间更正**：本机 `date` 实测 17:05；15:20 之后几条记录的时刻是 Coordinator 估算、偏晚约 1.5–2h，顺序无误）: TK-005 R3 修复 6eb2aa8（sonnet）→ Coordinator 复核 build/selftest/冒烟 24/24（含静默断网 17.1s 回退）→ CR-009 round4 Gemini pro（定向+安全，含补零无上限评估）
 - 2026-10-09 18:50 CEST: **TK-002c done**：CR-011 两轮 approve（Gemini flash / haiku）→ 合并 b7a55c8。**主线首次全绿：1019 passed（安装 112 + 其余 907）、0 failed、ruff 通过**。TK-005 R3 修复（sonnet）进行中
 - 2026-10-09 18:35 CEST: CR-009 round3 opus approve_with_minor：F4/F5 确认；新 R3-1（无 ping 超时，静默断网不回退，P7）/R3-2（扇出丢帧致节点时钟偏移，P5 错行）必修 + R3-4..7 低成本 + nit accepted；R3-3（本机 UDS 节点未实现）拆 TK-005b → sonnet 修（codex 20:24 才恢复、Gemini 前科假结论）→ 之后 round4。CR-011：opencode 因 external_directory 无结论、Gemini 503 → 重试中
 - 2026-10-09 18:15 CEST: CR-009 F4/F5 已在 codex WIP 91d5310 完成（Gemini 接续确认无需增补，但越权 `git reset` 回退已推送提交 → Coordinator `reset --soft` 恢复直线历史）；本机复核 build/selftest/冒烟 18/18 → round3 Claude opus 终审。TK-002c 回报 4555a09（+7 行 wait_session_freed；并发两份各 120 passed）→ CR-011 round1（opencode）
