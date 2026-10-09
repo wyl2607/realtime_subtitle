@@ -55,6 +55,7 @@ enum NodeClientError: Error, CustomStringConvertible {
     case timeout
     case protocolError(String)
     case connection(String)
+    case pingTimeout
 
     var description: String {
         switch self {
@@ -67,6 +68,7 @@ enum NodeClientError: Error, CustomStringConvertible {
         case .timeout: return "节点握手超时"
         case .protocolError(let message): return "节点协议错误：\(message)"
         case .connection(let message): return "节点连接失败：\(message)"
+        case .pingTimeout: return "节点心跳超时"
         }
     }
 
@@ -86,6 +88,8 @@ enum NodeClientError: Error, CustomStringConvertible {
             return "close_1013"
         case .timeout:
             return "handshake_timeout"
+        case .pingTimeout:
+            return "ping_timeout"
         case .protocolError:
             return "protocol_error"
         case .connection(let message):
@@ -100,6 +104,39 @@ enum NodeClientError: Error, CustomStringConvertible {
             }
             return "connection_error"
         }
+    }
+}
+
+/// 节点会话的身份：节点 id + 该节点的会话代号。
+struct NodeSessionRef: Hashable, Sendable {
+    var nodeID: String
+    var generation: Int
+}
+
+/// P7 / P2：与 gateway 约定一致，每 10s 一次 ping，10s 无 pong 判故障。
+enum HeartbeatPolicy {
+    static let interval = 10.0
+    static let timeout = 10.0
+
+    enum Action: Equatable {
+        case none
+        case sendPing
+        case dead
+    }
+
+    /// 纯函数：有未回的 ping（lastPongAt 早于 lastPingSentAt）且超时 -> dead；
+    /// 没有未回的 ping 且到期 -> 再发一个。
+    static func step(
+        now: Double,
+        lastPingSentAt: Double,
+        lastPongAt: Double,
+        interval: Double = HeartbeatPolicy.interval,
+        timeout: Double = HeartbeatPolicy.timeout
+    ) -> Action {
+        if lastPongAt < lastPingSentAt {
+            return now - lastPingSentAt >= timeout ? .dead : .none
+        }
+        return now - lastPingSentAt >= interval ? .sendPing : .none
     }
 }
 
@@ -126,7 +163,7 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
     private let info: NodeInfo
     private let sourceLocaleID: String
     private let targetLanguageID: String
-    private let offsetSeconds: Double
+    private var offsetSeconds: Double
     private let sessionGeneration: Int
     private let callbacks: NodeCallbacks
     private let lock = NSLock()
@@ -136,6 +173,11 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
     private var converter: AVAudioConverter?
     private var isClosed = false
     private var remoteCloseCode: Int?
+    private var closedNotified = false
+    private var heartbeatTask: Task<Void, Never>?
+    /// 节点时钟 = 已发给节点的样本数 / 16000；首个音频块到来时把 offset 对齐到它的 startSeconds。
+    private var clockStarted = false
+    private var sentSamples = 0
     private let closeFrameReceived = OneShotGate()
     private let finished = OneShotGate()
 
@@ -222,6 +264,8 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
             try await awaitReady(socket)
             callbacks.onReady(config.id, sessionGeneration, info)
             Task { await receiveLoop(socket) }
+            let heartbeat = Task { await self.heartbeatLoop(socket) }
+            lock.withLockVoid { heartbeatTask = heartbeat }
         } catch {
             throw await classify(error, socket)
         }
@@ -241,6 +285,25 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
             return
         }
         let data = try Self.convert(audio.buffer, using: converter)
+        // 节点按收到的样本数推时钟（P2）。会话建立期间/发送变慢时 AudioFanout 会丢旧帧，
+        // 客户端时钟前进了而节点没收到：用零 PCM 补上这段，节点 a0 才不会永久偏前（P5 替换对得上行）。
+        let pad = lock.withLockValue { () -> Int in
+            if !clockStarted {
+                clockStarted = true
+                offsetSeconds = audio.startSeconds
+                return 0
+            }
+            return Self.gapPadSamples(offset: offsetSeconds, sentSamples: sentSamples, audioStart: audio.startSeconds)
+        }
+        if pad > 0 {
+            var remaining = pad * 2
+            while remaining > 0 {
+                let n = min(Self.frameBytes, remaining)
+                try await socket.send(.data(Data(count: n)))
+                remaining -= n
+            }
+            lock.withLockVoid { sentSamples += pad }
+        }
         guard !data.isEmpty else {
             return
         }
@@ -250,6 +313,16 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
             try await socket.send(.data(Data(pending.prefix(n))))
             pending.removeFirst(n)
         }
+        lock.withLockVoid { sentSamples += data.count / 2 }
+    }
+
+    /// 纯函数：该块音频开始前，节点时钟落后客户端时钟多少个样本需要补零（≤ 容差视为连续）。
+    static func gapPadSamples(offset: Double, sentSamples: Int, audioStart: Double, tolerance: Double = 0.1) -> Int {
+        let gap = audioStart - (offset + Double(sentSamples) / 16_000)
+        guard gap > tolerance else {
+            return 0
+        }
+        return Int((gap * 16_000).rounded())
     }
 
     func flush() async {
@@ -262,7 +335,7 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         }
         try? await socket.send(.string(#"{"type":"drain"}"#))
         let gate = OneShotGate()
-        let token = NodeDrainWaiters.shared.add(nodeID: config.id, gate: gate)
+        let token = NodeDrainWaiters.shared.add(session: NodeSessionRef(nodeID: config.id, generation: sessionGeneration), gate: gate)
         let timer = Task {
             try? await Task.sleep(for: timeout)
             gate.open()
@@ -283,6 +356,8 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         guard let (socket, session) = pair else {
             return
         }
+        let heartbeat = lock.withLockValue { heartbeatTask }
+        heartbeat?.cancel()
         socket?.cancel(with: .normalClosure, reason: nil)
         let timer = Task {
             try? await Task.sleep(for: Self.closeTimeout)
@@ -350,10 +425,66 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
                 handle(text)
             } catch {
                 let closed = lock.withLockValue { isClosed }
-                callbacks.onClosed(config.id, sessionGeneration, closed ? nil : error)
+                notifyClosed(closed ? nil : error)
                 return
             }
         }
+    }
+
+    /// onClosed 每个会话只通知一次（receiveLoop 与心跳都可能触发）。
+    private func notifyClosed(_ error: Error?) {
+        let first = lock.withLockValue { () -> Bool in
+            guard !closedNotified else { return false }
+            closedNotified = true
+            return true
+        }
+        if first {
+            callbacks.onClosed(config.id, sessionGeneration, error)
+        }
+    }
+
+    /// P7：定期 ping，超时无 pong 判故障。静默断网时 receive/send 都不报错，只有心跳能发现。
+    private func heartbeatLoop(_ socket: URLSessionWebSocketTask) async {
+        let startedAt = Self.monotonic()
+        let pongAt = PongClock(start: startedAt)
+        var lastPingSentAt = startedAt
+        while !Task.isCancelled {
+            do {
+                try await Task.sleep(for: .seconds(1))
+            } catch {
+                return
+            }
+            if lock.withLockValue({ isClosed }) {
+                return
+            }
+            let now = Self.monotonic()
+            switch HeartbeatPolicy.step(now: now, lastPingSentAt: lastPingSentAt, lastPongAt: pongAt.value) {
+            case .none:
+                continue
+            case .sendPing:
+                lastPingSentAt = now
+                socket.sendPing { [weak self] error in
+                    if let error {
+                        self?.heartbeatFailed(socket, error)
+                    } else {
+                        pongAt.set(Self.monotonic())
+                    }
+                }
+            case .dead:
+                heartbeatFailed(socket, NodeClientError.pingTimeout)
+                return
+            }
+        }
+    }
+
+    private func heartbeatFailed(_ socket: URLSessionWebSocketTask, _ error: Error) {
+        let closed = lock.withLockValue { isClosed }
+        notifyClosed(closed ? nil : error)
+        socket.cancel(with: .goingAway, reason: nil)
+    }
+
+    private static func monotonic() -> Double {
+        ProcessInfo.processInfo.systemUptime
     }
 
     private func handle(_ text: String) {
@@ -363,8 +494,9 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         switch ev {
         case "final":
             guard let id = event["id"] as? Int, let body = event["text"] as? String else { return }
-            let t0 = (event["a0"] as? Double).map { $0 + offsetSeconds }
-            let t1 = (event["a1"] as? Double).map { $0 + offsetSeconds }
+            let offset = lock.withLockValue { offsetSeconds }
+            let t0 = (event["a0"] as? Double).map { $0 + offset }
+            let t1 = (event["a1"] as? Double).map { $0 + offset }
             callbacks.onFinal(config.id, sessionGeneration, id, body, t0, t1)
         case "translation":
             guard let id = event["id"] as? Int, let body = event["text"] as? String else { return }
@@ -374,7 +506,7 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
                 callbacks.onStatus("节点 \(config.id)：\(code)")
             }
         case "drained":
-            NodeDrainWaiters.shared.open(nodeID: config.id)
+            NodeDrainWaiters.shared.open(session: NodeSessionRef(nodeID: config.id, generation: sessionGeneration))
         default:
             return
         }
@@ -511,6 +643,8 @@ final class OneShotGate: @unchecked Sendable {
     private var isOpen = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
+    var isOpened: Bool { lock.withLockValue { isOpen } }
+
     func open() {
         let pending = lock.withLockValue { () -> [CheckedContinuation<Void, Never>] in
             guard !isOpen else { return [] }
@@ -536,14 +670,15 @@ final class OneShotGate: @unchecked Sendable {
     }
 }
 
-private final class NodeDrainWaiters: @unchecked Sendable {
+/// 「drained」等待者按（节点 + 会话代）登记：同一节点先后两个会话的 drain 不会互相误开。
+final class NodeDrainWaiters: @unchecked Sendable {
     static let shared = NodeDrainWaiters()
     private let lock = NSLock()
-    private var waiters: [UUID: (String, OneShotGate)] = [:]
+    private var waiters: [UUID: (NodeSessionRef, OneShotGate)] = [:]
 
-    func add(nodeID: String, gate: OneShotGate) -> UUID {
+    func add(session: NodeSessionRef, gate: OneShotGate) -> UUID {
         let id = UUID()
-        lock.withLockVoid { waiters[id] = (nodeID, gate) }
+        lock.withLockVoid { waiters[id] = (session, gate) }
         return id
     }
 
@@ -551,11 +686,52 @@ private final class NodeDrainWaiters: @unchecked Sendable {
         lock.withLockVoid { waiters.removeValue(forKey: id) }
     }
 
-    func open(nodeID: String) {
+    func open(session: NodeSessionRef) {
         let targets = lock.withLockValue {
-            waiters.values.compactMap { $0.0 == nodeID ? $0.1 : nil }
+            waiters.values.compactMap { $0.0 == session ? $0.1 : nil }
         }
         targets.forEach { $0.open() }
+    }
+}
+
+final class PongClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var at: Double
+    init(start: Double) { at = start }
+    var value: Double { lock.withLockValue { at } }
+    func set(_ value: Double) { lock.withLockVoid { at = value } }
+}
+
+@available(macOS 27.0, *)
+extension NodeClient {
+    static func selfTest() -> [String] {
+        var failures: [String] = []
+        func check(_ ok: Bool, _ name: String) {
+            if !ok { failures.append(name) }
+        }
+        // 心跳：10s 一发，发出后 10s 无 pong 判死
+        check(HeartbeatPolicy.step(now: 5, lastPingSentAt: 0, lastPongAt: 0) == .none, "心跳：未到间隔不发 ping")
+        check(HeartbeatPolicy.step(now: 10, lastPingSentAt: 0, lastPongAt: 0) == .sendPing, "心跳：到间隔发 ping")
+        check(HeartbeatPolicy.step(now: 15, lastPingSentAt: 10, lastPongAt: 0) == .none, "心跳：ping 未回但未超时")
+        check(HeartbeatPolicy.step(now: 20, lastPingSentAt: 10, lastPongAt: 0) == .dead, "心跳：ping 10s 无 pong 判故障")
+        check(HeartbeatPolicy.step(now: 15, lastPingSentAt: 10, lastPongAt: 12) == .none, "心跳：已回 pong 不算故障")
+        check(HeartbeatPolicy.step(now: 20, lastPingSentAt: 10, lastPongAt: 12) == .sendPing, "心跳：回 pong 后到期再发 ping，不误判 dead")
+        // 断档补零
+        check(gapPadSamples(offset: 100, sentSamples: 16_000, audioStart: 101) == 0, "时钟连续不补零")
+        check(gapPadSamples(offset: 100, sentSamples: 16_000, audioStart: 101.05) == 0, "容差内不补零")
+        check(gapPadSamples(offset: 100, sentSamples: 16_000, audioStart: 107) == 96_000, "丢 6s 帧补 6s 零（96000 样本）")
+        check(gapPadSamples(offset: 100, sentSamples: 16_000, audioStart: 100.5) == 0, "时钟重叠不补零")
+        // drained 按节点+会话代匹配
+        let waiters = NodeDrainWaiters()
+        let oldGate = OneShotGate()
+        let newGate = OneShotGate()
+        _ = waiters.add(session: NodeSessionRef(nodeID: "A", generation: 1), gate: oldGate)
+        _ = waiters.add(session: NodeSessionRef(nodeID: "A", generation: 2), gate: newGate)
+        waiters.open(session: NodeSessionRef(nodeID: "A", generation: 1))
+        check(oldGate.isOpened && !newGate.isOpened, "旧会话 drained 不应放行同节点新会话的等待者")
+        waiters.open(session: NodeSessionRef(nodeID: "B", generation: 2))
+        check(!newGate.isOpened, "其他节点 drained 不应放行")
+        return failures
     }
 }
 

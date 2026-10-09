@@ -139,6 +139,10 @@ final class NodeRouter: @unchecked Sendable {
     private var currentNode: NodeConfig?
     private var currentToken: String?
     private var currentInfo: NodeInfo?
+    private var currentSession: NodeSessionRef?
+    private var failedSessions = Set<NodeSessionRef>()
+    private var switchTask: Task<Void, Never>?
+    private var drainTasks: [UUID: Task<Void, Never>] = [:]
     private var audioTask: Task<Void, Never>?
     private var probeTask: Task<Void, Never>?
     private var gate = MigrationGate()
@@ -206,10 +210,12 @@ final class NodeRouter: @unchecked Sendable {
         }
         probeTask?.cancel()
         audioTask?.cancel()
+        lock.withLockValue { switchTask }?.cancel()
         let client = lock.withLockValue { currentClient }
         await client?.close()
         lock.withLockVoid {
             currentClient = nil
+            currentSession = nil
             currentNode = nil
             currentToken = nil
             currentInfo = nil
@@ -223,6 +229,11 @@ final class NodeRouter: @unchecked Sendable {
         let client = lock.withLockValue { stopped ? nil : currentClient }
         probeTask?.cancel()
         await client?.drain(timeout: .seconds(5))
+        // 迁移中的旧会话也要把尾部句子收回来（各自 drain ≤3s + close ≤2s，有上限）
+        let migrating = lock.withLockValue { Array(drainTasks.values) }
+        for task in migrating {
+            await task.value
+        }
         await stop()
     }
 
@@ -269,11 +280,18 @@ final class NodeRouter: @unchecked Sendable {
                 }
             } catch {
                 routeLog("probe node=\(node.id) offline err=\(routeErrorCode(error))")
-                let old = lock.withLockValue { states[node.id] }
+                // 探测失败：旧 info 已不可信，清掉缓存，不参与打分
+                let old = lock.withLockValue { () -> NodeStateRecord? in
+                    var record = states[node.id] ?? NodeStateRecord(info: nil, rtf: nil, offlineUntil: nil)
+                    record.info = nil
+                    record.rtf = nil
+                    states[node.id] = record
+                    return record
+                }
                 candidates.append(RouteCandidate(
                     id: node.id,
                     expectedNodeID: node.nodeID,
-                    info: old?.info,
+                    info: nil,
                     rttMS: 999,
                     isLocal: false,
                     offlineUntil: old?.offlineUntil
@@ -338,17 +356,27 @@ final class NodeRouter: @unchecked Sendable {
             if Task.isCancelled { return }
             lock.withLockVoid { latestClock = audio.startSeconds }
             updateSilence(audio)
-            if lock.withLockValue({ pendingMigrationID != nil && (currentNode == nil || silenceRun >= Self.silenceSecondsForMigration) }) {
-                await switchToPending(atSilence: currentNode != nil)
+            // prepare/connect 最长十几秒：放到独立 Task，音频循环不能被它堵住，
+            // 否则 AudioFanout 丢旧帧、节点时钟落后（R3-2）。switching 由 switchToPending 内部预约防重入。
+            let trigger = lock.withLockValue { () -> Bool? in
+                guard !stopped, !switching, pendingMigrationID != nil else { return nil }
+                guard currentNode == nil || silenceRun >= Self.silenceSecondsForMigration else { return nil }
+                return currentNode != nil
             }
-            let client = lock.withLockValue { currentClient }
+            if let atSilence = trigger {
+                let task = Task { await self.switchToPending(atSilence: atSilence) }
+                lock.withLockVoid { switchTask = task }
+            }
+            let (client, session) = lock.withLockValue { (currentClient, currentSession) }
             do {
                 try await client?.send(audio)
             } catch {
                 if isCancellationOrStopped(error) {
                     return
                 }
-                await markCurrentOfflineAndFallback(error: error)
+                if let session {
+                    await markCurrentOfflineAndFallback(error: error, session: session)
+                }
             }
         }
     }
@@ -374,6 +402,8 @@ final class NodeRouter: @unchecked Sendable {
                 }
             }
         }
+        var created: NodeClient?
+        var published = false
         do {
             let (token, info) = try await NodeClient.prepare(config: node)
             guard lock.withLockValue({
@@ -393,6 +423,13 @@ final class NodeRouter: @unchecked Sendable {
                 nodeSessionGenerations[node.id] = next
                 return next
             }
+            // 生产 onClosed 先转给上层（HybridEngine 清缓存），再交给 router 判故障回退（R3-1）
+            var wrapped = callbacks
+            let upstreamClosed = callbacks.onClosed
+            wrapped.onClosed = { [weak self] nodeID, generation, error in
+                upstreamClosed(nodeID, generation, error)
+                self?.handleClosed(NodeSessionRef(nodeID: nodeID, generation: generation), error: error)
+            }
             let client = NodeClient(
                 config: node,
                 token: token,
@@ -401,8 +438,9 @@ final class NodeRouter: @unchecked Sendable {
                 targetLanguageID: targetLanguageID,
                 offsetSeconds: lock.withLockValue { latestClock },
                 sessionGeneration: sessionGeneration,
-                callbacks: callbacks
+                callbacks: wrapped
             )
+            created = client
             try await client.connect()
             guard lock.withLockValue({
                 Self.canPublishSwitch(
@@ -420,22 +458,31 @@ final class NodeRouter: @unchecked Sendable {
             let old = lock.withLockValue { currentClient }
             lock.withLockVoid {
                 currentClient = client
+                currentSession = NodeSessionRef(nodeID: node.id, generation: sessionGeneration)
                 currentNode = node
                 currentToken = token
                 currentInfo = info
                 pendingMigrationID = nil
                 silenceRun = 0
             }
+            published = true
             onMode(.hybrid(node.id))
-            if atSilence {
-                Task {
-                    await old?.drain(timeout: .seconds(3))
-                    await old?.close()
+            if atSilence, let old {
+                let id = UUID()
+                lock.withLockVoid {
+                    drainTasks[id] = Task {
+                        await old.drain(timeout: .seconds(3))
+                        await old.close()
+                        self.lock.withLockVoid { _ = self.drainTasks.removeValue(forKey: id) }
+                    }
                 }
             } else {
                 await old?.close()
             }
         } catch {
+            if !published {
+                await created?.close()
+            }
             if isCancellationOrStopped(error) {
                 return
             }
@@ -451,26 +498,65 @@ final class NodeRouter: @unchecked Sendable {
         }
     }
 
-    private func markCurrentOfflineAndFallback(error: Error) async {
+    /// 来自 onClosed 的故障入口：与 send 失败共用 markCurrentOfflineAndFallback（唯一回退入口）。
+    private func handleClosed(_ session: NodeSessionRef, error: Error?) {
+        let (current, isStopped) = lock.withLockValue { (currentSession, stopped) }
+        guard Self.shouldFallbackOnClosed(error: error, closed: session, current: current, routerStopped: isStopped),
+              let error else {
+            return
+        }
+        Task { await self.markCurrentOfflineAndFallback(error: error, session: session) }
+    }
+
+    /// 只回退「出事的那个会话」：session 已不是当前会话（已迁移/已回退）就忽略，
+    /// 并发的 send 失败、心跳超时、receive 断开只会触发一次。
+    private func markCurrentOfflineAndFallback(error: Error, session: NodeSessionRef) async {
         guard !isCancellationOrStopped(error) else {
             return
         }
-        let failed = lock.withLockValue { currentNode }
-        if let failed {
-            routeLog("fallback failed_node=\(failed.id) offline_for_s=60 err=\(routeErrorCode(error))")
-            lock.withLockVoid {
-                var state = states[failed.id] ?? NodeStateRecord(info: nil, rtf: nil, offlineUntil: nil)
-                state.offlineUntil = nowSeconds() + Self.offlineDuration
-                states[failed.id] = state
+        let target = lock.withLockValue { () -> (NodeConfig, NodeClient?)? in
+            guard currentSession == session, let node = currentNode, !failedSessions.contains(session) else {
+                return nil
+            }
+            failedSessions.insert(session)
+            return (node, currentClient)
+        }
+        guard let (failed, client) = target else {
+            return
+        }
+        routeLog("fallback failed_node=\(failed.id) offline_for_s=60 err=\(routeErrorCode(error))")
+        // 先关 client（释放 URLSession delegate），再清引用
+        await client?.close()
+        lock.withLockVoid {
+            var state = states[failed.id] ?? NodeStateRecord(info: nil, rtf: nil, offlineUntil: nil)
+            state.offlineUntil = nowSeconds() + Self.offlineDuration
+            states[failed.id] = state
+            if currentSession == session {
                 currentClient = nil
+                currentSession = nil
                 currentNode = nil
                 currentToken = nil
                 currentInfo = nil
             }
-            persistState()
+            failedSessions.remove(session)
         }
+        persistState()
         onMode(.local)
         await probeOnce()
+    }
+
+    /// 纯函数：onClosed 是否应触发节点故障回退。
+    /// 只有「当前选中会话」带错误关闭才算；主动关闭（error=nil）、旧会话、取消/已停止都不算。
+    static func shouldFallbackOnClosed(
+        error: Error?,
+        closed: NodeSessionRef,
+        current: NodeSessionRef?,
+        routerStopped: Bool
+    ) -> Bool {
+        guard let error, closed == current else {
+            return false
+        }
+        return !isCancellationOrStopped(error, taskIsCancelled: false, routerStopped: routerStopped)
     }
 
     private func isCancellationOrStopped(_ error: Error) -> Bool {
@@ -530,6 +616,7 @@ final class NodeRouter: @unchecked Sendable {
         return decoded
     }
 
+    /// 同目录临时文件（0600）写满 -> fsync -> rename(2) 覆盖；任何一步失败都不动目标文件。
     static func atomicWriteJSON<T: Encodable>(_ value: T, to url: URL) throws {
         let data = try JSONEncoder().encode(value)
         try FileManager.default.createDirectory(
@@ -539,13 +626,39 @@ final class NodeRouter: @unchecked Sendable {
         )
         let tmp = url.deletingLastPathComponent()
             .appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
-        FileManager.default.createFile(atPath: tmp.path, contents: data, attributes: [.posixPermissions: 0o600])
-        chmod(tmp.path, 0o600)
-        if FileManager.default.fileExists(atPath: url.path) {
-            try FileManager.default.removeItem(at: url)
+        let fd = open(tmp.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+        guard fd >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
-        try FileManager.default.moveItem(at: tmp, to: url)
-        chmod(url.path, 0o600)
+        var ok = false
+        defer {
+            if !ok {
+                unlink(tmp.path)
+            }
+        }
+        do {
+            try data.withUnsafeBytes { raw in
+                var offset = 0
+                while offset < raw.count {
+                    let n = write(fd, raw.baseAddress! + offset, raw.count - offset)
+                    if n < 0 {
+                        if errno == EINTR { continue }
+                        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                    }
+                    offset += n
+                }
+            }
+            fchmod(fd, 0o600)
+            fsync(fd)
+        } catch {
+            close(fd)
+            throw error
+        }
+        close(fd)
+        guard rename(tmp.path, url.path) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        ok = true
     }
 
     static func selfTest() -> [String] {
@@ -649,6 +762,39 @@ final class NodeRouter: @unchecked Sendable {
               "router stop 后发送失败不应算节点故障")
         check(!Self.isCancellationOrStopped(NodeClientError.connection("close 1006"), taskIsCancelled: false, routerStopped: false),
               "真实连接错误仍应算节点故障")
+        // R3-1：onClosed 故障判定
+        let a = NodeSessionRef(nodeID: "A", generation: 2)
+        let aOld = NodeSessionRef(nodeID: "A", generation: 1)
+        let ioError = NodeClientError.pingTimeout
+        check(Self.shouldFallbackOnClosed(error: ioError, closed: a, current: a, routerStopped: false),
+              "当前会话带错误关闭应回退")
+        check(!Self.shouldFallbackOnClosed(error: nil, closed: a, current: a, routerStopped: false),
+              "主动关闭（无错误）不应回退")
+        check(!Self.shouldFallbackOnClosed(error: ioError, closed: aOld, current: a, routerStopped: false),
+              "旧会话出错不应回退当前会话")
+        check(!Self.shouldFallbackOnClosed(error: ioError, closed: a, current: nil, routerStopped: false),
+              "已无当前会话不应回退")
+        check(!Self.shouldFallbackOnClosed(error: ioError, closed: a, current: a, routerStopped: true),
+              "router 已停止不应回退")
+        check(!Self.shouldFallbackOnClosed(error: URLError(.cancelled), closed: a, current: a, routerStopped: false),
+              "取消类错误不应回退")
+        // R3-6：原子写
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("rslite-selftest-\(UUID().uuidString)")
+        let file = dir.appendingPathComponent("node-state.json")
+        do {
+            try atomicWriteJSON(["a": 1], to: file)
+            try atomicWriteJSON(["a": 2], to: file)
+            let back = try JSONDecoder().decode([String: Int].self, from: Data(contentsOf: file))
+            let perm = (try FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions] as? NSNumber)?.intValue ?? 0
+            let leftovers = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+            check(back == ["a": 2], "原子写覆盖后内容应为最新")
+            check(perm & 0o777 == 0o600, "原子写后权限应为 0600")
+            check(leftovers == ["node-state.json"], "原子写不应留下临时文件")
+        } catch {
+            check(false, "原子写失败：\(error)")
+        }
+        try? FileManager.default.removeItem(at: dir)
+        failures.append(contentsOf: NodeClient.selfTest().map { "NodeClient: \($0)" })
         return failures
     }
 

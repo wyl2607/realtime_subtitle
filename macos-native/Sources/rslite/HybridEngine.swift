@@ -171,16 +171,13 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
             onClosed: { [weak self] nodeID, generation, _ in
                 guard let self else { return }
                 self.lock.withLockVoid {
-                    let key = NodeSessionKey(nodeID: nodeID, generation: generation)
-                    self.pendingNodeFinals.removeValue(forKey: key)
-                    guard self.activeNodeSessions[nodeID] == generation else {
-                        return
-                    }
-                    self.activeNodeSessions.removeValue(forKey: nodeID)
-                    self.clearPending(for: nodeID)
-                    if self.selectedNodeSession == key {
-                        self.selectedNodeSession = nil
-                    }
+                    Self.applySessionClosed(
+                        nodeID: nodeID,
+                        generation: generation,
+                        pendingFinals: &self.pendingNodeFinals,
+                        activeSessions: &self.activeNodeSessions,
+                        selectedSession: &self.selectedNodeSession
+                    )
                 }
             }
         )
@@ -246,17 +243,21 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
         }
     }
 
-    private static func closingSessionClearsSelection(
+    /// 会话关闭的状态清理：生产 onClosed 与 selftest 共用这一个函数。
+    private static func applySessionClosed(
         nodeID: String,
         generation: Int,
+        pendingFinals: inout [NodeSessionKey: [Int: (String, Double?, Double?)]],
         activeSessions: inout [String: Int],
         selectedSession: inout NodeSessionKey?
     ) {
         let key = NodeSessionKey(nodeID: nodeID, generation: generation)
+        pendingFinals.removeValue(forKey: key)
         guard activeSessions[nodeID] == generation else {
             return
         }
         activeSessions.removeValue(forKey: nodeID)
+        pendingFinals = pendingFinals.filter { $0.key.nodeID != nodeID }
         if selectedSession == key {
             selectedSession = nil
         }
@@ -283,19 +284,27 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
             activeSessions: sessions,
             previous: Self.NodeSessionKey(nodeID: "A", generation: 1)
         )
-        Self.closingSessionClearsSelection(
+        var pending: [NodeSessionKey: [Int: (String, Double?, Double?)]] = [
+            NodeSessionKey(nodeID: "A", generation: 1): [1: ("x", nil, nil)],
+            NodeSessionKey(nodeID: "B", generation: 1): [2: ("y", nil, nil)],
+        ]
+        Self.applySessionClosed(
             nodeID: "A",
             generation: 1,
+            pendingFinals: &pending,
             activeSessions: &sessions,
             selectedSession: &selected
         )
+        check(pending.count == 1 && pending[NodeSessionKey(nodeID: "B", generation: 1)] != nil,
+              "旧会话关闭只应清自己的待定 final")
         check(selected == Self.NodeSessionKey(nodeID: "B", generation: 1),
               "旧会话关闭不应清除当前选中节点")
         check(sessions["A"] == nil && sessions["B"] == 1,
               "旧会话关闭只应清理自己的活跃缓存")
-        Self.closingSessionClearsSelection(
+        Self.applySessionClosed(
             nodeID: "B",
             generation: 1,
+            pendingFinals: &pending,
             activeSessions: &sessions,
             selectedSession: &selected
         )
