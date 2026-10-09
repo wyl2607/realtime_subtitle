@@ -371,6 +371,12 @@ final class NodeRouter: @unchecked Sendable {
             do {
                 try await client?.send(audio)
             } catch {
+                if Self.isAudioGap(error) {
+                    if let session {
+                        await endSessionForAudioGap(session: session)
+                    }
+                    continue
+                }
                 if isCancellationOrStopped(error) {
                     return
                 }
@@ -442,28 +448,31 @@ final class NodeRouter: @unchecked Sendable {
             )
             created = client
             try await client.connect()
-            guard lock.withLockValue({
-                Self.canPublishSwitch(
+            // 检查与发布在同一把锁内：并发 select 不能在两者之间改写 pendingMigrationID（R4-1）
+            let old = lock.withLockValue { () -> NodeClient?? in
+                guard Self.canPublishSwitch(
                     stopped: stopped,
                     switching: switching,
                     switchGeneration: switchGeneration,
                     reservedGeneration: generation,
                     pendingMigrationID: pendingMigrationID,
                     nodeID: node.id
-                )
-            }) else {
-                await client.close()
-                return
-            }
-            let old = lock.withLockValue { currentClient }
-            lock.withLockVoid {
+                ) else {
+                    return nil
+                }
+                let previous = currentClient
                 currentClient = client
                 currentSession = NodeSessionRef(nodeID: node.id, generation: sessionGeneration)
                 currentNode = node
                 currentToken = token
                 currentInfo = info
-                pendingMigrationID = nil
+                Self.clearPendingIfMatches(&pendingMigrationID, nodeID: node.id)
                 silenceRun = 0
+                return .some(previous)
+            }
+            guard let old = old else {
+                await client.close()
+                return
             }
             published = true
             onMode(.hybrid(node.id))
@@ -489,13 +498,35 @@ final class NodeRouter: @unchecked Sendable {
             routeLog("select local reason=switch_failed node=\(node.id) err=\(routeErrorCode(error))")
             lock.withLockVoid {
                 states[node.id] = NodeStateRecord(info: nil, rtf: nil, offlineUntil: nowSeconds() + Self.offlineDuration)
-                pendingMigrationID = nil
+                Self.clearPendingIfMatches(&pendingMigrationID, nodeID: node.id)
             }
             persistState()
             if lock.withLockValue({ currentNode == nil }) {
                 onMode(.local)
             }
         }
+    }
+
+    /// 音频断档过长：干净结束当前会话（不标 offline、不罚时），保留迁移意图，
+    /// 下一块音频到达时 audioLoop 因 currentNode==nil 立即重开（节点时钟用新的 latestClock 重建）。
+    private func endSessionForAudioGap(session: NodeSessionRef) async {
+        let old = lock.withLockValue { () -> NodeClient? in
+            guard currentSession == session, let node = currentNode else { return nil }
+            let client = currentClient
+            currentClient = nil
+            currentSession = nil
+            currentNode = nil
+            currentToken = nil
+            currentInfo = nil
+            if pendingMigrationID == nil {
+                pendingMigrationID = node.id
+            }
+            return client
+        }
+        guard let old else { return }
+        routeLog("audio_gap session_end node=\(session.nodeID) (not a node fault)")
+        onMode(.local)
+        await old.close()
     }
 
     /// 来自 onClosed 的故障入口：与 send 失败共用 markCurrentOfflineAndFallback（唯一回退入口）。
@@ -617,7 +648,13 @@ final class NodeRouter: @unchecked Sendable {
     }
 
     /// 同目录临时文件（0600）写满 -> fsync -> rename(2) 覆盖；任何一步失败都不动目标文件。
-    static func atomicWriteJSON<T: Encodable>(_ value: T, to url: URL) throws {
+    /// fchmod/fsync/write 任一失败 -> 关 fd、unlink 临时文件、抛错，绝不 rename（R4-3）。
+    /// `sync` 可注入（默认 fsync），仅供 selftest 模拟失败。
+    static func atomicWriteJSON<T: Encodable>(
+        _ value: T,
+        to url: URL,
+        sync: (Int32) -> Int32 = { fsync($0) }
+    ) throws {
         let data = try JSONEncoder().encode(value)
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
@@ -645,11 +682,18 @@ final class NodeRouter: @unchecked Sendable {
                         if errno == EINTR { continue }
                         throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
                     }
+                    if n == 0 {
+                        throw POSIXError(.EIO)
+                    }
                     offset += n
                 }
             }
-            fchmod(fd, 0o600)
-            fsync(fd)
+            if fchmod(fd, 0o600) != 0 {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            if sync(fd) != 0 {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
         } catch {
             close(fd)
             throw error
@@ -793,9 +837,46 @@ final class NodeRouter: @unchecked Sendable {
         } catch {
             check(false, "原子写失败：\(error)")
         }
+        // R4-3：fsync 失败 -> 抛错、不 rename（旧内容保留）、无残留临时文件
+        do {
+            try atomicWriteJSON(["a": 3], to: file)
+            var threw = false
+            do {
+                try atomicWriteJSON(["a": 4], to: file, sync: { _ in errno = EIO; return -1 })
+            } catch {
+                threw = true
+            }
+            let back = try JSONDecoder().decode([String: Int].self, from: Data(contentsOf: file))
+            let leftovers = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+            check(threw, "fsync 失败应抛错")
+            check(back == ["a": 3], "fsync 失败不得 rename 覆盖目标")
+            check(leftovers == ["node-state.json"], "fsync 失败应 unlink 临时文件")
+        } catch {
+            check(false, "fsync 注入测试异常：\(error)")
+        }
         try? FileManager.default.removeItem(at: dir)
+        // R4-1：清迁移意图只清自己的
+        var pend: String? = "other"
+        clearPendingIfMatches(&pend, nodeID: "better")
+        check(pend == "other", "R4-1：pending 被改写后不清除新意图")
+        pend = "better"
+        clearPendingIfMatches(&pend, nodeID: "better")
+        check(pend == nil, "R4-1：pending 匹配时清除")
+        // R4-2：audioGap 为非故障
+        check(isAudioGap(NodeClientError.audioGap), "audioGap 识别")
+        check(!isAudioGap(NodeClientError.pingTimeout), "pingTimeout 不是 audioGap")
+        check(isCancellationOrStopped(NodeClientError.audioGap, taskIsCancelled: false, routerStopped: false),
+              "R4-2：audioGap 视为非故障")
+        check(!shouldFallbackOnClosed(error: NodeClientError.audioGap, closed: a, current: a, routerStopped: false),
+              "R4-2：audioGap 不触发故障回退")
         failures.append(contentsOf: NodeClient.selfTest().map { "NodeClient: \($0)" })
         return failures
+    }
+
+    /// audioGap 属于「非故障」：isCancellationOrStopped 把它并入，故 markCurrentOfflineAndFallback / shouldFallbackOnClosed 都不会罚节点。
+    static func isAudioGap(_ error: Error) -> Bool {
+        if case NodeClientError.audioGap = error { return true }
+        return false
     }
 
     private static func isCancellationOrStopped(
@@ -806,7 +887,7 @@ final class NodeRouter: @unchecked Sendable {
         if taskIsCancelled || routerStopped {
             return true
         }
-        if error is CancellationError {
+        if error is CancellationError || isAudioGap(error) {
             return true
         }
         if let urlError = error as? URLError, urlError.code == .cancelled {
@@ -814,6 +895,13 @@ final class NodeRouter: @unchecked Sendable {
         }
         let nsError = error as NSError
         return nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled
+    }
+
+    /// 只清自己的迁移意图：pending 已被并发 select 改写成别的节点就保留（R4-1）。
+    static func clearPendingIfMatches(_ pending: inout String?, nodeID: String) {
+        if pending == nodeID {
+            pending = nil
+        }
     }
 
     private static func canPublishSwitch(

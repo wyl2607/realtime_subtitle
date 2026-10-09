@@ -56,6 +56,8 @@ enum NodeClientError: Error, CustomStringConvertible {
     case protocolError(String)
     case connection(String)
     case pingTimeout
+    /// 音频断档超过 maxPadGapSeconds：干净结束会话，不是节点故障（路由不标 offline、不罚时）。
+    case audioGap
 
     var description: String {
         switch self {
@@ -69,6 +71,7 @@ enum NodeClientError: Error, CustomStringConvertible {
         case .protocolError(let message): return "节点协议错误：\(message)"
         case .connection(let message): return "节点连接失败：\(message)"
         case .pingTimeout: return "节点心跳超时"
+        case .audioGap: return "音频断档过长，结束会话待重开"
         }
     }
 
@@ -90,6 +93,8 @@ enum NodeClientError: Error, CustomStringConvertible {
             return "handshake_timeout"
         case .pingTimeout:
             return "ping_timeout"
+        case .audioGap:
+            return "audio_gap"
         case .protocolError:
             return "protocol_error"
         case .connection(let message):
@@ -287,13 +292,17 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         let data = try Self.convert(audio.buffer, using: converter)
         // 节点按收到的样本数推时钟（P2）。会话建立期间/发送变慢时 AudioFanout 会丢旧帧，
         // 客户端时钟前进了而节点没收到：用零 PCM 补上这段，节点 a0 才不会永久偏前（P5 替换对得上行）。
-        let pad = lock.withLockValue { () -> Int in
+        let padResult = lock.withLockValue { () -> Int? in
             if !clockStarted {
                 clockStarted = true
                 offsetSeconds = audio.startSeconds
                 return 0
             }
-            return Self.gapPadSamples(offset: offsetSeconds, sentSamples: sentSamples, audioStart: audio.startSeconds)
+            return Self.boundedGapPadSamples(offset: offsetSeconds, sentSamples: sentSamples, audioStart: audio.startSeconds)
+        }
+        // 断档过长（如睡眠唤醒）不补零：补 30 分钟 = 57MB 零 PCM。抛 .audioGap，由路由干净结束会话并重开。
+        guard let pad = padResult else {
+            throw NodeClientError.audioGap
         }
         if pad > 0 {
             var remaining = pad * 2
@@ -323,6 +332,18 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
             return 0
         }
         return Int((gap * 16_000).rounded())
+    }
+
+    /// 补零上限（秒）：大于正常调度抖动/短暂卡顿，远小于 gateway 积压上限；超过则结束会话而非补零。
+    static let maxPadGapSeconds = 5.0
+
+    /// 有上限的补零：nil = 断档超过 maxPadGapSeconds（调用方应结束会话，不补零）。
+    static func boundedGapPadSamples(offset: Double, sentSamples: Int, audioStart: Double, tolerance: Double = 0.1) -> Int? {
+        let gap = audioStart - (offset + Double(sentSamples) / 16_000)
+        if gap > maxPadGapSeconds {
+            return nil
+        }
+        return gapPadSamples(offset: offset, sentSamples: sentSamples, audioStart: audioStart, tolerance: tolerance)
     }
 
     func flush() async {
@@ -719,7 +740,12 @@ extension NodeClient {
         // 断档补零
         check(gapPadSamples(offset: 100, sentSamples: 16_000, audioStart: 101) == 0, "时钟连续不补零")
         check(gapPadSamples(offset: 100, sentSamples: 16_000, audioStart: 101.05) == 0, "容差内不补零")
-        check(gapPadSamples(offset: 100, sentSamples: 16_000, audioStart: 107) == 96_000, "丢 6s 帧补 6s 零（96000 样本）")
+        check(gapPadSamples(offset: 100, sentSamples: 16_000, audioStart: 107) == 96_000, "丢 6s 帧纯函数仍算 96000 样本")
+        check(boundedGapPadSamples(offset: 100, sentSamples: 16_000, audioStart: 104) == 48_000, "R4-2：阈值内（3s）照旧补零")
+        check(boundedGapPadSamples(offset: 100, sentSamples: 16_000, audioStart: 106) == 80_000, "R4-2：恰好 5s 仍补零")
+        check(boundedGapPadSamples(offset: 100, sentSamples: 16_000, audioStart: 107) == nil, "R4-2：6s 超阈值不补零（结束会话）")
+        check(boundedGapPadSamples(offset: 100, sentSamples: 16_000, audioStart: 1900) == nil, "R4-2：30 分钟断档不补零")
+        check(boundedGapPadSamples(offset: 100, sentSamples: 16_000, audioStart: 101) == 0, "R4-2：连续仍为 0")
         check(gapPadSamples(offset: 100, sentSamples: 16_000, audioStart: 100.5) == 0, "时钟重叠不补零")
         // drained 按节点+会话代匹配
         let waiters = NodeDrainWaiters()
