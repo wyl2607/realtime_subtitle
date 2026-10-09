@@ -5,8 +5,8 @@
 
 | CR | TK | rounds | status | last_action |
 |----|----|--------|--------|-------------|
-| CR-010 | TK-003b | 1 | recheck | 2026-10-09 17:35 CEST: round1 needs_fix（CR010-01 accepted）→ e3eef2b → round2 codex |
-| CR-009 | TK-005 | 1 | recheck | 2026-10-09 17:35 CEST: round1 两路 needs_fix（default F1–F3 accepted；security S1 契约冲突上报用户、S2 rejected）→ 修复 18dcaed（冒烟 18/18）→ round2 Gemini pro |
+| CR-010 | TK-003b | 2 | resolved | 2026-10-09 17:50 CEST: round2 codex approve；已合并 523877b |
+| CR-009 | TK-005 | 2 | needs_fix | 2026-10-09 17:35 CEST: round1 两路 needs_fix（default F1–F3 accepted；security S1 契约冲突上报用户、S2 rejected）→ 修复 18dcaed → round2 Gemini needs_fix（F4/F5 accepted）→ codex 修 |
 | CR-008 | TK-006 | 2 | resolved | 2026-10-09 17:05 CEST: round2 codex approve（bb6b406）；待 TK-005 先合 + 同步 TK-002b 原因码 |
 | CR-007 | TK-002b | 3 | resolved | 2026-10-09 17:20 CEST: round3 Gemini approve；已合并 e3233ca |
 | CR-006 | TK-001c | 2 | resolved | 2026-10-09 12:00 CST: round2 approve_with_minor；R2-F1 coordinator-direct 0691d95；已合并；F3 文案 efa713c |

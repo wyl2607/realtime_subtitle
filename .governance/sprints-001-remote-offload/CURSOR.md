@@ -4,7 +4,7 @@
 <!-- Machine fields: new writes must use "- key: `value`". Legacy variants are read-only compatibility. -->
 - current_phase: `execution+review`
 - current_tk: `TK-002b,TK-005,TK-006,TK-007(prep)`
-- current_cr: `CR-009,CR-010`
+- current_cr: `CR-009`
 - current_round: `0`
 - escalated: `false`
 
@@ -18,13 +18,14 @@
 | TK-003 | 一键安装 install_node.sh | done（mini2 已装；TCP 监听 blocker，见 HANDOFF §11.2） |
 | TK-004 | rslite：带时间句子 + AudioFanout + 混合替换 + 单实例 | done |
 | TK-002b | gateway：launchd 下 Tailscale CLI 修复 + 安装自检补 TCP | done |
-| TK-003b | install 测试 macOS 密封 + bash 多字节 bug | reviewing |
+| TK-003b | install 测试 macOS 密封 + bash 多字节 bug | done |
 | TK-001c | worker：translator 写当前真实翻译器名 | done |
 | TK-005 | rslite：NodeClient v2 + NodeRouter + 本机档门槛 | reviewing |
 | TK-006 | 清理 v1 + 文档 | reviewing |
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 17:50 CEST: **TK-003b done**：CR-010 round2 approve → 合并 523877b（主线看门狗安装测试 112 passed、其余 906 passed/1 基线失败、ruff/shellcheck 通过）。主线安装脚本已可用于 mini2 重装（等用户批准）。CR-009 round2 Gemini：F1–F3 确认修好，新 F4（取消被当节点故障）/F5（旧会话 drain 期间断开覆盖新节点模式）accepted → codex 修。frame_size 基线失败（1013 busy）派 opencode 免费模型只做根因调查（detached /tmp/inv-frame/wt）
 - 2026-10-09 17:35 CEST: CR-010 round1 codex needs_fix（CR010-01 TGT_PATH_EXPORT 控制端插值注入面 accepted）→ e3eef2b 单引号目标端展开（shellcheck 0、看门狗 112 passed）→ round2 codex；Gemini 在 tk-003b 仓库根留 30 个调试文件已挪 /tmp。TK-005 codex 修 F1–F3 → 18dcaed（Coordinator 本机 build/selftest/冒烟 18/18/真实配置未动）→ CR-009 round2 Gemini pro。等用户：mini2 重装批准、S1 契约取舍
 - 2026-10-09 17:20 CEST: **TK-002b done**：CR-007 round3 Gemini approve → 合并 e3233ca（906 passed，唯一失败为基线 frame_size；ruff/bash -n 通过）。TK-003b：Gemini 定位 14 个 UnicodeDecodeError 根因——**bash 3.2 在 UTF-8 locale 下把 `$var` 后紧跟的全角字符首字节吞进变量名 → 变量值丢失+乱码**（Gemini 说成 C locale，Coordinator 复现纠正：C 下正常、UTF-8 下出错；生产 ssh 环境即 UTF-8，真 bug）；install_node.sh 2 处加大括号，并发两份 112 passed；Coordinator perl 全仓扫描另发现 power_compare.sh 2 处 → tk-007 [coordinator-direct] 1b4890b → CR-010（codex）。CR-008 两轮收敛（待 TK-005 先合）。CR-009：Gemini default needs_fix F1（stop 与 connect 竞态泄露会话）/F2（pendingNodeFinals 不清）/F3（pause→resume 路由不重启，Coordinator 核实属实）全 accepted；codex security S1（P1 要求 /v1/info 带 token vs S5「核对前不发 token」契约冲突）作为实现 rejected、上报用户决定，S2 rejected → codex 修 F1–F3
 - 2026-10-09 16:55 CEST: CR-007 round2 codex approve（17c5463，Coordinator 另以 /bin/bash 3.2 实打 13 个边界 IP 全对）→ round3 Gemini pro 整体安全通读。CR-008 round1 codex needs_fix → F1/F2/F4 accepted、F3 rejected → Gemini flash 修。TK-003b：opencode 改 RS_TOOL_PATH_PREFIX（默认值不变）+ BSD sed + say/afconvert 桩 → 不再挂死（105s），剩 14 个注入类安全测试 UnicodeDecodeError(0xbc) → 合入 tk-002b 最新后 Gemini pro 查根因。**TK-005**：sonnet 本机调试 b66455a 修 4 个客户端 bug，冒烟 18/18；Coordinator 复核时发现 ①冒烟曾覆盖用户真实 ~/.config/rslite/nodes.json（mini2 条目丢失，已按安装脚本同法重建并 ssh 只读取回 node_id）②契约 bug：P6 url 不带路径 → 客户端连到 "/" → 真节点必失败 → [coordinator-direct] 9de0e79 补 /v2/session + RSLITE_CONFIG_DIR 隔离冒烟；复跑 18/18、真实配置 md5 不变 → reviewing，CR-009 round1（Gemini pro default + codex security），计划 3 轮
