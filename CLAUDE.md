@@ -1262,10 +1262,10 @@ macOS 避坑（每一条都是这次迁移真实踩过的）：
     二进制靠环境里有没有 `SHLVL` 判 CLI/GUI 模式，launchd 的环境没有 `SHLVL`，
     于是按 GUI 启动，stdout 打 "The Tailscale GUI failed to start: ..."，退出码 0，
     被当成 IP 取了第一行，校验不过。做法：调 tailscale CLI 一律带环境变量
-    `TAILSCALE_BE_CLI=1`（官方强制 CLI 开关），并校验首行确实是 `100.64.0.0/10`
-    的 IPv4；复现要用 `env -i` + plist 里的 PATH，别用交互 shell；安装自检要验
-    TCP 真的在 Tailscale IP 上监听，只经 UDS 验 `/v1/info` 会把"TCP 没起来"
-    报成安装成功。
+    `TAILSCALE_BE_CLI=1`（2026-10-09 mini2：env -i 下加 TAILSCALE_BE_CLI=1 或
+    SHLVL=1 均恢复 CLI 输出），并校验首行确实是 `100.64.0.0/10` 的 IPv4；复现要用
+    `env -i` + plist 里的 PATH，别用交互 shell；安装自检要验 TCP 真的在 Tailscale IP
+    上监听，只经 UDS 验 `/v1/info` 会把"TCP 没起来"报成安装成功。
 23. **起真进程 + `pgrep` 的测试会互杀**（2026-10-09，CR-005）。现象：并发
     跑两份测试，或在 mini2 这种真有 v1 在跑的机器上跑，一个测试的 `pkill`/`pgrep`
     误杀别人起的进程，包括真正的 v1 服务；合成命令行的测试还测不出真实命令行

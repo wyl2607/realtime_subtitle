@@ -73,12 +73,12 @@ gateway 只向客户端放行这五种事件（`_CLIENT_EVENTS`，`gateway.py:10
 | `worker_crashed` | gateway（`gateway.py:586, 97-102`） | worker 在会话中退出：退出码非 0 且不是 2/3/4，**或退出码为 0**（会话进行中 worker 不该自己退出），或无法拉起/管道写失败后等不到退出码（记为 -1）。文案「识别进程异常退出」 |
 | `protocol_error` | worker 自发 + gateway 映射 | worker 退出码 2（`worker.py:206-207`） |
 | `engine_load_failed` | worker 自发 + gateway 映射 | worker 退出码 3（`worker.py:270-272`） |
-| `internal_error` | worker 自发 + gateway 映射 | worker 退出码 4（`worker.py:208-211`） |
+| `internal_error` | worker 自发 + gateway 映射 / 仅 gateway 映射 | worker 退出码 4（主线程异常 `worker.py:208-211`；工作线程 BaseException 直接 `os._exit(4)` `worker.py:545-555`） |
 | `translator_unavailable` | worker（`worker.py:288`） | 翻译器构造失败，只输出原文；会话继续 |
 | `translate_failed` | worker（`worker.py:490, 499`） | 一句翻译失败或异常，已跳过；会话继续 |
 | `asr_error` | worker（`worker.py:446`） | 一段识别失败，已跳过；会话继续 |
 
-其中 `protocol_error`/`engine_load_failed`/`internal_error` 对客户端是**致命**的：worker 先自发一条 status，退出后 gateway 把 worker 退出前已产出的事件刷完，再补发一条同码的 status，然后以 close `1011` 关闭连接（`gateway.py:590-597`）。客户端可能因此看到同一个 code 两次，应按 code 去重。
+其中 `protocol_error`/`engine_load_failed`/`internal_error` 对客户端是**致命**的：通常路径下 worker 先自发一条 status，退出后 gateway 把 worker 退出前已产出的事件刷完，再补发一条同码的 status，然后以 close `1011` 关闭连接（`gateway.py:590-597`）；但 `internal_error` 存在两种路径：主线程异常走上述自发+补发，若为工作线程致命异常退出（`worker.py:545-555` 直接 `os._exit(4)`），worker 无法自发 status，仅由 gateway 映射发出。客户端可能因此看到同一个 code 两次（或仅一次），应按 code 去重。
 
 ### 退出码 → status.code 映射
 
@@ -91,6 +91,7 @@ gateway 只向客户端放行这五种事件（`_CLIENT_EVENTS`，`gateway.py:10
 | 1000 | 会话达到 4h 上限（`SESSION_MAX_S`） | `gateway.py:60, 580` |
 | 1003 | hello 不是 JSON；音频格式不支持；音频帧字节数为奇数；会话中收到非 JSON 或未知消息 | `gateway.py:642, 676, 688, 908, 919` |
 | 1008 | hello 超时/缺失/版本不对/语言不合法；重复 hello；控制消息队列溢出 | `gateway.py:682, 686, 897, 902, 911, 914, 924` |
+| 1009 | 单帧消息超过 64KB（`MAX_MESSAGE_BYTES = 64 * 1024`，协议层直接拒绝） | `gateway.py:58, 741` |
 | 1011 | worker 异常退出（配合上表 status） | `gateway.py:597` |
 | 1013 | 忙（已有会话）。**判断在读 hello 之前**，后来者立即被拒 | `gateway.py:880-883` |
 
