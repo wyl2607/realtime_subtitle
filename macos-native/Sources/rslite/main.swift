@@ -18,8 +18,8 @@ struct Options {
     var src = "de-DE"
     var dst = "zh-Hans"
     var headless = false
-    var remote: URL?
-    var tokenFile = "~/.config/rslite/remote-token"
+    var mode = RSLiteMode.auto
+    var selftest = false
 }
 
 @main
@@ -35,6 +35,21 @@ struct RSLite {
             options = try parse(Array(CommandLine.arguments.dropFirst()))
         } catch {
             fputs("error: \(error)\n", stderr)
+            exit(1)
+        }
+        if options.selftest {
+            runSelfTest()
+            return
+        }
+        do {
+            if !(options.headless && options.source.hasPrefix("file:")) {
+                guard try SingleInstance.acquire() else {
+                    fputs("error: rslite 已在运行，本实例退出\n", stderr)
+                    exit(2)
+                }
+            }
+        } catch {
+            fputs("error: 单实例锁失败：\(error)\n", stderr)
             exit(1)
         }
         guard #available(macOS 27.0, *) else {
@@ -68,7 +83,10 @@ struct RSLite {
             case "--headless":
                 options.headless = true
                 i += 1
-            case "--source", "--src", "--dst", "--remote", "--token-file":
+            case "--selftest":
+                options.selftest = true
+                i += 1
+            case "--source", "--src", "--dst", "--mode":
                 guard i + 1 < args.count else {
                     throw RSLiteError.usage("missing value for \(key)")
                 }
@@ -80,14 +98,11 @@ struct RSLite {
                     options.src = value
                 case "--dst":
                     options.dst = value
-                case "--token-file":
-                    options.tokenFile = value
                 default:
-                    guard let url = URL(string: value), let scheme = url.scheme,
-                          ["ws", "wss"].contains(scheme), url.host != nil else {
-                        throw RSLiteError.usage("--remote 需要 ws:// 或 wss:// 地址，例如 ws://100.x.y.z:8790/v1")
+                    guard let mode = RSLiteMode(rawValue: value) else {
+                        throw RSLiteError.usage("--mode 只能是 auto、local 或 hybrid")
                     }
-                    options.remote = url
+                    options.mode = mode
                 }
                 i += 2
             default:
@@ -97,30 +112,27 @@ struct RSLite {
         return options
     }
 
-    private static let usage = "usage: rslite [--source tap|mic|file:PATH] [--src de-DE] [--dst zh-Hans] [--headless] [--remote ws://HOST:PORT/v1] [--token-file PATH]"
+    private static let usage = "usage: rslite [--source tap|mic|file:PATH] [--src de-DE] [--dst zh-Hans] [--headless] [--mode auto|local|hybrid] [--selftest]"
 
-    /// 给了 --remote 才走远程；否则和原来一样直接用本机 Pipeline。
     @available(macOS 27.0, *)
     private static func makeEngine(
         _ options: Options,
         callbacks: PipelineCallbacks,
-        onMode: @escaping @Sendable (SubtitleMode) -> Void
+        onMode: @escaping @Sendable (SubtitleMode) -> Void,
+        onNodeFinal: @escaping @Sendable (String, Double?, Double?, String, String?) -> Void = { _, _, _, _, _ in }
     ) -> SubtitleEngine {
-        let base = PipelineConfig(
+        let config = PipelineConfig(
             sourceSpec: options.source,
             sourceLocaleID: options.src,
             targetLanguageID: options.dst
         )
-        guard let remote = options.remote else {
-            return Pipeline(config: base, callbacks: callbacks)
-        }
-        let config = RemoteConfig(
-            url: remote,
-            token: RemoteTokenFile.read(path: options.tokenFile),
-            tokenPath: options.tokenFile,
-            base: base
+        return HybridEngine(
+            config: config,
+            mode: options.mode,
+            callbacks: callbacks,
+            onMode: onMode,
+            onNodeFinal: onNodeFinal
         )
-        return RemotePipeline(config: config, callbacks: callbacks, onMode: onMode)
     }
 
     @available(macOS 27.0, *)
@@ -146,6 +158,12 @@ struct RSLite {
             ),
             onMode: { mode in
                 writeEvent(clock: clock, startedAt: startedAt, ev: "status", id: nil, text: "模式：\(mode.label)")
+            },
+            onNodeFinal: { nodeID, t0, t1, src, dst in
+                writeEvent(clock: clock, startedAt: startedAt, ev: "final", id: nil, text: "[\(nodeID)] \(src)", t0: t0, t1: t1)
+                if let dst {
+                    writeEvent(clock: clock, startedAt: startedAt, ev: "translation", id: nil, text: "[\(nodeID)] \(dst)")
+                }
             }
         )
 
@@ -207,6 +225,9 @@ struct RSLite {
             ),
             onMode: { mode in
                 Task { @MainActor in overlay.setMode(mode) }
+            },
+            onNodeFinal: { nodeID, t0, t1, src, dst in
+                Task { @MainActor in overlay.addNodeFinal(nodeID: nodeID, t0: t0, t1: t1, src: src, dst: dst) }
             }
         )
 
@@ -252,6 +273,25 @@ struct RSLite {
 
     private static func round3(_ value: Double) -> Double {
         (value * 1000).rounded() / 1000
+    }
+
+    private static func runSelfTest() {
+        var failures: [String] = []
+        failures.append(contentsOf: LineStore.selfTest().map { "LineStore: \($0)" })
+        failures.append(contentsOf: Capability.selfTest().map { "Capability: \($0)" })
+        if #available(macOS 27.0, *) {
+            failures.append(contentsOf: NodeRouter.selfTest().map { "NodeRouter: \($0)" })
+        } else {
+            failures.append("NodeRouter: 需要 macOS 27")
+        }
+        if failures.isEmpty {
+            print("SELFTEST OK")
+            exit(0)
+        }
+        for failure in failures {
+            print("SELFTEST FAIL \(failure)")
+        }
+        exit(1)
     }
 }
 

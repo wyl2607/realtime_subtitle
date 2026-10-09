@@ -15,7 +15,9 @@ op 为 `translate` 或 `status`；失败返回 `{"id":..,"error":..}` 且进程�
 
 rslite（实时字幕）：`swift build -c release --product rslite`。
 真机界面：`.build/release/rslite --source tap --src de-DE --dst zh-Hans`；当前分支 `tap/mic` 会提示“采集模块未接入”。
-文件压测：`.build/release/rslite --headless --source file:/path/to/audio.wav --src de-DE --dst zh-Hans`。
+文件压测：`.build/release/rslite --headless --source file:/path/to/audio.wav --src de-DE --dst zh-Hans --mode local`。
 headless 输出 JSONL：`volatile/final/translation/status`，文件结束后等待最后一句翻译完成再退出。
-远程识别：`.build/release/rslite --remote ws://<mini2 Tailscale IP>:8790/v1 --token-file ~/.config/rslite/remote-token`，本机只抓声音和显示，识别翻译在 mini2 上做；菜单栏显示「字·远程」。
-token 文件权限须为 600（否则打印警告）；连不上远程（鉴权失败、busy、5 秒无 ready、中途断线）会回退到本机识别，菜单栏变「字·本机」，headless 的 status 行同步输出「模式：远程/本机」。
+混合精修：安装脚本写 `~/.config/rslite/nodes.json`（0600）后运行 `.build/release/rslite --source tap --mode auto`；也可用 `--mode local` 强制本机、`--mode hybrid` 强制尝试节点精修。
+节点清单格式：`[{"id":"mini2","node_id":"...","url":"ws://mini2.tailnet:8791/v2/session","token_file":"~/.config/rslite/mini2-token"}]`。token 文件必须是 0600；客户端先查 `/v1/info` 校验 `node_id`，不一致就不建立会话、不发送音频。
+菜单栏显示「字·本机」「字·混合·<节点>」「字·精修中」；路由选择理由写 stderr，日志不写转录正文或译文。
+自检：`.build/release/rslite --selftest` 会跑混合替换、P8 能力门槛、节点打分和迁移门槛的纯逻辑检查。
