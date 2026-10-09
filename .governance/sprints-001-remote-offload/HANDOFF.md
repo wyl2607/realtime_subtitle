@@ -222,7 +222,7 @@ cd macos-native && swift build -c release --product rslite
 | TK-002 gateway | ✅ done | CR-003 四轮。Mac 真机：RSS 33MB、只绑 Tailscale IP、LOCAL_PEERCRED 可用、401/200、日志无 token |
 | TK-003 install_node.sh | ✅ done（代码） | CR-005 三轮 + Coordinator C1/C2。**真机安装到 mini2 未执行，须先逐步说明、获用户批准** |
 | TK-004 rslite | ✅ done | CR-001 三轮。Mac `swift build` 通过、concat5 回放 t0/t1 与基线逐字节一致 |
-| TK-001c | planned | worker 的 asr_state.json `translator` 永久沿用旧值（安装写 ollama、后装语言包仍报 ollama）→ 写当前真实翻译器名。write_scope worker.py + tests/test_node_worker.py，单独小批 |
+| TK-001c | ✅ done | CR-006 两轮。translator 写本会话真实翻译器名；install_node.sh 提示文案同步（efa713c） |
 | TK-005 Swift NodeClient/Router | planned（已解锁） | 状态机+安全，准备第 3 轮。含 CR-001 F5（main 接单实例、`--selftest` 调 `LineStore.selfTest()`）与 M1 注记（AudioFanout start/stop 并发） |
 | TK-006 清理 v1 + 文档 | planned | 等 TK-005。`docs/protocol-v2.md` 须写明：会话中 worker 退出（含 0）→ worker_crashed；status code 2/3/4 映射、audio_dropped、backlog_dropped |
 | TK-007 验收 + 五组功耗 | planned | 远程操作，单独一批，每步先说明 |

@@ -2,7 +2,7 @@
 
 ## 当前状态
 <!-- Machine fields: new writes must use "- key: `value`". Legacy variants are read-only compatibility. -->
-- current_phase: `review`
+- current_phase: `merge`
 - current_tk: `TK-001c`
 - current_cr: `CR-006`
 - current_round: `2`
@@ -17,12 +17,13 @@
 | TK-002 | 节点 gateway：生命周期 + 协议 v2 + 鉴权与上限 | done |
 | TK-003 | 一键安装 install_node.sh | done（真机装 mini2 待批准） |
 | TK-004 | rslite：带时间句子 + AudioFanout + 混合替换 + 单实例 | done |
-| TK-001c | worker：translator 写当前真实翻译器名 | recheck |
+| TK-001c | worker：translator 写当前真实翻译器名 | done |
 | TK-005 | rslite：NodeClient v2 + NodeRouter + 本机档门槛 | planned |
 | TK-006 | 清理 v1 + 文档 | planned |
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 12:00 CST: CR-006 round2（opus）approve_with_minor：F1 partially（第一会话名恰等于 DEFAULT_TRANSLATOR，变异 B 抓不到）→ R2-F1 accepted，[coordinator-direct] 0691d95，复现改后变异 A/B 均红 → **TK-001c done**，合并进 feat/macos-native（920 passed、ruff 通过）；F3 [coordinator-direct] efa713c。下一步：向用户说明 mini2 真机安装计划，等批准
 - 2026-10-09 11:45 CST: TK-001c repair 回收 8fc99ce（Coordinator 复跑 210/920 passed、ruff 通过）→ recheck，CR-006 round2（opus）
 - 2026-10-09 11:35 CST: CR-006 round1（opus）approve_with_minor：F1（换语言对用例）/F2（注释）accepted → repair（同一 sonnet executor）；F3 accepted 由 Coordinator 合并后改 install_node.sh 文案；F4 rejected（pre-existing）
 - 2026-10-09 11:20 CST: TK-001c 回报 4257dc2（scope 内；Coordinator 复核 209/919 passed、ruff 通过、并发跑无互扰）→ reviewing，CR-006 round1（opus）
@@ -71,6 +72,5 @@
 - 2026-10-09 04:05 CST: Sprint 001 initialized, awaiting TK-001（用户已批准全部 TK 排队执行，含 TK-007 对 mini2 的远程操作）
 
 ## 下一步
-- TK-001c 回报 → CR-006 round1（opus）→ round2 → 合并
-- 向用户逐步说明真机安装 mini2 的计划，获批后执行
+- 向用户逐步说明真机安装 mini2 的计划（TK-003 最后一条），获批后执行
 - TK-005（Swift，单独一批，Mac 构建 + headless 冒烟后合并）
