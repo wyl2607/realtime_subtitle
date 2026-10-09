@@ -206,3 +206,52 @@ cd macos-native && swift build -c release --product rslite
 (2) TK-004：检查 origin/feat/tk-004 上 CR-001 的修复进度，代码复查后标成「待 Mac 构建」；
 (3) 接着做 TK-002 gateway（单独一批）。
 ```
+
+---
+
+## 10. 云端会话 2 交接（2026-10-09 10:45 CST，优先级高于 §2/§5/§9 的状态描述）
+
+> 写给下一位接手的 Coordinator。§1–§9 仍有效（目标、契约、约束、工作方式）；**状态以本节 + CURSOR/TASKS/REVIEWS 为准**。
+
+### 10.1 当前进度（全部已 push 到 `origin/feat/macos-native`，HEAD 见 `git log -1`）
+
+| TK | 状态 | 关键事实 |
+|---|---|---|
+| TK-001 worker | ✅ done | CR-002 四轮。Mac 回归冒烟：MLX turbo + Apple 翻译，concat5 WER 0.88%、延迟中位 3.40s、6/6 译文 |
+| TK-001b rtf 滑动更新 | ✅ done | CR-004 三轮。SIGTERM 回收时也收口写 asr_state.json（gateway 回收不关 stdin）。端到端 rtf None→0.0101→0.037 |
+| TK-002 gateway | ✅ done | CR-003 四轮。Mac 真机：RSS 33MB、只绑 Tailscale IP、LOCAL_PEERCRED 可用、401/200、日志无 token |
+| TK-003 install_node.sh | ✅ done（代码） | CR-005 三轮 + Coordinator C1/C2。**真机安装到 mini2 未执行，须先逐步说明、获用户批准** |
+| TK-004 rslite | ✅ done | CR-001 三轮。Mac `swift build` 通过、concat5 回放 t0/t1 与基线逐字节一致 |
+| TK-001c | planned | worker 的 asr_state.json `translator` 永久沿用旧值（安装写 ollama、后装语言包仍报 ollama）→ 写当前真实翻译器名。write_scope worker.py + tests/test_node_worker.py，单独小批 |
+| TK-005 Swift NodeClient/Router | planned（已解锁） | 状态机+安全，准备第 3 轮。含 CR-001 F5（main 接单实例、`--selftest` 调 `LineStore.selfTest()`）与 M1 注记（AudioFanout start/stop 并发） |
+| TK-006 清理 v1 + 文档 | planned | 等 TK-005。`docs/protocol-v2.md` 须写明：会话中 worker 退出（含 0）→ worker_crashed；status code 2/3/4 映射、audio_dropped、backlog_dropped |
+| TK-007 验收 + 五组功耗 | planned | 远程操作，单独一批，每步先说明 |
+
+PR：#62（TK-002）、#63（TK-004）已合并；无其它 open PR。**不向 master 开 PR、不合并 master。**
+
+### 10.2 设备访问（这一轮打通的）
+
+- **Desktop Commander 远程连接器**（用户在 claude.ai 接入；新会话启动时会加载）：工具前缀 `mcp__Remote_Desktop_Commander__*`，用 `list_devices` 取设备：
+  - MacBook Air：`yumeideMacBook-Air.local`（deviceId `05a89f69-9818-474e-a401-5fa3d278ce6b`），Tailscale 100.107.222.122，Swift 6.4，venv `~/projects/rs-mac-venv`，数据 `~/projects/rs-mac-native-data/`
+  - mini2：`YilindeMac-mini.local`（deviceId `084a98d2-0b31-4f5b-914a-f79b3b94bc7f`），用户 yilinwang，Tailscale 100.105.163.59，**v1 仍在跑：PID 34924，`venv/bin/python -u -m realtime_subtitle.remote.server --host 100.105.163.59 --port 8791 ...`，cwd `~/rs-remote`，没碰过**
+  - `start_process` 每次最多等 3s，长任务一律后台跑 + 写日志文件 + `while ! grep -q EXIT ...` 等待器 + `read_process_output` 取结果
+  - 每次调用会弹权限确认；用户可在 `/permissions` → Allow 加 `mcp__Remote_Desktop_Commander` 免弹（Coordinator 自己改权限会被安全规则拦，别试）
+- Mac 验证一律在**独立 detached worktree** 做，不碰用户原有 worktree。本轮在 MacBook Air 留下：`~/projects/rs-cloud-verify`（@846ef66）、`~/projects/rs-cloud-base`（@c53ef12）、`~/projects/rs-cloud-gw`（@d2b4651），可 `git -C ~/projects/realtime_subtitle worktree remove --force <路径>` 清理；临时文件在 `/tmp/rs-cv/`。冒烟脚本 `/tmp/rs-cv/smoke.py`（真 worker 走 P3 管道、实时节奏喂 concat5；**refs.jsonl 有 60 句，concat5 只对应前 5 句**，脚本已按前 5 句算 WER）。
+- 云端容器：无 tailscale/ssh/swift。测试环境 `/home/user/venv-rs`（重建：`python3 -m venv` + `pip install -r requirements-dev.txt numpy websockets ruff faster-whisper requests PyQt6 soxr yt-dlp` + `apt-get install libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 shellcheck`；torch 用空模块 `stubs/torch.py` 放 PYTHONPATH）。基线：`PYTHONPATH=stubs QT_QPA_PLATFORM=offscreen pytest -q --continue-on-collection-errors` = **916 passed / 46 skipped / 8 errors**（8 个都是 Windows 专用 pyaudiowpatch 收集错误）。
+
+### 10.3 这一轮推翻/纠正的假设（别再踩）
+
+1. **mini2 上 v1 用的是 8791，不是 server.py 默认的 8790**，与 v2 抢端口 → 安装时必须先停 v1 再 bootstrap；回滚要把 v1 拉回来（CR-005 F1 修法）。
+2. v1 真实命令行带 `-u`（`python -u -m ...`）。合成命令行的测试测不出来，**涉及真实进程/真实命令行的逻辑必须用逐字的真实形状做测试**（CR-005 C1）。
+3. 起真进程 + `pgrep -u 本人` 的测试会互杀、在 mini2 上会杀掉真 v1 → 测试用桩 pgrep 只返回自起 PID（CR-005 C2）。并发跑两份测试是发现这类问题的便宜办法。
+4. gateway 回收 worker 用 SIGTERM、不关 stdin；worker 侧「会话结束」不能只靠 EOF/下一个 hello（CR-004 F1）。
+5. Windows CI 会跑 macOS/POSIX 专用测试：shebang 假 helper、SIGTERM 退出码语义要 `skipif(sys.platform == "win32")`（eb6bfa5）。
+6. 评审子代理会往仓库里误写临时文件：派审 prompt 里写死「临时文件只放 /tmp/<名>/，结束前 `git status --short` 必须为空」。
+
+### 10.4 下一步（按顺序）
+
+1. **TK-001c**（小批，sonnet 执行 + opus 评审 2 轮）。
+2. **真机安装到 mini2**（TK-003 最后一条，远程操作，**逐步向用户说明并获批准**）：`bash scripts/node/install_node.sh mini2` 从 MacBook Air 跑（需要 MacBook 上能 `ssh mini2`，先确认）；会停 v1（PID 34924，目录保留）、装 LaunchAgent、写两端 token 与客户端 nodes.json。失败会自动回滚并重拉 v1。也可先在 MacBook Air 上 `--local` 演练。
+3. **TK-005**（Swift，状态机+安全，单独一批）：云端写、Mac 上 `swift build` + headless 冒烟后才能合并（可用 Desktop Commander 在 MacBook Air 的独立 worktree 里构建验证）。
+4. TK-006 → TK-007（验收，远程操作单独一批；功耗需用户 `sudo bash scripts/bench/power_compare.sh`）。
+5. 全部完成后 `/sprint-exit`。
