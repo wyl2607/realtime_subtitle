@@ -1723,3 +1723,52 @@ def test_real_worker_keepalive_reap_by_sigterm_still_updates_rtf(tmp_path, monke
     f = state / "asr_state.json"
     assert f.exists()
     assert 0 <= json.loads(f.read_text(encoding="utf-8"))["rtf"] < 1
+
+
+def test_volatile_never_emitted(tmp_path, monkeypatch):
+    async def scenario():
+        async with running_real_worker(tmp_path, monkeypatch) as gw:
+            ws = await uds_connect(gw)
+            await ws.send(json.dumps(HELLO))
+            audio = _tone(1.0) + _silence(0.3)
+            for i in range(0, len(audio), 3200):
+                await ws.send(audio[i:i + 3200])
+            await ws.send(json.dumps({"type": "flush"}))
+            evs = await _recv_until(ws, lambda e: e["ev"] == "translation")
+            await ws.close()
+            await until(lambda: not gw._session_active)
+            return evs
+
+    evs = asyncio.run(scenario())
+    assert any(e.get("ev") == "final" for e in evs)
+    assert not any(e.get("ev") == "volatile" for e in evs)
+
+
+def test_info_in_use_is_bool_not_seconds(tmp_path):
+    ni = lambda **kw: info_mod.NodeInfo(run=FakeSystem(**kw), state_dir=tmp_path)  # noqa: E731
+    for idle_ns, expected in [(59_000_000_000, True), (61_000_000_000, False)]:
+        info = ni(idle_ns=idle_ns)
+        val = info.in_use()
+        assert val is expected
+        assert isinstance(val, bool)
+        assert type(val) is bool
+        assert type(val) not in (int, float)
+
+        collected = info.collect(busy=False, worker="cold")["in_use"]
+        assert collected is expected
+        assert isinstance(collected, bool)
+        assert type(collected) is bool
+        assert type(collected) not in (int, float)
+
+    async def scenario():
+        async with running(tmp_path, info=ni(idle_ns=59_000_000_000)) as (gw, _rec):
+            status, body = await http_get("/v1/info", uds=gw.uds_path)
+            return status, body
+
+    status, body = asyncio.run(scenario())
+    assert status == 200
+    http_val = body["in_use"]
+    assert http_val is True
+    assert isinstance(http_val, bool)
+    assert type(http_val) is bool
+    assert type(http_val) not in (int, float)
