@@ -5,9 +5,10 @@
 
 | CR | TK | rounds | status | last_action |
 |----|----|--------|--------|-------------|
-| CR-009 | TK-005 | 1 | open | 2026-10-09 16:55 CEST: round1 两路派出（Gemini pro default + codex security） |
+| CR-010 | TK-003b | 1 | open | 2026-10-09 17:20 CEST: round1 派出（codex） |
+| CR-009 | TK-005 | 1 | needs_fix | 2026-10-09 16:55 CEST: round1 两路派出（Gemini pro default + codex security） |
 | CR-008 | TK-006 | 2 | resolved | 2026-10-09 17:05 CEST: round2 codex approve（bb6b406）；待 TK-005 先合 + 同步 TK-002b 原因码 |
-| CR-007 | TK-002b | 2 | recheck | 2026-10-09 16:50 CEST: round2 codex approve（D2/F01 实打修好，17c5463）→ round3 Gemini pro 整体安全通读进行中 |
+| CR-007 | TK-002b | 3 | resolved | 2026-10-09 17:20 CEST: round3 Gemini approve；已合并 e3233ca |
 | CR-006 | TK-001c | 2 | resolved | 2026-10-09 12:00 CST: round2 approve_with_minor；R2-F1 coordinator-direct 0691d95；已合并；F3 文案 efa713c |
 | CR-005 | TK-003 | 3 | resolved | 2026-10-09 14:35 CST: mini2 真机安装 EXIT=0；发现 TCP 监听 blocker 与自检漏洞，另开 TK（HANDOFF §11.2） |
 | CR-004 | TK-001b | 3 | resolved | 2026-10-09 08:25 CST: round3 approve（端到端 rtf None→0.0101→0.037 滑动）；三轮收敛，已合并 |

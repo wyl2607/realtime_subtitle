@@ -4,7 +4,7 @@
 <!-- Machine fields: new writes must use "- key: `value`". Legacy variants are read-only compatibility. -->
 - current_phase: `execution+review`
 - current_tk: `TK-002b,TK-005,TK-006,TK-007(prep)`
-- current_cr: `CR-007,CR-008,CR-009`
+- current_cr: `CR-009,CR-010`
 - current_round: `0`
 - escalated: `false`
 
@@ -17,14 +17,15 @@
 | TK-002 | 节点 gateway：生命周期 + 协议 v2 + 鉴权与上限 | done |
 | TK-003 | 一键安装 install_node.sh | done（mini2 已装；TCP 监听 blocker，见 HANDOFF §11.2） |
 | TK-004 | rslite：带时间句子 + AudioFanout + 混合替换 + 单实例 | done |
-| TK-002b | gateway：launchd 下 Tailscale CLI 修复 + 安装自检补 TCP | reviewing |
-| TK-003b | install 测试 macOS 密封 | executing |
+| TK-002b | gateway：launchd 下 Tailscale CLI 修复 + 安装自检补 TCP | done |
+| TK-003b | install 测试 macOS 密封 + bash 多字节 bug | reviewing |
 | TK-001c | worker：translator 写当前真实翻译器名 | done |
 | TK-005 | rslite：NodeClient v2 + NodeRouter + 本机档门槛 | reviewing |
 | TK-006 | 清理 v1 + 文档 | reviewing |
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 17:20 CEST: **TK-002b done**：CR-007 round3 Gemini approve → 合并 e3233ca（906 passed，唯一失败为基线 frame_size；ruff/bash -n 通过）。TK-003b：Gemini 定位 14 个 UnicodeDecodeError 根因——**bash 3.2 在 UTF-8 locale 下把 `$var` 后紧跟的全角字符首字节吞进变量名 → 变量值丢失+乱码**（Gemini 说成 C locale，Coordinator 复现纠正：C 下正常、UTF-8 下出错；生产 ssh 环境即 UTF-8，真 bug）；install_node.sh 2 处加大括号，并发两份 112 passed；Coordinator perl 全仓扫描另发现 power_compare.sh 2 处 → tk-007 [coordinator-direct] 1b4890b → CR-010（codex）。CR-008 两轮收敛（待 TK-005 先合）。CR-009：Gemini default needs_fix F1（stop 与 connect 竞态泄露会话）/F2（pendingNodeFinals 不清）/F3（pause→resume 路由不重启，Coordinator 核实属实）全 accepted；codex security S1（P1 要求 /v1/info 带 token vs S5「核对前不发 token」契约冲突）作为实现 rejected、上报用户决定，S2 rejected → codex 修 F1–F3
 - 2026-10-09 16:55 CEST: CR-007 round2 codex approve（17c5463，Coordinator 另以 /bin/bash 3.2 实打 13 个边界 IP 全对）→ round3 Gemini pro 整体安全通读。CR-008 round1 codex needs_fix → F1/F2/F4 accepted、F3 rejected → Gemini flash 修。TK-003b：opencode 改 RS_TOOL_PATH_PREFIX（默认值不变）+ BSD sed + say/afconvert 桩 → 不再挂死（105s），剩 14 个注入类安全测试 UnicodeDecodeError(0xbc) → 合入 tk-002b 最新后 Gemini pro 查根因。**TK-005**：sonnet 本机调试 b66455a 修 4 个客户端 bug，冒烟 18/18；Coordinator 复核时发现 ①冒烟曾覆盖用户真实 ~/.config/rslite/nodes.json（mini2 条目丢失，已按安装脚本同法重建并 ssh 只读取回 node_id）②契约 bug：P6 url 不带路径 → 客户端连到 "/" → 真节点必失败 → [coordinator-direct] 9de0e79 补 /v2/session + RSLITE_CONFIG_DIR 隔离冒烟；复跑 18/18、真实配置 md5 不变 → reviewing，CR-009 round1（Gemini pro default + codex security），计划 3 轮
 - 2026-10-09 16:40 CEST: CR-007 round1：codex needs_fix（D2 IP 每段未限 0–255，实测 100.64.999.999 预检通过 → accepted；D1 治理越界 → rejected，两点 diff 假象）、Gemini pro security approve（F01 nit 与 D2 同修法）→ TK-002b fixing（Gemini flash）。TK-006 回报 c038968（复核 884 passed、ruff 通过）→ reviewing，CR-008 round1（codex）。**发现**：sonnet 组长派 agy `--dangerously-skip-permissions` 被 auto-mode 分类器拒（Create Unsafe Agents）→ 分级编队里组长不能再往下派 agy，下级 lane 一律由 Coordinator 直接派；pytest 不带短 --basetemp 时 62 个 gateway 用例 AF_UNIX path too long（本机路径长度，非 bug）。TK-005：codex 加失败原因码 99b51ef，但其沙箱禁 socket/swift 缓存无法复现；Coordinator 本机实跑：会话已建立，但 gateway 未向客户端发事件、rslite 中途 no_available_node，冒烟判据自相矛盾 → sonnet 本机调试
 - 2026-10-09 16:05 CEST: TK-002b 回报 2792120（Coordinator 复核 906 passed、唯一失败为基线已有 frame_size、ruff/bash -n 通过）→ reviewing，CR-007 round1：codex default + Gemini pro security。发现 tests/test_install_node.py 在 Mac 不密封（PATH 前缀盖桩→真跑 uv/ollama、BSD sed、挂死留孤儿；ssh 是桩、未触及 mini2，本机无误装）→ 拆 TK-003b（opencode big-pickle，基于 feat/tk-002b）；已清理本会话孤儿测试进程。TK-007 prep 回报 a0cd68a（power_compare 五组、hybrid_score.py+6 单测、node-acceptance.md 骨架）。TK-005：agy Claude 池周额度耗尽（117h）→ Gemini pro 接续，声称「全部完成、冒烟 4/4」，**Coordinator 复跑证伪**：用例 1 实为 `switch_failed err=NodeClientError` 0.28s 退回本机，判据过松；Gemini 还越界改了 .governance 任务卡（已撤回）→ codex 查握手根因并收紧冒烟判据
