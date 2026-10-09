@@ -1191,13 +1191,15 @@ def test_session_translator_overrides_stale_old_value(tmp_path):
 
 def test_hello_with_new_pair_finishes_old_session_before_swapping_translator(tmp_path):
     # 钉住 _finish_session 必须在翻译器替换之前：第二条 hello 收口的是第一会话，
-    # 写进去的应是刚结束那个会话的翻译器（apple），而不是即将换上的 ollama:x
+    # 写进去的应是刚结束那个会话的翻译器（ollama:old），而不是即将换上的 ollama:x。
+    # 第一会话的名字故意不取 DEFAULT_TRANSLATOR（apple）：否则收口晚于旧翻译器置 None
+    # 时写入的默认值也会碰巧等于它，用例就拦不住（CR-006 R2-F1）
     seen = []
 
     def factory(src, dst):
         if src == "de":
             tr = FakeTr()
-            tr.name = "apple"
+            tr.name = "ollama:old"
             return tr
         # 第二会话的翻译器是在第一会话收口之后才构造的：此刻文件应已写好
         path = tmp_path / info_mod.ASR_STATE_FILENAME
@@ -1210,7 +1212,7 @@ def test_hello_with_new_pair_finishes_old_session_before_swapping_translator(tmp
     sess = audio_frames(pcm) + ctl(type="drain")
     stream = hello(src="de") + sess + hello(src="en") + sess
     run_rtf(stream, tmp_path, factory=factory)
-    assert seen == ["apple"]
+    assert seen == ["ollama:old"]
     # 第二会话 EOF 收口后，写的是第二会话的翻译器
     assert read_state(tmp_path)["translator"] == "ollama:x"
 
