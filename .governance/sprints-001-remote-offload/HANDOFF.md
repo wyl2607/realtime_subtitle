@@ -255,3 +255,48 @@ PR：#62（TK-002）、#63（TK-004）已合并；无其它 open PR。**不向 m
 3. **TK-005**（Swift，状态机+安全，单独一批）：云端写、Mac 上 `swift build` + headless 冒烟后才能合并（可用 Desktop Commander 在 MacBook Air 的独立 worktree 里构建验证）。
 4. TK-006 → TK-007（验收，远程操作单独一批；功耗需用户 `sudo bash scripts/bench/power_compare.sh`）。
 5. 全部完成后 `/sprint-exit`。
+
+---
+
+## 11. 云端会话 3 交接（2026-10-09 14:40 CST，优先级高于 §10 的状态描述）
+
+> 用户在 mini2 安装后的验收中途叫停，要求全部提交、交给本机处理。**以下状态全部已 push 到 `origin/feat/macos-native`。**
+
+### 11.1 本会话完成的
+
+- 云端测试环境重建，基线复核 916 passed / 46 skipped / 8 errors（均为 pyaudiowpatch）。
+- **TK-001c done**（CR-006 两轮）：worker 收口时 `asr_state.json.translator` 写本会话真实翻译器名；构造失败时沿用旧值（可能来自别的语言对，P1 冻结，已注释）。R2-F1（测试第一会话名恰等于 DEFAULT_TRANSLATOR）由 [coordinator-direct] 0691d95 修。合并后全量 920 passed、ruff 通过。
+- CR-006 F3：[coordinator-direct] efa713c 改 install_node.sh 语言包提示文案。
+- **mini2 真机安装（用户已批准）已执行**：在 MacBook Air 的 detached worktree `~/projects/rs-cloud-install`（@d37ecea）跑 `bash scripts/node/install_node.sh mini2`，**EXIT=0**，日志 MacBook Air `/tmp/rs-cv/install.log`：
+  - 自检：`TRANSLATION_STATUS=installed`、`RTF=0.368`（5 秒样句、30 秒 pad 的结果，偏高属预期；之后每次会话结束滑动更新）
+  - v1（PID 34924）已停，启动参数记录在 mini2 `~/Library/Application Support/rs-node/v1.restart`（安装成功后应已删除——**本机复核一下**），`~/rs-remote` 保留
+  - LaunchAgent `com.realtimesubtitle.node` running，gateway PID 12840，RSS 33.6MB，无 worker 进程
+  - UDS `/v1/info` 200、v=2；`asr_state.json` = `{"model":"mlx-community/whisper-large-v3-turbo","backend":"mlx","rtf":0.368,"translator":"apple"}`
+  - 权限：token 0600 / 目录 0700 / node_id 0600 / gw.sock 0600；日志里 token 出现次数 0
+  - 客户端 `~/.config/rslite/nodes.json` 写入 `mini2 → ws://yilinmac-mini-2.tail27b5c.ts.net:8791`，客户端 token `~/.config/rslite/tokens/mini2.token`
+
+### 11.2 ☠️ 未解决的 blocker：gateway 的 TCP 监听起不来
+
+mini2 `~/Library/Logs/rs-node/gateway.err.log`：
+
+```
+INFO gateway_started
+WARNING tcp_bind_failed attempt=1 err=ValueError retry_in_s=1
+... attempt=5 retry_in_s=16（指数退避，上限 60s）
+```
+
+`lsof -iTCP -sTCP:LISTEN` 下 gateway 没有任何 TCP 监听 → **远程客户端（MacBook Air）现在连不上 mini2，而 v1 已停**。UDS 正常。
+
+- ValueError 只可能来自 `gateway.py` 的 `resolve_tailscale_ipv4`（stdout 为空 → `tailscale_no_ipv4`）或 `validate_host`（第一行不是 100.64/10 的 IP，例如 CLI 打了警告行）。经 ssh（交互 PATH）跑 `tailscale ip -4` 输出正常 `100.105.163.59`，所以疑点是 **launchd 环境下 `/Applications/Tailscale.app/Contents/MacOS/tailscale` 的行为不同**（GUI 版 CLI 在无登录 shell 环境下输出为空/走 stderr/多一行警告等）。日志只记了类名，看不出是哪一种。
+- 下一步建议（本机做）：
+  1. 在 mini2 用 launchd 同款环境复现：`cd ~/rs-node && env -i HOME=$HOME PATH=<plist 里的 PATH> venv/bin/python -c 'import subprocess;r=subprocess.run(["tailscale","ip","-4"],capture_output=True,text=True);print(r.returncode,repr(r.stdout),repr(r.stderr))'`；如果 env -i 下正常，就要在 launchd 里真跑一次（临时 plist 或 `launchctl asuser`）。
+  2. 按根因修 gateway（新 TK，安全类，单独一批，CR 至少 2 轮）：如 CLI 路径/输出解析，或日志里补一个**不含敏感信息**的原因码（`tailscale_no_ipv4` / `not_tailscale_range` 等，现在只记 `ValueError`）。
+  3. **安装脚本的自检漏洞**：第 10 步只经 UDS 验 `/v1/info`，TCP 没起来也报成功 → 自检要加「TCP 已在 Tailscale IP:8791 监听」（例如有界等待 `lsof` 或带 token 的 HTTP 请求），否则回滚。这条也进同一 TK 或紧随其后。
+  4. 修好前若用户需要远程字幕：可在 `~/rs-remote` 手动拉回 v1（命令见 v1.restart 记录或 §10.2 的真实命令行），但会和 v2 抢 8791——**v2 的 TCP 一旦重试成功就会冲突**，要先 `launchctl bootout gui/$(id -u)/com.realtimesubtitle.node`。这些都改变 mini2 状态，先征得用户同意。
+- 中断时 Coordinator 正要跑第 1 步的复现命令（被用户拒绝），**mini2 上没有做任何安装以外的改动**。
+
+### 11.3 其它待办（顺序不变）
+
+- 本机清理：MacBook Air 上 `~/projects/rs-cloud-install`、`rs-cloud-verify`、`rs-cloud-base`、`rs-cloud-gw` 都是 detached worktree，可 `git -C ~/projects/realtime_subtitle worktree remove --force <路径>`。
+- install_node.sh 成功提示里「上一版保留在 ~/rs-node.prev」在首次安装（无 .prev）时不准确，小 nit。
+- TK-005（Swift，状态机+安全）→ TK-006 → TK-007，见 §10.4。TK-005 尚未开始。

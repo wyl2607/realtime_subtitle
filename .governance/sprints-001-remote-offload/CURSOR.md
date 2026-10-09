@@ -2,9 +2,9 @@
 
 ## 当前状态
 <!-- Machine fields: new writes must use "- key: `value`". Legacy variants are read-only compatibility. -->
-- current_phase: `merge`
-- current_tk: `TK-001c`
-- current_cr: `CR-006`
+- current_phase: `blocked`
+- current_tk: `TK-003`
+- current_cr: `—`
 - current_round: `2`
 - escalated: `false`
 
@@ -15,7 +15,7 @@
 | TK-001 | 节点 worker：VAD 分段 + 整段识别 + 可插拔翻译 | done |
 | TK-001b | worker：会话结束滑动更新 rtf | done |
 | TK-002 | 节点 gateway：生命周期 + 协议 v2 + 鉴权与上限 | done |
-| TK-003 | 一键安装 install_node.sh | done（真机装 mini2 待批准） |
+| TK-003 | 一键安装 install_node.sh | done（mini2 已装；TCP 监听 blocker，见 HANDOFF §11.2） |
 | TK-004 | rslite：带时间句子 + AudioFanout + 混合替换 + 单实例 | done |
 | TK-001c | worker：translator 写当前真实翻译器名 | done |
 | TK-005 | rslite：NodeClient v2 + NodeRouter + 本机档门槛 | planned |
@@ -23,6 +23,8 @@
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 14:40 CST: 用户叫停，全部提交，交给本机处理（HANDOFF §11）
+- 2026-10-09 14:35 CST: **mini2 真机安装（用户批准）EXIT=0**：语言包 installed、RTF 0.368、v1 已停、LaunchAgent running（RSS 33.6MB、无 worker）、UDS /v1/info 200、权限/日志无 token 核验通过、nodes.json 已写。**验收发现 blocker**：gateway `tcp_bind_failed err=ValueError` 持续退避，没有 TCP 监听（远程不可达）；安装自检只验 UDS 所以报成功
 - 2026-10-09 12:10 CST: mini2 安装前只读核查：GUI 会话在（console=yilinwang）、AC 供电、turbo 已缓存 3.0GB、v1 PID 34924 仍在 8791；MacBook Air 能 BatchMode ssh mini2。MacBook Air 建 detached worktree ~/projects/rs-cloud-install @d37ecea，`install_node.sh --dry-run mini2` 11 步计划正常 → 安装计划提交用户审批
 - 2026-10-09 12:00 CST: CR-006 round2（opus）approve_with_minor：F1 partially（第一会话名恰等于 DEFAULT_TRANSLATOR，变异 B 抓不到）→ R2-F1 accepted，[coordinator-direct] 0691d95，复现改后变异 A/B 均红 → **TK-001c done**，合并进 feat/macos-native（920 passed、ruff 通过）；F3 [coordinator-direct] efa713c。下一步：向用户说明 mini2 真机安装计划，等批准
 - 2026-10-09 11:45 CST: TK-001c repair 回收 8fc99ce（Coordinator 复跑 210/920 passed、ruff 通过）→ recheck，CR-006 round2（opus）
@@ -73,5 +75,5 @@
 - 2026-10-09 04:05 CST: Sprint 001 initialized, awaiting TK-001（用户已批准全部 TK 排队执行，含 TK-007 对 mini2 的远程操作）
 
 ## 下一步
-- 向用户逐步说明真机安装 mini2 的计划（TK-003 最后一条），获批后执行
-- TK-005（Swift，单独一批，Mac 构建 + headless 冒烟后合并）
+- 本机：复现并修 gateway TCP 监听失败（launchd 环境下 `tailscale ip -4`），安装自检补 TCP 校验（新 TK，安全类，单独一批）——见 HANDOFF §11.2
+- 之后 TK-005 → TK-006 → TK-007
