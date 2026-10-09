@@ -79,14 +79,20 @@
 - 判定（脚本自动输出 PASS/FAIL 与汇总 JSON）：
   - `rslite exit code 0`：rslite 正常跑完整个回放
   - `Token A not in output` / `Token B not in output`：token 未泄露到 stdout/stderr/gateway 日志
-  - `Routing logs contain selection reasons`：stderr 出现 `rslite.route select node=... quality=... speed=... penalties=... bonus=... rtt_ms=...` 形式的打分日志
-  - `Routing logs show migration to node-b`：出现 `select node=node-b` 迁移到更优节点
-  - `Fallback to node-a after node-b offline logged`：节点下线后出现 `fallback failed_node=node-b` 或重新 `select node=node-a`
-  - `Final event IDs non-decreasing`：final 事件 id 单调不减
-  - `Received finals from node A/B`：两个节点都有产出 final
-  - `Sufficient total finals`：总 final 数量与音频时长相符
+  - `Routing select logs fully match regex with all fields`：整行正则匹配 `rslite.route select node=<id> score=<n> quality=<n> speed=<n> penalties=<n> bonus=<n> rtt_ms=<n>`
+  - `Migration preceded by at least two consecutive select node=node-b`：连续两次打分领先才触发迁移
+  - `stdout contains status '混合·node-b'` 与静音窗判定：状态事件 t 落在 WAV 中 ≥0.6s 静音窗
+  - `Old session (Node A) received drain and emitted drained`：旧会话在静音点完成 drain 并回 drained
+  - `Node B first final t0 is not earlier than silence point start`：新会话首句不早于该静音点
+  - `Fallback failed_node=node-b is followed by select node=node-a`：节点下线后出现 fallback 并在其后重新 select node-a
+  - `Node A final after fallback has t0 later than last Node B final`：回退后有 t0 晚于最后一条 B 句的 A final
+  - `Node B finals count corresponds to active window`：B 的条数与在线窗口相符
+  - `Node sentences follow time order Phase A -> Phase B -> Phase A`：节点句严格遵循 A 段→B 段→A 段时序
+  - `Visible subtitle track not empty and no replaced local sentences remain`：可见字幕轨非空，读 ev=replace 被替换本机句不得保留在可见轨
+  - `Visible subtitle track has strictly unique text` / `Visible local IDs strictly increasing` / `Node sentences do not overlap in t0/t1`：字幕严格无重复
+  - `Timeline coverage has no gap exceeding silence threshold + switch budget`：整段音频无超预算间隙
   - `No switch_failed in stderr`：无切换失败
-  - 末尾汇总 JSON 含 `checks_passed`/`checks_failed`/`final_ids`/`node_a_finals`/`node_b_finals` 等字段
+  - 末尾汇总 JSON 含 `checks_passed`/`checks_failed`/`node_a_finals`/`node_b_finals`/`visible_lines` 等字段
 - 证据：TODO（实测时填入）
 
 ## 6. 功耗（五组）
