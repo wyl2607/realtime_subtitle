@@ -66,9 +66,28 @@
 
 ## 5. 多节点路由
 
-- 检查项：mini2 + 本机模拟的第二节点（`--local` 安装或另一端口 gateway）；更优节点上线后在静音点迁移、下线后退回；字幕不断不重复；选择理由在日志可见
-- 命令：TODO
-- 证据：TODO
+- 检查项：mini2 + 本机模拟的第二节点；更优节点上线后在静音点迁移、下线后退回；字幕不断不重复；选择理由在日志可见
+- 命令：
+  ```bash
+  # 生成带静音点的德语测试音频（约 105s）
+  say -v Anna "Guten Tag. [[slnc 1000]] Dies ist ein Test. [[slnc 1000]] Für das Echtzeit-Untertitel-System. [[slnc 1000]] Wir prüfen die Mehrknoten-Routing-Funktionalität. [[slnc 1000]] Der erste Knoten hat eine langsamere Erkennung. [[slnc 1000]] Der zweite Knoten ist schneller und kommt später online. [[slnc 1000]] Danach geht der zweite Knoten wieder offline. [[slnc 1000]] Und wir fallen zurück auf den ersten Knoten. [[slnc 1000]] Das System soll nahtlos im Stille-Punkt migrieren. [[slnc 1000]] Ohne Text-Wiederholungen oder Verluste. [[slnc 1000]] Wir wiederholen den Text mehrmals. [[slnc 1000]] Guten Tag. [[slnc 1000]] Dies ist ein Test. [[slnc 1000]] Für das Echtzeit-Untertitel-System. [[slnc 1000]] Wir prüfen die Mehrknoten-Routing-Funktionalität. [[slnc 1000]] Der erste Knoten hat eine langsamere Erkennung. [[slnc 1000]] Der zweite Knoten ist schneller. [[slnc 1000]] Und kommt später online. [[slnc 1000]] Danach geht der zweite Knoten wieder offline. [[slnc 1000]] Und wir fallen zurück. [[slnc 1000]] Auf den ersten Knoten. [[slnc 1000]] Das System soll nahtlos migrieren. [[slnc 1000]] Ohne Wiederholungen. [[slnc 1000]] Oder Verluste. [[slnc 1000]] Noch eine Runde. [[slnc 1000]] Guten Tag. [[slnc 1000]] Dies ist ein Test. [[slnc 1000]] Für das System. [[slnc 1000]] Wir prüfen das Routing. [[slnc 1000]] Erster Knoten langsam. [[slnc 1000]] Zweiter Knoten schnell. [[slnc 1000]] Zweiter geht offline. [[slnc 1000]] Zurück zum ersten. [[slnc 1000]] Migriert im Stille-Punkt. [[slnc 1000]] Keine Wiederholungen. [[slnc 1000]] Keine Verluste." -o /tmp/german_test.aiff
+  afconvert -f WAVE -d LEI16@16000 -c 1 /tmp/german_test.aiff /tmp/german_test.wav
+  
+  # 运行验收探针（自动起两个假网关、模拟节点上下线、跑 rslite --mode auto）
+  uv run python scripts/bench/multi_node_probe.py
+  ```
+- 判定（脚本自动输出 PASS/FAIL 与汇总 JSON）：
+  - `rslite exit code 0`：rslite 正常跑完整个回放
+  - `Token A not in output` / `Token B not in output`：token 未泄露到 stdout/stderr/gateway 日志
+  - `Routing logs contain selection reasons`：stderr 出现 `rslite.route select node=... quality=... speed=... penalties=... bonus=... rtt_ms=...` 形式的打分日志
+  - `Routing logs show migration to node-b`：出现 `select node=node-b` 迁移到更优节点
+  - `Fallback to node-a after node-b offline logged`：节点下线后出现 `fallback failed_node=node-b` 或重新 `select node=node-a`
+  - `Final event IDs non-decreasing`：final 事件 id 单调不减
+  - `Received finals from node A/B`：两个节点都有产出 final
+  - `Sufficient total finals`：总 final 数量与音频时长相符
+  - `No switch_failed in stderr`：无切换失败
+  - 末尾汇总 JSON 含 `checks_passed`/`checks_failed`/`final_ids`/`node_a_finals`/`node_b_finals` 等字段
+- 证据：TODO（实测时填入）
 
 ## 6. 功耗（五组）
 
