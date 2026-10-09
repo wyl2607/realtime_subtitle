@@ -73,7 +73,7 @@ measure_a() {
 }
 
 [ "$(id -u)" -eq 0 ] || { echo "需要 sudo 执行（powermetrics）" >&2; exit 1; }
-[ -x "$BIN" ] || { echo "找不到 $BIN，先 swift build -c release --product rslite" >&2; exit 1; }
+[ -x "$BIN" ] || { echo "找不到 ${BIN}，先 swift build -c release --product rslite" >&2; exit 1; }
 check_quiet
 
 echo "每组约 ${SECS} 秒，共五组（含冷却）……"
@@ -94,4 +94,4 @@ echo "[混合] rslite 混合档"
 measure hybrid "$BIN" --mode hybrid --source "file:$WAV" --headless
 # 数据是 root 写的，交还给发起 sudo 的用户，否则事后读不了
 chown -R "$RUN_USER" "$OUT"
-echo "原始数据: $OUT（hybrid.events 可交给 hybrid_score.py 评分）"
+echo "原始数据: ${OUT}（hybrid.events 可交给 hybrid_score.py 评分）"
