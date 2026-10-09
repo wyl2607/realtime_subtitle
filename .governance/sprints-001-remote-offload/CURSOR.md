@@ -24,6 +24,7 @@
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 15:50 CEST: TK-005 codex 额度中断（usage limit），半成品 1593 行存为 WIP 48d186c：swift build 通过、--selftest OK、--mode local 回放 5 句正常，但 codex 总结丢失 → 改派 agy Claude 池（claude-opus-4-6-thinking）做 Done criteria 审计+补齐+假 v2 节点冒烟
 - 2026-10-09 15:35 CEST: **分级并行编队**（用户要求）：L0 Coordinator(opus) → L1 组长(sonnet) → L2 下级(agy Gemini 池 flash/pro、agy Claude 池 opus-4-6-thinking、haiku)。实测推翻 HANDOFF §2「不要派 agy」：agy 带 `--dangerously-skip-permissions` 两个池都能跑 shell；`claude -p --model haiku` 可用。grok 对 TK-006 exit 0 零改动（PLAYBOOK 已知坑）→ 弃用。TK-006 改由 sonnet 组长带 agy/haiku；新开 TK-007 prep（sonnet 组长，worktree rs-tk-007，只做 scripts/bench + 文档骨架，真机验收仍等前序）。TK-002b(sonnet)、TK-005(codex) 继续
 - 2026-10-09 15:20 CEST: 用户要求多 lane 加速 → 三路并行（文件不重叠）：TK-002b=Claude sonnet（rs-tk-002b）；TK-005=codex gpt-5.5 high（rs-tk-005，沙箱不能 commit，Coordinator 代提交）；TK-006=grok（rs-tk-006，合并须在 TK-005 之后）。agy 不派（本机 headless 拒 shell，HANDOFF §2）。4 个 rs-cloud-* detached worktree 已由用户删除
 - 2026-10-09 15:00 CEST: **本机会话接手**（MacBook Air）。主 worktree ff 到 ebaa9fe。mini2 只读复现根因：App Store 版 Tailscale 二进制靠 `SHLVL` 判 CLI/GUI，launchd 环境无 SHLVL → `tailscale ip -4` stdout 打「The Tailscale GUI failed to start…」、rc=0 → validate_host ValueError；env -i 下加 `SHLVL=1` 或官方开关 `TAILSCALE_BE_CLI=1` 均恢复正常，改 argv0/PWD/_ 无效。v1.restart 已不存在（安装成功时删除，符合预期）；gateway PID 12840 仍在退避。新建 TK-002b → executing（sonnet，worktree ~/projects/rs-tk-002b，安全类单独一批）
