@@ -1126,3 +1126,19 @@ def test_decoy_real_v1_survives_stop_and_rollback(env, _real_v1_decoy, spawn, tm
     assert mine.wait(timeout=5) is not None
     assert "已恢复 v1" in _run_restore(e, home).stdout
     assert _real_v1_decoy.poll() is None
+
+
+def test_ssh_passes_dashdash_before_host(env):
+    e, _home, logdir = env
+    host = "mini2"
+    r = _run([host], e, timeout=300)
+    assert r.returncode == 0, r.stderr
+    raw = (logdir / "ssh.argv").read_bytes()
+    calls = [c for c in raw.split(b"\n---\n") if c.strip()]
+    assert len(calls) >= 1
+    for call in calls:
+        args = [part.decode("utf-8") for part in call.split(b"\0") if part]
+        assert host in args, f"{host} not found in ssh call: {args}"
+        idx = args.index(host)
+        assert idx > 0
+        assert args[idx - 1] == "--", f"argument before {host} is {args[idx - 1]}, expected '--'"
