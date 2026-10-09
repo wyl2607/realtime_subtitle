@@ -289,8 +289,10 @@ struct RSLite {
         failures.append(contentsOf: Capability.selfTest().map { "Capability: \($0)" })
         if #available(macOS 27.0, *) {
             failures.append(contentsOf: NodeRouter.selfTest().map { "NodeRouter: \($0)" })
+            failures.append(contentsOf: HybridEngine.selfTest().map { "HybridEngine: \($0)" })
         } else {
             failures.append("NodeRouter: 需要 macOS 27")
+            failures.append("HybridEngine: 需要 macOS 27")
         }
         if failures.isEmpty {
             print("SELFTEST OK")

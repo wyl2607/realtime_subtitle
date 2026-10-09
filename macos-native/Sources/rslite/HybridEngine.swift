@@ -43,7 +43,14 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
 
     private var local: Pipeline?
     private var router: NodeRouter?
-    private var pendingNodeFinals: [String: [Int: (String, Double?, Double?)]] = [:]
+    private var currentFanout: AudioFanout?
+    private var activeNodeSessions: [String: Int] = [:]
+    private var pendingNodeFinals: [NodeSessionKey: [Int: (String, Double?, Double?)]] = [:]
+
+    private struct NodeSessionKey: Hashable {
+        var nodeID: String
+        var generation: Int
+    }
 
     init(
         config: PipelineConfig,
@@ -78,17 +85,18 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
     }
 
     func pause() async {
-        await router?.stop()
+        await stopRouter(clearPending: true, clearFanout: true)
         await local?.pause()
         onMode(.local)
     }
 
     func resume() async {
         await local?.resume()
+        ensureRouterRunning()
     }
 
     func stop() async {
-        await router?.stop()
+        await stopRouter(clearPending: true, clearFanout: true)
         await local?.stop()
     }
 
@@ -98,27 +106,54 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
     }
 
     private func startRouterIfNeeded(fanout: AudioFanout) {
-        guard mode != .local else {
+        lock.withLockVoid { currentFanout = fanout }
+        ensureRouterRunning()
+    }
+
+    private func ensureRouterRunning() {
+        let fanout = lock.withLockValue { () -> AudioFanout? in
+            guard Self.shouldRunRouter(mode: mode, hasFanout: currentFanout != nil, hasRouter: router != nil) else {
+                return nil
+            }
+            return currentFanout
+        }
+        guard let fanout else {
             return
         }
         let nodeCallbacks = NodeCallbacks(
             // 模式标签由 NodeRouter 在切换成功后统一用清单里的 id 上报，这里不重复报
-            onReady: { _ in },
-            onFinal: { [weak self] nodeID, id, text, t0, t1 in
-                self?.lock.withLockVoid {
-                    var node = self?.pendingNodeFinals[nodeID] ?? [:]
-                    node[id] = (text, t0, t1)
-                    self?.pendingNodeFinals[nodeID] = node
+            onReady: { [weak self] nodeID, generation, _ in
+                guard let self else { return }
+                self.lock.withLockVoid {
+                    self.clearPending(for: nodeID)
+                    self.activeNodeSessions[nodeID] = generation
+                    self.pendingNodeFinals[NodeSessionKey(nodeID: nodeID, generation: generation)] = [:]
                 }
-                self?.onMode(.refining)
             },
-            onTranslation: { [weak self] nodeID, id, translation in
+            onFinal: { [weak self] nodeID, generation, id, text, t0, t1 in
+                guard let self else { return }
+                self.lock.withLockVoid {
+                    guard self.activeNodeSessions[nodeID] == generation else {
+                        return
+                    }
+                    let key = NodeSessionKey(nodeID: nodeID, generation: generation)
+                    var node = self.pendingNodeFinals[key] ?? [:]
+                    node[id] = (text, t0, t1)
+                    self.pendingNodeFinals[key] = node
+                }
+                self.onMode(.refining)
+            },
+            onTranslation: { [weak self] nodeID, generation, id, translation in
                 guard let self else { return }
                 let final = self.lock.withLockValue { () -> (String, Double?, Double?)? in
-                    guard var node = pendingNodeFinals[nodeID], let final = node.removeValue(forKey: id) else {
+                    guard activeNodeSessions[nodeID] == generation else {
                         return nil
                     }
-                    pendingNodeFinals[nodeID] = node
+                    let key = NodeSessionKey(nodeID: nodeID, generation: generation)
+                    guard var node = pendingNodeFinals[key], let final = node.removeValue(forKey: id) else {
+                        return nil
+                    }
+                    pendingNodeFinals[key] = node
                     return final
                 }
                 if let final {
@@ -127,8 +162,18 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
                 }
             },
             onStatus: callbacks.onStatus,
-            onClosed: { [onMode] error in
-                if error != nil {
+            onClosed: { [weak self, onMode] nodeID, generation, error in
+                guard let self else { return }
+                let wasActive = self.lock.withLockValue { () -> Bool in
+                    self.pendingNodeFinals.removeValue(forKey: NodeSessionKey(nodeID: nodeID, generation: generation))
+                    guard self.activeNodeSessions[nodeID] == generation else {
+                        return false
+                    }
+                    self.activeNodeSessions.removeValue(forKey: nodeID)
+                    self.clearPending(for: nodeID)
+                    return true
+                }
+                if wasActive, error != nil {
                     onMode(.local)
                 }
             }
@@ -141,5 +186,47 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
         )
         lock.withLockVoid { self.router = router }
         router.start(fanout: fanout)
+    }
+
+    private func stopRouter(clearPending: Bool, clearFanout: Bool) async {
+        let router = lock.withLockValue { () -> NodeRouter? in
+            let current = self.router
+            self.router = nil
+            if clearFanout {
+                currentFanout = nil
+            }
+            activeNodeSessions.removeAll()
+            if clearPending {
+                pendingNodeFinals.removeAll()
+            }
+            return current
+        }
+        await router?.stop()
+    }
+
+    private func clearPending(for nodeID: String) {
+        pendingNodeFinals = pendingNodeFinals.filter { $0.key.nodeID != nodeID }
+    }
+
+    private static func shouldRunRouter(mode: RSLiteMode, hasFanout: Bool, hasRouter: Bool) -> Bool {
+        mode != .local && hasFanout && !hasRouter
+    }
+
+    static func selfTest() -> [String] {
+        var failures: [String] = []
+        func check(_ ok: Bool, _ name: String) {
+            if !ok { failures.append(name) }
+        }
+        check(Self.shouldRunRouter(mode: .auto, hasFanout: true, hasRouter: false),
+              "auto 模式有 fanout 且无 router 时应启动路由")
+        check(Self.shouldRunRouter(mode: .hybrid, hasFanout: true, hasRouter: false),
+              "hybrid 模式恢复后应重启路由")
+        check(!Self.shouldRunRouter(mode: .local, hasFanout: true, hasRouter: false),
+              "local 模式不应启动路由")
+        check(!Self.shouldRunRouter(mode: .auto, hasFanout: false, hasRouter: false),
+              "无 fanout 时不应启动路由")
+        check(!Self.shouldRunRouter(mode: .auto, hasFanout: true, hasRouter: true),
+              "已有 router 时不应重复启动")
+        return failures
     }
 }

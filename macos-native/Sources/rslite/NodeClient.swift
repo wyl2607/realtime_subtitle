@@ -104,11 +104,11 @@ enum NodeClientError: Error, CustomStringConvertible {
 }
 
 struct NodeCallbacks: Sendable {
-    var onReady: @Sendable (NodeInfo) -> Void = { _ in }
-    var onFinal: @Sendable (String, Int, String, Double?, Double?) -> Void = { _, _, _, _, _ in }
-    var onTranslation: @Sendable (String, Int, String) -> Void = { _, _, _ in }
+    var onReady: @Sendable (String, Int, NodeInfo) -> Void = { _, _, _ in }
+    var onFinal: @Sendable (String, Int, Int, String, Double?, Double?) -> Void = { _, _, _, _, _, _ in }
+    var onTranslation: @Sendable (String, Int, Int, String) -> Void = { _, _, _, _ in }
     var onStatus: @Sendable (String) -> Void = { _ in }
-    var onClosed: @Sendable (Error?) -> Void = { _ in }
+    var onClosed: @Sendable (String, Int, Error?) -> Void = { _, _, _ in }
 }
 
 /// v2 节点会话客户端。token 只从 0600 文件读，只放 Authorization 头，不进 URL/argv/日志。
@@ -127,6 +127,7 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
     private let sourceLocaleID: String
     private let targetLanguageID: String
     private let offsetSeconds: Double
+    private let sessionGeneration: Int
     private let callbacks: NodeCallbacks
     private let lock = NSLock()
 
@@ -145,6 +146,7 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         sourceLocaleID: String,
         targetLanguageID: String,
         offsetSeconds: Double,
+        sessionGeneration: Int,
         callbacks: NodeCallbacks
     ) {
         self.config = config
@@ -153,6 +155,7 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         self.sourceLocaleID = sourceLocaleID
         self.targetLanguageID = targetLanguageID
         self.offsetSeconds = offsetSeconds
+        self.sessionGeneration = sessionGeneration
         self.callbacks = callbacks
     }
 
@@ -217,7 +220,7 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
             ]
             try await socket.send(.string(Self.jsonString(hello)))
             try await awaitReady(socket)
-            callbacks.onReady(info)
+            callbacks.onReady(config.id, sessionGeneration, info)
             Task { await receiveLoop(socket) }
         } catch {
             throw await classify(error, socket)
@@ -347,7 +350,7 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
                 handle(text)
             } catch {
                 let closed = lock.withLockValue { isClosed }
-                callbacks.onClosed(closed ? nil : error)
+                callbacks.onClosed(config.id, sessionGeneration, closed ? nil : error)
                 return
             }
         }
@@ -362,10 +365,10 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
             guard let id = event["id"] as? Int, let body = event["text"] as? String else { return }
             let t0 = (event["a0"] as? Double).map { $0 + offsetSeconds }
             let t1 = (event["a1"] as? Double).map { $0 + offsetSeconds }
-            callbacks.onFinal(config.id, id, body, t0, t1)
+            callbacks.onFinal(config.id, sessionGeneration, id, body, t0, t1)
         case "translation":
             guard let id = event["id"] as? Int, let body = event["text"] as? String else { return }
-            callbacks.onTranslation(config.id, id, body)
+            callbacks.onTranslation(config.id, sessionGeneration, id, body)
         case "status":
             if let code = event["code"] as? String {
                 callbacks.onStatus("节点 \(config.id)：\(code)")

@@ -147,6 +147,8 @@ final class NodeRouter: @unchecked Sendable {
     private var latestClock = 0.0
     private var stopped = false
     private var switching = false
+    private var switchGeneration = 0
+    private var nodeSessionGenerations: [String: Int] = [:]
 
     init(
         sourceLocaleID: String,
@@ -197,7 +199,11 @@ final class NodeRouter: @unchecked Sendable {
     }
 
     func stop() async {
-        lock.withLockVoid { stopped = true }
+        lock.withLockVoid {
+            stopped = true
+            switching = false
+            switchGeneration += 1
+        }
         probeTask?.cancel()
         audioTask?.cancel()
         let client = lock.withLockValue { currentClient }
@@ -345,17 +351,45 @@ final class NodeRouter: @unchecked Sendable {
     }
 
     private func switchToPending(atSilence: Bool) async {
-        let target = lock.withLockValue { () -> NodeConfig? in
+        let reservation = lock.withLockValue { () -> (NodeConfig, Int)? in
             guard !switching, !stopped, let id = pendingMigrationID else { return nil }
             switching = true
-            return nodes.first { $0.id == id }
+            switchGeneration += 1
+            guard let node = nodes.first(where: { $0.id == id }) else {
+                switching = false
+                return nil
+            }
+            return (node, switchGeneration)
         }
-        guard let node = target else {
+        guard let (node, generation) = reservation else {
             return
         }
-        defer { lock.withLockVoid { switching = false } }
+        defer {
+            lock.withLockVoid {
+                if switchGeneration == generation {
+                    switching = false
+                }
+            }
+        }
         do {
             let (token, info) = try await NodeClient.prepare(config: node)
+            guard lock.withLockValue({
+                Self.canPublishSwitch(
+                    stopped: stopped,
+                    switching: switching,
+                    switchGeneration: switchGeneration,
+                    reservedGeneration: generation,
+                    pendingMigrationID: pendingMigrationID,
+                    nodeID: node.id
+                )
+            }) else {
+                return
+            }
+            let sessionGeneration = lock.withLockValue {
+                let next = (nodeSessionGenerations[node.id] ?? 0) + 1
+                nodeSessionGenerations[node.id] = next
+                return next
+            }
             let client = NodeClient(
                 config: node,
                 token: token,
@@ -363,9 +397,23 @@ final class NodeRouter: @unchecked Sendable {
                 sourceLocaleID: sourceLocaleID,
                 targetLanguageID: targetLanguageID,
                 offsetSeconds: lock.withLockValue { latestClock },
+                sessionGeneration: sessionGeneration,
                 callbacks: callbacks
             )
             try await client.connect()
+            guard lock.withLockValue({
+                Self.canPublishSwitch(
+                    stopped: stopped,
+                    switching: switching,
+                    switchGeneration: switchGeneration,
+                    reservedGeneration: generation,
+                    pendingMigrationID: pendingMigrationID,
+                    nodeID: node.id
+                )
+            }) else {
+                await client.close()
+                return
+            }
             let old = lock.withLockValue { currentClient }
             lock.withLockVoid {
                 currentClient = client
@@ -532,7 +580,58 @@ final class NodeRouter: @unchecked Sendable {
         let b = RouteScore(id: "better", score: 70, reason: "")
         check(!gate.observe(best: b, current: c), "第一次领先不应迁移")
         check(gate.observe(best: b, current: c), "连续两次领先应迁移")
+        check(Self.canPublishSwitch(
+            stopped: false,
+            switching: true,
+            switchGeneration: 2,
+            reservedGeneration: 2,
+            pendingMigrationID: "better",
+            nodeID: "better"
+        ), "有效切换预约应允许发布")
+        check(!Self.canPublishSwitch(
+            stopped: true,
+            switching: true,
+            switchGeneration: 2,
+            reservedGeneration: 2,
+            pendingMigrationID: "better",
+            nodeID: "better"
+        ), "stop 后挂起切换不得发布")
+        check(!Self.canPublishSwitch(
+            stopped: false,
+            switching: false,
+            switchGeneration: 2,
+            reservedGeneration: 2,
+            pendingMigrationID: "better",
+            nodeID: "better"
+        ), "switching 被取消后不得发布")
+        check(!Self.canPublishSwitch(
+            stopped: false,
+            switching: true,
+            switchGeneration: 3,
+            reservedGeneration: 2,
+            pendingMigrationID: "better",
+            nodeID: "better"
+        ), "切换代号变化后旧 client 不得发布")
+        check(!Self.canPublishSwitch(
+            stopped: false,
+            switching: true,
+            switchGeneration: 2,
+            reservedGeneration: 2,
+            pendingMigrationID: "other",
+            nodeID: "better"
+        ), "pending 目标变化后旧 client 不得发布")
         return failures
+    }
+
+    private static func canPublishSwitch(
+        stopped: Bool,
+        switching: Bool,
+        switchGeneration: Int,
+        reservedGeneration: Int,
+        pendingMigrationID: String?,
+        nodeID: String
+    ) -> Bool {
+        !stopped && switching && switchGeneration == reservedGeneration && pendingMigrationID == nodeID
     }
 }
 
