@@ -562,6 +562,32 @@ def test_preflight_non_ip_first_line_fails_before_any_change(env):
         assert not (home / ".config").exists()
 
 
+@pytest.mark.parametrize("ts_ip, should_pass", [
+    ("100.64.999.999", False),
+    ("100.64.1", False),
+    ("100.64.1.2.3", False),
+    ("100.064.1.2", False),
+    ("100.105.163.59", True),
+])
+def test_preflight_tailscale_ip_validation(env, ts_ip, should_pass):
+    """参数化测试预检的 Tailscale IPv4 严格格式校验（100.64.0.0/10）。
+
+    前导零（如 100.064.1.2）视为不合法：标准 IPv4 严禁多余前导零以杜绝八进制歧义。
+    """
+    e, home, logdir = env
+    e["TS_IP"] = ts_ip
+    e["STUB_TCP_LISTEN"] = f"p4242\nn{ts_ip}:8791\n"
+    r = _run(["mini2"], e, timeout=300)
+    if should_pass:
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert f"TCP 已在 {ts_ip}:8791 监听" in r.stdout
+    else:
+        assert r.returncode != 0, f"非法的 TS_IP={ts_ip} 应该导致预检失败"
+        assert "Tailscale IPv4" in r.stdout + r.stderr, ts_ip
+        assert not (home / "rs-node.new").exists()
+        assert not (home / ".config").exists()
+
+
 def test_tailscale_is_called_with_be_cli_env(env):
     e, home, logdir = env
     ts = Path(e["PATH"].split(":")[0]) / "tailscale"
