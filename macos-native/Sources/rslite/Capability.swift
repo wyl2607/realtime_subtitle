@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 struct CapabilitySnapshot: Sendable {
     var chipName: String
@@ -9,6 +10,47 @@ struct CapabilitySnapshot: Sendable {
 
 enum Capability {
     static let accurateMemoryThresholdBytes: UInt64 = 24 * 1024 * 1024 * 1024
+
+    static func hwHash() -> String {
+        hwHash(run: { process in
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else {
+                return nil
+            }
+            return process
+        })
+    }
+
+    static func hwHash(run: (Process) throws -> Process?) -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/ioreg")
+        process.arguments = ["-rd1", "-c", "IOPlatformExpertDevice"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        do {
+            guard try run(process) != nil else {
+                return ""
+            }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            if let text = String(data: data, encoding: .utf8) {
+                return hwHash(fromIORegOutput: text)
+            }
+        } catch {}
+        return ""
+    }
+
+    static func hwHash(fromIORegOutput text: String) -> String {
+        guard let regex = try? NSRegularExpression(pattern: "\"IOPlatformUUID\"\\s*=\\s*\"([^\"]+)\""),
+              let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+              let range = Range(match.range(at: 1), in: text) else {
+            return ""
+        }
+        let uuid = String(text[range])
+        let hash = SHA256.hash(data: Data(uuid.utf8))
+        return String(hash.compactMap { String(format: "%02x", $0) }.joined().prefix(16))
+    }
 
     static func current() -> CapabilitySnapshot {
         CapabilitySnapshot(
@@ -47,6 +89,9 @@ enum Capability {
         check(supportsAccurateLocal(CapabilitySnapshot(
             chipName: "Apple M4", memoryBytes: 16 * 1024 * 1024 * 1024, onAC: true, hasBattery: false
         )), "无电池台式机应满足 P8")
+        check(hwHash(fromIORegOutput: #""IOPlatformUUID" = "A1B2C3D4-E5F6-7890-ABCD-EF1234567890""#) == "99ec2a80a62e95be",
+              "hw_hash 应与服务端算法一致")
+        check(hwHash(fromIORegOutput: "") == "", "hw_hash 缺失应为空串")
         return failures
     }
 

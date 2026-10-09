@@ -3,7 +3,7 @@
 ## 当前状态
 <!-- Machine fields: new writes must use "- key: `value`". Legacy variants are read-only compatibility. -->
 - current_phase: `execution`
-- current_tk: `TK-005b`
+- current_tk: `TK-005b,TK-007`
 - current_cr: `—`
 - current_round: `0`
 - escalated: `false`
@@ -22,11 +22,12 @@
 | TK-002c | gateway 测试 1009 后重连时序 | done |
 | TK-001c | worker：translator 写当前真实翻译器名 | done |
 | TK-005 | rslite：NodeClient v2 + NodeRouter + 本机档门槛 | done |
-| TK-005b | 本机节点 UDS 发现 | in-progress（agy gemini-3.1-pro；codex 额度 20:24 恢复） |
+| TK-005b | 本机节点 UDS 发现 | review R3（CR-012；R1/R2 已修，codex 修 R2 grok 意见中；UDS 冒烟 7/7、TK-005 冒烟 24/24、真 mini2 冷启动混合档通） |
 | TK-006 | 清理 v1 + 文档 | done |
-| TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
+| TK-007 | 端到端验收 + 五组功耗 + 结果文档 | in-progress（拆 7 块并行：1 证据已收、2/4/5 脚本已交待真机串行跑、3/6 需用户、7 质量门测试 e8d3942 评审中） |
 
 ## 最近动作
+- 2026-10-09 21:40 CEST: TK-005b：R1（grok+big-pickle 22 条全 accepted）→ codex 修 → agy 修 sun_len → [coordinator-direct] getpeereid 替换无效 fstat 比对、ready 超时 5s→15s（mini2 冷启动实测 >5s）；R2（codex 3 条 + grok 6 条全 accepted）→ R2 修复 8ad666b，R3 修复派 codex。真机：MacBook→mini2 混合档冷启动 14.4s 首精修、3 句替换。TK-007 拆块并行：feat/tk-007 有 node_lifecycle_probe.sh（第 2 条）、hybrid_e2e.sh（第 4 条）、multi_node_probe.py（第 5 条，自报 12/12 待 grok 评审+复跑）、第 1 条证据；feat/tk-007-gates 补 3 个质量门测试。**剩余**：TK-005b R3 修复→评审 R3→合并；TK-007 真机串行跑 2/4/5；需用户：第 6 条功耗（sudo）、第 3 条停 mini2 gateway 回退、第 1 条 mini2 二次安装/回滚演练。并行会话在写 SDD 002（未提交 specs/002，勿动）。
 - 2026-10-09 20:19 CEST: 用户批准后在 mini2 按 34cbbfa 重装节点：步骤 10 通过（UDS /v1/info 200 v=2；TCP 100.105.163.59:8791 LISTEN，无通配监听）；gateway.err.log `tcp_listening attempt=1`。只读复核：MacBook 带 token /v1/info 200、node_id 一致；无 token 401。⚠️ 发现：本机系统代理（127.0.0.1:6152）会劫持走系统代理的 HTTP 客户端（Python urllib 超时），TK-007 需确认 rslite URLSession 连 ws://*.ts.net 不经代理。TK-005b 已派出。
 - 2026-10-09 17:30 CEST: **TK-005 done**（CR-009 五轮收敛，r5 Gemini approve 903201e）→ 合并 7a99c44；**TK-006 done** → 合并 d88bd7f；[coordinator-direct] 41b11ab protocol-v2 同步原因码/TAILSCALE_BE_CLI/P6 url 补路径。主线验证：swift build+selftest OK、本机回放 5 句、冒烟 24/24（主线构建）、安装测试 112 + 其余 898 passed / 0 failed、ruff 通过。**用户额度将尽，停在此处**。下一步：等用户批准 mini2 重装、S1 取舍；TK-005b（本机 UDS 节点）→ TK-007 验收
 - 2026-10-09 17:12 CEST: CR-009 round4 Gemini needs_fix：R4-1 发布门两次加锁覆盖新迁移意图、R4-2 补零无上限（睡眠唤醒 57MB）、R4-3 原子写忽略 fsync/fchmod 返回值 → 全 accepted（R4-2 改为断档>5s 结束会话且不罚节点）→ sonnet 修；Round 5 为熔断前最后一轮
