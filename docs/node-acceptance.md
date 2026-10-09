@@ -23,8 +23,19 @@
 ## 2. 按需加载
 
 - 检查项：无会话时 mini2 上无 worker 进程、gateway 常驻内存 < 50MB；会话结束 120s 后 worker 退出；客户端被 kill/断网后 30s 内判定断开并回收 worker；冷启动后首条精修 ≤ 15s
-- 命令：TODO（`ps`/`vmmap` 取内存；kill 客户端；计时）
-- 证据：TODO（kill worker / 停 gateway 等远程操作须先获用户批准）
+- 命令（控制端 MacBook 执行；远端只读 `ps` 与 gateway 日志，不停止/杀远端进程）：
+  ```bash
+  bash scripts/bench/node_lifecycle_probe.sh mini2 ~/projects/rs-mac-native-data/concat5.wav
+  ```
+- 判定：
+  - `idle_no_worker`：`ssh mini2 ps -axo pid,rss,command` 中没有 `realtime_subtitle.node.worker`。
+  - `idle_gateway_rss`：`realtime_subtitle.node.gateway` 的最大 RSS < 50 MB。
+  - `cold_first_refine`：本机 `rslite --headless --source file:<wav> --mode hybrid` 启动后，stdout JSONL 中首条节点精修结果 ≤ 15s；脚本只保留事件类型和时间戳，不记录字幕正文。
+  - `idle_reap_after_playback`：回放结束后 worker 在约 120s 保温窗口后退出，脚本判定窗口为 100–150s。
+  - `disconnect_detected`：第二次启动 rslite，观察到 worker 出现后 kill 本机 rslite；用 gateway `session_end dur_s` 与本机 kill 时刻相减，要求 ≤ 30s。
+  - `disconnect_worker_reap`：kill 后 worker 最迟 150s 内消失（30s 断线判定 + 120s 保温回收上限）。
+  - stdout 每项输出 PASS/FAIL 与数字，最后一行是汇总 JSON；实测数字填入下方证据。
+- 证据：TODO（本探针不需要远端 kill/停服务；若另做远端故障注入须先获用户批准）
 
 ## 3. 自动选档
 
