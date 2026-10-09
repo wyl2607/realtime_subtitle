@@ -54,11 +54,14 @@ plan() { printf '  [dry-run] %s\n' "$*"; }
 # 目标机的登录 shell 是 zsh，所以统一显式起 bash，不依赖对端 shell 的语法。
 # ------------------------------------------------------------
 
-# ssh 非交互会话的 PATH 不含 /opt/homebrew/bin，也不含 Tailscale.app 里的命令行
-TGT_PATH_EXPORT='export PATH=/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH'
+# ssh 非交互会话的 PATH 不含 /opt/homebrew/bin，也不含 Tailscale.app 里的命令行。
+# 前缀抽成 RS_TOOL_PATH_PREFIX：测试可把它指向桩目录把真 tailscale/uv/ollama 挡在 PATH 外面；
+# 默认值逐字不变，远端脚本里用 ${RS_TOOL_PATH_PREFIX:-…} 兜底、同名生效。
+RS_TOOL_PATH_PREFIX=${RS_TOOL_PATH_PREFIX:-/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS}
+TGT_PATH_EXPORT="export PATH=${RS_TOOL_PATH_PREFIX}:\$PATH"
 
 IFS= read -r -d '' PREFLIGHT_SH <<'EOF' || true
-export PATH=/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH
+export PATH=${RS_TOOL_PATH_PREFIX:-/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS}:$PATH
 min_gb=$1
 [ "$(uname -s)" = Darwin ] || { echo "目标机不是 macOS"; exit 1; }
 free_kb=$(df -k "$HOME" | awk 'NR==2{print $4}')
@@ -215,7 +218,7 @@ EOF
 # 且每次动手（TERM / KILL）前都用 ps 的完整命令行再确认一遍。
 # Python 首字母大小写都认：macOS 框架版 Python 的进程名是 `Python`。
 IFS= read -r -d '' STOP_V1_SH <<'EOF' || true
-export PATH=/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH
+export PATH=${RS_TOOL_PATH_PREFIX:-/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS}:$PATH
 umask 077
 state="$HOME/Library/Application Support/rs-node"
 rec="$state/v1.restart"
@@ -295,7 +298,7 @@ STOP_V1_SH="${V1_LIB_SH}${STOP_V1_SH}"
 # 节点只多一个 websockets，单独装。--skip-models：节点默认用系统翻译，不拉 Ollama 模型。
 IFS= read -r -d '' BUILD_SH <<'EOF' || true
 set -e
-export PATH=/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH
+export PATH=${RS_TOOL_PATH_PREFIX:-/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS}:$PATH
 cd "$HOME/rs-node.new"
 bash scripts/macos/install.sh --skip-models </dev/null
 VIRTUAL_ENV="$PWD/venv" uv pip install -r realtime_subtitle/node/requirements.txt </dev/null
@@ -305,7 +308,7 @@ EOF
 # 为什么不等换名后再测：失败时 ~/rs-node 还是完好的旧版，回滚成本为零。
 # 音频只放 mktemp 目录，退出即删，不落盘保存。
 IFS= read -r -d '' SELFCHECK_SH <<'EOF' || true
-export PATH=/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH
+export PATH=${RS_TOOL_PATH_PREFIX:-/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS}:$PATH
 cd "$HOME/rs-node.new" || exit 1
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -408,7 +411,7 @@ EOF
 #              失败版改名 ~/rs-node.failed 留着排查。
 # 两种情况都按 STOP_V1_SH 记下的白名单参数把 v1 重新拉起（见 restore_v1）。
 IFS= read -r -d '' SWAP_SH <<'EOF' || true
-export PATH=/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH
+export PATH=${RS_TOOL_PATH_PREFIX:-/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS}:$PATH
 uid_n=$(id -u)
 label=$1
 plist="$HOME/Library/LaunchAgents/$label.plist"
