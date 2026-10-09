@@ -147,7 +147,8 @@ v1（`realtime_subtitle/remote/server.py`，已在 TK-006 删除）是外包算�
 
 ## 隐私与安全边界
 
-- **只绑 Tailscale**：TCP 监听地址每次启动现取 `tailscale ip -4`，且必须是 `100.64.0.0/10` 的 IPv4，拒绝通配/组播/主机名/带空白的值（`gateway.py:114-143`）；取不到则指数退避重试（1s 起，上限 60s）。另一路是本机 UDS，目录 0700、socket 0600，目录是 symlink、属主不对、权限不对一律拒绝启动，并逐连接校验对端 uid（`gateway.py:753-754, 772-791, 843-854`）。
+- **只绑 Tailscale**：TCP 监听地址每次启动现取 `tailscale ip -4`，且必须是 `100.64.0.0/10` 的 IPv4，拒绝通配/组播/主机名/带空白的值（`gateway.py:131-175`）；取不到则指数退避重试（1s 起，上限 60s）。调 CLI 时子进程环境追加 `TAILSCALE_BE_CLI=1`（`gateway.py:154`）：App Store 版 Tailscale 在 launchd 这种没有 `SHLVL` 的环境里会按 GUI 启动、往 stdout 打报错且退出码 0（2026-10-09 mini2 实测）。失败日志只记固定原因码 `tcp_bind_failed attempt=N reason=<code>`（`gateway.py:845`），`<code>` ∈ `tailscale_cli_missing` / `tailscale_cli_failed` / `tailscale_cli_timeout` / `tailscale_no_ipv4` / `tailscale_not_ip` / `not_tailscale_range` / `wildcard_or_multicast` / `bind_failed` / `unexpected_error`，不写 CLI 原始输出。`install_node.sh` 第 10 步要求 gateway 进程确实在 `<Tailscale IP>:8791` LISTEN 且无通配监听，否则回滚。
+- **客户端补会话路径**：P6 的 `nodes.json` 里 `url` 只写 `ws://<MagicDNS 名>:8791`（安装脚本即如此写），rslite 连接时路径为空就补 `/v2/session`，`/v1/info` 由同一主机派生。另一路是本机 UDS，目录 0700、socket 0600，目录是 symlink、属主不对、权限不对一律拒绝启动，并逐连接校验对端 uid（`gateway.py:753-754, 772-791, 843-854`）。
 - **token**：至少 32 字符（`MIN_TOKEN_CHARS`）；文件权限含 group/other 位即拒绝（要求 0600）；只能经 `--token-file` 或 `--token-stdin` 传入，不进命令行，避免出现在 `ps` 里；常量时间比较，重复的 `Authorization` 头一律不认；错误信息里不带 token（`gateway.py:146-163, 825-833, 948-963`）。
 - **日志无正文无 token**：gateway 和 worker 都只记事件类型、时长、字节数、帧数、错误码/类名；转录/译文正文、token、hello 字段值都不进日志。websockets 自带的 DEBUG 日志会逐帧打印文本，所以给它单独一个钉在 WARNING 的 logger（`gateway.py:14-16, 49-50`）；worker 的 `_log` 还会把形状不像「代号」的字符串值抹成 `?`，异常只记类名不记消息（`worker.py:25-28, 91-102`）。
 - **音频不落盘**：音频只在内存队列和管道里流转，不写任何文件；worker 写盘的只有 `asr_state.json`（模型名、后端、rtf、翻译器名），权限 0600，原子替换（`worker.py:379-386`）。
