@@ -5,7 +5,7 @@
 
 | CR | TK | rounds | status | last_action |
 |----|----|--------|--------|-------------|
-| CR-006 | TK-001c | 0 | open | 2026-10-09 11:20 CST: round1 派出（opus） |
+| CR-006 | TK-001c | 1 | needs_fix | 2026-10-09 11:35 CST: round1 approve_with_minor；F1/F2/F3 accepted、F4 rejected → repair（sonnet） |
 | CR-005 | TK-003 | 3 | resolved | 2026-10-09 10:40 CST: round3 两路 approve + Mac ps/pgrep/bash 核实；已合并；真机装 mini2 待用户批准 |
 | CR-004 | TK-001b | 3 | resolved | 2026-10-09 08:25 CST: round3 approve（端到端 rtf None→0.0101→0.037 滑动）；三轮收敛，已合并 |
 | CR-003 | TK-002 | 4 | resolved | 2026-10-09 07:30 CST: round4 approve；四轮收敛（15 accepted / 6 rejected），已合并（PR #62） |
