@@ -188,7 +188,8 @@ final class NodeRouter: @unchecked Sendable {
     }
 
     static var localUDSPath: String {
-        (NSHomeDirectory() as NSString).appendingPathComponent("Library/Application Support/rs-node/gw.sock")
+        let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+        return (home as NSString).appendingPathComponent("Library/Application Support/rs-node/gw.sock")
     }
 
     func start(fanout: AudioFanout) {
@@ -196,10 +197,6 @@ final class NodeRouter: @unchecked Sendable {
             stopped = false
             nodes = Self.loadNodes(from: nodesURL)
             states = Self.loadState(from: stateURL)
-        }
-        if lock.withLockValue({ nodes.isEmpty }) {
-            routeLog("select local reason=no_nodes")
-            onMode(.local)
         }
         let stream = fanout.subscribe(capacity: AudioFanout.defaultCapacity)
         probeTask = Task { await self.probeLoop() }
