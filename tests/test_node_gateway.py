@@ -105,6 +105,10 @@ async def until(pred, timeout: float = 8.0, what: str = "condition"):
     raise AssertionError(f"timeout waiting for {what}")
 
 
+async def wait_session_freed(gw: Gateway, timeout: float = 5.0) -> None:
+    await until(lambda: not gw._session_active, timeout=timeout, what="session slot freed")
+
+
 def _alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -702,10 +706,12 @@ def test_hello_must_be_first_text_and_arrive_in_time(tmp_path, monkeypatch):
             ws = await uds_connect(gw)  # 什么都不发
             await asyncio.wait_for(ws.wait_closed(), 5)
             assert ws.close_code == 1008
+            await wait_session_freed(gw)
             ws = await uds_connect(gw)  # 先发二进制
             await ws.send(b"\x00\x00")
             await asyncio.wait_for(ws.wait_closed(), 5)
             assert ws.close_code == 1008
+            await wait_session_freed(gw)
             ws = await uds_connect(gw)  # 先发 flush
             await ws.send(json.dumps({"type": "flush"}))
             await asyncio.wait_for(ws.wait_closed(), 5)
@@ -727,6 +733,7 @@ def test_frame_size_limit_and_alignment(tmp_path):
             await ws.send(b"\x01\x00" * (32 * 1024 + 1))  # 超 64KB：协议层直接 1009
             await asyncio.wait_for(ws.wait_closed(), 5)
             assert ws.close_code == 1009
+            await wait_session_freed(gw)
 
             ws = await uds_connect(gw)
             await hello_ready(ws)
