@@ -1,6 +1,6 @@
 # 节点化（remote-offload）端到端验收记录
 
-> 状态：骨架（TK-007 准备阶段）。所有 `TODO` 待 TK-005 合并、mini2 节点就绪后由 Coordinator 在真机补证据。
+> 状态：持续验收中（2026-10-09）。已补真机按需加载两轮实测、Grok 多节点 R2 失败、TK-005c 合并与双审、静态评分脚本单测；其余 `TODO` 代表尚未通过或未测，不得视为验收完成。
 > 契约来源：`.governance/sprints-001-remote-offload/RFC.md` 的 Done criteria 1–8。
 > 每条证据都写：命令、输出摘要、数字、日期/commit。没跑过的不要填。
 
@@ -35,7 +35,11 @@
   - `disconnect_detected`：第二次启动 rslite，观察到 worker 出现后 kill 本机 rslite；用 gateway `session_end dur_s` 与本机 kill 时刻相减，要求 ≤ 30s。
   - `disconnect_worker_reap`：kill 后 worker 最迟 150s 内消失（30s 断线判定 + 120s 保温回收上限）。
   - stdout 每项输出 PASS/FAIL 与数字，最后一行是汇总 JSON；实测数字填入下方证据。
-- 证据：TODO（本探针不需要远端 kill/停服务；若另做远端故障注入须先获用户批准）
+- **2026-10-09 真机首跑：FAIL（尚未验收）**。`feat/tk-007`=`2ecddc9`；控制端 MacBook Air，目标 mini2；实际命令：`RSLITE_BIN=$HOME/projects/rs-mac-native/macos-native/.build/release/rslite bash scripts/bench/node_lifecycle_probe.sh mini2 /tmp/e2e/de.wav`。保留脱敏原始检查结果 `/tmp/tk007/crit2_run.log`，细节目录 `/tmp/tk007/node_lifecycle_probe.20261009-222139.77137/`。
+  - PASS：空闲 worker=0；gateway RSS=20.0 MB（限 50 MB）；冷启动 worker 首次观测 3.419s；rslite 正常退出；回放后回收 120.870s；断连后 worker 消失 120.223s（限 150s）。
+  - FAIL：首次节点精修 16.159s（限 15s）；`disconnect_detected` 计算出 **-0.472s**（要求 0–30s）。后者可能受不同进程时钟起点或日志关联影响，不能据此断言节点实际断线检测迟缓，需修探针验证。
+  - **质量门缺陷**：首跑汇总 JSON 为 `ok:false`，但 shell 退出码仍为 0；后续工作树已补 `overall != PASS` 时退出 1，尚未提交/独立复核。此探针远端仅只读，不做 mini2 状态变更；远端故障注入仍待用户逐项批准。
+- **同日复跑（另一会话启动）：仍 FAIL**。`/tmp/tk007/crit2_run2.log`：空闲 worker=0，gateway RSS=22.2MB，worker 出现 2.270s，首次精修输出为 `null`（判定 FAIL），回放后回收 120.451s，断连检测 0.586s，断连后 worker 回收 119.632s；`ok:false`、退出码 1。需核实 `first_refine` 的采样竞争：脱敏记录 `/tmp/tk007/node_lifecycle_probe.20261009-222659.80917/cold.events.meta.jsonl` 实际包含 3 条节点 final，第一条 `t=14.007s`（进程事件时间），但脚本 15s 轮询截止前未读到，导致记录 `null`。**事件时间与检测截止的关系需先修并重跑，既不能直接算 PASS，也不能误认为节点完全没有精修。**
 
 ## 3. 自动选档
 
@@ -63,6 +67,7 @@
 | 不重复、不丢句 | 无 | TODO | TODO |
 
 - 评分脚本已用 B 档历史数据（`rslite_fast2.jsonl`，5 句、无节点行）验证能跑通：最终 WER 0.0789（与基线 7.9% 一致）；该数据没有节点行，所以精修延迟为 n/a。
+- **2026-10-09 静态/单测门：** `bash -n scripts/bench/hybrid_e2e.sh` = 0；`~/projects/rs-mac-venv/bin/python -m pytest -q tests/test_bench_hybrid_score.py -p no:cacheprovider` = **6 passed**。这只能证明脚本解析与计分单测，不代表真实 B/C/混合跑分；真实指标仍 TODO，安排在 TK-005c 合并后主线 pytest 和全局 rslite 串行资源释放之后。
 
 ## 5. 多节点路由
 
@@ -93,7 +98,7 @@
   - `Timeline coverage has no gap exceeding silence threshold + switch budget`：整段音频无超预算间隙
   - `No switch_failed in stderr`：无切换失败
   - 末尾汇总 JSON 含 `checks_passed`/`checks_failed`/`node_a_finals`/`node_b_finals`/`visible_lines` 等字段
-- 证据：TODO（实测时填入）
+- **2026-10-09 Grok R2：request-changes，未通过验收。**评审结果 `/tmp/tk007/grok_multinode_r2.md`（末行 `GROKDONE`）；虽然旧实现自报 20/20，F1/F2/F3/F5 未修好、F4/F6/F7 已修好。新增 F8 blocker（`t` 进程墙钟与 `t0` 音频轴混用，且迁移窗、首句窗是两个独立搜索）及 F9–F13 major（在线窗口自证、片头片尾丢句漏测、A→B→A 到达序混淆、可见轨不遵守 `LineStore`、drain/selection 因果次序无证据），F14/F15 minor。已创建隔离 lane `feat/tk-007-r2fix` 修验收探针，**修复与第三方复审前不能认定多节点迁移已通过**。
 
 ## 6. 功耗（五组）
 
@@ -117,7 +122,7 @@
 
 - 命令：`QT_QPA_PLATFORM=offscreen venv/bin/python -m pytest -q -p no:cacheprovider`；`venv/bin/ruff check .`；`cd macos-native && swift build -c release --product rslite`
 - 检查项：P2 各项上限、S3、S7 有测试覆盖；每个 TK 至少 2 轮评审（鉴权/生命周期/状态机类 3 轮）
-- 证据：TODO（云端基线参考：916 passed / 46 skipped / 8 个 Windows 专用收集错误）
+- **2026-10-09 TK-005c 已合入 `feat/macos-native`：merge `938240b`（仅特性分支，未碰 master、未 push）。** Coordinator release build 成功（`/tmp/tk005c/coordinator_build.log`），`rslite --selftest` = `SELFTEST OK`，UDS 冒烟 **7/7 PASS**（`/tmp/tk005c/coordinator_uds_smoke.log`）；Grok R1 和 Codex R2 均审 `approve` / 0 finding（`/tmp/tk005c/{grok_review_r1,codex_review_r2}.md`）。TK-005 24 项冒烟是 **21/24**，静默断网缺 30s 内 fallback、fallback 原因日志和恰好一次 fallback 证明；**同一脚本对未修改基线 `e150b92` 复跑同样 21/24、同样三项 FAIL**（`/tmp/tk005c/coordinator_tk005_baseline.log`），属于已知共同验收缺口而非已证明的 TK-005c 回归，保留后续诊断/修复；不宣称 24/24 PASS。主线合并后全量 pytest 和 ruff 复跑进行中（结果另行补录）。
 
 ## 8. 文档
 
