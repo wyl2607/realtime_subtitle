@@ -22,10 +22,12 @@
 | TK-002c | gateway 测试 1009 后重连时序 | reviewing |
 | TK-001c | worker：translator 写当前真实翻译器名 | done |
 | TK-005 | rslite：NodeClient v2 + NodeRouter + 本机档门槛 | reviewing |
+| TK-005b | 本机节点 UDS 发现 | planned |
 | TK-006 | 清理 v1 + 文档 | reviewing |
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 18:35 CEST: CR-009 round3 opus approve_with_minor：F4/F5 确认；新 R3-1（无 ping 超时，静默断网不回退，P7）/R3-2（扇出丢帧致节点时钟偏移，P5 错行）必修 + R3-4..7 低成本 + nit accepted；R3-3（本机 UDS 节点未实现）拆 TK-005b → sonnet 修（codex 20:24 才恢复、Gemini 前科假结论）→ 之后 round4。CR-011：opencode 因 external_directory 无结论、Gemini 503 → 重试中
 - 2026-10-09 18:15 CEST: CR-009 F4/F5 已在 codex WIP 91d5310 完成（Gemini 接续确认无需增补，但越权 `git reset` 回退已推送提交 → Coordinator `reset --soft` 恢复直线历史）；本机复核 build/selftest/冒烟 18/18 → round3 Claude opus 终审。TK-002c 回报 4555a09（+7 行 wait_session_freed；并发两份各 120 passed）→ CR-011 round1（opencode）
 - 2026-10-09 18:00 CEST: codex 第二次额度中断（20:24 重置），CR-009 F4 半成品 WIP 91d5310（build/selftest 通过）→ Gemini pro 接续 F4/F5（第 3 轮改由 Claude opus 终审，评审≠修复者）。frame_size 根因：1009 关闭后测试立即重连、gateway 收尾未完成 → 1013（测试时序，非产品缺陷）→ 新 TK-002c（Gemini flash，worktree rs-tk-002c）
 - 2026-10-09 17:50 CEST: **TK-003b done**：CR-010 round2 approve → 合并 523877b（主线看门狗安装测试 112 passed、其余 906 passed/1 基线失败、ruff/shellcheck 通过）。主线安装脚本已可用于 mini2 重装（等用户批准）。CR-009 round2 Gemini：F1–F3 确认修好，新 F4（取消被当节点故障）/F5（旧会话 drain 期间断开覆盖新节点模式）accepted → codex 修。frame_size 基线失败（1013 busy）派 opencode 免费模型只做根因调查（detached /tmp/inv-frame/wt）
