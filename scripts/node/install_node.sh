@@ -54,8 +54,11 @@ plan() { printf '  [dry-run] %s\n' "$*"; }
 # 目标机的登录 shell 是 zsh，所以统一显式起 bash，不依赖对端 shell 的语法。
 # ------------------------------------------------------------
 
-# ssh 非交互会话的 PATH 不含 /opt/homebrew/bin，也不含 Tailscale.app 里的命令行
-TGT_PATH_EXPORT='export PATH=/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH'
+# ssh 非交互会话的 PATH 不含 /opt/homebrew/bin，也不含 Tailscale.app 里的命令行。
+# 前缀抽成 RS_TOOL_PATH_PREFIX：测试可把它指向桩目录把真 tailscale/uv/ollama 挡在 PATH 外面；
+# 默认值逐字不变，远端脚本里用 ${RS_TOOL_PATH_PREFIX:-…} 兜底、同名生效。
+# 单引号：前缀只在目标端展开，控制端的值不会被拼进发给 ssh 的命令串（CR-010：防注入）。
+TGT_PATH_EXPORT='export PATH=${RS_TOOL_PATH_PREFIX:-/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS}:$PATH'
 
 IFS= read -r -d '' TS_IP_LIB_SH <<'EOF' || true
 is_ts_ipv4() {
@@ -65,7 +68,7 @@ is_ts_ipv4() {
 EOF
 
 IFS= read -r -d '' PREFLIGHT_SH <<'EOF' || true
-export PATH=/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH
+export PATH=${RS_TOOL_PATH_PREFIX:-/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS}:$PATH
 min_gb=$1
 [ "$(uname -s)" = Darwin ] || { echo "目标机不是 macOS"; exit 1; }
 free_kb=$(df -k "$HOME" | awk 'NR==2{print $4}')
@@ -74,7 +77,7 @@ if [ "${free_kb:-0}" -lt $((min_gb * 1024 * 1024)) ]; then
     exit 1
 fi
 for c in brew ollama uv swift; do
-    command -v "$c" >/dev/null 2>&1 || { echo "目标机没有找到 $c（scripts/macos/install.sh 需要它）。请先在目标机安装后重跑"; exit 1; }
+    command -v "$c" >/dev/null 2>&1 || { echo "目标机没有找到 ${c}（scripts/macos/install.sh 需要它）。请先在目标机安装后重跑"; exit 1; }
 done
 # TAILSCALE_BE_CLI=1：App Store 版二进制在环境里没有 SHLVL 时会按 GUI 启动，往 stdout 打报错且退出码 0
 ts_ip=$(TAILSCALE_BE_CLI=1 tailscale ip -4 2>/dev/null </dev/null | head -n 1 || true)
@@ -222,7 +225,7 @@ EOF
 # 且每次动手（TERM / KILL）前都用 ps 的完整命令行再确认一遍。
 # Python 首字母大小写都认：macOS 框架版 Python 的进程名是 `Python`。
 IFS= read -r -d '' STOP_V1_SH <<'EOF' || true
-export PATH=/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH
+export PATH=${RS_TOOL_PATH_PREFIX:-/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS}:$PATH
 umask 077
 state="$HOME/Library/Application Support/rs-node"
 rec="$state/v1.restart"
@@ -279,7 +282,7 @@ token_file=$V_TOK"
         echo "⚠️ 没能写入 v1 记录：如果 v2 安装失败，v1 需要手动重新启动"
     fi
 else
-    echo "⚠️ 不记录 v1 的启动命令（$why）：如果 v2 安装失败，v1 需要手动重新启动"
+    echo "⚠️ 不记录 v1 的启动命令（${why}）：如果 v2 安装失败，v1 需要手动重新启动"
     drop_rec
     write_rec "unrecorded=1" || true
 fi
@@ -302,7 +305,7 @@ STOP_V1_SH="${V1_LIB_SH}${STOP_V1_SH}"
 # 节点只多一个 websockets，单独装。--skip-models：节点默认用系统翻译，不拉 Ollama 模型。
 IFS= read -r -d '' BUILD_SH <<'EOF' || true
 set -e
-export PATH=/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH
+export PATH=${RS_TOOL_PATH_PREFIX:-/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS}:$PATH
 cd "$HOME/rs-node.new"
 bash scripts/macos/install.sh --skip-models </dev/null
 VIRTUAL_ENV="$PWD/venv" uv pip install -r realtime_subtitle/node/requirements.txt </dev/null
@@ -312,7 +315,7 @@ EOF
 # 为什么不等换名后再测：失败时 ~/rs-node 还是完好的旧版，回滚成本为零。
 # 音频只放 mktemp 目录，退出即删，不落盘保存。
 IFS= read -r -d '' SELFCHECK_SH <<'EOF' || true
-export PATH=/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH
+export PATH=${RS_TOOL_PATH_PREFIX:-/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS}:$PATH
 cd "$HOME/rs-node.new" || exit 1
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -415,7 +418,7 @@ EOF
 #              失败版改名 ~/rs-node.failed 留着排查。
 # 两种情况都按 STOP_V1_SH 记下的白名单参数把 v1 重新拉起（见 restore_v1）。
 IFS= read -r -d '' SWAP_SH <<'EOF' || true
-export PATH=/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH
+export PATH=${RS_TOOL_PATH_PREFIX:-/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS}:$PATH
 uid_n=$(id -u)
 label=$1
 plist="$HOME/Library/LaunchAgents/$label.plist"

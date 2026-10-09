@@ -72,6 +72,10 @@ _STUBS = {
             '[ -n "${STUB_INFO_FAIL:-}" ] && exit 22\n'
             'nid=$(cat "$HOME/Library/Application Support/rs-node/node_id")\n'
             'echo "{\\"v\\":2,\\"node_id\\":\\"$nid\\"}"\n',
+    # macOS 16.x：$PATH 前面的 bin 目录没有 say/afconvert，全走真系统工具会真跑 TTS/转码；
+    # 桩成无输出，让自检走「没有可用德语声音」分支，什么都不真的执行
+    "say": "#!/bin/bash\nexit 0\n",
+    "afconvert": "#!/bin/bash\nexit 0\n",
     # lsof：v1 的 cwd 由测试指定；`-iTCP` 查询（第 10 步 TCP 监听校验）返回 STUB_TCP_LISTEN（-Fpn 格式，默认 gateway=4242 在 100.64.0.7:8791）
     "lsof": '#!/bin/bash\n'
             'case "$*" in *-iTCP*)\n'
@@ -139,6 +143,9 @@ def env(tmp_path):
     e.update({
         "HOME": str(home),
         "PATH": f"{bindir}:{e['PATH']}",
+        # install_node.sh 会把这条前缀 export 到 PATH 最前面；指回桩目录可保证真
+        # tailscale/uv/ollama（在 /opt/homebrew/bin 等 System PATH 里）永远不会被优先命中
+        "RS_TOOL_PATH_PREFIX": str(bindir),
         "STUB_LOG_DIR": str(logdir),
         "STUB_PYTHON": sys.executable,
         "STUB_FAKE_PYTHON": str(fake),
@@ -876,7 +883,7 @@ def _run_restore(e, home: Path):
     prog = (
         'source "$1"; eval "$V1_LIB_SH"\n'
         f'state="{_state_dir(home)}"; rec="$state/v1.restart"\n'
-        'eval "$(printf "%s\\n" "$SWAP_SH" | sed -n "/^restore_v1() {/,/^}/p")"\n'
+        'eval "$(printf "%s\\n" "$SWAP_SH" | sed -n "/^restore_v1()/,/^}/p")"\n'
         'restore_v1\n')
     return subprocess.run(["bash", "-c", prog, "x", str(SCRIPT)], env=e,
                           capture_output=True, text=True, timeout=60)
