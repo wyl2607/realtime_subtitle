@@ -1073,14 +1073,14 @@ def speech_session(n_segments, speech_s=3.0):
     return hello() + audio_frames(pcm) + ctl(type="drain")
 
 
-def run_rtf(stream, state_dir, cost=0.5, utterances=None, tr_name="fake"):
+def run_rtf(stream, state_dir, cost=0.5, utterances=None, tr_name="fake", factory=None):
     clock = [0.0]
     asr = ClockAsr(clock, cost, utterances=utterances)
     out, err = io.BytesIO(), io.StringIO()
     tr = FakeTr()
     tr.name = tr_name
     w = RecordingWorker(io.BytesIO(stream), out, asr, EnergyVad(),
-                        translator_factory=lambda s, d: tr, err=err,
+                        translator_factory=factory or (lambda s, d: tr), err=err,
                         state_dir=state_dir)
     w.seg_durations = []
     worker_mod_time = worker_mod.time
@@ -1117,8 +1117,8 @@ def test_next_hello_also_ends_session_and_blends_with_old(tmp_path):
     session = 0.5 * len(w.seg_durations) / sum(w.seg_durations)
     state = read_state(tmp_path)
     assert state["rtf"] == pytest.approx(0.7 * 0.8 + 0.3 * session, abs=1e-3)
-    # 已有的 model/backend/translator 保留，不被当前引擎覆盖
-    assert (state["model"], state["backend"], state["translator"]) == ("m0", "b0", "apple")
+    # 已有的 model/backend 保留；translator 以本会话真实翻译器为准（FakeTr.name == "fake"），不再沿用旧值
+    assert (state["model"], state["backend"], state["translator"]) == ("m0", "b0", "fake")
 
 
 @pytest.mark.parametrize("old", ['not json', '[]', '{"rtf": -1}', '{"rtf": "0.3"}',
@@ -1173,6 +1173,40 @@ def test_gateway_info_reader_reads_back_what_worker_wrote(tmp_path):
     assert asr["rtf"] == pytest.approx(read_state(tmp_path)["rtf"])
     assert asr["rtf"] > 0 and translator == "ollama:fake"
     assert asr["model"] == "fake"
+
+
+def _write_old_state(d, translator):
+    (d / info_mod.ASR_STATE_FILENAME).write_text(json.dumps(
+        {"model": "m0", "backend": "b0", "rtf": 0.8, "translator": translator}))
+
+
+def test_session_translator_overrides_stale_old_value(tmp_path):
+    # 安装自检写了 ollama:x，之后装好语言包，本会话实际走 apple → 必须改写成 apple
+    _write_old_state(tmp_path, "ollama:x")
+    run_rtf(speech_session(3), tmp_path, tr_name="apple")
+    assert read_state(tmp_path)["translator"] == "apple"
+    _, translator = info_mod.NodeInfo(state_dir=tmp_path).asr_and_translator()
+    assert translator == "apple"
+
+
+def test_failed_translator_construction_keeps_old_valid_value(tmp_path):
+    def boom(s, d):
+        raise RuntimeError("no language pack")
+    _write_old_state(tmp_path, "apple")
+    run_rtf(speech_session(3), tmp_path, factory=boom)
+    assert read_state(tmp_path)["translator"] == "apple"
+    _, translator = info_mod.NodeInfo(state_dir=tmp_path).asr_and_translator()
+    assert translator == "apple"
+
+
+def test_no_old_value_and_no_translator_writes_default(tmp_path):
+    def boom(s, d):
+        raise RuntimeError("no language pack")
+    (tmp_path / info_mod.ASR_STATE_FILENAME).write_text(json.dumps({"rtf": 0.8}))
+    run_rtf(speech_session(3), tmp_path, factory=boom)
+    assert read_state(tmp_path)["translator"] == info_mod.DEFAULT_TRANSLATOR
+    _, translator = info_mod.NodeInfo(state_dir=tmp_path).asr_and_translator()
+    assert translator == info_mod.DEFAULT_TRANSLATOR
 
 
 def test_missing_state_dir_is_logged_and_keeps_exit_code(tmp_path):
