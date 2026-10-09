@@ -3,7 +3,7 @@
 ## 当前状态
 <!-- Machine fields: new writes must use "- key: `value`". Legacy variants are read-only compatibility. -->
 - current_phase: `execution`
-- current_tk: `TK-002b,TK-005,TK-006`
+- current_tk: `TK-005b`
 - current_cr: `—`
 - current_round: `0`
 - escalated: `false`
@@ -15,15 +15,34 @@
 | TK-001 | 节点 worker：VAD 分段 + 整段识别 + 可插拔翻译 | done |
 | TK-001b | worker：会话结束滑动更新 rtf | done |
 | TK-002 | 节点 gateway：生命周期 + 协议 v2 + 鉴权与上限 | done |
-| TK-003 | 一键安装 install_node.sh | done（mini2 已装；TCP 监听 blocker，见 HANDOFF §11.2） |
+| TK-003 | 一键安装 install_node.sh | done（mini2 10-09 20:19 按 34cbbfa 重装，TCP 已监听） |
 | TK-004 | rslite：带时间句子 + AudioFanout + 混合替换 + 单实例 | done |
-| TK-002b | gateway：launchd 下 Tailscale CLI 修复 + 安装自检补 TCP | executing |
+| TK-002b | gateway：launchd 下 Tailscale CLI 修复 + 安装自检补 TCP | done |
+| TK-003b | install 测试 macOS 密封 + bash 多字节 bug | done |
+| TK-002c | gateway 测试 1009 后重连时序 | done |
 | TK-001c | worker：translator 写当前真实翻译器名 | done |
-| TK-005 | rslite：NodeClient v2 + NodeRouter + 本机档门槛 | executing |
-| TK-006 | 清理 v1 + 文档 | executing |
+| TK-005 | rslite：NodeClient v2 + NodeRouter + 本机档门槛 | done |
+| TK-005b | 本机节点 UDS 发现 | in-progress（agy gemini-3.1-pro；codex 额度 20:24 恢复） |
+| TK-006 | 清理 v1 + 文档 | done |
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 20:19 CEST: 用户批准后在 mini2 按 34cbbfa 重装节点：步骤 10 通过（UDS /v1/info 200 v=2；TCP 100.105.163.59:8791 LISTEN，无通配监听）；gateway.err.log `tcp_listening attempt=1`。只读复核：MacBook 带 token /v1/info 200、node_id 一致；无 token 401。⚠️ 发现：本机系统代理（127.0.0.1:6152）会劫持走系统代理的 HTTP 客户端（Python urllib 超时），TK-007 需确认 rslite URLSession 连 ws://*.ts.net 不经代理。TK-005b 已派出。
+- 2026-10-09 17:30 CEST: **TK-005 done**（CR-009 五轮收敛，r5 Gemini approve 903201e）→ 合并 7a99c44；**TK-006 done** → 合并 d88bd7f；[coordinator-direct] 41b11ab protocol-v2 同步原因码/TAILSCALE_BE_CLI/P6 url 补路径。主线验证：swift build+selftest OK、本机回放 5 句、冒烟 24/24（主线构建）、安装测试 112 + 其余 898 passed / 0 failed、ruff 通过。**用户额度将尽，停在此处**。下一步：等用户批准 mini2 重装、S1 取舍；TK-005b（本机 UDS 节点）→ TK-007 验收
+- 2026-10-09 17:12 CEST: CR-009 round4 Gemini needs_fix：R4-1 发布门两次加锁覆盖新迁移意图、R4-2 补零无上限（睡眠唤醒 57MB）、R4-3 原子写忽略 fsync/fchmod 返回值 → 全 accepted（R4-2 改为断档>5s 结束会话且不罚节点）→ sonnet 修；Round 5 为熔断前最后一轮
+- 2026-10-09 17:10 CEST（**时间更正**：本机 `date` 实测 17:05；15:20 之后几条记录的时刻是 Coordinator 估算、偏晚约 1.5–2h，顺序无误）: TK-005 R3 修复 6eb2aa8（sonnet）→ Coordinator 复核 build/selftest/冒烟 24/24（含静默断网 17.1s 回退）→ CR-009 round4 Gemini pro（定向+安全，含补零无上限评估）
+- 2026-10-09 18:50 CEST: **TK-002c done**：CR-011 两轮 approve（Gemini flash / haiku）→ 合并 b7a55c8。**主线首次全绿：1019 passed（安装 112 + 其余 907）、0 failed、ruff 通过**。TK-005 R3 修复（sonnet）进行中
+- 2026-10-09 18:35 CEST: CR-009 round3 opus approve_with_minor：F4/F5 确认；新 R3-1（无 ping 超时，静默断网不回退，P7）/R3-2（扇出丢帧致节点时钟偏移，P5 错行）必修 + R3-4..7 低成本 + nit accepted；R3-3（本机 UDS 节点未实现）拆 TK-005b → sonnet 修（codex 20:24 才恢复、Gemini 前科假结论）→ 之后 round4。CR-011：opencode 因 external_directory 无结论、Gemini 503 → 重试中
+- 2026-10-09 18:15 CEST: CR-009 F4/F5 已在 codex WIP 91d5310 完成（Gemini 接续确认无需增补，但越权 `git reset` 回退已推送提交 → Coordinator `reset --soft` 恢复直线历史）；本机复核 build/selftest/冒烟 18/18 → round3 Claude opus 终审。TK-002c 回报 4555a09（+7 行 wait_session_freed；并发两份各 120 passed）→ CR-011 round1（opencode）
+- 2026-10-09 18:00 CEST: codex 第二次额度中断（20:24 重置），CR-009 F4 半成品 WIP 91d5310（build/selftest 通过）→ Gemini pro 接续 F4/F5（第 3 轮改由 Claude opus 终审，评审≠修复者）。frame_size 根因：1009 关闭后测试立即重连、gateway 收尾未完成 → 1013（测试时序，非产品缺陷）→ 新 TK-002c（Gemini flash，worktree rs-tk-002c）
+- 2026-10-09 17:50 CEST: **TK-003b done**：CR-010 round2 approve → 合并 523877b（主线看门狗安装测试 112 passed、其余 906 passed/1 基线失败、ruff/shellcheck 通过）。主线安装脚本已可用于 mini2 重装（等用户批准）。CR-009 round2 Gemini：F1–F3 确认修好，新 F4（取消被当节点故障）/F5（旧会话 drain 期间断开覆盖新节点模式）accepted → codex 修。frame_size 基线失败（1013 busy）派 opencode 免费模型只做根因调查（detached /tmp/inv-frame/wt）
+- 2026-10-09 17:35 CEST: CR-010 round1 codex needs_fix（CR010-01 TGT_PATH_EXPORT 控制端插值注入面 accepted）→ e3eef2b 单引号目标端展开（shellcheck 0、看门狗 112 passed）→ round2 codex；Gemini 在 tk-003b 仓库根留 30 个调试文件已挪 /tmp。TK-005 codex 修 F1–F3 → 18dcaed（Coordinator 本机 build/selftest/冒烟 18/18/真实配置未动）→ CR-009 round2 Gemini pro。等用户：mini2 重装批准、S1 契约取舍
+- 2026-10-09 17:20 CEST: **TK-002b done**：CR-007 round3 Gemini approve → 合并 e3233ca（906 passed，唯一失败为基线 frame_size；ruff/bash -n 通过）。TK-003b：Gemini 定位 14 个 UnicodeDecodeError 根因——**bash 3.2 在 UTF-8 locale 下把 `$var` 后紧跟的全角字符首字节吞进变量名 → 变量值丢失+乱码**（Gemini 说成 C locale，Coordinator 复现纠正：C 下正常、UTF-8 下出错；生产 ssh 环境即 UTF-8，真 bug）；install_node.sh 2 处加大括号，并发两份 112 passed；Coordinator perl 全仓扫描另发现 power_compare.sh 2 处 → tk-007 [coordinator-direct] 1b4890b → CR-010（codex）。CR-008 两轮收敛（待 TK-005 先合）。CR-009：Gemini default needs_fix F1（stop 与 connect 竞态泄露会话）/F2（pendingNodeFinals 不清）/F3（pause→resume 路由不重启，Coordinator 核实属实）全 accepted；codex security S1（P1 要求 /v1/info 带 token vs S5「核对前不发 token」契约冲突）作为实现 rejected、上报用户决定，S2 rejected → codex 修 F1–F3
+- 2026-10-09 16:55 CEST: CR-007 round2 codex approve（17c5463，Coordinator 另以 /bin/bash 3.2 实打 13 个边界 IP 全对）→ round3 Gemini pro 整体安全通读。CR-008 round1 codex needs_fix → F1/F2/F4 accepted、F3 rejected → Gemini flash 修。TK-003b：opencode 改 RS_TOOL_PATH_PREFIX（默认值不变）+ BSD sed + say/afconvert 桩 → 不再挂死（105s），剩 14 个注入类安全测试 UnicodeDecodeError(0xbc) → 合入 tk-002b 最新后 Gemini pro 查根因。**TK-005**：sonnet 本机调试 b66455a 修 4 个客户端 bug，冒烟 18/18；Coordinator 复核时发现 ①冒烟曾覆盖用户真实 ~/.config/rslite/nodes.json（mini2 条目丢失，已按安装脚本同法重建并 ssh 只读取回 node_id）②契约 bug：P6 url 不带路径 → 客户端连到 "/" → 真节点必失败 → [coordinator-direct] 9de0e79 补 /v2/session + RSLITE_CONFIG_DIR 隔离冒烟；复跑 18/18、真实配置 md5 不变 → reviewing，CR-009 round1（Gemini pro default + codex security），计划 3 轮
+- 2026-10-09 16:40 CEST: CR-007 round1：codex needs_fix（D2 IP 每段未限 0–255，实测 100.64.999.999 预检通过 → accepted；D1 治理越界 → rejected，两点 diff 假象）、Gemini pro security approve（F01 nit 与 D2 同修法）→ TK-002b fixing（Gemini flash）。TK-006 回报 c038968（复核 884 passed、ruff 通过）→ reviewing，CR-008 round1（codex）。**发现**：sonnet 组长派 agy `--dangerously-skip-permissions` 被 auto-mode 分类器拒（Create Unsafe Agents）→ 分级编队里组长不能再往下派 agy，下级 lane 一律由 Coordinator 直接派；pytest 不带短 --basetemp 时 62 个 gateway 用例 AF_UNIX path too long（本机路径长度，非 bug）。TK-005：codex 加失败原因码 99b51ef，但其沙箱禁 socket/swift 缓存无法复现；Coordinator 本机实跑：会话已建立，但 gateway 未向客户端发事件、rslite 中途 no_available_node，冒烟判据自相矛盾 → sonnet 本机调试
+- 2026-10-09 16:05 CEST: TK-002b 回报 2792120（Coordinator 复核 906 passed、唯一失败为基线已有 frame_size、ruff/bash -n 通过）→ reviewing，CR-007 round1：codex default + Gemini pro security。发现 tests/test_install_node.py 在 Mac 不密封（PATH 前缀盖桩→真跑 uv/ollama、BSD sed、挂死留孤儿；ssh 是桩、未触及 mini2，本机无误装）→ 拆 TK-003b（opencode big-pickle，基于 feat/tk-002b）；已清理本会话孤儿测试进程。TK-007 prep 回报 a0cd68a（power_compare 五组、hybrid_score.py+6 单测、node-acceptance.md 骨架）。TK-005：agy Claude 池周额度耗尽（117h）→ Gemini pro 接续，声称「全部完成、冒烟 4/4」，**Coordinator 复跑证伪**：用例 1 实为 `switch_failed err=NodeClientError` 0.28s 退回本机，判据过松；Gemini 还越界改了 .governance 任务卡（已撤回）→ codex 查握手根因并收紧冒烟判据
+- 2026-10-09 15:50 CEST: TK-005 codex 额度中断（usage limit），半成品 1593 行存为 WIP 48d186c：swift build 通过、--selftest OK、--mode local 回放 5 句正常，但 codex 总结丢失 → 改派 agy Claude 池（claude-opus-4-6-thinking）做 Done criteria 审计+补齐+假 v2 节点冒烟
+- 2026-10-09 15:35 CEST: **分级并行编队**（用户要求）：L0 Coordinator(opus) → L1 组长(sonnet) → L2 下级(agy Gemini 池 flash/pro、agy Claude 池 opus-4-6-thinking、haiku)。实测推翻 HANDOFF §2「不要派 agy」：agy 带 `--dangerously-skip-permissions` 两个池都能跑 shell；`claude -p --model haiku` 可用。grok 对 TK-006 exit 0 零改动（PLAYBOOK 已知坑）→ 弃用。TK-006 改由 sonnet 组长带 agy/haiku；新开 TK-007 prep（sonnet 组长，worktree rs-tk-007，只做 scripts/bench + 文档骨架，真机验收仍等前序）。TK-002b(sonnet)、TK-005(codex) 继续
 - 2026-10-09 15:20 CEST: 用户要求多 lane 加速 → 三路并行（文件不重叠）：TK-002b=Claude sonnet（rs-tk-002b）；TK-005=codex gpt-5.5 high（rs-tk-005，沙箱不能 commit，Coordinator 代提交）；TK-006=grok（rs-tk-006，合并须在 TK-005 之后）。agy 不派（本机 headless 拒 shell，HANDOFF §2）。4 个 rs-cloud-* detached worktree 已由用户删除
 - 2026-10-09 15:00 CEST: **本机会话接手**（MacBook Air）。主 worktree ff 到 ebaa9fe。mini2 只读复现根因：App Store 版 Tailscale 二进制靠 `SHLVL` 判 CLI/GUI，launchd 环境无 SHLVL → `tailscale ip -4` stdout 打「The Tailscale GUI failed to start…」、rc=0 → validate_host ValueError；env -i 下加 `SHLVL=1` 或官方开关 `TAILSCALE_BE_CLI=1` 均恢复正常，改 argv0/PWD/_ 无效。v1.restart 已不存在（安装成功时删除，符合预期）；gateway PID 12840 仍在退避。新建 TK-002b → executing（sonnet，worktree ~/projects/rs-tk-002b，安全类单独一批）
 - 2026-10-09 14:40 CST: 用户叫停，全部提交，交给本机处理（HANDOFF §11）

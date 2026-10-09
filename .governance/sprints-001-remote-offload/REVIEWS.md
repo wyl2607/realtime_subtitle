@@ -5,6 +5,11 @@
 
 | CR | TK | rounds | status | last_action |
 |----|----|--------|--------|-------------|
+| CR-011 | TK-002c | 2 | resolved | 2026-10-09 18:50 CEST: r1 Gemini flash approve、r2 haiku approve；已合并 b7a55c8（主线全绿 1019 passed） |
+| CR-010 | TK-003b | 2 | resolved | 2026-10-09 17:50 CEST: round2 codex approve；已合并 523877b |
+| CR-009 | TK-005 | 5 | resolved | 2026-10-09 17:30 CEST: r5 Gemini approve（903201e）；已合并 7a99c44；S1 契约冲突待用户决定；R3-3 拆 TK-005b |
+| CR-008 | TK-006 | 2 | resolved | 2026-10-09 17:05 CEST: round2 codex approve（bb6b406）；待 TK-005 先合 + 同步 TK-002b 原因码 |
+| CR-007 | TK-002b | 3 | resolved | 2026-10-09 17:20 CEST: round3 Gemini approve；已合并 e3233ca |
 | CR-006 | TK-001c | 2 | resolved | 2026-10-09 12:00 CST: round2 approve_with_minor；R2-F1 coordinator-direct 0691d95；已合并；F3 文案 efa713c |
 | CR-005 | TK-003 | 3 | resolved | 2026-10-09 14:35 CST: mini2 真机安装 EXIT=0；发现 TCP 监听 blocker 与自检漏洞，另开 TK（HANDOFF §11.2） |
 | CR-004 | TK-001b | 3 | resolved | 2026-10-09 08:25 CST: round3 approve（端到端 rtf None→0.0101→0.037 滑动）；三轮收敛，已合并 |

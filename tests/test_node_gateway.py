@@ -105,6 +105,10 @@ async def until(pred, timeout: float = 8.0, what: str = "condition"):
     raise AssertionError(f"timeout waiting for {what}")
 
 
+async def wait_session_freed(gw: Gateway, timeout: float = 5.0) -> None:
+    await until(lambda: not gw._session_active, timeout=timeout, what="session slot freed")
+
+
 def _alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -256,6 +260,117 @@ def test_tailscale_ip_runner_is_injected():
     assert calls == [["tailscale", "ip", "-4"]]
     with pytest.raises(ValueError):
         gw_mod.resolve_tailscale_ipv4(lambda argv: "\n")
+
+
+GUI_MODE_OUT = "The Tailscale GUI failed to start: boom (Tailscale.CLIError error 3.)\n"
+
+
+def test_tailscale_cli_runs_with_be_cli_env_added_not_replaced(monkeypatch):
+    """launchd 环境没有 SHLVL，App Store 版二进制会进 GUI 模式；必须追加 TAILSCALE_BE_CLI=1（且保留继承环境）。"""
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen["argv"], seen["env"] = argv, kw.get("env")
+
+        class R:
+            stdout = "100.64.0.9\n"
+
+        return R()
+
+    monkeypatch.setenv("RS_TEST_MARK", "keep")
+    monkeypatch.setattr(gw_mod.subprocess, "run", fake_run)
+    assert gw_mod.resolve_tailscale_ipv4() == "100.64.0.9"
+    assert seen["argv"] == ["tailscale", "ip", "-4"]
+    assert seen["env"]["TAILSCALE_BE_CLI"] == "1"
+    assert seen["env"]["RS_TEST_MARK"] == "keep"
+
+
+@pytest.mark.parametrize("exc,code", [
+    (FileNotFoundError("tailscale"), "tailscale_cli_missing"),
+    (gw_mod.subprocess.CalledProcessError(1, "tailscale"), "tailscale_cli_failed"),
+    (gw_mod.subprocess.TimeoutExpired("tailscale", 3), "tailscale_cli_timeout"),
+    (PermissionError("x"), "tailscale_cli_failed"),
+])
+def test_resolve_maps_runner_errors_to_codes(exc, code):
+    def run(argv):
+        raise exc
+
+    with pytest.raises(gw_mod.BindReasonError) as ei:
+        gw_mod.resolve_tailscale_ipv4(run)
+    assert ei.value.code == code
+
+
+def test_resolve_empty_output_code():
+    with pytest.raises(gw_mod.BindReasonError) as ei:
+        gw_mod.resolve_tailscale_ipv4(lambda argv: "\n")
+    assert ei.value.code == "tailscale_no_ipv4"
+
+
+@pytest.mark.parametrize("host,code", [
+    ("8.8.8.8", "not_tailscale_range"),
+    ("192.168.1.5", "not_tailscale_range"),
+    ("100.101.102.103 ", "tailscale_not_ip"),
+    ("not-an-ip", "tailscale_not_ip"),
+    ("0.0.0.0", "wildcard_or_multicast"),
+])
+def test_validate_host_codes(host, code):
+    with pytest.raises(gw_mod.BindReasonError) as ei:
+        gw_mod.validate_host(host)
+    assert ei.value.code == code
+
+
+def test_gui_mode_output_logs_code_only_and_binds_nothing(tmp_path, monkeypatch, caplog):
+    bound: list = []
+
+    async def spy_serve(handler, host=None, port=None, **kw):
+        bound.append(host)
+        raise AssertionError("不应绑定任何地址")
+
+    monkeypatch.setattr(gw_mod, "serve", spy_serve)
+    delays: list[float] = []
+
+    async def fake_sleep(d):
+        delays.append(d)
+        if len(delays) >= 2:
+            await asyncio.Event().wait()
+
+    async def scenario():
+        gw = Gateway(token=TOKEN, uds_dir=make_dir(tmp_path), port=0, sleep=fake_sleep,
+                     resolve_host=lambda: gw_mod.resolve_tailscale_ipv4(lambda argv: GUI_MODE_OUT))
+        await gw.start()
+        await until(lambda: len(delays) >= 2, what="retries")
+        assert not gw.tcp_ready.is_set()
+        await gw.stop()
+
+    asyncio.run(scenario())
+    assert bound == []
+    assert "tcp_bind_failed attempt=1 reason=tailscale_not_ip retry_in_s=1" in caplog.text
+    assert "GUI" not in caplog.text and "CLIError" not in caplog.text
+
+
+def test_bind_failed_code_for_port_in_use(tmp_path, caplog):
+    blocker = socket.socket()
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen()
+    delays: list[float] = []
+
+    async def fake_sleep(d):
+        delays.append(d)
+        await asyncio.Event().wait()
+
+    async def scenario():
+        gw = Gateway(token=TOKEN, uds_dir=make_dir(tmp_path), port=blocker.getsockname()[1],
+                     resolve_host=lambda: "127.0.0.1", sleep=fake_sleep,
+                     allow_non_tailscale_for_tests=True)
+        await gw.start()
+        await until(lambda: len(delays) >= 1, what="retry")
+        await gw.stop()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        blocker.close()
+    assert "reason=bind_failed" in caplog.text
 
 
 @pytest.mark.parametrize("bad", ["0.0.0.0", "::", ""])
@@ -591,10 +706,12 @@ def test_hello_must_be_first_text_and_arrive_in_time(tmp_path, monkeypatch):
             ws = await uds_connect(gw)  # 什么都不发
             await asyncio.wait_for(ws.wait_closed(), 5)
             assert ws.close_code == 1008
+            await wait_session_freed(gw)
             ws = await uds_connect(gw)  # 先发二进制
             await ws.send(b"\x00\x00")
             await asyncio.wait_for(ws.wait_closed(), 5)
             assert ws.close_code == 1008
+            await wait_session_freed(gw)
             ws = await uds_connect(gw)  # 先发 flush
             await ws.send(json.dumps({"type": "flush"}))
             await asyncio.wait_for(ws.wait_closed(), 5)
@@ -616,6 +733,7 @@ def test_frame_size_limit_and_alignment(tmp_path):
             await ws.send(b"\x01\x00" * (32 * 1024 + 1))  # 超 64KB：协议层直接 1009
             await asyncio.wait_for(ws.wait_closed(), 5)
             assert ws.close_code == 1009
+            await wait_session_freed(gw)
 
             ws = await uds_connect(gw)
             await hello_ready(ws)

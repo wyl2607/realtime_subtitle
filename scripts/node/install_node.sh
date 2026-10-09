@@ -28,6 +28,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 # 与 realtime_subtitle/node/gateway.py 的 PORT 保持一致
 NODE_PORT=8791
+HAD_PREV=0
 LABEL="com.realtimesubtitle.node"
 # venv(~3GB) + 依赖缓存 + Whisper 模型(~2.1GB)，且 .new 与 .prev 会同时存在
 MIN_FREE_GB=8
@@ -53,11 +54,21 @@ plan() { printf '  [dry-run] %s\n' "$*"; }
 # 目标机的登录 shell 是 zsh，所以统一显式起 bash，不依赖对端 shell 的语法。
 # ------------------------------------------------------------
 
-# ssh 非交互会话的 PATH 不含 /opt/homebrew/bin，也不含 Tailscale.app 里的命令行
-TGT_PATH_EXPORT='export PATH=/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH'
+# ssh 非交互会话的 PATH 不含 /opt/homebrew/bin，也不含 Tailscale.app 里的命令行。
+# 前缀抽成 RS_TOOL_PATH_PREFIX：测试可把它指向桩目录把真 tailscale/uv/ollama 挡在 PATH 外面；
+# 默认值逐字不变，远端脚本里用 ${RS_TOOL_PATH_PREFIX:-…} 兜底、同名生效。
+# 单引号：前缀只在目标端展开，控制端的值不会被拼进发给 ssh 的命令串（CR-010：防注入）。
+TGT_PATH_EXPORT='export PATH=${RS_TOOL_PATH_PREFIX:-/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS}:$PATH'
+
+IFS= read -r -d '' TS_IP_LIB_SH <<'EOF' || true
+is_ts_ipv4() {
+    local re='^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.(0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.(0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])$'
+    [[ $1 =~ $re ]]
+}
+EOF
 
 IFS= read -r -d '' PREFLIGHT_SH <<'EOF' || true
-export PATH=/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH
+export PATH=${RS_TOOL_PATH_PREFIX:-/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS}:$PATH
 min_gb=$1
 [ "$(uname -s)" = Darwin ] || { echo "目标机不是 macOS"; exit 1; }
 free_kb=$(df -k "$HOME" | awk 'NR==2{print $4}')
@@ -66,12 +77,18 @@ if [ "${free_kb:-0}" -lt $((min_gb * 1024 * 1024)) ]; then
     exit 1
 fi
 for c in brew ollama uv swift; do
-    command -v "$c" >/dev/null 2>&1 || { echo "目标机没有找到 $c（scripts/macos/install.sh 需要它）。请先在目标机安装后重跑"; exit 1; }
+    command -v "$c" >/dev/null 2>&1 || { echo "目标机没有找到 ${c}（scripts/macos/install.sh 需要它）。请先在目标机安装后重跑"; exit 1; }
 done
-ts_ip=$(tailscale ip -4 2>/dev/null | head -n 1 || true)
+# TAILSCALE_BE_CLI=1：App Store 版二进制在环境里没有 SHLVL 时会按 GUI 启动，往 stdout 打报错且退出码 0
+ts_ip=$(TAILSCALE_BE_CLI=1 tailscale ip -4 2>/dev/null </dev/null | head -n 1 || true)
 [ -n "$ts_ip" ] || { echo "目标机没有 Tailscale IPv4（tailscale ip -4 无输出）。请先登录 Tailscale"; exit 1; }
+if ! is_ts_ipv4 "$ts_ip"; then
+    echo "目标机 tailscale ip -4 的首行不是 Tailscale IPv4（100.64.0.0/10）。请检查 Tailscale 是否已登录/运行"
+    exit 1
+fi
 echo preflight-ok
 EOF
+PREFLIGHT_SH="${TS_IP_LIB_SH}${PREFLIGHT_SH}"
 
 # 目标机上生成/读取 node_id（info.py 的 STATE_DIR / NODE_ID_FILENAME），stdout 只输出 node_id
 IFS= read -r -d '' NODE_ID_SH <<'EOF' || true
@@ -208,7 +225,7 @@ EOF
 # 且每次动手（TERM / KILL）前都用 ps 的完整命令行再确认一遍。
 # Python 首字母大小写都认：macOS 框架版 Python 的进程名是 `Python`。
 IFS= read -r -d '' STOP_V1_SH <<'EOF' || true
-export PATH=/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH
+export PATH=${RS_TOOL_PATH_PREFIX:-/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS}:$PATH
 umask 077
 state="$HOME/Library/Application Support/rs-node"
 rec="$state/v1.restart"
@@ -265,7 +282,7 @@ token_file=$V_TOK"
         echo "⚠️ 没能写入 v1 记录：如果 v2 安装失败，v1 需要手动重新启动"
     fi
 else
-    echo "⚠️ 不记录 v1 的启动命令（$why）：如果 v2 安装失败，v1 需要手动重新启动"
+    echo "⚠️ 不记录 v1 的启动命令（${why}）：如果 v2 安装失败，v1 需要手动重新启动"
     drop_rec
     write_rec "unrecorded=1" || true
 fi
@@ -288,7 +305,7 @@ STOP_V1_SH="${V1_LIB_SH}${STOP_V1_SH}"
 # 节点只多一个 websockets，单独装。--skip-models：节点默认用系统翻译，不拉 Ollama 模型。
 IFS= read -r -d '' BUILD_SH <<'EOF' || true
 set -e
-export PATH=/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH
+export PATH=${RS_TOOL_PATH_PREFIX:-/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS}:$PATH
 cd "$HOME/rs-node.new"
 bash scripts/macos/install.sh --skip-models </dev/null
 VIRTUAL_ENV="$PWD/venv" uv pip install -r realtime_subtitle/node/requirements.txt </dev/null
@@ -298,7 +315,7 @@ EOF
 # 为什么不等换名后再测：失败时 ~/rs-node 还是完好的旧版，回滚成本为零。
 # 音频只放 mktemp 目录，退出即删，不落盘保存。
 IFS= read -r -d '' SELFCHECK_SH <<'EOF' || true
-export PATH=/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH
+export PATH=${RS_TOOL_PATH_PREFIX:-/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS}:$PATH
 cd "$HOME/rs-node.new" || exit 1
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -401,7 +418,7 @@ EOF
 #              失败版改名 ~/rs-node.failed 留着排查。
 # 两种情况都按 STOP_V1_SH 记下的白名单参数把 v1 重新拉起（见 restore_v1）。
 IFS= read -r -d '' SWAP_SH <<'EOF' || true
-export PATH=/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH
+export PATH=${RS_TOOL_PATH_PREFIX:-/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS}:$PATH
 uid_n=$(id -u)
 label=$1
 plist="$HOME/Library/LaunchAgents/$label.plist"
@@ -410,6 +427,8 @@ sock="$state/gw.sock"
 rec="$state/v1.restart"
 boot_tries=${RS_BOOT_TRIES:-5}
 info_wait=${RS_INFO_WAIT:-40}
+tcp_wait=${RS_TCP_WAIT:-30}
+node_port=${2:-8791}
 
 # 按 STOP_V1_SH 的记录重拉 v1：固定入口 <cwd>/venv/bin/python -m realtime_subtitle.remote.server
 # + 白名单参数，bash 数组直接 exec，不经 sh -c；读记录时每个值再校验一遍。
@@ -549,10 +568,45 @@ for _ in $(seq 1 "$info_wait"); do
     sleep 1
 done
 [ "$ok" = 1 ] || { rollback "gateway ${info_wait} 秒内没有通过 /v1/info 自检（v==2 且 node_id 匹配）；日志见 ~/Library/Logs/rs-node/"; exit 1; }
+
+# UDS 通了不代表 TCP 绑上了：launchd 下取不到 Tailscale IP 时 gateway 只退避重试、UDS 照常服务。
+# 有界等待（RS_TCP_WAIT 秒）确认 gateway 进程在 <Tailscale IP>:端口 LISTEN，且端口上没有任何通配监听。
+case "$node_port" in
+    ''|*[!0-9]*) rollback "内部错误：端口参数无效"; exit 1 ;;
+esac
+ts_ip=$(TAILSCALE_BE_CLI=1 tailscale ip -4 2>/dev/null </dev/null | head -n 1 || true)
+if ! is_ts_ipv4 "$ts_ip"; then
+    rollback "取不到 Tailscale IPv4，无法确认 gateway 的 TCP 监听"; exit 1
+fi
+tcp_end=$((SECONDS + tcp_wait))
+tcp_ok=0 tcp_wild=0
+while :; do
+    gw_pid=$(launchctl print "gui/$uid_n/$label" 2>/dev/null </dev/null | awk '$1=="pid" && $2=="="{print $3; exit}' || true)
+    tcp_ok=0 tcp_wild=0 cur=''
+    case "$gw_pid" in ''|*[!0-9]*) gw_pid='' ;; esac
+    while IFS= read -r l; do
+        case "$l" in
+            p*) cur=${l#p} ;;
+            n\*:"$node_port"|n0.0.0.0:"$node_port"|n\[::\]:"$node_port") tcp_wild=1 ;;
+            n"$ts_ip":"$node_port") [ -n "$gw_pid" ] && [ "$cur" = "$gw_pid" ] && tcp_ok=1 ;;
+        esac
+    done <<LSOF_OUT
+$(lsof -nP -iTCP:"$node_port" -sTCP:LISTEN -Fpn 2>/dev/null </dev/null || true)
+LSOF_OUT
+    if [ "$tcp_wild" = 1 ]; then break; fi
+    if [ "$tcp_ok" = 1 ]; then break; fi
+    [ "$SECONDS" -lt "$tcp_end" ] || break
+    sleep 1
+done
+if [ "$tcp_wild" = 1 ]; then
+    rollback "端口 ${node_port} 上存在通配（*/0.0.0.0）监听，违反只绑 Tailscale IP 的约束"; exit 1
+fi
+[ "$tcp_ok" = 1 ] || { rollback "gateway ${tcp_wait} 秒内没有在 ${ts_ip}:${node_port} 上监听 TCP（UDS 自检虽通过；日志 ~/Library/Logs/rs-node/ 里看 tcp_bind_failed reason=）"; exit 1; }
 rm -f "$rec"
-echo "gateway-ok：/v1/info 返回 200，v=2"
+echo "gateway-ok：/v1/info 返回 200，v=2；TCP 已在 ${ts_ip}:${node_port} 监听"
+if [ -d "$HOME/rs-node.prev" ]; then echo "prev-kept"; fi
 EOF
-SWAP_SH="${V1_LIB_SH}${SWAP_SH}"
+SWAP_SH="${TS_IP_LIB_SH}${V1_LIB_SH}${SWAP_SH}"
 
 # ------------------------------------------------------------
 # 控制端函数
@@ -685,7 +739,7 @@ print_dry_run() {
     plan "7. 停止 v1 realtime_subtitle.remote.server 进程（精确匹配本人进程；先记录其命令行与 cwd；保留 ~/rs-remote 目录）"
     plan "8. 原子换名：~/rs-node → ~/rs-node.prev，~/rs-node.new → ~/rs-node"
     plan "9. 渲染 plist（不含 IP、不含 token）→ ~/Library/LaunchAgents/${LABEL}.plist；launchctl bootstrap gui/\$UID + kickstart -k"
-    plan "10. 经 UDS 请求 /v1/info，要求 200 且 v=2、node_id 匹配；失败 → 回滚（有 .prev 则恢复；无则删 plist、失败版留作 ~/rs-node.failed），并按记录重新拉起 v1、告警"
+    plan "10. 经 UDS 请求 /v1/info，要求 200 且 v=2、node_id 匹配；再有界等待（RS_TCP_WAIT，默认 30 秒）确认 gateway 进程在 <Tailscale IP>:${NODE_PORT} LISTEN 且该端口无 */0.0.0.0 监听；任一失败 → 回滚（有 .prev 则恢复；无则删 plist、失败版留作 ~/rs-node.failed），并按记录重新拉起 v1、告警"
     if [[ "${LOCAL}" -eq 0 ]]; then
         plan "11. 写 ~/.config/rslite/nodes.json（0600、按 id=${HOST##*@} 去重、原子写）：url=ws://<MagicDNS 名>:${NODE_PORT}"
     else
@@ -792,11 +846,12 @@ step_swap() {
     tgt_script "${STOP_V1_SH}" || warn "停止 v1 进程时出现问题，继续安装"
     info "[8/9] 换名并启动 LaunchAgent..."
     local out
-    out="$(tgt_script "${SWAP_SH}" "${LABEL}")" || {
+    out="$(tgt_script "${SWAP_SH}" "${LABEL}" "${NODE_PORT}")" || {
         printf '%s\n' "${out:-}" >&2
         die "节点启动或自检失败，已按上面的说明回滚"
     }
     printf '%s\n' "${out}" | sed 's/^/  /'
+    if grep -qx 'prev-kept' <<<"${out}"; then HAD_PREV=1; fi
 }
 
 step_nodes_json() {
@@ -828,7 +883,9 @@ main() {
     step_swap
     step_nodes_json
     info ""
-    info "✅ 节点安装完成。日志：目标机 ~/Library/Logs/rs-node/；上一版保留在 ~/rs-node.prev"
+    local prev_note=""
+    if [[ "${HAD_PREV}" == "1" ]]; then prev_note="；上一版保留在 ~/rs-node.prev"; fi
+    info "✅ 节点安装完成。日志：目标机 ~/Library/Logs/rs-node/${prev_note}"
 }
 
 # 被 source 时只提供函数（测试直接调 merge_nodes_json 等），不执行 main
