@@ -23,6 +23,7 @@
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 12:10 CST: mini2 安装前只读核查：GUI 会话在（console=yilinwang）、AC 供电、turbo 已缓存 3.0GB、v1 PID 34924 仍在 8791；MacBook Air 能 BatchMode ssh mini2。MacBook Air 建 detached worktree ~/projects/rs-cloud-install @d37ecea，`install_node.sh --dry-run mini2` 11 步计划正常 → 安装计划提交用户审批
 - 2026-10-09 12:00 CST: CR-006 round2（opus）approve_with_minor：F1 partially（第一会话名恰等于 DEFAULT_TRANSLATOR，变异 B 抓不到）→ R2-F1 accepted，[coordinator-direct] 0691d95，复现改后变异 A/B 均红 → **TK-001c done**，合并进 feat/macos-native（920 passed、ruff 通过）；F3 [coordinator-direct] efa713c。下一步：向用户说明 mini2 真机安装计划，等批准
 - 2026-10-09 11:45 CST: TK-001c repair 回收 8fc99ce（Coordinator 复跑 210/920 passed、ruff 通过）→ recheck，CR-006 round2（opus）
 - 2026-10-09 11:35 CST: CR-006 round1（opus）approve_with_minor：F1（换语言对用例）/F2（注释）accepted → repair（同一 sonnet executor）；F3 accepted 由 Coordinator 合并后改 install_node.sh 文案；F4 rejected（pre-existing）
