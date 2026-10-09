@@ -57,8 +57,8 @@ plan() { printf '  [dry-run] %s\n' "$*"; }
 # ssh 非交互会话的 PATH 不含 /opt/homebrew/bin，也不含 Tailscale.app 里的命令行。
 # 前缀抽成 RS_TOOL_PATH_PREFIX：测试可把它指向桩目录把真 tailscale/uv/ollama 挡在 PATH 外面；
 # 默认值逐字不变，远端脚本里用 ${RS_TOOL_PATH_PREFIX:-…} 兜底、同名生效。
-RS_TOOL_PATH_PREFIX=${RS_TOOL_PATH_PREFIX:-/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS}
-TGT_PATH_EXPORT="export PATH=${RS_TOOL_PATH_PREFIX}:\$PATH"
+# 单引号：前缀只在目标端展开，控制端的值不会被拼进发给 ssh 的命令串（CR-010：防注入）。
+TGT_PATH_EXPORT='export PATH=${RS_TOOL_PATH_PREFIX:-/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS}:$PATH'
 
 IFS= read -r -d '' TS_IP_LIB_SH <<'EOF' || true
 is_ts_ipv4() {
