@@ -3,8 +3,8 @@
 ## 当前状态
 <!-- Machine fields: new writes must use "- key: `value`". Legacy variants are read-only compatibility. -->
 - current_phase: `review`
-- current_tk: `TK-003`
-- current_cr: `CR-005`
+- current_tk: `TK-001c`
+- current_cr: `—`
 - current_round: `1`
 - escalated: `false`
 
@@ -15,13 +15,14 @@
 | TK-001 | 节点 worker：VAD 分段 + 整段识别 + 可插拔翻译 | done |
 | TK-001b | worker：会话结束滑动更新 rtf | done |
 | TK-002 | 节点 gateway：生命周期 + 协议 v2 + 鉴权与上限 | done |
-| TK-003 | 一键安装 install_node.sh | recheck |
+| TK-003 | 一键安装 install_node.sh | done（真机装 mini2 待批准） |
 | TK-004 | rslite：带时间句子 + AudioFanout + 混合替换 + 单实例 | done |
 | TK-005 | rslite：NodeClient v2 + NodeRouter + 本机档门槛 | planned |
 | TK-006 | 清理 v1 + 文档 | planned |
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 10:40 CST: CR-005 round3 两路 approve；Mac 核实 ps 不截断/pgrep 命中/bash 3.2.57 → **TK-003 done**，合并进 feat/macos-native。用户要求开新对话接手 → HANDOFF §10 写入云端会话 2 交接
 - 2026-10-09 10:20 CST: TK-003 C2 修复 74fe494（三份并发各 98 passed、无残留）→ recheck，CR-005 round3 两路派出（default 用 mini2 真实 v1 命令行端到端；security 回归注入）
 - 2026-10-09 10:05 CST: TK-003 C1 修复 c8ec1ca（97 passed）；Coordinator 并发跑两份测试复现 4 failed → C2 blocker：测试会杀掉同用户匹配进程（在 mini2 上跑会杀真 v1）→ 同一 repairer 续修
 - 2026-10-09 09:40 CST: TK-003 repair round2 回收 236531d（91/909 passed，注入复现消失，已 push）；Coordinator 复核发现 C1 blocker：v1 匹配不兼容 mini2 实际的 `python -u -m ...`（NO-MATCH）→ 同一 repairer 续修
