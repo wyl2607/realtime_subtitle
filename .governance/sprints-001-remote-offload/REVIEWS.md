@@ -5,7 +5,7 @@
 
 | CR | TK | rounds | status | last_action |
 |----|----|--------|--------|-------------|
-| CR-011 | TK-002c | 1 | open | 2026-10-09 18:15 CEST: round1 派出（opencode） |
+| CR-011 | TK-002c | 2 | resolved | 2026-10-09 18:50 CEST: r1 Gemini flash approve、r2 haiku approve；已合并 b7a55c8（主线全绿 1019 passed） |
 | CR-010 | TK-003b | 2 | resolved | 2026-10-09 17:50 CEST: round2 codex approve；已合并 523877b |
 | CR-009 | TK-005 | 3 | needs_fix | 2026-10-09 17:35 CEST: round1 两路 needs_fix（default F1–F3 accepted；security S1 契约冲突上报用户、S2 rejected）→ 修复 18dcaed → r2 F4/F5 → 91d5310 → r3 opus approve_with_minor（R3-1/2/4–7 accepted，R3-3 拆 TK-005b）→ sonnet 修 → r4 |
 | CR-008 | TK-006 | 2 | resolved | 2026-10-09 17:05 CEST: round2 codex approve（bb6b406）；待 TK-005 先合 + 同步 TK-002b 原因码 |

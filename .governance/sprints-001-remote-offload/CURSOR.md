@@ -4,7 +4,7 @@
 <!-- Machine fields: new writes must use "- key: `value`". Legacy variants are read-only compatibility. -->
 - current_phase: `execution+review`
 - current_tk: `TK-002b,TK-005,TK-006,TK-007(prep)`
-- current_cr: `CR-009,CR-011`
+- current_cr: `CR-009`
 - current_round: `0`
 - escalated: `false`
 
@@ -19,7 +19,7 @@
 | TK-004 | rslite：带时间句子 + AudioFanout + 混合替换 + 单实例 | done |
 | TK-002b | gateway：launchd 下 Tailscale CLI 修复 + 安装自检补 TCP | done |
 | TK-003b | install 测试 macOS 密封 + bash 多字节 bug | done |
-| TK-002c | gateway 测试 1009 后重连时序 | reviewing |
+| TK-002c | gateway 测试 1009 后重连时序 | done |
 | TK-001c | worker：translator 写当前真实翻译器名 | done |
 | TK-005 | rslite：NodeClient v2 + NodeRouter + 本机档门槛 | reviewing |
 | TK-005b | 本机节点 UDS 发现 | planned |
@@ -27,6 +27,7 @@
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 18:50 CEST: **TK-002c done**：CR-011 两轮 approve（Gemini flash / haiku）→ 合并 b7a55c8。**主线首次全绿：1019 passed（安装 112 + 其余 907）、0 failed、ruff 通过**。TK-005 R3 修复（sonnet）进行中
 - 2026-10-09 18:35 CEST: CR-009 round3 opus approve_with_minor：F4/F5 确认；新 R3-1（无 ping 超时，静默断网不回退，P7）/R3-2（扇出丢帧致节点时钟偏移，P5 错行）必修 + R3-4..7 低成本 + nit accepted；R3-3（本机 UDS 节点未实现）拆 TK-005b → sonnet 修（codex 20:24 才恢复、Gemini 前科假结论）→ 之后 round4。CR-011：opencode 因 external_directory 无结论、Gemini 503 → 重试中
 - 2026-10-09 18:15 CEST: CR-009 F4/F5 已在 codex WIP 91d5310 完成（Gemini 接续确认无需增补，但越权 `git reset` 回退已推送提交 → Coordinator `reset --soft` 恢复直线历史）；本机复核 build/selftest/冒烟 18/18 → round3 Claude opus 终审。TK-002c 回报 4555a09（+7 行 wait_session_freed；并发两份各 120 passed）→ CR-011 round1（opencode）
 - 2026-10-09 18:00 CEST: codex 第二次额度中断（20:24 重置），CR-009 F4 半成品 WIP 91d5310（build/selftest 通过）→ Gemini pro 接续 F4/F5（第 3 轮改由 Claude opus 终审，评审≠修复者）。frame_size 根因：1009 关闭后测试立即重连、gateway 收尾未完成 → 1013（测试时序，非产品缺陷）→ 新 TK-002c（Gemini flash，worktree rs-tk-002c）
