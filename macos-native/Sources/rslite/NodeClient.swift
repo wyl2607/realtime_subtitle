@@ -69,6 +69,38 @@ enum NodeClientError: Error, CustomStringConvertible {
         case .connection(let message): return "节点连接失败：\(message)"
         }
     }
+
+    var reasonCode: String {
+        switch self {
+        case .badURL:
+            return "bad_url"
+        case .tokenUnavailable:
+            return "token_unavailable"
+        case .tokenPermissions:
+            return "token_permissions"
+        case .unauthorized:
+            return "http_401"
+        case .nodeIDMismatch:
+            return "node_id_mismatch"
+        case .busy:
+            return "close_1013"
+        case .timeout:
+            return "handshake_timeout"
+        case .protocolError:
+            return "protocol_error"
+        case .connection(let message):
+            if message.hasPrefix("info http ") {
+                return "http_\(message.dropFirst("info http ".count))"
+            }
+            if message.hasPrefix("http ") {
+                return "http_\(message.dropFirst("http ".count))"
+            }
+            if message.hasPrefix("close ") {
+                return "close_\(message.dropFirst("close ".count))"
+            }
+            return "connection_error"
+        }
+    }
 }
 
 struct NodeCallbacks: Sendable {
@@ -166,18 +198,22 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
             self.socket = socket
         }
         socket.resume()
-        let hello: [String: Any] = [
-            "type": "hello",
-            "v": 2,
-            "src": Self.languageCode(sourceLocaleID),
-            "dst": Self.languageCode(targetLanguageID),
-            "sample_rate": 16_000,
-            "format": "s16le",
-        ]
-        try await socket.send(.string(Self.jsonString(hello)))
-        try await awaitReady(socket)
-        callbacks.onReady(info)
-        Task { await receiveLoop(socket) }
+        do {
+            let hello: [String: Any] = [
+                "type": "hello",
+                "v": 2,
+                "src": Self.languageCode(sourceLocaleID),
+                "dst": Self.languageCode(targetLanguageID),
+                "sample_rate": 16_000,
+                "format": "s16le",
+            ]
+            try await socket.send(.string(Self.jsonString(hello)))
+            try await awaitReady(socket)
+            callbacks.onReady(info)
+            Task { await receiveLoop(socket) }
+        } catch {
+            throw await classify(error, socket)
+        }
     }
 
     func send(_ audio: TimedAudio) async throws {
@@ -337,8 +373,13 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         if let e = error as? NodeClientError {
             return e
         }
-        if let http = socket.response as? HTTPURLResponse, http.statusCode == 401 {
-            return .unauthorized
+        if let http = socket.response as? HTTPURLResponse {
+            if http.statusCode == 401 {
+                return .unauthorized
+            }
+            if !(200..<300).contains(http.statusCode) {
+                return .connection("http \(http.statusCode)")
+            }
         }
         let timeout = Task {
             try? await Task.sleep(for: .seconds(1))
@@ -349,6 +390,12 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         let code = lock.withLockValue { remoteCloseCode }
         if code == 1013 || socket.closeCode.rawValue == 1013 {
             return .busy
+        }
+        if let code, code != 1005 {
+            return .connection("close \(code)")
+        }
+        if socket.closeCode.rawValue != 1005 {
+            return .connection("close \(socket.closeCode.rawValue)")
         }
         return .connection(error.localizedDescription)
     }

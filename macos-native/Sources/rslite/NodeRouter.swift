@@ -240,7 +240,7 @@ final class NodeRouter: @unchecked Sendable {
                     states[node.id] = NodeStateRecord(info: nil, rtf: nil, offlineUntil: nowSeconds() + Self.offlineDuration)
                 }
             } catch {
-                routeLog("probe node=\(node.id) offline err=\(type(of: error))")
+                routeLog("probe node=\(node.id) offline err=\(routeErrorCode(error))")
                 let old = lock.withLockValue { states[node.id] }
                 candidates.append(RouteCandidate(
                     id: node.id,
@@ -361,7 +361,7 @@ final class NodeRouter: @unchecked Sendable {
                 await old?.close()
             }
         } catch {
-            routeLog("select local reason=switch_failed node=\(node.id) err=\(type(of: error))")
+            routeLog("select local reason=switch_failed node=\(node.id) err=\(routeErrorCode(error))")
             lock.withLockVoid {
                 states[node.id] = NodeStateRecord(info: nil, rtf: nil, offlineUntil: nowSeconds() + Self.offlineDuration)
                 pendingMigrationID = nil
@@ -374,7 +374,7 @@ final class NodeRouter: @unchecked Sendable {
     private func markCurrentOfflineAndFallback(error: Error) async {
         let failed = lock.withLockValue { currentNode }
         if let failed {
-            routeLog("fallback failed_node=\(failed.id) offline_for_s=60 err=\(type(of: error))")
+            routeLog("fallback failed_node=\(failed.id) offline_for_s=60 err=\(routeErrorCode(error))")
             lock.withLockVoid {
                 var state = states[failed.id] ?? NodeStateRecord(info: nil, rtf: nil, offlineUntil: nil)
                 state.offlineUntil = nowSeconds() + Self.offlineDuration
@@ -512,6 +512,13 @@ final class NodeRouter: @unchecked Sendable {
 
 private func routeLog(_ message: String) {
     FileHandle.standardError.write(Data("rslite.route \(message)\n".utf8))
+}
+
+private func routeErrorCode(_ error: Error) -> String {
+    if let error = error as? NodeClientError {
+        return error.reasonCode
+    }
+    return String(describing: type(of: error))
 }
 
 private func nowSeconds() -> Double {
