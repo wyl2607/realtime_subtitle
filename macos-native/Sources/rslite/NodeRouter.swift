@@ -118,6 +118,7 @@ struct MigrationGate {
 
 @available(macOS 27.0, *)
 final class NodeRouter: @unchecked Sendable {
+    private static let localUDSID = "local_uds"
     private static let probeInterval: Duration = .seconds(30)
     private static let offlineDuration = 60.0
     private static let silenceThreshold = 0.003
@@ -186,16 +187,16 @@ final class NodeRouter: @unchecked Sendable {
         URL(fileURLWithPath: configDir).appendingPathComponent("node-state.json")
     }
 
+    static var localUDSPath: String {
+        let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+        return (home as NSString).appendingPathComponent("Library/Application Support/rs-node/gw.sock")
+    }
+
     func start(fanout: AudioFanout) {
         lock.withLockVoid {
             stopped = false
             nodes = Self.loadNodes(from: nodesURL)
             states = Self.loadState(from: stateURL)
-        }
-        guard !nodes.isEmpty else {
-            routeLog("select local reason=no_nodes")
-            onMode(.local)
-            return
         }
         let stream = fanout.subscribe(capacity: AudioFanout.defaultCapacity)
         probeTask = Task { await self.probeLoop() }
@@ -252,7 +253,59 @@ final class NodeRouter: @unchecked Sendable {
     private func probeOnce() async {
         let configs = lock.withLockValue { nodes }
         var candidates: [RouteCandidate] = []
+        let localHWHash = Capability.hwHash()
+        var localInfo: NodeInfo?
+        let lastConfirmedLocalNodeID = lock.withLockValue { states[Self.localUDSID]?.info?.nodeID }
+
+        let tLocal = ContinuousClock().now
+        do {
+            let info = try await NodeClient.prepareUDS(path: Self.localUDSPath)
+            if Self.sameNonEmptyHash(info.hwHash, localHWHash) {
+                localInfo = info
+                let rtt = max(1, tLocal.duration(to: ContinuousClock().now).secondsValue * 1000)
+                var stateInfo = info
+                if lock.withLockValue({ currentNode?.id == Self.localUDSID }) {
+                    stateInfo.busy = false
+                }
+                let offlineUntil = lock.withLockValue { () -> Double? in
+                    let retained = Self.retainedOfflineUntilForProbeSuccess(
+                        states[Self.localUDSID]?.offlineUntil,
+                        now: nowSeconds()
+                    )
+                    states[Self.localUDSID] = NodeStateRecord(info: stateInfo, rtf: stateInfo.asr.rtf, offlineUntil: retained)
+                    if currentNode?.id == Self.localUDSID {
+                        currentToken = ""
+                        currentInfo = stateInfo
+                    }
+                    return retained
+                }
+                candidates.append(RouteCandidate(
+                    id: Self.localUDSID,
+                    expectedNodeID: info.nodeID,
+                    info: stateInfo,
+                    rttMS: rtt,
+                    isLocal: true,
+                    offlineUntil: offlineUntil
+                ))
+            } else {
+                routeLog("probe \(Self.localUDSID) rejected=hw_hash_mismatch")
+            }
+        } catch {
+            routeLog("probe \(Self.localUDSID) failed err=\(routeErrorCode(error))")
+            lock.withLockVoid {
+                var record = states[Self.localUDSID] ?? NodeStateRecord(info: nil, rtf: nil, offlineUntil: nil)
+                record.rtf = nil
+                states[Self.localUDSID] = record
+            }
+        }
+
+        let knownLocalNodeID = Self.knownLocalNodeID(localInfo: localInfo, fallbackNodeID: lastConfirmedLocalNodeID)
         for node in configs {
+            if Self.isManifestLocalDuplicate(node, knownLocalNodeID: knownLocalNodeID) {
+                routeLog("probe node=\(node.id) skipped=local_duplicate")
+                lock.withLockVoid { states.removeValue(forKey: node.id) }
+                continue
+            }
             let t0 = ContinuousClock().now
             do {
                 let (token, probed) = try await NodeClient.prepare(config: node)
@@ -263,15 +316,20 @@ final class NodeRouter: @unchecked Sendable {
                 if lock.withLockValue({ currentNode?.id == node.id }) {
                     info.busy = false
                 }
-                lock.withLockVoid {
-                    states[node.id] = NodeStateRecord(info: info, rtf: info.asr.rtf, offlineUntil: nil)
+                let offlineUntil = lock.withLockValue { () -> Double? in
+                    let retained = Self.retainedOfflineUntilForProbeSuccess(
+                        states[node.id]?.offlineUntil,
+                        now: nowSeconds()
+                    )
+                    states[node.id] = NodeStateRecord(info: info, rtf: info.asr.rtf, offlineUntil: retained)
                     if currentNode?.id == node.id {
                         currentToken = token
                         currentInfo = info
                     }
+                    return retained
                 }
                 candidates.append(RouteCandidate(
-                    id: node.id, expectedNodeID: node.nodeID, info: info, rttMS: rtt, isLocal: false, offlineUntil: nil
+                    id: node.id, expectedNodeID: node.nodeID, info: info, rttMS: rtt, isLocal: false, offlineUntil: offlineUntil
                 ))
             } catch NodeClientError.nodeIDMismatch {
                 routeLog("probe node=\(node.id) rejected=node_id_mismatch")
@@ -316,15 +374,10 @@ final class NodeRouter: @unchecked Sendable {
         )
         let currentScore: RouteScore? = lock.withLockValue {
             guard let node = currentNode, let info = currentInfo else { return nil }
-            return RoutingDecider.score(
-                RouteCandidate(
-                    id: node.id,
-                    expectedNodeID: node.nodeID,
-                    info: info,
-                    rttMS: 1,
-                    isLocal: false,
-                    offlineUntil: states[node.id]?.offlineUntil
-                ),
+            return Self.currentRouteScore(
+                node: node,
+                info: info,
+                offlineUntil: states[node.id]?.offlineUntil,
                 now: now,
                 localAccurate: localAccurate,
                 weights: weights
@@ -349,6 +402,29 @@ final class NodeRouter: @unchecked Sendable {
                 pendingMigrationID = best.id
             }
         }
+    }
+
+    private static func currentRouteScore(
+        node: NodeConfig,
+        info: NodeInfo,
+        offlineUntil: Double?,
+        now: Double,
+        localAccurate: Bool,
+        weights: RouteWeights = .default
+    ) -> RouteScore? {
+        RoutingDecider.score(
+                RouteCandidate(
+                    id: node.id,
+                    expectedNodeID: node.id == localUDSID ? info.nodeID : node.nodeID,
+                    info: info,
+                    rttMS: 1,
+                    isLocal: node.id == localUDSID,
+                    offlineUntil: offlineUntil
+                ),
+                now: now,
+                localAccurate: localAccurate,
+                weights: weights
+        )
     }
 
     private func audioLoop(stream: AsyncStream<TimedAudio>, fanout: AudioFanout) async {
@@ -388,17 +464,20 @@ final class NodeRouter: @unchecked Sendable {
     }
 
     private func switchToPending(atSilence: Bool) async {
-        let reservation = lock.withLockValue { () -> (NodeConfig, Int)? in
+        let reservation = lock.withLockValue { () -> (NodeConfig?, Int)? in
             guard !switching, !stopped, let id = pendingMigrationID else { return nil }
             switching = true
             switchGeneration += 1
+            if id == Self.localUDSID {
+                return (NodeConfig(id: Self.localUDSID, nodeID: "", url: "", tokenFile: ""), switchGeneration)
+            }
             guard let node = nodes.first(where: { $0.id == id }) else {
                 switching = false
                 return nil
             }
             return (node, switchGeneration)
         }
-        guard let (node, generation) = reservation else {
+        guard let (nodeOpt, generation) = reservation, var node = nodeOpt else {
             return
         }
         defer {
@@ -411,7 +490,20 @@ final class NodeRouter: @unchecked Sendable {
         var created: NodeClient?
         var published = false
         do {
-            let (token, info) = try await NodeClient.prepare(config: node)
+            let token: String
+            let info: NodeInfo
+            if node.id == Self.localUDSID {
+                info = try await NodeClient.prepareUDS(path: Self.localUDSPath)
+                guard Self.sameNonEmptyHash(info.hwHash, Capability.hwHash()) else {
+                    throw NodeClientError.nodeIDMismatch(expected: "local_hw_hash", got: info.hwHash)
+                }
+                node.nodeID = info.nodeID
+                token = ""
+            } else {
+                let p = try await NodeClient.prepare(config: node)
+                token = p.0
+                info = p.1
+            }
             guard lock.withLockValue({
                 Self.canPublishSwitch(
                     stopped: stopped,
@@ -440,6 +532,7 @@ final class NodeRouter: @unchecked Sendable {
                 config: node,
                 token: token,
                 info: info,
+                udsPath: node.id == Self.localUDSID ? Self.localUDSPath : nil,
                 sourceLocaleID: sourceLocaleID,
                 targetLanguageID: targetLanguageID,
                 offsetSeconds: lock.withLockValue { latestClock },
@@ -633,10 +726,62 @@ final class NodeRouter: @unchecked Sendable {
         }
         var seen = Set<String>()
         return decoded.filter { node in
+            guard node.id != localUDSID else { return false }
             guard !seen.contains(node.id) else { return false }
             seen.insert(node.id)
             return true
         }
+    }
+
+    static func sameNonEmptyHash(_ lhs: String, _ rhs: String) -> Bool {
+        !lhs.isEmpty && !rhs.isEmpty && lhs == rhs
+    }
+
+    static func isManifestLocalDuplicate(_ node: NodeConfig, localInfo: NodeInfo?) -> Bool {
+        isManifestLocalDuplicate(node, knownLocalNodeID: knownLocalNodeID(localInfo: localInfo, fallbackNodeID: nil))
+    }
+
+    static func isManifestLocalDuplicate(_ node: NodeConfig, knownLocalNodeID: String?) -> Bool {
+        guard let knownLocalNodeID, !knownLocalNodeID.isEmpty else { return false }
+        return node.nodeID == knownLocalNodeID
+    }
+
+    static func knownLocalNodeID(localInfo: NodeInfo?, fallbackNodeID: String?) -> String? {
+        if let nodeID = localInfo?.nodeID, !nodeID.isEmpty {
+            return nodeID
+        }
+        if let fallbackNodeID, !fallbackNodeID.isEmpty {
+            return fallbackNodeID
+        }
+        return nil
+    }
+
+    static func retainedOfflineUntilForProbeSuccess(_ offlineUntil: Double?, now: Double) -> Double? {
+        if let offlineUntil, offlineUntil > now {
+            return offlineUntil
+        }
+        return nil
+    }
+
+    static func candidateIDsForSelfTest(
+        configs: [NodeConfig],
+        localInfo: NodeInfo?,
+        lastConfirmedLocalNodeID: String? = nil,
+        localHWHash: String,
+        probe: (NodeConfig) -> NodeInfo?
+    ) -> [String] {
+        var ids: [String] = []
+        if localInfo != nil {
+            ids.append(localUDSID)
+        }
+        let knownLocalNodeID = knownLocalNodeID(localInfo: localInfo, fallbackNodeID: lastConfirmedLocalNodeID)
+        for node in configs where !isManifestLocalDuplicate(node, knownLocalNodeID: knownLocalNodeID) {
+            guard probe(node) != nil else {
+                continue
+            }
+            ids.append(node.id)
+        }
+        return ids
     }
 
     static func loadState(from url: URL = defaultStateURL) -> [String: NodeStateRecord] {
@@ -749,6 +894,90 @@ final class NodeRouter: @unchecked Sendable {
         check(RoutingDecider.score(RouteCandidate(id: "battery", expectedNodeID: "n4", info: batteryInfo, rttMS: 10, isLocal: false, offlineUntil: nil), now: 0, localAccurate: true)!.score
               < RoutingDecider.score(base, now: 0, localAccurate: true)!.score,
               "电池供电应扣分")
+        let slowInfo = NodeInfo(
+            v: 2, nodeID: "n1", hwHash: "h",
+            asr: .init(model: "whisper-large-v3-turbo", backend: "mlx", rtf: 0.5),
+            translator: "apple", busy: false, onAC: true, inUse: false, worker: "warm"
+        )
+        let localBadP8 = RouteCandidate(id: localUDSID, expectedNodeID: "n1", info: goodInfo, rttMS: 1, isLocal: true, offlineUntil: nil)
+        let localGoodP8 = RouteCandidate(id: localUDSID, expectedNodeID: "n1", info: goodInfo, rttMS: 1, isLocal: true, offlineUntil: nil)
+        let localSlowP8 = RouteCandidate(id: localUDSID, expectedNodeID: "n1", info: slowInfo, rttMS: 1, isLocal: true, offlineUntil: nil)
+        check(RoutingDecider.score(localBadP8, now: 0, localAccurate: false)!.score < RoutingDecider.score(base, now: 0, localAccurate: false)!.score, "本机节点 + P8 不满足时大幅扣分")
+        check(RoutingDecider.choose(candidates: [base, localGoodP8], now: 0, localAccurate: true)?.id == localUDSID,
+              "同 rtf 下本机节点应因无网络加分胜出")
+        check(RoutingDecider.choose(candidates: [better, localSlowP8], now: 0, localAccurate: true)?.id == "better",
+              "远端明显更优时应选远端")
+        check(Self.currentRouteScore(
+            node: NodeConfig(id: localUDSID, nodeID: "", url: "", tokenFile: ""),
+            info: goodInfo,
+            offlineUntil: nil,
+            now: 0,
+            localAccurate: true
+        )?.score == RoutingDecider.score(localGoodP8, now: 0, localAccurate: true)?.score,
+              "在任本机节点重打分应使用实际 node_id 且 isLocal=true")
+        let localClient = NodeClient(
+            config: NodeConfig(id: localUDSID, nodeID: "n1", url: "", tokenFile: ""),
+            token: "",
+            info: goodInfo,
+            udsPath: Self.localUDSPath,
+            sourceLocaleID: "de-DE",
+            targetLanguageID: "zh-Hans",
+            offsetSeconds: 0,
+            sessionGeneration: 1,
+            callbacks: NodeCallbacks()
+        )
+        check(localClient.udsPathForSelfTest() == Self.localUDSPath,
+              "NodeClient 本机 UDS 会话路径必须来自 NodeRouter.localUDSPath")
+        check(Self.sameNonEmptyHash("", "") == false, "hw_hash 空串不得匹配")
+        check(Self.sameNonEmptyHash("h", "h"), "非空 hw_hash 相同才匹配")
+        check(Self.retainedOfflineUntilForProbeSuccess(100, now: 1) == 100,
+              "回退后立即 /v1/info 探测成功不得清掉 offline_until")
+        check(Self.retainedOfflineUntilForProbeSuccess(100, now: 101) == nil,
+              "过期 offline_until 可在探测成功后清掉")
+        let manifestLocal = NodeConfig(id: "mini2", nodeID: "n1", url: "ws://mini2:8791", tokenFile: "/tmp/token")
+        let manifestRemote = NodeConfig(id: "remote", nodeID: "n2", url: "ws://remote:8791", tokenFile: "/tmp/token")
+        let remoteDifferentHW = NodeInfo(
+            v: 2, nodeID: "n2", hwHash: "remote-hw",
+            asr: .init(model: "whisper-large-v3-turbo", backend: "mlx", rtf: 0.02),
+            translator: "apple", busy: false, onAC: true, inUse: false, worker: "warm"
+        )
+        check(Self.candidateIDsForSelfTest(
+            configs: [manifestLocal, manifestRemote],
+            localInfo: goodInfo,
+            localHWHash: "h",
+            probe: { $0.id == "remote" ? remoteDifferentHW : goodInfo }
+        ) == [localUDSID, "remote"], "nodes.json 中同 node_id 本机条目应与 UDS 去重")
+        var probedManifestIDs: [String] = []
+        check(Self.candidateIDsForSelfTest(
+            configs: [manifestLocal, manifestRemote],
+            localInfo: nil,
+            lastConfirmedLocalNodeID: "n1",
+            localHWHash: "h",
+            probe: {
+                probedManifestIDs.append($0.id)
+                return $0.id == "remote" ? remoteDifferentHW : goodInfo
+            }
+        ) == ["remote"], "已确认本机 node_id 的清单条目应在 prepare/token 前跳过")
+        check(probedManifestIDs == ["remote"], "本机清单条目不得为了 hw_hash 触发 prepare/token")
+        check(Self.candidateIDsForSelfTest(
+            configs: [],
+            localInfo: goodInfo,
+            localHWHash: "h",
+            probe: { _ in nil }
+        ) == [localUDSID], "空 nodes.json 仍应构造 UDS 探测候选")
+        do {
+            let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("rslite-loadnodes-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let nodesFile = dir.appendingPathComponent("nodes.json")
+            let raw = """
+            [{"id":"local_uds","node_id":"bad","url":"ws://bad","token_file":"/tmp/t"},{"id":"remote","node_id":"n2","url":"ws://remote","token_file":"/tmp/t"}]
+            """
+            try Data(raw.utf8).write(to: nodesFile)
+            check(Self.loadNodes(from: nodesFile).map(\.id) == ["remote"], "nodes.json 不得占用 local_uds id")
+            try? FileManager.default.removeItem(at: dir)
+        } catch {
+            check(false, "loadNodes local_uds id 自检异常：\(error)")
+        }
         var gate = MigrationGate()
         let c = RouteScore(id: "base", score: 50, reason: "")
         let b = RouteScore(id: "better", score: 70, reason: "")

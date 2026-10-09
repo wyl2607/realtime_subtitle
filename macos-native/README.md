@@ -20,4 +20,8 @@ headless 输出 JSONL：`volatile/final/translation/status`，文件结束后等
 混合精修：安装脚本写 `~/.config/rslite/nodes.json`（0600）后运行 `.build/release/rslite --source tap --mode auto`；也可用 `--mode local` 强制本机、`--mode hybrid` 强制尝试节点精修。
 节点清单格式：`[{"id":"mini2","node_id":"...","url":"ws://mini2.tailnet:8791/v2/session","token_file":"~/.config/rslite/mini2-token"}]`。token 文件必须是 0600；客户端先查 `/v1/info` 校验 `node_id`，不一致就不建立会话、不发送音频。
 菜单栏显示「字·本机」「字·混合·<节点>」「字·精修中」；路由选择理由写 stderr，日志不写转录正文或译文。
-自检：`.build/release/rslite --selftest` 会跑混合替换、P8 能力门槛、节点打分和迁移门槛的纯逻辑检查。
+自检：`.build/release/rslite --selftest` 会跑混合替换、P8 能力门槛、节点打分、迁移门槛、UDS WebSocket 帧/close 码与本机节点去重检查。
+
+本机 UDS 节点（TK-005b）：
+当本机 gateway 的 hw_hash 与本机 IOPlatformUUID 算出的哈希一致时，优先走 `~/Library/Application Support/rs-node/gw.sock` 进行通讯，无需 token 且不受网络打分惩罚。
+由于 URLSession 不支持 UDS，且 Network.framework 无法轻易指定 WebSocket upgrade 的 HTTP 路径导致握手 404，本实现采用 POSIX socket 自写 HTTP GET（`/v1/info`）与 RFC 6455 WebSocket（`/v2/session`）客户端以支持本机 UDS 发现和会话（见 `UDSWebSocket.swift`）。
