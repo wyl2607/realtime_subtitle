@@ -2,9 +2,9 @@
 
 ## 当前状态
 <!-- Machine fields: new writes must use "- key: `value`". Legacy variants are read-only compatibility. -->
-- current_phase: `execution`
+- current_phase: `execution+review`
 - current_tk: `TK-002b,TK-005,TK-006,TK-007(prep)`
-- current_cr: `—`
+- current_cr: `CR-007`
 - current_round: `0`
 - escalated: `false`
 
@@ -17,13 +17,15 @@
 | TK-002 | 节点 gateway：生命周期 + 协议 v2 + 鉴权与上限 | done |
 | TK-003 | 一键安装 install_node.sh | done（mini2 已装；TCP 监听 blocker，见 HANDOFF §11.2） |
 | TK-004 | rslite：带时间句子 + AudioFanout + 混合替换 + 单实例 | done |
-| TK-002b | gateway：launchd 下 Tailscale CLI 修复 + 安装自检补 TCP | executing |
+| TK-002b | gateway：launchd 下 Tailscale CLI 修复 + 安装自检补 TCP | reviewing |
+| TK-003b | install 测试 macOS 密封 | executing |
 | TK-001c | worker：translator 写当前真实翻译器名 | done |
 | TK-005 | rslite：NodeClient v2 + NodeRouter + 本机档门槛 | executing |
 | TK-006 | 清理 v1 + 文档 | executing |
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 16:05 CEST: TK-002b 回报 2792120（Coordinator 复核 906 passed、唯一失败为基线已有 frame_size、ruff/bash -n 通过）→ reviewing，CR-007 round1：codex default + Gemini pro security。发现 tests/test_install_node.py 在 Mac 不密封（PATH 前缀盖桩→真跑 uv/ollama、BSD sed、挂死留孤儿；ssh 是桩、未触及 mini2，本机无误装）→ 拆 TK-003b（opencode big-pickle，基于 feat/tk-002b）；已清理本会话孤儿测试进程。TK-007 prep 回报 a0cd68a（power_compare 五组、hybrid_score.py+6 单测、node-acceptance.md 骨架）。TK-005：agy Claude 池周额度耗尽（117h）→ Gemini pro 接续，声称「全部完成、冒烟 4/4」，**Coordinator 复跑证伪**：用例 1 实为 `switch_failed err=NodeClientError` 0.28s 退回本机，判据过松；Gemini 还越界改了 .governance 任务卡（已撤回）→ codex 查握手根因并收紧冒烟判据
 - 2026-10-09 15:50 CEST: TK-005 codex 额度中断（usage limit），半成品 1593 行存为 WIP 48d186c：swift build 通过、--selftest OK、--mode local 回放 5 句正常，但 codex 总结丢失 → 改派 agy Claude 池（claude-opus-4-6-thinking）做 Done criteria 审计+补齐+假 v2 节点冒烟
 - 2026-10-09 15:35 CEST: **分级并行编队**（用户要求）：L0 Coordinator(opus) → L1 组长(sonnet) → L2 下级(agy Gemini 池 flash/pro、agy Claude 池 opus-4-6-thinking、haiku)。实测推翻 HANDOFF §2「不要派 agy」：agy 带 `--dangerously-skip-permissions` 两个池都能跑 shell；`claude -p --model haiku` 可用。grok 对 TK-006 exit 0 零改动（PLAYBOOK 已知坑）→ 弃用。TK-006 改由 sonnet 组长带 agy/haiku；新开 TK-007 prep（sonnet 组长，worktree rs-tk-007，只做 scripts/bench + 文档骨架，真机验收仍等前序）。TK-002b(sonnet)、TK-005(codex) 继续
 - 2026-10-09 15:20 CEST: 用户要求多 lane 加速 → 三路并行（文件不重叠）：TK-002b=Claude sonnet（rs-tk-002b）；TK-005=codex gpt-5.5 high（rs-tk-005，沙箱不能 commit，Coordinator 代提交）；TK-006=grok（rs-tk-006，合并须在 TK-005 之后）。agy 不派（本机 headless 拒 shell，HANDOFF §2）。4 个 rs-cloud-* detached worktree 已由用户删除

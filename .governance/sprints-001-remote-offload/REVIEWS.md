@@ -5,6 +5,7 @@
 
 | CR | TK | rounds | status | last_action |
 |----|----|--------|--------|-------------|
+| CR-007 | TK-002b | 1 | open | 2026-10-09 16:05 CEST: round1 两路派出（codex default + agy Gemini pro security） |
 | CR-006 | TK-001c | 2 | resolved | 2026-10-09 12:00 CST: round2 approve_with_minor；R2-F1 coordinator-direct 0691d95；已合并；F3 文案 efa713c |
 | CR-005 | TK-003 | 3 | resolved | 2026-10-09 14:35 CST: mini2 真机安装 EXIT=0；发现 TCP 监听 blocker 与自检漏洞，另开 TK（HANDOFF §11.2） |
 | CR-004 | TK-001b | 3 | resolved | 2026-10-09 08:25 CST: round3 approve（端到端 rtf None→0.0101→0.037 滑动）；三轮收敛，已合并 |
