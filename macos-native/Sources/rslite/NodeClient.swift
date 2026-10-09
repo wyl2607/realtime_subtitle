@@ -160,7 +160,8 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         commonFormat: .pcmFormatInt16, sampleRate: 16_000, channels: 1, interleaved: true
     )!
     private static let frameBytes = 3200
-    private static let readyTimeout: Duration = .seconds(5)
+    // 冷启动＝拉起 worker + import MLX + 加载权重，mini2 实测 >5s；预算对齐 RFC「冷启动后首条精修 ≤15s」，等待期间本机 B 照常出字
+    private static let readyTimeout: Duration = .seconds(15)
     private static let closeTimeout: Duration = .seconds(2)
 
     private let config: NodeConfig
