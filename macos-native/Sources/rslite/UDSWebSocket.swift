@@ -489,7 +489,8 @@ final class UDSWebSocketTask: @unchecked Sendable, NodeWebSocketTask {
         defer { _ = fcntl(fd, F_SETFL, flags) }
         while true {
             let rc = Darwin.connect(fd, addr, len)
-            if rc == 0 {
+            // EINTR 后重试时内核可能已连上，第二次 connect 返回 EISCONN，同样算成功
+            if rc == 0 || errno == EISCONN {
                 return
             }
             if errno == EINTR {
