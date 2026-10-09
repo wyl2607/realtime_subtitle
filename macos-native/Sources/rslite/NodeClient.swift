@@ -246,7 +246,7 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
     func connect() async throws {
         // P6 的 nodes.json 只记 ws://<名>:8791（install_node.sh 就这么写），会话路径由客户端补；
         // 不补的话升级请求打到 "/"，gateway 只认 /v2/session，真节点上必然连不上。
-        if config.id == "local_uds" {
+        if config.id == NodeRouter.localUDSID {
             guard let udsPath else {
                 throw NodeClientError.badURL(config.id)
             }
@@ -401,6 +401,9 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         let heartbeat = lock.withLockValue { heartbeatTask }
         heartbeat?.cancel()
         socket?.cancel(with: .normalClosure, reason: nil)
+        if socket?.completesCloseOnCancel == true || session == nil {
+            finished.open()
+        }
         let timer = Task {
             try? await Task.sleep(for: Self.closeTimeout)
             finished.open()
@@ -759,6 +762,15 @@ extension NodeClient {
         func check(_ ok: Bool, _ name: String) {
             if !ok { failures.append(name) }
         }
+        func isProtocolError(_ error: Error?) -> Bool {
+            guard let error else {
+                return false
+            }
+            if case NodeClientError.protocolError(_) = error {
+                return true
+            }
+            return false
+        }
         // 心跳：10s 一发，发出后 10s 无 pong 判死
         check(HeartbeatPolicy.step(now: 5, lastPingSentAt: 0, lastPongAt: 0) == .none, "心跳：未到间隔不发 ping")
         check(HeartbeatPolicy.step(now: 10, lastPingSentAt: 0, lastPongAt: 0) == .sendPing, "心跳：到间隔发 ping")
@@ -802,43 +814,26 @@ extension NodeClient {
             check(len126[1] == 126 && len126[2] == 0 && len126[3] == 126, "UDS WebSocket 126 长度编码")
             let len127 = UDSWebSocketTask.makeServerFrameForSelfTest(opcode: 0x2, payload: Data(count: 65_536))
             check(len127[1] == 127 && len127[7] == 1 && len127[8] == 0 && len127[9] == 0, "UDS WebSocket 127 长度编码")
-            if case .data(let payload) = try UDSWebSocketTask.decodeServerMessagesForSelfTest(len127).first {
+            if case .data(let payload) = UDSWebSocketTask.receiveOneForSelfTest(len127).message {
                 check(payload.count == 65_536, "UDS WebSocket 单帧 64KB 应允许")
             } else {
                 check(false, "UDS WebSocket 单帧 64KB 应解码为 data")
             }
             let tooLarge = UDSWebSocketTask.makeServerFrameForSelfTest(opcode: 0x2, payload: Data(count: 65_537))
-            var rejectedLargeFrame = false
-            do {
-                _ = try UDSWebSocketTask.decodeServerMessagesForSelfTest(tooLarge)
-            } catch NodeClientError.protocolError {
-                rejectedLargeFrame = true
-            }
+            let rejectedLargeFrame = isProtocolError(UDSWebSocketTask.receiveOneForSelfTest(tooLarge).error)
             check(rejectedLargeFrame, "UDS WebSocket 单帧超过 64KB 应协议错误")
             let frag = UDSWebSocketTask.makeServerFrameForSelfTest(fin: false, opcode: 0x1, payload: Data("hel".utf8))
                 + UDSWebSocketTask.makeServerFrameForSelfTest(fin: true, opcode: 0x0, payload: Data("lo".utf8))
-            if case .string(let text) = try UDSWebSocketTask.decodeServerMessagesForSelfTest(frag).first {
+            if case .string(let text) = UDSWebSocketTask.receiveOneForSelfTest(frag).message {
                 check(text == "hello", "UDS WebSocket 分片文本应拼接")
             } else {
                 check(false, "UDS WebSocket 分片文本应解码为 string")
             }
             let oversizedFragments = UDSWebSocketTask.makeServerFrameForSelfTest(fin: false, opcode: 0x2, payload: Data(count: 32_768))
                 + UDSWebSocketTask.makeServerFrameForSelfTest(fin: true, opcode: 0x0, payload: Data(count: 32_769))
-            var rejectedFragmentTotal = false
-            do {
-                _ = try UDSWebSocketTask.decodeServerMessagesForSelfTest(oversizedFragments)
-            } catch NodeClientError.protocolError {
-                rejectedFragmentTotal = true
-            }
+            let rejectedFragmentTotal = isProtocolError(UDSWebSocketTask.receiveOneForSelfTest(oversizedFragments).error)
             check(rejectedFragmentTotal, "UDS WebSocket 分片重组超过 64KB 应协议错误")
             let close = UDSWebSocketTask.makeServerFrameForSelfTest(opcode: 0x8, payload: Data([0x03, 0xF1]))
-            var closeCodeSeen = false
-            do {
-                _ = try UDSWebSocketTask.decodeServerMessagesForSelfTest(close)
-            } catch NodeClientError.connection(let message) {
-                closeCodeSeen = message == "close 1009"
-            }
-            check(closeCodeSeen, "UDS WebSocket close 码应解析")
             let busyClose = UDSWebSocketTask.makeServerFrameForSelfTest(opcode: 0x8, payload: Data([0x03, 0xF5]))
             let busyResult = UDSWebSocketTask.receiveOneForSelfTest(busyClose)
             check(busyResult.closeCode == 1013, "UDS WebSocket 线上 receiveBlocking 应记录 1013 close 码")
@@ -890,6 +885,7 @@ private extension Duration {
 
 protocol NodeWebSocketTask: Sendable {
     var nodeCloseCode: Int { get }
+    var completesCloseOnCancel: Bool { get }
     func resume()
     func send(_ message: URLSessionWebSocketTask.Message) async throws
     func receive() async throws -> URLSessionWebSocketTask.Message
@@ -899,4 +895,5 @@ protocol NodeWebSocketTask: Sendable {
 
 extension URLSessionWebSocketTask: NodeWebSocketTask {
     var nodeCloseCode: Int { closeCode.rawValue }
+    var completesCloseOnCancel: Bool { false }
 }

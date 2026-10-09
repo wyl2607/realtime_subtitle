@@ -19,6 +19,7 @@ final class UDSWebSocketTask: @unchecked Sendable, NodeWebSocketTask {
     private var continuationPayload = Data()
 
     var nodeCloseCode: Int { stateLock.withLockValue { closeCodeValue } }
+    var completesCloseOnCancel: Bool { true }
 
     init(path: String, timeoutMS: Int32 = defaultTimeoutMS) throws {
         fd = try Self.openValidatedSocket(path: path, timeoutMS: timeoutMS)
@@ -166,66 +167,45 @@ final class UDSWebSocketTask: @unchecked Sendable, NodeWebSocketTask {
         makeFrame(fin: fin, opcode: opcode, payload: payload, maskKey: nil)
     }
 
-    static func decodeServerMessagesForSelfTest(_ data: Data) throws -> [URLSessionWebSocketTask.Message] {
-        var offset = 0
-        var continuationOpcode: UInt8?
-        var continuationPayload = Data()
-        var messages: [URLSessionWebSocketTask.Message] = []
-        while offset < data.count {
-            let frame = try readFrame(data, offset: &offset)
-            switch frame.opcode {
-            case 0x1, 0x2:
-                if frame.fin {
-                    if frame.opcode == 0x1 {
-                        messages.append(.string(String(data: frame.payload, encoding: .utf8) ?? ""))
-                    } else {
-                        messages.append(.data(frame.payload))
-                    }
-                } else {
-                    continuationOpcode = frame.opcode
-                    continuationPayload = frame.payload
-                }
-            case 0x0:
-                guard let opcode = continuationOpcode else {
-                    throw NodeClientError.protocolError("unexpected continuation")
-                }
-                guard continuationPayload.count + frame.payload.count <= maxWebSocketPayloadBytes else {
-                    throw NodeClientError.protocolError("message too large")
-                }
-                continuationPayload.append(frame.payload)
-                if frame.fin {
-                    if opcode == 0x1 {
-                        messages.append(.string(String(data: continuationPayload, encoding: .utf8) ?? ""))
-                    } else {
-                        messages.append(.data(continuationPayload))
-                    }
-                    continuationOpcode = nil
-                    continuationPayload.removeAll(keepingCapacity: true)
-                }
-            case 0x8:
-                let code = closeCode(from: frame.payload)
-                throw NodeClientError.connection("close \(code)")
-            case 0x9, 0xA:
-                continue
-            default:
-                throw NodeClientError.protocolError("opcode \(frame.opcode)")
-            }
-        }
-        return messages
-    }
-
     static func receiveOneForSelfTest(_ data: Data) -> (message: URLSessionWebSocketTask.Message?, error: Error?, closeCode: Int) {
         var fds = [Int32](repeating: -1, count: 2)
         guard socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0 else {
             return (nil, POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO), 1005)
         }
-        let task = UDSWebSocketTask(connectedFDForSelfTest: fds[0])
-        defer { Darwin.close(fds[1]) }
+        fds.forEach { fd in
+            var noSigPipe: Int32 = 1
+            _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+        }
+        let readFD = fds[0]
+        let writeFD = fds[1]
+        let task = UDSWebSocketTask(connectedFDForSelfTest: readFD)
+        let writer = DispatchGroup()
+        writer.enter()
+        DispatchQueue.global(qos: .utility).async {
+            defer { writer.leave() }
+            do {
+                try writeAll(fd: writeFD, data: data, timeoutMS: defaultTimeoutMS)
+                _ = Darwin.shutdown(writeFD, SHUT_WR)
+            } catch {
+                _ = Darwin.shutdown(writeFD, SHUT_RDWR)
+            }
+        }
+        defer {
+            writer.wait()
+            Darwin.close(writeFD)
+        }
         do {
-            try writeAll(fd: fds[1], data: data, timeoutMS: defaultTimeoutMS)
-            _ = Darwin.shutdown(fds[1], SHUT_WR)
             return (try task.receiveBlocking(), nil, task.nodeCloseCode)
         } catch {
+            let closeFD = task.stateLock.withLockValue { () -> Int32 in
+                let value = task.fd
+                task.fd = -1
+                return value
+            }
+            if closeFD >= 0 {
+                _ = Darwin.shutdown(closeFD, SHUT_RDWR)
+                Darwin.close(closeFD)
+            }
             return (nil, error, task.nodeCloseCode)
         }
     }
@@ -331,17 +311,6 @@ final class UDSWebSocketTask: @unchecked Sendable, NodeWebSocketTask {
     private func readFrame() throws -> WebSocketFrame {
         try Self.readFrame { count in
             try Self.readExact(fd: fd, count: count, timeoutMS: Self.defaultTimeoutMS)
-        }
-    }
-
-    private static func readFrame(_ data: Data, offset: inout Int) throws -> WebSocketFrame {
-        try readFrame { count in
-            guard offset + count <= data.count else {
-                throw NodeClientError.protocolError("short frame")
-            }
-            let bytes = Array(data[offset..<(offset + count)])
-            offset += count
-            return bytes
         }
     }
 
