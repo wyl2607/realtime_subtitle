@@ -3,7 +3,7 @@
 ## 当前状态
 <!-- Machine fields: new writes must use "- key: `value`". Legacy variants are read-only compatibility. -->
 - current_phase: `execution`
-- current_tk: `TK-002b`
+- current_tk: `TK-002b,TK-005,TK-006`
 - current_cr: `—`
 - current_round: `0`
 - escalated: `false`
@@ -19,11 +19,12 @@
 | TK-004 | rslite：带时间句子 + AudioFanout + 混合替换 + 单实例 | done |
 | TK-002b | gateway：launchd 下 Tailscale CLI 修复 + 安装自检补 TCP | executing |
 | TK-001c | worker：translator 写当前真实翻译器名 | done |
-| TK-005 | rslite：NodeClient v2 + NodeRouter + 本机档门槛 | planned |
-| TK-006 | 清理 v1 + 文档 | planned |
+| TK-005 | rslite：NodeClient v2 + NodeRouter + 本机档门槛 | executing |
+| TK-006 | 清理 v1 + 文档 | executing |
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 15:20 CEST: 用户要求多 lane 加速 → 三路并行（文件不重叠）：TK-002b=Claude sonnet（rs-tk-002b）；TK-005=codex gpt-5.5 high（rs-tk-005，沙箱不能 commit，Coordinator 代提交）；TK-006=grok（rs-tk-006，合并须在 TK-005 之后）。agy 不派（本机 headless 拒 shell，HANDOFF §2）。4 个 rs-cloud-* detached worktree 已由用户删除
 - 2026-10-09 15:00 CEST: **本机会话接手**（MacBook Air）。主 worktree ff 到 ebaa9fe。mini2 只读复现根因：App Store 版 Tailscale 二进制靠 `SHLVL` 判 CLI/GUI，launchd 环境无 SHLVL → `tailscale ip -4` stdout 打「The Tailscale GUI failed to start…」、rc=0 → validate_host ValueError；env -i 下加 `SHLVL=1` 或官方开关 `TAILSCALE_BE_CLI=1` 均恢复正常，改 argv0/PWD/_ 无效。v1.restart 已不存在（安装成功时删除，符合预期）；gateway PID 12840 仍在退避。新建 TK-002b → executing（sonnet，worktree ~/projects/rs-tk-002b，安全类单独一批）
 - 2026-10-09 14:40 CST: 用户叫停，全部提交，交给本机处理（HANDOFF §11）
 - 2026-10-09 14:35 CST: **mini2 真机安装（用户批准）EXIT=0**：语言包 installed、RTF 0.368、v1 已停、LaunchAgent running（RSS 33.6MB、无 worker）、UDS /v1/info 200、权限/日志无 token 核验通过、nodes.json 已写。**验收发现 blocker**：gateway `tcp_bind_failed err=ValueError` 持续退避，没有 TCP 监听（远程不可达）；安装自检只验 UDS 所以报成功
