@@ -492,6 +492,12 @@ final class NodeRouter: @unchecked Sendable {
               "busy 节点应排除")
         check(RoutingDecider.choose(candidates: [RouteCandidate(id: "mismatch", expectedNodeID: "wrong", info: goodInfo, rttMS: 10, isLocal: false, offlineUntil: nil)], now: 0, localAccurate: true) == nil,
               "node_id 不匹配应排除")
+        // 节点下线：所有节点 offline_until 在未来，应返回 nil
+        check(RoutingDecider.choose(candidates: [
+            RouteCandidate(id: "off1", expectedNodeID: "n1", info: goodInfo, rttMS: 10, isLocal: false, offlineUntil: 100),
+            RouteCandidate(id: "off2", expectedNodeID: "n2", info: betterInfo, rttMS: 10, isLocal: false, offlineUntil: 200),
+        ], now: 1, localAccurate: true) == nil,
+              "所有节点下线时应返回 nil")
         check(RoutingDecider.score(RouteCandidate(id: "battery", expectedNodeID: "n4", info: batteryInfo, rttMS: 10, isLocal: false, offlineUntil: nil), now: 0, localAccurate: true)!.score
               < RoutingDecider.score(base, now: 0, localAccurate: true)!.score,
               "电池供电应扣分")
