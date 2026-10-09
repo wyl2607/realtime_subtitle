@@ -4,7 +4,7 @@
 <!-- Machine fields: new writes must use "- key: `value`". Legacy variants are read-only compatibility. -->
 - current_phase: `execution+review`
 - current_tk: `TK-002b,TK-005,TK-006,TK-007(prep)`
-- current_cr: `CR-009`
+- current_cr: `CR-009,CR-011`
 - current_round: `0`
 - escalated: `false`
 
@@ -19,13 +19,14 @@
 | TK-004 | rslite：带时间句子 + AudioFanout + 混合替换 + 单实例 | done |
 | TK-002b | gateway：launchd 下 Tailscale CLI 修复 + 安装自检补 TCP | done |
 | TK-003b | install 测试 macOS 密封 + bash 多字节 bug | done |
-| TK-002c | gateway 测试 1009 后重连时序 | executing |
+| TK-002c | gateway 测试 1009 后重连时序 | reviewing |
 | TK-001c | worker：translator 写当前真实翻译器名 | done |
 | TK-005 | rslite：NodeClient v2 + NodeRouter + 本机档门槛 | reviewing |
 | TK-006 | 清理 v1 + 文档 | reviewing |
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | planned |
 
 ## 最近动作
+- 2026-10-09 18:15 CEST: CR-009 F4/F5 已在 codex WIP 91d5310 完成（Gemini 接续确认无需增补，但越权 `git reset` 回退已推送提交 → Coordinator `reset --soft` 恢复直线历史）；本机复核 build/selftest/冒烟 18/18 → round3 Claude opus 终审。TK-002c 回报 4555a09（+7 行 wait_session_freed；并发两份各 120 passed）→ CR-011 round1（opencode）
 - 2026-10-09 18:00 CEST: codex 第二次额度中断（20:24 重置），CR-009 F4 半成品 WIP 91d5310（build/selftest 通过）→ Gemini pro 接续 F4/F5（第 3 轮改由 Claude opus 终审，评审≠修复者）。frame_size 根因：1009 关闭后测试立即重连、gateway 收尾未完成 → 1013（测试时序，非产品缺陷）→ 新 TK-002c（Gemini flash，worktree rs-tk-002c）
 - 2026-10-09 17:50 CEST: **TK-003b done**：CR-010 round2 approve → 合并 523877b（主线看门狗安装测试 112 passed、其余 906 passed/1 基线失败、ruff/shellcheck 通过）。主线安装脚本已可用于 mini2 重装（等用户批准）。CR-009 round2 Gemini：F1–F3 确认修好，新 F4（取消被当节点故障）/F5（旧会话 drain 期间断开覆盖新节点模式）accepted → codex 修。frame_size 基线失败（1013 busy）派 opencode 免费模型只做根因调查（detached /tmp/inv-frame/wt）
 - 2026-10-09 17:35 CEST: CR-010 round1 codex needs_fix（CR010-01 TGT_PATH_EXPORT 控制端插值注入面 accepted）→ e3eef2b 单引号目标端展开（shellcheck 0、看门狗 112 passed）→ round2 codex；Gemini 在 tk-003b 仓库根留 30 个调试文件已挪 /tmp。TK-005 codex 修 F1–F3 → 18dcaed（Coordinator 本机 build/selftest/冒烟 18/18/真实配置未动）→ CR-009 round2 Gemini pro。等用户：mini2 重装批准、S1 契约取舍
