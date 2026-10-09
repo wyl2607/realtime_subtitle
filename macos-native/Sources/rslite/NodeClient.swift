@@ -1,4 +1,3 @@
-import Darwin
 @preconcurrency import AVFoundation
 import Foundation
 
@@ -207,36 +206,10 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         self.callbacks = callbacks
     }
 
-        static func prepareUDS(path: String) async throws -> NodeInfo {
-        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { throw NodeClientError.connection("socket") }
-        defer { Darwin.close(fd) }
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        _ = withUnsafeMutablePointer(to: &addr.sun_path) {
-            $0.withMemoryRebound(to: CChar.self, capacity: 104) { strlcpy($0, path, 104) }
-        }
-        let addrLen = socklen_t(MemoryLayout<sockaddr_un>.size)
-        let res = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, addrLen) }
-        }
-        if res < 0 { throw NodeClientError.connection("connect") }
-        let req = "GET /v1/info HTTP/1.1\r\nHost: localhost\r\n\r\n"
-        req.withCString { _ = write(fd, $0, strlen($0)) }
-        var resp = Data()
-        var buf = [UInt8](repeating: 0, count: 1024)
-        while let n = Optional(read(fd, &buf, 1024)), n > 0 {
-            resp.append(contentsOf: buf[0..<n])
-        }
-        let str = String(data: resp, encoding: .utf8) ?? ""
-        guard str.contains("200 OK"), let range = str.range(of: "\r\n\r\n") else {
-            if str.contains("403") { throw NodeClientError.unauthorized }
-            throw NodeClientError.connection("http error")
-        }
-        let jsonStr = String(str[range.upperBound...])
-        guard let data = jsonStr.data(using: .utf8) else { throw NodeClientError.protocolError("invalid json") }
-        return try JSONDecoder().decode(NodeInfo.self, from: data)
+    static func prepareUDS(path: String) async throws -> NodeInfo {
+        try await UDSWebSocketTask.fetchInfo(path: path)
     }
+
     static func prepare(config: NodeConfig, timeout: Duration = .seconds(5)) async throws -> (String, NodeInfo) {
         guard let token = readTokenFile(config.tokenFile) else {
             throw NodeClientError.tokenUnavailable(config.id)
@@ -247,7 +220,9 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         var request = URLRequest(url: infoURL)
         request.timeoutInterval = timeout.secondsValue
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let session = URLSession(configuration: directSessionConfiguration(timeout: timeout.secondsValue))
+        defer { session.invalidateAndCancel() }
+        let (data, response) = try await session.data(for: request)
         if let http = response as? HTTPURLResponse, http.statusCode == 401 {
             throw NodeClientError.unauthorized
         }
@@ -269,12 +244,7 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         // 不补的话升级请求打到 "/"，gateway 只认 /v2/session，真节点上必然连不上。
         if config.id == "local_uds" {
             let udsPath = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Application Support/rs-node/gw.sock")
-            guard let udsTask = UDSWebSocketTask(path: udsPath) else {
-                throw NodeClientError.connection("uds_connect_failed")
-            }
-            if !udsTask.upgrade() {
-                throw NodeClientError.connection("uds_upgrade_failed")
-            }
+            let udsTask = try UDSWebSocketTask(path: udsPath)
             lock.withLockVoid { self.socket = udsTask }
             udsTask.resume()
         } else {
@@ -289,8 +259,7 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
             }
             var request = URLRequest(url: url)
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-            let sessionConfiguration = URLSessionConfiguration.ephemeral
-            sessionConfiguration.timeoutIntervalForRequest = 24 * 60 * 60
+            let sessionConfiguration = Self.directSessionConfiguration(timeout: 24 * 60 * 60)
             let session = URLSession(configuration: sessionConfiguration, delegate: self, delegateQueue: nil)
             let socket = session.webSocketTask(with: request)
             lock.withLockVoid {
@@ -308,12 +277,15 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
                 "sample_rate": 16_000,
                 "format": "s16le",
             ]
-            try await currentSocket()?.send(.string(Self.jsonString(hello)))
-            if let s = currentSocket() { try await awaitReady(s) }
+            guard let socket = currentSocket() else {
+                throw NodeClientError.connection("socket closed")
+            }
+            try await socket.send(.string(Self.jsonString(hello)))
+            try await awaitReady(socket)
             callbacks.onReady(config.id, sessionGeneration, info)
-            if let s = currentSocket() { Task { await receiveLoop(s) } }
-            if let s = currentSocket() { let heartbeat = Task { await self.heartbeatLoop(s) }; lock.withLockVoid { heartbeatTask = heartbeat } }
-            
+            Task { await receiveLoop(socket) }
+            let heartbeat = Task { await self.heartbeatLoop(socket) }
+            lock.withLockVoid { heartbeatTask = heartbeat }
         } catch {
             throw await classify(error, currentSocket())
         }
@@ -596,14 +568,14 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         await closeFrameReceived.wait()
         timeout.cancel()
         let code = lock.withLockValue { remoteCloseCode }
-        if code == 1013 || socket?.closeCode.rawValue == 1013 {
+        if code == 1013 || socket?.nodeCloseCode == 1013 {
             return .busy
         }
         if let code, code != 1005 {
             return .connection("close \(code)")
         }
-        if socket?.closeCode.rawValue != 1005 {
-            return .connection("close \(socket?.closeCode.rawValue ?? 1005)")
+        if socket?.nodeCloseCode != 1005 {
+            return .connection("close \(socket?.nodeCloseCode ?? 1005)")
         }
         return .connection(error.localizedDescription)
     }
@@ -658,6 +630,13 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
             return nil
         }
         return text
+    }
+
+    private static func directSessionConfiguration(timeout: TimeInterval) -> URLSessionConfiguration {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = timeout
+        configuration.connectionProxyDictionary = [:]
+        return configuration
     }
 
     private static func infoURL(from wsURL: String) -> URL? {
@@ -800,6 +779,35 @@ extension NodeClient {
         check(oldGate.isOpened && !newGate.isOpened, "旧会话 drained 不应放行同节点新会话的等待者")
         waiters.open(session: NodeSessionRef(nodeID: "B", generation: 2))
         check(!newGate.isOpened, "其他节点 drained 不应放行")
+        check(UDSWebSocketTask.webSocketAccept(key: "dGhlIHNhbXBsZSBub25jZQ==") == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=",
+              "UDS WebSocket Accept 应符合 RFC6455 示例向量")
+        do {
+            let small = try UDSWebSocketTask.makeClientFrame(opcode: 0x2, payload: Data([1, 2, 3]), maskKey: [1, 2, 3, 4])
+            check(small.count == 9 && small[1] == 0x83, "UDS WebSocket 客户端帧必须掩码")
+            let len126 = UDSWebSocketTask.makeServerFrameForSelfTest(opcode: 0x2, payload: Data(count: 126))
+            check(len126[1] == 126 && len126[2] == 0 && len126[3] == 126, "UDS WebSocket 126 长度编码")
+            let len127 = UDSWebSocketTask.makeServerFrameForSelfTest(opcode: 0x2, payload: Data(count: 65_536))
+            check(len127[1] == 127 && len127[7] == 1 && len127[8] == 0 && len127[9] == 0, "UDS WebSocket 127 长度编码")
+            let frag = UDSWebSocketTask.makeServerFrameForSelfTest(fin: false, opcode: 0x1, payload: Data("hel".utf8))
+                + UDSWebSocketTask.makeServerFrameForSelfTest(fin: true, opcode: 0x0, payload: Data("lo".utf8))
+            if case .string(let text) = try UDSWebSocketTask.decodeServerMessagesForSelfTest(frag).first {
+                check(text == "hello", "UDS WebSocket 分片文本应拼接")
+            } else {
+                check(false, "UDS WebSocket 分片文本应解码为 string")
+            }
+            let close = UDSWebSocketTask.makeServerFrameForSelfTest(opcode: 0x8, payload: Data([0x03, 0xF1]))
+            var closeCodeSeen = false
+            do {
+                _ = try UDSWebSocketTask.decodeServerMessagesForSelfTest(close)
+            } catch NodeClientError.connection(let message) {
+                closeCodeSeen = message == "close 1009"
+            }
+            check(closeCodeSeen, "UDS WebSocket close 码应解析")
+        } catch {
+            check(false, "UDS WebSocket 帧自检异常：\(error)")
+        }
+        check(Self.directSessionConfiguration(timeout: 1).connectionProxyDictionary?.isEmpty == true,
+              "NodeClient URLSession 应显式直连不走系统代理")
         return failures
     }
 }
@@ -825,7 +833,7 @@ private extension Duration {
 }
 
 protocol NodeWebSocketTask: Sendable {
-    var closeCode: URLSessionWebSocketTask.CloseCode { get }
+    var nodeCloseCode: Int { get }
     func resume()
     func send(_ message: URLSessionWebSocketTask.Message) async throws
     func receive() async throws -> URLSessionWebSocketTask.Message
@@ -833,172 +841,6 @@ protocol NodeWebSocketTask: Sendable {
     func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?)
 }
 
-extension URLSessionWebSocketTask: NodeWebSocketTask {}
-
-final class UDSWebSocketTask: @unchecked Sendable, NodeWebSocketTask {
-    private let fd: Int32
-    private let lock = NSLock()
-    private var isCancelled = false
-    private var pongHandlers: [(Error?) -> Void] = []
-    
-    var closeCode: URLSessionWebSocketTask.CloseCode { .invalid }
-    
-    init?(path: String) {
-        fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { return nil }
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        let _ = withUnsafeMutablePointer(to: &addr.sun_path) {
-            $0.withMemoryRebound(to: CChar.self, capacity: 104) {
-                strlcpy($0, path, 104)
-            }
-        }
-        let addrLen = socklen_t(MemoryLayout<sockaddr_un>.size)
-        let res = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.connect(fd, $0, addrLen)
-            }
-        }
-        if res < 0 {
-            Darwin.close(fd)
-            return nil
-        }
-    }
-    
-    deinit { if fd >= 0 { Darwin.close(fd) } }
-    
-    func upgrade() -> Bool {
-        let req = "GET /v2/session HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
-        req.withCString { _ = write(fd, $0, strlen($0)) }
-        var resp = Data()
-        var buf = [UInt8](repeating: 0, count: 1)
-        while read(fd, &buf, 1) == 1 {
-            resp.append(buf[0])
-            if resp.count >= 4 && resp.suffix(4) == Data([13, 10, 13, 10]) { break }
-        }
-        let str = String(data: resp, encoding: .utf8) ?? ""
-        return str.contains("101 Switching Protocols")
-    }
-    
-    func resume() {}
-    
-    func send(_ message: URLSessionWebSocketTask.Message) async throws {
-        try Task.checkCancellation()
-        switch message {
-        case .string(let text):
-            sendRaw(data: text.data(using: .utf8)!, opcode: 1)
-        case .data(let data):
-            sendRaw(data: data, opcode: 2)
-        @unknown default:
-            break
-        }
-    }
-    
-    private func sendRaw(data: Data, opcode: UInt8) {
-        var header = [UInt8]()
-        header.append(0x80 | opcode)
-        let len = data.count
-        if len < 126 {
-            header.append(UInt8(len) | 0x80)
-        } else if len <= 65535 {
-            header.append(126 | 0x80)
-            header.append(UInt8((len >> 8) & 0xFF))
-            header.append(UInt8(len & 0xFF))
-        } else {
-            return // Not needed
-        }
-        let maskKey: [UInt8] = [UInt8.random(in: 0...255), UInt8.random(in: 0...255), UInt8.random(in: 0...255), UInt8.random(in: 0...255)]
-        header.append(contentsOf: maskKey)
-        var msg = header
-        var masked = data
-        for i in 0..<masked.count {
-            masked[i] ^= maskKey[i % 4]
-        }
-        msg.append(contentsOf: masked)
-        msg.withUnsafeBytes { _ = write(fd, $0.baseAddress, $0.count) }
-    }
-    
-    func receive() async throws -> URLSessionWebSocketTask.Message {
-        return try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global().async {
-                while true {
-                    guard let (opcode, payload) = self.receiveBlocking() else {
-                        continuation.resume(throwing: URLError(.notConnectedToInternet))
-                        return
-                    }
-                    if opcode == 0xA { // Pong
-                        let handlers = self.lock.withLockValue {
-                            let h = self.pongHandlers
-                            self.pongHandlers.removeAll()
-                            return h
-                        }
-                        for h in handlers { h(nil) }
-                        continue
-                    }
-                    if opcode == 0x9 { // Ping
-                        self.sendRaw(data: payload, opcode: 0xA)
-                        continue
-                    }
-                    if opcode == 1 {
-                        continuation.resume(returning: .string(String(data: payload, encoding: .utf8) ?? ""))
-                        return
-                    }
-                    if opcode == 2 {
-                        continuation.resume(returning: .data(payload))
-                        return
-                    }
-                    if opcode == 8 {
-                        continuation.resume(throwing: URLError(.notConnectedToInternet))
-                        return
-                    }
-                }
-            }
-        }
-    }
-    
-    private func receiveBlocking() -> (UInt8, Data)? {
-        var hdr = [UInt8](repeating: 0, count: 2)
-        guard readFull(hdr.count, into: &hdr) else { return nil }
-        let opcode = hdr[0] & 0x0F
-        var len = Int(hdr[1] & 0x7F)
-        if len == 126 {
-            var ext = [UInt8](repeating: 0, count: 2)
-            guard readFull(2, into: &ext) else { return nil }
-            len = (Int(ext[0]) << 8) | Int(ext[1])
-        }
-        var payload = [UInt8](repeating: 0, count: len)
-        if len > 0 { guard readFull(len, into: &payload) else { return nil } }
-        return (opcode, Data(payload))
-    }
-    
-    private func readFull(_ count: Int, into buf: inout [UInt8]) -> Bool {
-        var offset = 0
-        while offset < count {
-            let n = read(fd, &buf[offset], count - offset)
-            if n <= 0 { return false }
-            offset += n
-        }
-        return true
-    }
-    
-    func sendPing(pongReceiveHandler: @escaping @Sendable (Error?) -> Void) {
-        lock.withLockVoid { pongHandlers.append(pongReceiveHandler) }
-        sendRaw(data: Data(), opcode: 0x9)
-    }
-    
-    func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
-        lock.withLockVoid {
-            if !isCancelled {
-                isCancelled = true
-                shutdown(fd, SHUT_RDWR)
-                Darwin.close(fd)
-            }
-        }
-        let handlers = lock.withLockValue {
-            let h = pongHandlers
-            pongHandlers.removeAll()
-            return h
-        }
-        for h in handlers { h(URLError(.cancelled)) }
-    }
+extension URLSessionWebSocketTask: NodeWebSocketTask {
+    var nodeCloseCode: Int { closeCode.rawValue }
 }
