@@ -298,6 +298,33 @@ final class NodeRouter: @unchecked Sendable {
                 ))
             }
         }
+                let udsPath = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Application Support/rs-node/gw.sock")
+        var st = stat()
+        if lstat(udsPath, &st) == 0, (st.st_mode & S_IFMT) == S_IFSOCK, st.st_uid == getuid() {
+            let t0 = ContinuousClock().now
+            do {
+                let info = try await NodeClient.prepareUDS(path: udsPath)
+                if info.hwHash == Capability.hwHash() {
+                    let rtt = max(1, t0.duration(to: ContinuousClock().now).secondsValue * 1000)
+                    var stateInfo = info
+                    if lock.withLockValue({ currentNode?.id == "local_uds" }) {
+                        stateInfo.busy = false
+                    }
+                    lock.withLockVoid {
+                        states["local_uds"] = NodeStateRecord(info: stateInfo, rtf: stateInfo.asr.rtf, offlineUntil: nil)
+                        if currentNode?.id == "local_uds" {
+                            currentToken = ""
+                            currentInfo = stateInfo
+                        }
+                    }
+                    candidates.append(RouteCandidate(
+                        id: "local_uds", expectedNodeID: info.nodeID, info: stateInfo, rttMS: rtt, isLocal: true, offlineUntil: nil
+                    ))
+                }
+            } catch {
+                routeLog("probe local_uds failed err=\(routeErrorCode(error))")
+            }
+        }
         persistState()
         await select(candidates: candidates)
     }
@@ -388,17 +415,20 @@ final class NodeRouter: @unchecked Sendable {
     }
 
     private func switchToPending(atSilence: Bool) async {
-        let reservation = lock.withLockValue { () -> (NodeConfig, Int)? in
+        let reservation = lock.withLockValue { () -> (NodeConfig?, Int)? in
             guard !switching, !stopped, let id = pendingMigrationID else { return nil }
             switching = true
             switchGeneration += 1
+            if id == "local_uds" {
+                return (NodeConfig(id: "local_uds", nodeID: "", url: "", tokenFile: ""), switchGeneration)
+            }
             guard let node = nodes.first(where: { $0.id == id }) else {
                 switching = false
                 return nil
             }
             return (node, switchGeneration)
         }
-        guard let (node, generation) = reservation else {
+        guard let (nodeOpt, generation) = reservation, let node = nodeOpt else {
             return
         }
         defer {
@@ -411,7 +441,17 @@ final class NodeRouter: @unchecked Sendable {
         var created: NodeClient?
         var published = false
         do {
-            let (token, info) = try await NodeClient.prepare(config: node)
+                        let token: String
+            let info: NodeInfo
+            if node.id == "local_uds" {
+                let udsPath = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Application Support/rs-node/gw.sock")
+                info = try await NodeClient.prepareUDS(path: udsPath)
+                token = ""
+            } else {
+                let p = try await NodeClient.prepare(config: node)
+                token = p.0
+                info = p.1
+            }
             guard lock.withLockValue({
                 Self.canPublishSwitch(
                     stopped: stopped,
@@ -749,6 +789,18 @@ final class NodeRouter: @unchecked Sendable {
         check(RoutingDecider.score(RouteCandidate(id: "battery", expectedNodeID: "n4", info: batteryInfo, rttMS: 10, isLocal: false, offlineUntil: nil), now: 0, localAccurate: true)!.score
               < RoutingDecider.score(base, now: 0, localAccurate: true)!.score,
               "电池供电应扣分")
+                let slowInfo = NodeInfo(
+            v: 2, nodeID: "n1", hwHash: "h",
+            asr: .init(model: "whisper-large-v3-turbo", backend: "mlx", rtf: 0.5),
+            translator: "apple", busy: false, onAC: true, inUse: false, worker: "warm"
+        )
+        let localBadP8 = RouteCandidate(id: "local_uds", expectedNodeID: "n1", info: goodInfo, rttMS: 1, isLocal: true, offlineUntil: nil)
+        let localGoodP8 = RouteCandidate(id: "local_uds", expectedNodeID: "n1", info: goodInfo, rttMS: 1, isLocal: true, offlineUntil: nil)
+        let localSlowP8 = RouteCandidate(id: "local_uds", expectedNodeID: "n1", info: slowInfo, rttMS: 1, isLocal: true, offlineUntil: nil)
+        
+        check(RoutingDecider.score(localBadP8, now: 0, localAccurate: false)!.score < RoutingDecider.score(base, now: 0, localAccurate: false)!.score, "本机节点 + P8 不满足时大幅扣分")
+        check(RoutingDecider.score(localGoodP8, now: 0, localAccurate: true)!.score > RoutingDecider.score(base, now: 0, localAccurate: true)!.score, "本机节点满足 P8 时由于无网络加分高于同等远端")
+        check(RoutingDecider.score(better, now: 0, localAccurate: true)!.score > RoutingDecider.score(localSlowP8, now: 0, localAccurate: true)!.score, "本机节点 + 远端更优时，选远端更优")
         var gate = MigrationGate()
         let c = RouteScore(id: "base", score: 50, reason: "")
         let b = RouteScore(id: "better", score: 70, reason: "")

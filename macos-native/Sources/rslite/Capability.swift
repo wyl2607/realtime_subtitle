@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 struct CapabilitySnapshot: Sendable {
     var chipName: String
@@ -9,6 +10,29 @@ struct CapabilitySnapshot: Sendable {
 
 enum Capability {
     static let accurateMemoryThresholdBytes: UInt64 = 24 * 1024 * 1024 * 1024
+
+    static func hwHash() -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/ioreg")
+        process.arguments = ["-rd1", "-c", "IOPlatformExpertDevice"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        do {
+            try process.run()
+            process.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            if let text = String(data: data, encoding: .utf8),
+               let regex = try? NSRegularExpression(pattern: "\"IOPlatformUUID\"\\s*=\\s*\"([^\"]+)\"") {
+                if let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+                   let range = Range(match.range(at: 1), in: text) {
+                    let uuid = String(text[range])
+                    let hash = SHA256.hash(data: uuid.data(using: .utf8)!)
+                    return String(hash.compactMap { String(format: "%02x", $0) }.joined().prefix(16))
+                }
+            }
+        } catch {}
+        return ""
+    }
 
     static func current() -> CapabilitySnapshot {
         CapabilitySnapshot(
