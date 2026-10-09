@@ -782,7 +782,7 @@ step_selfcheck() {
     elif ! grep -q '^TRANSLATION_STATUS=installed$' <<<"${out}"; then
         warn "系统翻译的 德语→中文 语言包还没装好，节点会退回 Ollama。请在目标机手动下载："
         warn "  系统设置 → 通用 → 语言与地区 → 翻译语言 → 下载「德语」和「中文（简体）」"
-        warn "  装好后重跑 install_node.sh（worker 只在安装时写入翻译器名称，kickstart 不会更新）"
+        warn "  装好后，下一次足够长的会话结束时 worker 会自动改报系统翻译；想立刻生效就重跑 install_node.sh"
         warn "  （退回 Ollama 时还需要目标机已 ollama pull 对应翻译模型）"
     fi
 }
