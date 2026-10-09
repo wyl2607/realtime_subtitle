@@ -467,6 +467,7 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
                 handle(text)
             } catch {
                 let closed = lock.withLockValue { isClosed }
+                finished.open()
                 notifyClosed(closed ? nil : error)
                 return
             }
@@ -801,6 +802,19 @@ extension NodeClient {
             check(len126[1] == 126 && len126[2] == 0 && len126[3] == 126, "UDS WebSocket 126 长度编码")
             let len127 = UDSWebSocketTask.makeServerFrameForSelfTest(opcode: 0x2, payload: Data(count: 65_536))
             check(len127[1] == 127 && len127[7] == 1 && len127[8] == 0 && len127[9] == 0, "UDS WebSocket 127 长度编码")
+            if case .data(let payload) = try UDSWebSocketTask.decodeServerMessagesForSelfTest(len127).first {
+                check(payload.count == 65_536, "UDS WebSocket 单帧 64KB 应允许")
+            } else {
+                check(false, "UDS WebSocket 单帧 64KB 应解码为 data")
+            }
+            let tooLarge = UDSWebSocketTask.makeServerFrameForSelfTest(opcode: 0x2, payload: Data(count: 65_537))
+            var rejectedLargeFrame = false
+            do {
+                _ = try UDSWebSocketTask.decodeServerMessagesForSelfTest(tooLarge)
+            } catch NodeClientError.protocolError {
+                rejectedLargeFrame = true
+            }
+            check(rejectedLargeFrame, "UDS WebSocket 单帧超过 64KB 应协议错误")
             let frag = UDSWebSocketTask.makeServerFrameForSelfTest(fin: false, opcode: 0x1, payload: Data("hel".utf8))
                 + UDSWebSocketTask.makeServerFrameForSelfTest(fin: true, opcode: 0x0, payload: Data("lo".utf8))
             if case .string(let text) = try UDSWebSocketTask.decodeServerMessagesForSelfTest(frag).first {
@@ -808,6 +822,15 @@ extension NodeClient {
             } else {
                 check(false, "UDS WebSocket 分片文本应解码为 string")
             }
+            let oversizedFragments = UDSWebSocketTask.makeServerFrameForSelfTest(fin: false, opcode: 0x2, payload: Data(count: 32_768))
+                + UDSWebSocketTask.makeServerFrameForSelfTest(fin: true, opcode: 0x0, payload: Data(count: 32_769))
+            var rejectedFragmentTotal = false
+            do {
+                _ = try UDSWebSocketTask.decodeServerMessagesForSelfTest(oversizedFragments)
+            } catch NodeClientError.protocolError {
+                rejectedFragmentTotal = true
+            }
+            check(rejectedFragmentTotal, "UDS WebSocket 分片重组超过 64KB 应协议错误")
             let close = UDSWebSocketTask.makeServerFrameForSelfTest(opcode: 0x8, payload: Data([0x03, 0xF1]))
             var closeCodeSeen = false
             do {
@@ -816,6 +839,22 @@ extension NodeClient {
                 closeCodeSeen = message == "close 1009"
             }
             check(closeCodeSeen, "UDS WebSocket close 码应解析")
+            let busyClose = UDSWebSocketTask.makeServerFrameForSelfTest(opcode: 0x8, payload: Data([0x03, 0xF5]))
+            let busyResult = UDSWebSocketTask.receiveOneForSelfTest(busyClose)
+            check(busyResult.closeCode == 1013, "UDS WebSocket 线上 receiveBlocking 应记录 1013 close 码")
+            if let error = busyResult.error, case NodeClientError.busy = error {
+                check(true, "UDS WebSocket 线上 receiveBlocking 1013 应分类为 busy")
+            } else {
+                check(false, "UDS WebSocket 线上 receiveBlocking 1013 应分类为 busy")
+            }
+            let close1009Result = UDSWebSocketTask.receiveOneForSelfTest(close)
+            if let error = close1009Result.error, case NodeClientError.connection(let message) = error {
+                check(message == "close 1009", "UDS WebSocket 线上 receiveBlocking 1009 应保留 close 1009")
+            } else {
+                check(false, "UDS WebSocket 线上 receiveBlocking 1009 应保留 close 1009")
+            }
+            check(UDSWebSocketTask.cancelPreservesRemoteCloseCodeForSelfTest(),
+                  "UDS WebSocket cancel 不应覆盖已记录的对端 close 码")
         } catch {
             check(false, "UDS WebSocket 帧自检异常：\(error)")
         }

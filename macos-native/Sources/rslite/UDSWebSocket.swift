@@ -7,6 +7,7 @@ final class UDSWebSocketTask: @unchecked Sendable, NodeWebSocketTask {
     private static let guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
     private static let defaultTimeoutMS: Int32 = 5_000
     private static let maxHTTPHeaderBytes = 64 * 1024
+    private static let maxWebSocketPayloadBytes = 64 * 1024
 
     private let stateLock = NSLock()
     private let writeLock = NSLock()
@@ -28,6 +29,10 @@ final class UDSWebSocketTask: @unchecked Sendable, NodeWebSocketTask {
             fd = -1
             throw error
         }
+    }
+
+    private init(connectedFDForSelfTest fd: Int32) {
+        self.fd = fd
     }
 
     deinit {
@@ -112,7 +117,9 @@ final class UDSWebSocketTask: @unchecked Sendable, NodeWebSocketTask {
         let closeFD = stateLock.withLockValue { () -> Int32 in
             guard !isCancelled else { return -1 }
             isCancelled = true
-            closeCodeValue = closeCode.rawValue
+            if closeCodeValue == 1005 {
+                closeCodeValue = closeCode.rawValue
+            }
             return fd
         }
         if closeFD >= 0 {
@@ -165,7 +172,7 @@ final class UDSWebSocketTask: @unchecked Sendable, NodeWebSocketTask {
         var continuationPayload = Data()
         var messages: [URLSessionWebSocketTask.Message] = []
         while offset < data.count {
-            let frame = try parseFrame(data, offset: &offset)
+            let frame = try readFrame(data, offset: &offset)
             switch frame.opcode {
             case 0x1, 0x2:
                 if frame.fin {
@@ -181,6 +188,9 @@ final class UDSWebSocketTask: @unchecked Sendable, NodeWebSocketTask {
             case 0x0:
                 guard let opcode = continuationOpcode else {
                     throw NodeClientError.protocolError("unexpected continuation")
+                }
+                guard continuationPayload.count + frame.payload.count <= maxWebSocketPayloadBytes else {
+                    throw NodeClientError.protocolError("message too large")
                 }
                 continuationPayload.append(frame.payload)
                 if frame.fin {
@@ -202,6 +212,34 @@ final class UDSWebSocketTask: @unchecked Sendable, NodeWebSocketTask {
             }
         }
         return messages
+    }
+
+    static func receiveOneForSelfTest(_ data: Data) -> (message: URLSessionWebSocketTask.Message?, error: Error?, closeCode: Int) {
+        var fds = [Int32](repeating: -1, count: 2)
+        guard socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0 else {
+            return (nil, POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO), 1005)
+        }
+        let task = UDSWebSocketTask(connectedFDForSelfTest: fds[0])
+        defer { Darwin.close(fds[1]) }
+        do {
+            try writeAll(fd: fds[1], data: data, timeoutMS: defaultTimeoutMS)
+            _ = Darwin.shutdown(fds[1], SHUT_WR)
+            return (try task.receiveBlocking(), nil, task.nodeCloseCode)
+        } catch {
+            return (nil, error, task.nodeCloseCode)
+        }
+    }
+
+    static func cancelPreservesRemoteCloseCodeForSelfTest() -> Bool {
+        var fds = [Int32](repeating: -1, count: 2)
+        guard socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0 else {
+            return false
+        }
+        let task = UDSWebSocketTask(connectedFDForSelfTest: fds[0])
+        defer { Darwin.close(fds[1]) }
+        task.stateLock.withLockVoid { task.closeCodeValue = 1013 }
+        task.cancel(with: .goingAway, reason: nil)
+        return task.nodeCloseCode == 1013
     }
 
     static func closeCodeForSelfTest(_ payload: Data) -> Int {
@@ -244,6 +282,9 @@ final class UDSWebSocketTask: @unchecked Sendable, NodeWebSocketTask {
             case 0x0:
                 guard let opcode = continuationOpcode else {
                     throw NodeClientError.protocolError("unexpected continuation")
+                }
+                guard continuationPayload.count + frame.payload.count <= Self.maxWebSocketPayloadBytes else {
+                    throw NodeClientError.protocolError("message too large")
                 }
                 continuationPayload.append(frame.payload)
                 if frame.fin {
@@ -288,23 +329,40 @@ final class UDSWebSocketTask: @unchecked Sendable, NodeWebSocketTask {
     }
 
     private func readFrame() throws -> WebSocketFrame {
-        var header = try Self.readExact(fd: fd, count: 2, timeoutMS: Self.defaultTimeoutMS)
+        try Self.readFrame { count in
+            try Self.readExact(fd: fd, count: count, timeoutMS: Self.defaultTimeoutMS)
+        }
+    }
+
+    private static func readFrame(_ data: Data, offset: inout Int) throws -> WebSocketFrame {
+        try readFrame { count in
+            guard offset + count <= data.count else {
+                throw NodeClientError.protocolError("short frame")
+            }
+            let bytes = Array(data[offset..<(offset + count)])
+            offset += count
+            return bytes
+        }
+    }
+
+    private static func readFrame(readExact: (Int) throws -> [UInt8]) throws -> WebSocketFrame {
+        var header = try readExact(2)
         let fin = (header[0] & 0x80) != 0
         let opcode = header[0] & 0x0F
         let masked = (header[1] & 0x80) != 0
         var length = UInt64(header[1] & 0x7F)
         if length == 126 {
-            header = try Self.readExact(fd: fd, count: 2, timeoutMS: Self.defaultTimeoutMS)
+            header = try readExact(2)
             length = (UInt64(header[0]) << 8) | UInt64(header[1])
         } else if length == 127 {
-            header = try Self.readExact(fd: fd, count: 8, timeoutMS: Self.defaultTimeoutMS)
+            header = try readExact(8)
             length = header.reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
         }
-        guard length <= UInt64(Int.max) else {
+        guard length <= UInt64(maxWebSocketPayloadBytes) else {
             throw NodeClientError.protocolError("frame too large")
         }
-        let mask = masked ? try Self.readExact(fd: fd, count: 4, timeoutMS: Self.defaultTimeoutMS) : []
-        var payload = try Self.readExact(fd: fd, count: Int(length), timeoutMS: Self.defaultTimeoutMS)
+        let mask = masked ? try readExact(4) : []
+        var payload = try readExact(Int(length))
         if masked {
             for i in payload.indices {
                 payload[i] ^= mask[i % 4]
@@ -344,45 +402,6 @@ final class UDSWebSocketTask: @unchecked Sendable, NodeWebSocketTask {
         return frame
     }
 
-    private static func parseFrame(_ data: Data, offset: inout Int) throws -> WebSocketFrame {
-        guard offset + 2 <= data.count else { throw NodeClientError.protocolError("short frame") }
-        let b0 = data[offset]
-        let b1 = data[offset + 1]
-        offset += 2
-        let fin = (b0 & 0x80) != 0
-        let opcode = b0 & 0x0F
-        let masked = (b1 & 0x80) != 0
-        var length = UInt64(b1 & 0x7F)
-        if length == 126 {
-            guard offset + 2 <= data.count else { throw NodeClientError.protocolError("short len126") }
-            length = (UInt64(data[offset]) << 8) | UInt64(data[offset + 1])
-            offset += 2
-        } else if length == 127 {
-            guard offset + 8 <= data.count else { throw NodeClientError.protocolError("short len127") }
-            length = data[offset..<(offset + 8)].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
-            offset += 8
-        }
-        let mask: [UInt8]
-        if masked {
-            guard offset + 4 <= data.count else { throw NodeClientError.protocolError("short mask") }
-            mask = Array(data[offset..<(offset + 4)])
-            offset += 4
-        } else {
-            mask = []
-        }
-        guard length <= UInt64(Int.max), offset + Int(length) <= data.count else {
-            throw NodeClientError.protocolError("short payload")
-        }
-        var payload = Array(data[offset..<(offset + Int(length))])
-        offset += Int(length)
-        if masked {
-            for i in payload.indices {
-                payload[i] ^= mask[i % 4]
-            }
-        }
-        return WebSocketFrame(fin: fin, opcode: opcode, payload: Data(payload))
-    }
-
     private static func closeCode(from payload: Data) -> Int {
         guard payload.count >= 2 else { return 1005 }
         return (Int(payload[payload.startIndex]) << 8) | Int(payload[payload.startIndex + 1])
@@ -418,13 +437,10 @@ final class UDSWebSocketTask: @unchecked Sendable, NodeWebSocketTask {
         do {
             var addr = try makeAddress(path)
             let addrLen = socklen_t(MemoryLayout<sockaddr_un>.size)
-            let connected = withUnsafePointer(to: &addr) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    connectRetry(fd: fd, addr: $0, len: addrLen)
+            try withUnsafePointer(to: &addr) {
+                try $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    try connectWithTimeout(fd: fd, addr: $0, len: addrLen, timeoutMS: timeoutMS)
                 }
-            }
-            guard connected == 0 else {
-                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
             // fstat 已连接的 socket 拿到的是 socket 自己的 inode，比不了路径；改核对端进程属主（与 gateway 的 LOCAL_PEERCRED 对称）
             var peerUID: uid_t = 0
@@ -457,11 +473,50 @@ final class UDSWebSocketTask: @unchecked Sendable, NodeWebSocketTask {
         return addr
     }
 
-    private static func connectRetry(fd: Int32, addr: UnsafePointer<sockaddr>, len: socklen_t) -> Int32 {
+    private static func connectWithTimeout(
+        fd: Int32,
+        addr: UnsafePointer<sockaddr>,
+        len: socklen_t,
+        timeoutMS: Int32
+    ) throws {
+        let flags = fcntl(fd, F_GETFL, 0)
+        guard flags >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        guard fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        defer { _ = fcntl(fd, F_SETFL, flags) }
         while true {
             let rc = Darwin.connect(fd, addr, len)
-            if rc == 0 || errno != EINTR {
-                return rc
+            if rc == 0 {
+                return
+            }
+            if errno == EINTR {
+                continue
+            }
+            guard errno == EINPROGRESS || errno == EALREADY else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+            while true {
+                let pollResult = poll(&pfd, 1, timeoutMS)
+                if pollResult == 0 {
+                    throw NodeClientError.timeout
+                }
+                if pollResult < 0 {
+                    if errno == EINTR { continue }
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+                var socketError: Int32 = 0
+                var socketErrorLen = socklen_t(MemoryLayout<Int32>.size)
+                guard getsockopt(fd, SOL_SOCKET, SO_ERROR, &socketError, &socketErrorLen) == 0 else {
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+                if socketError == 0 {
+                    return
+                }
+                throw POSIXError(POSIXErrorCode(rawValue: socketError) ?? .EIO)
             }
         }
     }
