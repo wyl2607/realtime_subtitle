@@ -184,7 +184,15 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
     }
 
     func connect() async throws {
-        guard let url = URL(string: config.url) else {
+        // P6 的 nodes.json 只记 ws://<名>:8791（install_node.sh 就这么写），会话路径由客户端补；
+        // 不补的话升级请求打到 "/"，gateway 只认 /v2/session，真节点上必然连不上。
+        guard var components = URLComponents(string: config.url) else {
+            throw NodeClientError.badURL(config.url)
+        }
+        if components.path.isEmpty || components.path == "/" {
+            components.path = "/v2/session"
+        }
+        guard let url = components.url else {
             throw NodeClientError.badURL(config.url)
         }
         var request = URLRequest(url: url)

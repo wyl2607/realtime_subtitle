@@ -166,12 +166,18 @@ final class NodeRouter: @unchecked Sendable {
         self.localAccurate = localAccurate
     }
 
+    // macOS 的 expandingTildeInPath 不认 $HOME，冒烟/测试没法靠改 HOME 隔离；
+    // 不给这个入口，测试只能去挪用户真实的 nodes.json（10-09 就被覆盖过一次）。
+    static var configDir: String {
+        ProcessInfo.processInfo.environment["RSLITE_CONFIG_DIR"] ?? "~/.config/rslite".expandingTilde
+    }
+
     static var defaultNodesURL: URL {
-        URL(fileURLWithPath: "~/.config/rslite/nodes.json".expandingTilde)
+        URL(fileURLWithPath: configDir).appendingPathComponent("nodes.json")
     }
 
     static var defaultStateURL: URL {
-        URL(fileURLWithPath: "~/.config/rslite/node-state.json".expandingTilde)
+        URL(fileURLWithPath: configDir).appendingPathComponent("node-state.json")
     }
 
     func start(fanout: AudioFanout) {
