@@ -116,6 +116,11 @@ final class UDSWebSocketTask: @unchecked Sendable, NodeWebSocketTask {
             return fd
         }
         if closeFD >= 0 {
+            do {
+                try sendFrame(opcode: 0x8, payload: Self.closePayload(closeCode: closeCode, reason: reason))
+            } catch {
+                // Best-effort RFC 6455 close handshake; transport shutdown still owns teardown.
+            }
             _ = Darwin.shutdown(closeFD, SHUT_RDWR)
         }
         let handlers = stateLock.withLockValue {
@@ -136,6 +141,14 @@ final class UDSWebSocketTask: @unchecked Sendable, NodeWebSocketTask {
             throw NodeClientError.protocolError("mask key length")
         }
         return makeFrame(fin: true, opcode: opcode, payload: payload, maskKey: maskKey)
+    }
+
+    static func makeClientCloseFrameForSelfTest(
+        closeCode: URLSessionWebSocketTask.CloseCode,
+        reason: Data?,
+        maskKey: [UInt8]
+    ) throws -> Data {
+        try makeClientFrame(opcode: 0x8, payload: closePayload(closeCode: closeCode, reason: reason), maskKey: maskKey)
     }
 
     static func makeServerFrameForSelfTest(opcode: UInt8, payload: Data) -> Data {
@@ -221,7 +234,7 @@ final class UDSWebSocketTask: @unchecked Sendable, NodeWebSocketTask {
         let frame = Self.makeFrame(fin: true, opcode: opcode, payload: payload, maskKey: maskKey)
         writeLock.lock()
         defer { writeLock.unlock() }
-            try Self.writeAll(fd: fd, data: frame, timeoutMS: Self.defaultTimeoutMS)
+        try Self.writeAll(fd: fd, data: frame, timeoutMS: Self.defaultTimeoutMS)
     }
 
     private func receiveBlocking() throws -> URLSessionWebSocketTask.Message {
@@ -373,6 +386,15 @@ final class UDSWebSocketTask: @unchecked Sendable, NodeWebSocketTask {
     private static func closeCode(from payload: Data) -> Int {
         guard payload.count >= 2 else { return 1005 }
         return (Int(payload[payload.startIndex]) << 8) | Int(payload[payload.startIndex + 1])
+    }
+
+    private static func closePayload(closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) -> Data {
+        let code = closeCode.rawValue
+        var payload = Data([UInt8((code >> 8) & 0xFF), UInt8(code & 0xFF)])
+        if let reason {
+            payload.append(reason)
+        }
+        return payload
     }
 
     private static func openValidatedSocket(path: String, timeoutMS: Int32) throws -> Int32 {

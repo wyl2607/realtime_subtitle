@@ -523,6 +523,7 @@ final class NodeRouter: @unchecked Sendable {
                 config: node,
                 token: token,
                 info: info,
+                udsPath: node.id == Self.localUDSID ? Self.localUDSPath : nil,
                 sourceLocaleID: sourceLocaleID,
                 targetLanguageID: targetLanguageID,
                 offsetSeconds: lock.withLockValue { latestClock },
@@ -877,7 +878,6 @@ final class NodeRouter: @unchecked Sendable {
         let localBadP8 = RouteCandidate(id: localUDSID, expectedNodeID: "n1", info: goodInfo, rttMS: 1, isLocal: true, offlineUntil: nil)
         let localGoodP8 = RouteCandidate(id: localUDSID, expectedNodeID: "n1", info: goodInfo, rttMS: 1, isLocal: true, offlineUntil: nil)
         let localSlowP8 = RouteCandidate(id: localUDSID, expectedNodeID: "n1", info: slowInfo, rttMS: 1, isLocal: true, offlineUntil: nil)
-        
         check(RoutingDecider.score(localBadP8, now: 0, localAccurate: false)!.score < RoutingDecider.score(base, now: 0, localAccurate: false)!.score, "本机节点 + P8 不满足时大幅扣分")
         check(RoutingDecider.choose(candidates: [base, localGoodP8], now: 0, localAccurate: true)?.id == localUDSID,
               "同 rtf 下本机节点应因无网络加分胜出")
@@ -891,6 +891,19 @@ final class NodeRouter: @unchecked Sendable {
             localAccurate: true
         )?.score == RoutingDecider.score(localGoodP8, now: 0, localAccurate: true)?.score,
               "在任本机节点重打分应使用实际 node_id 且 isLocal=true")
+        let localClient = NodeClient(
+            config: NodeConfig(id: localUDSID, nodeID: "n1", url: "", tokenFile: ""),
+            token: "",
+            info: goodInfo,
+            udsPath: Self.localUDSPath,
+            sourceLocaleID: "de-DE",
+            targetLanguageID: "zh-Hans",
+            offsetSeconds: 0,
+            sessionGeneration: 1,
+            callbacks: NodeCallbacks()
+        )
+        check(localClient.udsPathForSelfTest() == Self.localUDSPath,
+              "NodeClient 本机 UDS 会话路径必须来自 NodeRouter.localUDSPath")
         check(Self.sameNonEmptyHash("", "") == false, "hw_hash 空串不得匹配")
         check(Self.sameNonEmptyHash("h", "h"), "非空 hw_hash 相同才匹配")
         let manifestLocal = NodeConfig(id: "mini2", nodeID: "n1", url: "ws://mini2:8791", tokenFile: "/tmp/token")

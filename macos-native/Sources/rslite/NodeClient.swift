@@ -167,6 +167,7 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
     private let config: NodeConfig
     private let token: String
     private let info: NodeInfo
+    private let udsPath: String?
     private let sourceLocaleID: String
     private let targetLanguageID: String
     private var offsetSeconds: Double
@@ -191,6 +192,7 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         config: NodeConfig,
         token: String,
         info: NodeInfo,
+        udsPath: String? = nil,
         sourceLocaleID: String,
         targetLanguageID: String,
         offsetSeconds: Double,
@@ -200,6 +202,7 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         self.config = config
         self.token = token
         self.info = info
+        self.udsPath = udsPath
         self.sourceLocaleID = sourceLocaleID
         self.targetLanguageID = targetLanguageID
         self.offsetSeconds = offsetSeconds
@@ -244,7 +247,9 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         // P6 的 nodes.json 只记 ws://<名>:8791（install_node.sh 就这么写），会话路径由客户端补；
         // 不补的话升级请求打到 "/"，gateway 只认 /v2/session，真节点上必然连不上。
         if config.id == "local_uds" {
-            let udsPath = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Application Support/rs-node/gw.sock")
+            guard let udsPath else {
+                throw NodeClientError.badURL(config.id)
+            }
             let udsTask = try UDSWebSocketTask(path: udsPath)
             lock.withLockVoid { self.socket = udsTask }
             udsTask.resume()
@@ -785,6 +790,13 @@ extension NodeClient {
         do {
             let small = try UDSWebSocketTask.makeClientFrame(opcode: 0x2, payload: Data([1, 2, 3]), maskKey: [1, 2, 3, 4])
             check(small.count == 9 && small[1] == 0x83, "UDS WebSocket 客户端帧必须掩码")
+            let clientClose = try UDSWebSocketTask.makeClientCloseFrameForSelfTest(
+                closeCode: .normalClosure,
+                reason: Data("ok".utf8),
+                maskKey: [0, 0, 0, 0]
+            )
+            check(clientClose.elementsEqual([0x88, 0x84, 0, 0, 0, 0, 0x03, 0xE8, 0x6F, 0x6B]),
+                  "UDS WebSocket cancel close 帧应为 masked opcode=0x8 + 大端 close code + reason")
             let len126 = UDSWebSocketTask.makeServerFrameForSelfTest(opcode: 0x2, payload: Data(count: 126))
             check(len126[1] == 126 && len126[2] == 0 && len126[3] == 126, "UDS WebSocket 126 长度编码")
             let len127 = UDSWebSocketTask.makeServerFrameForSelfTest(opcode: 0x2, payload: Data(count: 65_536))
@@ -810,6 +822,10 @@ extension NodeClient {
         check(Self.directSessionConfiguration(timeout: 1).connectionProxyDictionary?.isEmpty == true,
               "NodeClient URLSession 应显式直连不走系统代理")
         return failures
+    }
+
+    func udsPathForSelfTest() -> String? {
+        udsPath
     }
 }
 
