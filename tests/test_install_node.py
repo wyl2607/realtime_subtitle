@@ -63,6 +63,7 @@ _STUBS = {
     # launchctl：只记录调用；STUB_BOOTSTRAP_FAIL=1 时 bootstrap 一律失败
     "launchctl": '#!/bin/bash\n'
                  'echo "$*" >> "$STUB_LOG_DIR/launchctl.log"\n'
+                 'if [ "${1:-}" = "print" ]; then printf "gui/501/x = {\\n\\tstate = running\\n\\tpid = 4242\\n}\\n"; exit 0; fi\n'
                  'if [ "${1:-}" = "bootstrap" ] && [ -n "${STUB_BOOTSTRAP_FAIL:-}" ]; then exit 5; fi\n'
                  'exit 0\n',
     "plutil": "#!/bin/bash\nexit 0\n",
@@ -71,8 +72,13 @@ _STUBS = {
             '[ -n "${STUB_INFO_FAIL:-}" ] && exit 22\n'
             'nid=$(cat "$HOME/Library/Application Support/rs-node/node_id")\n'
             'echo "{\\"v\\":2,\\"node_id\\":\\"$nid\\"}"\n',
-    # lsof：v1 的 cwd 由测试指定
-    "lsof": '#!/bin/bash\nprintf \'p1\\nfcwd\\nn%s\\n\' "${STUB_V1_CWD:-}"\n',
+    # lsof：v1 的 cwd 由测试指定；`-iTCP` 查询（第 10 步 TCP 监听校验）返回 STUB_TCP_LISTEN（-Fpn 格式，默认 gateway=4242 在 100.64.0.7:8791）
+    "lsof": '#!/bin/bash\n'
+            'case "$*" in *-iTCP*)\n'
+            '  if [ -n "${STUB_TCP_LISTEN+x}" ]; then printf "%s" "$STUB_TCP_LISTEN"; else printf "p4242\\nn100.64.0.7:8791\\n"; fi\n'
+            '  exit 0;;\n'
+            'esac\n'
+            'printf \'p1\\nfcwd\\nn%s\\n\' "${STUB_V1_CWD:-}"\n',
     # nohup：不真的起进程，只记下「在哪个目录、跑什么」
     # STUB_NOHUP_SPAWN=1 时再起一个 argv 与入参一致的假进程（模拟「v1 真的起来了」），pid 记下供清理
     "nohup": '#!/bin/bash\necho "PWD=$PWD ARGS=$*" >> "$STUB_LOG_DIR/nohup.log"\n'
@@ -139,6 +145,7 @@ def env(tmp_path):
         "STUB_REAL_MV": shutil.which("mv"),
         "STUB_REAL_SLEEP": shutil.which("sleep"),
         "RS_V1_WAIT": "2",
+        "RS_TCP_WAIT": "2",
     })
     yield e, home, logdir
     pids = logdir / "nohup.pids"
@@ -523,6 +530,114 @@ def test_success_twice_keeps_single_nodes_json_entry_and_updates_it(env):
     assert (home / "rs-node.prev").is_dir(), "第二次成功后上一版保留为 .prev"
     assert _mode(nodes) == 0o600
     assert not (home / "Library/Application Support/rs-node/v1.restart").exists()
+
+
+def test_first_install_does_not_claim_prev_and_second_does(env):
+    e, home, logdir = env
+    r = _run(["mini2"], e, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "rs-node.prev" not in r.stdout.split("节点安装完成")[1]
+    r = _run(["mini2"], e, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "上一版保留在 ~/rs-node.prev" in r.stdout
+
+
+def test_preflight_non_ip_first_line_fails_before_any_change(env):
+    """GUI 模式的报错行（rc=0、stdout 非 IP）不能被当成 Tailscale IP。"""
+    e, home, logdir = env
+    for bad in ("The Tailscale GUI failed to start: boom (Tailscale.CLIError error 3.)",
+                "8.8.8.8", "100.200.1.1", "100.63.255.255"):
+        e["TS_IP"] = bad
+        r = _run(["mini2"], e)
+        assert r.returncode != 0, bad
+        assert "Tailscale IPv4" in r.stdout + r.stderr, bad
+        assert not (home / "rs-node.new").exists()
+        assert not (home / ".config").exists()
+
+
+@pytest.mark.parametrize("ts_ip, should_pass", [
+    ("100.64.999.999", False),
+    ("100.64.1", False),
+    ("100.64.1.2.3", False),
+    ("100.064.1.2", False),
+    ("100.105.163.59", True),
+])
+def test_preflight_tailscale_ip_validation(env, ts_ip, should_pass):
+    """参数化测试预检的 Tailscale IPv4 严格格式校验（100.64.0.0/10）。
+
+    前导零（如 100.064.1.2）视为不合法：标准 IPv4 严禁多余前导零以杜绝八进制歧义。
+    """
+    e, home, logdir = env
+    e["TS_IP"] = ts_ip
+    e["STUB_TCP_LISTEN"] = f"p4242\nn{ts_ip}:8791\n"
+    r = _run(["mini2"], e, timeout=300)
+    if should_pass:
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert f"TCP 已在 {ts_ip}:8791 监听" in r.stdout
+    else:
+        assert r.returncode != 0, f"非法的 TS_IP={ts_ip} 应该导致预检失败"
+        assert "Tailscale IPv4" in r.stdout + r.stderr, ts_ip
+        assert not (home / "rs-node.new").exists()
+        assert not (home / ".config").exists()
+
+
+def test_tailscale_is_called_with_be_cli_env(env):
+    e, home, logdir = env
+    ts = Path(e["PATH"].split(":")[0]) / "tailscale"
+    ts.write_text('#!/bin/bash\necho "BE_CLI=${TAILSCALE_BE_CLI:-unset} $*" >> "$STUB_LOG_DIR/ts.log"\n'
+                  'if [ "${1:-}" = "ip" ]; then echo 100.64.0.7; exit 0; fi\n'
+                  'if [ "${1:-}" = "status" ]; then echo "{\\"Self\\":{\\"DNSName\\":\\"m.tail1.ts.net.\\"}}"; exit 0; fi\n'
+                  'exit 1\n')
+    r = _run(["mini2"], e, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
+    calls = [ln for ln in (logdir / "ts.log").read_text().splitlines() if " ip -4" in ln]
+    assert len(calls) >= 2, "预检与第 10 步都要取 IP"
+    assert all(ln.startswith("BE_CLI=1 ") for ln in calls)
+
+
+def test_tcp_not_listening_rolls_back(env, spawn, tmp_path):
+    """UDS 自检通过但 TCP 没起来 → 判失败并回滚（含按记录重拉 v1）。"""
+    e, home, logdir = env
+    spawn(V1_CMD)
+    e["STUB_V1_CWD"] = str(_make_v1_cwd(tmp_path))
+    e["STUB_NOHUP_SPAWN"] = "1"
+    e["STUB_TCP_LISTEN"] = ""  # lsof 看不到任何 8791 监听
+    r = _run(["mini2"], e, timeout=300)
+    out = r.stdout + r.stderr
+    assert r.returncode != 0, out
+    assert "ROLLBACK：gateway 2 秒内没有在 100.64.0.7:8791 上监听 TCP" in out
+    assert "v2 安装失败，已恢复 v1" in out
+    assert not (home / "Library/LaunchAgents/com.realtimesubtitle.node.plist").exists()
+    assert (home / "rs-node.failed").is_dir()
+    assert not (home / ".config" / "rslite" / "nodes.json").exists()
+
+
+def test_tcp_listening_on_wrong_pid_or_ip_rolls_back(env):
+    e, home, logdir = env
+    for listen in ("p999\nn100.64.0.7:8791\n",      # 不是 launchd 给的 gateway 进程
+                   "p4242\nn127.0.0.1:8791\n"):     # 不是 Tailscale IP
+        e["STUB_TCP_LISTEN"] = listen
+        r = _run(["mini2"], e, timeout=300)
+        assert r.returncode != 0, listen
+        assert "没有在 100.64.0.7:8791 上监听 TCP" in r.stdout + r.stderr
+
+
+@pytest.mark.parametrize("wild", ["*:8791", "0.0.0.0:8791", "[::]:8791"])
+def test_wildcard_listener_rolls_back_even_if_correct_ip_also_listens(env, wild):
+    e, home, logdir = env
+    e["STUB_TCP_LISTEN"] = f"p4242\nn100.64.0.7:8791\np4242\nn{wild}\n"
+    r = _run(["mini2"], e, timeout=300)
+    assert r.returncode != 0
+    assert "通配" in r.stdout + r.stderr
+    assert not (home / ".config" / "rslite" / "nodes.json").exists()
+
+
+def test_tcp_listening_on_correct_ip_succeeds(env):
+    e, home, logdir = env
+    e["STUB_TCP_LISTEN"] = "p4242\nn100.64.0.7:8791\n"
+    r = _run(["mini2"], e, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "TCP 已在 100.64.0.7:8791 监听" in r.stdout
 
 
 def test_no_prev_bootstrap_failure_removes_plist_keeps_failed_and_relaunches_v1(env, spawn, tmp_path):

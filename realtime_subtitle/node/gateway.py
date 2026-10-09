@@ -32,6 +32,7 @@ import signal
 import socket
 import stat
 import struct
+import subprocess
 import sys
 import time
 from collections import deque
@@ -111,6 +112,22 @@ class GatewayStartError(RuntimeError):
 # 地址与 token
 # --------------------------------------------------------------------------
 
+class BindReasonError(ValueError):
+    """TCP 绑定前置步骤失败；`code` 是固定枚举串，日志只记它（不记 tailscale 原始输出）。"""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+def bind_failure_code(exc: BaseException) -> str:
+    if isinstance(exc, BindReasonError):
+        return exc.code
+    if isinstance(exc, OSError):
+        return "bind_failed"
+    return "unexpected_error"
+
+
 def validate_host(host: str, *, allow_non_tailscale_for_tests: bool = False) -> str:
     """监听地址必须是 Tailscale 的 IPv4（100.64.0.0/10），且不带任何空白（S2）。
 
@@ -120,27 +137,43 @@ def validate_host(host: str, *, allow_non_tailscale_for_tests: bool = False) -> 
     """
     raw = host or ""
     if raw != raw.strip():
-        raise ValueError("监听地址不能带空白")
+        raise BindReasonError("tailscale_not_ip")
     try:
         addr = ipaddress.ip_address(raw)
     except ValueError:
-        raise ValueError("监听地址必须是明确的 IP（Tailscale IP），不能为空或主机名") from None
+        raise BindReasonError("tailscale_not_ip") from None
     if addr.is_unspecified or addr.is_multicast:
-        raise ValueError("监听地址不允许通配/组播地址；节点只绑定到 Tailscale IP")
+        raise BindReasonError("wildcard_or_multicast")
     if not allow_non_tailscale_for_tests and not (
         isinstance(addr, ipaddress.IPv4Address) and addr in TAILSCALE_CGNAT
     ):
-        raise ValueError("监听地址必须落在 Tailscale 地址段 100.64.0.0/10")
+        raise BindReasonError("not_tailscale_range")
     return str(addr)
 
 
-def resolve_tailscale_ipv4(run: node_info.Runner = node_info.run_command) -> str:
+def run_tailscale_cli(argv: list[str], timeout: float = 3.0) -> str:
+    """调 tailscale CLI。App Store 版二进制在环境里没有 SHLVL（launchd）时会按 GUI 启动，
+    往 stdout 打报错且退出码 0；`TAILSCALE_BE_CLI=1` 强制 CLI 模式。环境只追加、不清空。"""
+    env = {**os.environ, "TAILSCALE_BE_CLI": "1"}
+    return subprocess.run(
+        argv, capture_output=True, text=True, timeout=timeout, check=True, env=env
+    ).stdout
+
+
+def resolve_tailscale_ipv4(run: node_info.Runner = run_tailscale_cli) -> str:
     """每次启动现取 Tailscale IP（S2）：plist 里不写死，IP 变了重启即可跟上。"""
-    out = run(["tailscale", "ip", "-4"])
+    try:
+        out = run(["tailscale", "ip", "-4"])
+    except FileNotFoundError:
+        raise BindReasonError("tailscale_cli_missing") from None
+    except subprocess.TimeoutExpired:
+        raise BindReasonError("tailscale_cli_timeout") from None
+    except (subprocess.CalledProcessError, OSError):
+        raise BindReasonError("tailscale_cli_failed") from None
     lines = out.strip().splitlines()
     if not lines:
-        raise ValueError("tailscale_no_ipv4")
-    return lines[0].strip()
+        raise BindReasonError("tailscale_no_ipv4")
+    return lines[0].strip()  # 是不是合法 Tailscale IP 由 validate_host 判（GUI 报错行 → tailscale_not_ip）
 
 
 def check_token(token: str) -> str:
@@ -809,7 +842,7 @@ class Gateway:
                 )
             except Exception as e:  # noqa: BLE001 - 取不到地址/端口被占/Tailscale 还没起，都等一会再试
                 attempt += 1
-                log.warning("tcp_bind_failed attempt=%d err=%s retry_in_s=%.0f", attempt, type(e).__name__, delay)
+                log.warning("tcp_bind_failed attempt=%d reason=%s retry_in_s=%.0f", attempt, bind_failure_code(e), delay)
                 await self._sleep(delay)
                 delay = min(delay * 2, BIND_BACKOFF_MAX_S)
                 continue
