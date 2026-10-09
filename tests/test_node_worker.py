@@ -1189,6 +1189,32 @@ def test_session_translator_overrides_stale_old_value(tmp_path):
     assert translator == "apple"
 
 
+def test_hello_with_new_pair_finishes_old_session_before_swapping_translator(tmp_path):
+    # 钉住 _finish_session 必须在翻译器替换之前：第二条 hello 收口的是第一会话，
+    # 写进去的应是刚结束那个会话的翻译器（apple），而不是即将换上的 ollama:x
+    seen = []
+
+    def factory(src, dst):
+        if src == "de":
+            tr = FakeTr()
+            tr.name = "apple"
+            return tr
+        # 第二会话的翻译器是在第一会话收口之后才构造的：此刻文件应已写好
+        path = tmp_path / info_mod.ASR_STATE_FILENAME
+        seen.append(json.loads(path.read_text())["translator"] if path.exists() else None)
+        tr = FakeTr()
+        tr.name = "ollama:x"
+        return tr
+
+    pcm = np.concatenate([np.concatenate([tone(3.0), silence(1.0)]) for _ in range(3)])
+    sess = audio_frames(pcm) + ctl(type="drain")
+    stream = hello(src="de") + sess + hello(src="en") + sess
+    run_rtf(stream, tmp_path, factory=factory)
+    assert seen == ["apple"]
+    # 第二会话 EOF 收口后，写的是第二会话的翻译器
+    assert read_state(tmp_path)["translator"] == "ollama:x"
+
+
 def test_failed_translator_construction_keeps_old_valid_value(tmp_path):
     def boom(s, d):
         raise RuntimeError("no language pack")

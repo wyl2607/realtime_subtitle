@@ -368,6 +368,8 @@ class Worker:
         # translator 以本会话真实在用的为准，不再沿用旧值：安装自检时语言包未装会写
         # ollama:<model>，之后装好语言包 worker 实际走 apple，沿用旧值会让 /v1/info 永久报错。
         # 本会话翻译器不可用（None）时才退回旧的合法值，再没有就用默认（不写 "none"，不在 P1 枚举内）。
+        # 注意：沿用的旧值可能来自别的语言对（P1 是节点级单值，契约冻结，不按语言对区分），
+        # 路由可能因此高估该节点的翻译能力。
         tr = old.get("translator")
         if self._translator is not None:
             state["translator"] = self._translator.name
