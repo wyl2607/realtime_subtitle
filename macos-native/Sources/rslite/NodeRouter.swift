@@ -118,7 +118,7 @@ struct MigrationGate {
 
 @available(macOS 27.0, *)
 final class NodeRouter: @unchecked Sendable {
-    private static let localUDSID = "local_uds"
+    static let localUDSID = "local_uds"
     private static let probeInterval: Duration = .seconds(30)
     private static let offlineDuration = 60.0
     private static let silenceThreshold = 0.003
@@ -154,6 +154,7 @@ final class NodeRouter: @unchecked Sendable {
     private var switching = false
     private var switchGeneration = 0
     private var nodeSessionGenerations: [String: Int] = [:]
+    private var confirmedLocalHWHash: String?
 
     init(
         sourceLocaleID: String,
@@ -268,6 +269,7 @@ final class NodeRouter: @unchecked Sendable {
                     stateInfo.busy = false
                 }
                 let offlineUntil = lock.withLockValue { () -> Double? in
+                    confirmedLocalHWHash = localHWHash
                     let retained = Self.retainedOfflineUntilForProbeSuccess(
                         states[Self.localUDSID]?.offlineUntil,
                         now: nowSeconds()
@@ -494,8 +496,9 @@ final class NodeRouter: @unchecked Sendable {
             let info: NodeInfo
             if node.id == Self.localUDSID {
                 info = try await NodeClient.prepareUDS(path: Self.localUDSPath)
-                guard Self.sameNonEmptyHash(info.hwHash, Capability.hwHash()) else {
-                    throw NodeClientError.nodeIDMismatch(expected: "local_hw_hash", got: info.hwHash)
+                let probedHWHash = lock.withLockValue { confirmedLocalHWHash }
+                if Self.hasNonEmptyHashMismatch(info.hwHash, probedHWHash) {
+                    throw NodeClientError.nodeIDMismatch(expected: probedHWHash ?? "local_hw_hash", got: info.hwHash)
                 }
                 node.nodeID = info.nodeID
                 token = ""
@@ -737,8 +740,9 @@ final class NodeRouter: @unchecked Sendable {
         !lhs.isEmpty && !rhs.isEmpty && lhs == rhs
     }
 
-    static func isManifestLocalDuplicate(_ node: NodeConfig, localInfo: NodeInfo?) -> Bool {
-        isManifestLocalDuplicate(node, knownLocalNodeID: knownLocalNodeID(localInfo: localInfo, fallbackNodeID: nil))
+    static func hasNonEmptyHashMismatch(_ lhs: String, _ rhs: String?) -> Bool {
+        guard let rhs, !lhs.isEmpty, !rhs.isEmpty else { return false }
+        return lhs != rhs
     }
 
     static func isManifestLocalDuplicate(_ node: NodeConfig, knownLocalNodeID: String?) -> Bool {
@@ -767,7 +771,6 @@ final class NodeRouter: @unchecked Sendable {
         configs: [NodeConfig],
         localInfo: NodeInfo?,
         lastConfirmedLocalNodeID: String? = nil,
-        localHWHash: String,
         probe: (NodeConfig) -> NodeInfo?
     ) -> [String] {
         var ids: [String] = []
@@ -930,6 +933,9 @@ final class NodeRouter: @unchecked Sendable {
               "NodeClient 本机 UDS 会话路径必须来自 NodeRouter.localUDSPath")
         check(Self.sameNonEmptyHash("", "") == false, "hw_hash 空串不得匹配")
         check(Self.sameNonEmptyHash("h", "h"), "非空 hw_hash 相同才匹配")
+        check(!Self.hasNonEmptyHashMismatch("", "h"), "本机 hw_hash 复核：空串不得判 mismatch")
+        check(!Self.hasNonEmptyHashMismatch("h", nil), "本机 hw_hash 复核：缺少探测值不得判 mismatch")
+        check(Self.hasNonEmptyHashMismatch("h1", "h2"), "本机 hw_hash 复核：双方非空且不一致才 mismatch")
         check(Self.retainedOfflineUntilForProbeSuccess(100, now: 1) == 100,
               "回退后立即 /v1/info 探测成功不得清掉 offline_until")
         check(Self.retainedOfflineUntilForProbeSuccess(100, now: 101) == nil,
@@ -944,7 +950,6 @@ final class NodeRouter: @unchecked Sendable {
         check(Self.candidateIDsForSelfTest(
             configs: [manifestLocal, manifestRemote],
             localInfo: goodInfo,
-            localHWHash: "h",
             probe: { $0.id == "remote" ? remoteDifferentHW : goodInfo }
         ) == [localUDSID, "remote"], "nodes.json 中同 node_id 本机条目应与 UDS 去重")
         var probedManifestIDs: [String] = []
@@ -952,7 +957,6 @@ final class NodeRouter: @unchecked Sendable {
             configs: [manifestLocal, manifestRemote],
             localInfo: nil,
             lastConfirmedLocalNodeID: "n1",
-            localHWHash: "h",
             probe: {
                 probedManifestIDs.append($0.id)
                 return $0.id == "remote" ? remoteDifferentHW : goodInfo
@@ -962,7 +966,6 @@ final class NodeRouter: @unchecked Sendable {
         check(Self.candidateIDsForSelfTest(
             configs: [],
             localInfo: goodInfo,
-            localHWHash: "h",
             probe: { _ in nil }
         ) == [localUDSID], "空 nodes.json 仍应构造 UDS 探测候选")
         do {
