@@ -13,3 +13,5 @@ ruff==0.16.8       # 静态检查，规则集只有 E9+F（为什么这么窄见
                # ruff 每个小版本都可能给已有规则加新检查，本地和 CI 版本不同
                # = 本地全绿但 CI 红，而且看不出为什么。改版本要两处一起改。
                # 用法：venv\Scripts\python -m ruff check .
+jiwer>=4.0         # scripts/bench 的 WER 评分（hybrid_score/native_score）；tests/test_bench_hybrid_score.py
+               # 直接 import 它，不装的话整个 pytest 在收集阶段就中断（2026-10-11 Windows 实测）
