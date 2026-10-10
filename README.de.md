@@ -94,7 +94,7 @@ Beim ersten Start wird das Whisper-Modell geladen (~1,6 GB).
 
 ## macOS (Apple Silicon)
 
-Die macOS-Version unterstützt **nur Apple Silicon (M1 und neuer)**. Intel-Macs werden nicht unterstützt. Die Erkennung nutzt MLX auf der Apple-GPU, kein CUDA; die Übersetzung läuft weiterhin lokal über Ollama. Audio und Text bleiben auf dem Rechner.
+Die macOS-Version unterstützt **nur Apple Silicon (M1 und neuer)**. Intel-Macs werden nicht unterstützt. Die Erkennung nutzt MLX auf der Apple-GPU, kein CUDA; die Satzübersetzung bevorzugt die eingebaute macOS-Übersetzung (install.sh baut rstranslate; Sie müssen zuerst Deutsch und vereinfachtes Chinesisch in Systemeinstellungen → Allgemein → Sprache & Region → Übersetzungssprachen laden); wenn nicht verfügbar, fällt sie automatisch auf das lokale Ollama zurück. Wortnachschlagen und 🤖 KI-Analyse nutzen weiterhin Ollama. Audio und Text bleiben auf dem Rechner.
 
 Voraussetzungen:
 
@@ -140,6 +140,14 @@ bash scripts/macos/stop.sh
 Logs: `subtitle.log` / `subtitle.err.log`. Die Hotkeys sind wie unter Windows: `Ctrl+Alt+P/L/M/G/C`; auf dem Mac sind das die physischen Tasten **Control + Option**.
 
 Bekannte Unterschiede: Auf dem Mac aktualisieren Untertitel etwa alle 2–3 Sekunden (M2-Messung: Erkennung pro Lauf ca. 2,4 Sekunden), langsamer als mit NVIDIA-GPU. Eine einzelne Übersetzung dauert mit 4b ca. 4 Sekunden, mit 2b ca. 1,6 Sekunden. Erwarteter Speicherbedarf: Python-Umgebung ca. 1,5 GB + Whisper 1,6 GB (`--lean`: 0,5 GB) + Übersetzungsmodell 2,7–6,6 GB.
+
+### rslite (experimentell, native minimal Mac-Version)
+
+Kleines natives Programm mit Systemerkennung und Systemübersetzung; kein Python oder Ollama nötig; bei Akkubetrieb nur etwa 0,1 W über Leerlauf. Bauen: `cd macos-native && swift build -c release`; ausführen: `.build/release/rslite` (Oberflächenmodus). Details: `macos-native/README.md`.
+
+### Rechenknoten (experimentell)
+
+Erkennung an einen anderen Apple-Silicon-Mac oder NVIDIA-Windows-PC im Tailnet auslagern: dieses Gerät zeigt Untertitel zuerst, dann ersetzen genauere Ergebnisse des Knotens sie; bei Verbindungsabbruch laufen Untertitel weiter und fallen automatisch auf lokale Verarbeitung zurück, bei Rückkehr des Knotens wieder verbunden. Installation: Mac-Knoten `bash scripts/node/install_node.sh <ssh-Alias>`, Windows-Knoten `bash scripts/node/install_node_windows.sh <ssh-Alias>` (beide auf dem Mac ausführen). Datenschutzgrenze: Knoten lauscht nur auf Tailscale-Adressen (`100.64.0.0/10`), Token-Authentifizierung, nur Dateien, Audio bleibt im Speicher (keine Festplatte), Logs enthalten keinen Untertiteltext; Audio verlässt dieses Gerät nur zu Ihrem eigenen Knoten. Derzeit unterstützt nur rslite Knoten; das Windows-Desktop-Untertitelprogramm ist für v3.2.0 geplant. Protokolldetails: `docs/protocol-v2.md`.
 
 ## Update & Deinstallation
 

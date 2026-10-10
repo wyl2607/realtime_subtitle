@@ -92,7 +92,7 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
 
 ## macOS（Apple Silicon）
 
-macOS 版**仅支持 Apple Silicon（M1 及以后）**，Intel Mac 不支持。识别走 MLX（Apple GPU），不用 CUDA；翻译仍由本地 Ollama 完成。音频与文本都在本机处理，不上传。
+macOS 版**仅支持 Apple Silicon（M1 及以后）**，Intel Mac 不支持。识别走 MLX（Apple GPU），不用 CUDA；句子翻译优先使用 macOS 系统翻译（install.sh 会构建 rstranslate；需先在「系统设置 → 通用 → 语言与地区 → 翻译语言」下载德语和中文简体），不可用时自动回退本地 Ollama；点词查词与 🤖 AI 分析仍由 Ollama 完成。音频与文本都在本机处理，不上传。
 
 前置依赖：
 
@@ -138,6 +138,14 @@ bash scripts/macos/stop.sh
 日志仍写到 `subtitle.log` / `subtitle.err.log`。快捷键和 Windows 相同：`Ctrl+Alt+P/L/M/G/C`；在 Mac 上按物理 **Control + Option** 键。
 
 已知差异：Mac 上字幕刷新节奏约 2–3 秒一次（M2 实测识别单次约 2.4 秒），比 NVIDIA 显卡慢；翻译单句 4b 约 4 秒、2b 约 1.6 秒。预计硬盘占用：Python 环境约 1.5GB + Whisper 1.6GB（`--lean` 为 0.5GB）+ 翻译模型 2.7–6.6GB。
+
+### rslite（实验性，Mac 原生极简版）
+
+系统识别 + 系统翻译的原生小程序，不需要 Python 和 Ollama；不插电运行时整机功耗只比空闲多约 0.1W。构建：`cd macos-native && swift build -c release`；运行：`.build/release/rslite`（界面模式）。完整说明见 `macos-native/README.md`。
+
+### 算力节点（实验性）
+
+把识别交给 tailnet 里另一台 Apple Silicon Mac 或 NVIDIA Windows 电脑：本机先出字幕，节点精修结果随后替换上去；节点掉线时字幕不断、自动回到本机，节点恢复后自动接回。装法：Mac 节点 `bash scripts/node/install_node.sh <ssh 别名>`，Windows 节点 `bash scripts/node/install_node_windows.sh <ssh 别名>`（都在 Mac 上运行）。隐私边界：节点只监听 Tailscale 地址（`100.64.0.0/10`），token 鉴权、只经文件传递，音频只进内存不落盘，日志不写字幕正文；音频会离开本机、但只到你自己的节点机器。目前只有 rslite 能用节点，Windows 桌面字幕程序计划在 v3.2.0。协议细节见 `docs/protocol-v2.md`。
 
 ## 更新与卸载
 
