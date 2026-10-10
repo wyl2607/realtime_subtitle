@@ -41,8 +41,13 @@ from http import HTTPStatus
 from pathlib import Path
 from typing import Any
 
-from websockets.asyncio.server import serve, unix_serve
+from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
+
+try:
+    from websockets.asyncio.server import unix_serve
+except ImportError:  # pragma: no cover - depends on platform/websockets build
+    unix_serve = None
 
 from realtime_subtitle.node import info as node_info
 
@@ -214,6 +219,15 @@ def default_peer_uid(sock: socket.socket) -> int:
         _version, uid = struct.unpack_from("II", buf)
         return uid
     raise OSError("peer_uid_unsupported_platform")
+
+
+def _uds_supported() -> bool:
+    return sys.platform != "win32" and unix_serve is not None
+
+
+def _current_uid() -> int:
+    getuid = getattr(os, "getuid", None)
+    return int(getuid()) if getuid is not None else 0
 
 
 # --------------------------------------------------------------------------
@@ -748,11 +762,12 @@ class Gateway:
         self._port = port
         self._resolve_host = resolve_host or resolve_tailscale_ipv4
         self._peer_uid = peer_uid
-        self._uid = os.getuid() if uid is None else uid
+        self._uid = _current_uid() if uid is None else uid
         self._info = info or node_info.NodeInfo(state_dir=self._uds_dir)
         self._sleep = sleep
         # ☠️ 仅测试用：允许监听 127.0.0.1 等非 Tailscale 地址。生产入口（run_gateway）不传。
         self._allow_non_tailscale = allow_non_tailscale_for_tests
+        self._uds_enabled = _uds_supported()
         self.worker = WorkerManager(worker_argv if worker_argv is not None else WORKER_ARGV)
         self._session_active = False
         self._uds_server = None
@@ -769,7 +784,6 @@ class Gateway:
     # ---- 启停 ----
 
     async def start(self) -> None:
-        self._prepare_uds()  # 不满足就直接抛：起不来是看得见的，被悄悄放行才危险
         common = dict(
             max_size=MAX_MESSAGE_BYTES,
             ping_interval=PING_INTERVAL_S,
@@ -779,12 +793,14 @@ class Gateway:
             logger=_ws_log,
         )
         self._common = common
-        self._uds_server = await unix_serve(
-            self._handle_uds, str(self.uds_path),
-            process_request=self._process_request_uds, **common,
-        )
-        # 目录 0700 已经挡住了别人，socket 自身再收紧到 0600 是第二层
-        os.chmod(self.uds_path, 0o600)
+        if self._uds_enabled:
+            self._prepare_uds()  # 不满足就直接抛：起不来是看得见的，被悄悄放行才危险
+            self._uds_server = await unix_serve(
+                self._handle_uds, str(self.uds_path),
+                process_request=self._process_request_uds, **common,
+            )
+            # 目录 0700 已经挡住了别人，socket 自身再收紧到 0600 是第二层
+            os.chmod(self.uds_path, 0o600)
         self._tcp_task = asyncio.create_task(self._tcp_loop())
 
     async def stop(self) -> None:
@@ -797,8 +813,9 @@ class Gateway:
                 srv.close()
                 await srv.wait_closed()
         await self.worker.shutdown()
-        with contextlib.suppress(OSError):
-            os.unlink(self.uds_path)
+        if self._uds_enabled:
+            with contextlib.suppress(OSError):
+                os.unlink(self.uds_path)
 
     # ---- UDS 准备（S3）----
 
@@ -963,18 +980,46 @@ class Gateway:
 # 入口
 # --------------------------------------------------------------------------
 
+def _install_signal_handlers(loop: asyncio.AbstractEventLoop, stop_event: asyncio.Event) -> Callable[[], None]:
+    loop_handlers: list[int] = []
+    signal_handlers: list[tuple[int, Any]] = []
+
+    def request_stop(_signum, _frame) -> None:
+        loop.call_soon_threadsafe(stop_event.set)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+            loop_handlers.append(sig)
+        except (AttributeError, NotImplementedError):
+            try:
+                old = signal.signal(sig, request_stop)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            signal_handlers.append((sig, old))
+
+    def restore() -> None:
+        for sig in loop_handlers:
+            with contextlib.suppress(Exception):
+                loop.remove_signal_handler(sig)
+        for sig, old in signal_handlers:
+            with contextlib.suppress(Exception):
+                signal.signal(sig, old)
+
+    return restore
+
+
 async def run_gateway(token: str) -> None:
     gw = Gateway(token=token)
     await gw.start()
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(sig, stop_event.set)
+    restore_signals = _install_signal_handlers(loop, stop_event)
     log.info("gateway_started")
     try:
         await stop_event.wait()
     finally:
+        restore_signals()
         await gw.stop()
 
 
