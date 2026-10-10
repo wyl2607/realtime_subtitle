@@ -15,7 +15,6 @@ import argparse
 import io
 import json
 import re
-import resource
 import subprocess
 import sys
 import time
@@ -67,6 +66,8 @@ def norm(s):
 
 def peak_rss_mb():
     # macOS 上 ru_maxrss 单位是字节
+    import resource  # 仅 POSIX；放函数里，Windows 上 import norm 等工具函数不受影响
+
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
 
 
