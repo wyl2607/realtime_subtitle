@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -283,6 +284,47 @@ def test_tailscale_cli_runs_with_be_cli_env_added_not_replaced(monkeypatch):
     assert seen["argv"] == ["tailscale", "ip", "-4"]
     assert seen["env"]["TAILSCALE_BE_CLI"] == "1"
     assert seen["env"]["RS_TEST_MARK"] == "keep"
+
+
+def test_windows_gateway_starts_tcp_without_unix_socket(tmp_path, monkeypatch):
+    """Windows 节点没有本机客户端：只起 Tailscale TCP，不创建/校验 UDS。"""
+    uds_dir = tmp_path / "win-state"
+    tcp_calls: list[tuple[str, int]] = []
+
+    async def fail_unix_serve(*_args, **_kw):
+        raise AssertionError("Windows must not start unix_serve")
+
+    class Sock:
+        def getsockname(self):
+            return ("100.64.0.9", 8791)
+
+    class Server:
+        sockets = [Sock()]
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    async def fake_serve(_handler, host=None, port=None, **_kw):
+        tcp_calls.append((host, port))
+        return Server()
+
+    monkeypatch.setattr(gw_mod.sys, "platform", "win32")
+    monkeypatch.setattr(gw_mod, "unix_serve", fail_unix_serve)
+    monkeypatch.setattr(gw_mod, "serve", fake_serve)
+
+    async def scenario():
+        gw = Gateway(token=TOKEN, uds_dir=uds_dir, port=0, resolve_host=lambda: "100.64.0.9")
+        await gw.start()
+        await asyncio.wait_for(gw.tcp_ready.wait(), 5)
+        assert gw._uds_server is None
+        assert tcp_calls == [("100.64.0.9", 0)]
+        assert not uds_dir.exists()
+        await gw.stop()
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("exc,code", [
@@ -1198,6 +1240,162 @@ def test_info_in_use_threshold_and_fail_conservative(tmp_path):
     assert ni(fail=["ioreg"]).hw_hash() == ""
 
 
+class _FakeUser32:
+    def __init__(self, *, last_input_ms: int = 1000, ok: bool = True) -> None:
+        self.last_input_ms = last_input_ms
+        self.ok = ok
+
+    def GetLastInputInfo(self, data) -> int:  # noqa: N802 - Windows API spelling
+        data.dwTime = self.last_input_ms
+        return int(self.ok)
+
+
+class _FakeKernel32:
+    def __init__(self, *, tick_ms: int = 5000, ac_line: int = 1, power_ok: bool = True) -> None:
+        self.tick_ms = tick_ms
+        self.ac_line = ac_line
+        self.power_ok = power_ok
+        # 真 ctypes 的导出函数可设 restype；用普通函数对象模拟（绑定方法不能设属性）
+        self.GetTickCount = lambda: self.tick_ms  # noqa: N815 - Windows API spelling
+
+    def GetSystemPowerStatus(self, status) -> int:  # noqa: N802 - Windows API spelling
+        status.ACLineStatus = self.ac_line
+        return int(self.power_ok)
+
+
+class _FakeCtypes:
+    Structure = object
+    c_uint = int
+    c_byte = int
+    c_ulong = int
+
+    def __init__(
+        self,
+        *,
+        last_input_ms: int = 1000,
+        tick_ms: int = 5000,
+        ac_line: int = 1,
+        input_ok: bool = True,
+        power_ok: bool = True,
+    ) -> None:
+        self.windll = type("Windll", (), {
+            "user32": _FakeUser32(last_input_ms=last_input_ms, ok=input_ok),
+            "kernel32": _FakeKernel32(tick_ms=tick_ms, ac_line=ac_line, power_ok=power_ok),
+        })()
+
+    @staticmethod
+    def sizeof(_obj) -> int:
+        return 8
+
+    @staticmethod
+    def byref(obj):
+        return obj
+
+
+class _FakeKey:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+
+class _FakeWinreg:
+    HKEY_LOCAL_MACHINE = object()
+
+    @staticmethod
+    def OpenKey(_root, path):  # noqa: N802 - winreg API spelling
+        assert path == r"SOFTWARE\Microsoft\Cryptography"
+        return _FakeKey()
+
+    @staticmethod
+    def QueryValueEx(_key, name):  # noqa: N802 - winreg API spelling
+        assert name == "MachineGuid"
+        return FakeSystem.UUID, 1
+
+
+def test_load_token_skips_mode_bits_on_windows(tmp_path, monkeypatch):
+    # Windows 的 st_mode 恒为 0666，权限靠安装脚本的 icacls；这里不能因权限位拒绝
+    f = tmp_path / "token"
+    f.write_text(LONG_TOKEN, encoding="utf-8")
+    f.chmod(0o644)
+    monkeypatch.setattr(gw_mod.sys, "platform", "win32")
+    assert gw_mod.load_token(f) == LONG_TOKEN
+
+
+def test_windows_idle_seconds_handles_32bit_tick_wraparound():
+    # GetTickCount 回绕到 1_000，上次输入在回绕前 0xFFFFFFFF - 999 → 空闲约 2 秒
+    ctypes_mod = _FakeCtypes(last_input_ms=0xFFFFFFFF - 999, tick_ms=1_000, ac_line=1)
+    assert info_mod.windows_idle_seconds(ctypes_mod) == 2.0
+
+
+def test_windows_probe_helpers_accept_injected_ctypes_and_winreg():
+    ctypes_mod = _FakeCtypes(last_input_ms=2_000, tick_ms=7_000, ac_line=1)
+    assert info_mod.windows_idle_seconds(ctypes_mod) == 5.0
+    assert info_mod.windows_on_ac(ctypes_mod) is True
+    assert info_mod.windows_machine_guid(_FakeWinreg) == FakeSystem.UUID
+
+
+def test_info_windows_probes_success_and_cache(tmp_path, monkeypatch):
+    system = FakeSystem(fail=["ioreg", "pmset"])
+    ctypes_mod = _FakeCtypes(last_input_ms=2_000, tick_ms=7_000, ac_line=1)
+    guid_calls = 0
+    idle_probe = info_mod.windows_idle_seconds
+    power_probe = info_mod.windows_on_ac
+    guid_probe = info_mod.windows_machine_guid
+
+    def machine_guid():
+        nonlocal guid_calls
+        guid_calls += 1
+        return guid_probe(_FakeWinreg)
+
+    monkeypatch.setattr(info_mod.sys, "platform", "win32")
+    monkeypatch.setattr(info_mod, "windows_idle_seconds", lambda: idle_probe(ctypes_mod))
+    monkeypatch.setattr(info_mod, "windows_on_ac", lambda: power_probe(ctypes_mod))
+    monkeypatch.setattr(info_mod, "windows_machine_guid", machine_guid)
+
+    info = info_mod.NodeInfo(run=system, state_dir=tmp_path)
+    assert info.in_use() is True
+    assert info.on_ac() is True
+    assert info.hw_hash() == hashlib.sha256(FakeSystem.UUID.encode()).hexdigest()[:16]
+    assert info.hw_hash() == hashlib.sha256(FakeSystem.UUID.encode()).hexdigest()[:16]
+    assert system.calls == []
+    assert guid_calls == 1
+
+
+def test_info_windows_probe_failures_degrade_conservatively(tmp_path, monkeypatch, caplog):
+    idle_probe = info_mod.windows_idle_seconds
+    power_probe = info_mod.windows_on_ac
+    guid_probe = info_mod.windows_machine_guid
+
+    class BrokenWinreg:
+        HKEY_LOCAL_MACHINE = object()
+
+        @staticmethod
+        def OpenKey(_root, _path):  # noqa: N802 - winreg API spelling
+            raise PermissionError("registry denied")
+
+    monkeypatch.setattr(info_mod.sys, "platform", "win32")
+    monkeypatch.setattr(
+        info_mod,
+        "windows_idle_seconds",
+        lambda: idle_probe(_FakeCtypes(input_ok=False)),
+    )
+    monkeypatch.setattr(
+        info_mod,
+        "windows_on_ac",
+        lambda: power_probe(_FakeCtypes(power_ok=False)),
+    )
+    monkeypatch.setattr(info_mod, "windows_machine_guid", lambda: guid_probe(BrokenWinreg))
+
+    info = info_mod.NodeInfo(run=FakeSystem(fail=["ioreg", "pmset"]), state_dir=tmp_path)
+    assert info.in_use() is True
+    assert info.on_ac() is False
+    assert info.hw_hash() == ""
+    assert "err=OSError" in caplog.text
+    assert "err=PermissionError" in caplog.text
+
+
 def test_info_defaults_when_state_files_missing_or_bad(tmp_path):
     info = info_mod.NodeInfo(run=FakeSystem(), state_dir=tmp_path)
     assert info.node_id() == ""
@@ -1208,6 +1406,35 @@ def test_info_defaults_when_state_files_missing_or_bad(tmp_path):
     (tmp_path / "asr_state.json").write_text(json.dumps({"rtf": "fast", "translator": "evil; rm -rf"}))
     asr, tr = info.asr_and_translator()
     assert asr["rtf"] is None and tr == "apple"
+
+
+def test_info_state_dir_uses_localappdata_on_windows(tmp_path, monkeypatch):
+    original_platform = sys.platform
+    local = tmp_path / "LocalAppData"
+    monkeypatch.setenv("LOCALAPPDATA", str(local))
+    monkeypatch.setattr(sys, "platform", "win32")
+    try:
+        mod = importlib.reload(info_mod)
+        assert mod.STATE_DIR == local / "rs-node"
+        assert mod.DEFAULT_ASR["backend"] == "faster-whisper"
+        assert mod.NodeInfo(run=FakeSystem(), state_dir=tmp_path).asr_and_translator()[0]["backend"] == "faster-whisper"
+        assert mod.NodeInfo(run=FakeSystem())._state_dir == local / "rs-node"
+    finally:
+        monkeypatch.setattr(sys, "platform", original_platform)
+        importlib.reload(info_mod)
+
+
+def test_info_state_dir_keeps_existing_default_off_windows(monkeypatch):
+    original_platform = sys.platform
+    monkeypatch.setattr(sys, "platform", "darwin")
+    try:
+        mod = importlib.reload(info_mod)
+        assert mod.STATE_DIR == Path("~/Library/Application Support/rs-node").expanduser()
+        assert mod.DEFAULT_ASR["backend"] == "mlx"
+        assert mod.NodeInfo(run=FakeSystem()).asr_and_translator()[0]["backend"] == "mlx"
+    finally:
+        monkeypatch.setattr(sys, "platform", original_platform)
+        importlib.reload(info_mod)
 
 
 def test_info_hw_hash_is_cached(tmp_path):
@@ -1304,6 +1531,41 @@ def test_main_refuses_bad_tokens_without_leaking_them(tmp_path, monkeypatch):
     assert seen == [LONG_TOKEN]
     gw_mod.main(["--token-file", str(_token_file(tmp_path, LONG_TOKEN + "\n"))])
     assert seen == [LONG_TOKEN, LONG_TOKEN]
+
+
+def test_signal_handlers_fall_back_when_loop_signal_api_is_unavailable(monkeypatch):
+    calls: list[object] = []
+    installed: dict[int, object] = {}
+
+    class Loop:
+        def add_signal_handler(self, *_args):
+            raise NotImplementedError
+
+        def call_soon_threadsafe(self, func):
+            calls.append(func)
+
+    class Stop:
+        def set(self):
+            calls.append("stopped")
+
+    def fake_signal(sig, handler):
+        installed[sig] = handler
+        return signal.SIG_DFL
+
+    stop = Stop()
+    monkeypatch.setattr(gw_mod.signal, "signal", fake_signal)
+    restore = gw_mod._install_signal_handlers(Loop(), stop)
+    assert set(installed) == {signal.SIGINT, signal.SIGTERM}
+
+    installed[signal.SIGINT](signal.SIGINT, None)
+    assert len(calls) == 1
+    assert getattr(calls[0], "__self__", None) is stop
+    calls[0]()
+    assert calls == [calls[0], "stopped"]
+
+    restore()
+    assert installed[signal.SIGINT] == signal.SIG_DFL
+    assert installed[signal.SIGTERM] == signal.SIG_DFL
 
 
 # ------------------------------------------------------------------ S-F2：重复 Authorization 头

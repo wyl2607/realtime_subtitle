@@ -17,8 +17,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -29,14 +31,29 @@ log = logging.getLogger("realtime_subtitle.node.info")
 IN_USE_IDLE_THRESHOLD_S = 60.0
 HW_HASH_LEN = 16
 
+def _default_state_dir() -> Path:
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA")
+        if base:
+            return Path(base) / "rs-node"
+        return Path.home() / "AppData" / "Local" / "rs-node"
+    return Path("~/Library/Application Support/rs-node").expanduser()
+
+
 #: 安装脚本（TK-003）生成 / worker 维护的文件都放在这个目录，和 UDS 同目录（S3）
-STATE_DIR = Path("~/Library/Application Support/rs-node").expanduser()
+STATE_DIR = _default_state_dir()
 NODE_ID_FILENAME = "node_id"
 #: {"model","backend","rtf","translator"}：安装自检写入，之后每次会话结束滑动更新。
 #: gateway 只读，不负责测 rtf（测 rtf 要跑模型，会把 numpy/mlx 拉进常驻进程）。
 ASR_STATE_FILENAME = "asr_state.json"
 
-DEFAULT_ASR = {"model": "whisper-large-v3-turbo", "backend": "mlx", "rtf": None}
+def _default_asr_backend() -> str:
+    if sys.platform == "win32":
+        return "faster-whisper"
+    return "mlx"
+
+
+DEFAULT_ASR = {"model": "whisper-large-v3-turbo", "backend": _default_asr_backend(), "rtf": None}
 DEFAULT_TRANSLATOR = "apple"
 
 _TRANSLATOR_RE = re.compile(r"^(apple|ollama:[A-Za-z0-9_.:/-]{1,64})$")
@@ -78,6 +95,60 @@ def parse_on_ac(pmset_output: str) -> bool:
     raise ValueError("unknown_power_source")
 
 
+def windows_idle_seconds(ctypes_mod: Any | None = None) -> float:
+    if ctypes_mod is None:
+        import ctypes as ctypes_mod  # noqa: PLC0415 - Windows-only branch
+
+    class LASTINPUTINFO(ctypes_mod.Structure):
+        _fields_ = [
+            ("cbSize", ctypes_mod.c_uint),
+            ("dwTime", ctypes_mod.c_uint),
+        ]
+
+    last_input = LASTINPUTINFO()
+    last_input.cbSize = ctypes_mod.sizeof(LASTINPUTINFO)
+    if not ctypes_mod.windll.user32.GetLastInputInfo(ctypes_mod.byref(last_input)):
+        raise OSError("GetLastInputInfo")
+    # dwTime 是 32 位毫秒计数（约 49.7 天回绕），用同宽的 GetTickCount 相减再取模
+    get_tick = ctypes_mod.windll.kernel32.GetTickCount
+    get_tick.restype = ctypes_mod.c_uint
+    return ((int(get_tick()) - int(last_input.dwTime)) & 0xFFFFFFFF) / 1000.0
+
+
+def windows_on_ac(ctypes_mod: Any | None = None) -> bool:
+    if ctypes_mod is None:
+        import ctypes as ctypes_mod  # noqa: PLC0415 - Windows-only branch
+
+    class SYSTEM_POWER_STATUS(ctypes_mod.Structure):
+        _fields_ = [
+            ("ACLineStatus", ctypes_mod.c_byte),
+            ("BatteryFlag", ctypes_mod.c_byte),
+            ("BatteryLifePercent", ctypes_mod.c_byte),
+            ("SystemStatusFlag", ctypes_mod.c_byte),
+            ("BatteryLifeTime", ctypes_mod.c_ulong),
+            ("BatteryFullLifeTime", ctypes_mod.c_ulong),
+        ]
+
+    status = SYSTEM_POWER_STATUS()
+    if not ctypes_mod.windll.kernel32.GetSystemPowerStatus(ctypes_mod.byref(status)):
+        raise OSError("GetSystemPowerStatus")
+    return int(status.ACLineStatus) == 1
+
+
+def windows_machine_guid(winreg_mod: Any | None = None) -> str:
+    if winreg_mod is None:
+        import winreg as winreg_mod  # noqa: PLC0415 - Windows-only branch
+
+    with winreg_mod.OpenKey(
+        winreg_mod.HKEY_LOCAL_MACHINE,
+        r"SOFTWARE\Microsoft\Cryptography",
+    ) as key:
+        value, _kind = winreg_mod.QueryValueEx(key, "MachineGuid")
+    if not isinstance(value, str) or not value:
+        raise ValueError("no_machine_guid")
+    return value
+
+
 class NodeInfo:
     def __init__(self, *, run: Runner = run_command, state_dir: Path | None = None) -> None:
         self._run = run
@@ -88,7 +159,10 @@ class NodeInfo:
 
     def in_use(self) -> bool:
         try:
-            idle = parse_hid_idle_seconds(self._run(["ioreg", "-c", "IOHIDSystem", "-d", "4"]))
+            if sys.platform == "win32":
+                idle = windows_idle_seconds()
+            else:
+                idle = parse_hid_idle_seconds(self._run(["ioreg", "-c", "IOHIDSystem", "-d", "4"]))
         except Exception as e:  # noqa: BLE001 - 只记类名，输出里可能有设备信息
             log.warning("probe_failed what=hid_idle err=%s", type(e).__name__)
             return True
@@ -96,6 +170,8 @@ class NodeInfo:
 
     def on_ac(self) -> bool:
         try:
+            if sys.platform == "win32":
+                return windows_on_ac()
             return parse_on_ac(self._run(["pmset", "-g", "batt"]))
         except Exception as e:  # noqa: BLE001
             log.warning("probe_failed what=power err=%s", type(e).__name__)
@@ -105,7 +181,10 @@ class NodeInfo:
         # 平台 UUID 终身不变，探测一次就够
         if self._hw_hash is None:
             try:
-                uuid = parse_platform_uuid(self._run(["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"]))
+                if sys.platform == "win32":
+                    uuid = windows_machine_guid()
+                else:
+                    uuid = parse_platform_uuid(self._run(["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"]))
             except Exception as e:  # noqa: BLE001
                 log.warning("probe_failed what=hw_hash err=%s", type(e).__name__)
                 return ""
