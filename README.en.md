@@ -97,7 +97,7 @@ First launch downloads the Whisper model (~1.6 GB).
 
 ## macOS (Apple Silicon)
 
-The macOS build supports **Apple Silicon only (M1 and later)**. Intel Macs are not supported. Recognition uses MLX on the Apple GPU, not CUDA; translation still uses local Ollama. Audio and text stay on your machine.
+The macOS build supports **Apple Silicon only (M1 and later)**. Intel Macs are not supported. Recognition uses MLX on the Apple GPU, not CUDA; sentence translation prefers the built-in macOS Translation service (install.sh builds rstranslate; you must first download German and Simplified Chinese in System Settings → General → Language & Region → Translation Languages); it falls back to local Ollama when unavailable. Word lookup and 🤖 AI analysis still use Ollama. Audio and text stay on your machine.
 
 Prerequisites:
 
@@ -143,6 +143,14 @@ bash scripts/macos/stop.sh
 Logs are `subtitle.log` / `subtitle.err.log`. Hotkeys are the same as Windows: `Ctrl+Alt+P/L/M/G/C`; on Mac, press the physical **Control + Option** keys.
 
 Known differences: on Mac, subtitle refresh is about once every 2–3 seconds (M2 measured recognition at about 2.4 seconds per pass), slower than an NVIDIA GPU. Single-sentence translation is about 4 seconds with 4b and 1.6 seconds with 2b. Expected disk use: Python environment about 1.5 GB + Whisper 1.6 GB (`--lean`: 0.5 GB) + translation model 2.7–6.6 GB.
+
+### rslite (experimental, native minimal Mac version)
+
+A native small app using system recognition + system translation; no Python or Ollama needed; unplugged total power is only about 0.1 W above idle. Build: `cd macos-native && swift build -c release`; run: `.build/release/rslite` (UI mode). Full details in `macos-native/README.md`.
+
+### Compute node (experimental)
+
+Offload recognition to another Apple Silicon Mac or NVIDIA Windows machine inside the tailnet: this machine shows subtitles first, then the node's refined results replace them; if the node disconnects, subtitles continue and automatically fall back to local processing, reconnecting when the node returns. Install: Mac node `bash scripts/node/install_node.sh <ssh alias>`, Windows node `bash scripts/node/install_node_windows.sh <ssh alias>` (both run on Mac). Privacy boundary: node listens only on Tailscale (`100.64.0.0/10`), token-authenticated (the token is passed only via files), audio stays in memory (no disk), logs contain no transcript content; audio leaves this machine only to your own node. Currently only rslite supports nodes; the Windows desktop subtitle program is planned for v3.2.0. Protocol details: `docs/protocol-v2.md`.
 
 ## Update & uninstall
 
