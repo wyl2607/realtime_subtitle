@@ -6,6 +6,8 @@ import sys
 import wave
 from pathlib import Path
 
+import pytest
+
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "scripts" / "bench" / "hybrid_e2e.sh"
@@ -20,6 +22,9 @@ def _write_wav(path: Path) -> None:
 
 
 def test_hybrid_e2e_uses_overrides_splits_logs_and_writes_json(tmp_path):
+    if sys.platform == "win32":
+        # which("bash") 在 Windows 上会找到 System32\bash.exe（WSL 启动器），不能拿它判
+        pytest.skip("hybrid_e2e.sh 只在 macOS 上运行")
     wav = tmp_path / "concat5.wav"
     _write_wav(wav)
     refs = tmp_path / "refs.jsonl"
