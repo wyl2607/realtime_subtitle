@@ -1314,6 +1314,15 @@ class _FakeWinreg:
         return FakeSystem.UUID, 1
 
 
+def test_load_token_skips_mode_bits_on_windows(tmp_path, monkeypatch):
+    # Windows 的 st_mode 恒为 0666，权限靠安装脚本的 icacls；这里不能因权限位拒绝
+    f = tmp_path / "token"
+    f.write_text(LONG_TOKEN, encoding="utf-8")
+    f.chmod(0o644)
+    monkeypatch.setattr(gw_mod.sys, "platform", "win32")
+    assert gw_mod.load_token(f) == LONG_TOKEN
+
+
 def test_windows_idle_seconds_handles_32bit_tick_wraparound():
     # GetTickCount 回绕到 1_000，上次输入在回绕前 0xFFFFFFFF - 999 → 空闲约 2 秒
     ctypes_mod = _FakeCtypes(last_input_ms=0xFFFFFFFF - 999, tick_ms=1_000, ac_line=1)

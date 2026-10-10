@@ -192,11 +192,15 @@ def check_token(token: str) -> str:
 
 
 def load_token(path: str | Path) -> str:
-    """读 token 文件；权限含 group/other 位就拒绝（S5 要求 0600）。"""
+    """读 token 文件；权限含 group/other 位就拒绝（S5 要求 0600）。
+
+    Windows 的 st_mode 不反映 ACL（普通文件恒为 0666），由安装脚本用 icacls
+    收紧为仅当前用户可读写，这里不查权限位。
+    """
     with open(path, encoding="utf-8") as f:
         # 用 fstat 而不是先 stat 再 open：检查与读取是同一个文件
         mode = os.fstat(f.fileno()).st_mode
-        if mode & 0o077:
+        if sys.platform != "win32" and mode & 0o077:
             raise ValueError(f"token 文件权限过宽（{stat.S_IMODE(mode):04o}），需要 0600")
         return check_token(f.read())
 
