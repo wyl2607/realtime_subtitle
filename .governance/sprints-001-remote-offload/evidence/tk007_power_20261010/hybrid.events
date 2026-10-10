@@ -1,0 +1,218 @@
+{"ev":"status","t":0,"text":"模式：本机"}
+{"ev":"status","t":0.088999999999999996,"text":"识别资源状态：installed"}
+rslite.route probe local_uds failed err=connection_error
+rslite.route select node=mini2 score=33.2 quality=45.0 speed=-5.8 penalties=6.0 bonus=0.0 rtt_ms=138
+{"ev":"status","t":2.6760000000000002,"text":"模式：混合·mini2"}
+{"ev":"volatile","t":5.2169999999999996,"text":"Für"}
+{"ev":"volatile","t":6.274,"text":"Für die"}
+{"ev":"volatile","t":6.282,"text":"Für die besten"}
+{"ev":"volatile","t":6.2939999999999996,"text":"Für die besten A"}
+{"ev":"volatile","t":6.2969999999999997,"text":"Für die besten Auss"}
+{"ev":"volatile","t":7.234,"text":"Für die besten Aussichten"}
+{"ev":"volatile","t":7.242,"text":"Für die besten Aussichten auf"}
+{"ev":"volatile","t":7.2480000000000002,"text":"Für die besten Aussichten auf H"}
+{"ev":"volatile","t":7.25,"text":"Für die besten Aussichten auf Hong"}
+{"ev":"volatile","t":8.3109999999999999,"text":"Für die besten Aussichten auf Hongk"}
+{"ev":"volatile","t":8.3149999999999995,"text":"Für die besten Aussichten auf Hongkong"}
+{"ev":"volatile","t":8.3290000000000006,"text":"Für die besten Aussichten auf Hongkong sollten"}
+{"ev":"volatile","t":9.3819999999999997,"text":"Für die besten Aussichten auf Hongkong sollten Sie"}
+{"ev":"volatile","t":9.3859999999999992,"text":"Für die besten Aussichten auf Hongkong sollten Sie die"}
+{"ev":"volatile","t":9.3940000000000001,"text":"Für die besten Aussichten auf Hongkong sollten Sie die Insel"}
+{"ev":"volatile","t":10.343,"text":"Für die besten Aussichten auf Hongkong sollten Sie die Insel verlassen"}
+{"ev":"volatile","t":11.401,"text":"Für die besten Aussichten auf Hongkong sollten Sie die Insel verlassen und"}
+{"ev":"volatile","t":11.407,"text":"Für die besten Aussichten auf Hongkong sollten sie die Insel verlassen und zum"}
+{"ev":"volatile","t":11.417,"text":"Für die besten Aussichten auf Hongkong sollten sie die Insel verlassen und zum gegenüber"}
+{"ev":"volatile","t":12.367000000000001,"text":"Für die besten Aussichten auf Hongkong sollten sie die Insel verlassen und zum gegenüberliegen"}
+{"ev":"volatile","t":12.372,"text":"Für die besten Aussichten auf Hongkong sollten sie die Insel verlassen und zum gegenüberliegenden"}
+{"ev":"volatile","t":12.381,"text":"Für die besten Aussichten auf Hongkong sollten sie die Insel verlassen und zum gegenüberliegenden U"}
+{"ev":"volatile","t":13.422000000000001,"text":"Für die besten Aussichten auf Hongkong sollten sie die Insel verlassen und zum gegenüberliegenden Ufer"}
+{"ev":"volatile","t":14.477,"text":"Für die besten Aussichten auf Hongkong sollten sie die Insel verlassen und zum gegenüberliegenden Ufer von"}
+{"ev":"volatile","t":14.484,"text":"Für die besten Aussichten auf Hongkong sollten sie die Insel verlassen und zum gegenüberliegenden Ufer von K"}
+{"ev":"volatile","t":14.49,"text":"Für die besten Aussichten auf Hongkong sollten sie die Insel verlassen und zum gegenüberliegenden Ufer von Kl"}
+{"ev":"volatile","t":14.492000000000001,"text":"Für die besten Aussichten auf Hongkong sollten sie die Insel verlassen und zum gegenüberliegenden Ufer von Klun"}
+{"ev":"volatile","t":15.455,"text":"Für die besten Aussichten auf Hongkong sollten sie die Insel verlassen und zum gegenüberliegenden Ufer von Klun fahren"}
+{"ev":"final","id":1,"t":15.571999999999999,"t0":4.3200000000000003,"t1":13.74,"text":"Für die besten Aussichten auf Hongkong sollten Sie die Insel verlassen und zum gegenüberliegenden Ufer von Klun fahren"}
+{"ev":"volatile","t":15.571999999999999,"text":""}
+{"ev":"translation","id":1,"t":15.708,"text":"为了欣赏香港的最佳景色，你应该离开这个岛，开车去Klun的对岸"}
+{"ev":"status","t":17.77,"text":"模式：精修中"}
+{"ev":"replace","t":17.882000000000001,"t0":4.2919999999999998,"t1":13.612,"text":"P5 node=mini2 replaced=1 ids=[1]"}
+{"ev":"final","t":17.882000000000001,"t0":4.2919999999999998,"t1":13.612,"text":"[mini2] Für die besten Aussichten auf Hongkong sollten sie die Insel verlassen und zum gegenüberliegenden Ufer von Kowloon fahren."}
+{"ev":"translation","t":17.882000000000001,"text":"[mini2] 为了获得香港的最佳景色，他们应该离开该岛，开车去九龙的对岸。"}
+{"ev":"status","t":17.882000000000001,"text":"模式：混合·mini2"}
+{"ev":"volatile","t":23.629000000000001,"text":"Er"}
+{"ev":"volatile","t":23.632999999999999,"text":"Er g"}
+{"ev":"volatile","t":23.635000000000002,"text":"Er griff"}
+{"ev":"volatile","t":23.640000000000001,"text":"Er griff auch"}
+{"ev":"volatile","t":24.702999999999999,"text":"Er griff auch alles"}
+{"ev":"volatile","t":24.709,"text":"Er griff auch alles an"}
+{"ev":"volatile","t":24.718,"text":"Er griff auch alles an,"}
+{"ev":"volatile","t":25.655000000000001,"text":"Er griff auch alles an, was"}
+{"ev":"volatile","t":25.661000000000001,"text":"Er griff auch alles an, was ins"}
+{"ev":"volatile","t":25.667999999999999,"text":"Er griff auch alles an, was ins Wasser"}
+{"ev":"volatile","t":25.673999999999999,"text":"Er griff auch alles an, was ins Wasser kam"}
+{"ev":"volatile","t":26.738,"text":"Er griff auch alles an, was ins Wasser kam,"}
+{"ev":"volatile","t":26.744,"text":"Er griff auch alles an, was ins Wasser kam, selbst"}
+{"ev":"volatile","t":27.702999999999999,"text":"Er griff auch alles an, was ins Wasser kam, selbst ein"}
+{"ev":"volatile","t":27.709,"text":"Er griff auch alles an, was ins Wasser kam, selbst ein großer"}
+{"ev":"volatile","t":27.716000000000001,"text":"Er griff auch alles an, was ins Wasser kam, selbst ein großer D"}
+{"ev":"volatile","t":27.718,"text":"Er griff auch alles an, was ins Wasser kam, selbst ein großer Din"}
+{"ev":"volatile","t":27.721,"text":"Er griff auch alles an, was ins Wasser kam, selbst ein großer Dinos"}
+{"ev":"volatile","t":27.724,"text":"Er griff auch alles an, was ins Wasser kam, selbst ein großer Dinosaur"}
+{"ev":"volatile","t":28.768999999999998,"text":"Er griff auch alles an, was ins Wasser kam, selbst ein großer Dinosaurier wie"}
+{"ev":"volatile","t":28.773,"text":"Er griff auch alles an, was ins Wasser kam, selbst ein großer Dinosaurier wie der"}
+{"ev":"volatile","t":28.777999999999999,"text":"Er griff auch alles an, was ins Wasser kam, selbst ein großer Dinosaurier wie der T"}
+{"ev":"volatile","t":28.780000000000001,"text":"Er griff auch alles an, was ins Wasser kam, selbst ein großer Dinosaurier wie der T-"}
+{"ev":"volatile","t":28.783999999999999,"text":"Er griff auch alles an, was ins Wasser kam, selbst ein großer Dinosaurier wie der T-R"}
+{"ev":"volatile","t":28.786000000000001,"text":"Er griff auch alles an, was ins Wasser kam, selbst ein großer Dinosaurier wie der T-Re"}
+{"ev":"volatile","t":29.827999999999999,"text":"Er griff auch alles an, was ins Wasser kam, selbst ein großer Dinosaurier wie der T-Rex war"}
+{"ev":"volatile","t":29.832999999999998,"text":"Er griff auch alles an, was ins Wasser kam, selbst ein großer Dinosaurier wie der T-Rex war ihm"}
+{"ev":"volatile","t":29.838000000000001,"text":"Er griff auch alles an, was ins Wasser kam, selbst ein großer Dinosaurier wie der T-Rex war ihm nicht"}
+{"ev":"volatile","t":29.843,"text":"Er griff auch alles an, was ins Wasser kam, selbst ein großer Dinosaurier wie der T-Rex war ihm nicht gew"}
+{"ev":"volatile","t":29.847000000000001,"text":"Er griff auch alles an, was ins Wasser kam, selbst ein großer Dinosaurier wie der T-Rex war ihm nicht gewachsen"}
+rslite.route probe local_uds failed err=connection_error
+rslite.route select node=mini2 score=39.2 quality=45.0 speed=-5.8 penalties=0.0 bonus=0.0 rtt_ms=83
+{"ev":"volatile","t":30.782,"text":"Er griff auch alles an, was ins Wasser kam, selbst ein großer Dinosaurier wie der T-Rex war ihm nicht gewachsen."}
+{"ev":"status","t":32.091000000000001,"text":"模式：精修中"}
+{"ev":"status","t":32.125,"text":"模式：精修中"}
+{"ev":"replace","t":32.162999999999997,"t0":21.219999999999999,"t1":23.699999999999999,"text":"P5 node=mini2 replaced=0 ids=[]"}
+{"ev":"final","t":32.164000000000001,"t0":21.219999999999999,"t1":23.699999999999999,"text":"[mini2] Er griff auch alles an, was ins Wasser kam."}
+{"ev":"translation","t":32.164000000000001,"text":"[mini2] 他还攻击了所有进水的东西。"}
+{"ev":"status","t":32.164000000000001,"text":"模式：混合·mini2"}
+{"ev":"replace","t":32.194000000000003,"t0":24.079999999999998,"t1":27.66,"text":"P5 node=mini2 replaced=0 ids=[]"}
+{"ev":"final","t":32.195,"t0":24.079999999999998,"t1":27.66,"text":"[mini2] Selbst ein großer Dinosaurier wie der T-Rex war ihm nicht gewachsen."}
+{"ev":"translation","t":32.195,"text":"[mini2] 即使是像霸王龙这样的大恐龙也无法做到。"}
+{"ev":"status","t":32.195,"text":"模式：混合·mini2"}
+{"ev":"final","id":2,"t":32.826000000000001,"t0":21.120000000000001,"t1":28.559999999999999,"text":"Er griff auch alles an, was ins Wasser kam, selbst ein großer Dinosaurier wie der T-Rex war ihm nicht gewachsen."}
+{"ev":"volatile","t":32.826000000000001,"text":""}
+{"ev":"translation","id":2,"t":32.920999999999999,"text":"他还攻击了进入水中的一切，即使是像霸王龙这样的大恐龙也比不上他。"}
+{"ev":"volatile","t":35.872,"text":"Wenn"}
+{"ev":"volatile","t":35.880000000000003,"text":"Wenn Sie"}
+{"ev":"volatile","t":36.936999999999998,"text":"Wenn Sie den"}
+{"ev":"volatile","t":36.942999999999998,"text":"Wenn Sie den Film"}
+{"ev":"volatile","t":36.953000000000003,"text":"Wenn Sie den Film Das"}
+{"ev":"volatile","t":37.893999999999998,"text":"Wenn Sie den Film Das Ver"}
+{"ev":"volatile","t":37.898000000000003,"text":"Wenn Sie den Film Das Verm"}
+{"ev":"volatile","t":37.902000000000001,"text":"Wenn Sie den Film Das Vermächt"}
+{"ev":"volatile","t":37.906999999999996,"text":"Wenn Sie den Film Das Vermächtnis"}
+{"ev":"volatile","t":37.911999999999999,"text":"Wenn Sie den Film Das Vermächtnis der"}
+{"ev":"volatile","t":37.918999999999997,"text":"Wenn Sie den Film Das Vermächtnis der Tem"}
+{"ev":"volatile","t":38.970999999999997,"text":"Wenn Sie den Film Das Vermächtnis der Tempel"}
+{"ev":"volatile","t":38.973999999999997,"text":"Wenn Sie den Film Das Vermächtnis der Tempelr"}
+{"ev":"volatile","t":38.988,"text":"Wenn Sie den Film Das Vermächtnis der Tempelritter gesehen"}
+{"ev":"volatile","t":40.030000000000001,"text":"Wenn Sie den Film Das Vermächtnis der Tempelritter gesehen haben"}
+{"ev":"volatile","t":40.979999999999997,"text":"Wenn Sie den Film Das Vermächtnis der Tempelritter gesehen haben,"}
+{"ev":"volatile","t":40.988,"text":"Wenn Sie den Film Das Vermächtnis der Tempelritter gesehen haben, denken"}
+{"ev":"volatile","t":40.996000000000002,"text":"Wenn Sie den Film Das Vermächtnis der Tempelritter gesehen haben, denken Sie"}
+{"ev":"volatile","t":41.000999999999998,"text":"Wenn Sie den Film Das Vermächtnis der Tempelritter gesehen haben, denken Sie vielleicht"}
+{"ev":"volatile","t":42.039000000000001,"text":"Wenn Sie den Film Das Vermächtnis der Tempelritter gesehen haben, denken Sie vielleicht,"}
+{"ev":"volatile","t":42.042999999999999,"text":"Wenn Sie den Film Das Vermächtnis der Tempelritter gesehen haben, denken Sie vielleicht, dass"}
+{"ev":"volatile","t":42.049999999999997,"text":"Wenn Sie den Film Das Vermächtnis der Tempelritter gesehen haben, denken Sie vielleicht, dass auf"}
+{"ev":"volatile","t":42.055,"text":"Wenn Sie den Film Das Vermächtnis der Tempelritter gesehen haben, denken Sie vielleicht, dass auf der"}
+{"ev":"volatile","t":42.058999999999997,"text":"Wenn Sie den Film Das Vermächtnis der Tempelritter gesehen haben, denken Sie vielleicht, dass auf der Rück"}
+{"ev":"volatile","t":42.991,"text":"Wenn Sie den Film Das Vermächtnis der Tempelritter gesehen haben, denken Sie vielleicht, dass auf der Rückseite"}
+{"ev":"volatile","t":42.994999999999997,"text":"Wenn Sie den Film Das Vermächtnis der Tempelritter gesehen haben, denken Sie vielleicht, dass auf der Rückseite der"}
+{"ev":"volatile","t":43.002000000000002,"text":"Wenn Sie den Film Das Vermächtnis der Tempelritter gesehen haben, denken Sie vielleicht, dass auf der Rückseite der Un"}
+{"ev":"volatile","t":43.006,"text":"Wenn Sie den Film Das Vermächtnis der Tempelritter gesehen haben, denken Sie vielleicht, dass auf der Rückseite der Unab"}
+{"ev":"volatile","t":43.009999999999998,"text":"Wenn Sie den Film Das Vermächtnis der Tempelritter gesehen haben, denken Sie vielleicht, dass auf der Rückseite der Unabhäng"}
+{"ev":"volatile","t":44.055,"text":"Wenn Sie den Film Das Vermächtnis der Tempelritter gesehen haben, denken Sie vielleicht, dass auf der Rückseite der Unabhängigkeitserklär"}
+{"ev":"volatile","t":44.058999999999997,"text":"Wenn Sie den Film Das Vermächtnis der Tempelritter gesehen haben, denken Sie vielleicht, dass auf der Rückseite der Unabhängigkeitserklärung"}
+{"ev":"volatile","t":45.104999999999997,"text":"Wenn Sie den Film Das Vermächtnis der Tempelritter gesehen haben, denken Sie vielleicht, dass auf der Rückseite der Unabhängigkeitserklärung eine"}
+{"ev":"volatile","t":45.110999999999997,"text":"Wenn Sie den Film Das Vermächtnis der Tempelritter gesehen haben, denken Sie vielleicht, dass auf der Rückseite der Unabhängigkeitserklärung eine Schatz"}
+{"ev":"volatile","t":45.119,"text":"Wenn Sie den Film Das Vermächtnis der Tempelritter gesehen haben, denken Sie vielleicht, dass auf der Rückseite der Unabhängigkeitserklärung eine Schatzkarte"}
+{"ev":"volatile","t":46.057000000000002,"text":"Wenn Sie den Film Das Vermächtnis der Tempelritter gesehen haben, denken Sie vielleicht, dass auf der Rückseite der Unabhängigkeitserklärung eine Schatzkarte ge"}
+{"ev":"volatile","t":46.061999999999998,"text":"Wenn Sie den Film Das Vermächtnis der Tempelritter gesehen haben, denken Sie vielleicht, dass auf der Rückseite der Unabhängigkeitserklärung eine Schatzkarte gezeichnet"}
+{"ev":"volatile","t":46.073,"text":"Wenn Sie den Film Das Vermächtnis der Tempelritter gesehen haben, denken Sie vielleicht, dass auf der Rückseite der Unabhängigkeitserklärung eine Schatzkarte gezeichnet wurde"}
+{"ev":"final","id":3,"t":47.170999999999999,"t0":32.520000000000003,"t1":42.960000000000001,"text":"Wenn Sie den Film Das Vermächtnis der Tempelritter gesehen haben, denken Sie vielleicht, dass auf der Rückseite der Unabhängigkeitserklärung eine Schatzkarte gezeichnet wurde"}
+{"ev":"volatile","t":47.170999999999999,"text":""}
+{"ev":"translation","id":3,"t":47.274000000000001,"text":"如果你看过电影《圣殿骑士遗产》，你可能会认为《独立宣言》的背面画了一张藏宝图"}
+{"ev":"status","t":48.439,"text":"模式：精修中"}
+{"ev":"replace","t":48.529000000000003,"t0":32.387999999999998,"t1":42.847999999999999,"text":"P5 node=mini2 replaced=1 ids=[3]"}
+{"ev":"final","t":48.530000000000001,"t0":32.387999999999998,"t1":42.847999999999999,"text":"[mini2] Wenn Sie den Film Das Vermächtnis der Tempelritter gesehen haben, denken Sie vielleicht, dass auf der Rückseite der Unabhängigkeitserklärung eine Schatzkarte gezeichnet wurde."}
+{"ev":"translation","t":48.530000000000001,"text":"[mini2] 如果你看过电影《圣殿骑士的遗产》，你可能会认为《独立宣言》的背面画了一张藏宝图。"}
+{"ev":"status","t":48.530000000000001,"text":"模式：混合·mini2"}
+{"ev":"volatile","t":49.159999999999997,"text":""}
+{"ev":"volatile","t":49.164999999999999,"text":"Es"}
+{"ev":"volatile","t":49.168999999999997,"text":"Es leben"}
+{"ev":"volatile","t":49.174999999999997,"text":"Es leben noch"}
+{"ev":"volatile","t":50.237000000000002,"text":"Es leben noch viele"}
+{"ev":"volatile","t":50.243000000000002,"text":"Es leben noch viele Männer"}
+{"ev":"volatile","t":50.247,"text":"Es leben noch viele Männer und"}
+{"ev":"volatile","t":50.253999999999998,"text":"Es leben noch viele Männer und Frauen"}
+{"ev":"volatile","t":50.259,"text":"Es leben noch viele Männer und Frauen,"}
+{"ev":"volatile","t":50.261000000000003,"text":"Es leben noch viele Männer und Frauen, die"}
+{"ev":"volatile","t":51.206000000000003,"text":"Es leben noch viele Männer und Frauen, die ihre"}
+{"ev":"volatile","t":51.210999999999999,"text":"Es leben noch viele Männer und Frauen, die ihre Zeit"}
+{"ev":"volatile","t":51.215000000000003,"text":"Es leben noch viele Männer und Frauen, die ihre Zeit,"}
+{"ev":"volatile","t":51.220999999999997,"text":"Es leben noch viele Männer und Frauen, die ihre Zeit, über"}
+{"ev":"volatile","t":51.223999999999997,"text":"Es leben noch viele Männer und Frauen, die ihre Zeit, überle"}
+{"ev":"volatile","t":52.295999999999999,"text":"Es leben noch viele Männer und Frauen, die ihre Zeit, überlebt haben"}
+{"ev":"volatile","t":52.301000000000002,"text":"Es leben noch viele Männer und Frauen, die ihre Zeit, überlebt haben und"}
+{"ev":"volatile","t":52.307000000000002,"text":"Es leben noch viele Männer und Frauen, die ihre Zeit, überlebt haben und viele"}
+{"ev":"volatile","t":53.265999999999998,"text":"Es leben noch viele Männer und Frauen, die ihre Zeit, überlebt haben und viele weitere"}
+{"ev":"volatile","t":53.270000000000003,"text":"Es leben noch viele Männer und Frauen, die ihre Zeit, überlebt haben und viele weitere mit"}
+{"ev":"volatile","t":54.304000000000002,"text":"Es leben noch viele Männer und Frauen, die ihre Zeit, überlebt haben und viele weitere, die"}
+{"ev":"volatile","t":54.307000000000002,"text":"Es leben noch viele Männer und Frauen, die ihre Zeit, überlebt haben und viele weitere, die dort"}
+{"ev":"volatile","t":54.313000000000002,"text":"Es leben noch viele Männer und Frauen, die ihre Zeit, überlebt haben und viele weitere, die erm"}
+{"ev":"volatile","t":54.317,"text":"Es leben noch viele Männer und Frauen, die ihre Zeit, überlebt haben und viele weitere, die ermor"}
+{"ev":"volatile","t":55.371000000000002,"text":"Es leben noch viele Männer und Frauen, die ihre Zeit, überlebt haben und viele weitere, die ermor oder"}
+{"ev":"volatile","t":55.378,"text":"Es leben noch viele Männer und Frauen, die ihre Zeit, überlebt haben und viele weitere, die ermordet oder sich"}
+{"ev":"volatile","t":57.414999999999999,"text":"Es leben noch viele Männer und Frauen, die ihre Zeit, überlebt haben und viele weitere, die ermordet oder sich arbeiteten"}
+{"ev":"volatile","t":57.417999999999999,"text":"Es leben noch viele Männer und Frauen, die ihre Zeit, überlebt haben und viele weitere, die ermordet oder sich arbeiteten,"}
+{"ev":"volatile","t":57.421999999999997,"text":"Es leben noch viele Männer und Frauen, die ihre Zeit, überlebt haben und viele weitere, die ermordet oder sich arbeiteten, J"}
+{"ev":"volatile","t":57.426000000000002,"text":"Es leben noch viele Männer und Frauen, die ihre Zeit, überlebt haben und viele weitere, die ermordet oder sich arbeiteten, Juden"}
+{"ev":"volatile","t":57.432000000000002,"text":"Es leben noch viele Männer und Frauen, die ihre Zeit, überlebt haben und viele weitere, die ermordet oder sich arbeiteten, Juden und"}
+{"ev":"volatile","t":57.436,"text":"Es leben noch viele Männer und Frauen, die ihre Zeit, überlebt haben und viele weitere, die ermordet oder sich arbeiteten, Juden und Nicht"}
+{"ev":"volatile","t":58.356000000000002,"text":"Es leben noch viele Männer und Frauen, die ihre Zeit, überlebt haben und viele weitere, die ermordet oder sich arbeiteten, Juden und Nichtj"}
+{"ev":"volatile","t":58.360999999999997,"text":"Es leben noch viele Männer und Frauen, die ihre Zeit, überlebt haben und viele weitere, die ermordet oder sich arbeiteten, Juden und Nicht Juden"}
+{"ev":"volatile","t":58.369,"text":"Es leben noch viele Männer und Frauen, die ihre Zeit, überlebt haben und viele weitere, die ermordet oder sich arbeiteten, Juden und Nicht Juden gleich"}
+{"ev":"volatile","t":58.374000000000002,"text":"Es leben noch viele Männer und Frauen, die ihre Zeit, überlebt haben und viele weitere, die ermordet oder sich arbeiteten, Juden und Nicht Juden gleicher"}
+{"ev":"volatile","t":59.411000000000001,"text":"Es leben noch viele Männer und Frauen, die ihre Zeit, überlebt haben und viele weitere, die ermordet oder sich arbeiteten, Juden und Nichtjuden Juden gleicher"}
+rslite.route probe local_uds failed err=connection_error
+{"ev":"final","id":4,"t":60.5,"t0":45.18,"t1":55.140000000000001,"text":"Es leben noch viele Männer und Frauen, die ihre Zeit, überlebt haben und viele weitere, die ermordet oder sich arbeiteten, Juden und Nichtjuden gleichermaßen."}
+{"ev":"volatile","t":60.5,"text":""}
+rslite.route select node=mini2 score=39.2 quality=45.0 speed=-5.8 penalties=0.0 bonus=0.0 rtt_ms=87
+{"ev":"translation","id":4,"t":60.613999999999997,"text":"仍然有许多男人和女人活了下来，还有更多的人被谋杀或工作，犹太人和非犹太人。"}
+{"ev":"status","t":60.817,"text":"模式：精修中"}
+{"ev":"replace","t":60.905999999999999,"t0":45.188000000000002,"t1":54.548000000000002,"text":"P5 node=mini2 replaced=1 ids=[4]"}
+{"ev":"final","t":60.905999999999999,"t0":45.188000000000002,"t1":54.548000000000002,"text":"[mini2] Es leben noch viele Männer und Frauen, die ihre Zeit hier überlebt haben und viele weitere mit Angehörigen, die dort ermordet wurden oder sich zu Tode arbeiteten, Juden und Nichtjuden gleichermaßen."}
+{"ev":"translation","t":60.905999999999999,"text":"[mini2] 仍然有许多男人和女人在这里幸存下来，还有更多的亲戚在那里被谋杀或自己工作致死，包括犹太人和非犹太人。"}
+{"ev":"status","t":60.905999999999999,"text":"模式：混合·mini2"}
+{"ev":"volatile","t":62.442,"text":"Die"}
+{"ev":"volatile","t":62.448999999999998,"text":"Die Hö"}
+{"ev":"volatile","t":62.454000000000001,"text":"Die Höhle"}
+{"ev":"volatile","t":63.390000000000001,"text":"Die Höhle befindet"}
+{"ev":"volatile","t":63.395000000000003,"text":"Die Höhle befindet sich"}
+{"ev":"volatile","t":63.399999999999999,"text":"Die Höhle befindet sich auf"}
+{"ev":"volatile","t":63.405000000000001,"text":"Die Höhle befindet sich auf der"}
+{"ev":"volatile","t":64.439999999999998,"text":"Die Höhle befindet sich auf der Sp"}
+{"ev":"volatile","t":64.444000000000003,"text":"Die Höhle befindet sich auf der Spitze"}
+{"ev":"volatile","t":65.486999999999995,"text":"Die Höhle befindet sich auf der Spitze eines"}
+{"ev":"volatile","t":65.492000000000004,"text":"Die Höhle befindet sich auf der Spitze eines der"}
+{"ev":"volatile","t":65.497,"text":"Die Höhle befindet sich auf der Spitze eines der Ber"}
+{"ev":"volatile","t":65.501000000000005,"text":"Die Höhle befindet sich auf der Spitze eines der Berge"}
+{"ev":"volatile","t":65.507000000000005,"text":"Die Höhle befindet sich auf der Spitze eines der Berge n"}
+{"ev":"volatile","t":65.509,"text":"Die Höhle befindet sich auf der Spitze eines der Berge nör"}
+{"ev":"volatile","t":66.433999999999997,"text":"Die Höhle befindet sich auf der Spitze eines der Berge nördlich"}
+{"ev":"volatile","t":66.436000000000007,"text":"Die Höhle befindet sich auf der Spitze eines der Berge nördlich von"}
+{"ev":"volatile","t":66.442999999999998,"text":"Die Höhle befindet sich auf der Spitze eines der Berge nördlich von Me"}
+{"ev":"volatile","t":66.447000000000003,"text":"Die Höhle befindet sich auf der Spitze eines der Berge nördlich von Mek"}
+{"ev":"volatile","t":66.450999999999993,"text":"Die Höhle befindet sich auf der Spitze eines der Berge nördlich von Mekka"}
+{"ev":"volatile","t":67.484999999999999,"text":"Die Höhle befindet sich auf der Spitze eines der Berge nördlich von Mekka und"}
+{"ev":"volatile","t":67.488,"text":"Die Höhle befindet sich auf der Spitze eines der Berge nördlich von Mekka und ist"}
+{"ev":"volatile","t":67.495000000000005,"text":"Die Höhle befindet sich auf der Spitze eines der Berge nördlich von Mekka und ist vom"}
+{"ev":"volatile","t":67.501999999999995,"text":"Die Höhle befindet sich auf der Spitze eines der Berge nördlich von Mekka und ist vom Rest"}
+{"ev":"volatile","t":68.423000000000002,"text":"Die Höhle befindet sich auf der Spitze eines der Berge nördlich von Mekka und ist vom Rest der"}
+{"ev":"volatile","t":68.427000000000007,"text":"Die Höhle befindet sich auf der Spitze eines der Berge nördlich von Mekka und ist vom Rest der Welt"}
+{"ev":"volatile","t":68.433999999999997,"text":"Die Höhle befindet sich auf der Spitze eines der Berge nördlich von Mekka und ist vom Rest der Welt völlig"}
+{"ev":"volatile","t":68.438999999999993,"text":"Die Höhle befindet sich auf der Spitze eines der Berge nördlich von Mekka und ist vom Rest der Welt völlig i"}
+{"ev":"volatile","t":69.462000000000003,"text":"Die Höhle befindet sich auf der Spitze eines der Berge nördlich von Mekka und ist vom Rest der Welt völlig isol"}
+{"ev":"volatile","t":69.465999999999994,"text":"Die Höhle befindet sich auf der Spitze eines der Berge nördlich von Mekka und ist vom Rest der Welt völlig isoliert"}
+{"ev":"volatile","t":70.513000000000005,"text":"Die Höhle befindet sich auf der Spitze eines der Berge nördlich von Mekka und ist vom Rest der Welt völlig isoliert."}
+{"ev":"status","t":70.947000000000003,"text":"模式：精修中"}
+{"ev":"replace","t":71.037000000000006,"t0":57.828000000000003,"t1":64.408000000000001,"text":"P5 node=mini2 replaced=0 ids=[]"}
+{"ev":"final","t":71.037999999999997,"t0":57.828000000000003,"t1":64.408000000000001,"text":"[mini2] Die Höhle befindet sich auf der Spitze eines der Berge nördlich von Mekka und ist vom Rest der Welt völlig isoliert."}
+{"ev":"translation","t":71.037999999999997,"text":"[mini2] 这个洞穴位于麦加北部的一座山顶上，与世界其他地区完全隔绝。"}
+{"ev":"status","t":71.037999999999997,"text":"模式：混合·mini2"}
+{"ev":"final","id":5,"t":71.367000000000004,"t0":57.719999999999999,"t1":65.340000000000003,"text":"Die Höhle befindet sich auf der Spitze eines der Berge nördlich von Mekka und ist vom Rest der Welt völlig isoliert."}
+{"ev":"volatile","t":71.367000000000004,"text":""}
+{"ev":"translation","id":5,"t":71.459000000000003,"text":"这个洞穴位于麦加北部的一座山顶上，与世界其他地区完全隔绝。"}

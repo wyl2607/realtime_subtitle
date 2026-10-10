@@ -20,6 +20,7 @@
 | TK-005c | rslite：CR-012 R3 延后的 6 条 minor（UDS close 不白等、死代码、自检走线上收帧、UDS id 同源、hw_hash 复用与空串不退避） | done | TK-005b | macos-native/Sources/rslite/{NodeClient,NodeRouter,UDSWebSocket}.swift | default,security | codex 实现；build/selftest/UDS 冒烟 7/7（10-09 22:36）；grok R1 approve 0 finding；22:43 合并 938240b；big-pickle R2 合并后复核中 |
 | TK-008 | 节点冷启动首条精修 ≤15s（mini2 实测 16.2s / 未出） | planned | TK-007 | 待定（realtime_subtitle/node/{gateway,worker}.py 预热或 TK-007 阈值复议） | default | **Sprint-001 遗留，用户 10-09 定：记已知问题、不卡收尾**；证据 /tmp/tk007/crit2_run{,2}.log：worker 2.3–3.4s 即起，慢在首次模型加载/首段出结果 |
 | TK-009 | rslite：本机句 t0 不随句前进（同段多句共用段首 t0，时间区间互相嵌套） | planned | TK-007 | macos-native/Sources/rslite/SentenceCommitter.swift（待查） | default | **Sprint-001 遗留，用户 10-09 定快方案：记已知问题**；multi_node 探针真机 23/24 唯一 FAIL「本机句不重叠」；实例：本机 id 24/25/26 t0 均 79.38、t1 82.7/87.5/90.4；影响 P5 替换的重叠判断（本机区间被拉长） |
+| TK-010 | rslite P5 替换：节点把一句本机句拆成多句时不替换（每条覆盖 <50%），字幕重复 | planned | TK-007 | macos-native/Sources/rslite/SentenceCommitter.swift（shouldReplace 按多条节点句累计覆盖） | default | **Sprint-001 遗留（第 4 条真机发现）**：concat5 第 2 句本机 21.12–28.56，节点拆成 21.2–23.7 / 24.08–27.66，覆盖 34%/48% → replaced=0 → 本机句与两条节点句并存；混合档最终 WER 0.193（B 0.079）主要由此拉高；hybrid_score 的重复检测也没识别这种时间重叠型重复 |
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | executing（prep） | TK-001…TK-006 | scripts/bench/**, docs/node-acceptance.md | default | 涉及 F05；mini2 远程操作要先征得用户批准 |
 
 ## 字段说明
