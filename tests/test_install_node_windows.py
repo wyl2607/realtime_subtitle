@@ -5,7 +5,10 @@
 """
 
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "node" / "install_node_windows.sh"
@@ -17,10 +20,14 @@ def run(*args):
 
 
 def test_bash_syntax():
+    if sys.platform == "win32":
+        pytest.skip("需要 bash")
     assert subprocess.run(["bash", "-n", str(SCRIPT)]).returncode == 0
 
 
 def test_dry_run_lists_all_steps_without_token():
+    if sys.platform == "win32":
+        pytest.skip("需要 bash")
     r = run("winbox", "--dry-run")
     assert r.returncode == 0, r.stderr
     for step in range(1, 10):
@@ -30,11 +37,15 @@ def test_dry_run_lists_all_steps_without_token():
 
 
 def test_rejects_option_like_host():
+    if sys.platform == "win32":
+        pytest.skip("需要 bash")
     r = run("-oProxyCommand=touch /tmp/pwned", "--dry-run")
     assert r.returncode != 0
 
 
 def test_requires_host():
+    if sys.platform == "win32":
+        pytest.skip("需要 bash")
     assert run().returncode != 0
 
 

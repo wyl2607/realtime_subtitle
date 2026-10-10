@@ -28,7 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "node" / "install_node.sh"
 PLIST_TEMPLATE = REPO_ROOT / "scripts" / "node" / "com.realtimesubtitle.node.plist.template"
 
-pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="需要 bash")
+pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="依赖 bash/pgrep/chmod，仅在类 Unix 系统上运行")
 
 _STUB_SSH = r"""#!/bin/bash
 # 记录 argv（NUL 分隔）与 stdin；然后把目标机命令在本机执行
