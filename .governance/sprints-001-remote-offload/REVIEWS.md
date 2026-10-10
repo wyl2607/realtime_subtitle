@@ -5,6 +5,9 @@
 
 | CR | TK | rounds | status | last_action |
 |----|----|--------|--------|-------------|
+| CR-014 | TK-007 | 3 | resolved | 2026-10-10: multi_node grok R1–R3 + Coordinator 真机 4×23/24；lifecycle/hybrid 修复 Coordinator 真机复核；见 reviews/CR-014.md |
+| CR-013 | TK-005c | 2 | resolved | 2026-10-10: grok R1 approve 0 finding；big-pickle R2 编造整份驳回；Coordinator 复核 close() 路径 approve |
+| CR-012 | TK-005b | 3 | resolved | 2026-10-09 22:00: R3 终审 grok+big-pickle approve；合并 7d56ec0；6 条 minor 拆 TK-005c |
 | CR-011 | TK-002c | 2 | resolved | 2026-10-09 18:50 CEST: r1 Gemini flash approve、r2 haiku approve；已合并 b7a55c8（主线全绿 1019 passed） |
 | CR-010 | TK-003b | 2 | resolved | 2026-10-09 17:50 CEST: round2 codex approve；已合并 523877b |
 | CR-009 | TK-005 | 5 | resolved | 2026-10-09 17:30 CEST: r5 Gemini approve（903201e）；已合并 7a99c44；S1 契约冲突待用户决定；R3-3 拆 TK-005b |

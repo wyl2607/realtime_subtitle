@@ -18,13 +18,16 @@
 | TK-005b | rslite：本机节点经 UDS 发现与连接（P6/P8） | done | TK-005 | macos-native/Sources/rslite/{NodeClient,NodeRouter,Capability,main}.swift, macos-native/README.md | default,security | CR-009 R3-3 拆出；RFC Done criteria 4 依赖；TK-007 前完成 |
 | TK-006 | 清理 v1 + 文档 | done | TK-001, TK-002, TK-005 | realtime_subtitle/remote/**, tests/test_remote_server.py, CLAUDE.md, docs/protocol-v2.md | default | 10-09 15:20 CEST 与 TK-005 并行开写（grok，文件不重叠），**合并顺序：TK-005 先于 TK-006**；v1 删除时 RemotePipeline.swift 由 TK-005 负责删；protocol-v2.md 须写明：会话中 worker 退出（含 0）→ worker_crashed，status code 映射 2/3/4 与 audio_dropped/backlog_dropped（CR-002/CR-003） |
 | TK-005c | rslite：CR-012 R3 延后的 6 条 minor（UDS close 不白等、死代码、自检走线上收帧、UDS id 同源、hw_hash 复用与空串不退避） | done | TK-005b | macos-native/Sources/rslite/{NodeClient,NodeRouter,UDSWebSocket}.swift | default,security | codex 实现；build/selftest/UDS 冒烟 7/7（10-09 22:36）；grok R1 approve 0 finding；22:43 合并 938240b；big-pickle R2 合并后复核中 |
-| TK-008 | 节点冷启动首条精修 ≤15s（mini2 实测 16.2s / 未出） | planned | TK-007 | 待定（realtime_subtitle/node/{gateway,worker}.py 预热或 TK-007 阈值复议） | default | **Sprint-001 遗留，用户 10-09 定：记已知问题、不卡收尾**；证据 /tmp/tk007/crit2_run{,2}.log：worker 2.3–3.4s 即起，慢在首次模型加载/首段出结果 |
-| TK-009 | rslite：本机句 t0 不随句前进（同段多句共用段首 t0，时间区间互相嵌套） | planned | TK-007 | macos-native/Sources/rslite/SentenceCommitter.swift（待查） | default | **Sprint-001 遗留，用户 10-09 定快方案：记已知问题**；multi_node 探针真机 23/24 唯一 FAIL「本机句不重叠」；实例：本机 id 24/25/26 t0 均 79.38、t1 82.7/87.5/90.4；影响 P5 替换的重叠判断（本机区间被拉长） |
-| TK-010 | rslite P5 替换：节点把一句本机句拆成多句时不替换（每条覆盖 <50%），字幕重复 | planned | TK-007 | macos-native/Sources/rslite/SentenceCommitter.swift（shouldReplace 按多条节点句累计覆盖） | default | **Sprint-001 遗留（第 4 条真机发现）**：concat5 第 2 句本机 21.12–28.56，节点拆成 21.2–23.7 / 24.08–27.66，覆盖 34%/48% → replaced=0 → 本机句与两条节点句并存；混合档最终 WER 0.193（B 0.079）主要由此拉高；hybrid_score 的重复检测也没识别这种时间重叠型重复 |
-| TK-007 | 端到端验收 + 五组功耗 + 结果文档 | executing（prep） | TK-001…TK-006 | scripts/bench/**, docs/node-acceptance.md | default | 涉及 F05；mini2 远程操作要先征得用户批准 |
+| TK-007 | 端到端验收 + 五组功耗 + 结果文档 | done | TK-001…TK-006 | scripts/bench/**, docs/node-acceptance.md | default | 涉及 F05；mini2 远程操作要先征得用户批准；**10-10 收尾**：验收汇总 docs/node-acceptance.md（e43bf4d），第 1/3/6/7 条通过，第 2/4/5 条不达标项转 TK-008/009/010；CR-014 |
 
 ## 字段说明
 - **write_scope**：路径前缀白名单，Executor 只能写其中的文件。
 - **reviewer_lanes**：`default` / `architecture` / `security` / `perf` 可任意组合，决定要派几个 Reviewer。
 - **blocked_by**：上游依赖的 TK id 列表。
 - **notes**：split 时记录子 TK 的 id；blocked 时记录原因。
+
+## 遗留（不属本 Sprint 完成范围，转 Sprint-002 建卡，此处仅留档，不计入本 Sprint 状态；用户 10-09 定快方案）
+
+- **TK-008** 节点冷启动首条精修 ≤15s（mini2 实测 16.2s / 未出）——写入范围：待定（realtime_subtitle/node/{gateway,worker}.py 预热或 TK-007 阈值复议）；**Sprint-001 遗留，用户 10-09 定：记已知问题、不卡收尾**；证据 /tmp/tk007/crit2_run{,2}.log：worker 2.3–3.4s 即起，慢在首次模型加载/首段出结果
+- **TK-009** rslite：本机句 t0 不随句前进（同段多句共用段首 t0，时间区间互相嵌套）——写入范围：macos-native/Sources/rslite/SentenceCommitter.swift（待查）；**Sprint-001 遗留，用户 10-09 定快方案：记已知问题**；multi_node 探针真机 23/24 唯一 FAIL「本机句不重叠」；实例：本机 id 24/25/26 t0 均 79.38、t1 82.7/87.5/90.4；影响 P5 替换的重叠判断（本机区间被拉长）
+- **TK-010** rslite P5 替换：节点把一句本机句拆成多句时不替换（每条覆盖 <50%），字幕重复——写入范围：macos-native/Sources/rslite/SentenceCommitter.swift（shouldReplace 按多条节点句累计覆盖）；**Sprint-001 遗留（第 4 条真机发现）**：concat5 第 2 句本机 21.12–28.56，节点拆成 21.2–23.7 / 24.08–27.66，覆盖 34%/48% → replaced=0 → 本机句与两条节点句并存；混合档最终 WER 0.193（B 0.079）主要由此拉高；hybrid_score 的重复检测也没识别这种时间重叠型重复

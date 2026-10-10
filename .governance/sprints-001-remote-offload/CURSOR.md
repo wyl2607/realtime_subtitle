@@ -2,8 +2,8 @@
 
 ## 当前状态
 <!-- Machine fields: new writes must use "- key: `value`". Legacy variants are read-only compatibility. -->
-- current_phase: `execution`
-- current_tk: `TK-005b,TK-007`
+- current_phase: `sprint-exit`
+- current_tk: `—`
 - current_cr: `—`
 - current_round: `0`
 - escalated: `false`
@@ -27,6 +27,7 @@
 | TK-007 | 端到端验收 + 五组功耗 + 结果文档 | in-progress（拆 7 块并行：1 证据已收、2/4/5 脚本已交待真机串行跑、3/6 需用户、7 质量门测试 e8d3942 评审中） |
 
 ## 最近动作
+- 2026-10-10 11:50 CEST: **Sprint-exit（closed）**。主线 feat/macos-native=b5d3430 已 push（feat/tk-007=e43bf4d）；全量 pytest 1028 passed / 30 skipped / 0 failed，ruff 绿，release build + selftest OK；一致性检查 0 finding。验收（docs/node-acceptance.md）：第 1/3/6/7 条通过，第 2 条除冷启动外通过，第 4 条未通过（精修中位 5.3s、拆句不替换致重复），第 5 条探针 23/24。用户快方案：TK-008（冷启动/精修延迟）、TK-009（本机句 t0 不前进）、TK-010（P5 拆句不替换）转 Sprint-002。Experience（codex 执行角色契约）top-3 候选规则：①验收脚本失败即非零、判据不能只看「有输出」（CR-014）；②远程/launchd 行为用空环境或真实 launchd 等价环境复现（CR-007/005/010）；③安装/回滚脚本覆盖真实旧服务命令行、并发测试隔离、失败后恢复（CR-005）。全文 .governance/experiences/。
 - 2026-10-09 22:20 CEST: **暂停（用户换账号）**。TK-005b 合并、质量门测试合并、uv.lock 误提交已删（323a30c）。进行中：TK-005c（codex）、multi_node_probe 评审 R2（grok）。TK-007 第 2/4 条真机跑分尚未执行。交接详见 memory handoff-2026-10-08-rs-remote-offload §13。
 - 2026-10-09 21:40 CEST: TK-005b：R1（grok+big-pickle 22 条全 accepted）→ codex 修 → agy 修 sun_len → [coordinator-direct] getpeereid 替换无效 fstat 比对、ready 超时 5s→15s（mini2 冷启动实测 >5s）；R2（codex 3 条 + grok 6 条全 accepted）→ R2 修复 8ad666b，R3 修复派 codex。真机：MacBook→mini2 混合档冷启动 14.4s 首精修、3 句替换。TK-007 拆块并行：feat/tk-007 有 node_lifecycle_probe.sh（第 2 条）、hybrid_e2e.sh（第 4 条）、multi_node_probe.py（第 5 条，自报 12/12 待 grok 评审+复跑）、第 1 条证据；feat/tk-007-gates 补 3 个质量门测试。**剩余**：TK-005b R3 修复→评审 R3→合并；TK-007 真机串行跑 2/4/5；需用户：第 6 条功耗（sudo）、第 3 条停 mini2 gateway 回退、第 1 条 mini2 二次安装/回滚演练。并行会话在写 SDD 002（未提交 specs/002，勿动）。
 - 2026-10-09 20:19 CEST: 用户批准后在 mini2 按 34cbbfa 重装节点：步骤 10 通过（UDS /v1/info 200 v=2；TCP 100.105.163.59:8791 LISTEN，无通配监听）；gateway.err.log `tcp_listening attempt=1`。只读复核：MacBook 带 token /v1/info 200、node_id 一致；无 token 401。⚠️ 发现：本机系统代理（127.0.0.1:6152）会劫持走系统代理的 HTTP 客户端（Python urllib 超时），TK-007 需确认 rslite URLSession 连 ws://*.ts.net 不经代理。TK-005b 已派出。
@@ -99,5 +100,4 @@
 - 2026-10-09 04:05 CST: Sprint 001 initialized, awaiting TK-001（用户已批准全部 TK 排队执行，含 TK-007 对 mini2 的远程操作）
 
 ## 下一步
-- TK-002b 执行中 → CR-007 两路评审（opus default + sonnet security）≥2 轮 → 合并 → 向用户说明 mini2 重跑 install_node.sh 步骤并等批准
-- 之后 TK-005 → TK-006 → TK-007
+- Sprint-001 已关闭。Sprint-002 从 /sdd-specify 起步，范围：TASKS.md「遗留」一节的 TK-008/009/010（另可纳入 TK-005 冒烟 21/24 静默断网三项、--local 真机、功耗第 2 轮）。
