@@ -103,22 +103,30 @@ def test_load_events_skips_non_json(tmp_path):
 
 
 def test_accumulated_node_overlap_detects_duplicate():
-    # Local sentence: 0.0-10.0 (duration 10.0)
-    # Two node sentences: 
-    #   node1: 0.0-4.0 (overlap 4.0 -> 40%)
-    #   node2: 6.0-10.0 (overlap 4.0 -> 40%)
-    #   total overlap = 8.0 -> 80% >= 50% -> duplicate
+    # 客户端（rslite）没有替换本机句：replace 事件明确列出的 ids 不含本机 id=1，
+    # 两条节点句各覆盖 40%、合计 80% -> 本机句与节点句同时可见 = 重复
     events = [
-        local(5.0, "local sentence", 0.0, 10.0),
-        node(2.0, "node1", 0.0, 4.0),
-        node(8.0, "node2", 6.0, 10.0),
+        ev("final", 5.0, "local sentence", id=1, t0=0.0, t1=10.0),
+        ev("replace", 6.0, "P5 node=mini2 replaced=1 ids=[7]"),
+        real_node(6.0, "node1", 0.0, 4.0),
+        ev("replace", 8.0, "P5 node=mini2 replaced=1 ids=[7]"),
+        real_node(8.0, "node2", 6.0, 10.0),
     ]
     b_events = [ev("volatile", 1.0, "x")]
     r = hs.score(events, refs=["local sentence"], b_events=b_events, c_wer=0.0)
-    # Expect one duplicate problem, no dropped sentences
     assert r["problem_counts"]["duplicates"] == 1
-    assert r["problem_counts"]["dropped"] == 0
     assert any("累计重叠≥50%" in p for p in r["problems"])
+
+
+def test_node_first_cumulative_coverage_drops_late_local():
+    # 003 P5：两条节点句先到（各 <50%、合计 ≥50%），后到的本机句按并集覆盖被丢弃
+    events = [
+        real_node(2.0, "node1", 0.0, 4.0),
+        real_node(3.0, "node2", 6.0, 10.0),
+        local(5.0, "local sentence", 0.0, 10.0),
+    ]
+    lines = hs.replay_lines(events)
+    assert all(ln["node"] for ln in lines) and len(lines) == 2
 
 
 def test_accumulated_overlap_below_50_no_duplicate():

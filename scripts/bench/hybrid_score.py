@@ -105,16 +105,35 @@ def _overlap(a0, a1, b0, b1):
     return max(0.0, min(a1, b1) - max(a0, b0))
 
 
-def _should_replace(local_line, node_t0, node_t1):
-    if local_line["node"] or node_t0 is None or node_t1 is None:
+def _covered(l0, l1, intervals):
+    """本机区间被节点区间并集覆盖的时长（与 LineStore.coveredDuration 同口径）。"""
+    clipped = sorted((max(l0, a), min(l1, b)) for a, b in intervals if min(l1, b) > max(l0, a))
+    total, cur = 0.0, None
+    for a, b in clipped:
+        if cur and a <= cur[1] + 1e-9:
+            cur[1] = max(cur[1], b)
+        else:
+            if cur:
+                total += cur[1] - cur[0]
+            cur = [a, b]
+    return total + (cur[1] - cur[0] if cur else 0.0)
+
+
+def _should_replace(local_line, intervals):
+    """P5（003 版）：本机行被所有节点行时间并集覆盖 ≥ 自身时长 50% 即替换。"""
+    if local_line["node"]:
         return False
     l0, l1 = local_line.get("t0"), local_line.get("t1")
     if l0 is None or l1 is None:
         return False
     duration = max(l1 - l0, 0.0)
     if duration <= 1e-9:
-        return node_t0 - 1e-9 <= l0 <= node_t1 + 1e-9
-    return _overlap(l0, l1, node_t0, node_t1) >= 0.5 * duration - 1e-9
+        return any(a - 1e-9 <= l0 <= b + 1e-9 for a, b in intervals)
+    return _covered(l0, l1, intervals) >= 0.5 * duration - 1e-9
+
+
+def _node_intervals(lines):
+    return [(ln["t0"], ln["t1"]) for ln in lines if ln["node"] and ln["t0"] is not None and ln["t1"] is not None]
 
 
 def _insert_line(lines, row):
@@ -150,12 +169,14 @@ def replay_lines(events):
             if replace_ids:
                 replace_id_set = set(replace_ids)
                 lines = [ln for ln in lines if ln["node"] or ln.get("id") not in replace_id_set]
-            elif row["t0"] is not None and row["t1"] is not None:
-                lines = [ln for ln in lines if not _should_replace(ln, row["t0"], row["t1"])]
-            _insert_line(lines, row)
+                _insert_line(lines, row)
+            else:
+                _insert_line(lines, row)
+                intervals = _node_intervals(lines)
+                lines = [ln for ln in lines if not _should_replace(ln, intervals)]
             pending_replace = None
         else:
-            if any(_should_replace(row, ln["t0"], ln["t1"]) for ln in lines if ln["node"]):
+            if _should_replace(row, _node_intervals(lines)):
                 continue
             _insert_line(lines, row)
     return lines

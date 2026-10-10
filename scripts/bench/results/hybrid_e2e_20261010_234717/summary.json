@@ -1,0 +1,107 @@
+{
+  "b_mode": {
+    "b_first_text_s": 5.196,
+    "checks": {
+      "不重复不丢句": true,
+      "最终 WER ≤ C+1pp": null,
+      "精修中位延迟 ≤ 4s": null,
+      "首字不慢于 B": true
+    },
+    "events_file": "/Users/yumei/projects/rs-mac-native/scripts/bench/results/hybrid_e2e_20261010_234717/B.jsonl",
+    "final_wer": 0.07894736842105263,
+    "first_text_s": 5.196,
+    "lines": 5,
+    "mode": "local",
+    "node_lines": 0,
+    "problem_counts": {
+      "dropped": 0,
+      "duplicates": 0
+    },
+    "problems": [],
+    "refine_median_s": null,
+    "refine_n": 0,
+    "refs_n": 5
+  },
+  "c_mode": {
+    "b_first_text_s": null,
+    "checks": {
+      "不重复不丢句": false,
+      "最终 WER ≤ C+1pp": null,
+      "精修中位延迟 ≤ 4s": false,
+      "首字不慢于 B": null
+    },
+    "events_file": "/Users/yumei/projects/rs-mac-native/scripts/bench/results/hybrid_e2e_20261010_234717/C.jsonl",
+    "final_wer": 0.19298245614035087,
+    "first_text_s": 5.15,
+    "lines": 7,
+    "mode": "auto",
+    "node_lines": 6,
+    "note": "rslite supports --mode auto|local|hybrid; no pure all-node C mode is available, so --mode auto is used as the closest available C baseline.",
+    "problem_counts": {
+      "dropped": 0,
+      "duplicates": 1
+    },
+    "problems": [
+      "重复：本机行 [21.2,28.6] 与节点行累计重叠≥50%"
+    ],
+    "refine_median_s": 5.484000000000002,
+    "refine_n": 6,
+    "refs_n": 5
+  },
+  "events_dir": "/Users/yumei/projects/rs-mac-native/scripts/bench/results/hybrid_e2e_20261010_234717",
+  "hybrid_mode": {
+    "b_first_text_s": 5.196,
+    "c_wer": 0.19298245614035087,
+    "checks": {
+      "不重复不丢句": false,
+      "最终 WER ≤ C+1pp": false,
+      "精修中位延迟 ≤ 4s": false,
+      "首字不慢于 B": true
+    },
+    "events_file": "/Users/yumei/projects/rs-mac-native/scripts/bench/results/hybrid_e2e_20261010_234717/hybrid.jsonl",
+    "final_wer": 0.21052631578947367,
+    "first_text_s": 5.165,
+    "lines": 7,
+    "mode": "hybrid",
+    "node_lines": 6,
+    "problem_counts": {
+      "dropped": 0,
+      "duplicates": 1
+    },
+    "problems": [
+      "重复：本机行 [21.2,28.6] 与节点行累计重叠≥50%"
+    ],
+    "refine_median_s": 5.331499999999998,
+    "refine_n": 6,
+    "refs_n": 5
+  },
+  "passed": false,
+  "refs_n": 5,
+  "rfc_checks": {
+    "final_wer_le_c_plus_1pp": {
+      "c_wer": 0.19298245614035087,
+      "limit": 0.20298245614035088,
+      "pass": false,
+      "value": 0.21052631578947367
+    },
+    "first_text_not_slower_than_b": {
+      "baseline_s": 5.196,
+      "pass": true,
+      "value_s": 5.165
+    },
+    "no_duplicate_no_dropped": {
+      "dropped": 0,
+      "duplicates": 1,
+      "pass": false,
+      "problems": [
+        "重复：本机行 [21.2,28.6] 与节点行累计重叠≥50%"
+      ]
+    },
+    "refine_median_le_4s": {
+      "limit_s": 4.0,
+      "n": 6,
+      "pass": false,
+      "value_s": 5.331499999999998
+    }
+  }
+}
