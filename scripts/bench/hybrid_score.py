@@ -182,10 +182,12 @@ def check_integrity(lines, refs):
     for ln in lines:
         if ln["node"] or ln["t0"] is None or ln["t1"] is None or ln["t1"] <= ln["t0"]:
             continue
+        local_duration = ln["t1"] - ln["t0"]
+        total_overlap = 0.0
         for nd in nodes:
-            if _overlap(ln["t0"], ln["t1"], nd["t0"], nd["t1"]) >= 0.5 * (ln["t1"] - ln["t0"]):
-                problems.append(f"重复：本机行 [{ln['t0']:.1f},{ln['t1']:.1f}] 与节点行同区间并存")
-                break
+            total_overlap += _overlap(ln["t0"], ln["t1"], nd["t0"], nd["t1"])
+        if total_overlap >= 0.5 * local_duration:
+            problems.append(f"重复：本机行 [{ln['t0']:.1f},{ln['t1']:.1f}] 与节点行累计重叠≥50%")
     texts = [norm(ln["text"]) for ln in lines]
     for i, ref in enumerate(refs):
         best = max((difflib.SequenceMatcher(None, ref, t).ratio() for t in texts), default=0.0)

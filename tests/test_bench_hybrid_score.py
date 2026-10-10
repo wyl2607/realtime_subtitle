@@ -100,3 +100,54 @@ def test_load_events_skips_non_json(tmp_path):
     p = tmp_path / "e.events"
     p.write_text("warning: x\n" + json.dumps(ev("final", 1, "a")) + "\n{broken\n", encoding="utf-8")
     assert len(hs.load_events(p)) == 1
+
+
+def test_accumulated_node_overlap_detects_duplicate():
+    # Local sentence: 0.0-10.0 (duration 10.0)
+    # Two node sentences: 
+    #   node1: 0.0-4.0 (overlap 4.0 -> 40%)
+    #   node2: 6.0-10.0 (overlap 4.0 -> 40%)
+    #   total overlap = 8.0 -> 80% >= 50% -> duplicate
+    events = [
+        local(5.0, "local sentence", 0.0, 10.0),
+        node(2.0, "node1", 0.0, 4.0),
+        node(8.0, "node2", 6.0, 10.0),
+    ]
+    b_events = [ev("volatile", 1.0, "x")]
+    r = hs.score(events, refs=["local sentence"], b_events=b_events, c_wer=0.0)
+    # Expect one duplicate problem, no dropped sentences
+    assert r["problem_counts"]["duplicates"] == 1
+    assert r["problem_counts"]["dropped"] == 0
+    assert any("累计重叠≥50%" in p for p in r["problems"])
+
+
+def test_accumulated_overlap_below_50_no_duplicate():
+    # Local sentence: 0.0-10.0
+    # Two node sentences: each 0.0-2.0 (overlap 2.0 -> 20% each, total 40% < 50%)
+    events = [
+        local(5.0, "local sentence", 0.0, 10.0),
+        node(2.0, "node1", 0.0, 2.0),
+        node(4.0, "node2", 0.0, 2.0),
+    ]
+    b_events = [ev("volatile", 1.0, "x")]
+    r = hs.score(events, refs=["local sentence"], b_events=b_events, c_wer=0.0)
+    assert r["problem_counts"]["duplicates"] == 0
+    assert r["problem_counts"]["dropped"] == 0
+
+
+def test_local_sentence_replaced_by_node_not_considered_for_duplicate():
+    # Even if the accumulated overlap would be high, if the local sentence is replaced, it should not be considered.
+    events = [
+        local(5.0, "local sentence", 0.0, 10.0) | {"id": 1},
+        node(2.0, "node1", 0.0, 4.0),
+        node(8.0, "node2", 6.0, 10.0),
+        ev("replace", 9.0, "P5 node=mini2 replaced=1 ids=[1]", id=None, t0=0.0, t1=10.0),
+        real_node(9.1, "replaced sentence", 0.0, 10.0),
+    ]
+    b_events = [ev("volatile", 1.0, "x")]
+    r = hs.score(events, refs=["local sentence", "replaced sentence"], b_events=b_events, c_wer=0.0)
+    # The local sentence should be replaced, so no duplicate problem for it.
+    # We expect no duplicate problems (the replaced sentence is a node line and we don't check node lines for duplicates with local? 
+    # Actually, we only check local lines (non-node) for duplicates with node lines. The local line is gone, so no duplicate.
+    assert r["problem_counts"]["duplicates"] == 0
+    assert r["problem_counts"]["dropped"] == 0
