@@ -1,134 +1,109 @@
 # 节点化（remote-offload）端到端验收记录
 
-> 状态：持续验收中（2026-10-09）。已补真机按需加载两轮实测、Grok 多节点 R2 失败、TK-005c 合并与双审、静态评分脚本单测；其余 `TODO` 代表尚未通过或未测，不得视为验收完成。
-> 契约来源：`.governance/sprints-001-remote-offload/RFC.md` 的 Done criteria 1–8。
-> 每条证据都写：命令、输出摘要、数字、日期/commit。没跑过的不要填。
+> 状态：**Sprint-001 验收收尾（2026-10-10）**。契约来源：`.governance/sprints-001-remote-offload/RFC.md` Done criteria 1–8。
+> 每条证据写命令、数字、日期/commit；没跑过的写「未验」，不填推测。证据文件在 `.governance/sprints-001-remote-offload/evidence/`。
+> 用户 10-09 定「快方案」：不达标项登记为后续 TK（TK-008/009/010），不卡本 Sprint 收尾。
 
-## 已知基线（HANDOFF §2，同一段 67s concat5 回放）
+## 总览
 
-| 档位 | WER | 译文延迟 | 整机功耗（MacBook Air，CPU+GPU+ANE） |
+| 条 | 判据 | 结论 | 遗留 |
 |---|---|---|---|
-| 空闲 | — | — | 1004 mW |
-| B（本机系统识别 + 系统翻译） | 7.9% | 2.2–4.5 s | 1124 mW |
-| C（v1 远程 Whisper，客户端侧） | 2.6% | 5.6–12.3 s（系统翻译后 7–11 s） | 822 mW |
-
-三者功耗差异都在噪声以内。concat5 只对应 `refs.jsonl` 前 5 句（共 60 句），评分必须按前 5 句。
+| 1 一键安装 | 幂等 / 0600 / nodes.json / 回滚 / `--local` / 开机自启 | **部分通过**：幂等、token、nodes.json、回滚演练真机通过 | `--local` 只有单测；mini2 重启自启未验 |
+| 2 按需加载 | 空闲无 worker、gateway <50MB、120s 回收、断开 30s 判定并回收、冷启动首条精修 ≤15s | **除冷启动外通过** | 冷启动 15.7–18.1s 或窗口内未出 → TK-008 |
+| 3 自动选档 | 混合档 / 停 gateway 退回 B 字幕不断 / UDS 本机节点 | **通过**（UDS 见 TK-005b 冒烟 7/7） | — |
+| 4 混合档 | 首字不慢于 B / WER ≤ C+1pp / 精修中位 ≤4s / 不重复不丢句 | **未通过** | 精修中位 5.3s；拆句不替换致重复 → TK-010；C 基线无区分度 |
+| 5 多节点路由 | 静音点迁移、下线回退、不断不重复、理由可见 | **探针 23/24（真机 4 次稳定）** | 唯一 FAIL 为本机句 t0 不前进 → TK-009 |
+| 6 功耗五组 | 写进 docs | **已测**：A ≈ +7W，rslite 三档 ≈ 空闲 | 三档间排序需 ≥2 轮 |
+| 7 质量门 | 测试覆盖 + 评审轮次 | **通过**（见 §7） | TK-005 冒烟 21/24 为既有缺口 |
+| 8 文档 | CLAUDE.md §7 / protocol-v2 | 已随 TK-006 合并 | — |
 
 ## 1. 一键安装
 
-- 命令：`scripts/node/install_node.sh mini2`（第二次执行验证幂等；`--local`；人为制造自检失败验证回滚）
-- 检查项：mini2 开机自启；两端 token 权限 0600；客户端 `~/.config/rslite/nodes.json` 已写入
-- 证据：TODO
+- 命令：`bash scripts/node/install_node.sh mini2`（用户终端执行，2026-10-10；日志 `evidence/tk007_crit1_crit3_user_run.log`、`evidence/tk007_crit1_rollback_drill.log`）
+- **二次执行幂等：通过**（10:18）。前后快照：node_id `f9e6…868d` 不变；目标机 token `-rw-------`、两端 token 指纹同为 `de75e5…`；`nodes.json` 仍只有 `mini2` 一条；`~/rs-node` 更新、旧版轮换为 `~/rs-node.prev`；LaunchAgent running，`/v1/info` 200（v=2），TCP 在 Tailscale IP:8791 监听。
+- **人为制造自检失败能回滚：通过**（10:28）。在 mini2 `~/.zshenv` 临时注入 `RS_INFO_WAIT=x`（`seq 1 x` 无输出 → `/v1/info` 自检零轮），安装输出 `ROLLBACK：gateway x 秒内没有通过 /v1/info 自检` / `已回滚到上一版并重新启动`，退出码 1；事后 `~/rs-node` 恢复为 10:19 版、running、`/v1/info` 200、TCP 重新监听（新 PID）；`.zshenv` 已还原。回滚消耗了 `.prev`（预期行为）。
+  - 第一次注入用 `RS_INFO_WAIT=0` 无效：BSD `seq 1 0` 输出 `1 0`，自检照跑两轮通过——记录在案，别再用 0 做注入。
+- **未验**：`--local` 端到端（单测 `test_dry_run_local_skips_nodes_json` 覆盖 dry-run；真机会在本机常驻 LaunchAgent + 数 GB 依赖，快方案下未做）；mini2 整机重启后 LaunchAgent 自启（需重启 mini2，未获批）。
 
 ## 2. 按需加载
 
-- 检查项：无会话时 mini2 上无 worker 进程、gateway 常驻内存 < 50MB；会话结束 120s 后 worker 退出；客户端被 kill/断网后 30s 内判定断开并回收 worker；冷启动后首条精修 ≤ 15s
-- 命令（控制端 MacBook 执行；远端只读 `ps` 与 gateway 日志，不停止/杀远端进程）：
-  ```bash
-  bash scripts/bench/node_lifecycle_probe.sh mini2 ~/projects/rs-mac-native-data/concat5.wav
-  ```
-- 判定：
-  - `idle_no_worker`：`ssh mini2 ps -axo pid,rss,command` 中没有 `realtime_subtitle.node.worker`。
-  - `idle_gateway_rss`：`realtime_subtitle.node.gateway` 的最大 RSS < 50 MB。
-  - `cold_first_refine`：本机 `rslite --headless --source file:<wav> --mode hybrid` 启动后，stdout JSONL 中首条节点精修结果 ≤ 15s；脚本只保留事件类型和时间戳，不记录字幕正文。
-  - `idle_reap_after_playback`：回放结束后 worker 在约 120s 保温窗口后退出，脚本判定窗口为 100–150s。
-  - `disconnect_detected`：第二次启动 rslite，观察到 worker 出现后 kill 本机 rslite；用 gateway `session_end dur_s` 与本机 kill 时刻相减，要求 ≤ 30s。
-  - `disconnect_worker_reap`：kill 后 worker 最迟 150s 内消失（30s 断线判定 + 120s 保温回收上限）。
-  - stdout 每项输出 PASS/FAIL 与数字，最后一行是汇总 JSON；实测数字填入下方证据。
-- **2026-10-09 真机首跑：FAIL（尚未验收）**。`feat/tk-007`=`2ecddc9`；控制端 MacBook Air，目标 mini2；实际命令：`RSLITE_BIN=$HOME/projects/rs-mac-native/macos-native/.build/release/rslite bash scripts/bench/node_lifecycle_probe.sh mini2 /tmp/e2e/de.wav`。保留脱敏原始检查结果 `/tmp/tk007/crit2_run.log`，细节目录 `/tmp/tk007/node_lifecycle_probe.20261009-222139.77137/`。
-  - PASS：空闲 worker=0；gateway RSS=20.0 MB（限 50 MB）；冷启动 worker 首次观测 3.419s；rslite 正常退出；回放后回收 120.870s；断连后 worker 消失 120.223s（限 150s）。
-  - FAIL：首次节点精修 16.159s（限 15s）；`disconnect_detected` 计算出 **-0.472s**（要求 0–30s）。后者可能受不同进程时钟起点或日志关联影响，不能据此断言节点实际断线检测迟缓，需修探针验证。
-  - **质量门缺陷**：首跑汇总 JSON 为 `ok:false`，但 shell 退出码仍为 0；后续工作树已补 `overall != PASS` 时退出 1，尚未提交/独立复核。此探针远端仅只读，不做 mini2 状态变更；远端故障注入仍待用户逐项批准。
-- **同日复跑（另一会话启动）：仍 FAIL**。`/tmp/tk007/crit2_run2.log`：空闲 worker=0，gateway RSS=22.2MB，worker 出现 2.270s，首次精修输出为 `null`（判定 FAIL），回放后回收 120.451s，断连检测 0.586s，断连后 worker 回收 119.632s；`ok:false`、退出码 1。需核实 `first_refine` 的采样竞争：脱敏记录 `/tmp/tk007/node_lifecycle_probe.20261009-222659.80917/cold.events.meta.jsonl` 实际包含 3 条节点 final，第一条 `t=14.007s`（进程事件时间），但脚本 15s 轮询截止前未读到，导致记录 `null`。**事件时间与检测截止的关系需先修并重跑，既不能直接算 PASS，也不能误认为节点完全没有精修。**
+- 命令：`RSLITE_BIN=<主线 rslite> bash scripts/bench/node_lifecycle_probe.sh mini2 /tmp/e2e/de.wav`（远端只读 ps/日志）
+- 探针修复（cbe15e5）：`disconnect_detected` 原用 gateway 会话时长减本机启动时长（起点差一段建连时间，得 -0.472s）→ 改为 kill 到本机轮询见 `session_end` 的上界；`ok:false` 时原先仍 exit 0 → 改为 exit 1。
+
+| 检查 | 10-09 22:21 | 22:26 | 22:47（另一会话） | 10-10 10:3x | 10-10 11:1x | 结论 |
+|---|---|---|---|---|---|---|
+| 空闲无 worker | PASS | PASS | PASS | PASS | PASS | 通过 |
+| gateway RSS <50MB | 20.0 | 22.2 | 21.6 | 29.0 | 21.5 | 通过 |
+| 冷启动首条精修 ≤15s | 16.16 | null | null（首 final 18.08s） | 15.72 | null | **未通过 → TK-008** |
+| 回放后回收 100–150s | 120.9 | 120.5 | 119.8 | 120.5 | 120.8 | 通过 |
+| 断开判定 ≤30s | −0.47（探针 bug） | 0.59 | 0.50 | 中断 | 0.58 | 通过（修后 0.5–0.6s） |
+| 断开后回收 ≤150s | 120.2 | 119.6 | null | 中断 | 120.6 | 通过（4 次中 3 次 ~120s） |
+
+- worker 在 2.3–3.4s 即被拉起，慢在 mini2 首次模型加载/首段出结果（TK-008）。
+- 10:3x 一轮因与功耗测量撞车被协调者中止（只保留前 4 项）。
+- 断开后回收：22:47 那轮 150s 内未见 worker 退出（只读 ps 见其已运行 2m54s），此后 10-10 11:1x 复跑 120.6s 通过，未再复现；记为偶发，若再现并入 TK-008 排查。证据 `/tmp/tk007/crit2_run5.log`（主线 368965c 二进制）。
 
 ## 3. 自动选档
 
-- 检查项：MacBook Air（不满足 P8 门槛）连得上 mini2 时进混合档；停掉 mini2 gateway 后自动退回本机 B、字幕不断；mini2 本机运行 rslite 时走 UDS、无 token、不经网络
-- 命令：TODO（`rslite --mode auto`，观察「本机 / 混合·节点 / 精修中」显示与日志中的选择理由）
-- 证据：TODO
+- **停 gateway 退回本机：通过**（10-10 10:20，`evidence/tk007_crit1_crit3_user_run.log` + `evidence/tk007_crit3_stderr.log`）。`rslite --mode hybrid` 回放 concat5，第 25s `launchctl bootout` mini2 gateway：状态 25.5s 由「混合·mini2」变「本机」，stderr `route fallback failed_node=mini2 … select local reason=no_available_node`；之后本机 final 2–5 与译文持续输出至音频末 65s，rslite 退出 0，188 条事件；句间空档均为 concat5 片段间静音，无丢句。之后已重新 bootstrap，节点 running。
+- 小问题：混合模式下本机 Apple 翻译一次报「翻译失败：Unable to Translate」，随后被节点译文替换，用户不可见。
+- MacBook Air 自动进混合档：所有 hybrid/auto 跑分的路由日志均为 `select node=mini2`（rtt 109–317ms）。
+- mini2 本机走 UDS、无 token、不经网络：TK-005b UDS 冒烟 7/7（TK-005c 合并后 22:36 复跑，含「全程 0 条 TCP 连接」「无 token 字样」）。
 
-## 4. 混合档（concat5，67s 回放）
+## 4. 混合档（concat5，67s）
 
-- 命令（待 TK-005 合并后实跑）：
-  ```bash
-  rslite --mode hybrid --source file:$HOME/projects/rs-mac-native-data/concat5.wav --headless > /tmp/tk007/hybrid.events
-  rslite --mode local  --source file:$HOME/projects/rs-mac-native-data/concat5.wav --headless > /tmp/tk007/b.events
-  venv/bin/python scripts/bench/hybrid_score.py /tmp/tk007/hybrid.events \
-      --refs $HOME/projects/rs-mac-native-data/refs.jsonl --b-events /tmp/tk007/b.events --c-wer 0.026
-  ```
-  `power_compare.sh` 跑完也会留下 `hybrid.events`，可直接评分。
-- 注意：`hybrid_score.py` 假设节点精修行的事件带 `source` 以 `node` 开头，并有 `t0/t1`（P4 客户端时钟）；TK-005 的 headless 输出字段若不同，先对齐脚本再取数。
+- 命令：`bash scripts/bench/hybrid_e2e.sh`（10-09 22:54 采集，原始事件 `scripts/bench/results/hybrid_e2e_20261009_225418/`）；评分器修复后离线重算 `hybrid_score.py --offline-dir …`（863cca0）。
+- 评分器修复要点：真实事件里节点句是 `ev=final, id=null, text="[mini2] …"` 前接 `ev=replace … ids=[..]`，旧评分器靠不存在的 `source` 字段 → C/混合 WER 被算成 1.0。
 
 | 指标 | RFC 要求 | 实测 | 结论 |
 |---|---|---|---|
-| 首字时间 | 不慢于 B | TODO | TODO |
-| 最终文本 WER | ≤ C + 1pp（C 基线 2.6% → ≤ 3.6%） | TODO | TODO |
-| 精修延迟中位数 | ≤ 4 s | TODO | TODO |
-| 不重复、不丢句 | 无 | TODO | TODO |
+| 首字时间 | 不慢于 B | 混合 5.189s / B 5.177s | 字面 FAIL（差 12ms，两者首字都来自本机识别，属测量噪声；未放宽判据） |
+| 最终文本 WER | ≤ C + 1pp | 0.193 / C 0.193 | 字面 PASS，**但无意义**：rslite 无纯节点模式，C 只能用 `--mode auto`，在本机 ≈ 混合 |
+| 精修到达中位数 | ≤ 4s | 5.30s（6 条节点 final） | **FAIL**（节点速度，与 TK-008 同源） |
+| 不重复不丢句 | 无 | 评分器报 0/0 | **实际有重复**，见下 |
 
-- 评分脚本已用 B 档历史数据（`rslite_fast2.jsonl`，5 句、无节点行）验证能跑通：最终 WER 0.0789（与基线 7.9% 一致）；该数据没有节点行，所以精修延迟为 n/a。
-- **2026-10-09 静态/单测门：** `bash -n scripts/bench/hybrid_e2e.sh` = 0；`~/projects/rs-mac-venv/bin/python -m pytest -q tests/test_bench_hybrid_score.py -p no:cacheprovider` = **6 passed**。这只能证明脚本解析与计分单测，不代表真实 B/C/混合跑分；真实指标仍 TODO，安排在 TK-005c 合并后主线 pytest 和全局 rslite 串行资源释放之后。
+- **TK-010（产品缺陷）**：第 2 句本机识别为一整句（21.12–28.56），节点拆成两句（21.2–23.7、24.08–27.66），各自覆盖本机句 34%/48% < 50% 门槛 → `replaced=0` → 本机句与两条节点句同时可见。混合档 WER 0.193 高于 B 的 0.079 主要来自这条重复；节点识别本身更准（如第 4 句与参考一致而本机有错）。评分器的重复检测没识别这种时间重叠型重复，修 TK-010 时一并补。
 
 ## 5. 多节点路由
 
-- 检查项：mini2 + 本机模拟的第二节点；更优节点上线后在静音点迁移、下线后退回；字幕不断不重复；选择理由在日志可见
-- 命令：
-  ```bash
-  # 生成带静音点的德语测试音频（约 105s）
-  say -v Anna "Guten Tag. [[slnc 1000]] Dies ist ein Test. [[slnc 1000]] Für das Echtzeit-Untertitel-System. [[slnc 1000]] Wir prüfen die Mehrknoten-Routing-Funktionalität. [[slnc 1000]] Der erste Knoten hat eine langsamere Erkennung. [[slnc 1000]] Der zweite Knoten ist schneller und kommt später online. [[slnc 1000]] Danach geht der zweite Knoten wieder offline. [[slnc 1000]] Und wir fallen zurück auf den ersten Knoten. [[slnc 1000]] Das System soll nahtlos im Stille-Punkt migrieren. [[slnc 1000]] Ohne Text-Wiederholungen oder Verluste. [[slnc 1000]] Wir wiederholen den Text mehrmals. [[slnc 1000]] Guten Tag. [[slnc 1000]] Dies ist ein Test. [[slnc 1000]] Für das Echtzeit-Untertitel-System. [[slnc 1000]] Wir prüfen die Mehrknoten-Routing-Funktionalität. [[slnc 1000]] Der erste Knoten hat eine langsamere Erkennung. [[slnc 1000]] Der zweite Knoten ist schneller. [[slnc 1000]] Und kommt später online. [[slnc 1000]] Danach geht der zweite Knoten wieder offline. [[slnc 1000]] Und wir fallen zurück. [[slnc 1000]] Auf den ersten Knoten. [[slnc 1000]] Das System soll nahtlos migrieren. [[slnc 1000]] Ohne Wiederholungen. [[slnc 1000]] Oder Verluste. [[slnc 1000]] Noch eine Runde. [[slnc 1000]] Guten Tag. [[slnc 1000]] Dies ist ein Test. [[slnc 1000]] Für das System. [[slnc 1000]] Wir prüfen das Routing. [[slnc 1000]] Erster Knoten langsam. [[slnc 1000]] Zweiter Knoten schnell. [[slnc 1000]] Zweiter geht offline. [[slnc 1000]] Zurück zum ersten. [[slnc 1000]] Migriert im Stille-Punkt. [[slnc 1000]] Keine Wiederholungen. [[slnc 1000]] Keine Verluste." -o /tmp/german_test.aiff
-  afconvert -f WAVE -d LEI16@16000 -c 1 /tmp/german_test.aiff /tmp/german_test.wav
-  
-  # 运行验收探针（自动起两个假网关、模拟节点上下线、跑 rslite --mode auto）
-  uv run python scripts/bench/multi_node_probe.py
-  ```
-- 判定（脚本自动输出 PASS/FAIL 与汇总 JSON）：
-  - `rslite exit code 0`：rslite 正常跑完整个回放
-  - `Token A not in output` / `Token B not in output`：token 未泄露到 stdout/stderr/gateway 日志
-  - `Routing select logs fully match regex with all fields`：整行正则匹配 `rslite.route select node=<id> score=<n> quality=<n> speed=<n> penalties=<n> bonus=<n> rtt_ms=<n>`
-  - `Migration preceded by at least two consecutive select node=node-b`：连续两次打分领先才触发迁移
-  - `stdout contains status '混合·node-b'` 与静音窗判定：状态事件 t 落在 WAV 中 ≥0.6s 静音窗
-  - `Old session (Node A) received drain and emitted drained`：旧会话在静音点完成 drain 并回 drained
-  - `Node B first final t0 is not earlier than silence point start`：新会话首句不早于该静音点
-  - `Fallback failed_node=node-b is followed by select node=node-a`：节点下线后出现 fallback 并在其后重新 select node-a
-  - `Node A final after fallback has t0 later than last Node B final`：回退后有 t0 晚于最后一条 B 句的 A final
-  - `Node B finals count corresponds to active window`：B 的条数与在线窗口相符
-  - `Node sentences follow time order Phase A -> Phase B -> Phase A`：节点句严格遵循 A 段→B 段→A 段时序
-  - `Visible subtitle track not empty and no replaced local sentences remain`：可见字幕轨非空，读 ev=replace 被替换本机句不得保留在可见轨
-  - `Visible subtitle track has strictly unique text` / `Visible local IDs strictly increasing` / `Node sentences do not overlap in t0/t1`：字幕严格无重复
-  - `Timeline coverage has no gap exceeding silence threshold + switch budget`：整段音频无超预算间隙
-  - `No switch_failed in stderr`：无切换失败
-  - 末尾汇总 JSON 含 `checks_passed`/`checks_failed`/`node_a_finals`/`node_b_finals`/`visible_lines` 等字段
-- **2026-10-09 Grok R2：request-changes，未通过验收。**评审结果 `/tmp/tk007/grok_multinode_r2.md`（末行 `GROKDONE`）；虽然旧实现自报 20/20，F1/F2/F3/F5 未修好、F4/F6/F7 已修好。新增 F8 blocker（`t` 进程墙钟与 `t0` 音频轴混用，且迁移窗、首句窗是两个独立搜索）及 F9–F13 major（在线窗口自证、片头片尾丢句漏测、A→B→A 到达序混淆、可见轨不遵守 `LineStore`、drain/selection 因果次序无证据），F14/F15 minor。已创建隔离 lane `feat/tk-007-r2fix` 修验收探针，**修复与第三方复审前不能认定多节点迁移已通过**。
+- 命令：`python scripts/bench/multi_node_probe.py`（用仓库 venv；两个假 gateway + 真 rslite `--mode auto`）。判定在 `scripts/bench/multi_node_verify.py`，可对录下的运行离线重放。
+- 评审：grok R1（F1–F7）→ R2 request-changes（F8 blocker：墙钟 t 与音频轴 t0 混用）→ agy 修 → grok R3 request-changes（agy 删了 token 泄漏检查与 hello 清零）→ codex 修 → 协调者真机复核并修一行（`global_seg` 跨会话保留，否则 A→B→A 后节点句文字重复）。合并 336cc4e。
+- **真机结果：23/24，连续 4 次一致**。通过项含：路由日志整行字段齐全、连续两次领先才迁移、迁移点（A 尾句 t1 = B 首句 t0 = 57.8）落在同一扇静音窗、旧会话 drain、下线 fallback 后重新选 A、A→B→A 时序、节点句不重叠且文字唯一、全程覆盖无 >4s 空档、token 不出现在任何输出。
+- 唯一 FAIL「本机句不重叠」→ **TK-009**：本机句 t0 停在段首不前进（例：id 24/25/26 的 t0 都是 79.38，t1 为 82.7/87.5/90.4），文字各异、显示正常，但区间嵌套会影响 P5 替换判断。
 
 ## 6. 功耗（五组）
 
-- 命令（用户 sudo 执行；测前停掉 A 版和浏览器视频，脚本会检查并拒绝在 A 版/rslite 已运行时开始）：
-  ```bash
-  sudo bash scripts/bench/power_compare.sh ~/projects/rs-mac-native-data/concat5.wav
-  ```
-- 每组约 76 秒（含 8s 收尾），组间冷却 30s；A 版另加 30s 模型预热。建议整套至少重复 2 轮估计噪声。
+详见 `evidence/tk007_crit6_power.md`（含三轮作废记录与原因）。正式一轮（10-10 11:0x，干净）：
 
-| 组 | 平均功耗 (mW) 第 1 轮 | 第 2 轮 | 备注 |
+| 组 | 均值 mW | 标准误 | 相对空闲 |
 |---|---|---|---|
-| 空闲 | TODO | TODO | 基线 1004 |
-| B（rslite 本机） | TODO | TODO | 基线 1124 |
-| C（远程精修，v2 节点） | TODO | TODO | 基线 822（v1）；脚本里用 `--mode auto`，若客户端上与混合无法区分则改为节点侧采样 |
-| A（Python 桌面字幕） | TODO | TODO | 用 afplay 放音频，A 版抓系统声音；afplay 自身有少量播放功耗，其它组不出声 |
-| 混合（rslite --mode hybrid） | TODO | TODO | |
+| 空闲 | 940 | 185 | — |
+| B（rslite 本机） | 1271 | 227 | +331 |
+| C（rslite auto → mini2） | 1406 | 301 | +466 |
+| A（Python 桌面字幕） | 7969 | 712 | **+7029** |
+| 混合（rslite hybrid → mini2） | 336 | 73 | −604 |
 
-- 噪声说明：TODO（两轮之差；已知空闲与 B 仅差 120mW，在噪声以内——差距小于重复测量波动时不下结论）
+- 主结论：A 版比空闲多约 7W；rslite 任一模式比 A 省 6.5–7.5W。
+- B/C/混合都在空闲 ±0.6W 内（1–3 倍标准误），单轮分不出高低；要排序需整套重复 ≥2 轮。A 组用 afplay 外放，含少量播放功耗。
 
 ## 7. 质量门
 
-- 命令：`QT_QPA_PLATFORM=offscreen venv/bin/python -m pytest -q -p no:cacheprovider`；`venv/bin/ruff check .`；`cd macos-native && swift build -c release --product rslite`
-- 检查项：P2 各项上限、S3、S7 有测试覆盖；每个 TK 至少 2 轮评审（鉴权/生命周期/状态机类 3 轮）
-- **2026-10-09 TK-005c 已合入 `feat/macos-native`：merge `938240b`（仅特性分支，未碰 master、未 push）。** Coordinator release build 成功（`/tmp/tk005c/coordinator_build.log`），`rslite --selftest` = `SELFTEST OK`，UDS 冒烟 **7/7 PASS**（`/tmp/tk005c/coordinator_uds_smoke.log`）；Grok R1 和 Codex R2 均审 `approve` / 0 finding（`/tmp/tk005c/{grok_review_r1,codex_review_r2}.md`）。TK-005 24 项冒烟是 **21/24**，静默断网缺 30s 内 fallback、fallback 原因日志和恰好一次 fallback 证明；**同一脚本对未修改基线 `e150b92` 复跑同样 21/24、同样三项 FAIL**（`/tmp/tk005c/coordinator_tk005_baseline.log`），属于已知共同验收缺口而非已证明的 TK-005c 回归，保留后续诊断/修复；不宣称 24/24 PASS。主线合并后全量 pytest 和 ruff 复跑进行中（结果另行补录）。
+- 每 TK ≥2 轮评审：TK-005c = grok R1 approve（0 finding）+ 协调者复核 `close()` 提前放行只作用于 UDS/无会话路径（big-pickle R2 引用不存在的文件，整份驳回）；TK-007 探针 = grok R1/R2/R3 + 协调者真机。
+- 构建：`swift build -c release` + `rslite --selftest` = SELFTEST OK（主线 368965c 前后）。
+- bench 测试：`tests/test_bench_{multi_node_probe,hybrid_score,hybrid_e2e}.py` 共 15 passed。
+- **既有缺口**：TK-005 冒烟 21/24（静默断网 30s 内 fallback、fallback 原因日志、恰好一次 fallback 三项），对 TK-005c 合并前基线 `e150b92` 复跑同样 21/24——不是回归，未修。
+- 全量 pytest：见 Sprint 收尾记录（CURSOR）。
 
 ## 8. 文档
 
-- 检查项：`CLAUDE.md` 第 7 节新增避坑条目；README 说明用法；`docs/protocol-v2.md` 写清与 v1 的差异（TK-006）
-- 证据：TODO
+- `CLAUDE.md` 第 7 节第 14–23 条（节点架构、MLX 单线程、rslite 同步 main、1005/1013、悬空软链接、LaunchAgent 需登录、单实例、A/B 互扰、Tailscale GUI 模式、pgrep 互杀）；`docs/protocol-v2.md`（TK-006）。
 
 ## 不达标项与后续
 
-TODO（不达标的要么回对应 TK 修，要么在此写明原因与后续计划）
+| TK | 问题 | 来源 |
+|---|---|---|
+| TK-008 | 冷启动首条精修 >15s；精修中位 5.3s >4s | 第 2、4 条 |
+| TK-009 | 本机句 t0 不随句前进，区间嵌套 | 第 5 条 |
+| TK-010 | 节点拆句时 P5 不替换 → 字幕重复；评分器补时间重叠型重复检测 | 第 4 条 |
+| — | TK-005 冒烟 21/24（静默断网 fallback 三项） | 第 7 条，既有 |
+| — | `--local` 真机、mini2 重启自启、功耗第 2 轮、C 纯节点基线 | 未验项 |
