@@ -110,7 +110,7 @@ enum SentenceTiming {
             }
             let b = a + needle.count
             cursor = b
-            let hit = spans.filter { $0.end > a && $0.start < b }
+            let hit = spans.compactMap { clippedTime($0, toStart: a, end: b) }
             guard let t0 = hit.map(\.t0).min(), let t1 = hit.map(\.t1).max() else {
                 return nil
             }
@@ -118,7 +118,24 @@ enum SentenceTiming {
         }
     }
 
-    private static func find(_ needle: [Character], in haystack: [Character], from: Int) -> Int? {
+    private static func clippedTime(_ span: TimedSpan, toStart start: Int, end: Int) -> (t0: Double, t1: Double)? {
+        let clippedStart = max(start, span.start)
+        let clippedEnd = min(end, span.end)
+        guard clippedEnd > clippedStart, span.end > span.start else {
+            return nil
+        }
+        let ratio0 = Double(clippedStart - span.start) / Double(span.end - span.start)
+        let ratio1 = Double(clippedEnd - span.start) / Double(span.end - span.start)
+        let duration = span.t1 - span.t0
+        let t0 = span.t0 + duration * ratio0
+        let t1 = span.t0 + duration * ratio1
+        guard t0.isFinite, t1.isFinite else {
+            return nil
+        }
+        return (t0, t1)
+    }
+
+    fileprivate static func find(_ needle: [Character], in haystack: [Character], from: Int) -> Int? {
         guard !needle.isEmpty, haystack.count >= needle.count else {
             return nil
         }
@@ -171,11 +188,7 @@ struct LineStore {
         // 本机行直接丢弃——LineStore 没有独立的历史区，节点行已经是这一时段的权威文本，
         // 追加会造成顺序颠倒且同一句显示两遍（applyNode 的替换只发生在节点行到达那一刻）。
         // 之后对该 key 的 setTranslation 找不到行，自然忽略。
-        let coveredByNode = lines.contains { existing in
-            guard case .node = existing.source else { return false }
-            return Self.shouldReplace(line, byNodeT0: existing.t0, t1: existing.t1)
-        }
-        if coveredByNode {
+        if Self.shouldReplace(line, byNodeIntervals: Self.nodeIntervals(in: lines)) {
             return
         }
         insert(line)
@@ -194,26 +207,77 @@ struct LineStore {
     mutating func applyNode(
         nodeID: String, t0: Double?, t1: Double?, srcText: String, dstText: String?
     ) -> [Int] {
-        let replaced = lines.filter { Self.shouldReplace($0, byNodeT0: t0, t1: t1) }.map(\.key)
-        lines.removeAll { replaced.contains($0.key) }
         let key = nextNodeKey
         nextNodeKey -= 1
         insert(SubtitleLine(key: key, t0: t0, t1: t1, source: .node(nodeID), srcText: srcText, dstText: dstText))
+        let intervals = Self.nodeIntervals(in: lines)
+        let replaced = lines.filter { Self.shouldReplace($0, byNodeIntervals: intervals) }.map(\.key)
+        let replacedSet = Set(replaced)
+        lines.removeAll { line in
+            line.source == .local && replacedSet.contains(line.key)
+        }
         return replaced
     }
 
     /// 只有带时间的本机行才可能被替换；节点行永远不会被再次替换。
     static func shouldReplace(_ line: SubtitleLine, byNodeT0 n0: Double?, t1 n1: Double?) -> Bool {
-        guard line.source == .local, let n0, let n1,
-              let l0 = line.t0, let l1 = line.t1 else {
+        guard let n0, let n1 else {
+            return false
+        }
+        return shouldReplace(line, byNodeIntervals: [(n0, n1)])
+    }
+
+    /// 当前 store 内所有节点行的时间并集覆盖本机行达到阈值时替换。
+    /// 单条节点句仍走同一 helper，因此 001 的 P5 口径不变；TK-010 只是把多个节点句的覆盖累加。
+    private static func shouldReplace(_ line: SubtitleLine, byNodeIntervals intervals: [(Double, Double)]) -> Bool {
+        guard line.source == .local, let l0 = line.t0, let l1 = line.t1 else {
             return false
         }
         let duration = max(l1 - l0, 0)
         if duration <= epsilon {
-            return l0 >= n0 - epsilon && l0 <= n1 + epsilon
+            return intervals.contains { n0, n1 in
+                l0 >= n0 - epsilon && l0 <= n1 + epsilon
+            }
         }
-        let overlap = min(l1, n1) - max(l0, n0)
+        let overlap = coveredDuration(of: (l0, l1), by: intervals)
         return overlap >= duration * replaceRatio - epsilon
+    }
+
+    private static func nodeIntervals(in lines: [SubtitleLine]) -> [(Double, Double)] {
+        lines.compactMap { line in
+            guard case .node = line.source, let t0 = line.t0, let t1 = line.t1,
+                  t0.isFinite, t1.isFinite, t1 >= t0 else {
+                return nil
+            }
+            return (t0, t1)
+        }
+    }
+
+    private static func coveredDuration(of local: (Double, Double), by intervals: [(Double, Double)]) -> Double {
+        let clipped = intervals.compactMap { n0, n1 -> (Double, Double)? in
+            let start = max(local.0, n0)
+            let end = min(local.1, n1)
+            return end > start ? (start, end) : nil
+        }.sorted { left, right in
+            if abs(left.0 - right.0) <= epsilon {
+                return left.1 < right.1
+            }
+            return left.0 < right.0
+        }
+        guard var current = clipped.first else {
+            return 0
+        }
+        var total = 0.0
+        for interval in clipped.dropFirst() {
+            if interval.0 <= current.1 + epsilon {
+                current.1 = max(current.1, interval.1)
+            } else {
+                total += current.1 - current.0
+                current = interval
+            }
+        }
+        total += current.1 - current.0
+        return total
     }
 
     /// 本机行一律按到达顺序追加（Pipeline 自己保证顺序，且可能没有时间）；
@@ -243,6 +307,33 @@ struct LineStore {
             if !ok { failures.append(name) }
         }
         func keys(_ s: LineStore) -> [Int] { s.lines.map(\.key) }
+
+        // TK-009：Speech 的 audioTimeRange 可能覆盖从段首到当前句尾的宽区间；
+        // 句子时间必须取与句子字符区间相交后的时间，而不是直接沿用宽 span 的段首 t0。
+        do {
+            let text = "Erster Satz. Zweiter Satz. Dritter Satz."
+            let sentences = SentenceCommitter.split(text)
+            let chars = Array(text)
+            if let a0 = SentenceTiming.find(Array(sentences[0]), in: chars, from: 0),
+               let a1 = SentenceTiming.find(Array(sentences[1]), in: chars, from: a0 + sentences[0].count),
+               let a2 = SentenceTiming.find(Array(sentences[2]), in: chars, from: a1 + sentences[1].count) {
+                let b0 = a0 + sentences[0].count
+                let b1 = a1 + sentences[1].count
+                let b2 = a2 + sentences[2].count
+                let times = SentenceTiming.times(for: sentences, in: text, spans: [
+                    TimedSpan(start: 0, end: b0, t0: 79.38, t1: 82.70),
+                    TimedSpan(start: 0, end: b1, t0: 79.38, t1: 87.50),
+                    TimedSpan(start: 0, end: b2, t0: 79.38, t1: 90.40),
+                ])
+                check(times.count == 3 && times.allSatisfy { $0 != nil }, "TK-009 宽 span 应能算出三句时间")
+                if times.count == 3, let t0 = times[0], let t1 = times[1], let t2 = times[2] {
+                    check(t1.t0 > t0.t0 && t2.t0 > t1.t0, "TK-009 后续句 t0 应随句子前进")
+                    check(t0.t0 < t0.t1 && t1.t0 < t1.t1 && t2.t0 < t2.t1, "TK-009 每句时间应保持正时长")
+                }
+            } else {
+                check(false, "TK-009 复现文本应能定位三句")
+            }
+        }
 
         // 刚好 50%：本机 [0,10]，节点 [5,20] 重叠 5 = 50% -> 替换
         do {
@@ -321,6 +412,35 @@ struct LineStore {
             s.addLocal(key: 2, t0: 5.01 - 10, t1: 5.01, text: "b") // 重叠 0.01 -> 保留
             s.addLocal(key: 3, t0: nil, t1: nil, text: "c") // 无时间 -> 保留
             check(s.lines.count == 3, "节点先到：未被覆盖/无时间的本机行应保留")
+        }
+        // TK-010：节点把一句本机句拆成两句；单条都不足 50%，累计覆盖达标后替换本机句。
+        do {
+            var s = LineStore()
+            s.addLocal(key: 1, t0: 0, t1: 10, text: "local")
+            let first = s.applyNode(nodeID: "n", t0: 0, t1: 3.4, srcText: "part1", dstText: nil)
+            check(first.isEmpty && s.lines.contains { $0.key == 1 }, "TK-010 第一条拆分节点不足50%不应替换")
+            let second = s.applyNode(nodeID: "n", t0: 4.2, t1: 9.0, srcText: "part2", dstText: nil)
+            check(second == [1], "TK-010 第二条到达后累计覆盖应替换本机句")
+            check(!s.lines.contains { $0.key == 1 } && s.lines.filter {
+                if case .node = $0.source { return true }
+                return false
+            }.count == 2, "TK-010 替换后应保留两条节点句")
+        }
+        // TK-010：累计仍低于 50% 时不替换。
+        do {
+            var s = LineStore()
+            s.addLocal(key: 1, t0: 0, t1: 10, text: "local")
+            s.applyNode(nodeID: "n", t0: 0, t1: 2.0, srcText: "part1", dstText: nil)
+            let second = s.applyNode(nodeID: "n", t0: 3.0, t1: 4.9, srcText: "part2", dstText: nil)
+            check(second.isEmpty && s.lines.contains { $0.key == 1 }, "TK-010 累计低于50%不应替换")
+        }
+        // TK-010：节点先到时，后到本机句也按节点并集覆盖判定丢弃。
+        do {
+            var s = LineStore()
+            s.applyNode(nodeID: "n", t0: 0, t1: 3.4, srcText: "part1", dstText: nil)
+            s.applyNode(nodeID: "n", t0: 4.2, t1: 9.0, srcText: "part2", dstText: nil)
+            s.addLocal(key: 1, t0: 0, t1: 10, text: "local")
+            check(!s.lines.contains { $0.key == 1 }, "TK-010 节点先到累计覆盖时本机句应丢弃")
         }
         return failures
     }
