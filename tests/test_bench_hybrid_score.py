@@ -24,6 +24,10 @@ def node(t, text, t0, t1):
     return ev("final", t, text, t0=t0, t1=t1, source="node:mini2")
 
 
+def real_node(t, text, t0, t1):
+    return ev("final", t, f"[mini2] {text}", id=None, t0=t0, t1=t1)
+
+
 def test_node_replaces_overlapping_local_lines():
     events = [
         ev("volatile", 1.0, "Hal"),
@@ -39,6 +43,32 @@ def test_node_replaces_overlapping_local_lines():
     assert r["refine_median_s"] == pytest.approx(3.8)
     assert not r["problems"]
     assert all(v for v in r["checks"].values())
+
+
+def test_real_headless_replace_ids_drive_node_replay():
+    events = [
+        local(4.0, "Hallo lokale Welt", 0.0, 3.0) | {"id": 1},
+        local(7.0, "wie geht es", 3.2, 6.0) | {"id": 2},
+        ev("replace", 7.5, "P5 node=mini2 replaced=1 ids=[1]", id=None, t0=0.0, t1=3.1),
+        real_node(7.6, "Hallo Welt", 0.0, 3.1),
+        ev("translation", 7.6, "[mini2] Hallo Welt zh", id=None),
+    ]
+    r = hs.score(events, REFS, b_events=[ev("volatile", 1.0, "Hal")], c_wer=0.0)
+    assert [ln["text"] for ln in hs.replay_lines(events)] == ["Hallo Welt", "wie geht es"]
+    assert r["node_lines"] == 1
+    assert r["problems"] == []
+
+
+def test_real_node_first_drops_later_covered_local_line():
+    events = [
+        ev("replace", 7.5, "P5 node=mini2 replaced=0 ids=[]", id=None, t0=0.0, t1=3.1),
+        real_node(7.6, "Hallo Welt", 0.0, 3.1),
+        local(8.0, "Hallo Welt", 0.0, 3.0) | {"id": 1},
+    ]
+    lines = hs.replay_lines(events)
+    assert len(lines) == 1
+    assert lines[0]["node"] is True
+    assert hs.check_integrity(lines, ["hallo welt"]) == []
 
 
 def test_uncovered_local_line_is_kept():
