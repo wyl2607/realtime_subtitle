@@ -848,7 +848,7 @@ for line in sys.stdin:
     if req["op"] == "status":
         print(json.dumps({{"id": req["id"], "status": "installed"}}), flush=True)
         continue
-    open({marker!r}, "w").write("translate")
+    open({marker!r}, "w", encoding="utf-8").write("translate")
     print("kaputt " + SECRET, flush=True)                      # 非 JSON 行
     print(SECRET, file=sys.stderr, flush=True)                 # helper 自己的 stderr
     print(json.dumps({{"id": req["id"], "error": SECRET}}), flush=True)  # error 字段
@@ -1110,7 +1110,9 @@ def test_session_end_creates_state_file_with_session_rtf(tmp_path):
 
 def test_next_hello_also_ends_session_and_blends_with_old(tmp_path):
     (tmp_path / info_mod.ASR_STATE_FILENAME).write_text(
-        json.dumps({"model": "m0", "backend": "b0", "rtf": 0.8, "translator": "apple"}))
+        json.dumps({"model": "m0", "backend": "b0", "rtf": 0.8, "translator": "apple"}),
+        encoding="utf-8",
+    )
     # 第一会话由第二条 hello 结束；第二会话只有 hello，没音频 → 不再更新
     stream = speech_session(3) + hello()
     _, w, _ = run_rtf(stream, tmp_path, cost=0.5)
@@ -1124,7 +1126,7 @@ def test_next_hello_also_ends_session_and_blends_with_old(tmp_path):
 @pytest.mark.parametrize("old", ['not json', '[]', '{"rtf": -1}', '{"rtf": "0.3"}',
                                  '{"rtf": true}', '{"rtf": NaN}', '{}'])
 def test_invalid_old_value_is_overwritten_by_session_rtf(tmp_path, old):
-    (tmp_path / info_mod.ASR_STATE_FILENAME).write_text(old)
+    (tmp_path / info_mod.ASR_STATE_FILENAME).write_text(old, encoding="utf-8")
     _, w, _ = run_rtf(speech_session(3), tmp_path, cost=0.5)
     session = 0.5 * len(w.seg_durations) / sum(w.seg_durations)
     assert read_state(tmp_path)["rtf"] == pytest.approx(session, abs=1e-3)
@@ -1132,10 +1134,10 @@ def test_invalid_old_value_is_overwritten_by_session_rtf(tmp_path, old):
 
 def test_session_shorter_than_threshold_does_not_update(tmp_path):
     path = tmp_path / info_mod.ASR_STATE_FILENAME
-    path.write_text(json.dumps({"rtf": 0.8}))
+    path.write_text(json.dumps({"rtf": 0.8}), encoding="utf-8")
     _, w, err = run_rtf(speech_session(1, speech_s=2.0), tmp_path)
     assert sum(w.seg_durations) < worker_mod.RTF_MIN_AUDIO_S
-    assert json.loads(path.read_text()) == {"rtf": 0.8}
+    assert json.loads(path.read_text(encoding="utf-8")) == {"rtf": 0.8}
     assert "rtf_skipped" in err
     # 没有旧文件时也不凭空创建
     other = tmp_path / "other"
@@ -1160,7 +1162,8 @@ def test_state_file_has_no_transcript_text_and_is_0600(tmp_path):
     raw = path.read_text(encoding="utf-8")
     assert SECRET_SRC not in raw and SECRET_DST not in raw
     assert set(json.loads(raw)) == {"model", "backend", "rtf", "translator"}
-    assert (path.stat().st_mode & 0o777) == 0o600
+    if sys.platform != "win32":
+        assert (path.stat().st_mode & 0o777) == 0o600
     assert SECRET_SRC not in err and SECRET_DST not in err
     # 不留临时文件
     assert [p.name for p in tmp_path.iterdir()] == [info_mod.ASR_STATE_FILENAME]
@@ -1177,7 +1180,9 @@ def test_gateway_info_reader_reads_back_what_worker_wrote(tmp_path):
 
 def _write_old_state(d, translator):
     (d / info_mod.ASR_STATE_FILENAME).write_text(json.dumps(
-        {"model": "m0", "backend": "b0", "rtf": 0.8, "translator": translator}))
+        {"model": "m0", "backend": "b0", "rtf": 0.8, "translator": translator}),
+        encoding="utf-8",
+    )
 
 
 def test_session_translator_overrides_stale_old_value(tmp_path):
@@ -1203,7 +1208,7 @@ def test_hello_with_new_pair_finishes_old_session_before_swapping_translator(tmp
             return tr
         # 第二会话的翻译器是在第一会话收口之后才构造的：此刻文件应已写好
         path = tmp_path / info_mod.ASR_STATE_FILENAME
-        seen.append(json.loads(path.read_text())["translator"] if path.exists() else None)
+        seen.append(json.loads(path.read_text(encoding="utf-8"))["translator"] if path.exists() else None)
         tr = FakeTr()
         tr.name = "ollama:x"
         return tr
@@ -1230,7 +1235,10 @@ def test_failed_translator_construction_keeps_old_valid_value(tmp_path):
 def test_no_old_value_and_no_translator_writes_default(tmp_path):
     def boom(s, d):
         raise RuntimeError("no language pack")
-    (tmp_path / info_mod.ASR_STATE_FILENAME).write_text(json.dumps({"rtf": 0.8}))
+    (tmp_path / info_mod.ASR_STATE_FILENAME).write_text(
+        json.dumps({"rtf": 0.8}),
+        encoding="utf-8",
+    )
     run_rtf(speech_session(3), tmp_path, factory=boom)
     assert read_state(tmp_path)["translator"] == info_mod.DEFAULT_TRANSLATOR
     _, translator = info_mod.NodeInfo(state_dir=tmp_path).asr_and_translator()

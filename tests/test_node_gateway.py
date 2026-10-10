@@ -35,6 +35,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 TOKEN = "tok-S7-secret-value-9f3a"
 FEATURE = "ZXQ-FEATURE-STRING-7731"  # 假 worker 吐出的「正文」，任何日志里都不许出现
 HELLO = {"type": "hello", "v": 2, "src": "de", "dst": "zh", "sample_rate": 16000, "format": "s16le"}
+IS_WIN = sys.platform == "win32"
 
 _quiet = logging.getLogger("test.client")
 _quiet.setLevel(logging.CRITICAL)
@@ -45,7 +46,7 @@ FAKE_WORKER = textwrap.dedent(
     import json, os, signal, sys, time
     mode, rec = sys.argv[1], sys.argv[2]
     def record(s):
-        with open(rec, "a") as f:
+        with open(rec, "a", encoding="utf-8") as f:
             f.write(s + "\\n")
     record("start %d" % os.getpid())
     if mode == "ignore-term":
@@ -90,7 +91,7 @@ FAKE_WORKER = textwrap.dedent(
 # ------------------------------------------------------------------ 脚手架
 
 def _rec_lines(rec: Path) -> list[str]:
-    return rec.read_text().splitlines() if rec.exists() else []
+    return rec.read_text(encoding="utf-8").splitlines() if rec.exists() else []
 
 
 def _starts(rec: Path) -> list[int]:
@@ -111,6 +112,16 @@ async def wait_session_freed(gw: Gateway, timeout: float = 5.0) -> None:
 
 
 def _alive(pid: int) -> bool:
+    if IS_WIN:
+        out = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+        return out.returncode == 0 and str(pid) in out.stdout
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -128,7 +139,7 @@ def make_dir(tmp_path: Path) -> Path:
 @contextlib.asynccontextmanager
 async def running(tmp_path: Path, mode: str = "echo", **kw):
     script = tmp_path / "fake_worker.py"
-    script.write_text(FAKE_WORKER)
+    script.write_text(FAKE_WORKER, encoding="utf-8")
     rec = tmp_path / "worker.rec"
     kw.setdefault("resolve_host", lambda: "127.0.0.1")
     kw.setdefault("allow_non_tailscale_for_tests", True)  # 测试在 127.0.0.1 上监听
@@ -155,6 +166,8 @@ def tcp_connect(gw: Gateway, token: str | None = TOKEN):
 
 
 def uds_connect(gw: Gateway):
+    if IS_WIN:
+        return tcp_connect(gw)
     return unix_connect(str(gw.uds_path), "ws://localhost/v2/session", logger=_quiet)
 
 
@@ -496,6 +509,7 @@ def test_tcp_auth_info_and_session(tmp_path):
     asyncio.run(scenario())
 
 
+@pytest.mark.skipif(IS_WIN, reason="Windows 网关不启用 UDS；本机免 token 语义只存在于 Unix domain socket")
 def test_uds_needs_no_token(tmp_path):
     async def scenario():
         async with running(tmp_path) as (gw, rec):
@@ -522,7 +536,7 @@ LONG_TOKEN = "k" * 40
 
 def _token_file(tmp_path, text, mode=0o600):
     f = tmp_path / "token"
-    f.write_text(text)
+    f.write_text(text, encoding="utf-8")
     f.chmod(mode)
     return f
 
@@ -563,6 +577,7 @@ def test_second_session_gets_1013(tmp_path):
 
 # ------------------------------------------------------------------ 要求 4：UDS（S3）
 
+@pytest.mark.skipif(IS_WIN, reason="Windows 网关不启用 UDS，且 chmod/uid 所有权检查没有 POSIX 等价语义")
 def test_uds_dir_must_be_0700_and_owned(tmp_path):
     async def start(uds_dir, **kw):
         gw = Gateway(token=TOKEN, uds_dir=uds_dir, port=0, resolve_host=lambda: "127.0.0.1",
@@ -590,6 +605,7 @@ def test_uds_dir_must_be_0700_and_owned(tmp_path):
         asyncio.run(start(tmp_path / "linkdir"))
 
 
+@pytest.mark.skipif(IS_WIN, reason="Windows 网关不启用 UDS；不会创建 0700 UDS 目录或 0600 socket 路径")
 def test_uds_dir_is_created_0700_when_missing(tmp_path):
     d = tmp_path / "fresh" / "rs-node"
 
@@ -604,6 +620,7 @@ def test_uds_dir_is_created_0700_when_missing(tmp_path):
     asyncio.run(scenario())
 
 
+@pytest.mark.skipif(IS_WIN, reason="Windows 网关不启用 UDS；AF_UNIX socket 路径、symlink 防护和残留 socket 清理是 POSIX 语义")
 def test_uds_socket_path_symlink_and_stale(tmp_path):
     async def start(d):
         gw = Gateway(token=TOKEN, uds_dir=d, port=0, resolve_host=lambda: "127.0.0.1",
@@ -616,20 +633,20 @@ def test_uds_socket_path_symlink_and_stale(tmp_path):
     # symlink：拒绝，且不碰链接指向的目标
     d1 = make_dir(tmp_path)
     victim = tmp_path / "victim"
-    victim.write_text("keep")
+    victim.write_text("keep", encoding="utf-8")
     (d1 / gw_mod.UDS_FILENAME).symlink_to(victim)
     with pytest.raises(GatewayStartError, match="symlink"):
         asyncio.run(start(d1))
-    assert victim.read_text() == "keep"
+    assert victim.read_text(encoding="utf-8") == "keep"
 
     # 普通文件：不是 socket，不删
     d2 = tmp_path / "d2"
     d2.mkdir(mode=0o700)
     d2.chmod(0o700)
-    (d2 / gw_mod.UDS_FILENAME).write_text("not a socket")
+    (d2 / gw_mod.UDS_FILENAME).write_text("not a socket", encoding="utf-8")
     with pytest.raises(GatewayStartError, match="socket"):
         asyncio.run(start(d2))
-    assert (d2 / gw_mod.UDS_FILENAME).read_text() == "not a socket"
+    assert (d2 / gw_mod.UDS_FILENAME).read_text(encoding="utf-8") == "not a socket"
 
     # 残留 socket：清掉后正常启动
     d3 = tmp_path / "d3"
@@ -642,6 +659,7 @@ def test_uds_socket_path_symlink_and_stale(tmp_path):
     assert asyncio.run(start(d3)) is True
 
 
+@pytest.mark.skipif(IS_WIN, reason="Windows 网关不启用 UDS，且没有 os.getuid/SO_PEERCRED peer uid 认证语义")
 def test_uds_peer_uid_mismatch_is_rejected(tmp_path, caplog):
     async def scenario():
         async with running(tmp_path, peer_uid=lambda sock: os.getuid() + 1) as (gw, rec):
@@ -656,6 +674,7 @@ def test_uds_peer_uid_mismatch_is_rejected(tmp_path, caplog):
     assert "peer_uid_rejected" in caplog.text
 
 
+@pytest.mark.skipif(IS_WIN, reason="Windows 网关不启用 UDS，peer uid 读取失败的 fail-closed 路径只属于 POSIX UDS")
 def test_uds_peer_uid_failure_fails_closed(tmp_path):
     def boom(sock):
         raise OSError("no creds")
@@ -1030,7 +1049,7 @@ def test_worker_lifecycle_spawn_keepalive_reuse_reap(tmp_path, monkeypatch):
             await until(lambda: not gw._session_active)
             await until(lambda: gw.worker.pid is None, what="idle reap")
             await until(lambda: not _alive(pid1), what="worker process gone")
-            status, body = await http_get("/v1/info", uds=gw.uds_path)
+            status, body = await http_get("/v1/info", port=gw.tcp_port, token=TOKEN)
             assert body["worker"] == "cold"
             ws = await uds_connect(gw)  # 回收之后再来：重新 spawn
             await hello_ready(ws)
@@ -1040,6 +1059,7 @@ def test_worker_lifecycle_spawn_keepalive_reuse_reap(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+@pytest.mark.skipif(IS_WIN, reason="Windows terminate/kill 不是 POSIX SIGTERM 后再 SIGKILL 的回收模型")
 def test_reap_escalates_to_sigkill(tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(gw_mod, "WORKER_KEEPALIVE_S", 0.2)
     monkeypatch.setattr(gw_mod, "WORKER_KILL_GRACE_S", 0.4)
@@ -1057,6 +1077,7 @@ def test_reap_escalates_to_sigkill(tmp_path, monkeypatch, caplog):
     assert "how=kill" in caplog.text
 
 
+@pytest.mark.skipif(IS_WIN, reason="Windows terminate() 没有可忽略 SIGTERM 的宽限期回收语义")
 def test_new_session_during_reap_waits_and_respawns(tmp_path, monkeypatch):
     monkeypatch.setattr(gw_mod, "WORKER_KEEPALIVE_S", 0.1)
     monkeypatch.setattr(gw_mod, "WORKER_KILL_GRACE_S", 0.6)
@@ -1191,9 +1212,10 @@ class FakeSystem:
 
 def test_info_matches_p1_and_leaks_nothing_raw(tmp_path):
     state = make_dir(tmp_path)
-    (state / "node_id").write_text("node-abc\n")
+    (state / "node_id").write_text("node-abc\n", encoding="utf-8")
     (state / "asr_state.json").write_text(json.dumps(
-        {"model": "whisper-large-v3-turbo", "backend": "mlx", "rtf": 0.08, "translator": "ollama:qwen3.5:4b"}))
+        {"model": "whisper-large-v3-turbo", "backend": "mlx", "rtf": 0.08, "translator": "ollama:qwen3.5:4b"}),
+        encoding="utf-8")
     system = FakeSystem(idle_ns=7_654_321_000)
     info = info_mod.NodeInfo(run=system, state_dir=state)
 
@@ -1203,7 +1225,7 @@ def test_info_matches_p1_and_leaks_nothing_raw(tmp_path):
             raw = await _raw_info(gw)
             ws = await uds_connect(gw)
             await hello_ready(ws)
-            _, busy_body = await http_get("/v1/info", uds=gw.uds_path)
+            _, busy_body = await http_get("/v1/info", port=gw.tcp_port, token=TOKEN)
             await ws.close()
             return status, body, raw, busy_body
 
@@ -1401,9 +1423,12 @@ def test_info_defaults_when_state_files_missing_or_bad(tmp_path):
     assert info.node_id() == ""
     asr, tr = info.asr_and_translator()
     assert asr["rtf"] is None and tr == "apple"
-    (tmp_path / "asr_state.json").write_text("{not json")
+    (tmp_path / "asr_state.json").write_text("{not json", encoding="utf-8")
     assert info.asr_and_translator()[0]["rtf"] is None
-    (tmp_path / "asr_state.json").write_text(json.dumps({"rtf": "fast", "translator": "evil; rm -rf"}))
+    (tmp_path / "asr_state.json").write_text(
+        json.dumps({"rtf": "fast", "translator": "evil; rm -rf"}),
+        encoding="utf-8",
+    )
     asr, tr = info.asr_and_translator()
     assert asr["rtf"] is None and tr == "apple"
 
@@ -1485,6 +1510,7 @@ def test_logs_never_contain_transcripts_or_tokens(tmp_path, caplog, capfd):
 
 # ------------------------------------------------------------------ S-F6：token 文件权限与长度
 
+@pytest.mark.skipif(IS_WIN, reason="Windows token ACL 由安装脚本/icacls 管；POSIX group/other 权限位无意义")
 @pytest.mark.parametrize("mode", [0o640, 0o604, 0o660, 0o644, 0o666, 0o602])
 def test_token_file_with_group_or_other_bits_is_refused(tmp_path, mode):
     f = _token_file(tmp_path, LONG_TOKEN, mode)
@@ -1493,6 +1519,7 @@ def test_token_file_with_group_or_other_bits_is_refused(tmp_path, mode):
     assert LONG_TOKEN not in str(ei.value)
 
 
+@pytest.mark.skipif(IS_WIN, reason="Windows token ACL 由安装脚本/icacls 管；POSIX owner-only 权限位无意义")
 @pytest.mark.parametrize("mode", [0o600, 0o400])
 def test_token_file_owner_only_is_accepted(tmp_path, mode):
     assert gw_mod.load_token(_token_file(tmp_path, LONG_TOKEN, mode)) == LONG_TOKEN
@@ -1523,9 +1550,10 @@ def test_main_refuses_bad_tokens_without_leaking_them(tmp_path, monkeypatch):
         gw_mod.main(["--token-stdin"])
     assert secret not in str(ei.value) and not seen
     loose = _token_file(tmp_path, LONG_TOKEN, 0o644)
-    with pytest.raises(SystemExit) as ei:
-        gw_mod.main(["--token-file", str(loose)])
-    assert LONG_TOKEN not in str(ei.value) and not seen
+    if not IS_WIN:
+        with pytest.raises(SystemExit) as ei:
+            gw_mod.main(["--token-file", str(loose)])
+        assert LONG_TOKEN not in str(ei.value) and not seen
     monkeypatch.setattr(sys, "stdin", io.StringIO(f"  {LONG_TOKEN}  \n"))
     gw_mod.main(["--token-stdin"])
     assert seen == [LONG_TOKEN]
@@ -1640,7 +1668,7 @@ def test_dropped_audio_is_padded_so_worker_clock_matches_client(tmp_path, monkey
                 await ws.send(bytes([i % 100 + 1, 0]) * (frame_bytes // 2))
                 sent += frame_bytes
             await until(lambda: "audio_queue_drop" in caplog.text, what="drops happened")
-            Path(str(rec) + ".gate").write_text("go")  # 放 worker 读
+            Path(str(rec) + ".gate").write_text("go", encoding="utf-8")  # 放 worker 读
             await ws.send(json.dumps({"type": "flush"}))
             statuses, final = [], None
             while final is None:
@@ -1730,7 +1758,7 @@ async def running_real_worker(tmp_path: Path, monkeypatch, load_s: float = 0.0):
     pytest.importorskip("realtime_subtitle.node.segmenter")
     pytest.importorskip("realtime_subtitle.node.engines")
     child = tmp_path / "real_worker_child.py"
-    child.write_text(REAL_WORKER_CHILD)
+    child.write_text(REAL_WORKER_CHILD, encoding="utf-8")
     pkg_root = Path(worker_mod.__file__).resolve().parents[2]  # 真 worker 所在的包根，原样给子进程
     monkeypatch.setenv("FAKE_LOAD_S", str(load_s))
     gw = Gateway(
@@ -1910,12 +1938,13 @@ def test_real_worker_disconnect_during_cold_load_then_new_session_gets_one_own_r
     assert final["text"] == "Hallo Welt." and final["id"] == 1
 
 
+@pytest.mark.skipif(IS_WIN, reason="该回归用 sh、AF_UNIX 和 POSIX SIGKILL 构造旧 worker EOF 竞态，Windows 无等价路径")
 def test_stale_worker_events_and_exit_do_not_leak_into_new_session(tmp_path, monkeypatch, caplog):
     """R3-D1：旧 worker 被 SIGKILL（returncode 已置）但 stdout 被孙进程占住没 EOF 时，
     新会话 spawn 了新 worker；旧读事件协程迟到的 EOF/退出码不得断开新会话。"""
     monkeypatch.setattr(gw_mod, "WORKER_KEEPALIVE_S", 30)
     script = tmp_path / "fake_worker.py"
-    script.write_text(FAKE_WORKER)
+    script.write_text(FAKE_WORKER, encoding="utf-8")
     rec = tmp_path / "worker.rec"
 
     async def scenario():
@@ -1956,6 +1985,7 @@ def test_stale_worker_events_and_exit_do_not_leak_into_new_session(tmp_path, mon
     assert "session_worker_exit" not in caplog.text
 
 
+@pytest.mark.skipif(IS_WIN, reason="Windows terminate() 是 TerminateProcess，不能验证 POSIX SIGTERM 触发 worker 收口 rtf")
 def test_real_worker_keepalive_reap_by_sigterm_still_updates_rtf(tmp_path, monkeypatch):
     """CR-004 F1：gateway 结束会话不发 drain、不关 stdin，保温到期只 SIGTERM 回收；
     最常见路径「一个会话 -> 空闲 -> 回收」也必须把 rtf 落盘。"""
@@ -2024,7 +2054,7 @@ def test_info_in_use_is_bool_not_seconds(tmp_path):
 
     async def scenario():
         async with running(tmp_path, info=ni(idle_ns=59_000_000_000)) as (gw, _rec):
-            status, body = await http_get("/v1/info", uds=gw.uds_path)
+            status, body = await http_get("/v1/info", port=gw.tcp_port, token=TOKEN)
             return status, body
 
     status, body = asyncio.run(scenario())
