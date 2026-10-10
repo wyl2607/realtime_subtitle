@@ -126,7 +126,7 @@ main_win() {
 
     info "[4/9] 部署 HEAD 到 %USERPROFILE%\\rs-node.new ..."
     git -C "${REPO_ROOT}" archive --format=tar HEAD \
-        | win_run 'if exist "%USERPROFILE%\rs-node.new" rmdir /s /q "%USERPROFILE%\rs-node.new" & mkdir "%USERPROFILE%\rs-node.new" && tar -xf - -C "%USERPROFILE%\rs-node.new"' \
+        | win_run '(if exist "%USERPROFILE%\rs-node.new" rmdir /s /q "%USERPROFILE%\rs-node.new") & mkdir "%USERPROFILE%\rs-node.new" && tar -xf - -C "%USERPROFILE%\rs-node.new"' \
         || die "部署失败"
     if [[ -f "${SELFCHECK_WAV_SRC}" ]]; then
         local wav_tmp
