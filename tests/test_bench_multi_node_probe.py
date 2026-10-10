@@ -3,20 +3,12 @@ import struct
 import sys
 import wave
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 
-
-class DummyMock:
-    pass
-
-
-sys.modules["websockets"] = DummyMock()
-sys.modules["websockets.asyncio"] = DummyMock()
-sys.modules["websockets.asyncio.server"] = MagicMock()
-sys.modules["websockets.exceptions"] = MagicMock()
-sys.modules["websockets.exceptions"].ConnectionClosed = Exception
+# 探针 import 了真 gateway；缺 websockets 的环境直接跳过，别往 sys.modules 塞假模块——
+# 那会污染同一进程里后收集的 test_node_gateway 等用例（10-10 全量 pytest 收集即报错）
+pytest.importorskip("websockets.asyncio.server")
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))

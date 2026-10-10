@@ -26,7 +26,6 @@ import struct
 import sys
 import tempfile
 import textwrap
-import time
 import wave
 from pathlib import Path
 
