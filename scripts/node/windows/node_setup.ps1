@@ -56,15 +56,10 @@ function Register-Gateway {
 }
 
 function Ensure-Firewall {
-    $rule = Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue
-    if ($rule) {
-        Set-NetFirewallRule -Name $RuleName -Direction Inbound -Action Allow -Enabled True -Profile Any
-        Get-NetFirewallRule -Name $RuleName | Set-NetFirewallPortFilter -Protocol TCP -LocalPort $Port
-        Get-NetFirewallRule -Name $RuleName | Set-NetFirewallAddressFilter -RemoteAddress '100.64.0.0/10'
-    } else {
-        New-NetFirewallRule -Name $RuleName -DisplayName 'Realtime Subtitle node (Tailscale only)' `
-            -Direction Inbound -Protocol TCP -LocalPort $Port -RemoteAddress '100.64.0.0/10' -Action Allow -Profile Any | Out-Null
-    }
+    # Recreate instead of patching: Set-NetFirewall*Filter does not take a rule from the pipeline here.
+    Remove-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue
+    New-NetFirewallRule -Name $RuleName -DisplayName 'Realtime Subtitle node (Tailscale only)' `
+        -Direction Inbound -Protocol TCP -LocalPort $Port -RemoteAddress '100.64.0.0/10' -Action Allow -Profile Any | Out-Null
 }
 
 switch ($Action) {
