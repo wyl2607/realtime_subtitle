@@ -364,22 +364,6 @@ session_end_count() {
     grep -c 'session_end ' "$1" 2>/dev/null || true
 }
 
-last_session_end_dur() {
-    python3 - "$1" <<'PY'
-import re
-import sys
-
-last = None
-try:
-    text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
-except FileNotFoundError:
-    text = ""
-for m in re.finditer(r"session_end .*?dur_s=([0-9.]+)", text):
-    last = m.group(1)
-print(last or "null")
-PY
-}
-
 read -r r0_workers r0_gateways r0_gateway_rss r0_worker_pids r0_gateway_pids <<EOF
 $(get_proc_stats baseline)
 EOF
@@ -459,7 +443,6 @@ session_end_before=$(session_end_count "$logs_before")
 start_rslite disconnect
 disc_pid=$RSLITE_PID
 disc_sanitizer=$RSLITE_SANITIZER_PID
-disc_start=$(now_s)
 disc_worker_seen_s=null
 disc_worker_status=FAIL
 if disc_present_out=$(wait_worker_present disconnect_present "$COLD_REFINE_LIMIT_S"); then
@@ -473,7 +456,6 @@ wait "$disc_pid" 2>/dev/null || true
 wait "$disc_sanitizer" 2>/dev/null || true
 RSLITE_PID=
 RSLITE_SANITIZER_PID=
-kill_after_start_s=$(calc "${kill_ts} - ${disc_start}")
 
 disconnect_detect_s=null
 disconnect_status=FAIL
@@ -483,12 +465,11 @@ while [ "$i" -le 45 ]; do
     remote_gateway_logs > "$logs_after" || true
     session_end_after=$(session_end_count "$logs_after")
     if [ "$session_end_after" -gt "$session_end_before" ]; then
-        session_dur=$(last_session_end_dur "$logs_after")
-        if [ "$session_dur" != "null" ]; then
-            disconnect_detect_s=$(calc "${session_dur} - ${kill_after_start_s}")
-            if float_ge "$disconnect_detect_s" 0 && float_le "$disconnect_detect_s" "$DISCONNECT_LIMIT_S"; then
-                disconnect_status=PASS
-            fi
+        # 上界：kill 到本机轮询看到 session_end 的时间（含 ssh 往返与轮询间隔）。
+        # 不用 gateway 会话时长减本机启动时长：两者起点差一段建连时间，会算出负数。
+        disconnect_detect_s=$(calc "$(now_s) - ${kill_ts}")
+        if float_le "$disconnect_detect_s" "$DISCONNECT_LIMIT_S"; then
+            disconnect_status=PASS
         fi
         break
     fi
@@ -531,3 +512,4 @@ printf '{"ok":%s,"idle_no_worker":%s,"idle_worker_count":%s,"gateway_rss_ok":%s,
     "$(json_bool "$disconnect_reap_status")" \
     "$(json_num "$disconnect_worker_exit_s")" \
     "$RUN_DIR"
+[ "$overall" = PASS ] || exit 1
