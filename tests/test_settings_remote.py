@@ -87,7 +87,8 @@ def test_cloud_key_is_write_only_and_defaults_on(cfg, monkeypatch):
     win._on_save_groq_key()
     key_path = cfg / "groq.key"
     assert key_path.read_text(encoding="utf-8").strip() == FAKE_KEY
-    assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
+    if sys.platform != "win32":  # Windows 上权限靠 icacls，没有 POSIX 模式位
+        assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
     assert list(cfg.glob(".*.tmp")) == []
     assert win.groq_key_edit.text() == ""
     assert "已保存" in win.groq_key_edit.placeholderText()

@@ -435,6 +435,7 @@ def test_key_path_posix_and_windows(monkeypatch, tmp_path):
     monkeypatch.setenv("GROQ_API_KEY", ENV_KEY)
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Windows 上 Path.home() 读的是它
     assert groq_key_path() == tmp_path / ".config" / "realtime_subtitle" / "groq.key"
     assert config_dir() == tmp_path / ".config" / "realtime_subtitle"
     assert read_groq_key(tmp_path / "missing.key") is None

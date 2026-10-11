@@ -152,7 +152,8 @@ def test_pushclient_idempotent_when_icacls_exists(tmp_path):
         pytest.skip("需要 pwsh 和 icacls，留给 Windows 真机")
     appdata = tmp_path / "AppData"
     appdata.mkdir()
-    env = dict(**{"APPDATA": str(appdata), "USERNAME": "tester"})
+    # 用真实 USERNAME：icacls 授权给不存在的账户会直接失败
+    env = {"APPDATA": str(appdata)}
     token = "ab" * 32
     node_id = "c" * 16
     cmd = [
