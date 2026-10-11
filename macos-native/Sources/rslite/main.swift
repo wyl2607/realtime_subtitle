@@ -46,8 +46,10 @@ struct RSLite {
             exit(1)
         }
         if options.selftest {
-            runSelfTest()
-            return
+            Task {
+                exit(await runSelfTest())
+            }
+            dispatchMain()
         }
         if let command = options.cloudCommand {
             do {
@@ -218,6 +220,9 @@ struct RSLite {
                     store.setTranslation(key: id, text: text)
                     writeEvent(clock: clock, startedAt: startedAt, ev: "translation", id: id, text: text)
                 },
+                onTranslationFailed: { id, reason in
+                    writeEvent(clock: clock, startedAt: startedAt, ev: "translate_failed", id: id, text: reason)
+                },
                 onStatus: { text in
                     writeEvent(clock: clock, startedAt: startedAt, ev: "status", id: nil, text: text)
                 }
@@ -286,6 +291,9 @@ struct RSLite {
                 onTranslation: { id, text in
                     Task { @MainActor in overlay.addTranslation(id: id, text: text) }
                 },
+                onTranslationFailed: { _, _ in
+                    // TODO(P2b-mac): Overlay 显示「未翻译 ⟳」
+                },
                 onStatus: { text in
                     Task { @MainActor in overlay.setStatus(text) }
                 },
@@ -345,7 +353,7 @@ struct RSLite {
         (value * 1000).rounded() / 1000
     }
 
-    private static func runSelfTest() {
+    private static func runSelfTest() async -> Int32 {
         var failures: [String] = []
         failures.append(contentsOf: LineStore.selfTest().map { "LineStore: \($0)" })
         failures.append(contentsOf: P9FixtureSelfTest.selfTest().map { "P9Fixture: \($0)" })
@@ -360,18 +368,21 @@ struct RSLite {
         if #available(macOS 27.0, *) {
             failures.append(contentsOf: NodeRouter.selfTest().map { "NodeRouter: \($0)" })
             failures.append(contentsOf: HybridEngine.selfTest().map { "HybridEngine: \($0)" })
+            let pipelineFailures = await Pipeline.selfTest()
+            failures.append(contentsOf: pipelineFailures.map { "Pipeline: \($0)" })
         } else {
             failures.append("NodeRouter: 需要 macOS 27")
             failures.append("HybridEngine: 需要 macOS 27")
+            failures.append("Pipeline: 需要 macOS 27")
         }
         if failures.isEmpty {
             print("SELFTEST OK")
-            exit(0)
+            return 0
         }
         for failure in failures {
             print("SELFTEST FAIL \(failure)")
         }
-        exit(1)
+        return 1
     }
 }
 
