@@ -1,0 +1,339 @@
+{
+  "version": 1,
+  "route_cases": [
+    {
+      "name": "available_failures_stay_until_third_then_backoff",
+      "initial": {
+        "has_key": true,
+        "cloud_enabled": true,
+        "node_enabled": false,
+        "node_healthy": false,
+        "node_is_self": false
+      },
+      "steps": [
+        {
+          "event": {"type": "segment_failure"},
+          "expect": {
+            "tier": "cloud",
+            "cloud_state": "available",
+            "consecutive_failures": 1,
+            "action": "keep_local"
+          }
+        },
+        {
+          "event": {"type": "segment_failure"},
+          "expect": {
+            "tier": "cloud",
+            "cloud_state": "available",
+            "consecutive_failures": 2,
+            "action": "keep_local"
+          }
+        },
+        {
+          "event": {"type": "segment_failure"},
+          "expect": {
+            "tier": "local",
+            "cloud_state": "cooldown_backoff",
+            "consecutive_failures": 3,
+            "cooldown_seconds": 5,
+            "action": "fallback"
+          }
+        }
+      ]
+    },
+    {
+      "name": "unauthorized_disables_until_key_modified",
+      "initial": {
+        "has_key": true,
+        "cloud_enabled": true,
+        "node_enabled": true,
+        "node_healthy": true,
+        "node_is_self": false
+      },
+      "steps": [
+        {
+          "event": {"type": "http_status", "status": 401},
+          "expect": {
+            "tier": "node",
+            "cloud_state": "disabled_invalid_key",
+            "action": "mark_key_invalid"
+          }
+        },
+        {
+          "event": {"type": "key_modified"},
+          "expect": {
+            "tier": "cloud",
+            "cloud_state": "available",
+            "action": "resume_cloud"
+          }
+        }
+      ]
+    },
+    {
+      "name": "forbidden_disables_like_unauthorized",
+      "initial": {
+        "has_key": true,
+        "cloud_enabled": true,
+        "node_enabled": false,
+        "node_healthy": false,
+        "node_is_self": false
+      },
+      "steps": [
+        {
+          "event": {"type": "http_status", "status": 403},
+          "expect": {
+            "tier": "local",
+            "cloud_state": "disabled_invalid_key",
+            "action": "mark_key_invalid"
+          }
+        }
+      ]
+    },
+    {
+      "name": "rate_limit_uses_retry_after",
+      "initial": {
+        "has_key": true,
+        "cloud_enabled": true,
+        "node_enabled": true,
+        "node_healthy": true,
+        "node_is_self": false
+      },
+      "steps": [
+        {
+          "event": {"type": "http_status", "status": 429, "retry_after": 17},
+          "expect": {
+            "tier": "node",
+            "cloud_state": "cooldown_rate_limited",
+            "cooldown_seconds": 17,
+            "action": "rate_limited"
+          }
+        },
+        {
+          "event": {"type": "cooldown_expired"},
+          "expect": {
+            "tier": "cloud",
+            "cloud_state": "probe",
+            "action": "probe_once"
+          }
+        },
+        {
+          "event": {"type": "segment_success"},
+          "expect": {
+            "tier": "cloud",
+            "cloud_state": "available",
+            "action": "resume_cloud"
+          }
+        }
+      ]
+    },
+    {
+      "name": "rate_limit_without_retry_after_defaults_to_60",
+      "initial": {
+        "has_key": true,
+        "cloud_enabled": true,
+        "node_enabled": false,
+        "node_healthy": false,
+        "node_is_self": false
+      },
+      "steps": [
+        {
+          "event": {"type": "http_status", "status": 429},
+          "expect": {
+            "tier": "local",
+            "cloud_state": "cooldown_rate_limited",
+            "cooldown_seconds": 60,
+            "action": "rate_limited"
+          }
+        }
+      ]
+    },
+    {
+      "name": "quota_hysteresis_90_to_80",
+      "initial": {
+        "has_key": true,
+        "cloud_enabled": true,
+        "node_enabled": true,
+        "node_healthy": true,
+        "node_is_self": false
+      },
+      "steps": [
+        {
+          "event": {"type": "quota_update", "usage_percent": 90},
+          "expect": {
+            "tier": "node",
+            "cloud_state": "cooldown_quota",
+            "action": "quota_cooldown"
+          }
+        },
+        {
+          "event": {"type": "quota_update", "usage_percent": 85},
+          "expect": {
+            "tier": "node",
+            "cloud_state": "cooldown_quota",
+            "action": "quota_cooldown"
+          }
+        },
+        {
+          "event": {"type": "quota_update", "usage_percent": 79},
+          "expect": {
+            "tier": "cloud",
+            "cloud_state": "available",
+            "action": "resume_cloud"
+          }
+        }
+      ]
+    },
+    {
+      "name": "probe_failure_escalates_backoff",
+      "initial": {
+        "has_key": true,
+        "cloud_enabled": true,
+        "cloud_state": "cooldown_backoff",
+        "backoff_index": 0,
+        "node_enabled": false,
+        "node_healthy": false,
+        "node_is_self": false
+      },
+      "steps": [
+        {
+          "event": {"type": "cooldown_expired"},
+          "expect": {
+            "tier": "cloud",
+            "cloud_state": "probe",
+            "action": "probe_once"
+          }
+        },
+        {
+          "event": {"type": "segment_failure"},
+          "expect": {
+            "tier": "local",
+            "cloud_state": "cooldown_backoff",
+            "cooldown_seconds": 30,
+            "backoff_index": 1,
+            "action": "fallback"
+          }
+        }
+      ]
+    },
+    {
+      "name": "switch_off_clears_inflight_and_switch_on_resumes",
+      "initial": {
+        "has_key": true,
+        "cloud_enabled": true,
+        "node_enabled": false,
+        "node_healthy": false,
+        "node_is_self": false
+      },
+      "steps": [
+        {
+          "event": {"type": "switch_off"},
+          "expect": {
+            "tier": "local",
+            "cloud_state": "off",
+            "cancel_inflight": true,
+            "discard_response": true,
+            "action": "cloud_off"
+          }
+        },
+        {
+          "event": {"type": "switch_on"},
+          "expect": {
+            "tier": "cloud",
+            "cloud_state": "available",
+            "action": "resume_cloud"
+          }
+        }
+      ]
+    },
+    {
+      "name": "key_cleared_skips_cloud_until_modified",
+      "initial": {
+        "has_key": true,
+        "cloud_enabled": true,
+        "node_enabled": true,
+        "node_healthy": true,
+        "node_is_self": false
+      },
+      "steps": [
+        {
+          "event": {"type": "key_cleared"},
+          "expect": {
+            "tier": "node",
+            "cloud_state": "off",
+            "cancel_inflight": true,
+            "discard_response": true,
+            "action": "cloud_off"
+          }
+        },
+        {
+          "event": {"type": "key_modified"},
+          "expect": {
+            "tier": "cloud",
+            "cloud_state": "available",
+            "action": "resume_cloud"
+          }
+        }
+      ]
+    },
+    {
+      "name": "no_key_skips_tier_0",
+      "initial": {
+        "has_key": false,
+        "cloud_enabled": true,
+        "node_enabled": true,
+        "node_healthy": true,
+        "node_is_self": false
+      },
+      "steps": [
+        {
+          "event": {"type": "noop"},
+          "expect": {
+            "tier": "node",
+            "cloud_state": "available",
+            "action": "none"
+          }
+        }
+      ]
+    },
+    {
+      "name": "node_switch_off_skips_tier_1",
+      "initial": {
+        "has_key": false,
+        "cloud_enabled": true,
+        "node_enabled": false,
+        "node_healthy": true,
+        "node_is_self": false
+      },
+      "steps": [
+        {
+          "event": {"type": "noop"},
+          "expect": {
+            "tier": "local",
+            "cloud_state": "available",
+            "action": "none"
+          }
+        }
+      ]
+    },
+    {
+      "name": "do_not_connect_self",
+      "initial": {
+        "has_key": false,
+        "cloud_enabled": true,
+        "node_enabled": true,
+        "node_healthy": true,
+        "node_is_self": true
+      },
+      "steps": [
+        {
+          "event": {"type": "noop"},
+          "expect": {
+            "tier": "local",
+            "cloud_state": "available",
+            "action": "none"
+          }
+        }
+      ]
+    }
+  ]
+}
