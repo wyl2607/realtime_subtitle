@@ -79,7 +79,8 @@ def _bare_translator():
     t._held_since = 0.0
     t._last_unstable = ""
     t._draft_last_text = ""
-    t.processor = type("_P", (), {"init": lambda self: None})()
+    t._sample_clock_samples = 0
+    t.processor = type("_P", (), {"init": lambda self, offset=None: None})()
     return t
 
 

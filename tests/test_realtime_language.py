@@ -77,7 +77,8 @@ def _bare():
     t._held_since = 0.0
     t._last_unstable = ""
     t._draft_last_text = ""
-    t.processor = type("_P", (), {"init": lambda self: None})()
+    t._sample_clock_samples = 0
+    t.processor = type("_P", (), {"init": lambda self, offset=None: None})()
     return t
 
 
@@ -221,7 +222,7 @@ def test_events_carry_the_revision_at_emit_time(monkeypatch):
     _pairs(monkeypatch, [("de", "zh"), ("zh", "de")], "de", "zh")
     t = _bare()
     pairs, drafts = [], []
-    t.on_pair = lambda g, zh, rev=0: pairs.append(rev)
+    t.on_pair = lambda g, zh, t0, t1, key, rev: pairs.append(rev)
     t.on_draft = lambda text, rev=0: drafts.append(rev)
 
     t._emit_pair("Hallo", "你好")

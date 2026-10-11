@@ -361,7 +361,7 @@ def test_translation_worker_dict_shortcircuit_and_order():
     displays = []
     t.on_display = lambda c, u: displays.append((c, u))
     pairs = []
-    t.on_pair = lambda g, zh, rev=0: pairs.append((g, zh))
+    t.on_pair = lambda g, zh, t0, t1, key, rev: pairs.append((g, zh))
     t._save_transcript = lambda g, zh: None
     calls = []
 
@@ -420,7 +420,7 @@ def test_transcript_keeps_source_when_translation_failed():
     t.on_draft = None
     t.on_display = lambda c, u: None
     pairs = []
-    t.on_pair = lambda g, zh, rev=0: pairs.append((g, zh))
+    t.on_pair = lambda g, zh, t0, t1, key, rev: pairs.append((g, zh))
     saved = []
     t._save_transcript = lambda g, zh: saved.append((g, zh))
     # 翻译失败：_translate_single_sentence 的约定是原样返回原文
@@ -563,6 +563,7 @@ def test_lang_switch_pending_preempts_before_audio_batch():
     t._asr_scheduled = True
     t._pending_lang_switch = "en"
     t._asr_error_streak = 0
+    t._sample_clock_samples = 0
     applied = []
     processed = []
 
@@ -1285,6 +1286,7 @@ def test_asr_inbox_hard_cap(monkeypatch):
     t._asr_scheduled = True  # 假装识别线程在跑：enqueue 只进箱不提交 executor
     t._inbox_dropped = 0
     t._inbox_drop_warned = 0
+    t._sample_clock_samples = 0
     monkeypatch.setattr(config, "ASR_INBOX_MAX_BLOCKS", 50, raising=False)
 
     for i in range(120):
@@ -2482,8 +2484,9 @@ def test_request_and_apply_language_switch_logs_source(monkeypatch, capsys):
     t._last_unstable = ""
     t._draft_last_text = ""
     t.on_display = None
+    t._sample_clock_samples = 0
     t.processor = type("_P", (), {
-        "init": lambda self: None,
+        "init": lambda self, offset=None: None,
         "reset_prompt_context": lambda self: None,
     })()
 
@@ -2626,8 +2629,9 @@ def test_apply_pending_lang_switch_notifies_ui(monkeypatch):
     t._last_unstable = ""
     t._draft_last_text = ""
     t.on_display = None
+    t._sample_clock_samples = 0
     t.processor = type("_P", (), {
-        "init": lambda self: None,
+        "init": lambda self, offset=None: None,
         "reset_prompt_context": lambda self: None,
     })()
     applied = []
