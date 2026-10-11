@@ -5,10 +5,13 @@
 # The token never appears in argv or output: WriteToken reads it from stdin.
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Preflight', 'NodeId', 'ReadToken', 'WriteToken', 'Build', 'SelfCheck', 'Swap', 'Rollback')]
+    [ValidateSet('Preflight', 'NodeId', 'ReadToken', 'WriteToken', 'Build', 'SelfCheck', 'Swap', 'Rollback', 'PushClient')]
     [string]$Action,
     [int]$Port = 8791,
-    [string]$OllamaModel = 'qwen3.5:4b'
+    [string]$OllamaModel = 'qwen3.5:4b',
+    [string]$NodeAlias = '',
+    [string]$NodeId = '',
+    [string]$UrlHost = ''
 )
 $ErrorActionPreference = 'Stop'
 
@@ -154,5 +157,73 @@ switch ($Action) {
             Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
             "ROLLBACK=removed"
         }
+    }
+    'PushClient' {
+        # Client-side nodes.json + token. Token comes from stdin, never argv.
+        # WriteAllText is given UTF-8 without BOM: the Python client reads the token as utf-8.
+        if (-not $env:APPDATA) { throw 'APPDATA missing' }
+        if ($NodeAlias -notmatch '^[A-Za-z0-9._@-]+$') { throw 'bad NodeAlias' }
+        if ($NodeId -notmatch '^[A-Za-z0-9_-]{8,64}$') { throw 'bad NodeId' }
+        if ($UrlHost -notmatch '^[A-Za-z0-9.-]+$') { throw 'bad UrlHost' }
+        $tok = [Console]::In.ReadLine()
+        if ($tok -notmatch '^[0-9a-f]{64}$') { throw 'token on stdin has wrong shape' }
+        $root = Join-Path $env:APPDATA 'realtime_subtitle'
+        $tokDir = Join-Path $root 'tokens'
+        if (-not (Test-Path $root)) { New-Item -ItemType Directory -Path $root | Out-Null }
+        if (-not (Test-Path $tokDir)) { New-Item -ItemType Directory -Path $tokDir | Out-Null }
+        $utf8 = New-Object System.Text.UTF8Encoding $false
+        $clientToken = Join-Path $tokDir ($NodeAlias + '.token')
+        $tmpTok = "$clientToken.tmp"
+        [IO.File]::WriteAllText($tmpTok, $tok, $utf8)
+        Lock-Down $tmpTok
+        Move-Item -Force $tmpTok $clientToken
+        Lock-Down $clientToken
+        $nodesPath = Join-Path $root 'nodes.json'
+        $entries = @()
+        if (Test-Path $nodesPath) {
+            $raw = [IO.File]::ReadAllText($nodesPath)
+            $trim = $raw.TrimStart()
+            if (-not $trim.StartsWith('[')) { throw 'nodes.json is not an array' }
+            $parsed = $raw | ConvertFrom-Json
+            if ($null -eq $parsed) {
+                $entries = @()
+            } else {
+                $entries = @($parsed)
+            }
+        }
+        $url = "ws://${UrlHost}:${Port}"
+        $new = [ordered]@{
+            id = $NodeAlias
+            node_id = $NodeId
+            url = $url
+            token_file = $clientToken
+        }
+        $out = New-Object System.Collections.Generic.List[object]
+        $replaced = $false
+        foreach ($e in $entries) {
+            if ($e.id -eq $NodeAlias) {
+                if (-not $replaced) {
+                    $out.Add($new)
+                    $replaced = $true
+                }
+            } else {
+                $out.Add($e)
+            }
+        }
+        if (-not $replaced) { $out.Add($new) }
+        $arr = @($out.ToArray())
+        if ($arr.Count -eq 1) {
+            $json = '[' + (ConvertTo-Json -InputObject $arr[0] -Depth 6 -Compress) + ']'
+        } elseif ($arr.Count -eq 0) {
+            $json = '[]'
+        } else {
+            $json = ConvertTo-Json -InputObject $arr -Depth 6 -Compress
+        }
+        $tmpNodes = "$nodesPath.tmp"
+        [IO.File]::WriteAllText($tmpNodes, $json, $utf8)
+        Lock-Down $tmpNodes
+        Move-Item -Force $tmpNodes $nodesPath
+        Lock-Down $nodesPath
+        'PUSH=ok'
     }
 }

@@ -1,6 +1,12 @@
 """
 参数调节面板（⚙️）：tuning 持久化辅助函数 + 场景预设常量 + SettingsWindow。
 """
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 from PyQt6.QtWidgets import (
     QLabel, QWidget, QVBoxLayout, QHBoxLayout, QSlider,
     QPushButton, QGroupBox, QLineEdit, QCheckBox, QColorDialog, QFontComboBox,
@@ -9,6 +15,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QFont
 import realtime_subtitle.config as config
+from realtime_subtitle.remote.cloud_client import config_dir as _cloud_config_dir
+from realtime_subtitle.remote.cloud_client import read_groq_key
 from realtime_subtitle import language_policy
 from realtime_subtitle.ui.window_frame import DraggableWidget
 from realtime_subtitle.ui.window_geometry import (
@@ -55,6 +63,177 @@ def format_slider_value(value, step):
     text = f"{step:.10f}".rstrip("0")
     decimals = len(text.split(".", 1)[1]) if "." in text else 0
     return f"{value:.{decimals}f}"
+
+
+def config_dir():
+    """云端/节点开关的目录。
+
+    包一层是为了让面板测试替换本模块的 config_dir，而不必去改
+    cloud_client.groq_key_path() 里面那个绑定好的函数。路径规则仍以
+    cloud_client 为准：Windows 用 %APPDATA%，其它系统用 ~/.config。
+    """
+    return _cloud_config_dir()
+
+
+def groq_key_file():
+    return Path(config_dir()) / "groq.key"
+
+
+def _pref_path(name):
+    return Path(config_dir()) / name
+
+
+def _atomic_private(path, data):
+    """原子写，并把权限收成只有当前用户能读。
+
+    key 不能先进一个谁都能读的临时文件再改权限：先按 0600 建临时文件，
+    写完再 replace。Windows 上 os.open 的 mode 不起作用，所以写完用
+    icacls 去掉继承、只留当前用户。USERNAME 只在这一支用来当 ACL 主体，
+    不是密钥来源。
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        if sys.platform != "win32":
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    if sys.platform == "win32":
+        _icacls_user_only(path)
+    else:
+        os.chmod(path, 0o600)
+
+
+def _icacls_user_only(path):
+    """只给当前用户完全控制。命令按参数列表传，不经 shell，避免路径被拼接。"""
+    user = os.environ.get("USERNAME")
+    if not user:
+        raise OSError("icacls failed")
+    try:
+        subprocess.run(
+            ["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
+            check=True,
+            shell=False,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        raise OSError("icacls failed") from None
+
+
+def write_groq_key(text):
+    """写入 groq.key。空串直接拒绝，避免一次空保存把已有 key 抹掉。"""
+    key = (text or "").strip()
+    if not key:
+        raise ValueError("empty groq key")
+    _atomic_private(groq_key_file(), (key + "\n").encode("utf-8"))
+
+
+def clear_groq_key():
+    try:
+        groq_key_file().unlink()
+    except FileNotFoundError:
+        return
+
+
+def groq_key_configured():
+    """只回答「有没有 key」。读失败按没有处理，异常文本可能带路径，不往外抛。"""
+    try:
+        return bool(read_groq_key(groq_key_file()))
+    except Exception:
+        return False
+
+
+def _read_bool_pref(name, default):
+    try:
+        path = _pref_path(name)
+        if not path.is_file():
+            return default
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+    if isinstance(data, dict) and "enabled" in data:
+        return bool(data["enabled"])
+    return default
+
+
+def _write_bool_pref(name, enabled):
+    payload = (json.dumps({"enabled": bool(enabled)}) + "\n").encode("utf-8")
+    _atomic_private(_pref_path(name), payload)
+
+
+def read_cloud_enabled():
+    """没有 cloud.json 时：已经有 key 就默认开，否则关。老用户两边都没有，等于关。"""
+    return _read_bool_pref("cloud.json", groq_key_configured())
+
+
+def write_cloud_enabled(enabled):
+    _write_bool_pref("cloud.json", enabled)
+
+
+def read_node_enabled():
+    """没有 node.json 就是关。缺文件不能把用户以后下发的偏好提前写成开。"""
+    return _read_bool_pref("node.json", False)
+
+
+def write_node_enabled(enabled):
+    _write_bool_pref("node.json", enabled)
+
+
+def nodes_file():
+    return Path(config_dir()) / "nodes.json"
+
+
+def load_node_entries():
+    """只收有 id 和 url 的条目。文件缺失、不是数组、读坏了都当成没有节点。"""
+    path = nodes_file()
+    try:
+        if not path.is_file():
+            return []
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    usable = []
+    for entry in data:
+        if isinstance(entry, dict) and entry.get("id") and entry.get("url"):
+            usable.append(entry)
+    return usable
+
+
+def nodes_available():
+    return bool(load_node_entries())
+
+
+def cloud_active():
+    """开关文件写着开、但 key 已经没了，就不能再上传。"""
+    return bool(read_cloud_enabled()) and groq_key_configured()
+
+
+def node_active():
+    return bool(read_node_enabled()) and nodes_available()
+
+
+def static_route_label():
+    """没有接上路由器时，按落盘的开关给面板一个标签。"""
+    if cloud_active():
+        return "云端·Groq"
+    if node_active():
+        entries = load_node_entries()
+        name = str(entries[0].get("id") or "") if entries else ""
+        return f"混合·{name}" if name else "混合·节点"
+    return "本机"
 
 
 # 面板可调参数（存 window_state.json 的 "tuning"；FONT_SIZE/BACKGROUND_OPACITY
@@ -494,11 +673,61 @@ class SettingsWindow(DraggableWidget):
         cinema_layout.addWidget(self.cinema_german_cb)
         cinema_group.setLayout(cinema_layout)
 
+        # 识别来源和四个场景模式正交：不进 TUNING_KEYS，也不走 _apply_mode。
+        # 控件初值不在这里 setChecked——那会在信号接通后把用户目录写成默认值。
+        # 真正的显示在 _refresh_remote_controls，并且挡住信号。
+        self.on_remote_change = None
+        self.route_status_source = None
+        remote_group = QGroupBox("识别来源")
+        remote_layout = QVBoxLayout()
+
+        self.node_cb = QCheckBox("使用算力节点")
+        self.node_cb.setFont(self.font())
+        self.node_cb.setToolTip("音频会发到你的节点机器")
+        self.node_cb.toggled.connect(self._on_node_toggled)
+        self.node_reason = QLabel("")
+        self.node_reason.setFont(self.font())
+        self.node_reason.setWordWrap(True)
+
+        key_row = QWidget()
+        key_layout = QHBoxLayout()
+        key_layout.setContentsMargins(0, 0, 0, 0)
+        self.groq_key_edit = QLineEdit()
+        self.groq_key_edit.setFont(self.font())
+        self.groq_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.groq_key_edit.setPlaceholderText("粘贴 Groq key")
+        self.groq_key_edit.setToolTip("只写入本机 key 文件，不会回显已保存的 key")
+        self.groq_save_btn = QPushButton("保存 key")
+        self.groq_save_btn.setFont(self.font())
+        self.groq_save_btn.clicked.connect(self._on_save_groq_key)
+        self.groq_clear_btn = QPushButton("清除 key")
+        self.groq_clear_btn.setFont(self.font())
+        self.groq_clear_btn.clicked.connect(self._on_clear_groq_key)
+        key_layout.addWidget(self.groq_key_edit)
+        key_layout.addWidget(self.groq_save_btn)
+        key_layout.addWidget(self.groq_clear_btn)
+        key_row.setLayout(key_layout)
+
+        self.cloud_cb = QCheckBox("云端识别")
+        self.cloud_cb.setFont(self.font())
+        self.cloud_cb.setToolTip("打开后音频会上传到 Groq")
+        self.cloud_cb.toggled.connect(self._on_cloud_toggled)
+        self.route_label = QLabel("当前路由：本机")
+        self.route_label.setFont(self.font())
+
+        remote_layout.addWidget(self.node_cb)
+        remote_layout.addWidget(self.node_reason)
+        remote_layout.addWidget(key_row)
+        remote_layout.addWidget(self.cloud_cb)
+        remote_layout.addWidget(self.route_label)
+        remote_group.setLayout(remote_layout)
+
         # 添加到主布局
         layout.addWidget(duration_group)
         layout.addWidget(energy_group)
         layout.addWidget(display_group)
         layout.addWidget(cinema_group)
+        layout.addWidget(remote_group)
 
         # 重置按钮
         reset_btn = QPushButton("🔄 恢复默认值")
@@ -516,6 +745,8 @@ class SettingsWindow(DraggableWidget):
         outer.setContentsMargins(8, 8, 8, 8)
         outer.addWidget(scroll)
         self.setLayout(outer)
+        # 构造完再读盘。blockSignals 包在刷新里，避免把默认值写进用户目录。
+        self._refresh_remote_controls()
 
     def _apply_panel_chrome(self, scale):
         """面板字体 + 受屏幕约束的初始几何。不开全局 DPI 缩放。"""
@@ -694,6 +925,91 @@ class SettingsWindow(DraggableWidget):
         config.LOOPBACK_DEVICE_NAME = name
         print(f"📊 捕获设备名包含: {name or '（系统默认）'}")
 
+    def _emit_remote_change(self):
+        callback = self.on_remote_change
+        if callback is not None:
+            callback()
+
+    def _refresh_remote_controls(self):
+        """控件显示只从文件读回。信号先挡住，否则 setChecked 会再写一遍。"""
+        has_nodes = nodes_available()
+        self.node_cb.blockSignals(True)
+        self.node_cb.setEnabled(has_nodes)
+        # 没有 nodes.json 时勾选框显示关，但不改 node.json：文件还没到，偏好先留着。
+        self.node_cb.setChecked(bool(read_node_enabled()) and has_nodes)
+        self.node_cb.blockSignals(False)
+        if has_nodes:
+            self.node_reason.setText("")
+        else:
+            self.node_reason.setText("没有 nodes.json，开关不可用。音频不会发到节点。")
+
+        configured = groq_key_configured()
+        self.cloud_cb.blockSignals(True)
+        self.cloud_cb.setChecked(bool(read_cloud_enabled()) and configured)
+        self.cloud_cb.blockSignals(False)
+
+        # 正在输入时不要把框清掉，否则状态刷新会吞掉还没保存的 key。
+        if not self.groq_key_edit.hasFocus():
+            self.groq_key_edit.clear()
+        if configured:
+            self.groq_key_edit.setPlaceholderText("已保存（不会回显）")
+        else:
+            self.groq_key_edit.setPlaceholderText("粘贴 Groq key")
+
+        label = static_route_label()
+        source = self.route_status_source
+        if source is not None:
+            try:
+                label = source() or label
+            except Exception:
+                label = static_route_label()
+        self.route_label.setText(f"当前路由：{label}")
+
+    def _on_node_toggled(self, checked):
+        if not nodes_available():
+            self._refresh_remote_controls()
+            return
+        try:
+            write_node_enabled(bool(checked))
+        except Exception as exc:
+            print(f"⚠️  保存节点开关失败: {type(exc).__name__}")
+        self._refresh_remote_controls()
+        self._emit_remote_change()
+
+    def _on_cloud_toggled(self, checked):
+        try:
+            write_cloud_enabled(bool(checked))
+        except Exception as exc:
+            print(f"⚠️  保存云端开关失败: {type(exc).__name__}")
+        self._refresh_remote_controls()
+        self._emit_remote_change()
+
+    def _on_save_groq_key(self):
+        text = self.groq_key_edit.text().strip()
+        # 空保存什么都不做：密码框本来就不回显，空串不能当成「删掉 key」。
+        if not text:
+            return
+        try:
+            write_groq_key(text)
+            write_cloud_enabled(True)
+        except Exception as exc:
+            print(f"⚠️  保存 key 失败: {type(exc).__name__}")
+            return
+        self.groq_key_edit.clear()
+        self._refresh_remote_controls()
+        self._emit_remote_change()
+
+    def _on_clear_groq_key(self):
+        try:
+            clear_groq_key()
+            write_cloud_enabled(False)
+        except Exception as exc:
+            print(f"⚠️  清除 key 失败: {type(exc).__name__}")
+            return
+        self.groq_key_edit.clear()
+        self._refresh_remote_controls()
+        self._emit_remote_change()
+
     # ------------------------------------------------------------------
     # 场景预设
     # ------------------------------------------------------------------
@@ -772,7 +1088,11 @@ class SettingsWindow(DraggableWidget):
             self._sync_preset_button_highlight()
 
     def _reset_defaults(self):
-        """恢复到传入的 defaults 快照（config.py + config_local 出厂态）。"""
+        """恢复到传入的 defaults 快照（config.py + config_local 出厂态）。
+
+        不碰 groq.key / cloud.json / node.json：它们不是场景模式的一部分，
+        「恢复默认」不能把已经保存的 key 或节点开关清掉。
+        """
         # 通过滑块 setValue 触发 valueChanged，自动同步 config 和数值标签
         pairs = [
             (self.chunk_submit_slider, 'CHUNK_SUBMIT_SECONDS'),
@@ -893,5 +1213,6 @@ class SettingsWindow(DraggableWidget):
         self.auto_detect_cb.setChecked(bool(getattr(config, "AUTO_DETECT_LANGUAGE", False)))
         self.auto_detect_cb.blockSignals(False)
         self._sync_language_buttons()
+        self._refresh_remote_controls()
 
 
