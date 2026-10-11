@@ -25,7 +25,7 @@ final class OverlayController: NSObject {
         self.onQuit = onQuit
 
         let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
-        let size = NSSize(width: min(900, screenFrame.width - 80), height: 190)
+        let size = NSSize(width: min(1100, screenFrame.width - 80), height: 220)
         let origin = NSPoint(
             x: screenFrame.midX - size.width / 2,
             y: screenFrame.minY + 70
@@ -136,13 +136,13 @@ final class OverlayController: NSObject {
         stack.translatesAutoresizingMaskIntoConstraints = false
 
         volatileLabel.textColor = .secondaryLabelColor
-        volatileLabel.font = .systemFont(ofSize: 20)
+        volatileLabel.font = .systemFont(ofSize: 24)
         volatileLabel.lineBreakMode = .byWordWrapping
         volatileLabel.maximumNumberOfLines = 2
         volatileLabel.preferredMaxLayoutWidth = textWidth
 
         tierLabel.textColor = .secondaryLabelColor
-        tierLabel.font = .systemFont(ofSize: 13)
+        tierLabel.font = .systemFont(ofSize: 14)
         tierLabel.lineBreakMode = .byTruncatingTail
         tierLabel.maximumNumberOfLines = 1
         tierLabel.preferredMaxLayoutWidth = textWidth
@@ -183,9 +183,9 @@ final class OverlayController: NSObject {
         }
 
         for line in store.lines.suffix(2) {
-            stack.addArrangedSubview(label(line.srcText, color: .white, size: 22))
+            stack.addArrangedSubview(label(line.srcText, color: .white, size: 28))
             if let translation = line.dstText, !translation.isEmpty {
-                stack.addArrangedSubview(label(translation, color: NSColor(calibratedRed: 1.0, green: 0.91, blue: 0.58, alpha: 1), size: 22))
+                stack.addArrangedSubview(label(translation, color: NSColor(calibratedRed: 1.0, green: 0.91, blue: 0.58, alpha: 1), size: 28))
             }
         }
         stack.addArrangedSubview(volatileLabel)
