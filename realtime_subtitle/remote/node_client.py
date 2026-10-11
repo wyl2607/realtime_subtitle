@@ -52,6 +52,10 @@ class NodeIDMismatchError(NodeClientError):
     """node_id 不一致。"""
 
 
+class SelfNodeError(NodeClientError):
+    """探测到的 node_id 就是本机。路由必须跳过该节点，不得建会话。"""
+
+
 class NodeBusyError(NodeClientError):
     """节点忙（close 1013）。"""
 
@@ -223,53 +227,105 @@ def read_token_file(path: str | Path) -> str:
     return token
 
 
+def _first_ipv4_literal(resolved: list[str]) -> str:
+    """校验结果里的第一个 IPv4 字面量。没有则失败，禁止退回主机名。"""
+    for ip_str in resolved:
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            continue
+        if isinstance(ip, ipaddress.IPv4Address):
+            return str(ip)
+    raise BadURLError("Validated address list has no IPv4 literal")
+
+
+def _split_and_pin_ipv4(
+    url: str,
+    getaddrinfo_fn: Callable[..., Any],
+    *,
+    empty_message: str,
+) -> tuple[urllib.parse.SplitResult, str]:
+    parsed = urllib.parse.urlsplit(url)
+    if not parsed.hostname:
+        raise BadURLError(empty_message)
+    resolved = validate_and_resolve_node_host(
+        parsed.hostname,
+        parsed.port or 8791,
+        getaddrinfo_fn=getaddrinfo_fn,
+    )
+    return parsed, _first_ipv4_literal(resolved)
+
+
+def _pinned_info_url(parsed: urllib.parse.SplitResult, ip: str) -> str:
+    port = parsed.port or 8791
+    scheme = "https" if parsed.scheme in {"wss", "https"} else "http"
+    return urllib.parse.urlunsplit((scheme, f"{ip}:{port}", "/v1/info", "", ""))
+
+
+def _pinned_session_url(parsed: urllib.parse.SplitResult, ip: str) -> str:
+    port = parsed.port or 8791
+    scheme = parsed.scheme if parsed.scheme in {"ws", "wss"} else "ws"
+    path = parsed.path if parsed.path not in {"", "/"} else "/v2/session"
+    return urllib.parse.urlunsplit((scheme, f"{ip}:{port}", path, parsed.query, ""))
+
+
+def _read_self_node_id() -> str | None:
+    # 延迟导入：router 在模块加载时依赖本文件，读 node_id 的实现只留在 router。
+    from realtime_subtitle.remote.router import read_self_node_id
+
+    return read_self_node_id()
+
+
 def prepare(
     config: NodeConfig,
     timeout: float = 5.0,
     getaddrinfo_fn: Callable[..., Any] = socket.getaddrinfo,
 ) -> tuple[str, NodeInfo]:
     """
-    准备节点会话：校验 URL、读取 token 并请求 /v1/info 校验协议版本与 node_id。
-    显式禁用代理（proxies={"http": None, "https": None}）。
+    准备节点会话：校验 URL、把主机钉成已校验的 IPv4 字面量，再请求 /v1/info。
+    Session.trust_env = False，不读 HTTP(S)_PROXY / ALL_PROXY；不跟随重定向。
+    探测到的 node_id 与本机相同则抛 SelfNodeError，调用方应跳过自己。
     """
-    parsed = urllib.parse.urlsplit(config.url)
-    if not parsed.hostname:
-        raise BadURLError(f"Invalid node URL: {config.url}")
-    validate_and_resolve_node_host(parsed.hostname, parsed.port or 8791, getaddrinfo_fn=getaddrinfo_fn)
-
+    parsed, ip = _split_and_pin_ipv4(
+        config.url,
+        getaddrinfo_fn,
+        empty_message=f"Invalid node URL: {config.url}",
+    )
     token = read_token_file(config.token_file)
-
-    scheme = "https" if parsed.scheme in {"wss", "https"} else "http"
-    netloc = parsed.netloc
-    info_url = urllib.parse.urlunsplit((scheme, netloc, "/v1/info", "", ""))
+    info_url = _pinned_info_url(parsed, ip)
 
     import requests
 
     headers = {"Authorization": f"Bearer {token}"}
-    try:
-        resp = requests.get(
-            info_url,
-            headers=headers,
-            timeout=timeout,
-            proxies={"http": None, "https": None},
-        )
-    except Exception as e:
-        raise ConnectionClosedError(f"Failed to connect to {config.id}: {type(e).__name__}") from e
+    with requests.Session() as session:
+        session.trust_env = False
+        try:
+            resp = session.get(
+                info_url,
+                headers=headers,
+                timeout=timeout,
+                allow_redirects=False,
+            )
+        except Exception as e:
+            raise ConnectionClosedError(f"Failed to connect to {config.id}: {type(e).__name__}") from e
 
-    if resp.status_code == 401:
-        raise UnauthorizedError(f"Node {config.id} unauthorized (401)")
-    if not (200 <= resp.status_code < 300):
-        raise ConnectionClosedError(f"Node {config.id} info returned status {resp.status_code}")
+        if resp.status_code == 401:
+            raise UnauthorizedError(f"Node {config.id} unauthorized (401)")
+        if not (200 <= resp.status_code < 300):
+            raise ConnectionClosedError(f"Node {config.id} info returned status {resp.status_code}")
 
-    try:
-        data = resp.json()
-    except Exception as e:
-        raise ProtocolError(f"Invalid JSON from /v1/info: {e}") from e
+        try:
+            data = resp.json()
+        except Exception as e:
+            raise ProtocolError(f"Invalid JSON from /v1/info: {e}") from e
 
     if data.get("v") != 2:
         raise ProtocolError(f"Unsupported protocol version: {data.get('v')}")
 
     probed_node_id = str(data.get("node_id", ""))
+    self_node_id = _read_self_node_id()
+    if self_node_id and probed_node_id == self_node_id:
+        raise SelfNodeError(f"Node {config.id} is this machine; skip")
     if probed_node_id != config.node_id:
         raise NodeIDMismatchError(
             f"Node ID mismatch: expected {config.node_id}, got {probed_node_id}"
@@ -411,17 +467,13 @@ class NodeClient:
         self._drained_event = asyncio.Event()
 
     async def connect(self, ready_timeout: float = READY_TIMEOUT_SECONDS) -> None:
-        parsed = urllib.parse.urlsplit(self.config.url)
-        if not parsed.hostname:
-            raise BadURLError(f"Invalid URL: {self.config.url}")
-        validate_and_resolve_node_host(parsed.hostname, parsed.port or 8791, getaddrinfo_fn=self.getaddrinfo_fn)
-
-        path = parsed.path
-        if not path or path == "/":
-            path = "/v2/session"
-        session_url = urllib.parse.urlunsplit(
-            (parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment)
+        parsed, ip = _split_and_pin_ipv4(
+            self.config.url,
+            self.getaddrinfo_fn,
+            empty_message=f"Invalid URL: {self.config.url}",
         )
+        # 用已校验的 IPv4 字面量建连，避免 websockets 再次解析主机名。
+        session_url = _pinned_session_url(parsed, ip)
 
         headers = {"Authorization": f"Bearer {self.token}"}
         try:

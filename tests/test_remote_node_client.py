@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import socket
+import urllib.parse
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -22,6 +23,7 @@ from realtime_subtitle.remote.node_client import (
     NodeInfo,
     ProtocolError,
     ReadyAudioBuffer,
+    SelfNodeError,
     TokenPermissionsError,
     TokenUnavailableError,
     UnauthorizedError,
@@ -141,19 +143,10 @@ def test_read_token_file_missing_or_empty(tmp_path: Path):
 # --- 3. prepare (/v1/info) 测试 ---
 
 
-def test_prepare_success(tmp_path: Path):
-    token_file = tmp_path / "token"
-    token_file.write_text("test_token\n", encoding="utf-8")
-    if os.name == "posix":
-        token_file.chmod(0o600)
-
-    config = NodeConfig(id="node1", node_id="target_node", url="ws://100.64.0.10:8791", token_file=str(token_file))
-
-    fake_response = MagicMock()
-    fake_response.status_code = 200
-    fake_response.json.return_value = {
-        "v": 2,
-        "node_id": "target_node",
+def _info_payload(node_id: str = "target_node", version: int = 2) -> dict:
+    return {
+        "v": version,
+        "node_id": node_id,
         "hw_hash": "abc",
         "asr": {"model": "whisper-large-v3-turbo", "rtf": 0.05},
         "translator": "apple",
@@ -163,41 +156,142 @@ def test_prepare_success(tmp_path: Path):
         "worker": "warm",
     }
 
-    with patch("requests.get", return_value=fake_response) as mock_get:
-        token, info = prepare(config)
-        assert token == "test_token"
-        assert info.node_id == "target_node"
-        assert info.asr.model == "whisper-large-v3-turbo"
-        # 确认不走代理
-        assert mock_get.call_args.kwargs["proxies"] == {"http": None, "https": None}
+
+def _capture_session_request(response: MagicMock):
+    captured: dict = {}
+
+    def fake_request(self, method, url, **kwargs):
+        captured["trust_env"] = self.trust_env
+        captured["method"] = method
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return response
+
+    return fake_request, captured
 
 
-def test_prepare_rejects_unauthorized_and_mismatch(tmp_path: Path):
+def _write_token(tmp_path: Path) -> Path:
     token_file = tmp_path / "token"
     token_file.write_text("test_token\n", encoding="utf-8")
     if os.name == "posix":
         token_file.chmod(0o600)
+    return token_file
 
+
+def test_prepare_success(tmp_path: Path):
+    token_file = _write_token(tmp_path)
+    config = NodeConfig(id="node1", node_id="target_node", url="ws://100.64.0.10:8791", token_file=str(token_file))
+
+    fake_response = MagicMock()
+    fake_response.status_code = 200
+    fake_response.json.return_value = _info_payload()
+
+    fake_request, captured = _capture_session_request(fake_response)
+    with patch("requests.Session.request", fake_request):
+        token, info = prepare(config)
+        assert token == "test_token"
+        assert info.node_id == "target_node"
+        assert info.asr.model == "whisper-large-v3-turbo"
+        # trust_env=False：不读环境代理；且不跟随重定向
+        assert captured["trust_env"] is False
+        assert captured["kwargs"]["allow_redirects"] is False
+        assert urllib.parse.urlsplit(captured["url"]).hostname == "100.64.0.10"
+
+
+def test_prepare_pins_resolved_ipv4_literal(tmp_path: Path):
+    token_file = _write_token(tmp_path)
+    config = NodeConfig(
+        id="node1",
+        node_id="target_node",
+        url="ws://node.example.ts:8791/v2/session",
+        token_file=str(token_file),
+    )
+
+    def fake_getaddrinfo(host, port, proto=0):
+        assert host == "node.example.ts"
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("100.64.4.4", port)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("100.64.4.5", port)),
+        ]
+
+    fake_response = MagicMock(status_code=200)
+    fake_response.json.return_value = _info_payload()
+    fake_request, captured = _capture_session_request(fake_response)
+    with patch("requests.Session.request", fake_request):
+        prepare(config, getaddrinfo_fn=fake_getaddrinfo)
+
+    parsed = urllib.parse.urlsplit(captured["url"])
+    assert parsed.scheme == "http"
+    assert parsed.hostname == "100.64.4.4"
+    assert parsed.port == 8791
+    assert parsed.path == "/v1/info"
+    assert "node.example.ts" not in captured["url"]
+    assert captured["kwargs"]["allow_redirects"] is False
+
+
+def test_prepare_ignores_proxy_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    for key in ("ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "all_proxy", "https_proxy", "http_proxy"):
+        monkeypatch.setenv(key, "http://127.0.0.1:9")
+
+    token_file = _write_token(tmp_path)
+    config = NodeConfig(id="node1", node_id="target_node", url="ws://100.64.0.10:8791", token_file=str(token_file))
+    fake_response = MagicMock(status_code=200)
+    fake_response.json.return_value = _info_payload()
+    fake_request, captured = _capture_session_request(fake_response)
+    with patch("requests.Session.request", fake_request):
+        prepare(config)
+
+    assert os.environ["ALL_PROXY"] == "http://127.0.0.1:9"
+    assert os.environ["HTTPS_PROXY"] == "http://127.0.0.1:9"
+    assert os.environ["HTTP_PROXY"] == "http://127.0.0.1:9"
+    assert captured["method"] == "GET"
+    assert captured["trust_env"] is False
+    assert captured["kwargs"].get("proxies") in (None, {})
+
+
+def test_prepare_rejects_unauthorized_and_mismatch(tmp_path: Path):
+    token_file = _write_token(tmp_path)
     config = NodeConfig(id="node1", node_id="target_node", url="ws://100.64.0.10:8791", token_file=str(token_file))
 
     # 401
     resp_401 = MagicMock(status_code=401)
-    with patch("requests.get", return_value=resp_401):
+    fake_request, _captured = _capture_session_request(resp_401)
+    with patch("requests.Session.request", fake_request):
         with pytest.raises(UnauthorizedError):
             prepare(config)
 
     # node_id mismatch
     resp_mismatch = MagicMock(status_code=200)
     resp_mismatch.json.return_value = {"v": 2, "node_id": "other_node"}
-    with patch("requests.get", return_value=resp_mismatch):
+    fake_request, _captured = _capture_session_request(resp_mismatch)
+    with patch("requests.Session.request", fake_request):
         with pytest.raises(NodeIDMismatchError):
             prepare(config)
 
     # v != 2
     resp_v1 = MagicMock(status_code=200)
     resp_v1.json.return_value = {"v": 1, "node_id": "target_node"}
-    with patch("requests.get", return_value=resp_v1):
+    fake_request, _captured = _capture_session_request(resp_v1)
+    with patch("requests.Session.request", fake_request):
         with pytest.raises(ProtocolError):
+            prepare(config)
+
+
+def test_prepare_rejects_self_node_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import realtime_subtitle.node.info as node_info
+
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "node_id").write_text("local_box\n", encoding="utf-8")
+    monkeypatch.setattr(node_info, "STATE_DIR", state)
+
+    token_file = _write_token(tmp_path)
+    config = NodeConfig(id="node1", node_id="expected_other", url="ws://100.64.0.10:8791", token_file=str(token_file))
+    fake_response = MagicMock(status_code=200)
+    fake_response.json.return_value = _info_payload(node_id="local_box")
+    fake_request, _captured = _capture_session_request(fake_response)
+    with patch("requests.Session.request", fake_request):
+        with pytest.raises(SelfNodeError):
             prepare(config)
 
 
@@ -304,10 +398,18 @@ def test_node_client_flow_with_mock_server(tmp_path: Path):
 
         finals: list[tuple] = []
         translations: list[tuple] = []
-        callbacks = NodeCallbacks(
-            on_final=lambda node_id, gen, fid, text, t0, t1: finals.append((node_id, gen, fid, text, t0, t1)),
-            on_translation=lambda node_id, gen, fid, text: translations.append((node_id, gen, fid, text)),
-        )
+        final_ready = asyncio.Event()
+        translation_ready = asyncio.Event()
+
+        def on_final(node_id, gen, fid, text, t0, t1):
+            finals.append((node_id, gen, fid, text, t0, t1))
+            final_ready.set()
+
+        def on_translation(node_id, gen, fid, text):
+            translations.append((node_id, gen, fid, text))
+            translation_ready.set()
+
+        callbacks = NodeCallbacks(on_final=on_final, on_translation=on_translation)
 
         def mock_addrinfo(host, p, proto=0):
             return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("100.64.0.5", p))]
@@ -324,6 +426,11 @@ def test_node_client_flow_with_mock_server(tmp_path: Path):
 
         async def patched_connect(uri, **kwargs):
             assert kwargs.get("proxy") is None
+            pinned = urllib.parse.urlsplit(uri)
+            assert pinned.hostname == "100.64.0.5"
+            assert pinned.scheme == "ws"
+            assert pinned.path == "/v2/session"
+            assert "fake-node.ts" not in uri
             local_uri = f"ws://127.0.0.1:{port}/v2/session"
             return await real_ws_connect(local_uri, **kwargs)
 
@@ -338,7 +445,8 @@ def test_node_client_flow_with_mock_server(tmp_path: Path):
             await client.send(b"\x02\x00" * 1600, start_seconds=10.1)
             await client.drain(timeout=2.0)
 
-            await asyncio.sleep(0.1)
+            await asyncio.wait_for(final_ready.wait(), timeout=2.0)
+            await asyncio.wait_for(translation_ready.wait(), timeout=2.0)
             assert len(finals) >= 1
             assert finals[0][3] == "Hallo"
             assert finals[0][4] == 10.0
@@ -378,6 +486,10 @@ def test_node_client_distinguishes_busy_1013(tmp_path: Path):
         real_ws_connect = websockets.connect
 
         async def patched_connect(uri, **kwargs):
+            assert kwargs.get("proxy") is None
+            pinned = urllib.parse.urlsplit(uri)
+            assert pinned.hostname == "100.64.0.5"
+            assert "fake-node.ts" not in uri
             local_uri = f"ws://127.0.0.1:{port}/v2/session"
             return await real_ws_connect(local_uri, **kwargs)
 

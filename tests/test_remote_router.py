@@ -1,13 +1,19 @@
 from __future__ import annotations
 
-import os
+import time
 from pathlib import Path
-from unittest.mock import patch
 
-from realtime_subtitle.remote.node_client import NodeASRInfo, NodeConfig, NodeInfo
+from realtime_subtitle.remote.node_client import (
+    NodeASRInfo,
+    NodeConfig,
+    NodeIDMismatchError,
+    NodeInfo,
+    SelfNodeError,
+)
 from realtime_subtitle.remote.router import (
     CloudProviderStub,
     MigrationGate,
+    NodeStateRecord,
     RemoteRouter,
     RouteCandidate,
     RouteScore,
@@ -205,22 +211,63 @@ def test_silence_detection_and_migration():
 # --- 6. 不连自己测试（node_id 判据） ---
 
 
-def test_self_node_exclusion_from_file(tmp_path: Path):
-    node_id_file = tmp_path / "node_id"
-    node_id_file.write_text("my_self_node_id\n", encoding="utf-8")
+def test_self_node_exclusion_from_file(tmp_path: Path, monkeypatch):
+    import realtime_subtitle.node.info as node_info
 
-    with patch.object(Path, "home", return_value=tmp_path):
-        with patch.dict(os.environ, {"LOCALAPPDATA": ""}):
-            # 非 Windows 路径 ~/rs-node/node_id
-            rs_dir = tmp_path / "rs-node"
-            rs_dir.mkdir(parents=True, exist_ok=True)
-            (rs_dir / "node_id").write_text("my_self_node_id\n", encoding="utf-8")
+    home = tmp_path / "home"
+    state = tmp_path / "state"
+    home.mkdir()
+    state.mkdir()
+    legacy = home / "rs-node"
+    legacy.mkdir()
+    (legacy / "node_id").write_text("legacy_id\n", encoding="utf-8")
+    (state / node_info.NODE_ID_FILENAME).write_text("my_self_node_id\n", encoding="utf-8")
 
-            self_id = read_self_node_id()
-            assert self_id == "my_self_node_id"
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setattr(node_info, "STATE_DIR", state)
+
+    self_id = read_self_node_id()
+    assert self_id == "my_self_node_id"
 
     assert is_self_node("my_self_node_id", self_node_id="my_self_node_id")
     assert not is_self_node("other_node_id", self_node_id="my_self_node_id")
+
+
+def test_router_skips_self_node_error():
+    cfg = NodeConfig(id="probed", node_id="remote_1", url="ws://100.64.0.9:8791", token_file="/tmp/t")
+    other = NodeConfig(id="other", node_id="remote_2", url="ws://100.64.0.8:8791", token_file="/tmp/t")
+    router = RemoteRouter(node_configs=[cfg, other])
+
+    assert router.should_skip_node(cfg.node_id, SelfNodeError("local")) is True
+    kept = router.configs_skipping_self({"probed": SelfNodeError("local")})
+    assert [item.id for item in kept] == ["other"]
+
+    # 其他探测错误不当作「跳过自己」
+    kept_mismatch = router.configs_skipping_self({"probed": NodeIDMismatchError("mismatch")})
+    assert [item.id for item in kept_mismatch] == ["probed", "other"]
+
+
+def test_has_available_node_false_when_all_offline():
+    cfg_a = NodeConfig(id="a", node_id="n1", url="ws://100.64.0.1:8791", token_file="/tmp/t")
+    cfg_b = NodeConfig(id="b", node_id="n2", url="ws://100.64.0.2:8791", token_file="/tmp/t")
+    now = 1_000.0
+    router = RemoteRouter(
+        cloud_provider=CloudProviderStub(has_key=False),
+        node_configs=[cfg_a, cfg_b],
+    )
+    router.node_states["a"] = NodeStateRecord(offline_until=now + 10)
+    router.node_states["b"] = NodeStateRecord(offline_until=now + 20)
+    assert router.has_available_node(now=now) is False
+
+    # 有一个已过期的离线窗口，节点恢复可用
+    router.node_states["b"] = NodeStateRecord(offline_until=now - 1)
+    assert router.has_available_node(now=now) is True
+
+    # 墙钟时间下全部仍在离线窗口内时，层级落到本机
+    router.node_states["a"] = NodeStateRecord(offline_until=time.time() + 3600)
+    router.node_states["b"] = NodeStateRecord(offline_until=time.time() + 3600)
+    assert router.has_available_node() is False
+    assert router.select_tier() == "local"
 
 
 def test_router_excludes_self_node_candidate():

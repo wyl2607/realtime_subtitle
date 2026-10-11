@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import abc
 import logging
-import os
 import struct
-import sys
+import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Sequence
 
-from realtime_subtitle.remote.node_client import NodeConfig, NodeInfo
+from realtime_subtitle.remote.node_client import NodeConfig, NodeInfo, SelfNodeError
 from realtime_subtitle.remote.routing_rules import RoutingState
 
 logger = logging.getLogger("realtime_subtitle.remote.router")
@@ -75,20 +73,13 @@ class LocalProvider(Provider):
 
 def read_self_node_id() -> str | None:
     """
-    读取本机 node_id：
-    - Windows 读 %LOCALAPPDATA%\\rs-node\\node_id
-    - 非 Windows 读 ~/rs-node/node_id
-    - 读不到就不排除（返回 None）。
+    读取本机 node_id。路径复用 realtime_subtitle.node.info.STATE_DIR / "node_id"
+    （macOS: ~/Library/Application Support/rs-node，Windows: %LOCALAPPDATA%\\rs-node）。
+    读不到就不排除（返回 None）。
     """
-    if sys.platform == "win32":
-        local_appdata = os.environ.get("LOCALAPPDATA")
-        if local_appdata:
-            path = Path(local_appdata) / "rs-node" / "node_id"
-        else:
-            path = Path.home() / "AppData" / "Local" / "rs-node" / "node_id"
-    else:
-        path = Path.home() / "rs-node" / "node_id"
+    from realtime_subtitle.node.info import NODE_ID_FILENAME, STATE_DIR
 
+    path = STATE_DIR / NODE_ID_FILENAME
     try:
         if path.exists() and path.is_file():
             content = path.read_text(encoding="utf-8").strip()
@@ -392,22 +383,46 @@ class RemoteRouter:
         )
         return state.tier()
 
+    def should_skip_node(self, node_id: str, error: BaseException | None = None) -> bool:
+        """本机节点跳过：配置 node_id 命中，或 prepare 抛出 SelfNodeError。"""
+        if isinstance(error, SelfNodeError):
+            return True
+        return is_self_node(node_id, self.self_node_id)
+
+    def configs_skipping_self(
+        self,
+        probe_errors: dict[str, BaseException] | None = None,
+    ) -> list[NodeConfig]:
+        """去掉本机候选。probe_errors 的 key 是 NodeConfig.id。"""
+        errors = probe_errors or {}
+        kept: list[NodeConfig] = []
+        for cfg in self.node_configs:
+            if self.should_skip_node(cfg.node_id, errors.get(cfg.id)):
+                continue
+            kept.append(cfg)
+        return kept
+
     def filter_candidates(self) -> list[RouteConfigCandidate]:
         """过滤候选节点，排除本机 node_id。"""
-        candidates: list[RouteConfigCandidate] = []
-        for cfg in self.node_configs:
-            if is_self_node(cfg.node_id, self.self_node_id):
-                continue
-            candidates.append(RouteConfigCandidate(cfg))
-        return candidates
+        return [RouteConfigCandidate(cfg) for cfg in self.configs_skipping_self()]
 
-    def has_available_node(self) -> bool:
-        """检查 Tier 1 是否有至少一个可用节点。"""
-        return len(self.filter_candidates()) > 0
+    def has_available_node(self, now: float | None = None) -> bool:
+        """检查 Tier 1 是否有至少一个当前可用的节点。
+
+        已排除本机。node_states 中 offline_until > now 的节点视为离线；
+        全部剩余节点都离线时返回 False。没有 offline_until 的节点仍算可用。
+        """
+        current = time.time() if now is None else now
+        for cand in self.filter_candidates():
+            state = self.node_states.get(cand.config.id)
+            offline_until = None if state is None else state.offline_until
+            if offline_until is None or offline_until <= current:
+                return True
+        return False
 
     def select_best_node(self, candidates: Sequence[RouteCandidate], now: float) -> RouteScore | None:
         """层内打分并挑选最佳节点。"""
-        filtered = [c for c in candidates if not is_self_node(c.expected_node_id, self.self_node_id)]
+        filtered = [c for c in candidates if not self.should_skip_node(c.expected_node_id)]
         return RoutingDecider.choose(filtered, now=now, local_accurate=self.local_accurate, weights=self.weights)
 
     def observe_migration(self, best: RouteScore | None, current: RouteScore | None) -> bool:
