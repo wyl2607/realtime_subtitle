@@ -33,6 +33,9 @@ struct OverlayStyle: Codable, Equatable {
     /// 窗口左下角。空表示还没拖动过，用默认位置。
     var originX: Double?
     var originY: Double?
+    /// 用户手动调整的窗口尺寸。空表示沿用当前形状的默认宽度/内容高度。
+    var width: Double?
+    var height: Double?
 
     static let defaultFontSize = 28.0
     static let defaultSourceColor = "#F0F0F0"
@@ -40,6 +43,7 @@ struct OverlayStyle: Codable, Equatable {
     static let defaultBackgroundColor = "#000000"
     static let defaultBackgroundOpacity = 0.72
     static let defaultLines = 2
+    static let minimumWindowSize = CGSize(width: 360, height: 80)
     static let fontSizePresets: [Double] = [24, 28, 32, 40, 48]
     static let textColorPresets: [(title: String, hex: String)] = [
         ("白", "#F0F0F0"),
@@ -85,7 +89,9 @@ struct OverlayStyle: Codable, Equatable {
         lines: defaultLines,
         displayMode: .bilingual,
         originX: nil,
-        originY: nil
+        originY: nil,
+        width: nil,
+        height: nil
     )
 
     /// 圆角 18；直角和贴底横条都不倒角。
@@ -182,6 +188,12 @@ struct OverlayStyle: Codable, Equatable {
         if let y = partial.originY, y.isFinite {
             style.originY = y
         }
+        if let width = partial.width, width.isFinite, width > 0 {
+            style.width = width
+        }
+        if let height = partial.height, height.isFinite, height > 0 {
+            style.height = height
+        }
         return style
     }
 
@@ -193,10 +205,31 @@ struct OverlayStyle: Codable, Equatable {
         windowHeight: CGFloat,
         visibleFrames: [CGRect]
     ) -> CGPoint {
+        clampedFrame(
+            x: x,
+            y: y,
+            windowWidth: windowWidth,
+            windowHeight: windowHeight,
+            minimumSize: CGSize(width: 1, height: 1),
+            visibleFrames: visibleFrames
+        ).origin
+    }
+
+    /// 把窗口尺寸和左下角一起夹进某块可见屏幕；用于启动和显示器变化后的恢复。
+    static func clampedFrame(
+        x: CGFloat,
+        y: CGFloat,
+        windowWidth: CGFloat,
+        windowHeight: CGFloat,
+        minimumSize: CGSize = minimumWindowSize,
+        visibleFrames: [CGRect]
+    ) -> CGRect {
         let frames = visibleFrames.filter { $0.width > 1 && $0.height > 1 }
         let size = CGSize(width: max(windowWidth, 1), height: max(windowHeight, 1))
         let origin = CGPoint(x: x, y: y)
-        guard !frames.isEmpty else { return origin }
+        guard !frames.isEmpty else {
+            return CGRect(origin: origin, size: clampedSize(size, minimumSize: minimumSize, maximumSize: nil))
+        }
 
         let window = CGRect(origin: origin, size: size)
         var target: CGRect?
@@ -224,7 +257,8 @@ struct OverlayStyle: Codable, Equatable {
             }
             screen = nearest
         }
-        return clamp(origin, size: size, into: screen)
+        let fittedSize = clampedSize(size, minimumSize: minimumSize, maximumSize: screen.size)
+        return CGRect(origin: clamp(origin, size: fittedSize, into: screen), size: fittedSize)
     }
 
     static func preferredVisibleFrame(anchor: CGPoint, frames: [CGRect], fallback: CGRect) -> CGRect {
@@ -251,6 +285,17 @@ struct OverlayStyle: Codable, Equatable {
         let dx = max(frame.minX - point.x, point.x - frame.maxX, 0)
         let dy = max(frame.minY - point.y, point.y - frame.maxY, 0)
         return dx * dx + dy * dy
+    }
+
+    private static func clampedSize(_ size: CGSize, minimumSize: CGSize, maximumSize: CGSize?) -> CGSize {
+        let minWidth = max(minimumSize.width, 1)
+        let minHeight = max(minimumSize.height, 1)
+        let maxWidth = max(maximumSize?.width ?? CGFloat.greatestFiniteMagnitude, 1)
+        let maxHeight = max(maximumSize?.height ?? CGFloat.greatestFiniteMagnitude, 1)
+        return CGSize(
+            width: min(max(size.width, minWidth), maxWidth),
+            height: min(max(size.height, minHeight), maxHeight)
+        )
     }
 
     private static func clamp(_ origin: CGPoint, size: CGSize, into visible: CGRect) -> CGPoint {
@@ -286,6 +331,7 @@ struct OverlayStyle: Codable, Equatable {
         check(defaults.lines == 2, "默认行数 2")
         check(defaults.displayMode == .bilingual, "默认显示模式 bilingual")
         check(defaults.originX == nil && defaults.originY == nil, "默认无原点")
+        check(defaults.width == nil && defaults.height == nil, "默认无尺寸")
         check(defaults.cornerRadius == 18, "圆角半径 18")
         var square = defaults
         square.shape = .square
@@ -313,11 +359,15 @@ struct OverlayStyle: Codable, Equatable {
         edited.displayMode = .translationOnly
         edited.originX = 320
         edited.originY = 48
+        edited.width = 960
+        edited.height = 180
         do {
             let data = try JSONEncoder().encode(edited)
             let decoded = try JSONDecoder().decode(OverlayStyle.self, from: data)
             check(decoded == edited, "JSON 往返")
             check(fromJSON(data) == edited, "fromJSON 往返")
+            check(decoded.width == 960 && decoded.height == 180, "width/height 往返")
+            check(fromJSON(data).width == 960 && fromJSON(data).height == 180, "fromJSON width/height 往返")
         } catch {
             failures.append("JSON 往返异常：\(error)")
         }
@@ -333,6 +383,17 @@ struct OverlayStyle: Codable, Equatable {
         check(partial.fontSize == 40, "未知字段忽略")
         check(partial.translationColor == defaults.translationColor, "缺字段用默认")
         check(partial.originX == nil && partial.originY == nil, "缺原点保持空")
+        check(partial.width == nil && partial.height == nil, "缺尺寸保持空")
+        let sized = fromJSON(Data(#"{"width":777,"height":123}"#.utf8))
+        check(sized.width == 777 && sized.height == 123, "尺寸字段读取")
+        let onlyWidth = fromJSON(Data(#"{"width":640}"#.utf8))
+        check(onlyWidth.width == 640 && onlyWidth.height == nil, "只写 width 时 height 保持空")
+        let onlyHeight = fromJSON(Data(#"{"height":150}"#.utf8))
+        check(onlyHeight.width == nil && onlyHeight.height == 150, "只写 height 时 width 保持空")
+        let badSized = fromJSON(Data(#"{"width":0,"height":-1}"#.utf8))
+        check(badSized.width == nil && badSized.height == nil, "非法尺寸回空")
+        let nonFinite = fromJSON(Data(#"{"width":"wide","height":null}"#.utf8))
+        check(nonFinite.width == nil && nonFinite.height == nil, "尺寸类型不对保持空")
 
         let unknown = fromJSON(Data(
             #"{"textEdge":"glow","shape":"pill","displayMode":"karaoke","fontSize":32,"lines":3}"#.utf8
@@ -395,6 +456,24 @@ struct OverlayStyle: Codable, Equatable {
         check(off.x == 2480 && off.y == 700, "完全离屏夹进最近屏幕")
         let noScreen = clampedOrigin(x: 5, y: 6, windowWidth: 10, windowHeight: 10, visibleFrames: [])
         check(noScreen.x == 5 && noScreen.y == 6, "没有屏幕信息时保持原点")
+        let edgeTiny = clampedOrigin(x: 1430, y: 10, windowWidth: 10, windowHeight: 10, visibleFrames: [screen])
+        check(edgeTiny.x == 1430 && edgeTiny.y == 10, "原点夹回不把尺寸抬到最小")
+        check(minimumWindowSize == CGSize(width: 360, height: 80), "最小尺寸 360x80")
+        let smallFrame = clampedFrame(x: 50, y: 60, windowWidth: 10, windowHeight: 10, visibleFrames: [screen])
+        check(smallFrame.origin.x == 50 && smallFrame.origin.y == 60, "过小尺寸保留屏内原点")
+        check(smallFrame.size.width == 360 && smallFrame.size.height == 80, "过小尺寸夹到最小")
+        let hugeFrame = clampedFrame(x: 100, y: 100, windowWidth: 2000, windowHeight: 2000, visibleFrames: [screen])
+        check(hugeFrame.origin.x == 0 && hugeFrame.origin.y == 0, "过大尺寸原点夹回")
+        check(hugeFrame.size.width == 1440 && hugeFrame.size.height == 900, "过大尺寸夹到可见区")
+        let offFrame = clampedFrame(x: 4000, y: 3000, windowWidth: 500, windowHeight: 220, visibleFrames: [leftScreen, rightScreen])
+        check(offFrame.origin.x == 2380 && offFrame.origin.y == 680, "尺寸+位置完全离屏夹进最近屏幕")
+        check(offFrame.size.width == 500 && offFrame.size.height == 220, "屏内容尺寸不变")
+        let smallOff = clampedFrame(x: -100, y: -80, windowWidth: 20, windowHeight: 30, visibleFrames: [screen])
+        check(smallOff.size.width == 360 && smallOff.size.height == 80, "过小且离屏时尺寸夹到最小")
+        check(smallOff.origin.x == 0 && smallOff.origin.y == 0, "过小且离屏时原点夹回")
+        let hugeOff = clampedFrame(x: 5000, y: -500, windowWidth: 3000, windowHeight: 3000, visibleFrames: [leftScreen, rightScreen])
+        check(hugeOff.size.width == 1440 && hugeOff.size.height == 900, "过大且离屏时尺寸夹到最近屏幕")
+        check(hugeOff.origin.x == 1440 && hugeOff.origin.y == 0, "过大且离屏时原点贴住最近屏幕")
 
         let dir = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rslite-style-\(UUID().uuidString)")
@@ -431,6 +510,8 @@ private struct OverlayStylePartial: Decodable {
     var displayMode: String?
     var originX: Double?
     var originY: Double?
+    var width: Double?
+    var height: Double?
 }
 
 enum OverlayStyleStore {
