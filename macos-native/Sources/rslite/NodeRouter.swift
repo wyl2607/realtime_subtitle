@@ -66,7 +66,9 @@ enum RoutingDecider {
         let model = info.asr.model ?? ""
         let translator = info.translator
         let asr = weights.asrRank[model] ?? 25
-        let tr = weights.translatorRank[translator] ?? (translator.hasPrefix("ollama:") ? 16 : 12)
+        // translator_ok 缺失按 true。false 只把 tr 记 0，节点仍可当识别用，不加额外罚分。
+        let ranked = weights.translatorRank[translator] ?? (translator.hasPrefix("ollama:") ? 16 : 12)
+        let tr = info.translatorQualityEnabled ? ranked : 0
         let rtf = info.asr.rtf ?? candidate.rttMS / 1000.0
         var penalties = 0.0
         if info.inUse { penalties += weights.inUsePenalty }
@@ -1355,6 +1357,82 @@ final class NodeRouter: @unchecked Sendable {
               "同 rtf 下本机节点应因无网络加分胜出")
         check(RoutingDecider.choose(candidates: [better, localSlowP8], now: 0, localAccurate: true)?.id == "better",
               "远端明显更优时应选远端")
+        let ollamaDown = NodeInfo(
+            v: 2, nodeID: "od", hwHash: "h",
+            asr: .init(model: "whisper-large-v3-turbo", backend: "mlx", rtf: 0.08),
+            translator: "ollama:qwen", busy: false, onAC: true, inUse: false, worker: "warm",
+            translatorOK: false
+        )
+        let ollamaUp = NodeInfo(
+            v: 2, nodeID: "ou", hwHash: "h",
+            asr: .init(model: "whisper-large-v3-turbo", backend: "mlx", rtf: 0.08),
+            translator: "ollama:qwen", busy: false, onAC: true, inUse: false, worker: "warm",
+            translatorOK: true
+        )
+        let ollamaLegacy = NodeInfo(
+            v: 2, nodeID: "ou", hwHash: "h",
+            asr: .init(model: "whisper-large-v3-turbo", backend: "mlx", rtf: 0.08),
+            translator: "ollama:qwen", busy: false, onAC: true, inUse: false, worker: "warm"
+        )
+        let downCandidate = RouteCandidate(id: "down", expectedNodeID: "od", info: ollamaDown, rttMS: 20, isLocal: false, offlineUntil: nil)
+        let upCandidate = RouteCandidate(id: "up", expectedNodeID: "ou", info: ollamaUp, rttMS: 20, isLocal: false, offlineUntil: nil)
+        if let downScore = RoutingDecider.score(downCandidate, now: 0, localAccurate: true),
+           let upScore = RoutingDecider.score(upCandidate, now: 0, localAccurate: true),
+           let legacyScore = RoutingDecider.score(
+            RouteCandidate(id: "up", expectedNodeID: "ou", info: ollamaLegacy, rttMS: 20, isLocal: false, offlineUntil: nil),
+            now: 0, localAccurate: true
+           ) {
+            check(upScore.score - downScore.score == 16,
+                  "translator_ok=false 时 tr 记 0，不加额外罚分")
+            check(downScore.reason.contains("quality=40.0") && upScore.reason.contains("quality=56.0"),
+                  "translator_ok=false 只把质量项里的 tr 清掉")
+            check(legacyScore.score == upScore.score, "translator_ok 缺失按 true，分数与显式 true 相同")
+        } else {
+            check(false, "translator_ok=false 的节点仍可作识别")
+        }
+        check(RoutingDecider.choose(candidates: [downCandidate, upCandidate], now: 0, localAccurate: true)?.id == "up",
+              "翻译不可用时不应再靠 tr 赢过同条件的可用节点")
+        let fastDown = NodeInfo(
+            v: 2, nodeID: "fd", hwHash: "h",
+            asr: .init(model: "whisper-large-v3-turbo", backend: "mlx", rtf: 0.02),
+            translator: "ollama:qwen", busy: false, onAC: true, inUse: false, worker: "warm",
+            translatorOK: false
+        )
+        let slowUp = NodeInfo(
+            v: 2, nodeID: "su", hwHash: "h",
+            asr: .init(model: "whisper-large-v3-turbo", backend: "mlx", rtf: 1),
+            translator: "ollama:qwen", busy: false, onAC: true, inUse: false, worker: "warm",
+            translatorOK: true
+        )
+        check(RoutingDecider.choose(candidates: [
+            RouteCandidate(id: "fast", expectedNodeID: "fd", info: fastDown, rttMS: 20, isLocal: false, offlineUntil: nil),
+            RouteCandidate(id: "slow", expectedNodeID: "su", info: slowUp, rttMS: 20, isLocal: false, offlineUntil: nil),
+        ], now: 0, localAccurate: true)?.id == "fast",
+              "翻译不可用只把 tr 记 0，更快的识别节点仍可胜出")
+        let appleDown = NodeInfo(
+            v: 2, nodeID: "ad", hwHash: "h",
+            asr: .init(model: "whisper-large-v3-turbo", backend: "mlx", rtf: 0.08),
+            translator: "apple", busy: false, onAC: true, inUse: false, worker: "warm",
+            translatorOK: false
+        )
+        let appleUp = NodeInfo(
+            v: 2, nodeID: "au", hwHash: "h",
+            asr: .init(model: "whisper-large-v3-turbo", backend: "mlx", rtf: 0.08),
+            translator: "apple", busy: false, onAC: true, inUse: false, worker: "warm",
+            translatorOK: true
+        )
+        if let appleDownScore = RoutingDecider.score(
+            RouteCandidate(id: "ad", expectedNodeID: "ad", info: appleDown, rttMS: 20, isLocal: false, offlineUntil: nil),
+            now: 0, localAccurate: true
+        ), let appleUpScore = RoutingDecider.score(
+            RouteCandidate(id: "au", expectedNodeID: "au", info: appleUp, rttMS: 20, isLocal: false, offlineUntil: nil),
+            now: 0, localAccurate: true
+        ) {
+            check(appleUpScore.score - appleDownScore.score == 20,
+                  "translator_ok=false 时 apple 的 tr 也记 0，罚分幅度等于原 tr")
+        } else {
+            check(false, "translator_ok=false 的 apple 节点仍可作识别")
+        }
         check(Self.currentRouteScore(
             node: NodeConfig(id: localUDSID, nodeID: "", url: "", tokenFile: ""),
             info: goodInfo,

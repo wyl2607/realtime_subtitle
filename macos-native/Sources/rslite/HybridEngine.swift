@@ -76,6 +76,9 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
     private var activeNodeSessions: [String: Int] = [:]
     private var selectedNodeSession: NodeSessionKey?
     private var pendingNodeFinals: [NodeSessionKey: [Int: (String, Double?, Double?)]] = [:]
+    private var settledNodeSentences: [NodeSessionKey: Set<Int>] = [:]
+    private var earlyTranslateFailures: [NodeSessionKey: Set<Int>] = [:]
+    private var enqueueProbe: (@Sendable (Int, String) -> Void)?
     private var cloudController: CloudUploadController?
     private var cloudTask: Task<Void, Never>?
     private var uploadTasks: [UUID: Task<Void, Never>] = [:]
@@ -205,65 +208,20 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
         let nodeCallbacks = NodeCallbacks(
             // 模式标签由 NodeRouter 在切换成功后统一用清单里的 id 上报，这里不重复报
             onReady: { [weak self] nodeID, generation, _ in
-                guard let self else { return }
-                self.lock.withLockVoid {
-                    self.clearPending(for: nodeID)
-                    self.activeNodeSessions[nodeID] = generation
-                    self.pendingNodeFinals[NodeSessionKey(nodeID: nodeID, generation: generation)] = [:]
-                }
+                self?.openNodeSession(nodeID: nodeID, generation: generation)
             },
             onFinal: { [weak self] nodeID, generation, id, text, t0, t1 in
-                guard let self else { return }
-                let shouldShowRefining = self.lock.withLockValue { () -> Bool in
-                    guard self.activeNodeSessions[nodeID] == generation else {
-                        return false
-                    }
-                    let key = NodeSessionKey(nodeID: nodeID, generation: generation)
-                    var node = self.pendingNodeFinals[key] ?? [:]
-                    node[id] = (text, t0, t1)
-                    self.pendingNodeFinals[key] = node
-                    return self.selectedNodeSession == key
-                }
-                if shouldShowRefining, !self.lock.withLockValue({ self.cloudOwnsLabel }) {
-                    self.onMode(.refining)
-                }
+                self?.ingestNodeFinal(nodeID: nodeID, generation: generation, id: id, text: text, t0: t0, t1: t1)
             },
             onTranslation: { [weak self] nodeID, generation, id, translation in
-                guard let self else { return }
-                let result = self.lock.withLockValue { () -> ((String, Double?, Double?), Bool)? in
-                    guard activeNodeSessions[nodeID] == generation else {
-                        return nil
-                    }
-                    let key = NodeSessionKey(nodeID: nodeID, generation: generation)
-                    guard var node = pendingNodeFinals[key], let final = node.removeValue(forKey: id) else {
-                        return nil
-                    }
-                    pendingNodeFinals[key] = node
-                    return (final, selectedNodeSession == key)
-                }
-                if let (final, isSelected) = result {
-                    // 云端占着状态行时节点句仍然走 P5，只是不改标签。
-                    // 占一个显示键，让后面的云端句和 LineStore 的负数键对齐。
-                    _ = self.allocateDisplayKey()
-                    _ = self.consumeLocalTranslations(t0: final.1, t1: final.2)
-                    self.onNodeFinal(nodeID, final.1, final.2, final.0, translation)
-                    if isSelected, !self.lock.withLockValue({ self.cloudOwnsLabel }) {
-                        self.onMode(.hybrid(nodeID))
-                    }
-                }
+                self?.ingestNodeTranslation(nodeID: nodeID, generation: generation, id: id, text: translation)
             },
             onStatus: callbacks.onStatus,
+            onTranslateFailed: { [weak self] nodeID, generation, id in
+                self?.ingestNodeTranslateFailed(nodeID: nodeID, generation: generation, id: id)
+            },
             onClosed: { [weak self] nodeID, generation, _ in
-                guard let self else { return }
-                self.lock.withLockVoid {
-                    Self.applySessionClosed(
-                        nodeID: nodeID,
-                        generation: generation,
-                        pendingFinals: &self.pendingNodeFinals,
-                        activeSessions: &self.activeNodeSessions,
-                        selectedSession: &self.selectedNodeSession
-                    )
-                }
+                self?.closeNodeSession(nodeID: nodeID, generation: generation)
             }
         )
         let nodeTierEnabled = lock.withLockValue { lastNodeTierEnabled }
@@ -296,6 +254,8 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
             selectedNodeSession = nil
             if clearPending {
                 pendingNodeFinals.removeAll()
+                settledNodeSentences.removeAll()
+                earlyTranslateFailures.removeAll()
             }
             return current
         }
@@ -304,6 +264,206 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
 
     private func clearPending(for nodeID: String) {
         pendingNodeFinals = pendingNodeFinals.filter { $0.key.nodeID != nodeID }
+        settledNodeSentences = settledNodeSentences.filter { $0.key.nodeID != nodeID }
+        earlyTranslateFailures = earlyTranslateFailures.filter { $0.key.nodeID != nodeID }
+    }
+
+    private func openNodeSession(nodeID: String, generation: Int) {
+        lock.withLockVoid {
+            clearPending(for: nodeID)
+            activeNodeSessions[nodeID] = generation
+            pendingNodeFinals[NodeSessionKey(nodeID: nodeID, generation: generation)] = [:]
+        }
+    }
+
+    private enum NodeSentenceAction {
+        case showTranslation(text: String, t0: Double?, t1: Double?, dst: String)
+        case fallback(text: String, t0: Double?, t1: Double?)
+    }
+
+    private enum IngestStep {
+        case none
+        case refining
+        case publish(NodeSentenceAction, isSelected: Bool)
+    }
+
+    private func closeNodeSession(nodeID: String, generation: Int) {
+        lock.withLockVoid {
+            let closingActive = activeNodeSessions[nodeID] == generation
+            Self.applySessionClosed(
+                nodeID: nodeID,
+                generation: generation,
+                pendingFinals: &pendingNodeFinals,
+                activeSessions: &activeNodeSessions,
+                selectedSession: &selectedNodeSession
+            )
+            let key = NodeSessionKey(nodeID: nodeID, generation: generation)
+            settledNodeSentences.removeValue(forKey: key)
+            earlyTranslateFailures.removeValue(forKey: key)
+            if closingActive {
+                settledNodeSentences = settledNodeSentences.filter { $0.key.nodeID != nodeID }
+                earlyTranslateFailures = earlyTranslateFailures.filter { $0.key.nodeID != nodeID }
+            }
+        }
+    }
+
+    private func withSession<T>(
+        nodeID: String,
+        generation: Int,
+        _ body: (
+            inout [Int: (String, Double?, Double?)],
+            inout Set<Int>,
+            inout Set<Int>,
+            Bool
+        ) -> T
+    ) -> T? {
+        lock.withLockValue {
+            guard activeNodeSessions[nodeID] == generation else { return nil }
+            let key = NodeSessionKey(nodeID: nodeID, generation: generation)
+            var pending = pendingNodeFinals[key] ?? [:]
+            var settled = settledNodeSentences[key] ?? []
+            var early = earlyTranslateFailures[key] ?? []
+            let selected = selectedNodeSession == key
+            let result = body(&pending, &settled, &early, selected)
+            pendingNodeFinals[key] = pending
+            settledNodeSentences[key] = settled
+            earlyTranslateFailures[key] = early
+            return result
+        }
+    }
+
+    /// 先到的一边占坑。失败回退之后再来的 translation（包括空串）不再上屏。
+    private static func storeFinal(
+        id: Int,
+        text: String,
+        t0: Double?,
+        t1: Double?,
+        pending: inout [Int: (String, Double?, Double?)],
+        settled: inout Set<Int>,
+        early: inout Set<Int>
+    ) -> NodeSentenceAction? {
+        if settled.contains(id) {
+            return nil
+        }
+        if early.remove(id) != nil {
+            settled.insert(id)
+            return .fallback(text: text, t0: t0, t1: t1)
+        }
+        pending[id] = (text, t0, t1)
+        return nil
+    }
+
+    private static func claimTranslation(
+        id: Int,
+        dst: String,
+        pending: inout [Int: (String, Double?, Double?)],
+        settled: inout Set<Int>
+    ) -> NodeSentenceAction? {
+        if settled.contains(id) {
+            return nil
+        }
+        guard let sentence = pending.removeValue(forKey: id) else {
+            return nil
+        }
+        settled.insert(id)
+        return .showTranslation(text: sentence.0, t0: sentence.1, t1: sentence.2, dst: dst)
+    }
+
+    private static func claimTranslateFailed(
+        id: Int,
+        pending: inout [Int: (String, Double?, Double?)],
+        settled: inout Set<Int>,
+        early: inout Set<Int>
+    ) -> NodeSentenceAction? {
+        if settled.contains(id) {
+            return nil
+        }
+        guard let sentence = pending.removeValue(forKey: id) else {
+            early.insert(id)
+            return nil
+        }
+        settled.insert(id)
+        return .fallback(text: sentence.0, t0: sentence.1, t1: sentence.2)
+    }
+
+    private func ingestNodeFinal(nodeID: String, generation: Int, id: Int, text: String, t0: Double?, t1: Double?) {
+        let step = withSession(nodeID: nodeID, generation: generation) { pending, settled, early, selected in
+            if let action = Self.storeFinal(
+                id: id, text: text, t0: t0, t1: t1,
+                pending: &pending, settled: &settled, early: &early
+            ) {
+                return IngestStep.publish(action, isSelected: selected)
+            }
+            if selected, pending[id] != nil {
+                return IngestStep.refining
+            }
+            return IngestStep.none
+        } ?? .none
+        apply(nodeID: nodeID, step: step)
+    }
+
+    private func ingestNodeTranslation(nodeID: String, generation: Int, id: Int, text: String) {
+        let step = withSession(nodeID: nodeID, generation: generation) { pending, settled, _, selected in
+            guard let action = Self.claimTranslation(id: id, dst: text, pending: &pending, settled: &settled) else {
+                return IngestStep.none
+            }
+            return IngestStep.publish(action, isSelected: selected)
+        } ?? .none
+        apply(nodeID: nodeID, step: step)
+    }
+
+    private func ingestNodeTranslateFailed(nodeID: String, generation: Int, id: Int) {
+        let step = withSession(nodeID: nodeID, generation: generation) { pending, settled, early, selected in
+            guard let action = Self.claimTranslateFailed(
+                id: id, pending: &pending, settled: &settled, early: &early
+            ) else {
+                return IngestStep.none
+            }
+            return IngestStep.publish(action, isSelected: selected)
+        } ?? .none
+        apply(nodeID: nodeID, step: step)
+    }
+
+    private func apply(nodeID: String, step: IngestStep) {
+        switch step {
+        case .none:
+            return
+        case .refining:
+            if !lock.withLockValue({ cloudOwnsLabel }) {
+                onMode(.refining)
+            }
+        case .publish(let action, let isSelected):
+            publish(nodeID: nodeID, isSelected: isSelected, action: action)
+        }
+    }
+
+    /// 节点译文和本机回退都占一个显示键，好跟 LineStore 的负数键对齐。
+    /// 回退的译文走 Apple 翻译队列，按这个键回来；先到的一边已经占坑，后到的不再覆盖。
+    private func publish(nodeID: String, isSelected: Bool, action: NodeSentenceAction) {
+        let key = allocateDisplayKey()
+        switch action {
+        case .showTranslation(let text, let t0, let t1, let dst):
+            _ = consumeLocalTranslations(t0: t0, t1: t1)
+            onNodeFinal(nodeID, t0, t1, text, dst)
+        case .fallback(let text, let t0, let t1):
+            let inherited = consumeLocalTranslations(t0: t0, t1: t1)
+            onNodeFinal(nodeID, t0, t1, text, inherited)
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                enqueueLocalTranslation(id: key, text: trimmed)
+            }
+        }
+        if isSelected, !lock.withLockValue({ cloudOwnsLabel }) {
+            onMode(.hybrid(nodeID))
+        }
+    }
+
+    private func enqueueLocalTranslation(id: Int, text: String) {
+        if let probe = lock.withLockValue({ enqueueProbe }) {
+            probe(id, text)
+            return
+        }
+        lock.withLockValue { local }?.enqueueTranslation(id: id, text: text)
     }
 
     private func recordRouterMode(_ mode: SubtitleMode) {
@@ -432,6 +592,81 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
               "暂停中不应拉起 cloudTask")
         check(!Self.fanoutReadyStartsCloud(mode: .local, suspended: false),
               "本机模式不拉起云端")
+        final class NodeCapture: @unchecked Sendable {
+            var finals: [(String, String?)] = []
+            var enqueued: [(Int, String)] = []
+            var modes: [SubtitleMode] = []
+        }
+        func makeEngine(_ capture: NodeCapture) -> HybridEngine {
+            let engine = HybridEngine(
+                config: PipelineConfig(sourceSpec: "file:/dev/null", sourceLocaleID: "de-DE", targetLanguageID: "zh-Hans"),
+                mode: .hybrid,
+                callbacks: PipelineCallbacks(),
+                onMode: { capture.modes.append($0) },
+                onNodeFinal: { _, _, _, src, dst in capture.finals.append((src, dst)) }
+            )
+            engine.enqueueProbe = { capture.enqueued.append(($0, $1)) }
+            return engine
+        }
+        func select(_ engine: HybridEngine, _ nodeID: String, _ generation: Int) {
+            engine.openNodeSession(nodeID: nodeID, generation: generation)
+            engine.recordRouterMode(.hybrid(nodeID))
+        }
+        do {
+            let capture = NodeCapture()
+            let engine = makeEngine(capture)
+            select(engine, "yzwdmsnlmm", 2)
+            engine.noteLocalFinal(id: 1, t0: 0, t1: 2)
+            engine.noteLocalTranslation(id: 1, text: "继承译文")
+            engine.ingestNodeFinal(nodeID: "yzwdmsnlmm", generation: 2, id: 7, text: "Guten Tag", t0: 0, t1: 2)
+            engine.ingestNodeTranslateFailed(nodeID: "yzwdmsnlmm", generation: 2, id: 7)
+            check(capture.finals.count == 1 && capture.finals[0].0 == "Guten Tag" && capture.finals[0].1 == "继承译文",
+                  "翻译失败先继承本机译文上屏，不留空")
+            check(capture.enqueued.count == 1
+                  && capture.enqueued[0].0 == Self.displayKey(at: 0)
+                  && capture.enqueued[0].1 == "Guten Tag",
+                  "翻译失败按该句显示键入本机翻译队列")
+            check(capture.modes == [.refining, .hybrid("yzwdmsnlmm")],
+                  "翻译失败后离开精修，回到该节点的混合态")
+            engine.ingestNodeTranslation(nodeID: "yzwdmsnlmm", generation: 2, id: 7, text: "")
+            engine.ingestNodeTranslation(nodeID: "yzwdmsnlmm", generation: 2, id: 7, text: "节点译文")
+            check(capture.finals.count == 1 && capture.enqueued.count == 1 && engine.nextDisplayKey == -2,
+                  "失败后迟到的节点译文（含空串）不得覆盖，也不得再占显示键")
+        }
+        do {
+            let capture = NodeCapture()
+            let engine = makeEngine(capture)
+            select(engine, "yzwdmsnlmm", 1)
+            engine.ingestNodeFinal(nodeID: "yzwdmsnlmm", generation: 1, id: 3, text: "Abend", t0: 1, t1: 2)
+            engine.ingestNodeTranslation(nodeID: "yzwdmsnlmm", generation: 1, id: 3, text: "晚安")
+            engine.ingestNodeTranslateFailed(nodeID: "yzwdmsnlmm", generation: 1, id: 3)
+            check(capture.finals.count == 1 && capture.finals[0].0 == "Abend" && capture.finals[0].1 == "晚安"
+                  && capture.enqueued.isEmpty,
+                  "节点译文先到后不得再入本机翻译队列")
+            check(engine.nextDisplayKey == -2, "节点译文先到仍占用一个显示键")
+        }
+        do {
+            let capture = NodeCapture()
+            let engine = makeEngine(capture)
+            select(engine, "yzwdmsnlmm", 1)
+            engine.ingestNodeTranslateFailed(nodeID: "yzwdmsnlmm", generation: 1, id: 1)
+            engine.ingestNodeFinal(nodeID: "yzwdmsnlmm", generation: 1, id: 2, text: "Andere", t0: 0, t1: 1)
+            engine.ingestNodeTranslation(nodeID: "yzwdmsnlmm", generation: 1, id: 2, text: "别的")
+            engine.ingestNodeFinal(nodeID: "yzwdmsnlmm", generation: 1, id: 1, text: "Ziel", t0: 2, t1: 3)
+            check(capture.finals.count == 2
+                  && capture.finals[0].0 == "Andere" && capture.finals[0].1 == "别的"
+                  && capture.finals[1].0 == "Ziel" && capture.finals[1].1 == nil,
+                  "失败先到只回退对应 id，不抢走其它句")
+            check(capture.enqueued.count == 1
+                  && capture.enqueued[0].0 == Self.displayKey(at: 1)
+                  && capture.enqueued[0].1 == "Ziel",
+                  "失败先于 final 到达时，final 到达后按下一个显示键入队")
+            engine.ingestNodeTranslation(nodeID: "yzwdmsnlmm", generation: 1, id: 1, text: "")
+            check(capture.finals.count == 2 && capture.enqueued.count == 1,
+                  "回退之后的空译文不得覆盖")
+            engine.ingestNodeTranslateFailed(nodeID: "yzwdmsnlmm", generation: 9, id: 5)
+            check(capture.enqueued.count == 1, "旧会话的 translate_failed 不得入队")
+        }
         failures.append(contentsOf: CloudSegmenter.selfTest())
         failures.append(contentsOf: CloudUploadController.selfTest())
         return failures
