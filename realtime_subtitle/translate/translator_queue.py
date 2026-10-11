@@ -8,7 +8,7 @@ Whisper 增量识别 + LLM 翻译模块（2026-07-06 重写）
 
 显示模型（通过回调驱动 UI，由 main.py 接线）：
 - on_display(committed_live, unstable): live行 = 已提交未翻译的德语 + 灰色未稳定尾部
-- on_pair(german, chinese): 一段德语翻译完成，变成历史句对
+- on_pair(source_text, target_text, t0, t1, key, revision): 一段原文翻译完成，变成历史句对
 """
 import warnings
 import logging
@@ -88,6 +88,22 @@ from realtime_subtitle.translate.language_switch import (  # noqa: F401
     DecodeHealth,
     LanguageSwitchMixin,
 )
+
+
+class TimedSentence(str):
+    """字幕句子的本机时间元数据。
+
+    继承 str 是为了不改翻译、存档、live 行拼接这些文本路径；t0/t1/key
+    只给后续按时间替换本机字幕使用，本 TK 只负责一路保存。
+    """
+
+    def __new__(cls, text, t0=None, t1=None, key=None, source="local"):
+        obj = str.__new__(cls, text or "")
+        obj.t0 = t0
+        obj.t1 = t1
+        obj.key = key
+        obj.source = source
+        return obj
 
 
 def _glossary_applies():
@@ -550,6 +566,13 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
 
             # committed 但还没凑成完整句子的德语残句
             self.pending_text = ""
+            self.pending_words = []
+            # 客户端样本时钟：只按进入本管线的 16k 样本累计，暂停期间没有样本就
+            # 不前进；clear_context / 设备热切换只重置缓冲，不重置这只钟。
+            self._sample_clock_samples = 0
+            # 收件箱丢块后置位；识别线程下一批先收尾旧缓冲，再按样本钟重锚。
+            self._sample_clock_needs_reanchor = False
+            self._sentence_seq = 0
             # 句尾扣留起点（0=没扣着东西）：见 _extract_sentences / _release_held_boundary
             self._held_since = 0.0
             # 上次识别的未稳定尾部（重绘live行用）
@@ -645,7 +668,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
 
             # UI回调，由main.py接线（都必须线程安全——SubtitleWindow用Qt信号保证）
             self.on_display = None  # (committed_live, unstable) -> None
-            self.on_pair = None     # (german, chinese) -> None
+            self.on_pair = None     # (source_text, target_text, t0, t1, key, revision) -> None
             self.on_draft = None    # (chinese_draft) -> None 残句的草稿中文
             self.on_status = None   # (text) -> None 状态提示（如Ollama挂了）
             self.on_language_applied = None  # (src, tgt) -> None 语言对真正写进 config 之后
@@ -759,8 +782,9 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         worker完成时发现代数变了就丢弃结果（不上屏、不写回上下文）——
         否则切语言瞬间，旧语言的句对还会蹦出来并污染新语言的翻译上下文。
         """
-        self.processor.init()
+        self._processor_init_at_sample_clock()
         self.pending_text = ""
+        self.pending_words = []
         self._held_since = 0.0
         self._last_unstable = ""
         self._draft_last_text = ""
@@ -774,6 +798,43 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
     # ------------------------------------------------------------------
     # 显示
     # ------------------------------------------------------------------
+    def _sample_clock_seconds(self):
+        return self._sample_clock_samples / float(config.SAMPLE_RATE)
+
+    def _processor_init_at_sample_clock(self, offset=None):
+        """按样本钟重置 ASR 缓冲。offset 缺省取当前样本钟，不把 buffer_time_offset 归零。"""
+        if offset is None:
+            offset = self._sample_clock_seconds()
+        if not hasattr(self, "processor"):
+            return
+        self.processor.init(offset=offset)
+
+    def _advance_sample_clock(self, items):
+        """把这批样本计入样本钟。调用方必须已持有 _asr_lock。
+
+        _asr_lock 是 Lock 不是 RLock。这里再加锁会死锁：enqueue_audio 的丢块
+        路径是持着这把锁进来的。
+        """
+        samples = sum(len(audio) for audio, _capture_time in items if audio is not None)
+        self._sample_clock_samples += samples
+        return samples
+
+    def _finish_dropped_buffer_and_reanchor(self):
+        """收件箱丢块之后：先把旧缓冲收尾送翻译，再按当前样本钟重锚。
+
+        丢掉的样本已经进了样本钟，但没进识别缓冲。不论丢掉的时长多短、缓冲
+        是否为空都要重锚，否则下一批词的 t0 会落后被丢的那段。
+        标记在 _process_inbox 取批时就清掉了。这里再清的话，finish 期间新的
+        丢块会被抹掉。
+        """
+        proc = getattr(self, "processor", None)
+        if proc is not None and proc.buffer_seconds() > 0:
+            self._append_committed(proc.finish())
+            self._enqueue_sentences(self._extract_sentences())
+            if self.pending_text:
+                self._enqueue_sentences([self._take_pending_as_sentence()])
+        self._processor_init_at_sample_clock()
+
     def _live_text(self):
         """live行的白色部分 = 翻译中 + 待翻译 + 未成句残句"""
         with self._tx_lock:
@@ -797,15 +858,17 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
     # ------------------------------------------------------------------
     # 带语言代数的 UI 事件（O04）
     # ------------------------------------------------------------------
-    def _emit_pair(self, source_text, target_text):
+    def _emit_pair(self, source_text, target_text, t0=None, t1=None, key=None):
         """句对上屏。带上发出这一刻的语言代数，UI 侧拒收过期的。
 
         ☠️ 不能只靠发出前再查一次代数：查完到真正 emit 之间锁是放开的，
         窗口关不掉。判据必须跟着事件走，由最后消费的那一端校验。
+        on_pair 一律是 (source_text, target_text, t0, t1, key, revision)。
         """
         if self.on_pair:
-            self.on_pair(source_text, target_text,
-                         getattr(self, "_lang_revision", 0))
+            self.on_pair(
+                source_text, target_text, t0, t1, key,
+                getattr(self, "_lang_revision", 0))
 
     def _emit_draft(self, text):
         if self.on_draft:
@@ -820,7 +883,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             return
         if self._lang_hold_capture(sentences):
             return  # 确认换语言期间先扣住，见 LanguageSwitchMixin._update_lang_hold
-        sentences = _squash_repeats(sentences)  # 压缩Whisper复读伪影
+        sentences = self._squash_timed_sentences(sentences)  # 压缩Whisper复读伪影
         with self._tx_lock:
             self._tx_queue.extend(sentences)
             dropped = self._trim_tx_queue_locked()
@@ -847,6 +910,88 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             dropped += 1
         self._tx_dropped += dropped
         return dropped
+
+    @staticmethod
+    def _word_align_text(text):
+        return re.sub(r"\s+", "", text or "")
+
+    def _take_words_for_sentence(self, words, start_idx, sentence):
+        """从 pending_words 里取出组成 sentence 的词。
+
+        Whisper 的拉丁词常带前导空格，而 pending_text 之间还可能插入我们补的
+        分隔符；对齐时忽略空白，时间仍取真实首末词。
+        """
+        target = self._word_align_text(sentence)
+        if not target:
+            return [], start_idx
+        acc = ""
+        taken = []
+        idx = start_idx
+        while idx < len(words):
+            word = words[idx]
+            taken.append(word)
+            acc = self._word_align_text("".join(w[2] for w in taken))
+            idx += 1
+            if acc == target:
+                return taken, idx
+            if len(acc) >= len(target) and not target.startswith(acc):
+                break
+        return taken, idx
+
+    def _make_timed_sentence(self, text, words):
+        t0 = words[0][0] if words else None
+        t1 = words[-1][1] if words else None
+        self._sentence_seq = getattr(self, "_sentence_seq", 0) + 1
+        key = None
+        if t0 is not None and t1 is not None:
+            key = f"local:{t0:.3f}-{t1:.3f}:{self._sentence_seq}"
+        return TimedSentence(text, t0=t0, t1=t1, key=key, source="local")
+
+    def _take_pending_as_sentence(self):
+        sentence = self._make_timed_sentence(
+            self.pending_text, list(getattr(self, "pending_words", [])))
+        self.pending_text = ""
+        self.pending_words = []
+        return sentence
+
+    def _span_for_sentences(self, sentences):
+        timed = [s for s in sentences
+                 if getattr(s, "t0", None) is not None and getattr(s, "t1", None) is not None]
+        if not timed:
+            return None, None, None
+        t0 = timed[0].t0
+        t1 = timed[-1].t1
+        keys = [getattr(s, "key", None) for s in timed if getattr(s, "key", None)]
+        key = "+".join(keys) if keys else f"local:{t0:.3f}-{t1:.3f}"
+        return t0, t1, key
+
+    def _squash_timed_sentences(self, sentences):
+        """复读压缩保留句子时间；text_rules 的纯文本 helper 不知道元数据。"""
+        out = []
+        keep_words = 3
+        keep_sents = 2
+        for sentence in sentences:
+            words = str(sentence).split()
+            squashed_words = []
+            run = 0
+            for word in words:
+                if squashed_words and word.lower() == squashed_words[-1].lower():
+                    run += 1
+                    if run >= keep_words:
+                        continue
+                else:
+                    run = 0
+                squashed_words.append(word)
+            text = " ".join(squashed_words) if words else str(sentence)
+            if len(out) >= keep_sents and all(str(x) == text for x in out[-keep_sents:]):
+                continue
+            if isinstance(sentence, TimedSentence):
+                out.append(TimedSentence(
+                    text, t0=sentence.t0, t1=sentence.t1,
+                    key=sentence.key, source=sentence.source))
+            else:
+                out.append(text)
+        return out
 
     def _warn_tx_dropped(self, dropped):
         """队列丢弃告警（每累计10条报一次，别刷屏）。在锁外调，回调可能碰 UI。
@@ -1082,7 +1227,9 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
                 for g, zh in direct:
                     self._save_transcript(g, zh)
                     if self.on_pair:
-                        self._emit_pair(g, zh)
+                        self._emit_pair(g, zh, getattr(g, "t0", None),
+                                        getattr(g, "t1", None),
+                                        getattr(g, "key", None))
                 with self._stats_lock:
                     self._stat_dict += len(direct)
 
@@ -1098,6 +1245,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
 
         # 合并成一次请求时同样不能给中文插空格（见 _append_committed）
         german = ("" if _no_space_language() else " ").join(batch)
+        batch_t0, batch_t1, batch_key = self._span_for_sentences(batch)
         translation = None
         try:
             t0 = time.time()
@@ -1128,7 +1276,8 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         if self.on_pair:
             # 翻译失败时 translation==german：只显示一遍德语，
             # 不要"德语\n德语"重复两行（Ollama挂掉时实测很难看）
-            self._emit_pair(german, "" if translation == german else translation)
+            self._emit_pair(german, "" if translation == german else translation,
+                            batch_t0, batch_t1, batch_key)
         self._draft_last_text = ""  # 正式句对上屏了，残句草稿从头再来
         self._emit_display()
 
@@ -1479,15 +1628,23 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         音频 0.4 秒就到，自然就判定了；说完一段没有下文时由 flush_pending 的
         有界放行兜底（最多 SENTENCE_HOLD_SEC）。
         """
+        original_words = list(getattr(self, "pending_words", []))
         sentences, rest = _split_sentences(self.pending_text, final=final)
         self.pending_text = rest
+        timed = []
+        word_idx = 0
+        for sentence in sentences:
+            words, word_idx = self._take_words_for_sentence(
+                original_words, word_idx, sentence)
+            timed.append(self._make_timed_sentence(sentence, words))
+        self.pending_words = original_words[word_idx:] if rest else []
         # 记扣留起点：还有残句且它正停在终止符上 = 有句子被扣着等下文
         if not final and rest and _ends_with_terminator(rest):
             if not self._held_since:
                 self._held_since = time.time()
         else:
             self._held_since = 0.0
-        return sentences
+        return timed
 
     def _release_held_boundary(self):
         """扣留的句尾到点放行。
@@ -1515,6 +1672,8 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             self._emit_display()
 
     def _append_committed(self, committed_text):
+        committed_words = list(getattr(committed_text, "words", []) or [])
+        committed_text = str(committed_text or "")
         if not committed_text:
             return
         if getattr(self, "_release_pending", False):
@@ -1531,6 +1690,10 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             self.pending_text += sep + committed_text
         else:
             self.pending_text = committed_text
+        if committed_words:
+            if not hasattr(self, "pending_words"):
+                self.pending_words = []
+            self.pending_words.extend(committed_words)
 
     def enqueue_audio(self, audio_data, capture_time):
         """采集线程调用：音频进收件箱，识别线程没醒着就唤醒它。
@@ -1545,6 +1708,11 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             cap = getattr(config, "ASR_INBOX_MAX_BLOCKS", 240)
             if len(self._audio_inbox) > cap:
                 dropped = len(self._audio_inbox) - cap
+                dropped_items = self._audio_inbox[:dropped]
+                self._advance_sample_clock(dropped_items)
+                # 丢掉的样本已计入样本钟。下一批必须重锚，哪怕只丢了一小段、
+                # 识别缓冲是空的——否则新句子的 t0 会落后被丢的时长。
+                self._sample_clock_needs_reanchor = True
                 del self._audio_inbox[:dropped]  # 丢最旧的：反正早失去实时性了
                 self._inbox_dropped += dropped
                 # 每累计100块（≈50秒音频）报一次，别刷屏
@@ -1667,7 +1835,13 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
                 items = self._audio_inbox
                 self._audio_inbox = []
                 self._asr_backlog_n = 0  # 已全部取走，积压清零
-                if not items and pending_lang is None and pending_bits is None:
+                # 取批时就清标记。放到重锚之后再清的话，finish 期间新的丢块
+                # 会被这一轮抹掉，下一批不再重锚。
+                needs_reanchor = getattr(self, "_sample_clock_needs_reanchor", False)
+                if needs_reanchor:
+                    self._sample_clock_needs_reanchor = False
+                if (not items and pending_lang is None and pending_bits is None
+                        and not needs_reanchor):
                     self._asr_scheduled = False
                     return
             if pending_bits is not None:
@@ -1701,9 +1875,17 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
                 # 音频，丢掉纯属白扣用户一秒字幕
                 if items and switched:
                     print(f"🧹 切换语言，丢弃切换前的 {len(items)} 块音频")
+                    # 这条路径在锁外。_asr_lock 不是 RLock，加锁只能放在调用方。
+                    with self._asr_lock:
+                        self._advance_sample_clock(items)
                     items = []
+                    self._processor_init_at_sample_clock()
+            if needs_reanchor:
+                # 排在语言切换之后：真切换的 clear_context 会先作废切前缓冲，
+                # 这里看到的是空缓冲，仍然按当前样本钟重锚。
+                self._finish_dropped_buffer_and_reanchor()
             if not items:
-                continue  # 只有切语言、没有音频：回去看有没有新标志/新块
+                continue  # 只有切语言/重锚、没有音频：回去看有没有新标志/新块
             try:
                 self._process_items(items)
                 self._asr_error_streak = 0
@@ -1713,12 +1895,13 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
                 traceback.print_exc()
                 # 单次异常可能是瞬时的（CUDA打嗝）；连续异常说明
                 # HypothesisBuffer/音频缓冲已处于半更新的脏状态——
-                # 重置识别器丢弃当前缓冲，比一直错乱下去强
+                # 重置识别器丢弃当前缓冲，比一直错乱下去强。
+                # 重置必须带上当前样本钟，不能把 buffer_time_offset 归零。
                 self._asr_error_streak = getattr(self, "_asr_error_streak", 0) + 1
                 if self._asr_error_streak >= 2:
                     print("🧹 连续识别错误，重置识别器状态（丢弃当前音频缓冲）")
                     try:
-                        self.processor.init()
+                        self._processor_init_at_sample_clock()
                     except Exception:
                         pass
                     self._asr_error_streak = 0
@@ -1731,6 +1914,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         for audio_data, capture_time in items:
             if capture_time is None:
                 capture_time = start_time
+            chunk_start_sample_sec = self._sample_clock_seconds()
             # 真实音频间隔 = 当前段开始时刻 - 上一段结束时刻
             segment_start = capture_time - len(audio_data) / config.SAMPLE_RATE
             real_gap = (segment_start - self.last_capture_end) if self.last_capture_end else 0.0
@@ -1741,14 +1925,16 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
                 if config.SHOW_PERFORMANCE:
                     print(f"   🧹 音频中断{real_gap:.1f}秒，收尾并重置识别缓冲")
                 self._append_committed(self.processor.finish())
-                self.processor.init()
+                self._processor_init_at_sample_clock(offset=chunk_start_sample_sec)
                 # 中断前的内容不会再有下文，整段（含残句）都送翻译
                 self._enqueue_sentences(self._extract_sentences())
                 if self.pending_text:
-                    self._enqueue_sentences([self.pending_text])
-                    self.pending_text = ""
+                    self._enqueue_sentences([self._take_pending_as_sentence()])
 
             self.processor.insert_audio_chunk(audio_data)
+            # _process_items 跑在锁外。_asr_lock 不是 RLock，只在累加处加锁。
+            with self._asr_lock:
+                self._advance_sample_clock([(audio_data, capture_time)])
 
         # 推理**开始前**的缓冲长度 + 此刻 Ollama 是否也在跑。
         # 这两个是回答"ASR 耗时到底受什么影响"的关键自变量，之前只记了推理
@@ -1773,8 +1959,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         if _pending_too_long(self.pending_text):
             if config.SHOW_PERFORMANCE:
                 print(f"   ✂️  残句过长无标点，强制送翻译")
-            self._enqueue_sentences([self.pending_text])
-            self.pending_text = ""
+            self._enqueue_sentences([self._take_pending_as_sentence()])
             self._held_since = 0.0  # 连扣留的句尾一起送走了
 
         self._emit_display()
@@ -1829,8 +2014,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
 
         sentences = self._extract_sentences(final=True)
         if self.pending_text:
-            sentences.append(self.pending_text)
-            self.pending_text = ""
+            sentences.append(self._take_pending_as_sentence())
         self._held_since = 0.0
 
         if sentences:

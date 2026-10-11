@@ -13,9 +13,17 @@ class LiveTextRenderMixin:
         """更新live德语行：committed=已提交未翻译（白），unstable=未稳定尾部（灰）"""
         self.signals.live.emit(committed or "", unstable or "")
 
-    def add_pair(self, german, chinese, revision=0):
-        """一段句对翻译完成，加入历史。revision = 发出时的语言代数（见 _add_pair）"""
-        self.signals.pair.emit(german or "", chinese or "", int(revision))
+    def add_pair(self, german, chinese, t0=None, t1=None, key=None, revision=0):
+        """一段句对翻译完成，加入历史。
+
+        兼容旧的 add_pair(german, chinese, revision)；新路径带 t0/t1/key。
+        """
+        if t1 is None and key is None and isinstance(t0, int):
+            revision = t0
+            t0 = None
+        meta = {"revision": int(revision), "t0": t0, "t1": t1,
+                "key": key, "source": "local"}
+        self.signals.pair.emit(german or "", chinese or "", meta)
 
     def update_draft(self, chinese, revision=0):
         """live 行的草稿译文（线程安全）。正式句对完成后自动清掉"""
@@ -58,13 +66,27 @@ class LiveTextRenderMixin:
         current = getattr(self, "language_revision", 0)
         return int(revision or 0) < current
 
-    def _add_pair(self, german, chinese, revision=0):
+    @staticmethod
+    def _pair_meta(meta):
+        if isinstance(meta, dict):
+            return (
+                int(meta.get("revision") or 0),
+                meta.get("t0"),
+                meta.get("t1"),
+                meta.get("source") or "local",
+                meta.get("key"),
+            )
+        return int(meta or 0), None, None, "local", None
+
+    def _add_pair(self, german, chinese, meta=0):
+        revision, t0, t1, source, key = self._pair_meta(meta)
         if self._is_stale_language(revision):
             if config.SHOW_PERFORMANCE:
                 print(f"   🌐 丢弃切换语言前的句对（代数 {revision}）")
             return
-        # 第三元是墙钟时间：🤖 按"最近 N 分钟"过滤时用（二元组没法做时间窗）
-        self.sentence_pairs.append((german, chinese, time.time()))
+        # 第三元仍是墙钟时间：🤖 按"最近 N 分钟"过滤时用；后四项是客户端
+        # 样本时钟元数据，后续云端/节点结果按 key 或时间段替换时会用到。
+        self.sentence_pairs.append((german, chinese, time.time(), t0, t1, source, key))
         while len(self.sentence_pairs) > self.HISTORY_KEEP:
             self.sentence_pairs.pop(0)
         self.live_draft = ""  # 正式翻译到了，草稿退场
@@ -205,7 +227,8 @@ class LiveTextRenderMixin:
         # 结果与"全构造再取末尾 MAX 条非空"完全等价：这里同样跳过空块继续往回找
         keep = max(1, int(getattr(config, "MAX_SENTENCE_PAIRS", 20)))
         pair_blocks = []
-        for g, c, _ in reversed(self.sentence_pairs):
+        for item in reversed(self.sentence_pairs):
+            g, c = item[0], item[1]
             block = self._pair_html(g, c)
             if not block:
                 continue
