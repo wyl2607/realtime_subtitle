@@ -137,6 +137,8 @@ bash scripts/macos/start.sh
 bash scripts/macos/stop.sh
 ```
 
+`start.sh` holt vor jedem Start Updates von GitHub; einmalig überspringen mit `bash scripts/macos/start.sh --no-update` oder per `RS_NO_UPDATE=1`.
+
 Logs: `subtitle.log` / `subtitle.err.log`. Die Hotkeys sind wie unter Windows: `Ctrl+Alt+P/L/M/G/C`; auf dem Mac sind das die physischen Tasten **Control + Option**.
 
 Bekannte Unterschiede: Auf dem Mac aktualisieren Untertitel etwa alle 2–3 Sekunden (M2-Messung: Erkennung pro Lauf ca. 2,4 Sekunden), langsamer als mit NVIDIA-GPU. Eine einzelne Übersetzung dauert mit 4b ca. 4 Sekunden, mit 2b ca. 1,6 Sekunden. Erwarteter Speicherbedarf: Python-Umgebung ca. 1,5 GB + Whisper 1,6 GB (`--lean`: 0,5 GB) + Übersetzungsmodell 2,7–6,6 GB.

@@ -135,6 +135,8 @@ bash scripts/macos/start.sh
 bash scripts/macos/stop.sh
 ```
 
+`start.sh` 每次会先从 GitHub 拉更新；临时跳过可用 `bash scripts/macos/start.sh --no-update`，或设置 `RS_NO_UPDATE=1`。
+
 日志仍写到 `subtitle.log` / `subtitle.err.log`。快捷键和 Windows 相同：`Ctrl+Alt+P/L/M/G/C`；在 Mac 上按物理 **Control + Option** 键。
 
 已知差异：Mac 上字幕刷新节奏约 2–3 秒一次（M2 实测识别单次约 2.4 秒），比 NVIDIA 显卡慢；翻译单句 4b 约 4 秒、2b 约 1.6 秒。预计硬盘占用：Python 环境约 1.5GB + Whisper 1.6GB（`--lean` 为 0.5GB）+ 翻译模型 2.7–6.6GB。
