@@ -157,6 +157,9 @@ bash scripts/macos/stop.sh
 
 把识别交给 tailnet 里另一台 Apple Silicon Mac 或 NVIDIA Windows 电脑：本机先出字幕，节点精修结果随后替换上去；节点掉线时字幕不断、自动回到本机，节点恢复后自动接回。装法：Mac 节点 `bash scripts/node/install_node.sh <ssh 别名>`，Windows 节点 `bash scripts/node/install_node_windows.sh <ssh 别名>`（都在 Mac 上运行）。隐私边界：节点只监听 Tailscale 地址（`100.64.0.0/10`），token 鉴权、只经文件传递，音频只进内存不落盘，日志不写字幕正文；音频会离开本机、但只到你自己的节点机器。rslite 与 Windows 桌面字幕程序均已支持算力节点（Windows 配置见下文）。协议细节见 `docs/protocol-v2.md`。
 
+- 纯本机模式与隐私边界详见 [纯本机使用指南](docs/zh/local-only.md)。
+- 算力节点详细搭建步骤见 [算力节点配置指南](docs/zh/node-setup-guide.md)；AI 助手部署手册见 [AI 助手节点运行手册](docs/ai-agent-node-runbook.md)。
+
 ## 云端识别（可选）
 
 - **Mac rslite**：通过 `rslite --set-groq-key` 从标准输入读取 key，`rslite --clear-groq-key` 清除 key，`rslite --cloud on|off` 开关云端模式。
