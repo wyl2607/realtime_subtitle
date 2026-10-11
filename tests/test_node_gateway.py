@@ -19,6 +19,7 @@ import subprocess
 import sys
 import textwrap
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,8 @@ TOKEN = "tok-S7-secret-value-9f3a"
 FEATURE = "ZXQ-FEATURE-STRING-7731"  # 假 worker 吐出的「正文」，任何日志里都不许出现
 HELLO = {"type": "hello", "v": 2, "src": "de", "dst": "zh", "sample_rate": 16000, "format": "s16le"}
 IS_WIN = sys.platform == "win32"
+# Windows 的 venv python.exe 是启动器存根（会再起一个真解释器，pid 不同）；假 worker 只用标准库，直接用底层解释器
+_FAKE_WORKER_PY = getattr(sys, "_base_executable", sys.executable) if IS_WIN else sys.executable
 
 _quiet = logging.getLogger("test.client")
 _quiet.setLevel(logging.CRITICAL)
@@ -147,7 +150,7 @@ async def running(tmp_path: Path, mode: str = "echo", **kw):
         token=TOKEN,
         uds_dir=make_dir(tmp_path) if not (tmp_path / "rs-node").exists() else tmp_path / "rs-node",
         port=0,
-        worker_argv=[sys.executable, str(script), mode, str(rec)],
+        worker_argv=[_FAKE_WORKER_PY, str(script), mode, str(rec)],
         **kw,
     )
     await gw.start()
@@ -1145,6 +1148,7 @@ def test_worker_spawn_failure_is_reported(tmp_path):
                      worker_argv=["/nonexistent/worker-binary"], resolve_host=lambda: "127.0.0.1",
                      allow_non_tailscale_for_tests=True)
         await gw.start()
+        await asyncio.wait_for(gw.tcp_ready.wait(), 5)
         try:
             ws = await uds_connect(gw)
             await ws.send(json.dumps(HELLO))
@@ -1190,6 +1194,12 @@ def test_stale_events_from_previous_session_are_not_forwarded(tmp_path):
 
 # ------------------------------------------------------------------ 要求 7：info
 
+@pytest.fixture
+def mac_probes(monkeypatch):
+    """FakeSystem 模拟的是 macOS 的 ioreg/pmset；只在 info 模块内把平台钉成 darwin，Windows 上也测 Mac 分支。"""
+    monkeypatch.setattr(info_mod, "sys", types.SimpleNamespace(platform="darwin"))
+
+
 class FakeSystem:
     UUID = "11111111-2222-3333-4444-555555555555"
 
@@ -1210,7 +1220,7 @@ class FakeSystem:
         raise AssertionError(argv)
 
 
-def test_info_matches_p1_and_leaks_nothing_raw(tmp_path):
+def test_info_matches_p1_and_leaks_nothing_raw(tmp_path, mac_probes):
     state = make_dir(tmp_path)
     (state / "node_id").write_text("node-abc\n", encoding="utf-8")
     (state / "asr_state.json").write_text(json.dumps(
@@ -1252,7 +1262,7 @@ async def _raw_info(gw) -> str:
     return raw
 
 
-def test_info_in_use_threshold_and_fail_conservative(tmp_path):
+def test_info_in_use_threshold_and_fail_conservative(tmp_path, mac_probes):
     ni = lambda **kw: info_mod.NodeInfo(run=FakeSystem(**kw), state_dir=tmp_path)  # noqa: E731
     assert ni(idle_ns=59_000_000_000).in_use() is True
     assert ni(idle_ns=61_000_000_000).in_use() is False
@@ -1462,7 +1472,7 @@ def test_info_state_dir_keeps_existing_default_off_windows(monkeypatch):
         importlib.reload(info_mod)
 
 
-def test_info_hw_hash_is_cached(tmp_path):
+def test_info_hw_hash_is_cached(tmp_path, mac_probes):
     system = FakeSystem()
     info = info_mod.NodeInfo(run=system, state_dir=tmp_path)
     info.hw_hash()
@@ -1767,6 +1777,7 @@ async def running_real_worker(tmp_path: Path, monkeypatch, load_s: float = 0.0):
         worker_argv=[sys.executable, str(child), str(pkg_root)],
     )
     await gw.start()
+    await asyncio.wait_for(gw.tcp_ready.wait(), 5)
     try:
         yield gw
     finally:
@@ -2036,7 +2047,7 @@ def test_volatile_never_emitted(tmp_path, monkeypatch):
     assert not any(e.get("ev") == "volatile" for e in evs)
 
 
-def test_info_in_use_is_bool_not_seconds(tmp_path):
+def test_info_in_use_is_bool_not_seconds(tmp_path, mac_probes):
     ni = lambda **kw: info_mod.NodeInfo(run=FakeSystem(**kw), state_dir=tmp_path)  # noqa: E731
     for idle_ns, expected in [(59_000_000_000, True), (61_000_000_000, False)]:
         info = ni(idle_ns=idle_ns)
