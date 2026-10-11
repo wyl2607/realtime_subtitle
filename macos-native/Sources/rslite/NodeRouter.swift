@@ -93,6 +93,14 @@ enum RoutingDecider {
     }
 }
 
+/// 云端状态机看节点层的四个事实。云端不是节点，不会出现在这份清单里。
+struct NodeTierFacts: Sendable, Equatable {
+    var enabled: Bool
+    var healthy: Bool
+    var activeNodeID: String?
+    var isSelf: Bool
+}
+
 struct MigrationGate {
     var currentID: String?
     var pendingID: String?
@@ -200,6 +208,14 @@ final class NodeRouter: @unchecked Sendable {
     private var replayBuffer = TimedAudioReplayBuffer(maxSeconds: replayBufferSeconds)
     private var nodeAudioSentThrough: Double?
     private var connectingAudioSentThrough: Double?
+    /// 云端档为真时不把音频送去节点。默认开，Sprint 001 的连接行为不变。
+    private var nodeTierEnabled: Bool
+    /// 云端要收回节点会话：等到静音点再关，且不记 offline、不上报「本机」。
+    private var releaseNodeAtSilence = false
+    /// select 选出的节点。云端档关掉连接时也保留，降级时不用再等一轮 30s 探测。
+    private var preferredNodeID: String?
+    private var probeWaiter: CheckedContinuation<Void, Never>?
+    private var probeKick = false
 
     init(
         sourceLocaleID: String,
@@ -208,7 +224,8 @@ final class NodeRouter: @unchecked Sendable {
         onMode: @escaping @Sendable (SubtitleMode) -> Void,
         nodesURL: URL = NodeRouter.defaultNodesURL,
         stateURL: URL = NodeRouter.defaultStateURL,
-        localAccurate: Bool = Capability.supportsAccurateLocal()
+        localAccurate: Bool = Capability.supportsAccurateLocal(),
+        nodeTierEnabled: Bool = true
     ) {
         self.sourceLocaleID = sourceLocaleID
         self.targetLanguageID = targetLanguageID
@@ -217,6 +234,7 @@ final class NodeRouter: @unchecked Sendable {
         self.nodesURL = nodesURL
         self.stateURL = stateURL
         self.localAccurate = localAccurate
+        self.nodeTierEnabled = nodeTierEnabled
     }
 
     // macOS 的 expandingTildeInPath 不认 $HOME，冒烟/测试没法靠改 HOME 隔离；
@@ -252,12 +270,47 @@ final class NodeRouter: @unchecked Sendable {
         audioTask = Task { await self.audioLoop(stream: stream, fanout: fanout) }
     }
 
+    /// 云端档打开时关掉节点连接；降级时再打开。健康节点已经探测过就立刻作为待连接，否则马上再探一次。
+    func setNodeTierEnabled(_ enabled: Bool) {
+        let shouldProbe = lock.withLockValue { () -> Bool in
+            nodeTierEnabled = enabled
+            if enabled {
+                releaseNodeAtSilence = false
+                if currentNode == nil, pendingMigrationID == nil, let preferred = preferredNodeID {
+                    pendingMigrationID = preferred
+                }
+                return preferredNodeID == nil
+            }
+            pendingMigrationID = nil
+            let sessionOpen = currentNode != nil || currentClient != nil || connectingClient != nil
+            releaseNodeAtSilence = sessionOpen
+            return false
+        }
+        if shouldProbe {
+            requestProbeSoon()
+        }
+    }
+
+    /// 给云端状态机。isSelf 恒为 false：打分前已经丢掉指向本机的清单条目。
+    func tierFacts() -> NodeTierFacts {
+        lock.withLockValue {
+            NodeTierFacts(
+                enabled: !nodes.isEmpty || preferredNodeID != nil,
+                healthy: preferredNodeID != nil,
+                activeNodeID: currentNode?.id,
+                isSelf: false
+            )
+        }
+    }
+
     func stop() async {
         lock.withLockVoid {
             stopped = true
             switching = false
             switchGeneration += 1
         }
+        // 先唤醒等待中的探测，再 cancel。只恢复已挂起的 continuation，避免下一轮误踢。
+        resumeProbeWaiter(setKickIfIdle: false)
         probeTask?.cancel()
         audioTask?.cancel()
         lock.withLockValue { switchTask }?.cancel()
@@ -286,6 +339,7 @@ final class NodeRouter: @unchecked Sendable {
     func finish() async {
         await audioTask?.value
         let client = lock.withLockValue { stopped ? nil : currentClient }
+        resumeProbeWaiter(setKickIfIdle: false)
         probeTask?.cancel()
         await client?.drain(timeout: .seconds(5))
         // 迁移中的旧会话也要把尾部句子收回来（各自 drain ≤3s + close ≤2s，有上限）
@@ -298,13 +352,62 @@ final class NodeRouter: @unchecked Sendable {
 
     private func probeLoop() async {
         await probeOnce()
-        while !Task.isCancelled {
-            do {
-                try await Task.sleep(for: Self.probeInterval)
-            } catch {
+        while !Task.isCancelled && !lock.withLockValue({ stopped }) {
+            // 30s 和「马上再探」谁先到听谁的。取消只唤醒已经挂起的等待，不留下 kick。
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { [self] in
+                    do {
+                        try await Task.sleep(for: Self.probeInterval)
+                    } catch {
+                        return
+                    }
+                    if !Task.isCancelled {
+                        self.resumeProbeWaiter(setKickIfIdle: true)
+                    }
+                }
+                group.addTask { [self] in
+                    await withTaskCancellationHandler {
+                        await self.waitForNextProbe()
+                    } onCancel: {
+                        self.resumeProbeWaiter(setKickIfIdle: false)
+                    }
+                }
+                _ = await group.next()
+                group.cancelAll()
+            }
+            if Task.isCancelled || lock.withLockValue({ stopped }) {
                 return
             }
             await probeOnce()
+        }
+    }
+
+    private func requestProbeSoon() {
+        resumeProbeWaiter(setKickIfIdle: true)
+    }
+
+    private func resumeProbeWaiter(setKickIfIdle: Bool) {
+        lock.lock()
+        let waiter = probeWaiter
+        probeWaiter = nil
+        if waiter == nil && setKickIfIdle {
+            probeKick = true
+        }
+        lock.unlock()
+        waiter?.resume()
+    }
+
+    private func waitForNextProbe() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            self.lock.lock()
+            if self.probeKick || Task.isCancelled {
+                self.probeKick = false
+                self.lock.unlock()
+                continuation.resume()
+                return
+            }
+            self.probeWaiter = continuation
+            self.lock.unlock()
         }
     }
 
@@ -449,16 +552,28 @@ final class NodeRouter: @unchecked Sendable {
         }
         // 切换一律由 audioLoop 在下一块音频到达时执行（首次连接立刻，迁移等静音点）：
         // 这里若也直接切，会和 audioLoop 同时对同一节点开两个会话，后者吃 1013。
+        // 云端档关闭时只记住最优节点，不观察迁移门：观察 nil 会把节点之间的两轮计数清掉。
         lock.withLockVoid {
-            if currentNode == nil {
-                pendingMigrationID = best?.id
-                return
+            preferredNodeID = best?.id
+            let gateAllows: Bool
+            if !nodeTierEnabled || releaseNodeAtSilence || currentNode == nil {
+                gateAllows = false
+            } else {
+                var gateCopy = gate
+                gateAllows = gateCopy.observe(best: best, current: currentScore)
+                gate = gateCopy
             }
-            var gateCopy = gate
-            let ok = gateCopy.observe(best: best, current: currentScore)
-            gate = gateCopy
-            if ok, let best, best.id != currentNode?.id {
-                pendingMigrationID = best.id
+            switch Self.pendingMigrationUpdate(
+                nodeTierEnabled: nodeTierEnabled,
+                releaseNodeAtSilence: releaseNodeAtSilence,
+                currentNodeID: currentNode?.id,
+                bestID: best?.id,
+                gateAllows: gateAllows
+            ) {
+            case .set(let id):
+                pendingMigrationID = id
+            case .keep:
+                break
             }
         }
     }
@@ -552,14 +667,26 @@ final class NodeRouter: @unchecked Sendable {
             updateSilence(audio)
             // prepare/connect 最长十几秒：放到独立 Task，音频循环不能被它堵住，
             // 否则 AudioFanout 丢旧帧、节点时钟落后（R3-2）。switching 由 switchToPending 内部预约防重入。
-            let trigger = lock.withLockValue { () -> Bool? in
-                guard !stopped, !switching, pendingMigrationID != nil else { return nil }
-                guard currentNode == nil || silenceRun >= Self.silenceSecondsForMigration else { return nil }
-                return currentNode != nil
+            // 云端收回会话优先于连接：同一次静音里不能又连上又拆掉。
+            let action = lock.withLockValue {
+                Self.nodeTierAction(
+                    stopped: stopped,
+                    switching: switching,
+                    nodeTierEnabled: nodeTierEnabled,
+                    releaseNodeAtSilence: releaseNodeAtSilence,
+                    pendingMigrationID: pendingMigrationID,
+                    silenceRun: silenceRun,
+                    hasCurrentNode: currentNode != nil
+                )
             }
-            if let atSilence = trigger {
+            switch action {
+            case .release:
+                await releaseNodeForCloudTier()
+            case .connect(let atSilence):
                 let task = Task { await self.switchToPending(atSilence: atSilence) }
                 lock.withLockVoid { switchTask = task }
+            case nil:
+                break
             }
             let (client, session, connecting, connectingSession, connectingIsReplaying) = lock.withLockValue {
                 (
@@ -598,6 +725,90 @@ final class NodeRouter: @unchecked Sendable {
                 }
             }
         }
+    }
+
+    /// 云端档在静音点拆掉节点会话。不写 offline_until，也不上报本机：状态行这时属于云端。
+    private func releaseNodeForCloudTier() async {
+        let (client, connecting) = lock.withLockValue { () -> (NodeClient?, NodeClient?) in
+            let client = currentClient
+            let connecting = connectingClient
+            currentClient = nil
+            currentSession = nil
+            connectingClient = nil
+            connectingSession = nil
+            connectingReplaySession = nil
+            connectingAudioSentThrough = nil
+            currentNode = nil
+            currentToken = nil
+            currentInfo = nil
+            pendingMigrationID = nil
+            releaseNodeAtSilence = false
+            nodeAudioSentThrough = nil
+            return (client, connecting)
+        }
+        if let client {
+            let id = UUID()
+            lock.withLockVoid {
+                drainTasks[id] = Task {
+                    await client.drain(timeout: .seconds(3))
+                    await client.close()
+                    self.lock.withLockVoid { _ = self.drainTasks.removeValue(forKey: id) }
+                }
+            }
+        }
+        if let connecting, !Self.sameClient(connecting, client) {
+            await connecting.close()
+        }
+    }
+
+    enum NodeTierAction: Equatable {
+        case connect(atSilence: Bool)
+        case release
+    }
+
+    enum PendingMigrationUpdate: Equatable {
+        case set(String?)
+        case keep
+    }
+
+    /// 节点层关闭时的音频循环决策。默认参数下和原来的「无会话立刻连、有会话等 0.6s」一致。
+    static func nodeTierAction(
+        stopped: Bool,
+        switching: Bool,
+        nodeTierEnabled: Bool,
+        releaseNodeAtSilence: Bool,
+        pendingMigrationID: String?,
+        silenceRun: Double,
+        hasCurrentNode: Bool
+    ) -> NodeTierAction? {
+        guard !stopped, !switching else { return nil }
+        if releaseNodeAtSilence {
+            guard silenceRun >= silenceSecondsForMigration else { return nil }
+            return .release
+        }
+        guard nodeTierEnabled, pendingMigrationID != nil else { return nil }
+        guard !hasCurrentNode || silenceRun >= silenceSecondsForMigration else { return nil }
+        return .connect(atSilence: hasCurrentNode)
+    }
+
+    /// 待连接的三态：关闭时清掉；没有当前会话时直接采用最优；门没过就保留已有意图。
+    static func pendingMigrationUpdate(
+        nodeTierEnabled: Bool,
+        releaseNodeAtSilence: Bool,
+        currentNodeID: String?,
+        bestID: String?,
+        gateAllows: Bool
+    ) -> PendingMigrationUpdate {
+        if !nodeTierEnabled || releaseNodeAtSilence {
+            return .set(nil)
+        }
+        if currentNodeID == nil {
+            return .set(bestID)
+        }
+        if gateAllows, let bestID, bestID != currentNodeID {
+            return .set(bestID)
+        }
+        return .keep
     }
 
     private func switchToPending(atSilence: Bool) async {
@@ -1411,6 +1622,50 @@ final class NodeRouter: @unchecked Sendable {
               "R4-2：audioGap 视为非故障")
         check(!shouldFallbackOnClosed(error: NodeClientError.audioGap, closed: a, current: a, routerStopped: false),
               "R4-2：audioGap 不触发故障回退")
+        check(Self.nodeTierAction(
+            stopped: false, switching: false, nodeTierEnabled: true, releaseNodeAtSilence: false,
+            pendingMigrationID: "n1", silenceRun: 0, hasCurrentNode: false
+        ) == .connect(atSilence: false), "无当前节点时首次连接应立即发生")
+        check(Self.nodeTierAction(
+            stopped: false, switching: false, nodeTierEnabled: true, releaseNodeAtSilence: false,
+            pendingMigrationID: "n1", silenceRun: 0.59, hasCurrentNode: true
+        ) == nil, "已有节点时静音不足不应迁移")
+        check(Self.nodeTierAction(
+            stopped: false, switching: false, nodeTierEnabled: true, releaseNodeAtSilence: false,
+            pendingMigrationID: "n1", silenceRun: 0.6, hasCurrentNode: true
+        ) == .connect(atSilence: true), "已有节点且静音达到 0.6s 才迁移")
+        check(Self.nodeTierAction(
+            stopped: false, switching: false, nodeTierEnabled: true, releaseNodeAtSilence: false,
+            pendingMigrationID: nil, silenceRun: 1, hasCurrentNode: false
+        ) == nil, "没有迁移目标时不应连接")
+        check(Self.nodeTierAction(
+            stopped: true, switching: false, nodeTierEnabled: true, releaseNodeAtSilence: false,
+            pendingMigrationID: "n1", silenceRun: 1, hasCurrentNode: false
+        ) == nil, "停止后不应连接")
+        check(Self.nodeTierAction(
+            stopped: false, switching: true, nodeTierEnabled: true, releaseNodeAtSilence: false,
+            pendingMigrationID: "n1", silenceRun: 1, hasCurrentNode: false
+        ) == nil, "切换进行中不应重入")
+        check(Self.nodeTierAction(
+            stopped: false, switching: false, nodeTierEnabled: false, releaseNodeAtSilence: true,
+            pendingMigrationID: "n1", silenceRun: 0.6, hasCurrentNode: true
+        ) == .release, "云端档静音点应释放节点，且优先于连接")
+        check(Self.nodeTierAction(
+            stopped: false, switching: false, nodeTierEnabled: false, releaseNodeAtSilence: true,
+            pendingMigrationID: nil, silenceRun: 0.59, hasCurrentNode: true
+        ) == nil, "释放节点也要等到静音点")
+        check(Self.pendingMigrationUpdate(
+            nodeTierEnabled: false, releaseNodeAtSilence: false, currentNodeID: nil, bestID: "n1", gateAllows: true
+        ) == .set(nil), "节点层关闭时应清掉待连接")
+        check(Self.pendingMigrationUpdate(
+            nodeTierEnabled: true, releaseNodeAtSilence: false, currentNodeID: nil, bestID: "n1", gateAllows: false
+        ) == .set("n1"), "无当前节点时待连接应是最优节点")
+        check(Self.pendingMigrationUpdate(
+            nodeTierEnabled: true, releaseNodeAtSilence: false, currentNodeID: "a", bestID: "b", gateAllows: false
+        ) == .keep, "门未通过时不应清掉已有迁移意图")
+        check(Self.pendingMigrationUpdate(
+            nodeTierEnabled: true, releaseNodeAtSilence: false, currentNodeID: "a", bestID: "b", gateAllows: true
+        ) == .set("b"), "门通过时应改写迁移目标")
         failures.append(contentsOf: NodeClient.selfTest().map { "NodeClient: \($0)" })
         return failures
     }

@@ -16,12 +16,18 @@ enum SubtitleMode: Sendable, Equatable {
     case local
     case hybrid(String)
     case refining
+    /// 有 key 且这一档正在出字。菜单栏和字幕状态行用同一句。
+    case cloud
+    /// 401/403 之后保持到 key 变化，优先于「混合」。
+    case cloudKeyInvalid
 
     var label: String {
         switch self {
         case .local: return "本机"
         case .hybrid(let node): return "混合·\(node)"
         case .refining: return "精修中"
+        case .cloud: return "云端·Groq"
+        case .cloudKeyInvalid: return "云端 key 无效"
         }
     }
 }
@@ -47,6 +53,14 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
     private var activeNodeSessions: [String: Int] = [:]
     private var selectedNodeSession: NodeSessionKey?
     private var pendingNodeFinals: [NodeSessionKey: [Int: (String, Double?, Double?)]] = [:]
+    private var cloudController: CloudUploadController?
+    private var cloudTask: Task<Void, Never>?
+    private var uploadTasks: [UUID: Task<Void, Never>] = [:]
+    private var lastPublishedMode: SubtitleMode?
+    private var lastNodeTierEnabled = true
+    /// 云端或 key 无效占着状态行时，节点路由器的「混合/本机/精修中」不能把它盖掉。
+    private var cloudOwnsLabel = false
+    private var cloudSuspended = false
 
     private struct NodeSessionKey: Hashable {
         var nodeID: String
@@ -68,14 +82,22 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
     }
 
     func start() async throws {
-        onMode(.local)
+        onMode(activateCloudController())
         let wrapped = PipelineCallbacks(
             onVolatile: callbacks.onVolatile,
-            onFinal: callbacks.onFinal,
+            onFinal: { [weak self] id, text, t0, t1 in
+                // 词流在 Pipeline 里，出了句界才到这里。用句界修正已发出段的 a0/a1，不重发音频。
+                if let t0, let t1 {
+                    self?.noteCloudFinal(t0: t0, t1: t1)
+                }
+                self?.callbacks.onFinal(id, text, t0, t1)
+            },
             onTranslation: callbacks.onTranslation,
             onStatus: callbacks.onStatus,
             onFinished: callbacks.onFinished,
             onFanoutReady: { [weak self] fanout in
+                // 必须在 fanout.start 之前订阅，否则云端和节点都漏掉开头。
+                self?.startCloudIfNeeded(fanout: fanout)
                 self?.startRouterIfNeeded(fanout: fanout)
                 self?.callbacks.onFanoutReady(fanout)
             }
@@ -86,23 +108,48 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
     }
 
     func pause() async {
-        await stopRouter(clearPending: true, clearFanout: true)
+        lock.withLockVoid { cloudSuspended = true }
+        cloudController?.cancelInflight()
+        cancelUploadTasks()
         await local?.pause()
+        await cloudTask?.value
+        await cancelAndJoinUploads()
+        lock.withLockVoid {
+            cloudTask = nil
+            cloudOwnsLabel = false
+            lastPublishedMode = .local
+        }
+        await stopRouter(clearPending: true, clearFanout: true)
         onMode(.local)
     }
 
     func resume() async {
+        lock.withLockVoid { cloudSuspended = false }
         await local?.resume()
         ensureRouterRunning()
     }
 
     func stop() async {
+        lock.withLockVoid { cloudSuspended = true }
+        cloudController?.cancelInflight()
+        cancelUploadTasks()
         await stopRouter(clearPending: true, clearFanout: true)
         await local?.stop()
+        await cloudTask?.value
+        await cancelAndJoinUploads()
+        lock.withLockVoid {
+            cloudTask = nil
+            cloudController = nil
+        }
     }
 
     func waitUntilFinished() async {
         await local?.waitUntilFinished()
+        await cloudTask?.value
+        let uploads = lock.withLockValue { Array(uploadTasks.values) }
+        for task in uploads {
+            await task.value
+        }
         await router?.finish()
     }
 
@@ -143,7 +190,7 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
                     self.pendingNodeFinals[key] = node
                     return self.selectedNodeSession == key
                 }
-                if shouldShowRefining {
+                if shouldShowRefining, !self.lock.withLockValue({ self.cloudOwnsLabel }) {
                     self.onMode(.refining)
                 }
             },
@@ -161,8 +208,9 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
                     return (final, selectedNodeSession == key)
                 }
                 if let (final, isSelected) = result {
+                    // 云端占着状态行时节点句仍然走 P5，只是不改标签。
                     self.onNodeFinal(nodeID, final.1, final.2, final.0, translation)
-                    if isSelected {
+                    if isSelected, !self.lock.withLockValue({ self.cloudOwnsLabel }) {
                         self.onMode(.hybrid(nodeID))
                     }
                 }
@@ -181,14 +229,20 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
                 }
             }
         )
+        let nodeTierEnabled = lock.withLockValue { lastNodeTierEnabled }
         let router = NodeRouter(
             sourceLocaleID: config.sourceLocaleID,
             targetLanguageID: config.targetLanguageID,
             callbacks: nodeCallbacks,
             onMode: { [weak self, onMode] mode in
-                self?.recordRouterMode(mode)
+                guard let self else { return }
+                if self.lock.withLockValue({ self.cloudOwnsLabel }) {
+                    return
+                }
+                self.recordRouterMode(mode)
                 onMode(mode)
-            }
+            },
+            nodeTierEnabled: nodeTierEnabled
         )
         lock.withLockVoid { self.router = router }
         router.start(fanout: fanout)
@@ -218,6 +272,8 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
     private func recordRouterMode(_ mode: SubtitleMode) {
         lock.withLockVoid {
             selectedNodeSession = Self.selectedSession(after: mode, activeSessions: activeNodeSessions, previous: selectedNodeSession)
+            lastPublishedMode = mode
+            cloudOwnsLabel = mode == .cloud || mode == .cloudKeyInvalid
         }
     }
 
@@ -236,7 +292,7 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
                 return previous
             }
             return NodeSessionKey(nodeID: nodeID, generation: generation)
-        case .local:
+        case .local, .cloud, .cloudKeyInvalid:
             return nil
         case .refining:
             return previous
@@ -310,6 +366,167 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
         )
         check(selected == nil,
               "当前选中会话关闭才应清除选中状态")
+        check(Self.selectedSession(after: .cloud, activeSessions: ["A": 1], previous: Self.NodeSessionKey(nodeID: "A", generation: 1)) == nil,
+              "切到云端应清掉节点选中")
+        check(Self.selectedSession(after: .cloudKeyInvalid, activeSessions: ["A": 1], previous: Self.NodeSessionKey(nodeID: "A", generation: 1)) == nil,
+              "key 无效应清掉节点选中")
+        failures.append(contentsOf: CloudSegmenter.selfTest())
+        failures.append(contentsOf: CloudUploadController.selfTest())
         return failures
+    }
+
+    /// 只有非本机模式才建云端调度。key 和账本都在这时读，selftest 不走 start。
+    private func activateCloudController() -> SubtitleMode {
+        guard mode != .local else { return .local }
+        let controller = CloudUploadController(
+            localeID: config.sourceLocaleID,
+            ledger: QuotaLedger(),
+            readSwitch: {
+                let key = CloudConfigStore.readKey()
+                return CloudSwitchSnapshot(hasKey: key != nil, enabled: CloudConfigStore.readEnabled(), key: key)
+            },
+            makeClient: { CloudClient(key: $0) }
+        )
+        let effect = controller.snapshot(node: NodeTierFacts(enabled: false, healthy: false, activeNodeID: nil, isSelf: false))
+        lock.withLockVoid {
+            cloudController = controller
+            lastNodeTierEnabled = effect.nodeTierEnabled
+            lastPublishedMode = effect.mode
+            cloudOwnsLabel = effect.mode == .cloud || effect.mode == .cloudKeyInvalid
+        }
+        return effect.mode
+    }
+
+    private func noteCloudFinal(t0: Double, t1: Double) {
+        lock.withLockValue { cloudController }?.noteFinal(t0: t0, t1: t1)
+    }
+
+    private func startCloudIfNeeded(fanout: AudioFanout) {
+        let controller = lock.withLockValue { () -> CloudUploadController? in
+            cloudTask?.cancel()
+            return cloudController
+        }
+        guard let controller else { return }
+        let stream = fanout.subscribe()
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.runCloud(stream: stream, controller: controller)
+        }
+        lock.withLockVoid { cloudTask = task }
+    }
+
+    private func runCloud(stream: AsyncStream<TimedAudio>, controller: CloudUploadController) async {
+        for await audio in stream {
+            if Task.isCancelled || cloudIsSuspended() { return }
+            let effect = controller.ingest(audio: audio, now: Date(), node: currentNodeFacts())
+            applyCloudEffect(effect.control)
+            for segment in effect.uploads {
+                if Task.isCancelled || cloudIsSuspended() { return }
+                enqueueUpload(segment, controller: controller)
+            }
+        }
+        if Task.isCancelled || cloudIsSuspended() { return }
+        // 文件放完没有下一段音频。短段不能再干等 1.5s，否则尾句发不出去。
+        let tail = controller.finish(now: Date(), node: currentNodeFacts())
+        applyCloudEffect(tail.control)
+        for segment in tail.uploads {
+            enqueueUpload(segment, controller: controller)
+        }
+        let uploads = lock.withLockValue { Array(uploadTasks.values) }
+        for task in uploads {
+            await task.value
+        }
+    }
+
+    private func enqueueUpload(_ segment: EmittedCloudSegment, controller: CloudUploadController) {
+        let id = UUID()
+        let task = Task { [weak self] in
+            guard !Task.isCancelled else { return }
+            let now = Date()
+            guard let client = controller.prepareSend(segment, now: now) else { return }
+            let facts = self?.currentNodeFacts() ?? NodeTierFacts(enabled: false, healthy: false, activeNodeID: nil, isSelf: false)
+            if Task.isCancelled {
+                let effect = controller.resolveFailure(id: segment.id, error: CancellationError(), now: Date(), node: facts)
+                self?.applyCloudEffect(effect)
+                return
+            }
+            do {
+                let result = try await client.transcribe(
+                    pcm16Mono16k: segment.pcm16,
+                    a0: segment.audioOrigin,
+                    duration: segment.duration,
+                    language: controller.groqLanguageCode
+                )
+                let effect = controller.resolveSuccess(id: segment.id, result: result, now: Date(), node: self?.currentNodeFacts() ?? facts)
+                self?.applyCloudEffect(effect)
+            } catch {
+                let effect = controller.resolveFailure(id: segment.id, error: error, now: Date(), node: self?.currentNodeFacts() ?? facts)
+                self?.applyCloudEffect(effect)
+            }
+        }
+        lock.withLockVoid { uploadTasks[id] = task }
+        Task { [weak self] in
+            await task.value
+            self?.lock.withLockVoid { _ = self?.uploadTasks.removeValue(forKey: id) }
+        }
+    }
+
+    private func applyCloudEffect(_ effect: CloudControlEffect) {
+        let decision = lock.withLockValue { () -> (Bool, Bool, NodeRouter?) in
+            let modeChanged = lastPublishedMode != effect.mode
+            let tierChanged = lastNodeTierEnabled != effect.nodeTierEnabled
+            if modeChanged {
+                lastPublishedMode = effect.mode
+                cloudOwnsLabel = effect.mode == .cloud || effect.mode == .cloudKeyInvalid
+                selectedNodeSession = Self.selectedSession(
+                    after: effect.mode,
+                    activeSessions: activeNodeSessions,
+                    previous: selectedNodeSession
+                )
+            }
+            if tierChanged {
+                lastNodeTierEnabled = effect.nodeTierEnabled
+            }
+            return (modeChanged, tierChanged, router)
+        }
+        if !effect.discard {
+            for line in effect.lines {
+                // 译文在 Pipeline 的 TranslationQueue 里，这里改不到。云端句先以无译文上屏。
+                onNodeFinal(CloudUploadController.cloudNodeID, line.t0, line.t1, line.text, nil)
+            }
+        }
+        if decision.0 {
+            onMode(effect.mode)
+        }
+        if decision.1 {
+            decision.2?.setNodeTierEnabled(effect.nodeTierEnabled)
+        }
+    }
+
+    private func currentNodeFacts() -> NodeTierFacts {
+        let router = lock.withLockValue { self.router }
+        return router?.tierFacts() ?? NodeTierFacts(enabled: false, healthy: false, activeNodeID: nil, isSelf: false)
+    }
+
+    private func cloudIsSuspended() -> Bool {
+        lock.withLockValue { cloudSuspended }
+    }
+
+    private func cancelUploadTasks() {
+        let tasks = lock.withLockValue { Array(uploadTasks.values) }
+        for task in tasks {
+            task.cancel()
+        }
+    }
+
+    private func cancelAndJoinUploads() async {
+        cloudController?.cancelInflight()
+        let tasks = lock.withLockValue { Array(uploadTasks.values) }
+        for task in tasks {
+            task.cancel()
+        }
+        for task in tasks {
+            await task.value
+        }
     }
 }

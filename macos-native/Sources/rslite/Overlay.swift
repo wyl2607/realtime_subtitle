@@ -6,7 +6,9 @@ final class OverlayController: NSObject {
     private let panel: NSPanel
     private let stack = NSStackView()
     private let volatileLabel = NSTextField(labelWithString: "")
-    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+    /// 当前识别层。和草稿分开，避免 setStatus/setVolatile 把「云端·Groq」盖掉。
+    private let tierLabel = NSTextField(labelWithString: "本机")
+    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let pauseItem = NSMenuItem(title: "暂停", action: #selector(togglePause), keyEquivalent: "")
     private let clickThroughItem = NSMenuItem(title: "鼠标穿透", action: #selector(toggleClickThrough), keyEquivalent: "")
 
@@ -82,7 +84,10 @@ final class OverlayController: NSObject {
     }
 
     func setModeLabel(_ label: String) {
+        statusItem.length = NSStatusItem.variableLength
         statusItem.button?.title = "字·\(label)"
+        tierLabel.stringValue = label
+        fitHeight()
     }
 
     private func configurePanel() {
@@ -113,6 +118,12 @@ final class OverlayController: NSObject {
         volatileLabel.maximumNumberOfLines = 2
         volatileLabel.preferredMaxLayoutWidth = textWidth
 
+        tierLabel.textColor = .secondaryLabelColor
+        tierLabel.font = .systemFont(ofSize: 13)
+        tierLabel.lineBreakMode = .byTruncatingTail
+        tierLabel.maximumNumberOfLines = 1
+        tierLabel.preferredMaxLayoutWidth = textWidth
+
         root.addSubview(stack)
         panel.contentView = root
 
@@ -125,7 +136,7 @@ final class OverlayController: NSObject {
     }
 
     private func configureStatusItem() {
-        statusItem.button?.title = "字"
+        statusItem.button?.title = "字·本机"
 
         let menu = NSMenu()
         pauseItem.target = self
@@ -155,6 +166,7 @@ final class OverlayController: NSObject {
             }
         }
         stack.addArrangedSubview(volatileLabel)
+        stack.addArrangedSubview(tierLabel)
         fitHeight()
     }
 
