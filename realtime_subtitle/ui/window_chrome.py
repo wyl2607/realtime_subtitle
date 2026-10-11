@@ -3,8 +3,23 @@
 Ctrl+滚轮调字号、样式表刷新。以mixin形式并入 SubtitleWindow。
 """
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QColor
+from PyQt6.QtWidgets import QGraphicsDropShadowEffect
 import realtime_subtitle.config as config
 from realtime_subtitle.ui.window_frame import ResizableFramelessWidget
+
+
+def _hex_to_rgba(color, alpha):
+    body = str(color or "#000000").strip()
+    if body.startswith("#"):
+        body = body[1:]
+    if len(body) == 3:
+        body = "".join(c * 2 for c in body)
+    try:
+        r, g, b = (int(body[i:i + 2], 16) for i in (0, 2, 4))
+    except (TypeError, ValueError):
+        r, g, b = 0, 0, 0
+    return f"rgba({r}, {g}, {b}, {int(alpha)})"
 
 
 class WindowChromeMixin:
@@ -128,17 +143,32 @@ class WindowChromeMixin:
 
     def _apply_styles(self):
         """按当前config刷新字幕标签/历史窗口的样式（字号滑块实时调用）"""
+        bg = _hex_to_rgba(
+            getattr(config, "BACKGROUND_COLOR", "#000000"),
+            getattr(config, "BACKGROUND_OPACITY", 235),
+        )
+        source_color = getattr(config, "SOURCE_TEXT_COLOR", getattr(config, "TEXT_COLOR", "#F0F0F0"))
+        radius = int(getattr(config, "WINDOW_CORNER_RADIUS",
+                             getattr(config, "BORDER_RADIUS", 8)))
         self.window.setStyleSheet(f"""
             QLabel {{
-                background-color: rgba(0, 0, 0, {int(config.BACKGROUND_OPACITY)});
-                color: {config.TEXT_COLOR};
+                background-color: {bg};
+                color: {source_color};
                 font-size: {config.FONT_SIZE}px;
                 font-family: {config.FONT_FAMILY};
                 padding: {config.PADDING};
-                border-radius: {config.BORDER_RADIUS}px;
+                border-radius: {radius}px;
                 border: 1px solid {config.BORDER_COLOR};
             }}
         """)
+        if getattr(config, "TEXT_EDGE", "none") == "shadow":
+            effect = QGraphicsDropShadowEffect(self.window)
+            effect.setColor(QColor(0, 0, 0, 255))
+            effect.setBlurRadius(4)
+            effect.setOffset(0, 0)
+            self.window.setGraphicsEffect(effect)
+        else:
+            self.window.setGraphicsEffect(None)
         if hasattr(self, "history_window"):
             self.history_window.text.setStyleSheet(f"""
                 QTextEdit {{

@@ -37,7 +37,7 @@ from realtime_subtitle.ui.window_geometry import (
 from realtime_subtitle.ui.window_frame import ResizableFramelessWidget
 from realtime_subtitle.ui.settings_window import (
     SettingsWindow, MODE_ICONS,
-    apply_tuning, collect_tuning, snapshot_defaults,
+    apply_tuning, collect_tuning, snapshot_defaults, sync_display_mode_from_show_bilingual,
 )
 # ☠️ 这两个本模块自己不用，但 tests/test_presets.py 和 tests/test_tuning.py
 # 是从**这里**拿的——有意的 re-export，别当成「没用的 import」删掉。
@@ -733,8 +733,10 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         """主线程槽：真实模式名才需要把面板控件从 config 重读一遍 + 刷高亮；
         None（自定义）时 config 没变，只更新指示器文字。"""
         if name is not None:
+            sync_display_mode_from_show_bilingual()
             self.settings_window.refresh_from_config()
             self.settings_window.restore_active_preset(name)
+            self._on_display_settings_change()
         self._update_mode_indicator(name)
 
     def _update_mode_indicator(self, name):
