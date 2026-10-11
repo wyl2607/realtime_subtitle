@@ -2,6 +2,7 @@
 配置文件
 所有可调参数集中管理
 """
+import realtime_subtitle.ui.design_tokens as design_tokens
 
 # ============ Whisper 模型配置 ============
 # large-v3-turbo: large-v3的加速蒸馏版，德语准确率明显好于medium，
@@ -348,9 +349,9 @@ DRAFT_MIN_WORDS = 3       # 残句至少这么多词才值得出草稿
 # "等凑成完整句 + 一次完整 Ollama"，新闻播报那种 30 字以上的句子要 3-8 秒。
 # 8 字 ≈ 德语 3 词（按 MAX_PENDING_CHARS=60 ≈ MAX_PENDING_WORDS=24 的换算）
 DRAFT_MIN_CHARS = 8
-SOURCE_TEXT_COLOR = "#F0F0F0"  # 原文颜色（句对里的源语言行）
-CHINESE_TEXT_COLOR = "#ffe894"  # 正式译文颜色（句对里的目标语言行）
-DRAFT_TEXT_COLOR = "#8fb8e0"  # 草稿中文颜色（和正式中文区分）
+SOURCE_TEXT_COLOR = design_tokens.COLOR_SUBTITLE_SOURCE  # 原文颜色（句对里的源语言行）
+CHINESE_TEXT_COLOR = design_tokens.COLOR_SUBTITLE_TRANSLATION  # 正式译文颜色（句对里的目标语言行）
+DRAFT_TEXT_COLOR = design_tokens.COLOR_SUBTITLE_DRAFT  # 草稿中文颜色（和正式中文区分）
 
 # ============ 「性能」模式的轻量翻译模型 ============
 # 给游戏腾~3GB显存，GPU争用下tok/s也快得多。qwen3.5:4b(3.4GB)基准分还略高于
@@ -369,7 +370,9 @@ WINDOW_WIDTH = 1200  # 窗口宽度（像素，小屏上会按屏宽收窄）
 WINDOW_HEIGHT = 300  # 窗口高度（像素）- 双语3条句对+live行需要的高度
 WINDOW_X = 360  # 窗口X坐标（仅在拿不到屏幕信息的兜底路径用）
 WINDOW_Y = 750  # 窗口Y坐标（同上）
-FONT_SIZE = 22  # 字体大小（首次运行按屏幕 DPI 缩放倍率放大）
+FONT_SIZE = design_tokens.TYPE_SUBTITLE_DEFAULT  # 字体大小（首次运行按屏幕 DPI 缩放倍率放大）
+FONT_SIZE_MIN = design_tokens.TYPE_SUBTITLE_MIN
+FONT_SIZE_MAX = design_tokens.TYPE_SUBTITLE_MAX
 
 # ============ 电视全屏模式（📺）============
 TV_FONT_SIZE = 64       # 全屏大字字号（Ctrl+滚轮调节）
@@ -457,14 +460,14 @@ TRANSLATION_STYLE_PROMPTS = {
 }
 
 # 窗口样式
-BACKGROUND_COLOR = "#000000"  # 字幕窗底衬基础色；透明度由 BACKGROUND_OPACITY 控制
-BACKGROUND_OPACITY = 235  # 背景不透明度 0-255（255=纯黑不透；设置面板有滑块，会记住）
+BACKGROUND_COLOR = design_tokens.COLOR_BACKGROUND  # 字幕窗底衬基础色；透明度由 BACKGROUND_OPACITY 控制
+BACKGROUND_OPACITY = round(design_tokens.OPACITY_BACKGROUND_DEFAULT * 255)  # 背景不透明度 0-255（255=纯黑不透；设置面板有滑块，会记住）
 TEXT_COLOR = SOURCE_TEXT_COLOR  # 旧名兼容；新持久化键是 SOURCE_TEXT_COLOR
 TEXT_EDGE = "none"  # none / shadow
 BORDER_COLOR = "rgba(255, 255, 255, 0.3)"  # 边框颜色
-WINDOW_CORNER_RADIUS = 8  # 字幕窗圆角半径（只影响样式表，不改命中测试）
+WINDOW_CORNER_RADIUS = design_tokens.RADIUS_SMALL  # 字幕窗圆角半径（只影响样式表，不改命中测试）
 BORDER_RADIUS = WINDOW_CORNER_RADIUS  # 旧名兼容
-PADDING = "15px 20px"  # 内边距
+PADDING = f"{design_tokens.SPACE_WINDOW_PAD_V}px {design_tokens.SPACE_WINDOW_PAD_H}px"  # 内边距
 
 # ============ 翻译术语表（德 → 中）============
 # 人名/党派/固定政治术语的标准译名，防止Qwen自由发挥。

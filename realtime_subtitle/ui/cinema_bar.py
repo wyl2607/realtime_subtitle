@@ -30,6 +30,7 @@ from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel
 from PyQt6.QtCore import Qt, QTimer
 
 import realtime_subtitle.config as config
+import realtime_subtitle.ui.design_tokens as design_tokens
 
 
 class CinemaBar(QWidget):
@@ -53,6 +54,7 @@ class CinemaBar(QWidget):
 
         self.screen_index = None  # None = 跟随主字幕窗所在屏
         self._ct_applied = False  # 原生穿透标志是否已经打上（只需一次）
+        self._current_key = None
 
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -85,7 +87,7 @@ class CinemaBar(QWidget):
     # ------------------------------------------------------------------
     # 内容
     # ------------------------------------------------------------------
-    def append_pair(self, german, chinese):
+    def append_pair(self, german, chinese, key=None):
         """新句对上屏。影院条只显示**最新一句**，不滚动、不留历史。
 
         要回看历史请用 📜 历史窗或 📺 电视窗——在视频上叠多行会挡画面，
@@ -94,11 +96,26 @@ class CinemaBar(QWidget):
         if not self.isVisible():
             return
         chinese = (chinese or "").strip()
-        if not chinese:
+        german = (german or "").strip()
+        is_untranslated = (chinese in (design_tokens.TEXT_UNTRANSLATED, "翻译中…"))
+        if not chinese and not (german and is_untranslated):
             return
-        self._set_line(self.german_label, (german or "").strip()
-                       if getattr(config, "CINEMA_SHOW_GERMAN", True) else "")
+        self._current_key = key
+        show_german = getattr(config, "CINEMA_SHOW_GERMAN", True) or is_untranslated
+        self._set_line(self.german_label, german if show_german else "")
         self._set_line(self.chinese_label, chinese, draft=False)
+        self._restart_hold()
+
+    def update_dst(self, key, dst, german=None):
+        """按 key 原地更新译文（若之前是未翻译标记，更新为正式译文）"""
+        if not self.isVisible() or self._current_key != key:
+            return
+        dst = (dst or "").strip()
+        is_untranslated = (dst in (design_tokens.TEXT_UNTRANSLATED, "翻译中…"))
+        show_german = getattr(config, "CINEMA_SHOW_GERMAN", True) or is_untranslated
+        if german:
+            self._set_line(self.german_label, german if show_german else "")
+        self._set_line(self.chinese_label, dst, draft=False)
         self._restart_hold()
 
     def update_draft(self, chinese):

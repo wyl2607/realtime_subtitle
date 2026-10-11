@@ -153,12 +153,11 @@ def test_panel_controls_use_readable_font_and_click_area():
     win = SettingsWindow()
     try:
         expect = panel_font_px()
-        assert win.chinese_only_cb.font().pixelSize() >= expect - 1
         assert win.draft_cb.font().pixelSize() >= expect - 1
         live_btn = win._preset_buttons["直播"]
         assert live_btn.font().pixelSize() >= expect - 1
         assert live_btn.sizeHint().height() >= expect + 8
-        assert win.chinese_only_cb.sizeHint().height() >= expect
+        assert win.draft_cb.sizeHint().height() >= expect
         assert win.device_name_edit.font().pixelSize() >= expect - 1
         # 字幕字号滑块改的是 config.FONT_SIZE，不是面板字体
         snap = config.FONT_SIZE
@@ -166,7 +165,7 @@ def test_panel_controls_use_readable_font_and_click_area():
             win.font_size_slider["slider"].setValue(
                 round(40 / win.font_size_slider["step"]))
             assert config.FONT_SIZE == 40
-            assert win.chinese_only_cb.font().pixelSize() >= expect - 1
+            assert win.draft_cb.font().pixelSize() >= expect - 1
         finally:
             config.FONT_SIZE = snap
     finally:
@@ -178,14 +177,13 @@ def test_settings_checkboxes_keep_keyboard_focus():
     _app()
     win = SettingsWindow()
     try:
-        assert win.chinese_only_cb.focusPolicy() != Qt.FocusPolicy.NoFocus
         assert win.draft_cb.focusPolicy() != Qt.FocusPolicy.NoFocus
         assert win.cinema_german_cb.focusPolicy() != Qt.FocusPolicy.NoFocus
         win.show()
         QApplication.instance().processEvents()
-        win.chinese_only_cb.setFocus(Qt.FocusReason.TabFocusReason)
+        win.draft_cb.setFocus(Qt.FocusReason.TabFocusReason)
         QApplication.instance().processEvents()
-        assert win.chinese_only_cb.hasFocus()
+        assert win.draft_cb.hasFocus()
     finally:
         win.close()
 

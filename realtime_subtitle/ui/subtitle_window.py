@@ -29,6 +29,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import QColor, QPainter, QPen
 import realtime_subtitle.config as config
+import realtime_subtitle.ui.design_tokens as design_tokens
 from realtime_subtitle.paths import repo_path
 from realtime_subtitle.ui.window_geometry import (
     _screen_area_at, _clamp_geo_to_area, _clamp_geo_to_any_screen,
@@ -60,7 +61,7 @@ if sys.platform == "win32":
 # 仓库根：uninstall.ps1 / update_subtitles.ps1 都按这个位置跟用户讲
 STATE_FILE = repo_path("window_state.json")
 OLD_DEFAULT_TRANSLATION_COLOR = "#c8c8c8"
-NEW_DEFAULT_TRANSLATION_COLOR = "#FFE894"
+NEW_DEFAULT_TRANSLATION_COLOR = design_tokens.COLOR_SUBTITLE_TRANSLATION
 
 
 class ChromeToolButton(QPushButton):
@@ -144,10 +145,16 @@ def _migrate_tuning_defaults(state):
     tuning = state.get("tuning")
     if not isinstance(tuning, dict):
         return state
+    changed = False
+    tuning = dict(tuning)
     color = tuning.get("CHINESE_TEXT_COLOR")
     if isinstance(color, str) and color.strip().lower() == OLD_DEFAULT_TRANSLATION_COLOR:
-        tuning = dict(tuning)
         tuning["CHINESE_TEXT_COLOR"] = NEW_DEFAULT_TRANSLATION_COLOR
+        changed = True
+    if "SHOW_BILINGUAL" in tuning and "DISPLAY_MODE" not in tuning:
+        tuning["DISPLAY_MODE"] = "bilingual" if tuning["SHOW_BILINGUAL"] else "target"
+        changed = True
+    if changed:
         state = dict(state)
         state["tuning"] = tuning
     return state
@@ -178,6 +185,7 @@ class SubtitleSignals(QObject):
     toggle_cinema = pyqtSignal()  # 切换 🎞 影院字幕条（热键线程→主线程）
     mode = pyqtSignal(object)  # 当前模式名(str)或 None(自定义)：热键线程→主线程
     language = pyqtSignal(str, str, int)  # 语言对已应用 (源, 目标, 代数)：ASR 线程→主线程
+    translate_failed = pyqtSignal(str, object, object, str, int, str)  # 翻译失败 (源, t0, t1, key, 代数, 原因)
 
 class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
     """字幕悬浮窗"""
@@ -501,6 +509,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         # AI 分析/深度解释：同样由 main 接到 translator 的 _lookup_executor 路径
         self.on_ai_analysis = None   # (german_text, callback) -> None
         self.on_deep_explain = None  # (sentence, callback) -> None
+        self.on_retry_translation = None  # (key) -> bool
         self._last_html = ""   # 最近一次渲染的富文本（点击命中测试要按它重建排版）
         self._ai_context_text = ""  # 最近一次 🤖 请求的德文，给"问更强的AI"拼问句
         # 代数门控：连点 🤖 / 深度解释时只认最后一次结果（各自计数，弹窗不互相覆盖）
@@ -522,6 +531,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         self.signals.toggle_cinema.connect(self._toggle_cinema)
         self.signals.mode.connect(self._on_mode_applied)
         self.signals.language.connect(self._on_language_applied)
+        self.signals.translate_failed.connect(self._on_translate_failed)
         
         print("✅ 字幕窗口已创建")
         print(f"   位置: ({x}, {y})  大小: {w}x{h}")
@@ -831,7 +841,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         if self.tv_window.isVisible():
             self.tv_window.hide()
         else:
-            self.tv_window.backfill([item[1] for item in self.sentence_pairs])
+            self.tv_window.backfill(self.sentence_pairs)
             self.tv_window.open_fullscreen(
                 avoid_center=self.container.frameGeometry().center())
 

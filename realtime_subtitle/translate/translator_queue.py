@@ -921,8 +921,9 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             sentence = TimedSentence(src, t0=t0, t1=t1, key=k, source="local", revision=rev)
             self._tx_queue.append(sentence)
             dropped = self._trim_tx_queue_locked()
+        self._emit_dropped(dropped)
         if dropped:
-            self._warn_tx_dropped(dropped)
+            self._warn_tx_dropped(len(dropped))
         try:
             self._tx_executor.submit(self._translation_worker)
         except RuntimeError:
@@ -946,8 +947,9 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         with self._tx_lock:
             self._tx_queue.extend(sentences)
             dropped = self._trim_tx_queue_locked()
+        self._emit_dropped(dropped)
         if dropped:
-            self._warn_tx_dropped(dropped)
+            self._warn_tx_dropped(len(dropped))
         try:
             self._tx_executor.submit(self._translation_worker)
         except RuntimeError:
@@ -956,18 +958,16 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
     def _trim_tx_queue_locked(self):
         """翻译队列硬顶：Ollama 半死（每句都超时重试）时排空速率远低于产出速率，
         队列会一直涨。丢最旧的——它们的德语早就在屏幕上滚过去了，用户在看的是
-        最新几句。调用方必须持 _tx_lock。返回丢弃条数。
-
-        （照 enqueue_audio 里 ASR 收件箱硬顶的同一套写法：丢最旧 + 累计计数 +
-        节流告警。之前评估过"批量合并够用先不做"，但本轮给翻译加了超时重试，
-        排空速率进一步下降，这个上限就成了必需品。）"""
+        最新几句。调用方必须持 _tx_lock。
+        锁内只收集被丢弃的句子，返回 [(src, t0, t1, key, rev), ...]，
+        调用方在放锁后调用 _emit_dropped 发送 on_translate_failed。
+        """
         cap = getattr(config, "TRANSLATE_QUEUE_MAX_CHARS", 3000)
         total = sum(len(s) for s in self._tx_queue)
-        dropped = 0
+        dropped_items = []
         while total > cap and len(self._tx_queue) > 1:
             s = self._tx_queue.pop(0)
             total -= len(s)
-            dropped += 1
             src = str(s)
             t0 = getattr(s, "t0", None)
             t1 = getattr(s, "t1", None)
@@ -976,9 +976,14 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
                 key = f"local:{t0:.3f}-{t1:.3f}"
             rev = getattr(s, "revision", getattr(self, "_lang_revision", 0))
             self._record_failed_sentence_locked(src, t0, t1, key, rev)
+            dropped_items.append((src, t0, t1, key, rev))
+        self._tx_dropped += len(dropped_items)
+        return dropped_items
+
+    def _emit_dropped(self, dropped_items):
+        """在 _tx_lock 锁外发送丢弃事件（回调里不许持锁）。"""
+        for src, t0, t1, key, rev in dropped_items:
             self._emit_translate_failed(src, t0, t1, key, rev, reason="dropped")
-        self._tx_dropped += dropped
-        return dropped
 
     @staticmethod
     def _word_align_text(text):
@@ -1369,7 +1374,12 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             return  # 期间切了语言/正在退出：旧语言结果不上屏不写回
 
         if failed and cb_failed is not None and not is_retry:
-            # 首次失败且注册了失败回调：放进低优先级重试队列，后台自动重试 1 次
+            # 首次失败且注册了失败回调：立即 on_pair 让原文先上屏，再放进低优先级重试队列
+            if self.on_pair:
+                self._emit_pair(german, "", batch_t0, batch_t1, batch_key, batch_rev)
+            self._draft_last_text = ""
+            self._emit_display()
+
             retry_sentence = TimedSentence(
                 german, t0=batch_t0, t1=batch_t1, key=batch_key,
                 source=getattr(batch[0], "source", "local"),
@@ -1393,7 +1403,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             # 但存档必须照常写（格式和"只有原文"的行一致）
             out_target = "" if failed else translation
             self._save_transcript(german, out_target)
-            if self.on_pair:
+            if self.on_pair and not (failed and is_retry):
                 self._emit_pair(german, out_target, batch_t0, batch_t1, batch_key, batch_rev)
             self._draft_last_text = ""  # 正式句对上屏了，残句草稿从头再来
             self._emit_display()

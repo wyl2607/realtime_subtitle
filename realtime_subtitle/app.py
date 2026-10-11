@@ -1090,6 +1090,10 @@ class SubtitleApp:
             translator.on_draft = self.subtitle_window.update_draft
             translator.on_status = self.subtitle_window.show_status
             translator.on_language_applied = self.subtitle_window.notify_language_applied
+            translator.on_translate_failed = self.subtitle_window.on_translate_failed
+            self.subtitle_window.on_retry_translation = (
+                lambda k: self.translator.retry_translation(k) if self.translator else False
+            )
             self.translator = translator  # 此后 stop() 会负责 shutdown 它
             # 模型还没好时用户拨的开关只落在文件里。这里按文件决定要不要接远端。
             self._attach_remote()
@@ -1306,18 +1310,7 @@ class SubtitleApp:
         self._ui_invoke(_go)
 
     def _ui_update_dst(self, key, dst):
-        def _go():
-            window = self.subtitle_window
-            changed = False
-            for index, item in enumerate(window.sentence_pairs):
-                if len(item) >= 7 and item[6] == key:
-                    window.sentence_pairs[index] = (
-                        item[0], dst, item[2], item[3], item[4], item[5], item[6])
-                    changed = True
-                    break
-            if changed:
-                window._render()
-        self._ui_invoke(_go)
+        self._ui_invoke(lambda: self.subtitle_window.update_dst(key, dst))
 
     def _toggle_pause(self):
         """暂停/继续（和 暂停继续字幕.bat 完全等价：切换.paused标记文件）"""
