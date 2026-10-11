@@ -121,7 +121,14 @@ final class OverlayController: NSObject {
         root.state = .active
         root.wantsLayer = true
         root.layer?.cornerRadius = 18
-        root.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.62).cgColor
+        // 浅色模式下 hudWindow 会渲染成浅灰底，白字/黄字看不清；强制暗色外观，
+        // 再垫一层不受材质影响的黑色底（直接设 root 的 layer 底色会被材质盖掉）。
+        root.appearance = NSAppearance(named: .darkAqua)
+        let tint = NSView(frame: root.bounds)
+        tint.autoresizingMask = [.width, .height]
+        tint.wantsLayer = true
+        tint.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.72).cgColor
+        root.addSubview(tint)
 
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -209,6 +216,12 @@ final class OverlayController: NSObject {
         field.lineBreakMode = .byWordWrapping
         field.maximumNumberOfLines = 3
         field.preferredMaxLayoutWidth = textWidth
+        // 底板再透也压得住：细描边式阴影让字在任何背景上都有轮廓
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.9)
+        shadow.shadowOffset = .zero
+        shadow.shadowBlurRadius = 3
+        field.shadow = shadow
         return field
     }
 
