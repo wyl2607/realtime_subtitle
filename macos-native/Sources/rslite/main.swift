@@ -360,6 +360,7 @@ struct RSLite {
         failures.append(contentsOf: Capability.selfTest().map { "Capability: \($0)" })
         failures.append(contentsOf: CloudConfigStore.selfTest().map { "CloudConfig: \($0)" })
         failures.append(contentsOf: OverlayStyle.selfTest().map { "OverlayStyle: \($0)" })
+        failures.append(contentsOf: OverlayMotion.selfTest().map { "OverlayMotion: \($0)" })
         failures.append(contentsOf: AppSettings.selfTest().map { "AppSettings: \($0)" })
         failures.append(contentsOf: NodeCompareBoard.selfTest().map { "NodeCompare: \($0)" })
         failures.append(contentsOf: TailnetPin.selfTest().map { "TailnetPin: \($0)" })

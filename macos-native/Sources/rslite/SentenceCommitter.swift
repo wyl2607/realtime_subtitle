@@ -174,6 +174,8 @@ struct LineStore {
     private var nextNodeKey = -1
     private let capacity: Int
 
+    /// 瀑布流和回看最多画这么多句对。P5 替换仍看 `capacity`（默认 200）。
+    static let displayHistoryLimit = 60
     /// 重叠占本机行自身时长的比例达到这个值就整行替换（含等于）。
     static let replaceRatio = 0.5
     private static let epsilon = 1e-9
@@ -433,6 +435,15 @@ struct LineStore {
             s.applyNode(nodeID: "n", t0: 0, t1: 2.0, srcText: "part1", dstText: nil)
             let second = s.applyNode(nodeID: "n", t0: 3.0, t1: 4.9, srcText: "part2", dstText: nil)
             check(second.isEmpty && s.lines.contains { $0.key == 1 }, "TK-010 累计低于50%不应替换")
+        }
+        do {
+            var s = LineStore()
+            for index in 0..<80 {
+                s.addLocal(key: index, t0: nil, t1: nil, text: "t\(index)")
+            }
+            check(s.lines.count == 80, "历史上限：容量保留超过 60 对")
+            check(s.lines.suffix(LineStore.displayHistoryLimit).count == 60, "历史上限：显示取末尾 60 对")
+            check(s.lines.suffix(LineStore.displayHistoryLimit).first?.key == 20, "历史上限：第 20 对起进入显示历史")
         }
         // TK-010：节点先到时，后到本机句也按节点并集覆盖判定丢弃。
         do {
