@@ -32,7 +32,12 @@ private final class OverlayRootView: NSVisualEffectView {
     }
 }
 
-private final class OverlayDragSurfaceView: NSView {
+/// 盖在「未翻译 ⟳」文字上的命中层。范围只有文字本身，点下去重试，不拖窗口。
+private final class UntranslatedMarkerHitView: NSView {
+    var key = 0
+    var onClick: ((Int) -> Void)?
+
+    override var isOpaque: Bool { false }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
@@ -41,7 +46,53 @@ private final class OverlayDragSurfaceView: NSView {
         return bounds.contains(local) ? self : nil
     }
 
+    override func mouseDown(with event: NSEvent) {
+        guard window?.ignoresMouseEvents != true else { return }
+        onClick?(key)
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        nextResponder?.scrollWheel(with: event)
+    }
+}
+
+private final class OverlayDragSurfaceView: NSView {
     var scrollHandler: ((NSEvent) -> Void)?
+    private var markerHits: [Int: UntranslatedMarkerHitView] = [:]
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    /// 按文字矩形铺命中层。不在列表里的旧层去掉，避免滚出画面后还能点到。
+    func setMarkerHits(_ hits: [(key: Int, rect: NSRect)], onClick: @escaping (Int) -> Void) {
+        let live = Set(hits.map(\.key))
+        for key in Array(markerHits.keys) where !live.contains(key) {
+            markerHits[key]?.removeFromSuperview()
+            markerHits.removeValue(forKey: key)
+        }
+        for hit in hits {
+            let view = markerHits[hit.key] ?? UntranslatedMarkerHitView(frame: hit.rect)
+            view.key = hit.key
+            view.onClick = onClick
+            view.frame = hit.rect
+            if view.superview !== self {
+                addSubview(view)
+                markerHits[hit.key] = view
+            }
+        }
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !isHidden, alphaValue > 0, window?.ignoresMouseEvents != true else { return nil }
+        let local = convert(point, from: superview)
+        guard bounds.contains(local) else { return nil }
+        // 标记文字的范围交给标记视图；其余区域仍由拖动层接收。
+        for marker in markerHits.values {
+            if let hit = marker.hitTest(local) {
+                return hit
+            }
+        }
+        return self
+    }
 
     override func mouseDown(with event: NSEvent) {
         guard let window, !window.ignoresMouseEvents else { return }
@@ -67,6 +118,8 @@ private final class SubtitlePairView: NSStackView {
     var translationSignature = ""
     var didFadeIn = false
     var appliedOpacity = -1.0
+    /// 第二行当前是可点的「未翻译 ⟳」。拖动层只为这种句子让出文字范围。
+    var markerClickable = false
 
     init(key: Int) {
         self.key = key
@@ -192,6 +245,14 @@ final class OverlayController: NSObject {
     private var scrollAccumulator: CGFloat = 0
     /// 译文可能先于 MainActor 上的 applyNode 回来。先按 key 记下，行出现再补上。
     private var pendingTranslation: [Int: String] = [:]
+    /// 翻译失败的句子。键是句子 id，瀑布流和回看里的旧句用同一份。
+    private var failures: [Int: OverlayMotion.FailureState] = [:]
+    /// 失败原因只记账，不改标记文案（error / unavailable 都显示「未翻译 ⟳」）。
+    private var failureReasons: [Int: String] = [:]
+    private var expireTasks: [Int: Task<Void, Never>] = [:]
+    /// 标记被正常译文替换时，下一帧给译文做一次现有淡入。
+    private var fadeTranslationIDs: Set<Int> = []
+    private var translationFading: Set<Int> = []
     private var style: OverlayStyle
     private var isPaused = false
     private var originSaveTask: Task<Void, Never>?
@@ -200,10 +261,16 @@ final class OverlayController: NSObject {
     private var liveResizeStart: NSSize?
     private let onPauseChanged: (Bool) -> Void
     private let onQuit: () -> Void
+    private let onRetry: (Int) -> Bool
 
-    init(onPauseChanged: @escaping (Bool) -> Void, onQuit: @escaping () -> Void) {
+    init(
+        onPauseChanged: @escaping (Bool) -> Void,
+        onQuit: @escaping () -> Void,
+        onRetry: @escaping (Int) -> Bool = { _ in false }
+    ) {
         self.onPauseChanged = onPauseChanged
         self.onQuit = onQuit
+        self.onRetry = onRetry
         let loaded = OverlayStyleStore.load()
         self.style = loaded
 
@@ -257,6 +324,12 @@ final class OverlayController: NSObject {
     }
 
     func addTranslation(id: Int, text: String) {
+        let hadMarker = failures[id] != nil
+        let alreadyShown = pairViews[id]?.didFadeIn == true
+        clearFailure(id)
+        if hadMarker && alreadyShown {
+            fadeTranslationIDs.insert(id)
+        }
         if store.lines.contains(where: { $0.key == id }) {
             store.setTranslation(key: id, text: text)
             pendingTranslation.removeValue(forKey: id)
@@ -264,6 +337,109 @@ final class OverlayController: NSObject {
             pendingTranslation[id] = text
         }
         render()
+    }
+
+    /// 译文位置改显示「未翻译 ⟳」。同 id 的译文随后到达时由 addTranslation 换回正常译文。
+    func markUntranslated(id: Int, reason: String) {
+        if failures[id] == .failed, failureReasons[id] == reason {
+            return
+        }
+        cancelExpire(id)
+        fadeTranslationIDs.remove(id)
+        translationFading.remove(id)
+        failureReasons[id] = reason
+        failures[id] = .failed
+        render()
+    }
+
+    private func clearFailure(_ id: Int) {
+        cancelExpire(id)
+        failures[id] = nil
+        failureReasons[id] = nil
+    }
+
+    private func cancelExpire(_ id: Int) {
+        expireTasks[id]?.cancel()
+        expireTasks[id] = nil
+    }
+
+    /// 点「未翻译 ⟳」。接受则改成「翻译中…」；拒绝则改成「已过期」，3 秒后锁定为不可再点的灰色静态文字。
+    private func retryMarked(id: Int) {
+        guard !panel.ignoresMouseEvents else { return }
+        guard failures[id] == .failed else { return }
+        let accepted = onRetry(id)
+        failures[id] = OverlayMotion.markerAfterRetry(accepted: accepted)
+        if accepted {
+            cancelExpire(id)
+        } else {
+            scheduleExpireLock(id)
+        }
+        render()
+    }
+
+    private func scheduleExpireLock(_ id: Int) {
+        cancelExpire(id)
+        let wait = OverlayMotion.expiredLockSec
+        expireTasks[id] = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+            guard let self, !Task.isCancelled else { return }
+            guard let current = self.failures[id] else { return }
+            let settled = OverlayMotion.markerSettled(current, elapsed: wait)
+            guard settled != current else { return }
+            self.failures[id] = settled
+            self.render(animate: false)
+        }
+    }
+
+    private func beginTranslationFade(id: Int, field: NSTextField) {
+        let fade = OverlayMotion.motionSeconds(milliseconds: DesignTokens.Motion.fadeInMs, reduceMotion: reduceMotion)
+        translationFading.insert(id)
+        guard fade > 0 else {
+            field.alphaValue = 1
+            translationFading.remove(id)
+            return
+        }
+        field.alphaValue = 0
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = fade
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            field.animator().alphaValue = 1
+        }, completionHandler: {
+            Task { @MainActor in
+                self.translationFading.remove(id)
+            }
+        })
+    }
+
+    /// 瀑布流和回看里可见的「未翻译 ⟳」都铺一层与文字等大的命中视图。
+    private func syncMarkerHits() {
+        var hits: [(key: Int, rect: NSRect)] = []
+        let clipInDrag = dragSurface.convert(clipView.bounds, from: clipView)
+        for view in stack.arrangedSubviews {
+            guard let pair = view as? SubtitlePairView, pair.markerClickable, !pair.isHidden else { continue }
+            let field = pair.translationField
+            guard !field.isHidden, field.bounds.width > 1, field.bounds.height > 1 else { continue }
+            let font = field.font ?? NSFont.systemFont(
+                ofSize: CGFloat(style.fontSize * OverlayMotion.secondLineFontScale(.untranslated)),
+                weight: .semibold
+            )
+            let textSize = (field.stringValue as NSString).size(withAttributes: [.font: font])
+            let drawing = field.cell?.drawingRect(forBounds: field.bounds) ?? field.bounds
+            let localText = OverlayMotion.markerTextRect(fieldRect: drawing, textSize: textSize)
+            guard OverlayMotion.markerClickHits(
+                point: CGPoint(x: localText.midX, y: localText.midY),
+                textRect: localText,
+                clickThrough: false,
+                clickable: true
+            ) else { continue }
+            let inDrag = field.convert(localText, to: dragSurface)
+            let visible = inDrag.intersection(clipInDrag)
+            if visible.isNull || visible.isEmpty || visible.width < 1 || visible.height < 1 { continue }
+            hits.append((pair.key, visible))
+        }
+        dragSurface.setMarkerHits(hits) { [weak self] id in
+            self?.retryMarked(id: id)
+        }
     }
 
     /// 节点的精修句到达（P5）：整体替换被它覆盖的本机行，找不到就按时间插入。
@@ -636,14 +812,21 @@ final class OverlayController: NSObject {
             let content = ceil(stack.fittingSize.height) + OverlayStyle.windowPadV * 2
             fitHeight(waterfall: waterfall, contentHeight: content, animate: animateMotion)
         }
+        stack.layoutSubtreeIfNeeded()
+        root.layoutSubtreeIfNeeded()
+        syncMarkerHits()
         didRenderOnce = true
     }
 
-    /// 仅译文模式在译文到达前没有可画的行，不占可见行数。双语/仅原文保持旧行为：原文行始终占位。
+    /// 仅译文在译文到达前不占行。失败句改显示原文加标记，所以仍然占行。
     private func isDisplayable(_ line: SubtitleLine) -> Bool {
-        if style.displayMode != .translationOnly { return true }
-        guard let translated = line.dstText else { return false }
-        return !translated.isEmpty
+        let presented = OverlayMotion.pairLines(
+            source: line.srcText,
+            translation: line.dstText,
+            failure: failures[line.key] ?? .none,
+            mode: style.displayMode
+        )
+        return presented.first != nil || presented.second != nil
     }
 
     private func noteArrivals(in lines: [SubtitleLine]) {
@@ -746,29 +929,59 @@ final class OverlayController: NSObject {
     private func update(_ pair: SubtitlePairView, line: SubtitleLine, width: CGFloat) {
         pair.sourceField.preferredMaxLayoutWidth = width
         pair.translationField.preferredMaxLayoutWidth = width
-        let showSource = style.displayMode != .translationOnly
-        let translated = line.dstText.flatMap { $0.isEmpty ? nil : $0 }
-        let showTranslation = style.displayMode != .sourceOnly && translated != nil
-        pair.sourceField.isHidden = !showSource
-        pair.translationField.isHidden = !showTranslation
-        if showSource {
-            applySubtitle(line.srcText, hex: style.sourceColor, to: pair.sourceField, signature: &pair.sourceSignature)
+        let presented = OverlayMotion.pairLines(
+            source: line.srcText,
+            translation: line.dstText,
+            failure: failures[line.key] ?? .none,
+            mode: style.displayMode
+        )
+        pair.markerClickable = OverlayMotion.secondLineClickable(presented.secondStyle)
+        pair.sourceField.isHidden = presented.first == nil
+        pair.translationField.isHidden = presented.second == nil
+        if let first = presented.first {
+            applySubtitle(first, hex: style.sourceColor, to: pair.sourceField, signature: &pair.sourceSignature)
         }
-        if let translated, showTranslation {
-            applySubtitle(translated, hex: style.translationColor, to: pair.translationField, signature: &pair.translationSignature)
+        guard let second = presented.second else {
+            pair.translationField.alphaValue = 1
+            translationFading.remove(line.key)
+            return
+        }
+        let scale = OverlayMotion.secondLineFontScale(presented.secondStyle)
+        let hex = OverlayMotion.secondLineColorHex(presented.secondStyle) ?? style.translationColor
+        let edge: TextEdge? = presented.secondStyle == .translation ? nil : TextEdge.none
+        applySubtitle(
+            second,
+            hex: hex,
+            to: pair.translationField,
+            signature: &pair.translationSignature,
+            fontScale: scale,
+            textEdge: edge
+        )
+        if presented.secondStyle == .translation, fadeTranslationIDs.remove(line.key) != nil {
+            beginTranslationFade(id: line.key, field: pair.translationField)
+        } else if presented.secondStyle != .translation || !translationFading.contains(line.key) {
+            pair.translationField.alphaValue = 1
         }
     }
 
-    private func applySubtitle(_ text: String, hex: String, to field: NSTextField, signature: inout String) {
-        let sig = "\(text)\u{1}\(hex)\u{1}\(style.fontSize)\u{1}\(style.textEdge.rawValue)"
+    private func applySubtitle(
+        _ text: String,
+        hex: String,
+        to field: NSTextField,
+        signature: inout String,
+        fontScale: Double = 1,
+        textEdge: TextEdge? = nil
+    ) {
+        let edge = textEdge ?? style.textEdge
+        let sig = "\(text)\u{1}\(hex)\u{1}\(style.fontSize)\u{1}\(edge.rawValue)\u{1}\(fontScale)"
         guard sig != signature else { return }
         let parts = signature.split(separator: "\u{1}", omittingEmptySubsequences: false).map(String.init)
         let oldText = parts.first ?? ""
         let oldEdge = parts.count >= 4 ? parts[3] : ""
         signature = sig
-        let font = NSFont.systemFont(ofSize: CGFloat(style.fontSize), weight: .semibold)
+        let font = NSFont.systemFont(ofSize: CGFloat(style.fontSize * fontScale), weight: .semibold)
         let color = nsColor(hex, fallback: hex)
-        if style.textEdge == .outline {
+        if edge == .outline {
             // strokeWidth 是字号的百分比；负值同时填充和描边。-8 在 28pt 上大约 2px。
             let paragraph = NSMutableParagraphStyle()
             paragraph.lineBreakMode = .byWordWrapping
@@ -787,7 +1000,7 @@ final class OverlayController: NSObject {
         }
         field.textColor = color
         field.font = font
-        field.shadow = style.textEdge == .shadow ? textShadow() : nil
+        field.shadow = edge == .shadow ? textShadow() : nil
     }
 
     private func textShadow() -> NSShadow {
