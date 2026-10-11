@@ -251,8 +251,9 @@ final class OverlayController: NSObject {
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 22),
             stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -22),
-            stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 18),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: root.bottomAnchor, constant: -18),
+            // 用户把窗口拉高后，字幕要像视频字幕一样贴着底边出现，多出的空白留在上方。
+            stack.topAnchor.constraint(greaterThanOrEqualTo: root.topAnchor, constant: 18),
+            stack.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -18),
             dragSurface.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             dragSurface.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             dragSurface.topAnchor.constraint(equalTo: root.topAnchor),
