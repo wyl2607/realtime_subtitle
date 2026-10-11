@@ -11,3 +11,14 @@
 {"ts":"2026-10-11T17:05:33+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-002","cr":"CR-002","phase":"review","action":"repair","agent_role":"repairer","round":1,"notes":"agy gemini-3.1-pro (2nd attempt after tilde-path allowlist)"}
 {"ts":"2026-10-11T17:05:33+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-002","cr":"CR-002","phase":"review","action":"round-2-recheck","agent_role":"coordinator","round":2,"notes":"clean"}
 {"ts":"2026-10-11T17:05:33+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-002","cr":"CR-002","phase":"delivery","action":"synced","agent_role":"coordinator","notes":"merged into feat/macos-native"}
+{"ts":"2026-10-11T17:05:53+08:00","sprint":"sprints-002-cloud-asr-first","tk":null,"phase":"scheduler","action":"dispatched","agent_role":"coordinator","tks":["TK-003"],"notes":"security TK alone in batch 2"}
+{"ts":"2026-10-11T17:05:53+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-003","phase":"execution","action":"spawn","agent_role":"executor","notes":"codex gpt-5.5 high"}
+{"ts":"2026-10-11T17:16:52+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-003","cr":"CR-003","phase":"execution","action":"return","agent_role":"executor","notes":"codex hit usage limit after implementing all criteria; coordinator build+selftest OK"}
+{"ts":"2026-10-11T17:16:52+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-003","cr":"CR-003","phase":"review","action":"spawn","agent_role":"reviewer","round":1,"notes":"grok security + agy default"}
+{"ts":"2026-10-11T17:23:44+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-006","phase":"scheduler","action":"split","agent_role":"coordinator","tks":["TK-006A","TK-006B"]}
+{"ts":"2026-10-11T17:23:44+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-006A","phase":"execution","action":"spawn","agent_role":"executor","notes":"agy gemini-3.1-pro"}
+{"ts":"2026-10-11T17:23:44+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-006B","phase":"execution","action":"spawn","agent_role":"executor","notes":"grok"}
+{"ts":"2026-10-11T17:32:39+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-003","cr":"CR-003","phase":"review","action":"triage","agent_role":"coordinator","round":1,"notes":"6 accepted (S1 partial) 1 rejected"}
+{"ts":"2026-10-11T17:37:53+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-001","cr":"CR-001","phase":"execution","action":"return","agent_role":"executor","notes":"grok probe code; coordinator ran concat5+FLEURS60+groq429"}
+{"ts":"2026-10-11T17:37:53+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-001","cr":"CR-001","phase":"review","action":"resolved","agent_role":"coordinator","round":1}
+{"ts":"2026-10-11T17:37:53+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-001","cr":"CR-001","phase":"delivery","action":"synced","agent_role":"coordinator","notes":"merged"}

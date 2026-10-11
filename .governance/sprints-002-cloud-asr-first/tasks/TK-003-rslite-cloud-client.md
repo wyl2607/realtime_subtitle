@@ -42,3 +42,4 @@ codex（high）；Coordinator 做 security 复审 + 用真 key 跑一次真请�
 
 ## 状态历史
 - 2026-10-11 CST: planned（/sdd-rfc）
+- 2026-10-11 17:05 CST: executing（批次 2，单 TK）

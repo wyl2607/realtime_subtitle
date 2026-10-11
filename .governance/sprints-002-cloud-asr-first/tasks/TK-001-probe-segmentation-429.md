@@ -43,3 +43,4 @@ codex 写探针代码；真机测量（SpeechTranscriber 需要桌面会话）�
 ## 状态历史
 - 2026-10-11 CST: planned（/sdd-rfc）
 - 2026-10-11 16:38 CST: executing（批次 1）
+- 2026-10-11 17:37 CST: done（A3'；429 结论见 probes/）
