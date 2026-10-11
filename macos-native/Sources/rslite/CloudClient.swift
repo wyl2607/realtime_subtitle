@@ -11,6 +11,7 @@ struct CloudTranscriptionResult: Equatable {
     var segments: [CloudSegment]
     var statusCode: Int
     var xGroqID: String?
+    var remainingRequests: Int?
 }
 
 struct CloudLogEntry: Equatable {
@@ -57,8 +58,14 @@ final class CloudClient: @unchecked Sendable {
     private let session: URLSession
     private let logger: @Sendable (CloudLogEntry) -> Void
     private let lock = NSLock()
-    private var tasks: [Int: URLSessionDataTask] = [:]
+    private var slots: [Int: InflightSlot] = [:]
     private var nextTaskID = 0
+
+    private enum InflightSlot {
+        case reserved
+        case running(URLSessionDataTask)
+        case cancelRequested
+    }
 
     init(
         key: String,
@@ -80,13 +87,39 @@ final class CloudClient: @unchecked Sendable {
         return configuration
     }
 
+    /// 开关关闭时丢掉全部在飞请求。单个任务取消走 `cancelTask`，不会进这里。
     func cancelInflightRequests() {
         let active = lock.withLockValue { () -> [URLSessionDataTask] in
-            let current = Array(tasks.values)
-            tasks.removeAll()
-            return current
+            var found: [URLSessionDataTask] = []
+            var pending: [Int: InflightSlot] = [:]
+            for (id, slot) in slots {
+                switch slot {
+                case .running(let task):
+                    found.append(task)
+                case .reserved, .cancelRequested:
+                    pending[id] = .cancelRequested
+                }
+            }
+            slots = pending
+            return found
         }
         active.forEach { $0.cancel() }
+    }
+
+    private func cancelTask(_ id: Int) {
+        let task = lock.withLockValue { () -> URLSessionDataTask? in
+            switch slots[id] {
+            case .running(let task):
+                slots.removeValue(forKey: id)
+                return task
+            case .reserved:
+                slots[id] = .cancelRequested
+                return nil
+            case .cancelRequested, .none:
+                return nil
+            }
+        }
+        task?.cancel()
     }
 
     func transcribe(
@@ -98,7 +131,6 @@ final class CloudClient: @unchecked Sendable {
         let wav = Self.wavData(pcm16Mono16k: pcm16Mono16k, sampleRate: 16_000, channels: 1)
         var request = URLRequest(url: endpointURL)
         request.httpMethod = "POST"
-        request.timeoutInterval = Self.totalTimeout
         let boundary = "rslite-\(UUID().uuidString)"
         request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
@@ -135,7 +167,8 @@ final class CloudClient: @unchecked Sendable {
                     CloudSegment(t0: a0 + $0.start, t1: a0 + $0.end, text: $0.text)
                 },
                 statusCode: http.statusCode,
-                xGroqID: groqID
+                xGroqID: groqID,
+                remainingRequests: QuotaLedger.remainingRequests(from: http.allHeaderFields)
             )
         } catch {
             logger(CloudLogEntry(xGroqID: groqID, duration: duration, statusCode: http.statusCode, reason: "decode_failed", errorType: "decode"))
@@ -144,14 +177,15 @@ final class CloudClient: @unchecked Sendable {
     }
 
     private func data(for request: URLRequest, duration: Double) async throws -> (Data, URLResponse) {
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                let id = lock.withLockValue { () -> Int in
-                    nextTaskID += 1
-                    return nextTaskID
-                }
-                let task = session.dataTask(with: request) { data, response, error in
-                    self.lock.withLockVoid { self.tasks.removeValue(forKey: id) }
+        let id = lock.withLockValue { () -> Int in
+            nextTaskID += 1
+            slots[nextTaskID] = .reserved
+            return nextTaskID
+        }
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<(Data, URLResponse), Error>) in
+                let task = self.session.dataTask(with: request) { data, response, error in
+                    self.lock.withLockVoid { self.slots.removeValue(forKey: id) }
                     if let error {
                         let type = Self.errorType(error)
                         self.logger(CloudLogEntry(xGroqID: nil, duration: duration, statusCode: nil, reason: "network_error", errorType: type))
@@ -169,11 +203,21 @@ final class CloudClient: @unchecked Sendable {
                     }
                     continuation.resume(returning: (data, response))
                 }
-                lock.withLockVoid { tasks[id] = task }
+                let cancelNow = self.lock.withLockValue { () -> Bool in
+                    if case .cancelRequested = self.slots[id] {
+                        self.slots.removeValue(forKey: id)
+                        return true
+                    }
+                    self.slots[id] = .running(task)
+                    return false
+                }
                 task.resume()
+                if cancelNow {
+                    task.cancel()
+                }
             }
         } onCancel: {
-            cancelInflightRequests()
+            self.cancelTask(id)
         }
     }
 
@@ -260,7 +304,7 @@ final class CloudClient: @unchecked Sendable {
         return String(describing: type(of: error))
     }
 
-    private static func bodyData(from request: URLRequest) -> Data {
+    fileprivate static func bodyData(from request: URLRequest) -> Data {
         if let body = request.httpBody {
             return body
         }
@@ -321,9 +365,13 @@ final class CloudClient: @unchecked Sendable {
         run {
             CloudURLProtocolStub.handler = { request in
                 check(request.value(forHTTPHeaderField: "Authorization") == "Bearer \(fakeKey)", "请求应设置 Authorization header")
+                check(request.timeoutInterval != Self.totalTimeout, "请求不应设置 timeoutInterval 覆盖 session 总超时")
                 return .success(
                     status: 200,
-                    headers: ["x_groq.id": "groq-ok"],
+                    headers: [
+                        "x_groq.id": "groq-ok",
+                        "x-ratelimit-remaining-requests": "1980",
+                    ],
                     body: Data(#"{"text":"Hallo","segments":[{"start":0.1,"end":0.4,"text":"Hallo"}]}"#.utf8)
                 )
             }
@@ -334,6 +382,7 @@ final class CloudClient: @unchecked Sendable {
                 language: "de"
             )
             check(result.segments == [CloudSegment(t0: 12.1, t1: 12.4, text: "Hallo")], "segments 应映射到 a0 时间轴")
+            check(result.remainingRequests == 1980, "成功响应应带上 remainingRequests")
         }
 
         for status in [401, 429, 500] {
@@ -387,7 +436,54 @@ final class CloudClient: @unchecked Sendable {
             }
         }
 
-        check(defaultSessionConfiguration().connectionProxyDictionary == nil, "CloudClient 不应禁用系统代理")
+        run {
+            logs.removeAll()
+            CloudURLProtocolStub.handler = { request in
+                let body = CloudClient.bodyData(from: request)
+                if body.range(of: Data("name=\"language\"\r\n\r\nja".utf8)) != nil {
+                    return .delayed
+                }
+                return .parked
+            }
+            let doomed = Task {
+                try await client.transcribe(pcm16Mono16k: Data([0, 0]), a0: 0, duration: 1, language: "ja")
+            }
+            let kept = Task {
+                try await client.transcribe(pcm16Mono16k: Data([0, 0]), a0: 1, duration: 1, language: "de")
+            }
+            try await Task.sleep(nanoseconds: 100_000_000)
+            doomed.cancel()
+            var cancelThrew = false
+            do {
+                _ = try await doomed.value
+            } catch {
+                cancelThrew = true
+                check(!"\(error)".contains(fakeKey), "取消单个任务的错误描述不得泄露 key")
+            }
+            check(cancelThrew, "取消其中一个并发请求应抛错")
+            let resumed = CloudURLProtocolStub.resumeParked(
+                bodyNeedle: "name=\"language\"\r\n\r\nde",
+                status: 200,
+                headers: [
+                    "x_groq.id": "groq-keep",
+                    "x-ratelimit-remaining-requests": "1970",
+                ],
+                body: Data(#"{"text":"Hallo","segments":[{"start":0.0,"end":0.2,"text":"Hallo"}]}"#.utf8)
+            )
+            check(resumed == 1, "取消一个请求后另一个应仍在飞行")
+            do {
+                let keptResult = try await kept.value
+                check(keptResult.text == "Hallo", "未取消的并发请求应正常完成")
+                check(keptResult.remainingRequests == 1970, "未取消的成功响应应带上 remainingRequests")
+            } catch {
+                check(false, "未取消的并发请求应正常完成，实际失败")
+            }
+        }
+
+        let session = defaultSessionConfiguration()
+        check(session.timeoutIntervalForRequest == connectTimeout, "session timeoutIntervalForRequest 应为 5 秒")
+        check(session.timeoutIntervalForResource == totalTimeout, "session timeoutIntervalForResource 应为 10 秒")
+        check(session.connectionProxyDictionary == nil, "CloudClient 不应禁用系统代理")
         return failures.all()
     }
 }
@@ -457,10 +553,13 @@ private enum CloudURLProtocolResult {
     case success(status: Int, headers: [String: String], body: Data)
     case failure(Error)
     case delayed
+    case parked
 }
 
 private final class CloudURLProtocolStub: URLProtocol {
     nonisolated(unsafe) static var handler: ((URLRequest) -> CloudURLProtocolResult)?
+    private static let parkLock = NSLock()
+    nonisolated(unsafe) private static var parked: [ObjectIdentifier: CloudURLProtocolStub] = [:]
 
     override class func canInit(with request: URLRequest) -> Bool {
         true
@@ -477,23 +576,61 @@ private final class CloudURLProtocolStub: URLProtocol {
         }
         switch result {
         case .success(let status, let headers, let body):
-            let response = HTTPURLResponse(
-                url: request.url!,
-                statusCode: status,
-                httpVersion: "HTTP/1.1",
-                headerFields: headers
-            )!
-            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: body)
-            client?.urlProtocolDidFinishLoading(self)
+            emitSuccess(status: status, headers: headers, body: body)
         case .failure(let error):
             client?.urlProtocol(self, didFailWithError: error)
         case .delayed:
             break
+        case .parked:
+            Self.park(self)
         }
     }
 
     override func stopLoading() {
+        Self.unpark(self)
         client?.urlProtocol(self, didFailWithError: URLError(.cancelled))
+    }
+
+    @discardableResult
+    static func resumeParked(
+        bodyNeedle: String,
+        status: Int,
+        headers: [String: String],
+        body: Data
+    ) -> Int {
+        let needle = Data(bodyNeedle.utf8)
+        let matches: [CloudURLProtocolStub] = parkLock.withLockValue {
+            let hits = parked.values.filter {
+                CloudClient.bodyData(from: $0.request).range(of: needle) != nil
+            }
+            for hit in hits {
+                parked.removeValue(forKey: ObjectIdentifier(hit))
+            }
+            return Array(hits)
+        }
+        for match in matches {
+            match.emitSuccess(status: status, headers: headers, body: body)
+        }
+        return matches.count
+    }
+
+    private static func park(_ proto: CloudURLProtocolStub) {
+        parkLock.withLockVoid { parked[ObjectIdentifier(proto)] = proto }
+    }
+
+    private static func unpark(_ proto: CloudURLProtocolStub) {
+        parkLock.withLockVoid { parked.removeValue(forKey: ObjectIdentifier(proto)) }
+    }
+
+    private func emitSuccess(status: Int, headers: [String: String], body: Data) {
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: status,
+            httpVersion: "HTTP/1.1",
+            headerFields: headers
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
     }
 }

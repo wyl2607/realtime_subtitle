@@ -59,10 +59,54 @@ enum CloudConfigStore {
     }
 
     static func readLineFromStdinAndWriteKey(directory: URL = defaultDirectory) throws {
+        if isatty(STDIN_FILENO) != 0 {
+            let line = try readHiddenLineFromTTY()
+            try writeKey(line, directory: directory)
+            return
+        }
         guard let line = readLine(strippingNewline: true) else {
             throw CloudConfigError.stdinClosed
         }
         try writeKey(line, directory: directory)
+    }
+
+    /// stdin 是 TTY 时关掉 ECHO 读一行。任何退出（含出错）都恢复进入时的 termios，并向 stderr 补一个换行。
+    private static func readHiddenLineFromTTY() throws -> String {
+        var original = termios()
+        guard tcgetattr(STDIN_FILENO, &original) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        var hidden = original
+        hidden.c_lflag &= ~tcflag_t(ECHO)
+        guard tcsetattr(STDIN_FILENO, TCSANOW, &hidden) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        defer {
+            var restore = original
+            _ = tcsetattr(STDIN_FILENO, TCSANOW, &restore)
+            var newline: UInt8 = 0x0A
+            _ = Darwin.write(STDERR_FILENO, &newline, 1)
+        }
+        var bytes: [UInt8] = []
+        var byte: UInt8 = 0
+        while true {
+            let count = Darwin.read(STDIN_FILENO, &byte, 1)
+            if count == 0 {
+                if bytes.isEmpty {
+                    throw CloudConfigError.stdinClosed
+                }
+                break
+            }
+            if count < 0 {
+                if errno == EINTR { continue }
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            if byte == UInt8(ascii: "\n") {
+                break
+            }
+            bytes.append(byte)
+        }
+        return String(decoding: bytes, as: UTF8.self)
     }
 
     static func writeKey(_ raw: String, directory: URL = defaultDirectory) throws {
@@ -201,6 +245,179 @@ enum CloudConfigStore {
         } catch {
             failures.append("CloudConfig 原子写测试异常：\(error)")
         }
+
+        failures.append(contentsOf: ttyEchoSelfTest())
+        return failures
+    }
+
+    private static func ttyEchoSelfTest() -> [String] {
+        var failures: [String] = []
+        func check(_ ok: Bool, _ name: String) {
+            if !ok { failures.append(name) }
+        }
+
+        var master: Int32 = -1
+        var slave: Int32 = -1
+        var savedIn: Int32 = -1
+        var savedErr: Int32 = -1
+        var errRead: Int32 = -1
+        defer {
+            if savedIn >= 0 {
+                _ = dup2(savedIn, STDIN_FILENO)
+                close(savedIn)
+            }
+            if savedErr >= 0 {
+                _ = dup2(savedErr, STDERR_FILENO)
+                close(savedErr)
+            }
+            if slave >= 0 { close(slave) }
+            if master >= 0 { close(master) }
+            if errRead >= 0 { close(errRead) }
+        }
+
+        guard openpty(&master, &slave, nil, nil, nil) == 0 else {
+            failures.append("openpty 失败，无法验证 TTY 关回显")
+            return failures
+        }
+        savedIn = dup(STDIN_FILENO)
+        guard savedIn >= 0, dup2(slave, STDIN_FILENO) != -1 else {
+            failures.append("dup2 stdin 失败，无法验证 TTY 关回显")
+            return failures
+        }
+        close(slave)
+        slave = -1
+
+        var pipeEnds = [Int32](repeating: 0, count: 2)
+        guard pipe(&pipeEnds) == 0 else {
+            failures.append("pipe 失败，无法验证 TTY stderr 换行")
+            return failures
+        }
+        errRead = pipeEnds[0]
+        let errWrite = pipeEnds[1]
+        savedErr = dup(STDERR_FILENO)
+        guard savedErr >= 0, dup2(errWrite, STDERR_FILENO) != -1 else {
+            close(errWrite)
+            failures.append("dup2 stderr 失败，无法验证 TTY stderr 换行")
+            return failures
+        }
+        close(errWrite)
+        let errFlags = fcntl(errRead, F_GETFL)
+        _ = fcntl(errRead, F_SETFL, errFlags | O_NONBLOCK)
+        let masterFlags = fcntl(master, F_GETFL)
+        _ = fcntl(master, F_SETFL, masterFlags | O_NONBLOCK)
+
+        var cooked = termios()
+        guard tcgetattr(STDIN_FILENO, &cooked) == 0 else {
+            failures.append("无法读取 pty termios")
+            return failures
+        }
+        cooked.c_lflag |= tcflag_t(ECHO | ICANON)
+        cooked.c_iflag |= tcflag_t(ICRNL)
+        guard tcsetattr(STDIN_FILENO, TCSANOW, &cooked) == 0 else {
+            failures.append("无法设置 pty termios")
+            return failures
+        }
+        var savedTerm = termios()
+        guard tcgetattr(STDIN_FILENO, &savedTerm) == 0 else {
+            failures.append("无法回读 pty termios")
+            return failures
+        }
+        check((savedTerm.c_lflag & tcflag_t(ECHO)) != 0, "测试前 TTY 应开启 ECHO")
+
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rslite-tty-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let key = "gsk_abcdefghijklmnopqrstuvwxyz012345"
+
+        func drain(_ fd: Int32) -> Data {
+            var buffer = [UInt8](repeating: 0, count: 256)
+            var data = Data()
+            while true {
+                let count = Darwin.read(fd, &buffer, buffer.count)
+                if count > 0 {
+                    data.append(buffer, count: count)
+                    continue
+                }
+                break
+            }
+            return data
+        }
+
+        func flagsMatch(_ term: termios) -> Bool {
+            term.c_iflag == savedTerm.c_iflag
+                && term.c_oflag == savedTerm.c_oflag
+                && term.c_cflag == savedTerm.c_cflag
+                && term.c_lflag == savedTerm.c_lflag
+        }
+
+        func exercise(line: String) -> Error? {
+            final class Outcome: @unchecked Sendable {
+                private let lock = NSLock()
+                private var error: Error?
+                func set(_ error: Error?) { lock.withLockVoid { self.error = error } }
+                func get() -> Error? { lock.withLockValue { error } }
+            }
+            let outcome = Outcome()
+            let done = DispatchSemaphore(value: 0)
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    try readLineFromStdinAndWriteKey(directory: dir)
+                    outcome.set(nil)
+                } catch {
+                    outcome.set(error)
+                }
+                done.signal()
+            }
+
+            let deadline = Date().addingTimeInterval(1)
+            var sawEchoOff = false
+            while Date() < deadline {
+                var nowTerm = termios()
+                if tcgetattr(STDIN_FILENO, &nowTerm) == 0, (nowTerm.c_lflag & tcflag_t(ECHO)) == 0 {
+                    sawEchoOff = true
+                    break
+                }
+                Thread.sleep(forTimeInterval: 0.002)
+            }
+            check(sawEchoOff, "TTY 读取期间应关闭 ECHO")
+            _ = drain(master)
+
+            let payload = Array((line + "\n").utf8)
+            let wrote = payload.withUnsafeBytes { raw -> Int in
+                guard let base = raw.baseAddress else { return -1 }
+                return Darwin.write(master, base, raw.count)
+            }
+            check(wrote == payload.count, "向 pty 写入测试行失败")
+            if done.wait(timeout: .now() + 2) == .timedOut {
+                failures.append("TTY 读 key 超时")
+                if master >= 0 {
+                    close(master)
+                    master = -1
+                }
+                _ = done.wait(timeout: .now() + 2)
+            }
+            return outcome.get()
+        }
+
+        let successError = exercise(line: key)
+        check(successError == nil, "TTY 关闭回显后应写入合法 key")
+        check(readKey(from: defaultKeyURL(directory: dir)) == key, "TTY 路径写入的 key 应能读回")
+        let perm = (try? FileManager.default.attributesOfItem(atPath: defaultKeyURL(directory: dir).path)[.posixPermissions] as? NSNumber)?.intValue ?? 0
+        check(perm & 0o777 == 0o600, "TTY 写入的 key 文件权限应为 0600")
+        var after = termios()
+        _ = tcgetattr(STDIN_FILENO, &after)
+        check(flagsMatch(after), "TTY 读完应恢复原终端设置")
+        let echoed = drain(master)
+        check(!String(decoding: echoed, as: UTF8.self).contains("gsk_"), "TTY 读 key 期间不应回显")
+        check(drain(errRead) == Data([0x0A]), "TTY 读完应向 stderr 补一个换行")
+
+        let invalidError = exercise(line: "bad")
+        check(invalidError != nil, "TTY 下无效 key 仍应拒绝")
+        check(readKey(from: defaultKeyURL(directory: dir)) == key, "TTY 下无效 key 不得覆盖已有 key")
+        _ = tcgetattr(STDIN_FILENO, &after)
+        check(flagsMatch(after), "TTY 出错后应恢复原终端设置")
+        check(drain(errRead) == Data([0x0A]), "TTY 出错后仍应向 stderr 补一个换行")
+        _ = drain(master)
 
         return failures
     }
