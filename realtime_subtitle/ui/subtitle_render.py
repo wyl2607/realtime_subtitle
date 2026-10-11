@@ -7,6 +7,29 @@ import time
 import uuid
 from PyQt6.QtCore import Qt
 import realtime_subtitle.config as config
+
+
+def _hex_to_rgb(color):
+    body = (color or "").strip()
+    if body.startswith("#"):
+        body = body[1:]
+    if len(body) == 3:
+        body = "".join(c * 2 for c in body)
+    if len(body) != 6:
+        return None
+    try:
+        return tuple(int(body[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return None
+
+
+def _dim_color(color, factor=0.60):
+    rgb = _hex_to_rgb(color)
+    if rgb is None:
+        return color
+    return "#" + "".join(f"{round(channel * factor):02x}" for channel in rgb)
+
+
 class LiveTextRenderMixin:
 
     def update_live(self, committed, unstable):
@@ -135,15 +158,42 @@ class LiveTextRenderMixin:
             return text[:config.MAX_SUBTITLE_LENGTH] + "..."
         return text
 
-    def _pair_html(self, german, chinese):
+    def _pair_html(self, german, chinese, *, dim=False, top_gap=False):
         """一条已完成句对的富文本块"""
         lines = []
+        opacity = 0.60 if dim else 1.0
+        source_size = round(config.FONT_SIZE * 0.86)
+        source_color = getattr(config, "TEXT_COLOR", "#F0F0F0")
+        target_color = getattr(config, "CHINESE_TEXT_COLOR", "#FFE894")
+        if dim:
+            source_color = _dim_color(source_color, opacity)
+            target_color = _dim_color(target_color, opacity)
         if german and getattr(config, "SHOW_BILINGUAL", True):
-            lines.append(html.escape(self._clip(german)))
+            lines.append(
+                f'<span style="color:{source_color};font-size:{source_size}px">'
+                f'{html.escape(self._clip(german))}</span>'
+            )
         if chinese:
-            color = getattr(config, "CHINESE_TEXT_COLOR", "#c8c8c8")
-            lines.append(f'<span style="color:{color}">{html.escape(self._clip(chinese))}</span>')
-        return "<br>".join(lines)
+            lines.append(
+                f'<span style="color:{target_color};font-size:{config.FONT_SIZE}px">'
+                f'{html.escape(self._clip(chinese))}</span>'
+            )
+        if not lines:
+            return ""
+        gap = "margin-top:0.45em;" if top_gap else ""
+        opacity_style = f"opacity:{opacity:.2f};" if dim else ""
+        return f'<div style="{gap}{opacity_style}">' + "<br>".join(lines) + "</div>"
+
+    @staticmethod
+    def _join_render_blocks(pair_blocks, fixed_blocks):
+        parts = []
+        if pair_blocks:
+            parts.append("".join(pair_blocks))
+        if fixed_blocks:
+            if parts:
+                parts.append("<br>")
+            parts.append("<br>".join(fixed_blocks))
+        return "".join(parts)
 
     def _live_block_html(self):
         """live行的富文本块：德语（白+灰色未稳定尾部）+ 草稿中文。
@@ -226,20 +276,31 @@ class LiveTextRenderMixin:
         # 热路径上（on_partial → _update_draft → _render）。
         # 结果与"全构造再取末尾 MAX 条非空"完全等价：这里同样跳过空块继续往回找
         keep = max(1, int(getattr(config, "MAX_SENTENCE_PAIRS", 20)))
-        pair_blocks = []
+        pair_items = []
         for item in reversed(self.sentence_pairs):
             g, c = item[0], item[1]
             block = self._pair_html(g, c)
             if not block:
                 continue
-            pair_blocks.append(block)
-            if len(pair_blocks) >= keep:
+            pair_items.append((g, c))
+            if len(pair_items) >= keep:
                 break
-        pair_blocks.reverse()
-        cap = len(pair_blocks)
+        pair_items.reverse()
+        cap = len(pair_items)
+
+        def pair_blocks_for(count):
+            selected = pair_items[len(pair_items) - count:]
+            return [
+                self._pair_html(
+                    g, c,
+                    dim=(idx < len(selected) - 1),
+                    top_gap=(idx > 0),
+                )
+                for idx, (g, c) in enumerate(selected)
+            ]
 
         def fits(count):
-            doc.setHtml("<br>".join(pair_blocks[len(pair_blocks) - count:] + fixed))
+            doc.setHtml(self._join_render_blocks(pair_blocks_for(count), fixed))
             return doc.size().height() <= avail_h
 
         # 二分找能装下的最多句对数（fits随count单调递减；每次渲染最多
@@ -257,11 +318,11 @@ class LiveTextRenderMixin:
                 else:
                     hi = mid - 1
 
-        blocks = (pair_blocks[len(pair_blocks) - shown:] if shown else []) + fixed
-        if not blocks:
+        pair_blocks = pair_blocks_for(shown) if shown else []
+        if not pair_blocks and not fixed:
             return  # 什么都没有就保持现状（避免闪空白）
 
-        self._last_html = "<br>".join(blocks)
+        self._last_html = self._join_render_blocks(pair_blocks, fixed)
         self.window.setText(self._last_html)
         self.window.show()
 
