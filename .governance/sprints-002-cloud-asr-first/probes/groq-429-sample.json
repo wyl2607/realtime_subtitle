@@ -1,0 +1,68 @@
+{
+  "captured": true,
+  "http_status": 429,
+  "headers": {
+    "Date": "Sun, 11 Oct 2026 09:21:20 GMT",
+    "Content-Type": "application/json",
+    "Content-Length": "368",
+    "Connection": "close",
+    "Cache-Control": "private, max-age=0, no-store, no-cache, must-revalidate",
+    "retry-after": "3",
+    "Server": "cloudflare",
+    "vary": "Origin",
+    "x-groq-region": "fra",
+    "x-ratelimit-limit-requests": "2000",
+    "x-ratelimit-remaining-requests": "1980",
+    "x-ratelimit-reset-requests": "14m24s",
+    "x-request-id": "req_01m4n48j2de0zts6a1fm51ddjc",
+    "via": "1.1 google",
+    "cf-cache-status": "DYNAMIC",
+    "set-cookie": "__cf_bm=lcH.JZXa5Z6jkG.2Ts4EL0Lednxt2ARAJOoATm7cQ0c-1791710480.4453278-1.0.1.1-..iWHcOtGzn1j5b.VtqCYomhyY4JnqIm0DViCtfKCBSMMXEQTt0OCRNggj94oJ4XC13.GjnsBpM92S42FRNyUUs0iNraavh1y0Eyww6lXb_lQPAMM3NwLoUygLCHoNfa; HttpOnly; SameSite=None; Secure; Path=/; Domain=groq.com; Expires=Sun, 11 Oct 2026 09:51:20 GMT",
+    "Strict-Transport-Security": "max-age=15552000",
+    "CF-RAY": "a48ccb46cf97bb71-FRA",
+    "alt-svc": "h3=\":443\"; ma=86400"
+  },
+  "body_redacted": "{\"error\":{\"message\":\"Rate limit reached for model `whisper-large-v3` in organization `org_01m4h145hgedhbnvmws6pzqzjw` service tier `on_demand` on requests per minute (RPM): Limit 20, Used 20, Requested 1. Please try again in 3s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing\",\"type\":\"requests\",\"code\":\"rate_limit_exceeded\"}}\n",
+  "has_retry_after": true,
+  "retry_after": "3",
+  "x_ratelimit": {
+    "x-ratelimit-limit-requests": "2000",
+    "x-ratelimit-remaining-requests": "1980",
+    "x-ratelimit-reset-requests": "14m24s"
+  },
+  "audio_header_names": [],
+  "reset_guesses": [
+    {
+      "header": "retry-after",
+      "raw": "3",
+      "seconds": 3.0,
+      "guess": "insufficient"
+    },
+    {
+      "header": "x-ratelimit-reset-requests",
+      "raw": "14m24s",
+      "seconds": 864.0,
+      "guess": "insufficient"
+    }
+  ],
+  "request_window_guess": "insufficient",
+  "timing": {
+    "first_request_unix": 1791710479.9184902,
+    "response_unix": 1791710480.474932,
+    "elapsed_s": 0.556,
+    "unix_mod_60": 20.475,
+    "unix_mod_3600": 1280.475
+  },
+  "requests": {
+    "sent": 24,
+    "status_counts": {
+      "200": 20,
+      "429": 4
+    },
+    "stopped_on_401": false
+  },
+  "audio_s": 1.0,
+  "billed_s_each_local": 10,
+  "billed_s_if_all_sent": 240,
+  "note": "request_window_guess 只解释请求次数那条 reset（先看 x-ratelimit-reset-requests，没有再看 retry-after）。音频秒窗口看 audio_header_names / 名字里带 reset 的另一条，不要把请求次数的猜测抄过去。启发式容差 2 秒，不是裁决。这一轮打满的是每分钟请求数，不是每小时音频秒。"
+}
