@@ -1,11 +1,58 @@
 import AppKit
 import Foundation
 
+private final class OverlayPanel: NSPanel {
+    var arrowKeyHandler: ((NSEvent) -> Bool)?
+
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+
+    override func keyDown(with event: NSEvent) {
+        if arrowKeyHandler?(event) == true { return }
+        super.keyDown(with: event)
+    }
+}
+
+/// 内容区盖住文字。NSTextField 的 mouseDownCanMoveWindow 恒为 false，按在字幕上拖不动。
+/// 四边留给系统缩放：hitTest 返回 nil 后，事件才会落到无边框窗口的边缘缩放上。
+private final class OverlayRootView: NSVisualEffectView {
+    var resizeInset: CGFloat = 5
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !isHidden, alphaValue > 0 else { return nil }
+        if window?.ignoresMouseEvents == true { return nil }
+        let local = convert(point, from: superview)
+        guard bounds.contains(local) else { return nil }
+        if local.x <= resizeInset || local.y <= resizeInset ||
+            local.x >= bounds.width - resizeInset || local.y >= bounds.height - resizeInset {
+            return nil
+        }
+        return super.hitTest(point)
+    }
+}
+
+private final class OverlayDragSurfaceView: NSView {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !isHidden, alphaValue > 0, window?.ignoresMouseEvents != true else { return nil }
+        let local = convert(point, from: superview)
+        return bounds.contains(local) ? self : nil
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let window, !window.ignoresMouseEvents else { return }
+        window.performDrag(with: event)
+        window.makeKey()
+    }
+}
+
 @MainActor
 final class OverlayController: NSObject {
-    private let panel: NSPanel
-    private let root: NSVisualEffectView
+    private let panel: OverlayPanel
+    private let root: OverlayRootView
     private let tint: NSView
+    private let dragSurface: OverlayDragSurfaceView
     private let stack = NSStackView()
     private let volatileLabel = NSTextField(labelWithString: "")
     /// 当前识别层。和草稿分开，避免 setStatus/setVolatile 把「云端·Groq」盖掉。
@@ -24,6 +71,9 @@ final class OverlayController: NSObject {
     private var style: OverlayStyle
     private var isPaused = false
     private var originSaveTask: Task<Void, Never>?
+    private var isApplyingProgrammaticFrame = false
+    /// 用户开始拖边时的尺寸。松手时只把真正拉过的边写进 style，避免拉宽把高度误存成用户高度。
+    private var liveResizeStart: NSSize?
     private let onPauseChanged: (Bool) -> Void
     private let onQuit: () -> Void
 
@@ -34,19 +84,23 @@ final class OverlayController: NSObject {
         self.style = loaded
 
         let frame = Self.initialFrame(for: loaded)
-        panel = NSPanel(
+        panel = OverlayPanel(
             contentRect: frame,
-            styleMask: [.borderless, .nonactivatingPanel],
+            styleMask: [.borderless, .nonactivatingPanel, .resizable],
             backing: .buffered,
             defer: false
         )
-        root = NSVisualEffectView(frame: NSRect(origin: .zero, size: frame.size))
+        root = OverlayRootView(frame: NSRect(origin: .zero, size: frame.size))
         tint = NSView(frame: NSRect(origin: .zero, size: frame.size))
+        dragSurface = OverlayDragSurfaceView(frame: NSRect(origin: .zero, size: frame.size))
 
         super.init()
         configurePanel()
         configureStatusItem()
         panel.delegate = self
+        panel.arrowKeyHandler = { [weak self] event in
+            self?.handleArrowKey(event) ?? false
+        }
         applyChrome()
         applyTypography()
         render()
@@ -121,32 +175,44 @@ final class OverlayController: NSObject {
         let main = NSScreen.main?.visibleFrame ?? fallback
         let anchor = CGPoint(x: style.originX ?? main.midX, y: style.originY ?? main.midY)
         let screen = OverlayStyle.preferredVisibleFrame(anchor: anchor, frames: frames, fallback: main)
-        let width = OverlayStyle.windowWidth(for: style.shape, visibleWidth: screen.width)
-        let height: CGFloat = 220
+        let defaultWidth = OverlayStyle.windowWidth(for: style.shape, visibleWidth: screen.width)
+        let width: CGFloat
+        if style.shape == .strip {
+            width = defaultWidth
+        } else if let savedWidth = style.width {
+            width = CGFloat(savedWidth)
+        } else {
+            width = defaultWidth
+        }
+        let height = CGFloat(style.height ?? 220)
         let origin: CGPoint
         if let x = style.originX, let y = style.originY {
-            origin = OverlayStyle.clampedOrigin(
-                x: x,
-                y: y,
-                windowWidth: width,
-                windowHeight: height,
-                visibleFrames: frames.isEmpty ? [screen] : frames
-            )
+            origin = CGPoint(x: x, y: y)
         } else if style.shape == .strip {
             origin = CGPoint(x: screen.minX + 20, y: screen.minY)
         } else {
             origin = CGPoint(x: screen.midX - width / 2, y: screen.minY + 70)
         }
-        return NSRect(origin: origin, size: NSSize(width: width, height: height))
+        return OverlayStyle.clampedFrame(
+            x: origin.x,
+            y: origin.y,
+            windowWidth: width,
+            windowHeight: height,
+            visibleFrames: frames.isEmpty ? [screen] : frames
+        )
     }
 
     private func configurePanel() {
         panel.level = .statusBar
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.becomesKeyOnlyIfNeeded = true
+        // 菜单栏应用一点标题栏就会 deactivate；默认 hidesOnDeactivate 会把字幕面板收掉。
+        panel.hidesOnDeactivate = false
         panel.isMovableByWindowBackground = true
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = true
+        updateSizeLimits(for: panel.frame)
 
         root.autoresizingMask = [.width, .height]
         root.material = .hudWindow
@@ -178,6 +244,8 @@ final class OverlayController: NSObject {
         tierLabel.preferredMaxLayoutWidth = textWidth
 
         root.addSubview(stack)
+        dragSurface.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(dragSurface)
         panel.contentView = root
 
         NSLayoutConstraint.activate([
@@ -185,6 +253,10 @@ final class OverlayController: NSObject {
             stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -22),
             stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 18),
             stack.bottomAnchor.constraint(lessThanOrEqualTo: root.bottomAnchor, constant: -18),
+            dragSurface.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            dragSurface.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            dragSurface.topAnchor.constraint(equalTo: root.topAnchor),
+            dragSurface.bottomAnchor.constraint(equalTo: root.bottomAnchor),
         ])
     }
 
@@ -303,26 +375,18 @@ final class OverlayController: NSObject {
     private func fitHeight() {
         updateWrapWidths()
         stack.layoutSubtreeIfNeeded()
-        let height = ceil(stack.fittingSize.height) + 36
+        let contentHeight = ceil(stack.fittingSize.height) + 36
+        let userHeight = style.height.map { CGFloat($0) } ?? 0
         var frame = panel.frame
-        frame.size.height = max(height, 1)
-        let screens = NSScreen.screens.map(\.visibleFrame)
-        if !screens.isEmpty {
-            let clamped = OverlayStyle.clampedOrigin(
-                x: frame.origin.x,
-                y: frame.origin.y,
-                windowWidth: frame.size.width,
-                windowHeight: frame.size.height,
-                visibleFrames: screens
-            )
-            frame.origin = clamped
-        }
-        if abs(panel.frame.size.height - frame.size.height) <= 1,
+        frame.size.height = max(contentHeight, userHeight, OverlayStyle.minimumWindowSize.height)
+        frame = clampedFrame(frame)
+        if abs(panel.frame.size.width - frame.size.width) <= 1,
+           abs(panel.frame.size.height - frame.size.height) <= 1,
            abs(panel.frame.origin.x - frame.origin.x) < 0.5,
            abs(panel.frame.origin.y - frame.origin.y) < 0.5 {
             return
         }
-        panel.setFrame(frame, display: true)
+        setPanelFrame(frame, display: true)
     }
 
     // NSTextField 在 StackView 里不给最大宽度就不会折行
@@ -399,22 +463,88 @@ final class OverlayController: NSObject {
     private func applyGeometry(stickStripToBottom: Bool) {
         let screen = screenForPanel()
         var frame = panel.frame
-        frame.size.width = OverlayStyle.windowWidth(for: style.shape, visibleWidth: screen.width)
+        if style.shape == .strip {
+            frame.size.width = OverlayStyle.windowWidth(for: style.shape, visibleWidth: screen.width)
+            style.width = nil
+        } else if let savedWidth = style.width {
+            frame.size.width = CGFloat(savedWidth)
+        } else {
+            frame.size.width = OverlayStyle.windowWidth(for: style.shape, visibleWidth: screen.width)
+        }
         if style.shape == .strip && stickStripToBottom {
             frame.origin.x = screen.minX + 20
             frame.origin.y = screen.minY
         }
+        frame = clampedFrame(frame, fallback: screen)
+        updateSizeLimits(for: frame)
+        setPanelFrame(frame, display: true)
+        updateWrapWidths()
+    }
+
+    private func clampedFrame(_ frame: NSRect, fallback: CGRect? = nil) -> NSRect {
+        let screen = fallback ?? screenForPanel()
         let screens = NSScreen.screens.map(\.visibleFrame)
-        let clamped = OverlayStyle.clampedOrigin(
+        return OverlayStyle.clampedFrame(
             x: frame.origin.x,
             y: frame.origin.y,
             windowWidth: frame.size.width,
             windowHeight: frame.size.height,
             visibleFrames: screens.isEmpty ? [screen] : screens
         )
-        frame.origin = clamped
-        panel.setFrame(frame, display: true)
-        updateWrapWidths()
+    }
+
+    private func updateSizeLimits(for frame: NSRect) {
+        let screen = OverlayStyle.preferredVisibleFrame(
+            anchor: CGPoint(x: frame.midX, y: frame.midY),
+            frames: NSScreen.screens.map(\.visibleFrame),
+            fallback: NSScreen.main?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1280, height: 800)
+        )
+        let minSize = OverlayStyle.minimumWindowSize
+        let maxHeight = max(minSize.height, screen.height)
+        let newMin: NSSize
+        let newMax: NSSize
+        if style.shape == .strip {
+            let locked = lockedStripWidth(on: screen)
+            newMin = NSSize(width: locked, height: minSize.height)
+            newMax = NSSize(width: locked, height: maxHeight)
+        } else {
+            newMin = minSize
+            newMax = NSSize(width: max(minSize.width, screen.width), height: maxHeight)
+        }
+        guard panel.minSize != newMin || panel.maxSize != newMax else { return }
+        let wasProgrammatic = isApplyingProgrammaticFrame
+        isApplyingProgrammaticFrame = true
+        panel.minSize = newMin
+        panel.maxSize = newMax
+        isApplyingProgrammaticFrame = wasProgrammatic
+    }
+
+    /// 贴底横条的目标宽：可见宽 − 40，但不小于最小宽，也不宽过这块屏幕。
+    private func lockedStripWidth(on screen: CGRect) -> CGFloat {
+        let natural = OverlayStyle.windowWidth(for: .strip, visibleWidth: screen.width)
+        let floor = min(OverlayStyle.minimumWindowSize.width, max(screen.width, 1))
+        return min(max(natural, floor), max(screen.width, 1))
+    }
+
+    /// 贴底横条宽度锁死，不写进 style.width。和当前帧比较夹回后的结果，避免来回 setFrame。
+    private func syncStripWidthIfNeeded() {
+        guard style.shape == .strip else { return }
+        let screen = screenForPanel()
+        var frame = panel.frame
+        frame.size.width = lockedStripWidth(on: screen)
+        frame = clampedFrame(frame, fallback: screen)
+        if abs(panel.frame.width - frame.width) <= 1,
+           abs(panel.frame.origin.x - frame.origin.x) < 0.5,
+           abs(panel.frame.origin.y - frame.origin.y) < 0.5 {
+            return
+        }
+        setPanelFrame(frame, display: true)
+    }
+
+    private func setPanelFrame(_ frame: NSRect, display: Bool) {
+        isApplyingProgrammaticFrame = true
+        panel.setFrame(frame, display: display)
+        isApplyingProgrammaticFrame = false
     }
 
     private func screenForPanel() -> CGRect {
@@ -443,13 +573,7 @@ final class OverlayController: NSObject {
         try? OverlayStyleStore.save(style)
     }
 
-    private func rememberOrigin() {
-        let origin = panel.frame.origin
-        let x = Double(origin.x)
-        let y = Double(origin.y)
-        if style.originX == x, style.originY == y { return }
-        style.originX = x
-        style.originY = y
+    private func scheduleStyleSave() {
         originSaveTask?.cancel()
         originSaveTask = Task { @MainActor [weak self] in
             do {
@@ -460,6 +584,61 @@ final class OverlayController: NSObject {
             guard let self else { return }
             try? OverlayStyleStore.save(self.style)
         }
+    }
+
+    private func rememberOrigin() {
+        let origin = panel.frame.origin
+        let x = Double(origin.x)
+        let y = Double(origin.y)
+        if style.originX == x, style.originY == y { return }
+        style.originX = x
+        style.originY = y
+        scheduleStyleSave()
+    }
+
+    /// 只记录相对手势起点真正变过的边。横条不写宽度。高度记用户拉到的值，显示时再和内容取较大者。
+    private func rememberSize(changedFrom start: NSSize) {
+        var changed = false
+        if style.shape == .strip {
+            if style.width != nil {
+                style.width = nil
+                changed = true
+            }
+        } else if abs(panel.frame.width - start.width) > 1 {
+            style.width = Double(panel.frame.width)
+            changed = true
+        }
+        if abs(panel.frame.height - start.height) > 1 {
+            style.height = Double(panel.frame.height)
+            changed = true
+        }
+        if changed {
+            scheduleStyleSave()
+        }
+    }
+
+    private func handleArrowKey(_ event: NSEvent) -> Bool {
+        let blocked: NSEvent.ModifierFlags = [.command, .option, .control]
+        if !event.modifierFlags.intersection(blocked).isEmpty { return false }
+        let delta: CGFloat = event.modifierFlags.contains(.shift) ? 50 : 10
+        var frame = panel.frame
+        switch event.keyCode {
+        case 123:
+            frame.origin.x -= delta
+        case 124:
+            frame.origin.x += delta
+        case 125:
+            frame.origin.y -= delta
+        case 126:
+            frame.origin.y += delta
+        default:
+            return false
+        }
+        frame = clampedFrame(frame)
+        setPanelFrame(frame, display: true)
+        syncStripWidthIfNeeded()
+        rememberOrigin()
+        return true
     }
 
     @objc private func chooseFontSize(_ sender: NSMenuItem) {
@@ -565,7 +744,34 @@ final class OverlayController: NSObject {
 extension OverlayController: NSWindowDelegate {
     func windowDidMove(_ notification: Notification) {
         guard (notification.object as? NSWindow) === panel else { return }
+        updateSizeLimits(for: panel.frame)
+        if !isApplyingProgrammaticFrame {
+            syncStripWidthIfNeeded()
+        }
         rememberOrigin()
+    }
+
+    func windowWillStartLiveResize(_ notification: Notification) {
+        guard (notification.object as? NSWindow) === panel else { return }
+        liveResizeStart = panel.frame.size
+    }
+
+    func windowDidResize(_ notification: Notification) {
+        guard (notification.object as? NSWindow) === panel else { return }
+        updateSizeLimits(for: panel.frame)
+        updateWrapWidths()
+        // 松手后再记尺寸并 fitHeight。这里如果先把高度抬回内容高度，用户拉高的值会被盖掉。
+    }
+
+    func windowDidEndLiveResize(_ notification: Notification) {
+        guard (notification.object as? NSWindow) === panel else { return }
+        let start = liveResizeStart
+        liveResizeStart = nil
+        if let start {
+            rememberSize(changedFrom: start)
+        }
+        syncStripWidthIfNeeded()
+        fitHeight()
     }
 }
 
