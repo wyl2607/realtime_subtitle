@@ -40,3 +40,6 @@
 {"ts":"2026-10-11T18:36:35+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-006B","cr":"CR-006B","phase":"review","action":"repair","agent_role":"repairer","round":1,"notes":"lane-chain grok try1"}
 {"ts":"2026-10-11T18:36:35+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-006B","cr":"CR-006B","phase":"review","action":"round-2-recheck","agent_role":"coordinator","round":2,"notes":"clean + integration scan fix"}
 {"ts":"2026-10-11T18:36:35+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-006","phase":"delivery","action":"synced","agent_role":"coordinator","notes":"parent done; full pytest 1161 passed"}
+{"ts":"2026-10-11T18:41:50+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-005","cr":"CR-005","phase":"review","action":"repair","agent_role":"repairer","round":1,"notes":"lane-chain grok try1"}
+{"ts":"2026-10-11T18:41:50+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-005","cr":"CR-005","phase":"review","action":"round-2-recheck","agent_role":"coordinator","round":2,"notes":"clean; lock order checked"}
+{"ts":"2026-10-11T18:41:50+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-005","cr":"CR-005","phase":"delivery","action":"synced","agent_role":"coordinator","notes":"merged; full pytest 1173 passed"}

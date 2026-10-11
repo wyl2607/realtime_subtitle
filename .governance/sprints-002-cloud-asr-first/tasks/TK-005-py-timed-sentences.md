@@ -44,3 +44,4 @@ codex（high）。
 ## 状态历史
 - 2026-10-11 CST: planned（/sdd-rfc）
 - 2026-10-11 16:38 CST: executing（批次 1）
+- 2026-10-11 18:41 CST: done（CR-005 resolved，2 轮）

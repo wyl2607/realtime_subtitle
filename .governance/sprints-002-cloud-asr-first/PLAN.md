@@ -29,7 +29,7 @@ v3.2.0：填了 Groq key 的 Mac（rslite）和 Windows 桌面客户端都能**�
 - [x] TK-002 P9 夹具 + 云端状态机 + Provider 抽象（双端读夹具）
 - [x] TK-003 rslite 云端：CloudClient + QuotaLedger + key/开关
 - [ ] TK-004 rslite CloudSegmenter + 分级路由接入 HybridEngine
-- [ ] TK-005 Windows 客户端句子带时间 + 样本时钟连续性
+- [x] TK-005 Windows 客户端句子带时间 + 样本时钟连续性
 - [x] TK-006 Python remote/：node_client + router + line_store + cloud_client + quota
 - [ ] TK-007 Windows 面板 + 接线 + `--client` 下发
 - [ ] TK-008 文档 + v3.2.0 + Mac/Windows 端到端验收
