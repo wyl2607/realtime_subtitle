@@ -14,7 +14,7 @@
 | TK-006 | Python remote/：node_client + router + line_store + cloud_client + quota | done | TK-002, TK-005 | realtime_subtitle/remote/** (除 routing_rules.py), requirements.txt, tests/test_remote_*.py | default,security | 子 TK：TK-006A（agy）/ TK-006B（grok）；TK-005 只在 TK-007 接线时需要，故提前开工 |
 | TK-006A | remote/ node_client + router + line_store | done | TK-002 | realtime_subtitle/remote/{node_client,router,line_store}.py, requirements.txt, tests/test_remote_{node_client,router,line_store}.py | default,security | agy gemini-3.1-pro |
 | TK-006B | remote/ cloud_client + quota + cloud_segmenter | done | TK-002, TK-001(429 结论) | realtime_subtitle/remote/{cloud_client,quota,cloud_segmenter}.py, tests/test_remote_{cloud_client,quota,cloud_segmenter}.py | default,security | grok |
-| TK-007 | Windows 面板 + 接线 + --client 下发 | executing | TK-006 | realtime_subtitle/ui/settings_window.py, realtime_subtitle/app.py, scripts/node/**, scripts/windows/node_setup.ps1, tests/test_settings_*.py, tests/test_install_node*.py | security | key 写入/ACL/下发 token 由 Coordinator 自审 |
+| TK-007 | Windows 面板 + 接线 + --client 下发 | done | TK-006 | realtime_subtitle/ui/settings_window.py, realtime_subtitle/app.py, scripts/node/**, scripts/windows/node_setup.ps1, tests/test_settings_*.py, tests/test_install_node*.py | security | key 写入/ACL/下发 token 由 Coordinator 自审 |
 | TK-008 | 文档 + v3.2.0 + 端到端验收 | executing | TK-004, TK-007 | README*.md, CLAUDE.md, docs/**, version.py, .governance/sprints-002-cloud-asr-first/acceptance/** | default,security | 文档含隐私承诺改写（需 security lens）；验收 Coordinator 自留 |
 
 ## 字段说明
