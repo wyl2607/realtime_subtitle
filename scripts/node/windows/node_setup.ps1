@@ -109,6 +109,13 @@ switch ($Action) {
         Lock-Down $tmp
         Move-Item -Force $tmp $TokenFile
         Lock-Down $TokenFile
+        # Copy, do not move: legacy clients keep reading $TokenFile.
+        $devDir = Join-Path $State 'tokens'
+        if (-not (Test-Path $devDir)) { New-Item -ItemType Directory -Path $devDir | Out-Null }
+        Lock-Down $devDir
+        $devCopy = Join-Path $devDir 'default.token'
+        Copy-Item -Force $TokenFile $devCopy
+        Lock-Down $devCopy
         "TOKEN=written"
     }
     'Build' {

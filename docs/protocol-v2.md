@@ -28,10 +28,12 @@
 | `asr` | object | `{model, backend, rtf}`；默认 `whisper-large-v3-turbo` / `mlx` / `null`（`info.py:39`），之后读 `asr_state.json` |
 | `translator` | str | `apple` 或 `ollama:<model>`（正则 `info.py:42`）；默认 `apple` |
 | `translator_ok` | bool | 翻译器当前是否可用。`ollama:<model>` 时 gateway 探测本机 `127.0.0.1:11434/api/version`（0.5s 超时、10s 缓存、不走系统代理），200 且 JSON 含 `version` 才为 `true`；其它翻译器恒为 `true`。只暴露布尔值，不暴露 URL 或错误文本 |
-| `busy` | bool | 当前是否有会话（`gateway.py:863`） |
+| `busy` | bool | 当前会话数是否达到容量（`sessions >= capacity`，旧客户端兼容；`gateway.py:1165`） |
+| `sessions` | int | 当前正在进行的会话数（`gateway.py:1163`） |
+| `capacity` | int | 节点配置的会话容量，缺省 2，范围 1–4（`gateway.py:85-87, 1164`） |
 | `on_ac` | bool | `pmset -g batt` 首行含 `AC Power` 为真；探测不出按 `False`（`info.py:71-78, 97-102`） |
 | `in_use` | bool | `HIDIdleTime < 60s`（`IN_USE_IDLE_THRESHOLD_S = 60.0`，`info.py:29`）；探测不出按 `True`。**只给布尔值，不给原始空闲秒数** |
-| `worker` | str | `cold`（无存活 worker）或 `warm`（`gateway.py:326-328`） |
+| `worker` | str | `cold`（无存活 worker）或 `warm`（`gateway.py:531-532`） |
 
 「探测不出来」一律往对路由保守的方向取（`in_use=True`、`on_ac=False`）。`rtf` 由 worker 在会话结束时滑动更新：
 `new = 0.7*old + 0.3*session`，会话被识别音频不足 5 秒不更新（`worker.py:77-84, 334-336, 359-360`）。
@@ -94,39 +96,43 @@ gateway 只向客户端放行这五种事件（`_CLIENT_EVENTS`，`gateway.py:10
 | 1008 | hello 超时/缺失/版本不对/语言不合法；重复 hello；控制消息队列溢出 | `gateway.py:682, 686, 897, 902, 911, 914, 924` |
 | 1009 | 单帧消息超过 64KB（`MAX_MESSAGE_BYTES = 64 * 1024`，协议层直接拒绝） | `gateway.py:58, 741` |
 | 1011 | worker 异常退出（配合上表 status） | `gateway.py:597` |
-| 1013 | 忙（已有会话）。**判断在读 hello 之前**，后来者立即被拒 | `gateway.py:880-883` |
+| 1013 | 忙（会话数达到容量 `sessions >= capacity`）。**判断在读 hello 之前**，超额连接立即被拒 | `gateway.py:1188-1191` |
 
-同时只服务一个会话。心跳：每 10s ping，10s 无应答判断开，再加 2s 的 close 等待（`PING_INTERVAL_S`/`PING_TIMEOUT_S`/`CLOSE_TIMEOUT_S`，`gateway.py:61-65`）。
+一个 worker 进程服务多个会话（容量 `capacity`，缺省 2，节点配置 `node_config.json` 的 `max_sessions` 可配 1–4）。各会话共享同一个 worker 进程中的模型与单线程执行器，队列按会话轮转公平取活（FairQueue，不让一个会话的积压饿死另一个）；会话之间状态与事件完全隔离，客户端协议不含 `sid`。心跳：每 10s ping，10s 无应答判断开，再加 2s 的 close 等待（`PING_INTERVAL_S`/`PING_TIMEOUT_S`/`CLOSE_TIMEOUT_S`，`gateway.py:67-71`）。
 
 ### 资源上限（S4）
 
 - 音频：200 帧，满了丢最旧并换成静音占位（见 `audio_dropped`）。
-- 控制消息：上限 64（`CTL_QUEUE_MAX`，`gateway.py:73`）；紧挨着的 `flush` 合并；仍超限则丢最旧的 `flush`；`drain` 永不丢，全是 `drain`/`hello` 导致无法再收时断开 1008（`gateway.py:202-205, 247-267`）。
+- 控制消息：上限 64（`CTL_QUEUE_MAX`，`gateway.py:79`）；紧挨着的 `flush` 合并；仍超限则丢最旧的 `flush`；`drain` 永不丢，全是 `drain`/`hello` 导致无法再收时断开 1008（`gateway.py:445-488`）。
 
 ## P3 gateway ↔ worker（本机管道）
 
-worker 命令行：`python -m realtime_subtitle.node.worker`（`WORKER_ARGV`，`gateway.py:83`）。
+worker 命令行：`python -m realtime_subtitle.node.worker`（`WORKER_ARGV`，`gateway.py:99`）。
 
-**上行（gateway 写 worker 的 stdin）**两种消息交错，靠首字节区分（`worker.py:7-12, 174-197`）：
+**上行（gateway 写 worker 的 stdin）**两种消息交错，靠首字节区分（`worker.py:7-17, 298-333`）：
 
-- 控制消息：一行一个 JSON（`hello`/`flush`/`drain`），以 `{`（0x7B）开头，单行 ≤ `MAX_LINE = 4096`。
-- 音频帧：4 字节大端长度 + s16le PCM，长度 ≤ `MAX_FRAME = 64KB`，且为偶数；合法长度的大端首字节恒为 0x00。
-- 其它首字节、超长行、非 JSON、非对象、会话（hello）之前来的音频/控制、未知控制类型，一律协议错误（退出码 2）。
+- 控制消息：一行一个 JSON（`hello`/`flush`/`drain`/`end`），以 `{`（0x7B）开头，单行 ≤ `MAX_LINE = 4096`。多会话带整数 `sid`；无 `sid` 走单会话兼容（sid 0）。会话结束 gateway 发送 `end` 通知 worker 收口该会话（清分段器/语言/草稿/翻译器、滑动计入 rtf）。
+- 音频帧：
+  - 旧：4 字节大端长度 + s16le PCM，长度 ≤ `MAX_FRAME = 64KB`，且为偶数；大端首字节恒为 0x00，进 sid 0。
+  - 新：首字节 `0x01` + 4 字节大端 `sid` + 4 字节大端长度 + s16le PCM（`gateway.py:583-585`，`worker.py:317-324`）。
+- 其它首字节、超长行、非 JSON、非对象、会话（hello）之前来的音频/控制、未知控制类型，一律协议错误（退出码 2）。未知 sid 的音频或控制丢弃该帧不打死其它会话。
 
-**下行（worker 写 stdout）**：一行一个 JSON 事件，格式同 P2；单行上限 1MB，超限 gateway 杀掉 worker（`gateway.py:85, 403-407`）。stdout 只走协议，`main()` 一开始就把 fd 1/2 指向 `/dev/null`，第三方库的 print 到不了事件流和日志（`worker.py:504-515`）。
+**下行（worker 写 stdout）**：一行一个 JSON 事件，格式同 P2；单行上限 1MB，超限 gateway 杀掉 worker（`gateway.py:101, 626-630`）。stdout 只走协议，`main()` 一开始就把 fd 1/2 指向 `/dev/null`，第三方库的 print 到不了事件流和日志（`worker.py:741-753`）。hello 携带显式 `sid` 时，worker 事件也携带 `sid`；gateway 按 `sid` 路由至对应客户端连接并剥除 `sid` 字段后转发（`gateway.py:659-673`）。
 
-**hello 与 ready 一一对应**：worker 对每条 hello 恰好回一个 ready。保温中的 worker 跨会话复用，gateway 按序号过滤，冷加载中途断开的旧会话遗留的 ready 及其间事件不会交给新会话（`gateway.py:425-447`）。每条 hello 开启新会话：句子 `id` 和 `a0/a1` 从零重算，旧会话遗留的待处理段丢弃，新 hello 之前 gateway 会先收口旧会话的 rtf（`worker.py:17-19, 254-262`）。
+**会话与并发调度**：
+- worker 内每个会话（sid）独立维护分段器、VAD、语言对、翻译器和句子 id；识别与翻译各单线程运行，队列按会话轮转取活（`FairQueue`，`worker.py:118-212`），避免单会话积压饿死其它会话。
+- hello 与 ready 一一对应：worker 对每条 hello 恰好回一个 ready（带 `sid`）。保温中的 worker 跨会话复用。单个会话结束（收到 `end` 或客户端断开）只收口并释放该 sid 的状态与排队任务；最后一个会话结束后才开始 120s 保温计时（`gateway.py:551-565`）。
 
-**退出码**（`worker.py:54-57`）：
+**退出码**（`worker.py:59-63`）：
 
 | 码 | 含义 |
 |---|---|
-| 0 | 正常：stdin 关闭，或收到 SIGTERM（`worker.py:219-222, 535`） |
+| 0 | 正常：stdin 关闭，或收到 SIGTERM（`worker.py:356-359, 756-773`） |
 | 2 | 协议错误 |
 | 3 | 引擎加载失败 |
-| 4 | 内部错误（含工作线程被 BaseException 杀死，`worker.py:550-555`） |
+| 4 | 内部错误（含工作线程被 BaseException 杀死，`worker.py:782-793`） |
 
-**生命周期**（`gateway.py:81-82, 449-475`）：无会话 = 无 worker；合法 hello 到达才 spawn；会话结束后保温 `WORKER_KEEPALIVE_S = 120s`，到期 SIGTERM，`WORKER_KILL_GRACE_S = 3s` 后 SIGKILL。gateway 回收只发 SIGTERM、不关 stdin，所以 worker 在 SIGTERM 处理函数里尽力收口 rtf（限时拿锁 0.5s）后 `os._exit(0)`（`worker.py:519-535`）。
+**生命周期**（`gateway.py:97-98, 538-565, 685-712`）：无会话 = 无 worker；合法 hello 到达才 spawn；最后一个会话结束后保温 `WORKER_KEEPALIVE_S = 120s`，到期 SIGTERM，`WORKER_KILL_GRACE_S = 3s` 后 SIGKILL。gateway 回收只发 SIGTERM、不关 stdin，worker 在 SIGTERM 处理函数里尽力收口活跃会话的 rtf（限时拿锁 0.5s）后 `os._exit(0)`（`worker.py:756-773`）。
 
 ## 与 v1 的差异
 
@@ -137,21 +143,24 @@ v1（`realtime_subtitle/remote/server.py`，已在 TK-006 删除）是外包算�
 | 路径 | `WS /v1` | `WS /v2/session` + `GET /v1/info` |
 | 端口 | 默认 8790（mini2 实际用 8791） | 固定 8791；8790 是 iPhone 采集服务，勿占 |
 | hello 版本 | `v:1` | `v:2` |
-| 进程模型 | 单进程，直接包装 `WhisperQueueTranslator` | gateway（常驻 <50MB）+ worker（按需、保温 120s、可回收） |
+| 进程模型 | 单进程，直接包装 `WhisperQueueTranslator` | gateway（常驻 <50MB）+ worker（按需、保温 120s、多会话复用单进程与模型） |
 | 事件时间 | `t`（服务端流逝秒数），含 `volatile`/`draft` | `final` 带 `a0`/`a1`（按收到样本数计的音频秒数），不发 volatile/draft |
 | `final`/`translation` | 同一回调里连发一对 | 分开：先 `final`，译文就绪后再发 `translation`（`id` 关联），识别延迟不被翻译拖累 |
-| 控制消息 | 仅 hello | 增加 `flush`、`drain`/`drained`（迁移用） |
-| 积压处理 | 无明确上限 | 音频 200 帧、控制 64、worker 段 8/句 64，满了丢最旧并发 `audio_dropped`/`backlog_dropped` |
+| 控制消息 | 仅 hello | 增加 `flush`、`drain`/`drained`（迁移用）、`end`（会话结束收口） |
+| 积压处理 | 无明确上限 | 音频 200 帧、控制 64、worker 段 8/句 64，按会话轮转，满了丢最旧并发 `audio_dropped`/`backlog_dropped` |
 | 错误上报 | 通用 status | 结构化 `status.code`，worker 退出码映射 |
 | 节点发现 | 无 | `GET /v1/info`（P1）供客户端路由 |
 | 部署 | 手工 nohup | `scripts/node/install_node.sh` 装 LaunchAgent `com.realtimesubtitle.node`，失败自动回滚 |
 
 ## 隐私与安全边界
 
-- **只绑 Tailscale**：TCP 监听地址每次启动现取 `tailscale ip -4`，且必须是 `100.64.0.0/10` 的 IPv4，拒绝通配/组播/主机名/带空白的值（`gateway.py:131-175`）；取不到则指数退避重试（1s 起，上限 60s）。调 CLI 时子进程环境追加 `TAILSCALE_BE_CLI=1`（`gateway.py:154`）：App Store 版 Tailscale 在 launchd 这种没有 `SHLVL` 的环境里会按 GUI 启动、往 stdout 打报错且退出码 0（2026-10-09 mini2 实测）。失败日志只记固定原因码 `tcp_bind_failed attempt=N reason=<code>`（`gateway.py:845`），`<code>` ∈ `tailscale_cli_missing` / `tailscale_cli_failed` / `tailscale_cli_timeout` / `tailscale_no_ipv4` / `tailscale_not_ip` / `not_tailscale_range` / `wildcard_or_multicast` / `bind_failed` / `unexpected_error`，不写 CLI 原始输出。`install_node.sh` 第 10 步要求 gateway 进程确实在 `<Tailscale IP>:8791` LISTEN 且无通配监听，否则回滚。
-- **客户端补会话路径**：P6 的 `nodes.json` 里 `url` 只写 `ws://<MagicDNS 名>:8791`（安装脚本即如此写），rslite 连接时路径为空就补 `/v2/session`，`/v1/info` 由同一主机派生。另一路是本机 UDS，目录 0700、socket 0600，目录是 symlink、属主不对、权限不对一律拒绝启动，并逐连接校验对端 uid（`gateway.py:753-754, 772-791, 843-854`）。
-- **token**：至少 32 字符（`MIN_TOKEN_CHARS`）；文件权限含 group/other 位即拒绝（要求 0600）；只能经 `--token-file` 或 `--token-stdin` 传入，不进命令行，避免出现在 `ps` 里；常量时间比较，重复的 `Authorization` 头一律不认；错误信息里不带 token（`gateway.py:146-163, 825-833, 948-963`）。
-- **日志无正文无 token**：gateway 和 worker 都只记事件类型、时长、字节数、帧数、错误码/类名；转录/译文正文、token、hello 字段值都不进日志。websockets 自带的 DEBUG 日志会逐帧打印文本，所以给它单独一个钉在 WARNING 的 logger（`gateway.py:14-16, 49-50`）；worker 的 `_log` 还会把形状不像「代号」的字符串值抹成 `?`，异常只记类名不记消息（`worker.py:25-28, 91-102`）。
+- **只绑 Tailscale**：TCP 监听地址每次启动现取 `tailscale ip -4`，且必须是 `100.64.0.0/10` 的 IPv4，拒绝通配/组播/主机名/带空白的值（`gateway.py:146-192`）；取不到则指数退避重试（1s 起，上限 60s）。调 CLI 时子进程环境追加 `TAILSCALE_BE_CLI=1`（`gateway.py:172`）：App Store 版 Tailscale 在 launchd 这种没有 `SHLVL` 的环境里会按 GUI 启动、往 stdout 打报错且退出码 0（2026-10-09 mini2 实测）。失败日志只记固定原因码 `tcp_bind_failed attempt=N reason=<code>`（`gateway.py:1112`），`<code>` ∈ `tailscale_cli_missing` / `tailscale_cli_failed` / `tailscale_cli_timeout` / `tailscale_no_ipv4` / `tailscale_not_ip` / `not_tailscale_range` / `wildcard_or_multicast` / `bind_failed` / `unexpected_error`，不写 CLI 原始输出。`install_node.sh` 第 10 步要求 gateway 进程确实在 `<Tailscale IP>:8791` LISTEN 且无通配监听，否则回滚。
+- **客户端补会话路径**：P6 的 `nodes.json` 里 `url` 只写 `ws://<MagicDNS 名>:8791`（安装脚本即如此写），rslite 连接时路径为空就补 `/v2/session`，`/v1/info` 由同一主机派生。另一路是本机 UDS，目录 0700、socket 0600，目录是 symlink、属主不对、权限不对一律拒绝启动，并逐连接校验对端 uid（`gateway.py:1032-1039, 1072-1092, 1143-1155`）。
+- **每设备 token 与鉴权**：
+  - 支持单 token 文件（`token`，作为 `default` 设备加载）及每设备 token 目录 `rs-node/tokens/*.token`（文件名为设备名，正则 `^[A-Za-z0-9_.-]{1,64}$`）。权限要求 0600、属主本人（Windows 经 icacls 锁定为仅当前用户+SYSTEM）。每把 token 至少 32 字符（`MIN_TOKEN_CHARS`）。
+  - 启动加载，Mac 收到 `SIGHUP` 信号重载，Windows 每 10s 检查目录 `mtime` 重载。吊销 = 删除对应 `*.token` 文件。
+  - 鉴权逻辑（`TokenBook.match`）对账本中每把 token 常量时间比较（`hmac.compare_digest`），全部比完再出结论，杜绝提前返回的时序泄露。重复的 `Authorization` 头一律不认。
+- **日志无正文无 token**：gateway 和 worker 都只记事件类型、时长、字节数、帧数、错误码/类名；转录/译文正文、token、hello 字段值都不进日志。日志中仅记录设备代号（如 `device=mac`），绝不记 token。websockets 自带的 DEBUG 日志会逐帧打印文本，所以给它单独一个钉在 WARNING 的 logger（`gateway.py:55-56`）；worker 的 `_log` 还会把形状不像「代号」的字符串值抹成 `?`，异常只记类名不记消息（`worker.py:69, 213-225`）。
 - **音频不落盘**：音频只在内存队列和管道里流转，不写任何文件；worker 写盘的只有 `asr_state.json`（模型名、后端、rtf、翻译器名），权限 0600，原子替换（`worker.py:379-386`）。
 - **`/v1/info` 的最小暴露**：`in_use` 只给布尔值，`translator_ok` 只给布尔值，`hw_hash` 只给哈希前 16 位；原始空闲秒数、Ollama URL/错误文本和硬件 UUID 不出 `info.py`（`info.py:9-10`）。
 

@@ -878,10 +878,13 @@ step_token() {
         tgt_run 'chmod 700 "$HOME/.config/rs-node" && chmod 600 "$HOME/.config/rs-node/token"' \
             || die "无法收紧目标机 token 的权限"
     fi
+    # 复制（不移动）为每设备目录里的 default。原文件留在原地，老客户端照常读它。
+    tgt_run 'umask 077; d="$HOME/.config/rs-node"; mkdir -p "$d/tokens"; chmod 700 "$d/tokens"; cp "$d/token" "$d/tokens/default.token"; chmod 600 "$d/tokens/default.token"' \
+        || die "token 目录迁移失败"
     if [[ -n "${client_file}" ]]; then
         write_secret_file "${client_file}" "${NODE_TOKEN}"
     fi
-    info "  ✅ token 就绪（目标机 ~/.config/rs-node/token）"
+    info "  ✅ token 就绪（目标机 ~/.config/rs-node/token，副本 tokens/default.token）"
 }
 
 step_deploy() {

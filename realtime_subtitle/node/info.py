@@ -251,8 +251,12 @@ class NodeInfo:
             translator = tr
         return asr, translator
 
-    def collect(self, *, busy: bool, worker: str) -> dict[str, Any]:
-        """返回 P1 规定的 JSON。会阻塞（跑子进程），gateway 在线程池里调它。"""
+    def collect(self, *, busy: bool, worker: str, sessions: int = 0, capacity: int = 2) -> dict[str, Any]:
+        """返回 P1 规定的 JSON。会阻塞（跑子进程），gateway 在线程池里调它。
+
+        `sessions` / `capacity` 由 gateway 传入（缺省 0 / 2，直接调 collect 的旧调用仍合法）。
+        `busy` 的含义由调用方决定：gateway 传的是 `sessions >= capacity`。
+        """
         asr, translator = self.asr_and_translator()
         translator_ok = True
         if translator.startswith("ollama:"):
@@ -265,6 +269,8 @@ class NodeInfo:
             "translator": translator,
             "translator_ok": translator_ok,
             "busy": bool(busy),
+            "sessions": int(sessions),
+            "capacity": int(capacity),
             "on_ac": self.on_ac(),
             "in_use": self.in_use(),
             "worker": worker,

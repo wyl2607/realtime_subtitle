@@ -5,18 +5,23 @@
 线路格式（仅本机进程间，gateway <-> worker）：
 
   上行（stdin）两种消息交错：
-    * 控制消息：一行一个 JSON（`hello` / `flush` / `drain`），以 `{` 开头；
-    * 音频帧：4 字节大端长度 + s16le PCM，长度 ≤ 64KB（P2 的单帧上限）。
-  两种消息靠首字节区分：合法长度 ≤ 0x00010000，大端首字节恒为 0x00，
-  而 JSON 首字节是 0x7B，不会混淆。其他首字节一律按协议错误处理。
-  下行（stdout）：一行一个 JSON 事件，格式同 P2（ready/final/translation/status/drained）。
+    * 控制消息：一行一个 JSON（`hello` / `flush` / `drain` / `end`），以 `{` 开头。
+      多会话时带整数 `sid`；没有 `sid` 的 hello/flush/drain 走旧的单会话路径（sid 0）。
+    * 音频帧两种：
+        - 旧：4 字节大端长度 + s16le PCM（首字节 0x00），长度 ≤ 64KB，进当前 sid 0；
+        - 新：0x01 + 4 字节大端 sid + 4 字节大端长度 + PCM。
+  首字节 0x00 / 0x01 / `{`（0x7B）以外一律协议错误。未知 sid 的音频或控制只丢弃
+  该帧（不退出）：一个坏 sid 不能把别的会话一起打死。`end` 在 hello 之前出现也忽略。
+  下行（stdout）：一行一个 JSON 事件，格式同 P2。只有 hello 带了显式 sid 时，
+  事件才多一个 `sid`（gateway 转发给客户端之前会剥掉）。
 
 退出码（P3 要求 gateway 能据此记录错误码）：
   0 正常（stdin 关闭 / 收到 SIGTERM）  2 协议错误  3 引擎加载失败  4 内部错误
 
-会话：一个 worker 进程可以按顺序服务多个会话（RFC：会话结束后 worker 保温
-120s）。每条 `hello` 开启新会话：句子 id 与 a0/a1 时间轴从零重新计，上一会话
-遗留的待处理段直接丢弃（gateway 应该先 drain 再 hello）。
+会话：一个 worker 进程同时服务多个会话。每个 sid 有自己的分段器、VAD、语言对、
+翻译器和句子 id。识别与翻译仍各只有一个线程（MLX 必须留在 asr 这一条线程上），
+队列按会话轮转取活，避免一个会话的积压饿死另一个。`end` 或同 sid 的新 hello
+只清该 sid；没有 sid 的新 hello 仍按旧行为收口并替换 sid 0。
 
 线程：主线程读 stdin 并跑 VAD 分段（几毫秒/帧）；`asr` 线程逐段识别并立即发
 `final`；`tx` 线程翻译并发 `translation`。翻译独立成线程是为了让下一段的识别
@@ -33,12 +38,12 @@ import faulthandler
 import json
 import math
 import os
-import queue
 import re
 import signal
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -49,7 +54,7 @@ from realtime_subtitle.node.info import (
     DEFAULT_TRANSLATOR,
     STATE_DIR,
 )
-from realtime_subtitle.node.segmenter import Segmenter, Segment, VadFn
+from realtime_subtitle.node.segmenter import Segment, Segmenter
 
 # 节点段长上限比 Segmenter 默认（15s）短。2026-10-11 网页视频实测：连续人声/背景乐里 Silero 找不到
 # 0.6s 静音，几乎每段都顶到 13.5–14.6s 才切，精修结果 15s 一批整屏替换，用户觉得「卡」。
@@ -93,6 +98,123 @@ class ProtocolError(Exception):
     """协议违规。消息是固定短语，不夹带输入内容。"""
 
 
+class _Sess:
+    """一个 sid 的分段 / 语言 / 草稿 / 翻译器。识别队列里的项只认 gen，不认对象身份。"""
+
+    __slots__ = (
+        "sid", "explicit", "gen", "src", "dst", "seg",
+        "translator", "tr_pair", "next_id", "audio_s", "asr_s",
+    )
+
+    def __init__(self, sid: int, explicit: bool, gen: int, src: str, dst: str, seg: Segmenter) -> None:
+        self.sid = sid
+        self.explicit = explicit
+        self.gen = gen
+        self.src = src
+        self.dst = dst
+        self.seg = seg
+        self.translator: Translator | None = None
+        self.tr_pair: tuple[str, str] | None = None
+        self.next_id = 1
+        self.audio_s = 0.0
+        self.asr_s = 0.0
+
+
+class FairQueue:
+    """按 sid 分桶、轮转取活的有界队列。
+
+    `qsize` 只数还排着队的项（不含正在处理的）；`unfinished_tasks` 含在飞的。
+    丢弃只丢该 sid 队列里最旧的，并立刻把 unfinished 减掉，`join` 才不会卡住。
+    一个 sid 的 `join_sid` 不等待别的 sid。
+    """
+
+    def __init__(self) -> None:
+        self._cv = threading.Condition()
+        self._qs: dict[int, deque] = {}
+        self._order: deque[int] = deque()
+        self._pending: dict[int, int] = {}
+        self._inflight: dict[int, int] = {}
+        self.unfinished_tasks = 0
+
+    def qsize(self) -> int:
+        with self._cv:
+            return sum(len(q) for q in self._qs.values())
+
+    def put_bounded(self, sid: int, item, cap: int) -> int:
+        dropped = 0
+        with self._cv:
+            q = self._qs.setdefault(sid, deque())
+            while len(q) >= cap:
+                q.popleft()
+                dropped += 1
+                self.unfinished_tasks -= 1
+                self._pending[sid] = self._pending.get(sid, 0) - 1
+                if not q:
+                    self._discard_order(sid)
+            empty = not q
+            q.append(item)
+            if empty:
+                self._order.append(sid)
+            self.unfinished_tasks += 1
+            self._pending[sid] = self._pending.get(sid, 0) + 1
+            self._cv.notify()
+        return dropped
+
+    def get(self):
+        with self._cv:
+            while True:
+                while not self._order:
+                    self._cv.wait()
+                sid = self._order.popleft()
+                q = self._qs.get(sid)
+                if not q:
+                    continue
+                item = q.popleft()
+                if q:
+                    self._order.append(sid)
+                self._inflight[sid] = self._inflight.get(sid, 0) + 1
+                return sid, item
+
+    def task_done(self, sid: int | None = None) -> None:
+        with self._cv:
+            self.unfinished_tasks -= 1
+            if sid is not None:
+                self._pending[sid] = self._pending.get(sid, 0) - 1
+                left = self._inflight.get(sid, 0) - 1
+                if left <= 0:
+                    self._inflight.pop(sid, None)
+                else:
+                    self._inflight[sid] = left
+            self._cv.notify_all()
+
+    def drop_session(self, sid: int) -> int:
+        """丢掉还排着队的项（在飞的留给 task_done）。返回丢掉的个数。"""
+        with self._cv:
+            q = self._qs.pop(sid, None)
+            self._discard_order(sid)
+            n = len(q) if q else 0
+            self.unfinished_tasks -= n
+            self._pending[sid] = self._inflight.get(sid, 0)
+            self._cv.notify_all()
+            return n
+
+    def join(self) -> None:
+        with self._cv:
+            while self.unfinished_tasks > 0:
+                self._cv.wait()
+
+    def join_sid(self, sid: int) -> None:
+        with self._cv:
+            while self._pending.get(sid, 0) > 0:
+                self._cv.wait()
+
+    def _discard_order(self, sid: int) -> None:
+        try:
+            self._order.remove(sid)
+        except ValueError:
+            pass
+
+
 def _log(stream, event: str, **fields) -> None:
     parts = []
     for k, v in fields.items():
@@ -108,33 +230,31 @@ def _log(stream, event: str, **fields) -> None:
 
 
 class Worker:
-    def __init__(self, inp, out, asr: AsrEngine, vad: VadFn,
-                 translator_factory=None, err=None, state_dir=None):
+    def __init__(self, inp, out, asr: AsrEngine, vad=None,
+                 translator_factory=None, err=None, state_dir=None, vad_factory=None):
         self._in = inp
         self._out = out
         self._err = err if err is not None else sys.stderr
         self._asr = asr
-        self._vad = vad
+        if vad_factory is not None:
+            self._vad_factory = vad_factory
+        elif vad is not None:
+            # 旧测试传入同一个无状态 VAD：单会话复用即可。多会话要各拿一份有状态的。
+            self._vad_factory = lambda: vad
+        else:
+            raise TypeError("vad is required")
         self._translator_factory = translator_factory or select_translator
-        self._translator: Translator | None = None
-        self._tr_pair: tuple[str, str] | None = None
         self._loaded = False
         # 测试注入点；None 表示用 info.STATE_DIR（运行时以它为准，读取时才解析）
         self._state_dir = Path(state_dir) if state_dir is not None else None
-        # 本会话累计：被识别的音频秒数与识别耗时，受 _state_lock 保护
-        self._sess_audio_s = 0.0
-        self._sess_asr_s = 0.0
 
         self._emit_lock = threading.Lock()
         self._state_lock = threading.Lock()
-        self._gen = 0
-        self._next_id = 1
-        self._src = ""
-        self._dst = ""
-        self._seg: Segmenter | None = None
-        self._asr_q: queue.Queue = queue.Queue()
-        self._tx_q: queue.Queue = queue.Queue()
-        self._put_lock = threading.Lock()
+        self._sessions: dict[int, _Sess] = {}
+        self._by_gen: dict[int, int] = {}
+        self._next_gen = 0
+        self._asr_q = FairQueue()
+        self._tx_q = FairQueue()
         self._threads_started = False
         self._pipe_dead = False
 
@@ -162,9 +282,11 @@ class Worker:
                 # gateway 已经走了：不再写，主循环会在读到 EOF 时正常退出
                 self._pipe_dead = True
 
-    def _status(self, code: str, text: str, **fields) -> None:
+    def _status(self, code: str, text: str, sess: _Sess | None = None, **fields) -> None:
         event = {"ev": "status", "code": code, "text": text}
         event.update(fields)
+        if sess is not None and sess.explicit:
+            event["sid"] = sess.sid
         self._emit(event)
 
     def log(self, event: str, **fields) -> None:
@@ -179,7 +301,10 @@ class Worker:
         return buf
 
     def _read_message(self):
-        """返回 ("ctl", dict) / ("pcm", bytes) / None（EOF）。"""
+        """返回 ("ctl", dict, None) / ("pcm", bytes, sid|None) / None（EOF）。
+
+        没有 sid 的旧音频帧用 None，调用方把它送到 sid 0。
+        """
         first = self._in.read(1)
         if not first:
             return None
@@ -193,14 +318,22 @@ class Worker:
                 raise ProtocolError("control_not_json") from None
             if not isinstance(msg, dict):
                 raise ProtocolError("control_not_object")
-            return "ctl", msg
+            return "ctl", msg, None
+        if first == b"\x01":
+            sid = int.from_bytes(self._read_exact(4), "big")
+            n = int.from_bytes(self._read_exact(4), "big")
+            if n > MAX_FRAME:
+                raise ProtocolError("frame_too_large")
+            if n % 2:
+                raise ProtocolError("frame_not_s16le")
+            return "pcm", self._read_exact(n) if n else b"", sid
         if first == b"\x00":
             n = int.from_bytes(first + self._read_exact(3), "big")
             if n > MAX_FRAME:
                 raise ProtocolError("frame_too_large")
             if n % 2:
                 raise ProtocolError("frame_not_s16le")
-            return "pcm", self._read_exact(n) if n else b""
+            return "pcm", self._read_exact(n) if n else b"", None
         raise ProtocolError("bad_message_prefix")
 
     # ------------------------------------------------------------ 主循环
@@ -217,8 +350,10 @@ class Worker:
             self._status("internal_error", "内部错误")
             return EXIT_INTERNAL
         finally:
-            if self._translator is not None:
-                self._translator.close()
+            for sess in list(self._sessions.values()):
+                if sess.translator is not None:
+                    sess.translator.close()
+                    sess.translator = None
 
     def _loop(self) -> int:
         while True:
@@ -227,27 +362,39 @@ class Worker:
                 self.log("stdin_closed")
                 self._finish_session()
                 return EXIT_OK
-            kind, body = msg
+            kind, body, frame_sid = msg
             if kind == "pcm":
-                if self._seg is None:
-                    raise ProtocolError("audio_before_hello")
-                self._on_audio(body)
+                self._on_audio(body, frame_sid)
                 continue
             t = body.get("type")
             if t == "hello":
                 code = self._on_hello(body)
                 if code is not None:
                     return code
+            elif t == "end":
+                self._on_end(body)
             elif t in ("flush", "drain"):
-                if self._seg is None:
-                    raise ProtocolError("control_before_hello")
-                self._enqueue(self._seg.flush())
+                sess = self._control_session(body)
+                if sess is None:
+                    if not self._sessions:
+                        raise ProtocolError("control_before_hello")
+                    self.log("ignored_unknown_sid")
+                    continue
+                self._enqueue(sess, sess.seg.flush())
                 if t == "drain":
-                    self._drain()
+                    self._drain(sess)
             else:
                 raise ProtocolError("unknown_control")
 
     # ------------------------------------------------------------ 会话
+
+    def _hello_sid(self, msg: dict) -> tuple[int, bool]:
+        if "sid" not in msg:
+            return 0, False
+        sid = msg["sid"]
+        if isinstance(sid, bool) or not isinstance(sid, int) or sid < 0 or sid > 0xFFFFFFFF:
+            raise ProtocolError("bad_hello")
+        return sid, True
 
     def _on_hello(self, msg: dict) -> int | None:
         if (msg.get("v") != 2 or msg.get("sample_rate") != SAMPLE_RATE
@@ -257,15 +404,17 @@ class Worker:
                 or not _LANG.fullmatch(msg["src"]) or not _LANG.fullmatch(msg["dst"])):
             raise ProtocolError("bad_hello")
         src, dst = msg["src"], msg["dst"]
+        sid, explicit = self._hello_sid(msg)
 
-        # 上一会话在这里结束：先收口它的 rtf（hello 校验通过之后再收，
-        # 协议错误的坏 hello 不算会话边界）
-        self._finish_session()
-
-        # 先递增代数再动翻译器/引擎：此后 tx/asr 线程里属于旧会话的结果在
-        # 「查代数 + 发事件」那把锁里一律被拒，不会挂到新会话 id 上
-        with self._state_lock:
-            self._gen += 1
+        # 同 sid 的上一段在这里结束。先收口 rtf（用旧翻译器的名字），再决定
+        # 留不留翻译器。坏 hello 在上面已经拒绝，不算会话边界。
+        # 显式 sid 只动这一个会话；没有 sid 的旧 hello 也只动 sid 0。
+        prev = self._sessions.get(sid)
+        carried: Translator | None = None
+        if prev is not None:
+            if prev.translator is not None and prev.tr_pair == (src, dst):
+                carried = prev.translator
+            self._retire_session(sid, close_translator=carried is None)
 
         cold = not self._loaded
         load_s = 0.0
@@ -280,73 +429,127 @@ class Worker:
             self._loaded = True
             load_s = time.perf_counter() - t0
 
-        tr_note = None
-        if self._tr_pair != (src, dst):
-            if self._translator is not None:
-                self._translator.close()
-                self._translator = None
-            self._tr_pair = None
-            try:
-                self._translator = self._translator_factory(src, dst)
-                self._tr_pair = (src, dst)
-            except Exception as e:  # noqa: BLE001
-                # 构造失败不记语言对：同语言对的下一次 hello 要重试并再报告
-                self.log("translator_unavailable", err=type(e).__name__)
-                tr_note = ("translator_unavailable", "翻译不可用，只输出原文")
-
-        with self._state_lock:
-            self._gen += 1
-            self._next_id = 1
-            # 第一次递增之后旧会话的识别结果已被拒收，这里清零才不会混进新会话
-            self._sess_audio_s = self._sess_asr_s = 0.0
-            self._src, self._dst = src, dst
-            if hasattr(self._vad, "reset"):
-                self._vad.reset()
-            self._seg = Segmenter(self._vad, max_s=NODE_MAX_SEGMENT_S)
+        sess = self._open_session(sid, explicit, src, dst)
+        tr_note = self._bind_translator(sess, src, dst, carried)
         self._start_threads()
 
         engine = dict(self._asr.info())
-        engine["translator"] = self._translator.name if self._translator else "none"
-        self._emit({"ev": "ready", "cold": cold, "load_s": round(load_s, 3),
-                    "engine": engine})
+        engine["translator"] = sess.translator.name if sess.translator else "none"
+        ready = {"ev": "ready", "cold": cold, "load_s": round(load_s, 3), "engine": engine}
+        if explicit:
+            ready["sid"] = sid
+        self._emit(ready)
         self.log("ready", cold=cold, load_s=load_s)
         if tr_note:
-            self._status(*tr_note)
+            self._status(*tr_note, sess=sess)
         return None
+
+    def _bind_translator(self, sess: _Sess, src: str, dst: str, carried: Translator | None):
+        if carried is not None:
+            sess.translator = carried
+            sess.tr_pair = (src, dst)
+            return None
+        try:
+            sess.translator = self._translator_factory(src, dst)
+            sess.tr_pair = (src, dst)
+        except Exception as e:  # noqa: BLE001
+            # 构造失败不记语言对：同语言对的下一次 hello 要重试并再报告
+            sess.translator = None
+            sess.tr_pair = None
+            self.log("translator_unavailable", err=type(e).__name__)
+            return ("translator_unavailable", "翻译不可用，只输出原文")
+        return None
+
+    def _open_session(self, sid: int, explicit: bool, src: str, dst: str) -> _Sess:
+        vad = self._vad_factory()
+        if hasattr(vad, "reset"):
+            vad.reset()
+        with self._state_lock:
+            self._next_gen += 1
+            gen = self._next_gen
+            sess = _Sess(sid, explicit, gen, src, dst, Segmenter(vad, max_s=NODE_MAX_SEGMENT_S))
+            self._sessions[sid] = sess
+            self._by_gen[gen] = sid
+        return sess
+
+    def _control_session(self, msg: dict) -> _Sess | None:
+        if "sid" not in msg:
+            return self._sessions.get(0)
+        sid = msg["sid"]
+        if isinstance(sid, bool) or not isinstance(sid, int):
+            return None
+        return self._sessions.get(sid)
+
+    def _on_end(self, msg: dict) -> None:
+        # end 在任何 hello 之前、或 sid 已经不在：忽略。协议错误会杀掉其它会话。
+        if "sid" not in msg:
+            sid: object = 0
+        else:
+            sid = msg["sid"]
+        if isinstance(sid, bool) or not isinstance(sid, int) or sid not in self._sessions:
+            return
+        self._retire_session(sid, close_translator=True)
 
     # ------------------------------------------------------------ rtf 持久化
 
     def _finish_session(self, lock_timeout: float | None = None) -> None:
-        """会话结束（下一条 hello / stdin EOF）：把本会话 rtf 滑动并入 asr_state.json。
+        """stdin EOF / SIGTERM：把还活着的每个会话的 rtf 滑动并入 asr_state.json。
 
-        任何失败只记日志：这只是给 /v1/info 的路由提示，不能影响会话与退出码。
+        单个 sid 的结束走 `_retire_session`（hello 替换、end）。这里不拆会话对象：
+        SIGTERM 之后进程马上退出，来不及再被别的路径重复写。
 
-        lock_timeout 仅供 SIGTERM 处理函数用：handler 跑在主线程，可能打断持锁中的
-        主线程，普通 `with` 会死锁，所以限时拿锁，拿不到就放弃收口。累计值在锁内
-        取走并清零，这同时是防重入：EOF / hello 路径已在收口时，handler 读到 0
-        会因样本不足而跳过，不会重复写。
+        lock_timeout 仅供 SIGTERM：handler 跑在主线程，可能打断持锁中的主线程，
+        普通 `with` 会死锁。拿不到锁就整批放弃，不写一半。没有会话时不记
+        rtf_skipped（和「还没 hello 就 EOF」的旧行为一致）。
         """
-        if lock_timeout is None:
-            self._state_lock.acquire()
-        elif not self._state_lock.acquire(timeout=lock_timeout):
+        if lock_timeout is not None and not self._state_lock.acquire(timeout=lock_timeout):
             self.log("rtf_skipped", reason="lock_busy_on_term")
             return
+        if lock_timeout is None:
+            self._state_lock.acquire()
         try:
-            audio_s, asr_s = self._sess_audio_s, self._sess_asr_s
-            self._sess_audio_s = self._sess_asr_s = 0.0
+            snap = []
+            for sess in self._sessions.values():
+                snap.append((sess.audio_s, sess.asr_s, sess.translator))
+                sess.audio_s = 0.0
+                sess.asr_s = 0.0
         finally:
             self._state_lock.release()
-        if self._seg is None:
-            return  # 还没有过会话
+        for audio_s, asr_s, translator in snap:
+            self._commit_rtf(audio_s, asr_s, translator)
+
+    def _retire_session(self, sid: int, *, close_translator: bool) -> None:
+        """收口一个 sid：写 rtf、从映射里摘掉、丢掉还排着队的活。在飞的识别靠 gen 对不上丢弃。"""
+        self._state_lock.acquire()
+        try:
+            sess = self._sessions.get(sid)
+            if sess is None:
+                return
+            audio_s, asr_s = sess.audio_s, sess.asr_s
+            sess.audio_s = 0.0
+            sess.asr_s = 0.0
+            translator = sess.translator
+            self._sessions.pop(sid, None)
+            self._by_gen.pop(sess.gen, None)
+        finally:
+            self._state_lock.release()
+        self._asr_q.drop_session(sid)
+        self._tx_q.drop_session(sid)
+        self._commit_rtf(audio_s, asr_s, translator)
+        if close_translator and translator is not None:
+            translator.close()
+            sess.translator = None
+
+    def _commit_rtf(self, audio_s: float, asr_s: float, translator: Translator | None) -> None:
         if audio_s < RTF_MIN_AUDIO_S:
             self.log("rtf_skipped", reason="short_session", audio_s=audio_s)
             return
         try:
-            self._update_rtf_file(asr_s / audio_s, audio_s)
+            self._update_rtf_file(asr_s / audio_s, audio_s, translator)
         except Exception as e:  # noqa: BLE001 - 只记类名
             self.log("rtf_write_failed", err=type(e).__name__)
 
-    def _update_rtf_file(self, session_rtf: float, audio_s: float) -> None:
+    def _update_rtf_file(self, session_rtf: float, audio_s: float, translator: Translator | None = None) -> None:
         state_dir = self._state_dir if self._state_dir is not None else STATE_DIR
         # 目录由安装脚本 / gateway 建（权限也由它们定），worker 不越俎代庖
         if not state_dir.is_dir():
@@ -378,8 +581,8 @@ class Worker:
         # 注意：沿用的旧值可能来自别的语言对（P1 是节点级单值，契约冻结，不按语言对区分），
         # 路由可能因此高估该节点的翻译能力。
         tr = old.get("translator")
-        if self._translator is not None:
-            state["translator"] = self._translator.name
+        if translator is not None:
+            state["translator"] = translator.name
         else:
             state["translator"] = tr if isinstance(tr, str) and tr else DEFAULT_TRANSLATOR
 
@@ -399,35 +602,47 @@ class Worker:
             raise
         self.log("rtf_updated", rtf=new_rtf, session_rtf=session_rtf, audio_s=audio_s)
 
-    def _on_audio(self, data: bytes) -> None:
+    def _on_audio(self, data: bytes, frame_sid: int | None = None) -> None:
+        if frame_sid is None:
+            if not self._sessions:
+                raise ProtocolError("audio_before_hello")
+            sess = self._sessions.get(0)
+        else:
+            if not self._sessions:
+                raise ProtocolError("audio_before_hello")
+            sess = self._sessions.get(frame_sid)
+        if sess is None:
+            self.log("ignored_unknown_sid", sid=0 if frame_sid is None else frame_sid)
+            return
         pcm = np.frombuffer(data, dtype="<i2")
-        self._enqueue(self._seg.feed(pcm))
+        self._enqueue(sess, sess.seg.feed(pcm))
 
-    def _put_bounded(self, q: queue.Queue, item, cap: int, what: str) -> None:
-        """入队；超过上限就丢最旧的（task_done 补账，join 才不会卡住）并告警。"""
-        dropped = 0
-        with self._put_lock:
-            while q.qsize() >= cap:
-                try:
-                    q.get_nowait()
-                except queue.Empty:
-                    break
-                q.task_done()
-                dropped += 1
-            q.put(item)
+    def _put_bounded(self, q: FairQueue, sid: int, item, cap: int, what: str, sess: _Sess) -> None:
+        """入队；该 sid 超过上限就丢它最旧的（unfinished 立刻减，join 才不会卡住）并告警。"""
+        dropped = q.put_bounded(sid, item, cap)
         if dropped:
             self.log("backlog_dropped", queue=what, dropped=dropped, cap=cap)
-            self._status("backlog_dropped", "处理积压，已丢弃最旧内容")
+            self._status("backlog_dropped", "处理积压，已丢弃最旧内容", sess=sess)
 
-    def _enqueue(self, segments: list[Segment]) -> None:
+    def _enqueue(self, sess: _Sess, segments: list[Segment]) -> None:
+        gen, sid = sess.gen, sess.sid
         for s in segments:
-            self._put_bounded(self._asr_q, (self._gen, s), MAX_ASR_BACKLOG, "asr")
+            self._put_bounded(self._asr_q, sid, (gen, s), MAX_ASR_BACKLOG, "asr", sess)
 
-    def _drain(self) -> None:
-        # asr 线程先放空（它会往 tx 队列里放东西），再等 tx 放空，顺序不能反
-        self._asr_q.join()
-        self._tx_q.join()
-        self._emit({"ev": "drained"})
+    def _drain(self, sess: _Sess) -> None:
+        # 只等这一个 sid：asr 先放空（它会往 tx 队列里放东西），再等 tx。别的会话不用等。
+        sid, gen = sess.sid, sess.gen
+        self._asr_q.join_sid(sid)
+        self._tx_q.join_sid(sid)
+        with self._state_lock:
+            cur = self._sessions.get(sid)
+            if cur is None or cur.gen != gen:
+                return
+            explicit = cur.explicit
+        event = {"ev": "drained"}
+        if explicit:
+            event["sid"] = sid
+        self._emit(event)
         self.log("drained")
 
     # ------------------------------------------------------------ 工作线程
@@ -441,18 +656,22 @@ class Worker:
 
     def _asr_loop(self) -> None:
         while True:
-            gen, seg = self._asr_q.get()
+            sid, (gen, seg) = self._asr_q.get()
             try:
                 with self._state_lock:
-                    live = gen == self._gen
-                    src = self._src
+                    sess = self._sessions.get(sid)
+                    live = sess is not None and sess.gen == gen
+                    src = sess.src if live else ""
                 if live:
                     self._recognize(gen, seg, src)
             except Exception as e:  # noqa: BLE001
                 self.log("asr_error", err=type(e).__name__)
-                self._status("asr_error", "识别失败，已跳过一段")
+                with self._state_lock:
+                    sess = self._sessions.get(sid)
+                    current = sess if sess is not None and sess.gen == gen else None
+                self._status("asr_error", "识别失败，已跳过一段", sess=current)
             finally:
-                self._asr_q.task_done()
+                self._asr_q.task_done(sid)
 
     def _recognize(self, gen: int, seg: Segment, src: str) -> None:
         t0 = time.perf_counter()
@@ -462,50 +681,66 @@ class Worker:
         # 夹到含垫边界会让强切相邻两段的 final 时间重叠（P5 按时间替换会吃掉邻行）
         lo, hi = seg.a0, seg.a1
         with self._state_lock:
-            # 识别期间如果来了新 hello，这批结果属于已结束的会话，丢弃
-            if gen != self._gen:
+            # 识别期间如果这个 sid 被换代或结束，这批结果丢掉，不能挂到新会话上
+            sid = self._by_gen.get(gen)
+            sess = self._sessions.get(sid) if sid is not None else None
+            if sess is None or sess.gen != gen:
                 return
-            self._sess_audio_s += max(seg.a1 - seg.a0, 0.0)
-            self._sess_asr_s += asr_s
+            sess.audio_s += max(seg.a1 - seg.a0, 0.0)
+            sess.asr_s += asr_s
+            explicit = sess.explicit
+            session_sid = sess.sid
+            emitted = []
             for u in utts:
                 a0 = min(max(seg.audio_t0 + u.start, lo), hi)
                 a1 = min(max(seg.audio_t0 + u.end, a0), hi)
-                sid = self._next_id
-                self._next_id += 1
-                self._emit({"ev": "final", "id": sid, "a0": round(a0, 3),
-                            "a1": round(a1, 3), "text": u.text})
-                self._put_bounded(self._tx_q, (gen, sid, u.text), MAX_TX_BACKLOG, "tx")
+                sentence_id = sess.next_id
+                sess.next_id += 1
+                emitted.append((sentence_id, a0, a1, u.text))
+        for sentence_id, a0, a1, text in emitted:
+            event = {"ev": "final", "id": sentence_id, "a0": round(a0, 3),
+                     "a1": round(a1, 3), "text": text}
+            if explicit:
+                event["sid"] = session_sid
+            self._emit(event)
+            self._put_bounded(self._tx_q, session_sid, (gen, sentence_id, text), MAX_TX_BACKLOG, "tx", sess)
         self.log("segment", seg_s=seg.a1 - seg.a0, asr_s=asr_s, sentences=len(utts))
 
     def _tx_loop(self) -> None:
         while True:
-            gen, sid, text = self._tx_q.get()
+            qsid, (gen, sentence_id, text) = self._tx_q.get()
             try:
                 with self._state_lock:
-                    if gen != self._gen or self._translator is None:
+                    sess = self._sessions.get(qsid)
+                    if sess is None or sess.gen != gen or sess.translator is None:
                         continue
-                    tr, src, dst = self._translator, self._src, self._dst
+                    tr, src, dst = sess.translator, sess.src, sess.dst
                 t0 = time.perf_counter()
                 out = tr.translate(text, src, dst)
-                # 「查代数 + 发事件」必须在同一把锁里：翻译期间 hello 可能已开新会话
+                # 「查代数 + 发事件」必须在同一把锁里：翻译期间 hello/end 可能已收掉这个 sid
                 with self._state_lock:
-                    if gen != self._gen:
+                    sess = self._sessions.get(qsid)
+                    if sess is None or sess.gen != gen:
                         continue
                     if out:
-                        self._emit({"ev": "translation", "id": sid, "text": out})
+                        event = {"ev": "translation", "id": sentence_id, "text": out}
+                        if sess.explicit:
+                            event["sid"] = qsid
+                        self._emit(event)
                     else:
-                        self._status("translate_failed", "一句翻译失败，已跳过", id=sid)
+                        self._status("translate_failed", "一句翻译失败，已跳过", sess=sess, id=sentence_id)
                 if out:
-                    self.log("translated", id=sid, tx_s=time.perf_counter() - t0)
+                    self.log("translated", id=sentence_id, tx_s=time.perf_counter() - t0)
                 else:
-                    self.log("translate_failed", id=sid)
+                    self.log("translate_failed", id=sentence_id)
             except Exception as e:  # noqa: BLE001
-                self.log("translate_error", id=sid, err=type(e).__name__)
+                self.log("translate_error", id=sentence_id, err=type(e).__name__)
                 with self._state_lock:
-                    if gen == self._gen:
-                        self._status("translate_failed", "一句翻译失败，已跳过", id=sid)
+                    sess = self._sessions.get(qsid)
+                    if sess is not None and sess.gen == gen:
+                        self._status("translate_failed", "一句翻译失败，已跳过", sess=sess, id=sentence_id)
             finally:
-                self._tx_q.task_done()
+                self._tx_q.task_done(qsid)
 
 
 def main() -> None:
@@ -569,12 +804,13 @@ def main() -> None:
         from realtime_subtitle.node.engines import WhisperEngine
         from realtime_subtitle.node.segmenter import SileroVad
 
-        asr, vad = WhisperEngine(), SileroVad()
+        asr = WhisperEngine()
+        SileroVad()  # 模型加载失败走退出码 3；每个会话再各自 new（VAD 的 h/c 不能共享）
     except Exception as e:  # noqa: BLE001
         _log(err, "engine_load_failed", err=type(e).__name__)
         sys.exit(EXIT_ENGINE)
 
-    worker = Worker(sys.stdin.buffer, out, asr, vad, err=err)
+    worker = Worker(sys.stdin.buffer, out, asr, vad_factory=SileroVad, err=err)
     holder.append(worker)
     sys.exit(worker.run())
 
