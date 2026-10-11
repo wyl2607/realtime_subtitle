@@ -51,6 +51,72 @@ struct NodeInfo: Codable, Equatable, Sendable {
     }
 }
 
+/// 一次 /v1/info 测速结果。不包含 token。
+struct ProbeResult: Equatable, Sendable {
+    enum Availability: Equatable, Sendable {
+        case idle
+        case busy
+        case inUse
+        case offline
+        case unauthorized
+
+        var title: String {
+            switch self {
+            case .idle: return "空闲"
+            case .busy: return "忙"
+            case .inUse: return "有人在用"
+            case .offline: return "离线"
+            case .unauthorized: return "鉴权失败"
+            }
+        }
+    }
+
+    static let samplesPerNode = 3
+    static let timeout: Duration = .seconds(3)
+
+    var info: NodeInfo?
+    var rttMS: Double?
+    var availability: Availability
+
+    /// 有限样本的中位数。偶数个取中间两数的平均。空样本返回 nil。
+    static func median(_ samples: [Double]) -> Double? {
+        let values = samples.filter(\.isFinite).sorted()
+        guard !values.isEmpty else { return nil }
+        let mid = values.count / 2
+        if values.count % 2 == 1 {
+            return values[mid]
+        }
+        return (values[mid - 1] + values[mid]) / 2
+    }
+
+    static func availability(of info: NodeInfo) -> Availability {
+        if info.inUse { return .inUse }
+        if info.busy { return .busy }
+        return .idle
+    }
+
+    static func availability(of error: NodeClientError) -> Availability {
+        switch error {
+        case .unauthorized, .tokenUnavailable, .tokenPermissions:
+            return .unauthorized
+        default:
+            return .offline
+        }
+    }
+
+    /// 多次探测合成一条：成功样本的 RTT 取中位数；都失败时鉴权失败优先于离线。
+    static func combined(_ results: [ProbeResult]) -> ProbeResult {
+        let rtt = median(results.compactMap(\.rttMS))
+        if let info = results.lazy.compactMap(\.info).last {
+            return ProbeResult(info: info, rttMS: rtt, availability: availability(of: info))
+        }
+        if results.contains(where: { $0.availability == .unauthorized }) {
+            return ProbeResult(info: nil, rttMS: nil, availability: .unauthorized)
+        }
+        return ProbeResult(info: nil, rttMS: nil, availability: .offline)
+    }
+}
+
 enum NodeClientError: Error, CustomStringConvertible {
     case badURL(String)
     case tokenUnavailable(String)
@@ -308,6 +374,21 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
             throw NodeClientError.nodeIDMismatch(expected: config.nodeID, got: info.nodeID)
         }
         return (token, info)
+    }
+
+    /// 测速用的 /v1/info。走 `prepare`：同一份 token 文件、同一条直连 URLSession（空代理字典，不走代理）。
+    /// 默认超时 3 秒。结果里没有 token。
+    static func probeInfo(config: NodeConfig, timeout: Duration = ProbeResult.timeout) async -> ProbeResult {
+        let started = ContinuousClock().now
+        do {
+            let (_, info) = try await prepare(config: config, timeout: timeout)
+            let rtt = max(0, started.duration(to: ContinuousClock().now).secondsValue * 1000)
+            return ProbeResult(info: info, rttMS: rtt, availability: ProbeResult.availability(of: info))
+        } catch let error as NodeClientError {
+            return ProbeResult(info: nil, rttMS: nil, availability: ProbeResult.availability(of: error))
+        } catch {
+            return ProbeResult(info: nil, rttMS: nil, availability: .offline)
+        }
     }
 
     func connect() async throws {
@@ -1137,6 +1218,40 @@ extension NodeClient {
               "JSON 整数 1 不得被当成布尔")
         check(Self.eventInt(Self.parseEvent(#"{"id":true}"#)?["id"]) == nil,
               "JSON 布尔不是句子 id")
+        check(ProbeResult.median([30, 10, 20]) == 20, "ProbeResult 3 次 RTT 取中位数")
+        check(ProbeResult.median([1, 3]) == 2, "ProbeResult 偶数个样本取中间平均")
+        check(ProbeResult.median([4]) == 4, "ProbeResult 单个样本就是中位数")
+        check(ProbeResult.median([]) == nil, "ProbeResult 空样本没有中位数")
+        check(ProbeResult.median([.nan, 4, .infinity, 8]) == 6, "ProbeResult 中位数忽略非有限值")
+        check(ProbeResult.samplesPerNode == 3, "每个节点测 3 次")
+        check(ProbeResult.timeout == .seconds(3), "测速超时 3 秒")
+        let idleInfo = NodeInfo(
+            v: 2, nodeID: "n", hwHash: "h", asr: .init(model: "whisper-large-v3-turbo", rtf: 0.1),
+            translator: "apple", busy: false, onAC: true, inUse: false, worker: "warm"
+        )
+        var busyInfo = idleInfo
+        busyInfo.busy = true
+        var usedInfo = idleInfo
+        usedInfo.inUse = true
+        usedInfo.busy = true
+        check(ProbeResult.availability(of: idleInfo) == .idle, "未占用且不忙是空闲")
+        check(ProbeResult.availability(of: busyInfo) == .busy, "busy 是忙")
+        check(ProbeResult.availability(of: usedInfo) == .inUse, "有人在用优先于忙")
+        check(ProbeResult.availability(of: NodeClientError.unauthorized) == .unauthorized, "401 是鉴权失败")
+        check(ProbeResult.availability(of: NodeClientError.tokenUnavailable("/tmp/secret-token-value")) == .unauthorized, "token 文件不可用算鉴权失败")
+        check(ProbeResult.availability(of: NodeClientError.timeout) == .offline, "超时算离线")
+        check(ProbeResult.availability(of: NodeClientError.tokenUnavailable("/tmp/secret-token-value")).title == "鉴权失败", "鉴权状态不带 token 路径")
+        let combined = ProbeResult.combined([
+            ProbeResult(info: nil, rttMS: 30, availability: .offline),
+            ProbeResult(info: idleInfo, rttMS: 10, availability: .idle),
+            ProbeResult(info: idleInfo, rttMS: 20, availability: .idle),
+        ])
+        check(combined.rttMS == 20 && combined.availability == .idle && combined.info == idleInfo, "ProbeResult 合并三次取中位数")
+        let denied = ProbeResult.combined([
+            ProbeResult(info: nil, rttMS: nil, availability: .offline),
+            ProbeResult(info: nil, rttMS: nil, availability: .unauthorized),
+        ])
+        check(denied.availability == .unauthorized && denied.rttMS == nil && denied.info == nil, "都失败时鉴权失败优先于离线")
         return failures
     }
 

@@ -214,6 +214,10 @@ final class NodeRouter: @unchecked Sendable {
     private var releaseNodeAtSilence = false
     /// select 选出的节点。云端档关掉连接时也保留，降级时不用再等一轮 30s 探测。
     private var preferredNodeID: String?
+    /// 用户钉住的节点 id。nil 表示不指定，选点与原来一样。
+    private let pinnedNode: String?
+    private var announcedMissingPin = false
+    private var lastPinnedDownNotice: String?
     private var probeWaiter: CheckedContinuation<Void, Never>?
     private var probeKick = false
 
@@ -225,7 +229,8 @@ final class NodeRouter: @unchecked Sendable {
         nodesURL: URL = NodeRouter.defaultNodesURL,
         stateURL: URL = NodeRouter.defaultStateURL,
         localAccurate: Bool = Capability.supportsAccurateLocal(),
-        nodeTierEnabled: Bool = true
+        nodeTierEnabled: Bool = true,
+        pinnedNode: String? = nil
     ) {
         self.sourceLocaleID = sourceLocaleID
         self.targetLanguageID = targetLanguageID
@@ -235,6 +240,7 @@ final class NodeRouter: @unchecked Sendable {
         self.stateURL = stateURL
         self.localAccurate = localAccurate
         self.nodeTierEnabled = nodeTierEnabled
+        self.pinnedNode = AppSettings.normalizedPin(pinnedNode)
     }
 
     // macOS 的 expandingTildeInPath 不认 $HOME，冒烟/测试没法靠改 HOME 隔离；
@@ -412,7 +418,19 @@ final class NodeRouter: @unchecked Sendable {
     }
 
     private func probeOnce() async {
-        let configs = lock.withLockValue { nodes }
+        let allConfigs = lock.withLockValue { nodes }
+        let decision = Self.pinnedCandidateDecision(nodeIDs: allConfigs.map(\.id), pinnedNode: pinnedNode)
+        if case .missing(let missingID) = decision {
+            let tell = lock.withLockValue { () -> Bool in
+                if announcedMissingPin { return false }
+                announcedMissingPin = true
+                return true
+            }
+            if tell {
+                callbacks.onStatus(Self.pinnedMissingStatus(id: missingID))
+            }
+        }
+        let configs = Self.configsForProbe(allConfigs, pinnedNode: pinnedNode)
         var candidates: [RouteCandidate] = []
         let localHWHash = Capability.hwHash()
         var localInfo: NodeInfo?
@@ -524,12 +542,16 @@ final class NodeRouter: @unchecked Sendable {
 
     private func select(candidates: [RouteCandidate]) async {
         let now = nowSeconds()
-        let best = RoutingDecider.choose(
-            candidates: candidates.map { candidate in
-                var c = candidate
-                c.offlineUntil = lock.withLockValue { states[candidate.id]?.offlineUntil }
-                return c
-            },
+        let manifestIDs = lock.withLockValue { nodes.map(\.id) }
+        let adjusted = candidates.map { candidate in
+            var c = candidate
+            c.offlineUntil = lock.withLockValue { states[candidate.id]?.offlineUntil }
+            return c
+        }
+        let best = Self.routeSelection(
+            candidates: adjusted,
+            nodeIDs: manifestIDs,
+            pinnedNode: pinnedNode,
             now: now,
             localAccurate: localAccurate,
             weights: weights
@@ -553,16 +575,23 @@ final class NodeRouter: @unchecked Sendable {
         // 切换一律由 audioLoop 在下一块音频到达时执行（首次连接立刻，迁移等静音点）：
         // 这里若也直接切，会和 audioLoop 同时对同一节点开两个会话，后者吃 1013。
         // 云端档关闭时只记住最优节点，不观察迁移门：观察 nil 会把节点之间的两轮计数清掉。
-        lock.withLockVoid {
+        let followUp = lock.withLockValue { () -> (notice: String?, drop: NodeSessionRef?) in
             preferredNodeID = best?.id
-            let gateAllows: Bool
+            let scoredGate: Bool
             if !nodeTierEnabled || releaseNodeAtSilence || currentNode == nil {
-                gateAllows = false
+                scoredGate = false
             } else {
                 var gateCopy = gate
-                gateAllows = gateCopy.observe(best: best, current: currentScore)
+                scoredGate = gateCopy.observe(best: best, current: currentScore)
                 gate = gateCopy
             }
+            let gateAllows = Self.migrationGateAllows(
+                nodeIDs: manifestIDs,
+                pinnedNode: pinnedNode,
+                bestID: best?.id,
+                currentNodeID: currentNode?.id,
+                scoredGateAllows: scoredGate
+            )
             switch Self.pendingMigrationUpdate(
                 nodeTierEnabled: nodeTierEnabled,
                 releaseNodeAtSilence: releaseNodeAtSilence,
@@ -575,7 +604,46 @@ final class NodeRouter: @unchecked Sendable {
             case .keep:
                 break
             }
+            let notice = Self.pinnedUnavailableNotice(
+                nodeIDs: manifestIDs,
+                pinnedNode: pinnedNode,
+                bestID: best?.id
+            )
+            let emitNotice = notice != lastPinnedDownNotice ? notice : nil
+            lastPinnedDownNotice = notice
+            let drop = Self.shouldDropPinnedSession(
+                nodeIDs: manifestIDs,
+                pinnedNode: pinnedNode,
+                bestID: best?.id,
+                currentNodeID: currentNode?.id
+            ) && !switching ? currentSession : nil
+            return (emitNotice, drop)
         }
+        if let notice = followUp.notice {
+            callbacks.onStatus(notice)
+        }
+        if let session = followUp.drop {
+            await dropPinnedSession(session)
+        }
+    }
+
+    /// 指定节点已经不可用，而且没有本机节点可迁：拆掉当前会话，字幕留在本机流水线。
+    /// 不额外写 offline_until，下一轮探测看到它恢复就按「当前没有会话」接回去。
+    private func dropPinnedSession(_ session: NodeSessionRef) async {
+        let client = lock.withLockValue { () -> NodeClient? in
+            guard currentSession == session, !switching else { return nil }
+            let client = currentClient
+            currentClient = nil
+            currentSession = nil
+            currentNode = nil
+            currentToken = nil
+            currentInfo = nil
+            pendingMigrationID = nil
+            return client
+        }
+        guard let client else { return }
+        await client.close()
+        onMode(.local)
     }
 
     private static func currentRouteScore(
@@ -1300,6 +1368,119 @@ final class NodeRouter: @unchecked Sendable {
         ok = true
     }
 
+    enum PinnedCandidateDecision: Equatable {
+        case unrestricted
+        case only(String)
+        case missing(String)
+    }
+
+    /// 不指定：保持全部候选。指定的 id 在清单里：只留它和本机。不在清单里：只留本机。
+    static func pinnedCandidateDecision(nodeIDs: [String], pinnedNode: String?) -> PinnedCandidateDecision {
+        guard let pin = AppSettings.normalizedPin(pinnedNode) else {
+            return .unrestricted
+        }
+        if nodeIDs.contains(pin) {
+            return .only(pin)
+        }
+        return .missing(pin)
+    }
+
+    static func filterRouteCandidates(
+        candidates: [RouteCandidate],
+        nodeIDs: [String],
+        pinnedNode: String?
+    ) -> [RouteCandidate] {
+        switch pinnedCandidateDecision(nodeIDs: nodeIDs, pinnedNode: pinnedNode) {
+        case .unrestricted:
+            return candidates
+        case .only(let id):
+            return candidates.filter { $0.isLocal || $0.id == id }
+        case .missing:
+            return candidates.filter(\.isLocal)
+        }
+    }
+
+    static func configsForProbe(_ nodes: [NodeConfig], pinnedNode: String?) -> [NodeConfig] {
+        switch pinnedCandidateDecision(nodeIDs: nodes.map(\.id), pinnedNode: pinnedNode) {
+        case .unrestricted:
+            return nodes
+        case .only(let id):
+            return nodes.filter { $0.id == id }
+        case .missing:
+            return []
+        }
+    }
+
+    /// 未指定时与 `RoutingDecider.choose` 相同。
+    /// 指定节点能打分时就用它，不因为别的节点分数更高而改选。
+    /// 指定节点不在清单里，或当前打不出分（离线、忙、鉴权失败）：只在本机候选里选。
+    static func routeSelection(
+        candidates: [RouteCandidate],
+        nodeIDs: [String],
+        pinnedNode: String?,
+        now: Double,
+        localAccurate: Bool,
+        weights: RouteWeights = .default
+    ) -> RouteScore? {
+        let decision = pinnedCandidateDecision(nodeIDs: nodeIDs, pinnedNode: pinnedNode)
+        let filtered = filterRouteCandidates(candidates: candidates, nodeIDs: nodeIDs, pinnedNode: pinnedNode)
+        if case .only(let id) = decision,
+           let pinned = filtered.first(where: { !$0.isLocal && $0.id == id }),
+           let score = RoutingDecider.score(pinned, now: now, localAccurate: localAccurate, weights: weights) {
+            return score
+        }
+        return RoutingDecider.choose(
+            candidates: filtered,
+            now: now,
+            localAccurate: localAccurate,
+            weights: weights
+        )
+    }
+
+    /// 未指定时沿用原来的迁移门。指定节点能用就要接回去；它不能用且当前还连着它，就离开。
+    static func migrationGateAllows(
+        nodeIDs: [String],
+        pinnedNode: String?,
+        bestID: String?,
+        currentNodeID: String?,
+        scoredGateAllows: Bool
+    ) -> Bool {
+        guard case .only(let pinned) = pinnedCandidateDecision(nodeIDs: nodeIDs, pinnedNode: pinnedNode) else {
+            return scoredGateAllows
+        }
+        if bestID == pinned && currentNodeID != pinned {
+            return true
+        }
+        if bestID != pinned && currentNodeID == pinned {
+            return true
+        }
+        return scoredGateAllows
+    }
+
+    static func shouldDropPinnedSession(
+        nodeIDs: [String],
+        pinnedNode: String?,
+        bestID: String?,
+        currentNodeID: String?
+    ) -> Bool {
+        guard case .only(let pinned) = pinnedCandidateDecision(nodeIDs: nodeIDs, pinnedNode: pinnedNode) else {
+            return false
+        }
+        return bestID == nil && currentNodeID == pinned
+    }
+
+    static func pinnedUnavailableNotice(nodeIDs: [String], pinnedNode: String?, bestID: String?) -> String? {
+        guard case .only(let id) = pinnedCandidateDecision(nodeIDs: nodeIDs, pinnedNode: pinnedNode) else {
+            return nil
+        }
+        guard bestID != id else { return nil }
+        return "\(id) 不可用，已用本机"
+    }
+
+    static func pinnedMissingStatus(id: String) -> String {
+        "\(id) 不在节点列表，已用本机"
+    }
+
     static func selfTest() -> [String] {
         var failures: [String] = []
         func check(_ ok: Bool, _ name: String) {
@@ -1329,6 +1510,57 @@ final class NodeRouter: @unchecked Sendable {
         let better = RouteCandidate(id: "better", expectedNodeID: "n2", info: betterInfo, rttMS: 20, isLocal: false, offlineUntil: nil)
         check(RoutingDecider.choose(candidates: [base, better], now: 0, localAccurate: true)?.id == "better",
               "更优节点上线应被选中")
+        let localCandidate = RouteCandidate(
+            id: localUDSID, expectedNodeID: "n1", info: goodInfo, rttMS: 5, isLocal: true, offlineUntil: nil
+        )
+        let manifestIDs = ["base", "better", "win"]
+        let winBusy = RouteCandidate(id: "win", expectedNodeID: "n3", info: busyInfo, rttMS: 10, isLocal: false, offlineUntil: nil)
+        let pool = [localCandidate, base, better, winBusy]
+        check(Self.routeSelection(candidates: pool, nodeIDs: manifestIDs, pinnedNode: nil, now: 0, localAccurate: true)?.id
+              == RoutingDecider.choose(candidates: pool, now: 0, localAccurate: true)?.id,
+              "pinned 为 nil 时选择与原来的 choose 一致")
+        check(Self.filterRouteCandidates(candidates: pool, nodeIDs: manifestIDs, pinnedNode: nil).map(\.id) == ["local_uds", "base", "better", "win"],
+              "pinned 为 nil 时候选不过滤")
+        check(Self.filterRouteCandidates(candidates: pool, nodeIDs: manifestIDs, pinnedNode: "win").map(\.id) == ["local_uds", "win"],
+              "pinned 存在时只留该 id 和本机")
+        check(Self.filterRouteCandidates(candidates: pool, nodeIDs: manifestIDs, pinnedNode: "ghost").map(\.id) == ["local_uds"],
+              "pinned 不存在时只留本机")
+        check(Self.filterRouteCandidates(candidates: pool, nodeIDs: manifestIDs, pinnedNode: "  ").map(\.id) == ["local_uds", "base", "better", "win"],
+              "空白 pinned 视为不指定")
+        check(Self.routeSelection(candidates: pool, nodeIDs: manifestIDs, pinnedNode: "base", now: 0, localAccurate: true)?.id == "base",
+              "指定节点可用时选它，不选更快的其它节点")
+        check(Self.routeSelection(candidates: pool, nodeIDs: manifestIDs, pinnedNode: "win", now: 0, localAccurate: true)?.id == localUDSID,
+              "指定节点不可用时只回本机，不选其它节点")
+        check(Self.routeSelection(candidates: [base, better, winBusy], nodeIDs: manifestIDs, pinnedNode: "win", now: 0, localAccurate: true) == nil,
+              "指定节点不可用且没有本机候选时不改选其它节点")
+        check(Self.routeSelection(candidates: pool, nodeIDs: manifestIDs, pinnedNode: "ghost", now: 0, localAccurate: true)?.id == localUDSID,
+              "pinned 不在清单时当作本机")
+        let winConfig = NodeConfig(id: "win", nodeID: "n3", url: "ws://win:8791", tokenFile: "/tmp/t")
+        let miniConfig = NodeConfig(id: "mini2", nodeID: "n2", url: "ws://mini2:8791", tokenFile: "/tmp/t")
+        check(Self.configsForProbe([winConfig, miniConfig], pinnedNode: nil).map(\.id) == ["win", "mini2"],
+              "未指定时探测全部节点")
+        check(Self.configsForProbe([winConfig, miniConfig], pinnedNode: "mini2").map(\.id) == ["mini2"],
+              "指定节点时只探测该 id")
+        check(Self.configsForProbe([winConfig, miniConfig], pinnedNode: "ghost").isEmpty,
+              "指定节点不在清单时不探测其它节点")
+        check(Self.migrationGateAllows(nodeIDs: manifestIDs, pinnedNode: nil, bestID: "b", currentNodeID: "a", scoredGateAllows: false) == false,
+              "未指定时沿用原来的迁移门")
+        check(Self.migrationGateAllows(nodeIDs: manifestIDs, pinnedNode: "win", bestID: "win", currentNodeID: localUDSID, scoredGateAllows: false),
+              "指定节点恢复后应接回，不等分数差")
+        check(Self.migrationGateAllows(nodeIDs: manifestIDs, pinnedNode: "win", bestID: localUDSID, currentNodeID: "win", scoredGateAllows: false),
+              "指定节点不可用时应离开它")
+        check(Self.shouldDropPinnedSession(nodeIDs: manifestIDs, pinnedNode: "win", bestID: nil, currentNodeID: "win"),
+              "指定节点不可用且没有本机节点会话时应断开")
+        check(!Self.shouldDropPinnedSession(nodeIDs: manifestIDs, pinnedNode: nil, bestID: nil, currentNodeID: "win"),
+              "未指定时不因这条规则断开")
+        check(Self.pinnedUnavailableNotice(nodeIDs: manifestIDs, pinnedNode: "win", bestID: nil) == "win 不可用，已用本机",
+              "指定节点不可用的状态文案")
+        check(Self.pinnedUnavailableNotice(nodeIDs: manifestIDs, pinnedNode: "win", bestID: localUDSID) == "win 不可用，已用本机",
+              "回到本机节点时也提示指定节点不可用")
+        check(Self.pinnedUnavailableNotice(nodeIDs: manifestIDs, pinnedNode: "win", bestID: "win") == nil,
+              "指定节点可用时不报不可用")
+        check(Self.pinnedMissingStatus(id: "ghost") == "ghost 不在节点列表，已用本机",
+              "清单里没有该节点的提示")
         check(RoutingDecider.choose(candidates: [better, RouteCandidate(id: "off", expectedNodeID: "n1", info: goodInfo, rttMS: 10, isLocal: false, offlineUntil: 100)], now: 1, localAccurate: true)?.id == "better",
               "offline_until 内节点应排除")
         check(RoutingDecider.choose(candidates: [RouteCandidate(id: "busy", expectedNodeID: "n3", info: busyInfo, rttMS: 10, isLocal: false, offlineUntil: nil)], now: 0, localAccurate: true) == nil,
