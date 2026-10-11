@@ -348,7 +348,7 @@ DRAFT_MIN_WORDS = 3       # 残句至少这么多词才值得出草稿
 # "等凑成完整句 + 一次完整 Ollama"，新闻播报那种 30 字以上的句子要 3-8 秒。
 # 8 字 ≈ 德语 3 词（按 MAX_PENDING_CHARS=60 ≈ MAX_PENDING_WORDS=24 的换算）
 DRAFT_MIN_CHARS = 8
-CHINESE_TEXT_COLOR = "#c8c8c8"  # 正式中文颜色（句对里的译文行）
+CHINESE_TEXT_COLOR = "#ffe894"  # 正式译文颜色（句对里的目标语言行）
 DRAFT_TEXT_COLOR = "#8fb8e0"  # 草稿中文颜色（和正式中文区分）
 
 # ============ 「性能」模式的轻量翻译模型 ============
@@ -456,7 +456,7 @@ TRANSLATION_STYLE_PROMPTS = {
 
 # 窗口样式
 BACKGROUND_OPACITY = 235  # 背景不透明度 0-255（255=纯黑不透；设置面板有滑块，会记住）
-TEXT_COLOR = "white"  # 文字颜色
+TEXT_COLOR = "#F0F0F0"  # 原文颜色
 BORDER_COLOR = "rgba(255, 255, 255, 0.3)"  # 边框颜色
 BORDER_RADIUS = 10  # 圆角半径
 PADDING = "15px 20px"  # 内边距

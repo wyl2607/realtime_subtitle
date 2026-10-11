@@ -25,8 +25,9 @@ from PyQt6.QtWidgets import (
     QGraphicsOpacityEffect,
 )
 from PyQt6.QtCore import (
-    Qt, pyqtSignal, QObject, QTimer, QPropertyAnimation, QEasingCurve,
+    Qt, pyqtSignal, QObject, QTimer, QPropertyAnimation, QEasingCurve, QPointF, QRectF,
 )
+from PyQt6.QtGui import QColor, QPainter, QPen
 import realtime_subtitle.config as config
 from realtime_subtitle.paths import repo_path
 from realtime_subtitle.ui.window_geometry import (
@@ -58,6 +59,67 @@ if sys.platform == "win32":
 # 窗口位置/大小/字号的持久化文件（重启后恢复用户调好的布局）。
 # 仓库根：uninstall.ps1 / update_subtitles.ps1 都按这个位置跟用户讲
 STATE_FILE = repo_path("window_state.json")
+OLD_DEFAULT_TRANSLATION_COLOR = "#c8c8c8"
+NEW_DEFAULT_TRANSLATION_COLOR = "#FFE894"
+
+
+class ChromeToolButton(QPushButton):
+    """30px 工具条按钮：样式表画底，QPainter 画跨平台单色图标。"""
+
+    def __init__(self, text="", icon=None):
+        super().__init__(text)
+        self._chrome_icon = icon
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self._chrome_icon:
+            return
+        try:
+            self._paint_icon()
+        except Exception:
+            return
+
+    def _paint_icon(self):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        pen = QPen(QColor(245, 245, 245, 235), 2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        icon = self._chrome_icon
+        if icon == "history":
+            for y in (10, 15, 20):
+                p.drawPoint(QPointF(9, y))
+                p.drawLine(QPointF(12, y), QPointF(22, y))
+        elif icon == "tv":
+            p.drawRoundedRect(QRectF(7, 8, 16, 11), 2, 2)
+            p.drawLine(QPointF(15, 19), QPointF(15, 22))
+            p.drawLine(QPointF(11, 22), QPointF(19, 22))
+        elif icon == "cinema":
+            p.drawRoundedRect(QRectF(6, 10, 18, 10), 2, 2)
+            p.drawLine(QPointF(8, 13), QPointF(22, 13))
+            p.drawLine(QPointF(8, 17), QPointF(22, 17))
+        elif icon == "ai":
+            p.drawRoundedRect(QRectF(7, 8, 16, 11), 5, 5)
+            p.drawLine(QPointF(12, 19), QPointF(10, 22))
+            p.drawLine(QPointF(12, 19), QPointF(15, 19))
+        elif icon == "settings":
+            p.drawEllipse(QPointF(15, 15), 4.0, 4.0)
+            for a, b in (
+                ((15, 6), (15, 9)),
+                ((15, 21), (15, 24)),
+                ((6, 15), (9, 15)),
+                ((21, 15), (24, 15)),
+                ((9, 9), (11, 11)),
+                ((21, 9), (19, 11)),
+                ((9, 21), (11, 19)),
+                ((21, 21), (19, 19)),
+            ):
+                p.drawLine(QPointF(*a), QPointF(*b))
+        elif icon == "quit":
+            p.drawLine(QPointF(10, 10), QPointF(20, 20))
+            p.drawLine(QPointF(20, 10), QPointF(10, 20))
+        p.end()
 
 
 def _atomic_write_json(path, data):
@@ -76,6 +138,19 @@ def _atomic_write_json(path, data):
     except OSError:
         pass  # 备份失败不该挡住正常保存
     os.replace(tmp_path, path)
+
+
+def _migrate_tuning_defaults(state):
+    tuning = state.get("tuning")
+    if not isinstance(tuning, dict):
+        return state
+    color = tuning.get("CHINESE_TEXT_COLOR")
+    if isinstance(color, str) and color.strip().lower() == OLD_DEFAULT_TRANSLATION_COLOR:
+        tuning = dict(tuning)
+        tuning["CHINESE_TEXT_COLOR"] = NEW_DEFAULT_TRANSLATION_COLOR
+        state = dict(state)
+        state["tuning"] = tuning
+    return state
 
 
 def _ai_web_enabled():
@@ -173,69 +248,63 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
                 border: 1px solid rgba(255, 255, 255, 0.3);
                 border-radius: 15px;
                 font-size: 16px;
+                font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
             }
             QPushButton:hover {
                 background-color: rgba(80, 80, 80, 200);
             }
+            QPushButton[danger="true"]:hover {
+                background-color: rgba(190, 54, 54, 220);
+            }
         """
         
         # 创建最小化按钮
-        self.minimize_btn = QPushButton("➖")
+        self.minimize_btn = ChromeToolButton("—")
         self.minimize_btn.setFixedSize(30, 30)
         self.minimize_btn.setStyleSheet(button_style)
         self.minimize_btn.clicked.connect(self._minimize_window)
         self.minimize_btn.setToolTip("最小化字幕")
         
         # 创建历史按钮
-        self.history_btn = QPushButton("📜")
+        self.history_btn = ChromeToolButton(icon="history")
         self.history_btn.setFixedSize(30, 30)
         self.history_btn.setStyleSheet(button_style)
         self.history_btn.clicked.connect(self._toggle_history)
         self.history_btn.setToolTip("字幕历史（可滚动回看）")
 
         # 创建电视全屏按钮
-        self.tv_btn = QPushButton("📺")
+        self.tv_btn = ChromeToolButton(icon="tv")
         self.tv_btn.setFixedSize(30, 30)
         self.tv_btn.setStyleSheet(button_style)
         self.tv_btn.clicked.connect(self._toggle_tv)
         self.tv_btn.setToolTip("电视全屏模式（大字滚动，Esc 退出）")
 
         # 影院字幕条：叠在全屏视频底部的透明覆盖层（全屏看剧场景）
-        self.cinema_btn = QPushButton("🎞")
+        self.cinema_btn = ChromeToolButton(icon="cinema")
         self.cinema_btn.setFixedSize(30, 30)
         self.cinema_btn.setStyleSheet(button_style)
         self.cinema_btn.clicked.connect(self._toggle_cinema)
         self.cinema_btn.setToolTip("影院字幕条（叠在全屏视频底部，鼠标可穿透）")
 
         # AI 分析：最近几分钟背景总结（本地 Ollama → 可跳网页版追问）
-        self.ai_btn = QPushButton("🤖")
+        self.ai_btn = ChromeToolButton(icon="ai")
         self.ai_btn.setFixedSize(30, 30)
         self.ai_btn.setStyleSheet(button_style)
         self.ai_btn.clicked.connect(self._on_ai_analysis_clicked)
         self.ai_btn.setToolTip("AI 分析最近几分钟内容（本地模型 + 可跳网页版）")
 
         # 创建设置按钮
-        self.settings_btn = QPushButton("⚙️")
+        self.settings_btn = ChromeToolButton(icon="settings")
         self.settings_btn.setFixedSize(30, 30)
         self.settings_btn.setStyleSheet(button_style)
         self.settings_btn.clicked.connect(self._toggle_settings)
         self.settings_btn.setToolTip("参数设置")
         
         # 创建退出按钮
-        self.quit_btn = QPushButton("❌")
+        self.quit_btn = ChromeToolButton(icon="quit")
         self.quit_btn.setFixedSize(30, 30)
-        self.quit_btn.setStyleSheet("""
-            QPushButton {
-                background-color: rgba(180, 50, 50, 180);
-                color: white;
-                border: 1px solid rgba(255, 255, 255, 0.3);
-                border-radius: 15px;
-                font-size: 16px;
-            }
-            QPushButton:hover {
-                background-color: rgba(220, 60, 60, 200);
-            }
-        """)
+        self.quit_btn.setProperty("danger", True)
+        self.quit_btn.setStyleSheet(button_style)
         self.quit_btn.clicked.connect(self._quit_application)
         self.quit_btn.setToolTip("退出程序")
         
@@ -460,9 +529,9 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         print("   💡 鼠标移到窗口边缘/四角可拖拽缩放（窗口越大显示的历史越多）")
         print("   💡 拖动条/按钮工具条平时隐藏，鼠标移入才出现（看剧零遮挡）")
         print("   💡 若完全点不到窗口：按 Ctrl+Alt+M 关闭「鼠标穿透」（右上角会有幽灵提示）")
-        print("   💡 点击 ➖ 按钮可最小化字幕")
-        print("   💡 点击 ⚙️ 按钮可打开参数调节面板")
-        print("   💡 点击 ❌ 按钮可退出程序")
+        print("   💡 点击最小化按钮可最小化字幕")
+        print("   💡 点击设置按钮可打开参数调节面板")
+        print("   💡 点击退出按钮可退出程序")
     
     # ------------------------------------------------------------------
     # 悬浮工具条 / 标题拖动条 / 穿透指示器
@@ -499,6 +568,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
             if migrated is not data and migrated.get("coord_dpr") != data.get("coord_dpr"):
                 print(f"ℹ️  显示缩放变了（存档 {data.get('coord_dpr', 1.0)} → 当前 "
                       f"{current_dpr}），窗口布局和字号已按比例换算")
+            migrated = _migrate_tuning_defaults(migrated)
             return migrated
         return {}
 
