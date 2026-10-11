@@ -102,6 +102,10 @@ curl -s -H "Authorization: Bearer $TOKEN" http://<节点Tailscale-IP>:8791/v1/in
 - 启动客户端（Mac 原生版 `rslite`，或 Windows 客户端在 ⚙️ 设置面板中开启「使用算力节点」）；
 - 查看悬浮窗左下角状态行：应由「本机」更新为**「混合·<节点名>」**（例如「混合·mini2」）；
 - 播放一段视频：本机实时出字，稍后状态栏提示精修到达，字幕无缝更新。
+- **Mac rslite：节点对比 / 测速**。菜单栏状态项（标题为「字·」加当前模式，例如「字·本机」）里的「设置…」（⌘,）打开「rslite 设置」，进入「算力节点」。表的列是「名称」「识别模型」「翻译」「延迟」「rtf」「状态」「预计」。按钮文案是「测速」，进行中变为「测速中…」。打开这一页时会自动测一次。表下说明原文：「预计每句耗时 ≈ RTT + rtf×4s（RTT 用秒，表里的延迟是毫秒）。这是估算，不是实测整句耗时。本机没有网络延迟，延迟显示为 —。」
+- **Mac rslite：指定节点**。在「识别与语言」→「运行模式」选择「指定节点」（另外两项是「仅本机（默认）」和「自动选最快」）。`nodes.json` 里还没有节点时，原文是「nodes.json 里还没有节点。指定节点需要先添加。」有节点时，在「节点」里选定一台（第一项是「请选择」），点「保存」。页上原文：「选定后重启才会钉住这一台。不选具体节点则仍按混合路由。」以及「重启 rslite 后生效」。保存成功显示「已写入 settings.json。重启 rslite 后生效。」「指定节点」写入 `mode` 为 `hybrid`，并把所选 id 写入 `pinnedNode`。
+- **命令行备选**：`rslite --mode hybrid --node ID`。usage 原文是 `usage: rslite [--source tap|mic|file:PATH] [--src de-DE] [--dst zh-Hans] [--headless] [--mode auto|local|hybrid] [--node ID] [--selftest] [--set-groq-key|--clear-groq-key|--cloud on|off]`。`--mode` 只能是 auto、local 或 hybrid。只写 `--node ID` 而 mode 仍是 local 时不连节点。命令行上的 `--mode` 和 `--node` 只覆盖这一次启动，不写回 `settings.json`。
+- 指定的节点不可用时，状态文案为「<id> 不可用，已用本机」（`<id>` 是指定的节点 id）。该 id 不在节点列表里时，状态文案为「<id> 不在节点列表，已用本机」。
 
 ---
 
@@ -112,6 +116,7 @@ curl -s -H "Authorization: Bearer $TOKEN" http://<节点Tailscale-IP>:8791/v1/in
 2. **凭据安全**：Token 采用 32 字节随机熵（64 位十六进制），仅通过标准输入（stdin）或权限严格锁定的文件传递（Mac 设为 `0600`，Windows 通过 `icacls` 移除继承并仅赋权当前用户和 SYSTEM）。Token 绝不出现在命令行参数（argv）、`ps` 进程列表或系统日志中；
 3. **音频不落盘**：音频切片仅在内存管道与内存队列中流转，识别完成后立即释放，绝不在节点磁盘生成任何临时音频文件；
 4. **日志脱敏**：Gateway 与 Worker 日志仅记录连接事件、耗时、帧数与状态码，**绝不记录任何转录原文或翻译文本内容**。
+5. **Swift 客户端也校验 Tailscale 网段**：Mac 原生 `rslite` 在连节点前要求地址属于 `100.64.0.0/10`，并钉成 IPv4 字面量再连。主机名先解析成 IPv4；解析出的任一地址不在该网段就拒绝，文案为「节点地址不在 Tailscale 网段（100.64.0.0/10），拒绝连接：<主机名>」。`/v1/info` 与 `/v2/session` 都先做这一步。
 
 ---
 
