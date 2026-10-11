@@ -5,6 +5,7 @@
 
 | CR | TK | rounds | status | last_action |
 |----|----|--------|--------|-------------|
+| CR-002 | TK-002 | 2 | resolved | 2026-10-11 17:05 CST: round-2 recheck clean，已合并 feat/macos-native |
 
 ## 字段说明
 - **rounds**：已完成 review 轮数（initial = 1，第一次 recheck = 2，以此类推）

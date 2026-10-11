@@ -26,7 +26,7 @@ v3.2.0：填了 Groq key 的 Mac（rslite）和 Windows 桌面客户端都能**�
 
 ## Checklist（与 TK done 状态保持一致）
 - [ ] TK-001 探针：rslite 词时间分段精度/延迟 + Groq 429 样本
-- [ ] TK-002 P9 夹具 + 云端状态机 + Provider 抽象（双端读夹具）
+- [x] TK-002 P9 夹具 + 云端状态机 + Provider 抽象（双端读夹具）
 - [ ] TK-003 rslite 云端：CloudClient + QuotaLedger + key/开关
 - [ ] TK-004 rslite CloudSegmenter + 分级路由接入 HybridEngine
 - [ ] TK-005 Windows 客户端句子带时间 + 样本时钟连续性

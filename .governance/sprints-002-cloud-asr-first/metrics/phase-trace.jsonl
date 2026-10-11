@@ -1,1 +1,13 @@
 {"ts":"2026-10-11T16:37:13+08:00","sprint":"sprints-002-cloud-asr-first","tk":null,"phase":"sprint-init","action":"enter","agent_role":"coordinator"}
+{"ts":"2026-10-11T16:37:49+08:00","sprint":"sprints-002-cloud-asr-first","tk":null,"phase":"scheduler","action":"dispatched","agent_role":"coordinator","tks":["TK-001","TK-002","TK-005"],"notes":"batch1 write_scope disjoint; TK-001 grok, TK-002/005 codex gpt-5.5 high"}
+{"ts":"2026-10-11T16:37:49+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-001","phase":"execution","action":"spawn","agent_role":"executor"}
+{"ts":"2026-10-11T16:37:49+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-002","phase":"execution","action":"spawn","agent_role":"executor"}
+{"ts":"2026-10-11T16:37:49+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-005","phase":"execution","action":"spawn","agent_role":"executor"}
+{"ts":"2026-10-11T16:47:42+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-002","phase":"execution","action":"return","agent_role":"executor","notes":"codex; coordinator re-verified pytest 4 passed, ruff, swift release build, selftest OK"}
+{"ts":"2026-10-11T16:53:11+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-005","phase":"execution","action":"return","agent_role":"executor","notes":"codex; coordinator full pytest 1062 passed/0 failed, ruff green; 3 pre-review findings"}
+{"ts":"2026-10-11T16:53:11+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-002","cr":"CR-002","phase":"review","action":"spawn","agent_role":"reviewer","round":1,"notes":"agy gemini-3.1-pro architecture (retry after allowlist fix)"}
+{"ts":"2026-10-11T16:53:11+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-005","cr":"CR-005","phase":"review","action":"spawn","agent_role":"reviewer","round":1,"notes":"opencode nvidia deepseek-v4.1-flash default lens"}
+{"ts":"2026-10-11T16:56:21+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-002","cr":"CR-002","phase":"review","action":"triage","agent_role":"coordinator","round":1,"notes":"2 accepted 0 rejected"}
+{"ts":"2026-10-11T17:05:33+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-002","cr":"CR-002","phase":"review","action":"repair","agent_role":"repairer","round":1,"notes":"agy gemini-3.1-pro (2nd attempt after tilde-path allowlist)"}
+{"ts":"2026-10-11T17:05:33+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-002","cr":"CR-002","phase":"review","action":"round-2-recheck","agent_role":"coordinator","round":2,"notes":"clean"}
+{"ts":"2026-10-11T17:05:33+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-002","cr":"CR-002","phase":"delivery","action":"synced","agent_role":"coordinator","notes":"merged into feat/macos-native"}
