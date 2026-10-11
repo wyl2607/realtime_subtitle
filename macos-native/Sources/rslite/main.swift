@@ -20,6 +20,13 @@ struct Options {
     var headless = false
     var mode = RSLiteMode.auto
     var selftest = false
+    var cloudCommand: CloudCommand?
+}
+
+enum CloudCommand {
+    case setGroqKey
+    case clearGroqKey
+    case setCloud(Bool)
 }
 
 @main
@@ -40,6 +47,15 @@ struct RSLite {
         if options.selftest {
             runSelfTest()
             return
+        }
+        if let command = options.cloudCommand {
+            do {
+                try runCloudCommand(command)
+                exit(0)
+            } catch {
+                fputs("error: \(error)\n", stderr)
+                exit(1)
+            }
         }
         do {
             if !(options.headless && options.source.hasPrefix("file:")) {
@@ -86,6 +102,25 @@ struct RSLite {
             case "--selftest":
                 options.selftest = true
                 i += 1
+            case "--set-groq-key":
+                options.cloudCommand = .setGroqKey
+                i += 1
+            case "--clear-groq-key":
+                options.cloudCommand = .clearGroqKey
+                i += 1
+            case "--cloud":
+                guard i + 1 < args.count else {
+                    throw RSLiteError.usage("missing value for \(key)")
+                }
+                switch args[i + 1] {
+                case "on":
+                    options.cloudCommand = .setCloud(true)
+                case "off":
+                    options.cloudCommand = .setCloud(false)
+                default:
+                    throw RSLiteError.usage("--cloud 只能是 on 或 off")
+                }
+                i += 2
             case "--source", "--src", "--dst", "--mode":
                 guard i + 1 < args.count else {
                     throw RSLiteError.usage("missing value for \(key)")
@@ -112,7 +147,21 @@ struct RSLite {
         return options
     }
 
-    private static let usage = "usage: rslite [--source tap|mic|file:PATH] [--src de-DE] [--dst zh-Hans] [--headless] [--mode auto|local|hybrid] [--selftest]"
+    private static let usage = "usage: rslite [--source tap|mic|file:PATH] [--src de-DE] [--dst zh-Hans] [--headless] [--mode auto|local|hybrid] [--selftest] [--set-groq-key|--clear-groq-key|--cloud on|off]"
+
+    private static func runCloudCommand(_ command: CloudCommand) throws {
+        switch command {
+        case .setGroqKey:
+            try CloudConfigStore.readLineFromStdinAndWriteKey()
+            print("Groq key 已写入")
+        case .clearGroqKey:
+            try CloudConfigStore.clearKey()
+            print("Groq key 已清除")
+        case .setCloud(let enabled):
+            try CloudConfigStore.writeEnabled(enabled)
+            print(enabled ? "云端已开启" : "云端已关闭")
+        }
+    }
 
     @available(macOS 27.0, *)
     private static func makeEngine(
@@ -288,6 +337,9 @@ struct RSLite {
         failures.append(contentsOf: LineStore.selfTest().map { "LineStore: \($0)" })
         failures.append(contentsOf: P9FixtureSelfTest.selfTest().map { "P9Fixture: \($0)" })
         failures.append(contentsOf: Capability.selfTest().map { "Capability: \($0)" })
+        failures.append(contentsOf: CloudConfigStore.selfTest().map { "CloudConfig: \($0)" })
+        failures.append(contentsOf: QuotaLedger.selfTest().map { "QuotaLedger: \($0)" })
+        failures.append(contentsOf: CloudClient.selfTest().map { "CloudClient: \($0)" })
         if #available(macOS 27.0, *) {
             failures.append(contentsOf: NodeRouter.selfTest().map { "NodeRouter: \($0)" })
             failures.append(contentsOf: HybridEngine.selfTest().map { "HybridEngine: \($0)" })
