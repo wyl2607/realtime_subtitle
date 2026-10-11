@@ -16,6 +16,7 @@ permissions:
 # - ubuntu:        pure pipeline helpers (no torch/PyQt/WASAPI)
 # - windows:       full pytest suite except standalone GUI harness scripts
 #   (those open real windows and sys.exit; still manual / optional)
+# - rslite-macos:  Swift 客户端编译 + 自检 + 设计令牌生成物同步（spec 006 E1）
 
 jobs:
   # 静态检查单独一个 job：十几秒出结果，不用等 windows 那边装完 torch 才知道
@@ -125,3 +126,45 @@ jobs:
           # Prefer non-interactive Qt
           export QT_QPA_PLATFORM=offscreen
           python -m pytest tests -q --tb=line
+
+  # rslite（Swift 客户端，spec 006 E1）：编译 + --selftest + 设计令牌生成物同步。
+  #
+  # 选 macos-26 而不是 macos-latest：Package.swift 声明 platforms macOS 26，
+  # rslite 依赖 macOS 26 的系统 API（SpeechTranscriber / Process Tap 等），
+  # 必须落在带对应 SDK 的镜像上；macos-latest 现在指向哪个大版本会随 GitHub
+  # 调整而漂移，写死 macos-26 才能让"编译不过"是真实信号而不是镜像换代。
+  # 若将来该标签不存在，回退 macos-latest，并保留这条注释说明本意。
+  #
+  # ☠️ continue-on-error 的来由：部分代码是 @available(macOS 27.0, *)，
+  # 当前 runner 的 SDK 尚未包含 macOS 27 API 时连编译都过不去。这是 runner
+  # 侧的滞后、不是本仓库的回归，所以整个 job 先容忍失败。**runner SDK 跟上
+  # macOS 27 后去掉这个 continue-on-error。**
+  rslite-macos:
+    runs-on: macos-26
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - name: Swift version
+        run: swift --version
+      # 缓存 SwiftPM 构建产物。key 里带上 Package.resolved（仓库当前没有依赖，
+      # hashFiles 取不到时返回空串、不会报错）和 Sources 的哈希——源码一改就换
+      # key，避免用旧编译结果糊弄出一份假的绿。
+      - uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57  # v4.2.0
+        with:
+          path: macos-native/.build
+          key: ${{ runner.os }}-swiftpm-${{ hashFiles('macos-native/Package.resolved', 'macos-native/Sources/**/*.swift') }}
+          restore-keys: |
+            ${{ runner.os }}-swiftpm-
+      - name: swift build (release)
+        run: swift build -c release --package-path macos-native
+      - name: rslite selftest
+        shell: bash
+        run: |
+          out="$(macos-native/.build/release/rslite --selftest)"
+          printf '%s\n' "$out"
+          case "$out" in
+            *"SELFTEST OK"*) echo "rslite selftest: OK" ;;
+            *) echo "::error::rslite --selftest 未输出 SELFTEST OK"; exit 1 ;;
+          esac
+      - name: Check design tokens are up to date
+        run: python3 scripts/design/gen_tokens.py --check
