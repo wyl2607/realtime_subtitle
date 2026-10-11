@@ -31,6 +31,9 @@ SAMPLE_RATE = 16000
 # Apple 单句通常 0.12s；超时留宽是为了冷启动，超过就算失败，不拖住后面的句子
 APPLE_TIMEOUT_S = 5.0
 
+# 节点翻译请求的 Ollama 租期。见下方 post 处注释。
+NODE_OLLAMA_KEEP_ALIVE = "3m"
+
 
 @dataclass
 class Utterance:
@@ -246,7 +249,9 @@ class OllamaBackend(Translator):
                     "prompt": prompt,
                     "stream": False,
                     "think": False,
-                    "keep_alive": getattr(config, "OFFLINE_OLLAMA_KEEP_ALIVE", "10m"),
+                    # 节点机往往也是用户自己的游戏/工作机：会话结束 2 分钟 worker 回收，
+                    # 翻译模型再多留 1 分钟就让出显存（2026-10-11 用户问「为什么 GPU 还被占着」）。
+                    "keep_alive": NODE_OLLAMA_KEEP_ALIVE,
                     # 与翻译/查词共用 num_ctx，否则 Ollama 会换 runner 重装模型
                     # （CLAUDE.md 第 4 节第 21 条）
                     "options": {"temperature": 0.2, "num_predict": 512,
