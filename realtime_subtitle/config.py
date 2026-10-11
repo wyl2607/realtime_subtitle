@@ -348,6 +348,7 @@ DRAFT_MIN_WORDS = 3       # 残句至少这么多词才值得出草稿
 # "等凑成完整句 + 一次完整 Ollama"，新闻播报那种 30 字以上的句子要 3-8 秒。
 # 8 字 ≈ 德语 3 词（按 MAX_PENDING_CHARS=60 ≈ MAX_PENDING_WORDS=24 的换算）
 DRAFT_MIN_CHARS = 8
+SOURCE_TEXT_COLOR = "#F0F0F0"  # 原文颜色（句对里的源语言行）
 CHINESE_TEXT_COLOR = "#ffe894"  # 正式译文颜色（句对里的目标语言行）
 DRAFT_TEXT_COLOR = "#8fb8e0"  # 草稿中文颜色（和正式中文区分）
 
@@ -393,7 +394,8 @@ CINEMA_BG_ALPHA = 150        # 文字底衬的黑色不透明度 0-255（0=纯�
 CINEMA_HOLD_SEC = 6.0
 FONT_FAMILY = "Microsoft YaHei, Arial"  # 字体
 MAX_SUBTITLE_LENGTH = 400  # 字幕最大字符数（双语显示需要更多空间）
-SHOW_BILINGUAL = True  # 同时显示德语原文和中文翻译
+DISPLAY_MODE = "bilingual"  # bilingual / target / source
+SHOW_BILINGUAL = True  # 同时显示德语原文和中文翻译（旧二态入口，仍由模式预设写入）
 UNSTABLE_TEXT_COLOR = "#999999"  # live行里未稳定（还可能变）的德语尾部颜色
 MAX_SENTENCE_PAIRS = 20  # 悬浮窗句对（德+中）条数上限；实际显示条数按窗口高度
                          # 精确排版测算，窗口拉大自动填满（更早的在📜历史窗口里）
@@ -455,10 +457,13 @@ TRANSLATION_STYLE_PROMPTS = {
 }
 
 # 窗口样式
+BACKGROUND_COLOR = "#000000"  # 字幕窗底衬基础色；透明度由 BACKGROUND_OPACITY 控制
 BACKGROUND_OPACITY = 235  # 背景不透明度 0-255（255=纯黑不透；设置面板有滑块，会记住）
-TEXT_COLOR = "#F0F0F0"  # 原文颜色
+TEXT_COLOR = SOURCE_TEXT_COLOR  # 旧名兼容；新持久化键是 SOURCE_TEXT_COLOR
+TEXT_EDGE = "none"  # none / shadow
 BORDER_COLOR = "rgba(255, 255, 255, 0.3)"  # 边框颜色
-BORDER_RADIUS = 10  # 圆角半径
+WINDOW_CORNER_RADIUS = 8  # 字幕窗圆角半径（只影响样式表，不改命中测试）
+BORDER_RADIUS = WINDOW_CORNER_RADIUS  # 旧名兼容
 PADDING = "15px 20px"  # 内边距
 
 # ============ 翻译术语表（德 → 中）============

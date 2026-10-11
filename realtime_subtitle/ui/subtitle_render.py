@@ -30,6 +30,15 @@ def _dim_color(color, factor=0.60):
     return "#" + "".join(f"{round(channel * factor):02x}" for channel in rgb)
 
 
+def _display_mode():
+    mode = str(getattr(config, "DISPLAY_MODE", "") or "").lower()
+    if mode not in {"bilingual", "target", "source"}:
+        return "bilingual" if getattr(config, "SHOW_BILINGUAL", True) else "target"
+    if getattr(config, "SHOW_BILINGUAL", True):
+        return "bilingual"
+    return "target" if mode == "bilingual" else mode
+
+
 class LiveTextRenderMixin:
 
     def update_live(self, committed, unstable):
@@ -162,18 +171,20 @@ class LiveTextRenderMixin:
         """一条已完成句对的富文本块"""
         lines = []
         opacity = 0.60 if dim else 1.0
+        mode = _display_mode()
         source_size = round(config.FONT_SIZE * 0.86)
-        source_color = getattr(config, "TEXT_COLOR", "#F0F0F0")
+        source_color = getattr(config, "SOURCE_TEXT_COLOR",
+                               getattr(config, "TEXT_COLOR", "#F0F0F0"))
         target_color = getattr(config, "CHINESE_TEXT_COLOR", "#FFE894")
         if dim:
             source_color = _dim_color(source_color, opacity)
             target_color = _dim_color(target_color, opacity)
-        if german and getattr(config, "SHOW_BILINGUAL", True):
+        if german and mode in {"bilingual", "source"}:
             lines.append(
                 f'<span style="color:{source_color};font-size:{source_size}px">'
                 f'{html.escape(self._clip(german))}</span>'
             )
-        if chinese:
+        if chinese and mode in {"bilingual", "target"}:
             lines.append(
                 f'<span style="color:{target_color};font-size:{config.FONT_SIZE}px">'
                 f'{html.escape(self._clip(chinese))}</span>'
@@ -202,15 +213,17 @@ class LiveTextRenderMixin:
         句对遵守这个开关，说话过程中德语照样往外冒，和复选框文案直接矛盾。
         藏掉之后这段时间显示的是草稿中文，不会变成空白。
         """
-        bilingual = getattr(config, "SHOW_BILINGUAL", True)
+        mode = _display_mode()
+        show_source = mode in {"bilingual", "source"}
+        show_target = mode in {"bilingual", "target"}
         live_parts = []
-        if bilingual and self.live_committed:
+        if show_source and self.live_committed:
             live_parts.append(html.escape(self._clip(self.live_committed)))
-        if bilingual and self.live_unstable:
+        if show_source and self.live_unstable:
             color = getattr(config, "UNSTABLE_TEXT_COLOR", "#999999")
             live_parts.append(f'<span style="color:{color}"><i>{html.escape(self._clip(self.live_unstable))}</i></span>')
         live_block = " ".join(live_parts)
-        if self.live_draft:
+        if show_target and self.live_draft:
             # 草稿中文：正式翻译还没到之前先给一版（浅蓝斜体和正式中文区分）
             draft_color = getattr(config, "DRAFT_TEXT_COLOR", "#8fb8e0")
             live_block += ('<br>' if live_block else '') + \
