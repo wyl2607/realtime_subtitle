@@ -89,9 +89,11 @@ struct RsBench {
     static func main() async {
         do {
             let args = Array(CommandLine.arguments.dropFirst())
-            guard let cmd = args.first else {
-                throw BenchError.usage(Self.usage)
+            if args.isEmpty || args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
+                print(Self.usage)
+                return
             }
+            let cmd = args[0]
             let rest = Array(args.dropFirst())
             if cmd == "asr" {
                 if #available(macOS 27.0, *) {
@@ -105,6 +107,8 @@ struct RsBench {
                 } else {
                     throw BenchError.unsupported("Translation benchmark requires macOS 26.")
                 }
+            } else if cmd == "probe-seg" {
+                try await ProbeSeg.run(rest)
             } else {
                 throw BenchError.usage(Self.usage)
             }
@@ -118,6 +122,11 @@ struct RsBench {
     usage:
       rsbench asr --wav-dir D --refs R --locale de-DE --out O.jsonl [--volatile]
       rsbench translate --pairs P --n 40 --src de --dst zh-Hans --out O.jsonl
+      rsbench probe-seg --selftest
+      rsbench probe-seg --wav FILE --locale de-DE --out O.jsonl [--clips DIR --refs R --n 5] [--bounds B.jsonl]
+      rsbench probe-seg --wav-dir DIR --refs R --locale de-DE --out O.jsonl [--n N] [--bounds B.jsonl]
+    Groq 429 样本不走 rsbench（key 不进语音进程）：
+      probes/groq_429_probe.py
     """
 
     static func parse(_ args: [String]) throws -> ([String: String], Set<String>) {
