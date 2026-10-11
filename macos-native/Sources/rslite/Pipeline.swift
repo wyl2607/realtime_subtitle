@@ -27,6 +27,9 @@ struct PipelineCallbacks: Sendable {
     /// t0/t1：句子在统一样本时钟（AudioFanout）上的起止秒数；拿不到时为 nil，这样的句子不参与替换（RFC P4）。
     var onFinal: @Sendable (Int, String, Double?, Double?) -> Void = { _, _, _, _ in }
     var onTranslation: @Sendable (Int, String) -> Void = { _, _ in }
+    /// 本机翻译自动重试一次后仍失败：句子 id + 原因（"error" / "unavailable"＝语言包未装）。
+    /// 该句进入失败句缓冲，之后可经 retryTranslation(id:) 手动重试。
+    var onTranslationFailed: @Sendable (Int, String) -> Void = { _, _ in }
     var onStatus: @Sendable (String) -> Void = { _ in }
     var onFinished: @Sendable () -> Void = {}
     /// 每轮识别启动前调用：NodeClient 在这里 subscribe，必须赶在 fanout.start() 之前订阅，
@@ -62,7 +65,8 @@ final class Pipeline: @unchecked Sendable {
             sourceID: config.sourceLocaleID,
             targetID: config.targetLanguageID,
             onStatus: callbacks.onStatus,
-            onTranslation: callbacks.onTranslation
+            onTranslation: callbacks.onTranslation,
+            onTranslationFailed: callbacks.onTranslationFailed
         )
     }
 
@@ -283,6 +287,114 @@ final class Pipeline: @unchecked Sendable {
         translator.enqueue(id: id, text: trimmed)
     }
 
+    /// 手动重试一条翻译失败句。id 不在最近 50 条失败句里返回 false。
+    @discardableResult
+    func retryTranslation(id: Int) -> Bool {
+        translator.retryTranslation(id: id)
+    }
+
+    /// 失败句结局 + 手动重试的纯逻辑自检：注入翻译闭包，不联网、不建窗口、不真等。
+    static func selfTest() async -> [String] {
+        var failures: [String] = []
+        func check(_ ok: Bool, _ name: String) {
+            if !ok { failures.append(name) }
+        }
+
+        // 失败句环形缓冲上限 50，超出丢最旧
+        let store = FailedSentenceStore()
+        for id in 1...60 {
+            store.record(id: id, text: "sentence-\(id)")
+        }
+        check(store.count == FailedSentenceStore.capacity, "失败句环形缓冲上限为 50")
+        check(store.text(for: 1) == nil, "超出上限后最旧的失败句被丢弃")
+        check(store.text(for: 60) == "sentence-60", "最新的失败句仍保留在缓冲里")
+
+        final class Probe: @unchecked Sendable {
+            private let lock = NSLock()
+            private var attempts = 0
+            private var translations: [Int: String] = [:]
+            private var reported: [(Int, String)] = []
+
+            func nextAttempt() -> Int { lock.withLockValue { attempts += 1; return attempts } }
+            func record(id: Int, text: String) { lock.withLockVoid { translations[id] = text } }
+            func report(id: Int, reason: String) { lock.withLockVoid { reported.append((id, reason)) } }
+            func attemptCount() -> Int { lock.withLockValue { attempts } }
+            func translation(id: Int) -> String? { lock.withLockValue { translations[id] } }
+            func reportedList() -> [(Int, String)] { lock.withLockValue { reported } }
+        }
+
+        // 第一次失败自动重试一次，第二次成功 -> 走 onTranslation，不上报失败
+        let retryProbe = Probe()
+        let retryQueue = TranslationQueue(
+            sourceID: "de-DE",
+            targetID: "zh-Hans",
+            onStatus: { _ in },
+            onTranslation: { id, text in retryProbe.record(id: id, text: text) },
+            onTranslationFailed: { id, reason in retryProbe.report(id: id, reason: reason) },
+            attempt: { text in
+                if retryProbe.nextAttempt() == 1 {
+                    throw PipelineError.unavailable("临时失败")
+                }
+                return "译文:\(text)"
+            },
+            sleep: { _ in }
+        )
+        retryQueue.enqueue(id: 7, text: "Hallo")
+        await retryQueue.waitUntilIdle()
+        check(retryProbe.translation(id: 7) == "译文:Hallo", "第一次失败重试成功：译文经 onTranslation 回来")
+        check(retryProbe.reportedList().isEmpty, "重试成功后不得调用 onTranslationFailed")
+        check(retryProbe.attemptCount() == 2, "自动重试只发生一次（共两次尝试）")
+        check(retryQueue.retryTranslation(id: 999) == false, "retryTranslation 未知 id 返回 false")
+
+        // 两次都失败 -> 以 unavailable 上报一次，并留待手动重试
+        let failProbe = Probe()
+        let failQueue = TranslationQueue(
+            sourceID: "de-DE",
+            targetID: "zh-Hans",
+            onStatus: { _ in },
+            onTranslation: { id, text in failProbe.record(id: id, text: text) },
+            onTranslationFailed: { id, reason in failProbe.report(id: id, reason: reason) },
+            attempt: { _ in
+                _ = failProbe.nextAttempt()
+                throw PipelineError.unsupported("语言包未安装")
+            },
+            sleep: { _ in }
+        )
+        failQueue.enqueue(id: 9, text: "Guten Tag")
+        await failQueue.waitUntilIdle()
+        let failReported = failProbe.reportedList()
+        check(failReported.count == 1 && failReported[0].0 == 9 && failReported[0].1 == TranslationQueue.reasonUnavailable,
+              "语言包未安装上报一次，原因为 unavailable")
+        check(failProbe.attemptCount() == 1, "语言包未安装是确定性失败：不重试，只尝试一次")
+        check(failProbe.translation(id: 9) == nil, "失败句不上屏译文")
+
+        // 手动重试：已知失败 id 返回 true，成功后从失败缓冲移除
+        let manualProbe = Probe()
+        let manualQueue = TranslationQueue(
+            sourceID: "de-DE",
+            targetID: "zh-Hans",
+            onStatus: { _ in },
+            onTranslation: { id, text in manualProbe.record(id: id, text: text) },
+            onTranslationFailed: { id, reason in manualProbe.report(id: id, reason: reason) },
+            attempt: { text in
+                if manualProbe.nextAttempt() <= 2 {
+                    throw PipelineError.unavailable("暂时失败")
+                }
+                return "手动:\(text)"
+            },
+            sleep: { _ in }
+        )
+        manualQueue.enqueue(id: 11, text: "Text")
+        await manualQueue.waitUntilIdle()
+        check(manualProbe.reportedList().count == 1, "自动重试后仍失败：上报一次")
+        check(manualQueue.retryTranslation(id: 11) == true, "已知失败 id 返回 true")
+        await manualQueue.waitUntilIdle()
+        check(manualProbe.translation(id: 11) == "手动:Text", "手动重试成功走 onTranslation")
+        check(manualQueue.retryTranslation(id: 11) == false, "成功后该 id 从失败缓冲移除")
+
+        return failures
+    }
+
     private func ensureSpeechAssets(transcriber: SpeechTranscriber) async throws {
         let status = await AssetInventory.status(forModules: [transcriber])
         callbacks.onStatus("识别资源状态：\(status)")
@@ -451,13 +563,64 @@ struct SendableTimedStream: @unchecked Sendable {
     let stream: AsyncStream<TimedAudio>
 }
 
+/// 翻译失败句的环形缓冲：最多保留最近 50 条（id → 原文），供 retryTranslation 手动重试；
+/// 超出上限丢最旧的一条。只做记账，不碰 Translation 框架，便于 selftest 直接验证上限语义。
+final class FailedSentenceStore: @unchecked Sendable {
+    static let capacity = 50
+
+    private let lock = NSLock()
+    private var order: [Int] = []
+    private var texts: [Int: String] = [:]
+
+    var count: Int {
+        lock.withLockValue { order.count }
+    }
+
+    func text(for id: Int) -> String? {
+        lock.withLockValue { texts[id] }
+    }
+
+    func record(id: Int, text: String) {
+        lock.withLockVoid {
+            if texts[id] != nil {
+                order.removeAll { $0 == id }
+            }
+            texts[id] = text
+            order.append(id)
+            while order.count > Self.capacity {
+                let oldest = order.removeFirst()
+                texts.removeValue(forKey: oldest)
+            }
+        }
+    }
+
+    func remove(id: Int) {
+        lock.withLockVoid {
+            guard texts.removeValue(forKey: id) != nil else {
+                return
+            }
+            order.removeAll { $0 == id }
+        }
+    }
+}
+
 @available(macOS 26.0, *)
 final class TranslationQueue: @unchecked Sendable {
+    /// onTranslationFailed 的原因码，与 spec 003 P2 约定一致。
+    static let reasonError = "error"
+    static let reasonUnavailable = "unavailable"
+
     private let source: Locale.Language
     private let target: Locale.Language
     private let key: String
     private let onStatus: @Sendable (String) -> Void
     private let onTranslation: @Sendable (Int, String) -> Void
+    private let onTranslationFailed: @Sendable (Int, String) -> Void
+    /// 可注入的翻译尝试 / 重试间隔 / 等待：selftest 用它绕开 Translation 框架（不联网、不真等）。
+    private let overrideAttempt: (@Sendable (String) async throws -> String)?
+    private let retryDelay: Duration
+    private let sleep: @Sendable (Duration) async -> Void
+    private let failures = FailedSentenceStore()
 
     private var sessions: [String: TranslationSession] = [:]
     private let queue = DispatchQueue(label: "rslite.translation.queue")
@@ -465,18 +628,28 @@ final class TranslationQueue: @unchecked Sendable {
     private var pending = 0
     private var idleWaiters: [CheckedContinuation<Void, Never>] = []
     private var cancelled = false
+    /// 只在串行 chain 里读写；翻译失败对状态行只说一次，失败句结局一律走 onTranslationFailed。
+    private var didAnnounceFailure = false
 
     init(
         sourceID: String,
         targetID: String,
         onStatus: @escaping @Sendable (String) -> Void,
-        onTranslation: @escaping @Sendable (Int, String) -> Void
+        onTranslation: @escaping @Sendable (Int, String) -> Void,
+        onTranslationFailed: @escaping @Sendable (Int, String) -> Void = { _, _ in },
+        attempt: (@Sendable (String) async throws -> String)? = nil,
+        retryDelay: Duration = .seconds(1),
+        sleep: (@Sendable (Duration) async -> Void)? = nil
     ) {
         source = Locale.Language(identifier: sourceID)
         target = Locale.Language(identifier: targetID)
         key = "\(sourceID)->\(targetID)"
         self.onStatus = onStatus
         self.onTranslation = onTranslation
+        self.onTranslationFailed = onTranslationFailed
+        overrideAttempt = attempt
+        self.retryDelay = retryDelay
+        self.sleep = sleep ?? { try? await Task.sleep(for: $0) }
     }
 
     func enqueue(id: Int, text: String) {
@@ -484,31 +657,105 @@ final class TranslationQueue: @unchecked Sendable {
             guard !cancelled else {
                 return
             }
-            pending += 1
-            let previous = chain
-            chain = Task { [weak self] in
-                await previous.value
-                guard let self else {
-                    return
-                }
-                await self.translateOne(id: id, text: text)
-                self.completeOne()
+            scheduleLocked { [weak self] in
+                await self?.translateOne(id: id, text: text)
             }
         }
     }
 
-    private func translateOne(id: Int, text: String) async {
-        do {
-            let session = try await session()
-            let response = try await session.translate(text)
-            var output = response.targetText.trimmingCharacters(in: .whitespacesAndNewlines)
-            if Self.isSimplifiedChinese(target) {
-                output = Self.toSimplified(output)
+    /// 手动重试一条失败句。id 不在最近 50 条失败句里返回 false。
+    @discardableResult
+    func retryTranslation(id: Int) -> Bool {
+        queue.sync {
+            guard !cancelled, let text = failures.text(for: id) else {
+                return false
             }
+            scheduleLocked { [weak self] in
+                await self?.retryOne(id: id, text: text)
+            }
+            return true
+        }
+    }
+
+    private func scheduleLocked(_ work: @escaping @Sendable () async -> Void) {
+        pending += 1
+        let previous = chain
+        chain = Task { [weak self] in
+            await previous.value
+            await work()
+            self?.completeOne()
+        }
+    }
+
+    private func translateOne(id: Int, text: String) async {
+        var lastError: Error?
+        for pass in 0..<2 {
+            do {
+                let output = try await perform(text)
+                failures.remove(id: id)
+                onTranslation(id, output)
+                return
+            } catch {
+                lastError = error
+                // 语言包没装是确定性失败，重试只会让串行队列里后面每一句都多等 1 秒。
+                if Self.reason(for: error) == Self.reasonUnavailable {
+                    break
+                }
+                if pass == 0 {
+                    await sleep(retryDelay)
+                }
+            }
+        }
+        let reason = Self.reason(for: lastError)
+        failures.record(id: id, text: text)
+        announceFailure(reason: reason)
+        onTranslationFailed(id, reason)
+    }
+
+    private func retryOne(id: Int, text: String) async {
+        do {
+            let output = try await perform(text)
+            failures.remove(id: id)
             onTranslation(id, output)
         } catch {
-            onStatus("翻译失败：\(error.localizedDescription)")
+            let reason = Self.reason(for: error)
+            failures.record(id: id, text: text)
+            onTranslationFailed(id, reason)
         }
+    }
+
+    /// 生产走 Apple 翻译；selftest 注入 overrideAttempt 时只做纯编排。
+    private func perform(_ text: String) async throws -> String {
+        if let overrideAttempt {
+            return try await overrideAttempt(text)
+        }
+        let session = try await session()
+        let response = try await session.translate(text)
+        var output = response.targetText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if Self.isSimplifiedChinese(target) {
+            output = Self.toSimplified(output)
+        }
+        return output
+    }
+
+    static func reason(for error: Error?) -> String {
+        guard let error else {
+            return reasonError
+        }
+        if let pipelineError = error as? PipelineError, case .unsupported = pipelineError {
+            return reasonUnavailable
+        }
+        return reasonError
+    }
+
+    private func announceFailure(reason: String) {
+        guard !didAnnounceFailure else {
+            return
+        }
+        didAnnounceFailure = true
+        onStatus(reason == Self.reasonUnavailable
+            ? "翻译语言包未安装，部分句子未翻译"
+            : "翻译失败，部分句子未翻译")
     }
 
     func waitUntilIdle() async {

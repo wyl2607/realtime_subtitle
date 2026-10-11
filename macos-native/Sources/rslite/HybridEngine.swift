@@ -7,6 +7,9 @@ protocol SubtitleEngine: AnyObject, Sendable {
     func resume() async
     func stop() async
     func waitUntilFinished() async
+    /// 手动重试一条翻译失败句（本机 / 节点兜底 / 云端句同一套失败缓冲）。id 不存在返回 false。
+    @discardableResult
+    func retryTranslation(id: Int) -> Bool
 }
 
 @available(macOS 27.0, *)
@@ -132,6 +135,10 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
                 self?.noteLocalTranslation(id: id, text: text)
                 self?.callbacks.onTranslation(id, text)
             },
+            onTranslationFailed: { [weak self] id, reason in
+                // 节点句走本机兜底 / 云端句本机兜底仍失败：结局原样交给上层（id 是显示键）。
+                self?.callbacks.onTranslationFailed(id, reason)
+            },
             onStatus: callbacks.onStatus,
             onFinished: callbacks.onFinished,
             onFanoutReady: { [weak self] fanout in
@@ -191,6 +198,13 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
             await task.value
         }
         await router?.finish()
+    }
+
+    /// 失败句缓冲在本机 Pipeline 里（节点兜底 / 云端句也用它的负数显示键入队），交给它重试。
+    @discardableResult
+    func retryTranslation(id: Int) -> Bool {
+        let pipeline = lock.withLockValue { local }
+        return pipeline?.retryTranslation(id: id) ?? false
     }
 
     private func startRouterIfNeeded(fanout: AudioFanout) {
