@@ -1299,3 +1299,8 @@ macOS 避坑（每一条都是这次迁移真实踩过的）：
     - **现象**：尝试在 rslite 中利用 SpeechTranscriber 的 `audioTimeRange` 进行词级时间驱动分段时，无法获取中间词的时间戳，分段点判定不准或滞后。
     - **根因**：macOS SpeechTranscriber 的 volatile（未定稿）流式识别结果不提供词级（word-level）时间戳，只有从当前段首到当前位置的宽区间（段首→当前的宽区间），无法直接通过词边界静音（≥0.6s）进行切段。
     - **做法**：rslite 放弃依赖 SpeechTranscriber 词时间分段，云端切段改用 20ms 帧、RMS 0.005 阈值的本地能量 VAD 算法；静音 ≥0.6s 收段、15s 强切、<1.5s 的段并入相邻段。阈值实测（concat5 建议 0.005、FLEURS 60 建议 0.003，词时间分段两份都不达标）见 `.governance/sprints-002-cloud-asr-first/probes/segmentation.md`；产品用 0.005，直播素材上 0.003/0.005 对比待真机验收。
+25. **rslite 关掉 Swift 6 的运行期 actor 隔离检查**（2026-10-11 19:39 真机崩溃）。
+    - **现象**：rslite 跑了 11 分钟后 SIGSEGV，崩在主线程 `OverlayRootView.hitTest` 的 @objc 入口：`swift_task_isCurrentExecutor → isMainExecutor → swift_getObjectType` 读空指针；调用方是辅助功能命中测试（`accessibilityHitTest`，截图/读屏/窗口管理类工具都会触发）。
+    - **根因**（未完全确认）：Swift 6 语言模式给每个 MainActor 隔离的 @objc 覆写插运行期检查；rslite 是同步 main + `app.run()`（第 16 条），这条 AX 回调路径上拿到的主执行器为空。代码本身确实在主线程。
+    - **做法**：`Package.swift` 里 rslite 目标加 `-Xfrontend -disable-dynamic-actor-isolation`，只关运行期检查、编译期并发检查照旧；二进制里该检查调用点从 112 降到 1。别为了"更安全"把它删掉；要删先复现 AX 命中测试（如 Accessibility Inspector 指向字幕窗）确认不再崩。
+
