@@ -1297,4 +1297,4 @@ macOS 避坑（每一条都是这次迁移真实踩过的）：
 24. **SpeechTranscriber volatile 结果没有词级时间，rslite 云端分段采用 20ms RMS 0.005 能量 VAD**（2026-10-11，TK-001 探针）。
     - **现象**：尝试在 rslite 中利用 SpeechTranscriber 的 `audioTimeRange` 进行词级时间驱动分段时，无法获取中间词的时间戳，分段点判定不准或滞后。
     - **根因**：macOS SpeechTranscriber 的 volatile（未定稿）流式识别结果不提供词级（word-level）时间戳，只有从当前段首到当前位置的宽区间（段首→当前的宽区间），无法直接通过词边界静音（≥0.6s）进行切段。
-    - **做法**：rslite 放弃依赖 SpeechTranscriber 词时间分段，云端切段改用 20ms 帧、RMS 0.005 阈值的本地能量 VAD 算法；静音 ≥0.6s 收段、15s 强切、<1.5s 的段并入相邻段。阈值的真机测量（concat5 / FLEURS 60）见 `.governance/sprints-002-cloud-asr-first/probes/segmentation.md`，结果待补。
+    - **做法**：rslite 放弃依赖 SpeechTranscriber 词时间分段，云端切段改用 20ms 帧、RMS 0.005 阈值的本地能量 VAD 算法；静音 ≥0.6s 收段、15s 强切、<1.5s 的段并入相邻段。阈值实测（concat5 建议 0.005、FLEURS 60 建议 0.003，词时间分段两份都不达标）见 `.governance/sprints-002-cloud-asr-first/probes/segmentation.md`；产品用 0.005，直播素材上 0.003/0.005 对比待真机验收。
