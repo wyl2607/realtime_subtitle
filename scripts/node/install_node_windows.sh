@@ -18,6 +18,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 source "${SCRIPT_DIR}/install_node.sh"
 
 NODE_PORT="${RS_NODE_PORT:-8791}"
+valid_tcp_port "${NODE_PORT}" || die "端口不合法"
 OLLAMA_MODEL="${RS_OLLAMA_MODEL:-qwen3.5:4b}"
 INFO_WAIT="${RS_INFO_WAIT:-90}"
 SELFCHECK_WAV_SRC="${RS_SELFCHECK_WAV:-${HOME}/projects/rs-mac-native-data/concat5.wav}"

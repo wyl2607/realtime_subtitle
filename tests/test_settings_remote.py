@@ -143,3 +143,92 @@ def test_cloud_toggle_does_not_mark_a_scene_mode(cfg):
     assert not win.cloud_cb.isChecked()
     assert modes == []
     assert sw.read_cloud_enabled() is False
+
+
+def test_windows_icacls_locks_temp_before_replace(cfg, monkeypatch):
+    """C1：NTFS 同卷 rename 会带走 DACL，icacls 必须打在临时文件上，且发生在替换之前。"""
+    import subprocess
+
+    monkeypatch.setattr(sw.sys, "platform", "win32")
+    monkeypatch.setenv("USERNAME", "tester")
+    events = []
+    real_replace = os.replace
+
+    def spy_replace(src, dst):
+        events.append(("replace", os.path.basename(src)))
+        return real_replace(src, dst)
+
+    def fake_run(args, check, shell):
+        assert shell is False
+        assert args[0] == "icacls"
+        target = args[1]
+        name = os.path.basename(target)
+        events.append(("icacls", name))
+        assert name.startswith(".") and name.endswith(".tmp")
+        dest_name = name[1:].rsplit(".", 2)[0]
+        assert os.path.exists(target)
+        assert not (cfg / dest_name).exists()
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(os, "replace", spy_replace)
+    monkeypatch.setattr(sw.subprocess, "run", fake_run)
+    sw.write_groq_key(FAKE_KEY)
+    sw.write_cloud_enabled(False)
+    sw.write_node_enabled(True)
+    assert [kind for kind, _name in events] == [
+        "icacls", "replace", "icacls", "replace", "icacls", "replace",
+    ]
+    assert (cfg / "groq.key").read_text(encoding="utf-8").strip() == FAKE_KEY
+    assert (cfg / "cloud.json").is_file()
+    assert (cfg / "node.json").is_file()
+    assert list(cfg.glob(".*.tmp")) == []
+
+
+def test_windows_icacls_failure_removes_temp_and_skips_target(cfg, monkeypatch):
+    import subprocess
+
+    monkeypatch.setattr(sw.sys, "platform", "win32")
+    monkeypatch.setenv("USERNAME", "tester")
+
+    def fake_run(args, check, shell):
+        raise subprocess.CalledProcessError(1, args)
+
+    monkeypatch.setattr(sw.subprocess, "run", fake_run)
+    with pytest.raises(OSError, match="icacls failed"):
+        sw.write_groq_key(FAKE_KEY)
+    assert not (cfg / "groq.key").exists()
+    assert list(cfg.glob(".*.tmp")) == []
+
+    monkeypatch.delenv("USERNAME", raising=False)
+    with pytest.raises(OSError, match="icacls failed"):
+        sw.write_cloud_enabled(True)
+    assert not (cfg / "cloud.json").exists()
+    assert list(cfg.glob(".*.tmp")) == []
+
+
+def test_settings_import_does_not_pull_remote_modules():
+    """BUG-06：import 设置面板不得把 cloud_client / requests 拉进进程。"""
+    import subprocess
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    script = (
+        "import sys\n"
+        "import realtime_subtitle.ui.settings_window\n"
+        "bad = [name for name in ("
+        "'realtime_subtitle.remote.cloud_client', 'requests'"
+        ") if name in sys.modules]\n"
+        "print(','.join(bad))\n"
+        "raise SystemExit(1 if bad else 0)\n"
+    )
+    env = dict(os.environ)
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    env["REALTIME_SUBTITLE_NO_SINGLETON"] = "1"
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

@@ -708,12 +708,27 @@ client_scp() {
     scp -q -o BatchMode=yes -o ConnectTimeout=10 -- "$1" "$2"
 }
 
+# 端口会拼进 ssh 交给 cmd.exe 的那条远端命令。必须是 1–65535 的纯数字，
+# 否则 `& | < >` 会在 powershell 启动之前被执行。
+valid_tcp_port() {
+    local port="$1" value
+    if [[ ! "${port}" =~ ^[0-9]{1,5}$ ]]; then
+        return 1
+    fi
+    value=$((10#${port}))
+    if [[ "${value}" -lt 1 || "${value}" -gt 65535 ]]; then
+        return 1
+    fi
+    return 0
+}
+
 push_windows_client() {
     local client="$1" id="$2" node_id="$3" url_host="$4" port="$5" token="$6"
     local ps1_src remote ps
     [[ "${id}" =~ ^[A-Za-z0-9._@-]+$ ]] || die "节点 id 不合法"
     [[ "${node_id}" =~ ^[A-Za-z0-9_-]{8,64}$ ]] || die "node_id 格式异常"
     [[ "${url_host}" =~ ^[A-Za-z0-9.-]+$ ]] || die "MagicDNS 名异常"
+    valid_tcp_port "${port}" || die "端口不合法"
     [[ "${token}" =~ ^[0-9a-f]{64}$ ]] || die "token 形状不对"
     valid_host "${client}" || die "客户端别名不合法（只允许 [A-Za-z0-9._@-]，且不能以 - 开头）"
     ps1_src="${SCRIPT_DIR}/windows/node_setup.ps1"

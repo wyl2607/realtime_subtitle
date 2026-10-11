@@ -198,16 +198,42 @@ switch ($Action) {
             url = $url
             token_file = $clientToken
         }
+        $tokensRoot = Join-Path (Join-Path $env:APPDATA 'realtime_subtitle') 'tokens'
+        $tokensPrefix = [System.IO.Path]::GetFullPath($tokensRoot)
+        $sep = [System.IO.Path]::DirectorySeparatorChar
+        if (-not $tokensPrefix.EndsWith([string]$sep)) {
+            $tokensPrefix = $tokensPrefix + $sep
+        }
         $out = New-Object System.Collections.Generic.List[object]
         $replaced = $false
         foreach ($e in $entries) {
-            if ($e.id -eq $NodeAlias) {
+            if ([string]$e.id -eq $NodeAlias) {
                 if (-not $replaced) {
                     $out.Add($new)
                     $replaced = $true
                 }
-            } else {
-                $out.Add($e)
+                continue
+            }
+            $tokenFile = [string]$e.token_file
+            $keep = $false
+            if (-not [string]::IsNullOrWhiteSpace($tokenFile)) {
+                try {
+                    $full = [System.IO.Path]::GetFullPath($tokenFile)
+                    if ($full.StartsWith($tokensPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        $keep = $true
+                    }
+                } catch {
+                    $keep = $false
+                }
+            }
+            if ($keep) {
+                $projected = [ordered]@{
+                    id = [string]$e.id
+                    node_id = [string]$e.node_id
+                    url = [string]$e.url
+                    token_file = $tokenFile
+                }
+                $out.Add($projected)
             }
         }
         if (-not $replaced) { $out.Add($new) }

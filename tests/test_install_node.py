@@ -1227,3 +1227,18 @@ def test_push_windows_client_rejects_bad_token_before_ssh(tmp_path):
     assert r.returncode != 0
     assert not (log / "ssh.argv").exists()
 
+
+@pytest.mark.parametrize("port", ["8791&calc", "0", "65536", "80 91", "-1"])
+def test_push_windows_client_rejects_bad_port_before_ssh(tmp_path, port):
+    """S1：port 含 shell 元字符或越界时，拼 remote 之前就 die，且不 ssh。"""
+    log, env = _push_stubs(tmp_path)
+    token = "ab" * 32
+    r = subprocess.run(
+        ["bash", "-c", 'source "$1"; shift; push_windows_client "$@"',
+         "x", str(SCRIPT), "winbox", "mynode", "c" * 16, "node.tail.ts.net", port, token],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert r.returncode != 0
+    assert not (log / "ssh.argv").exists()
+    assert not (log / "scp.argv").exists()
+

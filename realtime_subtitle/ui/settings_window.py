@@ -15,8 +15,6 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QFont
 import realtime_subtitle.config as config
-from realtime_subtitle.remote.cloud_client import config_dir as _cloud_config_dir
-from realtime_subtitle.remote.cloud_client import read_groq_key
 from realtime_subtitle import language_policy
 from realtime_subtitle.ui.window_frame import DraggableWidget
 from realtime_subtitle.ui.window_geometry import (
@@ -71,8 +69,10 @@ def config_dir():
     包一层是为了让面板测试替换本模块的 config_dir，而不必去改
     cloud_client.groq_key_path() 里面那个绑定好的函数。路径规则仍以
     cloud_client 为准：Windows 用 %APPDATA%，其它系统用 ~/.config。
+    延迟导入：两个开关都关时，import 本模块不应把远端客户端带进来。
     """
-    return _cloud_config_dir()
+    from realtime_subtitle.remote.cloud_client import config_dir as cloud_config_dir
+    return cloud_config_dir()
 
 
 def groq_key_file():
@@ -87,9 +87,11 @@ def _atomic_private(path, data):
     """原子写，并把权限收成只有当前用户能读。
 
     key 不能先进一个谁都能读的临时文件再改权限：先按 0600 建临时文件，
-    写完再 replace。Windows 上 os.open 的 mode 不起作用，所以写完用
-    icacls 去掉继承、只留当前用户。USERNAME 只在这一支用来当 ACL 主体，
-    不是密钥来源。
+    写完再 replace。Windows 上 os.open 的 mode 不起作用，所以在 replace
+    之前对临时文件跑 icacls。NTFS 同卷 rename 会保留 DACL；若先替换再改
+    权限，中间窗口和 icacls 失败都会把目标文件留成继承来的宽松 ACL。
+    icacls 失败就删掉临时文件并抛 OSError，目标文件不会出现。
+    USERNAME 只在这一支用来当 ACL 主体，不是密钥来源。
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -101,7 +103,9 @@ def _atomic_private(path, data):
     finally:
         os.close(fd)
     try:
-        if sys.platform != "win32":
+        if sys.platform == "win32":
+            _icacls_user_only(tmp)
+        else:
             os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     except Exception:
@@ -110,9 +114,7 @@ def _atomic_private(path, data):
         except OSError:
             pass
         raise
-    if sys.platform == "win32":
-        _icacls_user_only(path)
-    else:
+    if sys.platform != "win32":
         os.chmod(path, 0o600)
 
 
@@ -149,6 +151,7 @@ def clear_groq_key():
 def groq_key_configured():
     """只回答「有没有 key」。读失败按没有处理，异常文本可能带路径，不往外抛。"""
     try:
+        from realtime_subtitle.remote.cloud_client import read_groq_key
         return bool(read_groq_key(groq_key_file()))
     except Exception:
         return False

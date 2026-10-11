@@ -165,6 +165,47 @@ def _pcm_int16(audio):
     return np.ascontiguousarray((clipped * 32767.0).astype(np.int16)).reshape(-1)
 
 
+def _coerce_revision(value):
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _reinsert_pair_by_t0(window, key, source):
+    """远端句替换后按 t0 插回 sentence_pairs，保持时间递增。
+
+    add_pair 只会追加。远端结果往往比后出现的本机句更早，留在末尾会把旧句顶到底行。
+    """
+    pairs = window.sentence_pairs
+    found = None
+    for index in range(len(pairs) - 1, -1, -1):
+        item = pairs[index]
+        if len(item) >= 7 and item[6] == key:
+            found = index
+            break
+    if found is None:
+        return
+    item = pairs.pop(found)
+    item = (item[0], item[1], item[2], item[3], item[4], source, item[6])
+    t0 = item[3]
+    insert_at = len(pairs)
+    if t0 is not None:
+        for index, existing in enumerate(pairs):
+            existing_t0 = existing[3] if len(existing) > 3 else None
+            if existing_t0 is None:
+                existing_t0 = float("-inf")
+            try:
+                later = existing_t0 > t0
+            except TypeError:
+                later = False
+            if later:
+                insert_at = index
+                break
+    pairs.insert(insert_at, item)
+    window._render()
+
+
 class RemoteBridge:
     """本机句和远端句的汇合点。
 
@@ -206,6 +247,11 @@ class RemoteBridge:
         self._node_dst_keys = {}
         self._early_node_dst = {}
         self._fed_samples = 0
+        self._language_revision = 0
+        # 冷却时长只存在 routing_rules.cooldown_seconds，到点与否由桥自己记。
+        self._routing_checked_at = None
+        self._cooldown_deadline = None
+        self._cooldown_sig = None
         # 分段器的 a0 从这次开桥算起。加上开桥时本机识别已经走过的样本，
         # 远端句才能和本机句用同一套 t0/t1。中途才打开时，收件箱里还没
         # 识别的音频可能对不齐，这是已知限制。
@@ -290,13 +336,14 @@ class RemoteBridge:
         return "本机"
 
     def on_local_pair(self, src, tgt, t0, t1, key, revision):
-        del revision
+        revision = _coerce_revision(revision)
+        self._language_revision = revision
         with self._lock:
             self.line_store.add_local(key, t0, t1, src or "", tgt)
             kept = any(line.key == key for line in self.line_store.lines)
         # 已经被远端盖住的本机句不再上屏。没盖住的仍走原来的本地来源。
         if kept:
-            self._ui_show(src, tgt, t0, t1, key, "local")
+            self._ui_show(src, tgt, t0, t1, key, "local", revision)
 
     def feed_audio(self, audio):
         if self._closed:
@@ -308,6 +355,7 @@ class RemoteBridge:
         start = self._origin_seconds + (self._fed_samples / rate)
         self._fed_samples += int(pcm.shape[0])
         self._track_silence(pcm, pcm.shape[0] / rate)
+        self._recover_routing()
         self._sync_provider()
         tier = "local"
         select = getattr(self.router, "select_tier", None)
@@ -315,11 +363,15 @@ class RemoteBridge:
             tier = select()
         if tier == "cloud":
             self._saw_cloud = True
-        if self.cloud_on and tier == "cloud" and self.segmenter is not None:
+        # 开关开着就一直喂，分段器的样本钟才不会在降档时空转落后。
+        # 非云端档吐出来的段直接丢掉，不上传。
+        if self.cloud_on and self.segmenter is not None:
             import numpy as np
-            for a0, a1, seg in self.segmenter.feed(pcm):
-                copied = np.array(seg, dtype=np.int16, copy=True)
-                self._pool.submit(self._transcribe_one, float(a0), float(a1), copied, self._generation)
+            segments = self.segmenter.feed(pcm)
+            if tier == "cloud" and self._pool is not None:
+                for a0, a1, seg in segments:
+                    copied = np.array(seg, dtype=np.int16, copy=True)
+                    self._pool.submit(self._transcribe_one, float(a0), float(a1), copied, self._generation)
         if not self.node_on or tier == "cloud":
             return
         # 从云端退到节点要等一段静音，免得一句话被切两半。本机识别一直在跑。
@@ -421,8 +473,47 @@ class RemoteBridge:
                     break
         if replaced:
             self._ui_drop(replaced)
-        self._ui_show(src, dst or "", t0, t1, remote_key, "remote")
+        self._ui_show(src, dst or "", t0, t1, remote_key, "remote", self._language_revision)
         return remote_key
+
+    def _recover_routing(self):
+        """音频驱动的冷却恢复。至少隔 1 秒看一次，避免每个音频块都打状态机。
+
+        限流和退避的时长在 routing.cooldown_seconds（apply 会把它清掉，所以只在
+        看到新值时记一次 deadline）。额度冷却没有秒数，靠 ledger.usage() 在
+        降到 80% 以下时自己派发 quota_update。
+        """
+        import time
+        now = time.monotonic()
+        last = self._routing_checked_at
+        if last is not None and (now - last) < 1.0:
+            return
+        self._routing_checked_at = now
+        routing = self.routing
+        if routing is None:
+            return
+        state = str(getattr(routing, "cloud_state", "") or "")
+        seconds = getattr(routing, "cooldown_seconds", None)
+        if state == "cooldown_quota" or not state.startswith("cooldown_"):
+            self._cooldown_deadline = None
+            self._cooldown_sig = None
+        elif isinstance(seconds, (int, float)) and not isinstance(seconds, bool):
+            signature = (state, int(seconds))
+            if signature != self._cooldown_sig:
+                self._cooldown_sig = signature
+                self._cooldown_deadline = now + float(seconds)
+        deadline = self._cooldown_deadline
+        if (
+            deadline is not None
+            and state.startswith("cooldown_")
+            and state != "cooldown_quota"
+            and now >= deadline
+        ):
+            routing.apply({"type": "cooldown_expired"})
+            self._cooldown_deadline = None
+            self._cooldown_sig = None
+        if self.ledger is not None:
+            self.ledger.usage()
 
     def _sync_provider(self):
         stub = getattr(self.router, "cloud_provider", None)
@@ -529,13 +620,20 @@ class RemoteBridge:
             print(f"⚠️  节点客户端创建失败 {cfg.id}: {type(exc).__name__}")
             self._node_backoff_until = time.time() + 30
             return
+        generation = self._generation
         try:
             self._start_node_loop()
             self._run_on_loop(client.connect())
         except Exception as exc:
             print(f"⚠️  节点连接失败 {cfg.id}: {type(exc).__name__}")
+            self._abandon_client(client)
             self._close_node()
             self._node_backoff_until = time.time() + 30
+            return
+        # 连接在音频线程上等待。返回时主线程可能已经 close()，或云端开关把代次加一。
+        # 这时不能把新客户端留在桥上。
+        if self._closed or self._generation != generation:
+            self._abandon_client(client)
             return
         if hasattr(self.router, "node_states"):
             self.router.node_states[cfg.id] = NodeStateRecord(info=info)
@@ -572,6 +670,11 @@ class RemoteBridge:
     def _start_node_loop(self):
         import asyncio
         import threading
+        loop = self._loop
+        thread = self._node_thread
+        if loop is not None and thread is not None and thread.is_alive() and not loop.is_closed():
+            return
+        self._stop_node_loop()
         loop = asyncio.new_event_loop()
         self._loop = loop
 
@@ -581,6 +684,42 @@ class RemoteBridge:
 
         self._node_thread = threading.Thread(target=_run, name="remote-node", daemon=True)
         self._node_thread.start()
+
+    def _stop_node_loop(self):
+        import threading
+        loop = self._loop
+        thread = self._node_thread
+        self._loop = None
+        self._node_thread = None
+        if loop is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except Exception:
+                pass
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=2)
+        if loop is not None and not loop.is_closed():
+            try:
+                loop.close()
+            except Exception:
+                pass
+
+    def _abandon_client(self, client):
+        """连接还没挂到 self._node_client 上就要作废。优先用现有 loop。"""
+        if client is None:
+            return
+        loop = self._loop
+        try:
+            if loop is not None and not loop.is_closed():
+                self._run_on_loop(client.close(), timeout=2)
+                return
+        except Exception as exc:
+            print(f"⚠️  节点连接作废失败: {type(exc).__name__}")
+        try:
+            import asyncio
+            asyncio.run(client.close())
+        except Exception as exc:
+            print(f"⚠️  节点连接作废失败: {type(exc).__name__}")
 
     def _run_on_loop(self, coro, timeout=5):
         import asyncio
@@ -596,28 +735,13 @@ class RemoteBridge:
 
     def _close_node(self):
         client = self._node_client
-        loop = self._loop
-        thread = self._node_thread
         self._node_client = None
-        if client is not None and loop is not None:
+        if client is not None and self._loop is not None and not self._loop.is_closed():
             try:
                 self._run_on_loop(client.close(), timeout=2)
             except Exception as exc:
                 print(f"⚠️  节点关闭失败: {type(exc).__name__}")
-        if loop is not None:
-            try:
-                loop.call_soon_threadsafe(loop.stop)
-            except Exception:
-                pass
-        if thread is not None:
-            thread.join(timeout=2)
-        if loop is not None:
-            try:
-                loop.close()
-            except Exception:
-                pass
-        self._loop = None
-        self._node_thread = None
+        self._stop_node_loop()
 
     def _on_node_final(self, node_id, generation, final_id, body, t0, t1):
         del generation
@@ -1108,19 +1232,18 @@ class SubtitleApp:
         except Exception:
             return "本机"
 
-    def _ui_show_line(self, src, dst, t0, t1, key, source):
+    def _ui_show_line(self, src, dst, t0, t1, key, source, revision=0):
         def _go():
             window = self.subtitle_window
-            # add_pair 把来源写成 local。远端句要在槽函数跑完后改回 remote。
-            window.add_pair(src or "", dst or "", t0, t1, key, 0)
+            rev = _coerce_revision(revision)
             if source != "local":
-                pairs = window.sentence_pairs
-                for index in range(len(pairs) - 1, -1, -1):
-                    item = pairs[index]
-                    if len(item) >= 7 and item[6] == key:
-                        pairs[index] = (item[0], item[1], item[2], item[3], item[4], source, item[6])
-                        break
-                window._render()
+                # 远端句没有自己的代数。用窗口当前代数和桥上见过的最新代数里更大的那个，
+                # 语言切过去之后才不会被 _is_stale_language 当成 0 丢掉。
+                rev = max(rev, _coerce_revision(getattr(window, "language_revision", 0)))
+            window.add_pair(src or "", dst or "", t0, t1, key, rev)
+            if source == "local":
+                return
+            _reinsert_pair_by_t0(window, key, source)
         self._ui_invoke(_go)
 
     def _ui_drop_keys(self, keys):
