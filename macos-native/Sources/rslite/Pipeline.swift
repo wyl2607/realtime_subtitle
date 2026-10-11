@@ -276,6 +276,13 @@ final class Pipeline: @unchecked Sendable {
         translator.enqueue(id: id, text: sentence)
     }
 
+    /// 云端句不走本机 Speech 的句子编号。调用方自备不与本机 id 冲突的 key，译文仍从 onTranslation 回来。
+    func enqueueTranslation(id: Int, text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        translator.enqueue(id: id, text: trimmed)
+    }
+
     private func ensureSpeechAssets(transcriber: SpeechTranscriber) async throws {
         let status = await AssetInventory.status(forModules: [transcriber])
         callbacks.onStatus("识别资源状态：\(status)")

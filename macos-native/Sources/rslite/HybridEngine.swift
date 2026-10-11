@@ -38,6 +38,29 @@ enum RSLiteMode: String, Sendable {
     case hybrid
 }
 
+/// P5 替换瞬间：云端译文还没到时，先拿走被覆盖本机行里已经有的译文。
+func partitionInheritedTranslation(
+    lines: [SubtitleLine],
+    t0: Double?,
+    t1: Double?
+) -> (text: String?, replaced: Set<Int>) {
+    var replaced = Set<Int>()
+    var texts: [String] = []
+    for line in lines {
+        guard LineStore.shouldReplace(line, byNodeT0: t0, t1: t1) else { continue }
+        replaced.insert(line.key)
+        let trimmed = line.dstText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !trimmed.isEmpty {
+            texts.append(trimmed)
+        }
+    }
+    return (texts.isEmpty ? nil : texts.joined(separator: "\n"), replaced)
+}
+
+func inheritedSubtitleTranslation(lines: [SubtitleLine], t0: Double?, t1: Double?) -> String? {
+    partitionInheritedTranslation(lines: lines, t0: t0, t1: t1).text
+}
+
 @available(macOS 27.0, *)
 final class HybridEngine: SubtitleEngine, @unchecked Sendable {
     private let config: PipelineConfig
@@ -61,6 +84,16 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
     /// 云端或 key 无效占着状态行时，节点路由器的「混合/本机/精修中」不能把它盖掉。
     private var cloudOwnsLabel = false
     private var cloudSuspended = false
+    /// 与 LineStore 的节点行键同一序列：从 -1 往下，不与本机句子 id 相撞。
+    private var nextDisplayKey = -1
+    private var localDrafts: [LocalDraft] = []
+
+    private struct LocalDraft {
+        var key: Int
+        var t0: Double?
+        var t1: Double?
+        var dst: String?
+    }
 
     private struct NodeSessionKey: Hashable {
         var nodeID: String
@@ -86,13 +119,13 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
         let wrapped = PipelineCallbacks(
             onVolatile: callbacks.onVolatile,
             onFinal: { [weak self] id, text, t0, t1 in
-                // 词流在 Pipeline 里，出了句界才到这里。用句界修正已发出段的 a0/a1，不重发音频。
-                if let t0, let t1 {
-                    self?.noteCloudFinal(t0: t0, t1: t1)
-                }
+                self?.noteLocalFinal(id: id, t0: t0, t1: t1)
                 self?.callbacks.onFinal(id, text, t0, t1)
             },
-            onTranslation: callbacks.onTranslation,
+            onTranslation: { [weak self] id, text in
+                self?.noteLocalTranslation(id: id, text: text)
+                self?.callbacks.onTranslation(id, text)
+            },
             onStatus: callbacks.onStatus,
             onFinished: callbacks.onFinished,
             onFanoutReady: { [weak self] fanout in
@@ -126,6 +159,7 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
     func resume() async {
         lock.withLockVoid { cloudSuspended = false }
         await local?.resume()
+        ensureCloudRunning()
         ensureRouterRunning()
     }
 
@@ -209,6 +243,9 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
                 }
                 if let (final, isSelected) = result {
                     // 云端占着状态行时节点句仍然走 P5，只是不改标签。
+                    // 占一个显示键，让后面的云端句和 LineStore 的负数键对齐。
+                    _ = self.allocateDisplayKey()
+                    _ = self.consumeLocalTranslations(t0: final.1, t1: final.2)
                     self.onNodeFinal(nodeID, final.1, final.2, final.0, translation)
                     if isSelected, !self.lock.withLockValue({ self.cloudOwnsLabel }) {
                         self.onMode(.hybrid(nodeID))
@@ -370,6 +407,31 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
               "切到云端应清掉节点选中")
         check(Self.selectedSession(after: .cloudKeyInvalid, activeSessions: ["A": 1], previous: Self.NodeSessionKey(nodeID: "A", generation: 1)) == nil,
               "key 无效应清掉节点选中")
+        do {
+            var store = LineStore()
+            store.addLocal(key: 1, t0: 0, t1: 10, text: "Hallo")
+            store.setTranslation(key: 1, text: "你好")
+            let inherited = partitionInheritedTranslation(lines: store.lines, t0: 0, t1: 10).text
+            let key = Self.displayKey(at: 0)
+            store.applyNode(nodeID: CloudUploadController.cloudNodeID, t0: 0, t1: 10, srcText: "Guten Tag", dstText: inherited)
+            check(store.lines.count == 1 && store.lines[0].key == key, "云端句使用不与本机冲突的 key")
+            check(key < 0, "云端句 key 为负数，不与本机句子 id 冲突")
+            check(store.lines[0].dstText == "你好", "替换瞬间不出现空译文")
+            store.setTranslation(key: key, text: "晚安")
+            check(store.lines[0].dstText == "晚安", "云端句最终带译文")
+        }
+        check(Self.shouldRestartCloud(suspended: false, hasController: true, hasFanout: true, taskRunning: false),
+              "暂停后恢复应重新拉起 cloudTask")
+        check(!Self.shouldRestartCloud(suspended: true, hasController: true, hasFanout: true, taskRunning: false),
+              "暂停未解除时不应拉起 cloudTask")
+        check(!Self.shouldRestartCloud(suspended: false, hasController: true, hasFanout: true, taskRunning: true),
+              "cloudTask 仍在跑时不应再开一路上传")
+        check(Self.fanoutReadyStartsCloud(mode: .auto, suspended: false),
+              "start 与 resume 的 fanout 就绪都应拉起云端")
+        check(!Self.fanoutReadyStartsCloud(mode: .auto, suspended: true),
+              "暂停中不应拉起 cloudTask")
+        check(!Self.fanoutReadyStartsCloud(mode: .local, suspended: false),
+              "本机模式不拉起云端")
         failures.append(contentsOf: CloudSegmenter.selfTest())
         failures.append(contentsOf: CloudUploadController.selfTest())
         return failures
@@ -397,12 +459,84 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
         return effect.mode
     }
 
-    private func noteCloudFinal(t0: Double, t1: Double) {
-        lock.withLockValue { cloudController }?.noteFinal(t0: t0, t1: t1)
+    private func ensureCloudRunning() {
+        let fanout = lock.withLockValue { () -> AudioFanout? in
+            let fanout = currentFanout ?? local?.fanout
+            guard Self.shouldRestartCloud(
+                suspended: cloudSuspended,
+                hasController: cloudController != nil,
+                hasFanout: fanout != nil,
+                taskRunning: cloudTask != nil
+            ) else {
+                return nil
+            }
+            return fanout
+        }
+        if let fanout {
+            startCloudIfNeeded(fanout: fanout)
+        }
+    }
+
+    static func shouldRestartCloud(suspended: Bool, hasController: Bool, hasFanout: Bool, taskRunning: Bool) -> Bool {
+        !suspended && hasController && hasFanout && !taskRunning
+    }
+
+    static func fanoutReadyStartsCloud(mode: RSLiteMode, suspended: Bool) -> Bool {
+        mode != .local && !suspended
+    }
+
+    static func displayKey(at index: Int) -> Int {
+        -1 - index
+    }
+
+    private func allocateDisplayKey() -> Int {
+        lock.withLockValue {
+            let key = nextDisplayKey
+            nextDisplayKey -= 1
+            return key
+        }
+    }
+
+    private func noteLocalFinal(id: Int, t0: Double?, t1: Double?) {
+        lock.withLockVoid {
+            localDrafts.removeAll { $0.key == id }
+            localDrafts.append(LocalDraft(key: id, t0: t0, t1: t1, dst: nil))
+            if localDrafts.count > 200 {
+                localDrafts.removeFirst(localDrafts.count - 200)
+            }
+        }
+    }
+
+    private func noteLocalTranslation(id: Int, text: String) {
+        lock.withLockVoid {
+            guard let index = localDrafts.firstIndex(where: { $0.key == id }) else { return }
+            localDrafts[index].dst = text
+        }
+    }
+
+    private func consumeLocalTranslations(t0: Double?, t1: Double?) -> String? {
+        lock.withLockValue {
+            let lines = localDrafts.map {
+                SubtitleLine(key: $0.key, t0: $0.t0, t1: $0.t1, source: .local, srcText: "", dstText: $0.dst)
+            }
+            let parted = partitionInheritedTranslation(lines: lines, t0: t0, t1: t1)
+            if !parted.replaced.isEmpty {
+                localDrafts.removeAll { parted.replaced.contains($0.key) }
+            }
+            return parted.text
+        }
+    }
+
+    private func emitCloudLine(_ line: CloudP5Line) {
+        let key = allocateDisplayKey()
+        let inherited = consumeLocalTranslations(t0: line.t0, t1: line.t1)
+        onNodeFinal(CloudUploadController.cloudNodeID, line.t0, line.t1, line.text, inherited)
+        lock.withLockValue { local }?.enqueueTranslation(id: key, text: line.text)
     }
 
     private func startCloudIfNeeded(fanout: AudioFanout) {
         let controller = lock.withLockValue { () -> CloudUploadController? in
+            guard Self.fanoutReadyStartsCloud(mode: mode, suspended: cloudSuspended) else { return nil }
             cloudTask?.cancel()
             return cloudController
         }
@@ -419,6 +553,7 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
         for await audio in stream {
             if Task.isCancelled || cloudIsSuspended() { return }
             let effect = controller.ingest(audio: audio, now: Date(), node: currentNodeFacts())
+            forwardSilence(effect.atSilence)
             applyCloudEffect(effect.control)
             for segment in effect.uploads {
                 if Task.isCancelled || cloudIsSuspended() { return }
@@ -428,6 +563,7 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
         if Task.isCancelled || cloudIsSuspended() { return }
         // 文件放完没有下一段音频。短段不能再干等 1.5s，否则尾句发不出去。
         let tail = controller.finish(now: Date(), node: currentNodeFacts())
+        forwardSilence(tail.atSilence)
         applyCloudEffect(tail.control)
         for segment in tail.uploads {
             enqueueUpload(segment, controller: controller)
@@ -473,9 +609,12 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
 
     private func applyCloudEffect(_ effect: CloudControlEffect) {
         let decision = lock.withLockValue { () -> (Bool, Bool, NodeRouter?) in
-            let modeChanged = lastPublishedMode != effect.mode
-            let tierChanged = lastNodeTierEnabled != effect.nodeTierEnabled
-            if modeChanged {
+            if effect.yieldStatusToNode {
+                cloudOwnsLabel = false
+                lastPublishedMode = nil
+            }
+            var publish = false
+            if effect.publishStatus && lastPublishedMode != effect.mode {
                 lastPublishedMode = effect.mode
                 cloudOwnsLabel = effect.mode == .cloud || effect.mode == .cloudKeyInvalid
                 selectedNodeSession = Self.selectedSession(
@@ -483,16 +622,17 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
                     activeSessions: activeNodeSessions,
                     previous: selectedNodeSession
                 )
+                publish = true
             }
+            let tierChanged = lastNodeTierEnabled != effect.nodeTierEnabled
             if tierChanged {
                 lastNodeTierEnabled = effect.nodeTierEnabled
             }
-            return (modeChanged, tierChanged, router)
+            return (publish, tierChanged, router)
         }
         if !effect.discard {
             for line in effect.lines {
-                // 译文在 Pipeline 的 TranslationQueue 里，这里改不到。云端句先以无译文上屏。
-                onNodeFinal(CloudUploadController.cloudNodeID, line.t0, line.t1, line.text, nil)
+                emitCloudLine(line)
             }
         }
         if decision.0 {
@@ -501,6 +641,10 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
         if decision.1 {
             decision.2?.setNodeTierEnabled(effect.nodeTierEnabled)
         }
+    }
+
+    private func forwardSilence(_ atSilence: Bool) {
+        lock.withLockValue { router }?.noteCloudSilence(atSilence)
     }
 
     private func currentNodeFacts() -> NodeTierFacts {

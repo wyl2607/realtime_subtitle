@@ -14,6 +14,8 @@ final class OverlayController: NSObject {
 
     // 字幕历史（含已滚出屏幕的行）；界面只画末尾两行。节点精修结果按 P5 在这里替换本机行。
     private var store = LineStore()
+    /// 译文可能先于 MainActor 上的 applyNode 回来。先按 key 记下，行出现再补上。
+    private var pendingTranslation: [Int: String] = [:]
     private var isPaused = false
     private let onPauseChanged: (Bool) -> Void
     private let onQuit: () -> Void
@@ -63,13 +65,27 @@ final class OverlayController: NSObject {
     }
 
     func addTranslation(id: Int, text: String) {
-        store.setTranslation(key: id, text: text)
+        if store.lines.contains(where: { $0.key == id }) {
+            store.setTranslation(key: id, text: text)
+            pendingTranslation.removeValue(forKey: id)
+        } else {
+            pendingTranslation[id] = text
+        }
         render()
     }
 
     /// 节点的精修句到达（P5）：整体替换被它覆盖的本机行，找不到就按时间插入。
+    /// 云端译文未到时先继承被替换本机行的译文，到了再覆盖，避免替换瞬间空白。
     func addNodeFinal(nodeID: String, t0: Double?, t1: Double?, src: String, dst: String?) {
-        store.applyNode(nodeID: nodeID, t0: t0, t1: t1, srcText: src, dstText: dst)
+        let provided = dst?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let shown = (provided?.isEmpty == false ? provided : nil)
+            ?? inheritedSubtitleTranslation(lines: store.lines, t0: t0, t1: t1)
+        let before = Set(store.lines.map(\.key))
+        store.applyNode(nodeID: nodeID, t0: t0, t1: t1, srcText: src, dstText: shown)
+        if let created = store.lines.first(where: { !before.contains($0.key) }),
+           let pending = pendingTranslation.removeValue(forKey: created.key) {
+            store.setTranslation(key: created.key, text: pending)
+        }
         render()
     }
 

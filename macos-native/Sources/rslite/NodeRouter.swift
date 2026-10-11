@@ -167,8 +167,6 @@ final class NodeRouter: @unchecked Sendable {
     static let localUDSID = "local_uds"
     private static let probeInterval: Duration = .seconds(30)
     private static let offlineDuration = 60.0
-    private static let silenceThreshold = 0.003
-    private static let silenceSecondsForMigration = 0.6
     private static let replayBufferSeconds = Double(NodeClient.preReadyAudioSeconds)
 
     private let sourceLocaleID: String
@@ -664,7 +662,6 @@ final class NodeRouter: @unchecked Sendable {
                 latestClock = audio.startSeconds
                 replayBuffer.append(audio)
             }
-            updateSilence(audio)
             // prepare/connect 最长十几秒：放到独立 Task，音频循环不能被它堵住，
             // 否则 AudioFanout 丢旧帧、节点时钟落后（R3-2）。switching 由 switchToPending 内部预约防重入。
             // 云端收回会话优先于连接：同一次静音里不能又连上又拆掉。
@@ -783,12 +780,22 @@ final class NodeRouter: @unchecked Sendable {
     ) -> NodeTierAction? {
         guard !stopped, !switching else { return nil }
         if releaseNodeAtSilence {
-            guard silenceRun >= silenceSecondsForMigration else { return nil }
+            guard silenceRun >= CloudSegmenter.silenceSeconds else { return nil }
             return .release
         }
         guard nodeTierEnabled, pendingMigrationID != nil else { return nil }
-        guard !hasCurrentNode || silenceRun >= silenceSecondsForMigration else { return nil }
+        guard !hasCurrentNode || silenceRun >= CloudSegmenter.silenceSeconds else { return nil }
         return .connect(atSilence: hasCurrentNode)
+    }
+
+    /// 静音只认 CloudSegmenter 的判定（20ms RMS 0.005、静音 ≥0.6s）。这里不再另量一整块 RMS。
+    static func silenceRun(fromCloudAtSilence atSilence: Bool) -> Double {
+        atSilence ? CloudSegmenter.silenceSeconds : 0
+    }
+
+    func noteCloudSilence(_ atSilence: Bool) {
+        let run = Self.silenceRun(fromCloudAtSilence: atSilence)
+        lock.withLockVoid { silenceRun = run }
     }
 
     /// 待连接的三态：关闭时清掉；没有当前会话时直接采用最优；门没过就保留已有意图。
@@ -1149,25 +1156,6 @@ final class NodeRouter: @unchecked Sendable {
             taskIsCancelled: Task.isCancelled,
             routerStopped: lock.withLockValue { stopped }
         )
-    }
-
-    private func updateSilence(_ audio: TimedAudio) {
-        let seconds = audio.duration
-        guard let channel = audio.buffer.floatChannelData?[0] else {
-            lock.withLockVoid { silenceRun = 0 }
-            return
-        }
-        let count = Int(audio.buffer.frameLength)
-        guard count > 0 else { return }
-        var sum = 0.0
-        for i in 0..<count {
-            let v = Double(channel[i])
-            sum += v * v
-        }
-        let rms = sqrt(sum / Double(count))
-        lock.withLockVoid {
-            silenceRun = rms < Self.silenceThreshold ? silenceRun + seconds : 0
-        }
     }
 
     private func persistState() {
@@ -1654,6 +1642,18 @@ final class NodeRouter: @unchecked Sendable {
             stopped: false, switching: false, nodeTierEnabled: false, releaseNodeAtSilence: true,
             pendingMigrationID: nil, silenceRun: 0.59, hasCurrentNode: true
         ) == nil, "释放节点也要等到静音点")
+        check(Self.silenceRun(fromCloudAtSilence: true) == CloudSegmenter.silenceSeconds,
+              "节点静音只消费分段器的静音判定")
+        check(Self.silenceRun(fromCloudAtSilence: false) == 0,
+              "分段器未静音时节点不得自行累计静音")
+        check(Self.nodeTierAction(
+            stopped: false, switching: false, nodeTierEnabled: false, releaseNodeAtSilence: true,
+            pendingMigrationID: nil, silenceRun: Self.silenceRun(fromCloudAtSilence: true), hasCurrentNode: true
+        ) == .release, "分段器判定静音后才释放节点")
+        check(Self.nodeTierAction(
+            stopped: false, switching: false, nodeTierEnabled: false, releaseNodeAtSilence: true,
+            pendingMigrationID: nil, silenceRun: Self.silenceRun(fromCloudAtSilence: false), hasCurrentNode: true
+        ) == nil, "分段器未静音时不释放节点")
         check(Self.pendingMigrationUpdate(
             nodeTierEnabled: false, releaseNodeAtSilence: false, currentNodeID: nil, bestID: "n1", gateAllows: true
         ) == .set(nil), "节点层关闭时应清掉待连接")

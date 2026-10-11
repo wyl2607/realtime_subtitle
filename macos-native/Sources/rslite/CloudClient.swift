@@ -60,6 +60,10 @@ final class CloudClient: @unchecked Sendable {
     private let lock = NSLock()
     private var slots: [Int: InflightSlot] = [:]
     private var nextTaskID = 0
+    /// 取消代次。cancelInflightRequests 递增后，尚未登记 slot 的 transcribe 看到代次变化就不再 resume。
+    private var cancelGeneration = 0
+    /// selftest 在登记 slot 之前插入取消。生产路径保持 nil。
+    nonisolated(unsafe) static var testBeforeRegister: (@Sendable () -> Void)?
 
     private enum InflightSlot {
         case reserved
@@ -90,6 +94,7 @@ final class CloudClient: @unchecked Sendable {
     /// 开关关闭时丢掉全部在飞请求。单个任务取消走 `cancelTask`，不会进这里。
     func cancelInflightRequests() {
         let active = lock.withLockValue { () -> [URLSessionDataTask] in
+            cancelGeneration += 1
             var found: [URLSessionDataTask] = []
             var pending: [Int: InflightSlot] = [:]
             for (id, slot) in slots {
@@ -147,7 +152,8 @@ final class CloudClient: @unchecked Sendable {
             fileData: wav
         )
 
-        let (data, response) = try await data(for: request, duration: duration)
+        let generation = lock.withLockValue { cancelGeneration }
+        let (data, response) = try await data(for: request, duration: duration, generation: generation)
         guard let http = response as? HTTPURLResponse else {
             logger(CloudLogEntry(xGroqID: nil, duration: duration, statusCode: nil, reason: "invalid_response", errorType: nil))
             throw CloudClientError.invalidResponse
@@ -176,14 +182,36 @@ final class CloudClient: @unchecked Sendable {
         }
     }
 
-    private func data(for request: URLRequest, duration: Double) async throws -> (Data, URLResponse) {
-        let id = lock.withLockValue { () -> Int in
+    private func data(for request: URLRequest, duration: Double, generation: Int) async throws -> (Data, URLResponse) {
+        Self.testBeforeRegister?()
+        let id = lock.withLockValue { () -> Int? in
+            if cancelGeneration != generation {
+                return nil
+            }
             nextTaskID += 1
             slots[nextTaskID] = .reserved
             return nextTaskID
         }
+        guard let id else {
+            throw CloudClientError.cancelled
+        }
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<(Data, URLResponse), Error>) in
+                let aborted = self.lock.withLockValue { () -> Bool in
+                    if self.cancelGeneration != generation {
+                        self.slots.removeValue(forKey: id)
+                        return true
+                    }
+                    if case .cancelRequested = self.slots[id] {
+                        self.slots.removeValue(forKey: id)
+                        return true
+                    }
+                    return false
+                }
+                if aborted {
+                    continuation.resume(throwing: CloudClientError.cancelled)
+                    return
+                }
                 let task = self.session.dataTask(with: request) { data, response, error in
                     self.lock.withLockVoid { self.slots.removeValue(forKey: id) }
                     if let error {
@@ -204,6 +232,10 @@ final class CloudClient: @unchecked Sendable {
                     continuation.resume(returning: (data, response))
                 }
                 let cancelNow = self.lock.withLockValue { () -> Bool in
+                    if self.cancelGeneration != generation {
+                        self.slots.removeValue(forKey: id)
+                        return true
+                    }
                     if case .cancelRequested = self.slots[id] {
                         self.slots.removeValue(forKey: id)
                         return true
@@ -324,6 +356,7 @@ final class CloudClient: @unchecked Sendable {
     }
 
     static func selfTest() -> [String] {
+        testBeforeRegister = nil
         let failures = CloudFailureBox()
         let check: @Sendable (Bool, String) -> Void = { ok, name in
             if !ok { failures.append(name) }
@@ -480,6 +513,25 @@ final class CloudClient: @unchecked Sendable {
             }
         }
 
+        run {
+            CloudURLProtocolStub.starts = 0
+            CloudURLProtocolStub.handler = { _ in
+                .success(status: 200, headers: [:], body: Data(#"{"text":"x","segments":[]}"#.utf8))
+            }
+            let client = CloudClient(key: fakeKey, endpoint: endpoint, sessionConfiguration: config, logger: { _ in })
+            testBeforeRegister = { client.cancelInflightRequests() }
+            defer { testBeforeRegister = nil }
+            var threw = false
+            do {
+                _ = try await client.transcribe(pcm16Mono16k: Data([0, 0]), a0: 0, duration: 0.2, language: "de")
+            } catch {
+                threw = true
+                check(!"\(error)".contains(fakeKey), "登记前取消的错误描述不得泄露 key")
+            }
+            check(threw, "登记前取消应直接抛取消")
+            check(CloudURLProtocolStub.starts == 0, "登记前取消时 URLProtocol 桩计数应为 0")
+        }
+
         let session = defaultSessionConfiguration()
         check(session.timeoutIntervalForRequest == connectTimeout, "session timeoutIntervalForRequest 应为 5 秒")
         check(session.timeoutIntervalForResource == totalTimeout, "session timeoutIntervalForResource 应为 10 秒")
@@ -558,6 +610,7 @@ private enum CloudURLProtocolResult {
 
 private final class CloudURLProtocolStub: URLProtocol {
     nonisolated(unsafe) static var handler: ((URLRequest) -> CloudURLProtocolResult)?
+    nonisolated(unsafe) static var starts = 0
     private static let parkLock = NSLock()
     nonisolated(unsafe) private static var parked: [ObjectIdentifier: CloudURLProtocolStub] = [:]
 
@@ -570,6 +623,7 @@ private final class CloudURLProtocolStub: URLProtocol {
     }
 
     override func startLoading() {
+        Self.starts += 1
         guard let result = Self.handler?(request) else {
             client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
             return

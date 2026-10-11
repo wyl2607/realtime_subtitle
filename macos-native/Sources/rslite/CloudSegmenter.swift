@@ -2,8 +2,7 @@ import AVFoundation
 import Foundation
 
 /// TK-001 实测：SpeechTranscriber 的 volatile 结果没有词级时间，用它判段尾会把延迟做成 final 的 ~2s。
-/// 所以收段只看环形缓冲里的 16k 能量（A3'）。final 的精确时间事后改已发出段的 a0/a1，
-/// 只给 P5 用，不重切、不重发音频。
+/// 所以收段只看环形缓冲里的 16k 能量（A3'）。上屏时间用 Groq 返回的 segments，不再用本机 final 改已发出段。
 ///
 /// 门限写死，不是旋钮：20ms 帧 RMS ≥ 0.005 算有声；静音 ≥ 0.6s 收段；段长 ≤ 15s 强切；
 /// 短于 1.5s 且与下一段间隔在 (0.02s, 1.5s) 才合并。间隔为 0 的是强切接缝，不能粘回去。
@@ -18,12 +17,6 @@ struct EmittedCloudSegment: Equatable {
     var duration: Double {
         Double(pcm16.count) / 2 / 16_000
     }
-}
-
-struct SegmentBoundCorrection: Equatable {
-    var id: Int
-    var speechA0: Double
-    var speechA1: Double
 }
 
 struct SegmenterOutput: Equatable {
@@ -62,13 +55,6 @@ final class CloudSegmenter {
         var reason: String
     }
 
-    private struct Record {
-        var speechA0: Double
-        var speechA1: Double
-        var audioOrigin: Double
-        var pcmCount: Int
-    }
-
     private var samples: [Float] = []
     private var origin = 0.0
     private var frameCursor = 0
@@ -77,7 +63,6 @@ final class CloudSegmenter {
     private var queued: [HeldSpeech] = []
     private var silenceRun = 0.0
     private var nextID = 1
-    private var records: [Int: Record] = [:]
     private var converter: AVAudioConverter?
     private var converterKey: String?
     private let eps = 1e-6
@@ -143,41 +128,6 @@ final class CloudSegmenter {
         }
         emitted.append(contentsOf: flushReady(force: true))
         return emitted
-    }
-
-    func bounds(for id: Int) -> CloudSpeechBounds? {
-        guard let record = records[id] else { return nil }
-        return CloudSpeechBounds(
-            speechA0: record.speechA0,
-            speechA1: record.speechA1,
-            audioOrigin: record.audioOrigin,
-            pcmCount: record.pcmCount
-        )
-    }
-
-    /// final 词时间（Pipeline 交出来的是切句后的句界，词时间已经折进去了）只改包络。
-    /// 音频切片在发出时就冻住了，这里不动 pcm。
-    func noteFinalWords(_ words: [(t0: Double, t1: Double)]) -> [SegmentBoundCorrection] {
-        let usable = words.filter { $0.t1 >= $0.t0 && $0.t0.isFinite && $0.t1.isFinite }
-        guard !usable.isEmpty else { return [] }
-        var corrections: [SegmentBoundCorrection] = []
-        for id in records.keys.sorted() {
-            guard var record = records[id] else { continue }
-            let audioEnd = record.audioOrigin + Double(record.pcmCount) / 2 / Self.sampleRate
-            let overlapping = usable.filter { word in
-                word.t1 > record.speechA0 - Self.audioPad && word.t0 < record.speechA1 + Self.audioPad
-                    && word.t1 > record.audioOrigin && word.t0 < audioEnd
-            }
-            guard let first = overlapping.first else { continue }
-            let newA0 = overlapping.reduce(first.t0) { min($0, $1.t0) }
-            let newA1 = overlapping.reduce(first.t1) { max($0, $1.t1) }
-            guard abs(newA0 - record.speechA0) > eps || abs(newA1 - record.speechA1) > eps else { continue }
-            record.speechA0 = newA0
-            record.speechA1 = newA1
-            records[id] = record
-            corrections.append(SegmentBoundCorrection(id: id, speechA0: newA0, speechA1: newA1))
-        }
-        return corrections
     }
 
     private var atSilence: Bool {
@@ -302,7 +252,6 @@ final class CloudSegmenter {
         let id = nextID
         nextID += 1
         let originOut = floats.isEmpty ? start : start
-        records[id] = Record(speechA0: pending.speechA0, speechA1: pending.speechA1, audioOrigin: originOut, pcmCount: pcm.count)
         return EmittedCloudSegment(
             id: id,
             speechA0: pending.speechA0,
@@ -499,20 +448,31 @@ final class CloudSegmenter {
             let segmenter = CloudSegmenter()
             var clock = 0.0
             let got = feed(segmenter, 0.05, 2.0, &clock) + feed(segmenter, 0, 0.6, &clock)
-            guard let segment = got.first, let before = segmenter.bounds(for: segment.id) else {
+            guard let segment = got.first else {
                 check(false, "校正前应能查到已发出段")
                 return failures
             }
-            let pcmCount = before.pcmCount
-            let corrections = segmenter.noteFinalWords([(before.speechA0 + 0.15, before.speechA1 - 0.1)])
-            let after = segmenter.bounds(for: segment.id)
-            check(corrections.count == 1, "重叠的 final 词时间应校正已发出段")
-            check(after?.pcmCount == pcmCount, "校正不得改动已发音频")
-            check(after?.audioOrigin == before.audioOrigin, "校正不得改动切片起点")
-            if let after, let correction = corrections.first {
-                check(abs(after.speechA0 - correction.speechA0) < 1e-9, "记录里的 a0 应等于校正值")
-                check(after.speechA0 > before.speechA0 && after.speechA1 < before.speechA1, "校正应把包络收到词时间上")
-            }
+            let expectedSamples = Int((2.2 * sampleRate).rounded())
+            check(segment.pcm16.count == expectedSamples * 2, "校正不得改动已发音频")
+            check(abs(segment.audioOrigin - 0) < 0.03, "校正不得改动切片起点")
+            check(abs(segment.speechA0 - 0) < 0.03 && abs(segment.speechA1 - 2) < 0.03,
+                  "已发出段界保持能量包络，final 不再改写")
+        }
+
+        do {
+            let segmenter = CloudSegmenter()
+            // 0.004 落在旧的整块 RMS 0.003 和新门限 0.005 之间。分段器必须把它当成静音。
+            let quiet = segmenter.append(
+                samples: [Float](repeating: 0.004, count: Int((0.8 * sampleRate).rounded())),
+                startSeconds: 0
+            )
+            check(quiet.segments.isEmpty, "0.004 低于 0.005，不是语音")
+            check(quiet.atSilence, "0.004 持续 0.8s 应算静音，节点释放消费这一判定")
+            let voiced = segmenter.append(
+                samples: [Float](repeating: 0.02, count: Int(sampleRate)),
+                startSeconds: 0.8
+            )
+            check(!voiced.atSilence, "有声帧应清掉静音")
         }
 
         do {
@@ -574,11 +534,16 @@ struct CloudControlEffect: Equatable {
     var lines: [CloudP5Line]
     var discard: Bool
     var cancelInflight: Bool
+    /// Tier0 / 云端状态变化时才为 true。Tier1 期间不写状态行。
+    var publishStatus: Bool
+    /// Tier1 把状态行交给 NodeRouter。
+    var yieldStatusToNode: Bool
 }
 
 struct CloudIngestEffect: Equatable {
     var uploads: [EmittedCloudSegment]
     var control: CloudControlEffect
+    var atSilence: Bool
 }
 
 /// 云端上传调度。分段器给出段，这里按 P7' 决定发不发、何时从节点切回来。
@@ -606,6 +571,9 @@ final class CloudUploadController: @unchecked Sendable {
     private var inSilence = false
     private var lastMode: SubtitleMode?
     private var sawInvalidKey = false
+    /// 在飞段的能量包络。resolve 后删掉，取消时清空，避免无界增长。
+    private var segmentBounds: [Int: CloudSpeechBounds] = [:]
+    private static let boundsLimit = 64
 
     init(
         localeID: String,
@@ -645,9 +613,9 @@ final class CloudUploadController: @unchecked Sendable {
         applyNodeFacts(node)
         ledger.applyQuotaEvent(to: &context, at: now)
         let output = segmenter.append(samples: samples, startSeconds: startSeconds)
-        let uploads = output.segments.filter { shouldUploadLocked($0) }
+        let uploads = takeUploads(output.segments)
         let control = reconcileLocked(atSilence: output.atSilence, node: node, lines: [], discard: false, cancel: cancel)
-        return CloudIngestEffect(uploads: uploads, control: control)
+        return CloudIngestEffect(uploads: uploads, control: control, atSilence: output.atSilence)
     }
 
     func ingest(audio: TimedAudio, now: Date, node: NodeTierFacts) -> CloudIngestEffect {
@@ -658,9 +626,9 @@ final class CloudUploadController: @unchecked Sendable {
         applyNodeFacts(node)
         ledger.applyQuotaEvent(to: &context, at: now)
         let output = segmenter.append(audio: audio)
-        let uploads = output.segments.filter { shouldUploadLocked($0) }
+        let uploads = takeUploads(output.segments)
         let control = reconcileLocked(atSilence: output.atSilence, node: node, lines: [], discard: false, cancel: cancel)
-        return CloudIngestEffect(uploads: uploads, control: control)
+        return CloudIngestEffect(uploads: uploads, control: control, atSilence: output.atSilence)
     }
 
     func finish(now: Date, node: NodeTierFacts) -> CloudIngestEffect {
@@ -670,15 +638,9 @@ final class CloudUploadController: @unchecked Sendable {
         expireIfNeeded(now)
         applyNodeFacts(node)
         let segments = segmenter.finish()
-        let uploads = segments.filter { shouldUploadLocked($0) }
+        let uploads = takeUploads(segments)
         let control = reconcileLocked(atSilence: true, node: node, lines: [], discard: false, cancel: cancel)
-        return CloudIngestEffect(uploads: uploads, control: control)
-    }
-
-    func noteFinal(t0: Double, t1: Double) {
-        lock.lock()
-        defer { lock.unlock() }
-        _ = segmenter.noteFinalWords([(t0, t1)])
+        return CloudIngestEffect(uploads: uploads, control: control, atSilence: true)
     }
 
     /// 真正发请求前再查一次开关和额度。返回 nil 表示这段留在本机，不再重发。
@@ -716,28 +678,33 @@ final class CloudUploadController: @unchecked Sendable {
     func resolveSuccess(id: Int, result: CloudTranscriptionResult, now: Date, node: NodeTierFacts) -> CloudControlEffect {
         lock.lock()
         defer { lock.unlock() }
+        let cancel = refreshSwitchLocked()
+        expireIfNeeded(now)
+        applyNodeFacts(node)
         if id == probeID { probeID = nil }
-        guard segmentEpoch[id] == epoch else {
-            return reconcileLocked(atSilence: false, node: node, lines: [], discard: true, cancel: false)
+        let bounds = segmentBounds.removeValue(forKey: id)
+        if dropResolvedResultLocked(cancel: cancel) || segmentEpoch[id] != epoch {
+            return reconcileLocked(atSilence: false, node: node, lines: [], discard: true, cancel: cancel)
         }
         if let remaining = result.remainingRequests {
             try? ledger.correctRemainingRequests(["x-ratelimit-remaining-requests": NSNumber(value: remaining)], at: now)
         }
         context.apply(RouteEvent(type: "segment_success", status: nil, retryAfter: nil, usagePercent: nil))
         clearCooldownIfResumed()
-        let lines = Self.p5Lines(result: result, bounds: segmenter.bounds(for: id))
+        let lines = Self.p5Lines(result: result, bounds: bounds)
         return reconcileLocked(atSilence: false, node: node, lines: lines, discard: false, cancel: false)
     }
 
     func resolveFailure(id: Int, error: Error, now: Date, node: NodeTierFacts) -> CloudControlEffect {
         lock.lock()
         defer { lock.unlock() }
+        let cancel = refreshSwitchLocked()
+        expireIfNeeded(now)
+        applyNodeFacts(node)
         if id == probeID { probeID = nil }
-        guard segmentEpoch[id] == epoch else {
-            return reconcileLocked(atSilence: false, node: node, lines: [], discard: true, cancel: false)
-        }
-        if Self.isCancellation(error) {
-            return reconcileLocked(atSilence: false, node: node, lines: [], discard: true, cancel: false)
+        segmentBounds.removeValue(forKey: id)
+        if dropResolvedResultLocked(cancel: cancel) || segmentEpoch[id] != epoch || Self.isCancellation(error) {
+            return reconcileLocked(atSilence: false, node: node, lines: [], discard: true, cancel: cancel)
         }
         if let http = error as? CloudClientError, case .httpStatus(let status, let retryAfter, _) = http {
             context.apply(RouteEvent(type: "http_status", status: status, retryAfter: retryAfter, usagePercent: nil))
@@ -752,7 +719,7 @@ final class CloudUploadController: @unchecked Sendable {
     func bounds(for id: Int) -> CloudSpeechBounds? {
         lock.lock()
         defer { lock.unlock() }
-        return segmenter.bounds(for: id)
+        return segmentBounds[id]
     }
 
     func attemptCount(_ id: Int) -> Int {
@@ -777,6 +744,7 @@ final class CloudUploadController: @unchecked Sendable {
         defer { lock.unlock() }
         epoch += 1
         probeID = nil
+        segmentBounds.removeAll()
         client?.cancelInflightRequests()
     }
 
@@ -797,6 +765,36 @@ final class CloudUploadController: @unchecked Sendable {
         return [CloudP5Line(t0: bounds.speechA0, t1: bounds.speechA1, text: text)]
     }
 
+    private func takeUploads(_ segments: [EmittedCloudSegment]) -> [EmittedCloudSegment] {
+        let uploads = segments.filter { shouldUploadLocked($0) }
+        for segment in uploads {
+            rememberBounds(segment)
+        }
+        return uploads
+    }
+
+    private func rememberBounds(_ segment: EmittedCloudSegment) {
+        segmentBounds[segment.id] = CloudSpeechBounds(
+            speechA0: segment.speechA0,
+            speechA1: segment.speechA1,
+            audioOrigin: segment.audioOrigin,
+            pcmCount: segment.pcm16.count
+        )
+        while segmentBounds.count > Self.boundsLimit {
+            guard let oldest = segmentBounds.keys.min() else { break }
+            segmentBounds.removeValue(forKey: oldest)
+        }
+    }
+
+    /// 开关已关或 key 已清：结果不上屏，也不记成段成功/失败。
+    private func dropResolvedResultLocked(cancel: Bool) -> Bool {
+        if cancel { return true }
+        if !context.hasKey || !context.cloudEnabled || context.cloudState == .off {
+            return true
+        }
+        return false
+    }
+
     private func shouldUploadLocked(_ segment: EmittedCloudSegment, consumeProbe: Bool = true) -> Bool {
         guard !accepted.contains(segment.id) else { return false }
         guard context.tier() == .cloud else { return false }
@@ -811,13 +809,13 @@ final class CloudUploadController: @unchecked Sendable {
     private func refreshSwitchLocked() -> Bool {
         let snap = readSwitch()
         var cancel = false
-        if !snap.hasKey {
+        let clearingKey = !snap.hasKey
+        if clearingKey {
             if context.hasKey || context.cloudState != .off {
                 context.apply(RouteEvent(type: "key_cleared", status: nil, retryAfter: nil, usagePercent: nil))
                 cancel = context.cancelInflight
             }
             lastKey = nil
-            client = nil
         } else if !snap.enabled {
             if context.cloudEnabled && context.cloudState != .off {
                 context.apply(RouteEvent(type: "switch_off", status: nil, retryAfter: nil, usagePercent: nil))
@@ -836,10 +834,14 @@ final class CloudUploadController: @unchecked Sendable {
             clearCooldownIfResumed()
         }
         if cancel {
-            // 代次一变，在飞响应就算回来也进不了 P5。字节已经发出去的收不回。
+            // 代次一变，在飞响应就算回来也进不了 P5。先取消，再丢掉 client，避免取消落空。
             epoch += 1
             probeID = nil
+            segmentBounds.removeAll()
             client?.cancelInflightRequests()
+        }
+        if clearingKey {
+            client = nil
         }
         return cancel
     }
@@ -905,13 +907,28 @@ final class CloudUploadController: @unchecked Sendable {
         }
         let waitingOnNode = desired == .cloud && node.activeNodeID != nil && !cloudGateOpen
         let mode = presentationMode(desired: desired, waitingOnNode: waitingOnNode, node: node)
+        let cloudLabel = mode == .cloud || mode == .cloudKeyInvalid
+        let nodeOwnsStatus = !cloudLabel && (desired == .node || waitingOnNode)
+        let publish = Self.shouldPublishStatus(nodeOwnsStatus: nodeOwnsStatus, mode: mode, last: lastMode)
+        if nodeOwnsStatus {
+            lastMode = nil
+        } else if publish {
+            lastMode = mode
+        }
         return CloudControlEffect(
             mode: mode,
             nodeTierEnabled: desired != .cloud || waitingOnNode,
             lines: lines,
             discard: discard,
-            cancelInflight: cancel
+            cancelInflight: cancel,
+            publishStatus: publish,
+            yieldStatusToNode: nodeOwnsStatus
         )
+    }
+
+    /// Tier1 不写状态行。同一云端状态也不每帧重写。
+    static func shouldPublishStatus(nodeOwnsStatus: Bool, mode: SubtitleMode, last: SubtitleMode?) -> Bool {
+        !nodeOwnsStatus && last != mode
     }
 
     private func presentationMode(desired: ProviderTier, waitingOnNode: Bool, node: NodeTierFacts) -> SubtitleMode {
@@ -996,6 +1013,7 @@ final class CloudUploadController: @unchecked Sendable {
             check(fell.mode == .local, "连续 3 次失败应降到本机，实际 \(fell.mode.label)")
             check(fell.nodeTierEnabled, "降级后应允许节点层接手")
             check(fell.mode != .cloud, "降级后不应继续标云端")
+            check(fell.publishStatus == false && fell.yieldStatusToNode, "降级到节点时状态行交给 NodeRouter，云端不写")
         } else {
             check(false, "第三次应变出新段")
         }
@@ -1004,6 +1022,7 @@ final class CloudUploadController: @unchecked Sendable {
         let hybrid = controller.ingest(samples: [Float](repeating: 0, count: 16_000), startSeconds: clock, now: now.addingTimeInterval(2), node: active)
         clock += 1
         check(hybrid.control.mode == .hybrid("mini2"), "节点会话建立后状态应为混合·节点名，实际 \(hybrid.control.mode.label)")
+        check(hybrid.control.publishStatus == false, "节点连接期间云端不改写混合/本机")
 
         let limited = controller.resolveFailure(
             id: -1,
@@ -1041,6 +1060,7 @@ final class CloudUploadController: @unchecked Sendable {
             clock += 1
             check(secondSilence.control.mode == .cloud, "第二次静音点应切回云端·Groq，实际 \(secondSilence.control.mode.label)")
             check(secondSilence.control.nodeTierEnabled == false, "切回云端后应放开节点会话")
+            check(secondSilence.control.publishStatus, "切回云端时应写一次状态行")
         }
 
         box.snapshot.enabled = false
@@ -1125,6 +1145,114 @@ final class CloudUploadController: @unchecked Sendable {
         let fallback = CloudUploadController.p5Lines(result: empty, bounds: corrected)
         check(fallback.count == 1 && abs(fallback[0].t0 - 1.2) < 1e-9 && abs(fallback[0].t1 - 3.4) < 1e-9,
               "没有 Groq 句时间时 P5 用校正后的段界")
+
+        var lastLabel: SubtitleMode? = .cloud
+        var published: [String] = []
+        let flicker: [(Bool, SubtitleMode)] = [
+            (true, .local),
+            (true, .hybrid("mini2")),
+            (true, .local),
+            (true, .hybrid("mini2")),
+        ]
+        for frame in flicker {
+            if Self.shouldPublishStatus(nodeOwnsStatus: frame.0, mode: frame.1, last: lastLabel) {
+                published.append(frame.1.label)
+                lastLabel = frame.1
+            } else if frame.0 {
+                lastLabel = nil
+            }
+        }
+        check(published.isEmpty, "降级到节点、节点连接中不出现本机↔混合来回闪")
+        check(!Self.shouldPublishStatus(nodeOwnsStatus: false, mode: .cloud, last: .cloud), "同一云端状态不每帧刷")
+        check(Self.shouldPublishStatus(nodeOwnsStatus: false, mode: .cloudKeyInvalid, last: .cloud), "key 无效要写状态行")
+
+        let clearFake = FakeCloud()
+        let clearBox = SwitchBox(snapshot: CloudSwitchSnapshot(hasKey: true, enabled: true, key: "gsk_selftest_fake_key_abcdefghijklmnopqrstuvwxyz"))
+        let clearController = CloudUploadController(
+            localeID: "de-DE",
+            ledger: QuotaLedger(url: root.appendingPathComponent("quota-clear.json")),
+            readSwitch: { clearBox.snapshot },
+            makeClient: { _ in clearFake }
+        )
+        clearBox.snapshot = CloudSwitchSnapshot(hasKey: false, enabled: true, key: nil)
+        let cleared = clearController.ingest(samples: [Float](repeating: 0, count: 1_600), startSeconds: 0, now: now, node: idle)
+        check(cleared.control.cancelInflight, "清 key 应取消在飞请求")
+        check(clearFake.cancelled == 1, "清 key 应在丢掉 client 之前调用 cancelInflightRequests")
+
+        let lateFake = FakeCloud()
+        let lateBox = SwitchBox(snapshot: CloudSwitchSnapshot(hasKey: true, enabled: true, key: "gsk_selftest_fake_key_abcdefghijklmnopqrstuvwxyz"))
+        let late = CloudUploadController(
+            localeID: "de-DE",
+            ledger: QuotaLedger(url: root.appendingPathComponent("quota-late.json")),
+            readSwitch: { lateBox.snapshot },
+            makeClient: { _ in lateFake }
+        )
+        var lateClock = 0.0
+        _ = late.ingest(samples: [Float](repeating: 0.05, count: 32_000), startSeconds: lateClock, now: now, node: idle)
+        lateClock += 2
+        let lateClosed = late.ingest(samples: [Float](repeating: 0, count: 12_800), startSeconds: lateClock, now: now, node: idle)
+        if let seg = lateClosed.uploads.first, late.prepareSend(seg, now: now) != nil {
+            lateBox.snapshot.enabled = false
+            let lateResult = late.resolveSuccess(
+                id: seg.id,
+                result: CloudTranscriptionResult(text: "迟到", segments: [CloudSegment(t0: 0, t1: 1, text: "迟到")], statusCode: 200, xGroqID: nil, remainingRequests: nil),
+                now: now,
+                node: idle
+            )
+            check(lateResult.discard && lateResult.lines.isEmpty, "尾段返回时开关已关则不上屏")
+            check(lateFake.cancelled == 1, "resolve 发现开关已关应取消在飞请求")
+        } else {
+            check(false, "F2 用例应先有一段已接受的上传")
+        }
+
+        let keyLateFake = FakeCloud()
+        let keyLateBox = SwitchBox(snapshot: CloudSwitchSnapshot(hasKey: true, enabled: true, key: "gsk_selftest_fake_key_abcdefghijklmnopqrstuvwxyz"))
+        let keyLate = CloudUploadController(
+            localeID: "de-DE",
+            ledger: QuotaLedger(url: root.appendingPathComponent("quota-key-late.json")),
+            readSwitch: { keyLateBox.snapshot },
+            makeClient: { _ in keyLateFake }
+        )
+        _ = keyLate.ingest(samples: [Float](repeating: 0.05, count: 32_000), startSeconds: 0, now: now, node: idle)
+        let keyLateClosed = keyLate.ingest(samples: [Float](repeating: 0, count: 12_800), startSeconds: 2, now: now, node: idle)
+        if let seg = keyLateClosed.uploads.first, keyLate.prepareSend(seg, now: now) != nil {
+            keyLateBox.snapshot = CloudSwitchSnapshot(hasKey: false, enabled: true, key: nil)
+            let dropped = keyLate.resolveSuccess(
+                id: seg.id,
+                result: CloudTranscriptionResult(text: "迟到", segments: [CloudSegment(t0: 0, t1: 1, text: "迟到")], statusCode: 200, xGroqID: nil, remainingRequests: nil),
+                now: now,
+                node: idle
+            )
+            check(dropped.discard && dropped.lines.isEmpty, "尾段返回时 key 已清则不上屏")
+            check(keyLateFake.cancelled == 1, "resolve 发现 key 已清应先取消在飞请求")
+        } else {
+            check(false, "清 key 的 F2 用例应先有一段已接受的上传")
+        }
+
+        let resumeFake = FakeCloud()
+        let resumeBox = SwitchBox(snapshot: CloudSwitchSnapshot(hasKey: true, enabled: true, key: "gsk_selftest_fake_key_abcdefghijklmnopqrstuvwxyz"))
+        let resumed = CloudUploadController(
+            localeID: "de-DE",
+            ledger: QuotaLedger(url: root.appendingPathComponent("quota-resume.json")),
+            readSwitch: { resumeBox.snapshot },
+            makeClient: { _ in resumeFake }
+        )
+        var resumeClock = 0.0
+        _ = resumed.ingest(samples: [Float](repeating: 0.05, count: 32_000), startSeconds: resumeClock, now: now, node: idle)
+        resumeClock += 2
+        let beforePause = resumed.ingest(samples: [Float](repeating: 0, count: 12_800), startSeconds: resumeClock, now: now, node: idle)
+        resumeClock += 0.8
+        check(beforePause.uploads.count == 1, "暂停前应有一段可上传")
+        resumed.cancelInflight()
+        _ = resumed.ingest(samples: [Float](repeating: 0.05, count: 32_000), startSeconds: resumeClock, now: now, node: idle)
+        resumeClock += 2
+        let afterResume = resumed.ingest(samples: [Float](repeating: 0, count: 12_800), startSeconds: resumeClock, now: now, node: idle)
+        check(afterResume.uploads.count == 1, "暂停取消在飞之后，新的段仍应上传")
+        if let seg = afterResume.uploads.first {
+            check(resumed.prepareSend(seg, now: now) != nil, "恢复后的段应能继续交给客户端")
+        } else {
+            check(false, "恢复后应发出新段")
+        }
         return failures
     }
 }
