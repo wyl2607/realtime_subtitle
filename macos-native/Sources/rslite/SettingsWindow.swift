@@ -40,8 +40,8 @@ final class SettingsWindow {
         let window = NSWindow(contentViewController: host)
         window.title = "rslite 设置"
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-        window.setContentSize(NSSize(width: 720, height: 680))
-        window.contentMinSize = NSSize(width: 560, height: 480)
+        window.setContentSize(NSSize(width: 960, height: 720))
+        window.contentMinSize = NSSize(width: 720, height: 520)
         window.isReleasedWhenClosed = false
         window.tabbingMode = .disallowed
         window.center()
@@ -64,9 +64,13 @@ final class SettingsViewModel: ObservableObject {
     @Published var source: String
     @Published var src: String
     @Published var dst: String
-    @Published var mode: String
+    /// local / auto / pinned。指定节点对应 mode hybrid + pinnedNode。
+    @Published var runChoice: String
+    @Published var pinnedDraft: String
     @Published var languageMessage: String?
     @Published var nodeLoad: SettingsNodeLoad = .missing
+    @Published var compareRows: [NodeCompareRow] = []
+    @Published var probing = false
 
     private let onStyleChange: (OverlayStyle) -> Void
     private var savedLanguage: AppSettings
@@ -79,18 +83,30 @@ final class SettingsViewModel: ObservableObject {
         source = loadedLanguage.source
         src = loadedLanguage.src
         dst = loadedLanguage.dst
-        mode = loadedLanguage.mode
+        runChoice = Self.runChoice(for: loadedLanguage)
+        pinnedDraft = loadedLanguage.pinnedNode ?? ""
         savedLanguage = loadedLanguage
         keyConfigured = CloudConfigStore.readKey() != nil
         cloudEnabled = CloudConfigStore.readEnabled()
         nodeLoad = SettingsNodeList.load()
+        compareRows = NodeCompareBoard.makeRows(nodes: Self.loadedNodes(nodeLoad), probes: [:], probing: false)
     }
 
+    private var probeGeneration = 0
+
     var languageDirty: Bool {
-        source != savedLanguage.source
-            || src != savedLanguage.src
-            || dst != savedLanguage.dst
-            || mode != savedLanguage.mode
+        editedLanguage() != savedLanguage
+    }
+
+    var nodeChoices: [String] {
+        var ids: [String] = []
+        if case .loaded(let nodes) = nodeLoad {
+            ids = nodes.map(\.id)
+        }
+        if !pinnedDraft.isEmpty, !ids.contains(pinnedDraft) {
+            ids.append(pinnedDraft)
+        }
+        return ids
     }
 
     var cloudEnabledBinding: Binding<Bool> {
@@ -174,7 +190,7 @@ final class SettingsViewModel: ObservableObject {
     }
 
     func saveLanguage() {
-        let next = AppSettings.normalized(AppSettings(source: source, src: src, dst: dst, mode: mode))
+        let next = editedLanguage()
         do {
             try AppSettingsStore.save(next)
             applyLanguage(next)
@@ -188,11 +204,79 @@ final class SettingsViewModel: ObservableObject {
         nodeLoad = SettingsNodeList.load()
     }
 
+    /// 打开「算力节点」时调用。并发测每个节点的 /v1/info，每台 3 次取 RTT 中位数。
+    func probeNodes() {
+        reloadNodes()
+        probeGeneration += 1
+        let generation = probeGeneration
+        let nodes = Self.loadedNodes(nodeLoad)
+        probing = true
+        compareRows = NodeCompareBoard.makeRows(nodes: nodes, probes: [:], probing: true)
+        let configs = nodes.compactMap(\.config)
+        guard !configs.isEmpty else {
+            probing = false
+            compareRows = NodeCompareBoard.makeRows(nodes: nodes, probes: [:], probing: false)
+            return
+        }
+        guard #available(macOS 27.0, *) else {
+            probing = false
+            compareRows = NodeCompareBoard.makeRows(nodes: nodes, probes: [:], probing: false)
+            return
+        }
+        Task { [weak self] in
+            let measured = await NodeProber.measure(configs)
+            await MainActor.run {
+                guard let self, self.probeGeneration == generation else { return }
+                self.probing = false
+                self.compareRows = NodeCompareBoard.makeRows(
+                    nodes: nodes,
+                    probes: Dictionary(uniqueKeysWithValues: measured),
+                    probing: false
+                )
+            }
+        }
+    }
+
+    private func editedLanguage() -> AppSettings {
+        let mode: String
+        let pin: String?
+        switch runChoice {
+        case "local":
+            mode = "local"
+            pin = nil
+        case "auto":
+            mode = "auto"
+            pin = nil
+        default:
+            mode = "hybrid"
+            pin = pinnedDraft
+        }
+        return AppSettings.normalized(AppSettings(source: source, src: src, dst: dst, mode: mode, pinnedNode: pin))
+    }
+
+    private static func runChoice(for settings: AppSettings) -> String {
+        if settings.mode == "local" {
+            return "local"
+        }
+        if settings.mode == "hybrid" {
+            return "pinned"
+        }
+        return "auto"
+    }
+
+    private static func loadedNodes(_ load: SettingsNodeLoad) -> [SettingsNodeSummary] {
+        if case .loaded(let nodes) = load {
+            return nodes
+        }
+        return []
+    }
+
     private func applyLanguage(_ settings: AppSettings) {
         source = settings.source
         src = settings.src
         dst = settings.dst
-        mode = settings.mode
+        runChoice = Self.runChoice(for: settings)
+        pinnedDraft = settings.pinnedNode ?? ""
         savedLanguage = settings
     }
 
@@ -568,12 +652,34 @@ struct LanguageSettingsTab: View {
                 Text("目标语言")
                 TextField("例如 zh-Hans", text: $model.dst)
                     .textFieldStyle(.roundedBorder)
-                Picker("模式", selection: $model.mode) {
-                    Text("自动").tag("auto")
-                    Text("仅本机").tag("local")
-                    Text("混合").tag("hybrid")
+                Text("运行模式")
+                Picker("运行模式", selection: $model.runChoice) {
+                    Text("仅本机（默认）").tag("local")
+                    Text("自动选最快").tag("auto")
+                    Text("指定节点").tag("pinned")
                 }
                 .pickerStyle(.radioGroup)
+                .labelsHidden()
+                if model.runChoice == "pinned" {
+                    if model.nodeChoices.isEmpty {
+                        Text("nodes.json 里还没有节点。指定节点需要先添加。")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Picker("节点", selection: $model.pinnedDraft) {
+                            Text("请选择").tag("")
+                            ForEach(model.nodeChoices, id: \.self) { id in
+                                Text(id).tag(id)
+                            }
+                        }
+                    }
+                    Text("选定后重启才会钉住这一台。不选具体节点则仍按混合路由。")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                Text("重启 rslite 后生效")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
                 HStack(spacing: 8) {
                     Button("保存") { model.saveLanguage() }
                     if model.languageDirty {
@@ -600,28 +706,56 @@ struct NodesSettingsTab: View {
             VStack(alignment: .leading, spacing: 12) {
                 switch model.nodeLoad {
                 case .missing, .empty:
-                    Text("还没有节点。")
+                    Text("还没有节点。下面只列出本机。")
                 case .unreadable:
                     Text("节点列表无法读取。")
-                case .loaded(let nodes):
-                    ForEach(nodes) { node in
-                        HStack(alignment: .firstTextBaseline) {
-                            Text(node.id)
-                                .font(.body.monospaced())
-                            Spacer()
-                            Text(node.host)
-                                .foregroundStyle(.secondary)
-                                .textSelection(.enabled)
-                        }
+                case .loaded:
+                    EmptyView()
+                }
+                HStack {
+                    Button(model.probing ? "测速中…" : "测速") {
+                        model.probeNodes()
+                    }
+                    .disabled(model.probing)
+                    Text("打开这一页时会自动测一次。")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                Table(model.compareRows) {
+                    TableColumn("名称") { row in
+                        Text(row.isFastest ? "\(row.name) 最快" : row.name)
+                    }
+                    TableColumn("识别模型") { row in
+                        Text(row.model)
+                    }
+                    TableColumn("翻译") { row in
+                        Text(row.translation)
+                    }
+                    TableColumn("延迟") { row in
+                        Text(row.latency).monospacedDigit()
+                    }
+                    TableColumn("rtf") { row in
+                        Text(row.rtf).monospacedDigit()
+                    }
+                    TableColumn("状态") { row in
+                        Text(row.status)
+                    }
+                    TableColumn("预计") { row in
+                        Text(row.estimate).monospacedDigit()
                     }
                 }
+                .frame(minHeight: 220)
+                Text("预计每句耗时 ≈ RTT + rtf×4s（RTT 用秒，表里的延迟是毫秒）。这是估算，不是实测整句耗时。本机没有网络延迟，延迟显示为 —。")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 Text("如何添加节点：bash scripts/node/install_node.sh <ssh 别名>")
                     .textSelection(.enabled)
             }
             .padding(20)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .onAppear { model.reloadNodes() }
+        .onAppear { model.probeNodes() }
     }
 }
 
@@ -635,6 +769,8 @@ enum SettingsNodeLoad: Equatable {
 struct SettingsNodeSummary: Identifiable, Equatable {
     var id: String
     var host: String
+    /// 测速用。界面不展示 token 文件路径，也不读文件内容。
+    var config: NodeConfig?
 }
 
 enum SettingsNodeList {
@@ -653,7 +789,14 @@ enum SettingsNodeList {
             let id = alias.isEmpty ? nodeID : alias
             guard !id.isEmpty, seen.insert(id).inserted else { continue }
             let urlString = object["url"] as? String ?? ""
-            nodes.append(SettingsNodeSummary(id: id, host: hostName(from: urlString)))
+            let tokenFile = (object["token_file"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let config: NodeConfig?
+            if !nodeID.isEmpty, !urlString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !tokenFile.isEmpty {
+                config = NodeConfig(id: id, nodeID: nodeID, url: urlString, tokenFile: tokenFile)
+            } else {
+                config = nil
+            }
+            nodes.append(SettingsNodeSummary(id: id, host: hostName(from: urlString), config: config))
         }
         return nodes.isEmpty ? .empty : .loaded(nodes)
     }
@@ -664,6 +807,257 @@ enum SettingsNodeList {
             return "（无主机名）"
         }
         return host
+    }
+}
+
+struct NodeCompareRow: Identifiable, Equatable {
+    var id: String
+    var name: String
+    var model: String
+    var translation: String
+    var latency: String
+    var rtf: String
+    var status: String
+    var estimate: String
+    var estimateSeconds: Double?
+    var isFastest: Bool
+}
+
+enum NodeCompareBoard {
+    static let localID = "__rslite_local__"
+    /// 估算用的一句时长。界面写明这不是实测整句耗时。
+    static let sentenceSeconds = 4.0
+
+    /// 预计每句耗时（秒）≈ RTT（秒）+ rtf × 4。缺 RTT 或 rtf 时不估算。
+    static func estimateSeconds(rttMS: Double?, rtf: Double?) -> Double? {
+        guard let rttMS, let rtf, rttMS.isFinite, rtf.isFinite, rttMS >= 0, rtf >= 0 else {
+            return nil
+        }
+        return rttMS / 1000 + rtf * sentenceSeconds
+    }
+
+    static func modelText(model: String?, local: Bool) -> String {
+        if local { return "Apple 语音识别" }
+        guard let model, !model.isEmpty else { return "—" }
+        return model
+    }
+
+    static func translationText(translator: String?, translatorOK: Bool?, local: Bool) -> String {
+        if local { return "Apple 翻译" }
+        guard let translator, !translator.isEmpty else { return "—" }
+        let state = translatorOK == false ? "离线" : "在线"
+        return "\(translator) · \(state)"
+    }
+
+    static func latencyText(_ rttMS: Double?, local: Bool) -> String {
+        if local { return "—" }
+        guard let rttMS, rttMS.isFinite else { return "—" }
+        return "\(Int(rttMS.rounded())) ms"
+    }
+
+    static func rtfText(_ rtf: Double?) -> String {
+        guard let rtf, rtf.isFinite else { return "—" }
+        return String(format: "%.2f", rtf)
+    }
+
+    static func estimateText(_ seconds: Double?) -> String {
+        guard let seconds, seconds.isFinite else { return "—" }
+        return String(format: "预计 %.2fs", seconds)
+    }
+
+    static func makeRows(
+        nodes: [SettingsNodeSummary],
+        probes: [String: ProbeResult],
+        probing: Bool
+    ) -> [NodeCompareRow] {
+        var rows = [localRow()]
+        for node in nodes {
+            rows.append(nodeRow(node, probe: probes[node.id], probing: probing && probes[node.id] == nil))
+        }
+        return ordered(rows)
+    }
+
+    static func localRow() -> NodeCompareRow {
+        NodeCompareRow(
+            id: localID,
+            name: "本机",
+            model: modelText(model: nil, local: true),
+            translation: translationText(translator: nil, translatorOK: nil, local: true),
+            latency: "—",
+            rtf: "—",
+            status: "本机",
+            estimate: "—",
+            estimateSeconds: nil,
+            isFastest: false
+        )
+    }
+
+    static func nodeRow(_ node: SettingsNodeSummary, probe: ProbeResult?, probing: Bool) -> NodeCompareRow {
+        let info = probe?.info
+        let seconds = estimateSeconds(rttMS: probe?.rttMS, rtf: info?.asr.rtf)
+        let status: String
+        if let probe {
+            status = probe.availability.title
+        } else if node.config == nil {
+            status = ProbeResult.Availability.offline.title
+        } else if probing {
+            status = "测速中"
+        } else {
+            status = "—"
+        }
+        return NodeCompareRow(
+            id: node.id,
+            name: node.id,
+            model: modelText(model: info?.asr.model, local: false),
+            translation: translationText(translator: info?.translator, translatorOK: info?.translatorOK, local: false),
+            latency: latencyText(probe?.rttMS, local: false),
+            rtf: rtfText(info?.asr.rtf),
+            status: status,
+            estimate: estimateText(seconds),
+            estimateSeconds: seconds,
+            isFastest: false
+        )
+    }
+
+    /// 有估算的按耗时升序，相同耗时按 id。没有估算的排在后面，本机行靠前。只标一台最快。
+    static func ordered(_ rows: [NodeCompareRow]) -> [NodeCompareRow] {
+        let fastest = fastestID(rows)
+        let marked = rows.map { row in
+            var copy = row
+            copy.isFastest = row.id == fastest
+            return copy
+        }
+        return marked.sorted { lhs, rhs in
+            switch (lhs.estimateSeconds, rhs.estimateSeconds) {
+            case let (left?, right?) where left != right:
+                return left < right
+            case let (left?, right?) where left == right:
+                return lhs.id < rhs.id
+            case (_?, nil):
+                return true
+            case (nil, _?):
+                return false
+            default:
+                if lhs.id == localID { return true }
+                if rhs.id == localID { return false }
+                return lhs.id < rhs.id
+            }
+        }
+    }
+
+    static func fastestID(_ rows: [NodeCompareRow]) -> String? {
+        let ranked = rows.compactMap { row -> (String, Double)? in
+            guard let seconds = row.estimateSeconds else { return nil }
+            return (row.id, seconds)
+        }
+        return ranked.min { lhs, rhs in
+            if lhs.1 != rhs.1 { return lhs.1 < rhs.1 }
+            return lhs.0 < rhs.0
+        }?.0
+    }
+
+    static func selfTest() -> [String] {
+        var failures: [String] = []
+        func check(_ ok: Bool, _ name: String) {
+            if !ok { failures.append(name) }
+        }
+        check(estimateSeconds(rttMS: 1000, rtf: 1) == 5, "预计每句耗时 = RTT秒 + rtf×4")
+        check(estimateSeconds(rttMS: 125, rtf: 0.25) == 1.125, "125ms + rtf 0.25×4s = 1.125s")
+        check(estimateSeconds(rttMS: nil, rtf: 1) == nil, "没有 RTT 不估算")
+        check(estimateSeconds(rttMS: 10, rtf: nil) == nil, "没有 rtf 不估算")
+        check(estimateSeconds(rttMS: -1, rtf: 0.1) == nil, "负 RTT 不估算")
+
+        let secret = "/tmp/secret-token-value"
+        let info = NodeInfo(
+            v: 2, nodeID: "n2", hwHash: "h",
+            asr: .init(model: "whisper-large-v3-turbo", backend: "mlx", rtf: 0.1),
+            translator: "apple", busy: false, onAC: true, inUse: false, worker: "warm",
+            translatorOK: true
+        )
+        let slow = NodeInfo(
+            v: 2, nodeID: "n3", hwHash: "h",
+            asr: .init(model: "whisper-large-v3", backend: "mlx", rtf: 0.5),
+            translator: "ollama:qwen", busy: true, onAC: true, inUse: false, worker: "warm",
+            translatorOK: false
+        )
+        let mini = SettingsNodeSummary(
+            id: "mini2",
+            host: "mini2",
+            config: NodeConfig(id: "mini2", nodeID: "n2", url: "ws://mini2:8791", tokenFile: secret)
+        )
+        let win = SettingsNodeSummary(
+            id: "win",
+            host: "win",
+            config: NodeConfig(id: "win", nodeID: "n3", url: "ws://win:8791", tokenFile: secret)
+        )
+        let rows = makeRows(
+            nodes: [win, mini],
+            probes: [
+                "mini2": ProbeResult(info: info, rttMS: 50, availability: .idle),
+                "win": ProbeResult(info: slow, rttMS: 100, availability: .busy),
+            ],
+            probing: false
+        )
+        check(rows.first?.id == "mini2" && rows.first?.isFastest == true, "最快只标一台，且按预计耗时排在最前")
+        check(rows.filter(\.isFastest).count == 1, "相同比较里只有一台标最快")
+        let local = rows.first { $0.id == localID }
+        check(local?.name == "本机" && local?.model == "Apple 语音识别" && local?.translation == "Apple 翻译", "本机行写 Apple 语音识别和 Apple 翻译")
+        check(local?.latency == "—" && local?.estimateSeconds == nil && local?.isFastest == false, "本机没有 RTT 时不参与最快")
+        let miniRow = rows.first { $0.id == "mini2" }
+        check(miniRow?.model == "whisper-large-v3-turbo", "节点识别模型取 asr.model")
+        check(miniRow?.translation == "apple · 在线", "translator_ok 为真时翻译显示在线")
+        check(miniRow?.latency == "50 ms" && miniRow?.rtf == "0.10" && miniRow?.status == "空闲", "节点行显示延迟、rtf 和空闲")
+        let winRow = rows.first { $0.id == "win" }
+        check(winRow?.translation == "ollama:qwen · 离线" && winRow?.status == "忙", "translator_ok 为假时翻译显示离线")
+        let blob = rows.map { "\($0.name) \($0.model) \($0.translation) \($0.latency) \($0.status)" }.joined(separator: "\n")
+        check(!blob.contains(secret) && !blob.contains("token"), "对比行不显示 token 或 token 文件")
+        let tieA = NodeCompareRow(
+            id: "b", name: "b", model: "m", translation: "t", latency: "1 ms", rtf: "0.10",
+            status: "空闲", estimate: "预计 1.00s", estimateSeconds: 1, isFastest: false
+        )
+        let tieB = NodeCompareRow(
+            id: "a", name: "a", model: "m", translation: "t", latency: "1 ms", rtf: "0.10",
+            status: "空闲", estimate: "预计 1.00s", estimateSeconds: 1, isFastest: false
+        )
+        let tied = ordered([tieA, tieB])
+        check(tied.first?.id == "a" && tied.first?.isFastest == true && tied.filter(\.isFastest).count == 1, "耗时相同按 id 只标一台")
+        let missingRTF = translationText(translator: "apple", translatorOK: nil, local: false)
+        check(missingRTF == "apple · 在线", "translator_ok 缺失按在线")
+        return failures
+    }
+}
+
+@available(macOS 27.0, *)
+enum NodeProber {
+    static func measure(_ configs: [NodeConfig]) async -> [(String, ProbeResult)] {
+        await withTaskGroup(of: (String, ProbeResult).self) { group in
+            for config in configs {
+                group.addTask {
+                    let result = await sample(config)
+                    return (config.id, result)
+                }
+            }
+            var measured: [(String, ProbeResult)] = []
+            for await item in group {
+                measured.append(item)
+            }
+            return measured
+        }
+    }
+
+    static func sample(_ config: NodeConfig) async -> ProbeResult {
+        await withTaskGroup(of: ProbeResult.self) { group in
+            for _ in 0..<ProbeResult.samplesPerNode {
+                group.addTask {
+                    await NodeClient.probeInfo(config: config, timeout: ProbeResult.timeout)
+                }
+            }
+            var results: [ProbeResult] = []
+            for await result in group {
+                results.append(result)
+            }
+            return ProbeResult.combined(results)
+        }
     }
 }
 

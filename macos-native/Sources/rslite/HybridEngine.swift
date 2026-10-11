@@ -68,6 +68,7 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
     private let callbacks: PipelineCallbacks
     private let onMode: @Sendable (SubtitleMode) -> Void
     private let onNodeFinal: @Sendable (String, Double?, Double?, String, String?) -> Void
+    private let pinnedNode: String?
     private let lock = NSLock()
 
     private var local: Pipeline?
@@ -108,13 +109,15 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
         mode: RSLiteMode,
         callbacks: PipelineCallbacks,
         onMode: @escaping @Sendable (SubtitleMode) -> Void,
-        onNodeFinal: @escaping @Sendable (String, Double?, Double?, String, String?) -> Void = { _, _, _, _, _ in }
+        onNodeFinal: @escaping @Sendable (String, Double?, Double?, String, String?) -> Void = { _, _, _, _, _ in },
+        pinnedNode: String? = nil
     ) {
         self.config = config
         self.mode = mode
         self.callbacks = callbacks
         self.onMode = onMode
         self.onNodeFinal = onNodeFinal
+        self.pinnedNode = pinnedNode
     }
 
     func start() async throws {
@@ -237,7 +240,8 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
                 self.recordRouterMode(mode)
                 onMode(mode)
             },
-            nodeTierEnabled: nodeTierEnabled
+            nodeTierEnabled: nodeTierEnabled,
+            pinnedNode: pinnedNode
         )
         lock.withLockVoid { self.router = router }
         router.start(fanout: fanout)

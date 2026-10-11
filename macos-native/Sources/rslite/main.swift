@@ -18,7 +18,8 @@ struct Options {
     var src = "de-DE"
     var dst = "zh-Hans"
     var headless = false
-    var mode = RSLiteMode.auto
+    var mode = RSLiteMode.local
+    var pinnedNode: String?
     var selftest = false
     var cloudCommand: CloudCommand?
 }
@@ -100,6 +101,7 @@ struct RSLite {
         if let mode = RSLiteMode(rawValue: resolved.mode) {
             options.mode = mode
         }
+        options.pinnedNode = resolved.pinnedNode
         var i = 0
         while i < args.count {
             let key = args[i]
@@ -129,7 +131,7 @@ struct RSLite {
                     throw RSLiteError.usage("--cloud 只能是 on 或 off")
                 }
                 i += 2
-            case "--source", "--src", "--dst", "--mode":
+            case "--source", "--src", "--dst", "--mode", "--node":
                 guard i + 1 < args.count else {
                     throw RSLiteError.usage("missing value for \(key)")
                 }
@@ -141,6 +143,8 @@ struct RSLite {
                     options.src = value
                 case "--dst":
                     options.dst = value
+                case "--node":
+                    options.pinnedNode = AppSettings.normalizedPin(value)
                 default:
                     guard let mode = RSLiteMode(rawValue: value) else {
                         throw RSLiteError.usage("--mode 只能是 auto、local 或 hybrid")
@@ -155,7 +159,7 @@ struct RSLite {
         return options
     }
 
-    private static let usage = "usage: rslite [--source tap|mic|file:PATH] [--src de-DE] [--dst zh-Hans] [--headless] [--mode auto|local|hybrid] [--selftest] [--set-groq-key|--clear-groq-key|--cloud on|off]"
+    private static let usage = "usage: rslite [--source tap|mic|file:PATH] [--src de-DE] [--dst zh-Hans] [--headless] [--mode auto|local|hybrid] [--node ID] [--selftest] [--set-groq-key|--clear-groq-key|--cloud on|off]"
 
     private static func runCloudCommand(_ command: CloudCommand) throws {
         switch command {
@@ -188,7 +192,8 @@ struct RSLite {
             mode: options.mode,
             callbacks: callbacks,
             onMode: onMode,
-            onNodeFinal: onNodeFinal
+            onNodeFinal: onNodeFinal,
+            pinnedNode: options.pinnedNode
         )
     }
 
@@ -348,6 +353,7 @@ struct RSLite {
         failures.append(contentsOf: CloudConfigStore.selfTest().map { "CloudConfig: \($0)" })
         failures.append(contentsOf: OverlayStyle.selfTest().map { "OverlayStyle: \($0)" })
         failures.append(contentsOf: AppSettings.selfTest().map { "AppSettings: \($0)" })
+        failures.append(contentsOf: NodeCompareBoard.selfTest().map { "NodeCompare: \($0)" })
         failures.append(contentsOf: QuotaLedger.selfTest().map { "QuotaLedger: \($0)" })
         failures.append(contentsOf: CloudClient.selfTest().map { "CloudClient: \($0)" })
         if #available(macOS 27.0, *) {
