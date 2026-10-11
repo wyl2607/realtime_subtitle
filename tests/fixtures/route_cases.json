@@ -388,6 +388,126 @@
           }
         }
       ]
+    },
+    {
+      "name": "disabled_invalid_key_ignores_quota_update",
+      "initial": {
+        "has_key": true,
+        "cloud_enabled": true,
+        "node_enabled": false,
+        "node_healthy": false,
+        "node_is_self": false
+      },
+      "steps": [
+        {
+          "event": {"type": "http_status", "status": 401},
+          "expect": {
+            "tier": "local",
+            "cloud_state": "disabled_invalid_key",
+            "action": "mark_key_invalid"
+          }
+        },
+        {
+          "event": {"type": "quota_update", "usage_percent": 95},
+          "expect": {
+            "tier": "local",
+            "cloud_state": "disabled_invalid_key",
+            "action": "none"
+          }
+        },
+        {
+          "event": {"type": "quota_update", "usage_percent": 50},
+          "expect": {
+            "tier": "local",
+            "cloud_state": "disabled_invalid_key",
+            "action": "none"
+          }
+        }
+      ]
+    },
+    {
+      "name": "cloud_off_ignores_quota_update",
+      "initial": {
+        "has_key": true,
+        "cloud_enabled": true,
+        "node_enabled": false,
+        "node_healthy": false,
+        "node_is_self": false
+      },
+      "steps": [
+        {
+          "event": {"type": "switch_off"},
+          "expect": {
+            "tier": "local",
+            "cloud_state": "off",
+            "cancel_inflight": true,
+            "discard_response": true,
+            "action": "cloud_off"
+          }
+        },
+        {
+          "event": {"type": "quota_update", "usage_percent": 95},
+          "expect": {
+            "tier": "local",
+            "cloud_state": "off",
+            "action": "none"
+          }
+        },
+        {
+          "event": {"type": "quota_update", "usage_percent": 50},
+          "expect": {
+            "tier": "local",
+            "cloud_state": "off",
+            "action": "none"
+          }
+        }
+      ]
+    },
+    {
+      "name": "unauthorized_persists_across_switch_until_key_modified",
+      "initial": {
+        "has_key": true,
+        "cloud_enabled": true,
+        "node_enabled": false,
+        "node_healthy": false,
+        "node_is_self": false
+      },
+      "steps": [
+        {
+          "event": {"type": "http_status", "status": 401},
+          "expect": {
+            "tier": "local",
+            "cloud_state": "disabled_invalid_key",
+            "action": "mark_key_invalid"
+          }
+        },
+        {
+          "event": {"type": "switch_off"},
+          "expect": {
+            "tier": "local",
+            "cloud_state": "off",
+            "cancel_inflight": true,
+            "discard_response": true,
+            "action": "cloud_off"
+          }
+        },
+        {
+          "event": {"type": "switch_on"},
+          "expect": {
+            "tier": "local",
+            "cloud_state": "disabled_invalid_key",
+            "action": "none"
+          }
+        },
+        {
+          "event": {"type": "key_modified"},
+          "expect": {
+            "tier": "cloud",
+            "cloud_state": "available",
+            "action": "resume_cloud"
+          }
+        }
+      ]
     }
   ]
 }

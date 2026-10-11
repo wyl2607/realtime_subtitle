@@ -23,6 +23,7 @@ class RoutingState:
     cancel_inflight: bool = False
     discard_response: bool = False
     action: str = "none"
+    key_invalid: bool = False
 
     @classmethod
     def from_fixture(cls, data: dict[str, Any]) -> RoutingState:
@@ -35,6 +36,7 @@ class RoutingState:
             node_is_self=bool(data.get("node_is_self", False)),
             consecutive_failures=int(data.get("consecutive_failures", 0)),
             backoff_index=int(data.get("backoff_index", 0)),
+            key_invalid=bool(data.get("key_invalid", data.get("cloud_state") == "disabled_invalid_key")),
         )
 
     def apply(self, event: dict[str, Any]) -> None:
@@ -74,13 +76,17 @@ class RoutingState:
         if event_type == "switch_on":
             self.cloud_enabled = True
             if self.has_key:
-                self._resume_cloud()
+                if self.key_invalid:
+                    self.cloud_state = "disabled_invalid_key"
+                else:
+                    self._resume_cloud()
             return
         if event_type == "key_cleared":
             self.has_key = False
             self._turn_cloud_off()
             return
         if event_type == "key_modified":
+            self.key_invalid = False
             self.has_key = True
             self.cloud_enabled = True
             self._resume_cloud()
@@ -104,6 +110,7 @@ class RoutingState:
             "cancel_inflight": self.cancel_inflight,
             "discard_response": self.discard_response,
             "action": self.action,
+            "key_invalid": self.key_invalid,
         }
         return {key: full[key] for key in expected}
 
@@ -130,6 +137,7 @@ class RoutingState:
 
     def _http_status(self, status: int, retry_after: Any) -> None:
         if status in {401, 403}:
+            self.key_invalid = True
             self.cloud_state = "disabled_invalid_key"
             self.action = "mark_key_invalid"
             return
@@ -142,6 +150,8 @@ class RoutingState:
             self._fail_segment()
 
     def _quota_update(self, usage_percent: float) -> None:
+        if not self.cloud_enabled or not self.has_key or self.cloud_state in {"disabled_invalid_key", "off"}:
+            return
         if usage_percent >= 90:
             self.cloud_state = "cooldown_quota"
             self.action = "quota_cooldown"
