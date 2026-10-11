@@ -351,9 +351,10 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         guard let token = readTokenFile(config.tokenFile) else {
             throw NodeClientError.tokenUnavailable(config.id)
         }
-        guard let infoURL = infoURL(from: config.url) else {
+        guard let rawInfoURL = infoURL(from: config.url) else {
             throw NodeClientError.badURL(config.url)
         }
+        let infoURL = try TailnetPin.pinned(rawInfoURL)
         var request = URLRequest(url: infoURL)
         request.timeoutInterval = timeout.secondsValue
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -408,9 +409,10 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
             if components.path.isEmpty || components.path == "/" {
                 components.path = "/v2/session"
             }
-            guard let url = components.url else {
+            guard let rawURL = components.url else {
                 throw NodeClientError.badURL(config.url)
             }
+            let url = try TailnetPin.pinned(rawURL)
             var request = URLRequest(url: url)
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
             let sessionConfiguration = Self.directSessionConfiguration(timeout: 24 * 60 * 60)

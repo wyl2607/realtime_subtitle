@@ -1059,6 +1059,7 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     - **现象**：节点客户端若沿用 requests/websockets 默认行为，会读 HTTP(S)_PROXY / ALL_PROXY 把 Tailscale 流量交给代理，并在连接时对主机名再解析一次。
     - **根因**：先校验 100.64.0.0/10、后按主机名连接，两次解析之间 DNS 可以变（TOCTOU），代理也可以把连接带出 tailnet；云端相反，Groq 在公网，有的用户只能经系统代理访问。
     - **做法**：云端客户端保持系统代理（trust_env 默认）；节点客户端必须显式设置 `trust_env=False`，且必须在解析并验证目标 IP 属于 `100.64.0.0/10` 后，直接钉住该 IP 发起连接，禁止使用域名进行二次解析。
+    - **Swift 端（rslite）同样适用**：`TailnetPin.swift` 解析→校验全部地址在 100.64.0.0/10→把 URL 主机换成 IP 字面量，/v1/info、测速和 /v2/session 都走它（2026-10-11 补；此前 Swift 只关了代理、没校验网段，陌生 Wi-Fi 的 DNS 应答节点名就会把 token 和音频明文发出去）。
 
 48. **requests 在 trust_env 下会用 `~/.netrc` 的 Basic 覆盖 Bearer**（2026-10-11，CR-006B 评审发现）。
     - **现象**：只用 `headers={"Authorization": "Bearer …"}` 时，若 `~/.netrc` 里有 api.groq.com 的条目，发出去的是 netrc 的 Basic 认证，Groq 会按 key 无效处理。
