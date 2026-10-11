@@ -133,3 +133,18 @@ Tier 2  本机         永远可用；混合档下本机识别本来就一直在
 | 7 | Windows 面板 + 状态显示 + `--client` 下发 | 5, 6 | 免费 lane + 协调者审（安全部分自留） |
 | 8 | 文档（README 三语、CLAUDE.md、用户手册）+ version 3.2.0 | 2–7 | inkling + 协调者审 |
 | 9 | 端到端验收：002 Done 1–8 + 005 Done 1–7（Mac + Windows 真机） | 全部 | 协调者 |
+
+## Review Decision（2026-10-11，/sdd-review）
+
+评审全文见 `draft.review.md`。证据都由 Coordinator 对照文件和代码核过。
+
+| id | 结论 | 处理 / 理由 |
+|---|---|---|
+| ARCH-01 单段失败即降级 vs 连续 3 次才判不可用，两条规则冲突 | **接受** | RFC 里把 Tier 0 写成状态表：`可用 →(单段失败) 可用·该段保留本机版 →(连续 3 次) 不可用/冷却 →(冷却到期) 试探 →(成功) 可用`，401/403 与 429 各自直达对应状态。§1.1「路由随即降级」改为「连续 3 次才降级」，以 §1.3 为准。状态转移写进 P9 `route_cases.json`，两端共用。 |
+| ARCH-02 云端不能复用 NodeConfig / RoutingDecider（WS 契约需要 node_id/token_file/busy…） | **接受** | 「云端是又一种节点」只在概念上成立。实现上定义 `Provider` 抽象（`tier`、`available()`、产出 P5 句子），节点 Provider 包住现有 NodeClient + RoutingDecider，云端 Provider 单独实现；两类只共享分级选择器和 P5 输出，云端不进 nodes.json（与 §3 一致）。 |
+| ARCH-03 句子时间在 `process_iter` 返回时就丢了，样本时钟问题没解决却让 TK5/6 开工 | **接受** | 已核实：`streaming_asr.process_iter` 只返回 `(committed_text, unstable_text)`（streaming_asr.py:431-433），时间丢失点比 §1.5-1 写的更早。TK4 改为从 `process_iter` 起把词时间往下传，**出口条件**加上样本时钟连续性测试（语言切换 `clear_context` / 暂停 / 设备热切换三种情况），通过后 TK5/6 才开工。§4-3 并入 TK4。 |
+| S1 关开关后在飞那一段仍会上传，违反 requirement「关掉后完全不连 Groq」 | **接受** | §1.4 改为：关开关立即取消在飞请求（Swift `URLSessionTask.cancel()`，Python 关 session），响应一律丢弃，该段保留本机版。注明已发出的字节无法撤回，只能保证关掉之后不再发起任何连接。 |
+| S2 走系统代理时没写 TLS 校验要求 | **部分接受** | 接受：两端都**禁止关闭证书校验**（Python 不许 `verify=False`，Swift 不实现放行任何证书的 delegate），不加自定义 CA，测试用源码扫描守住。驳回「禁止 MITM」：用户自己的 Surge 是否解密 HTTPS 由用户的系统信任链决定，客户端检测不了也不该管；README 写一句「经代理时代理可见上传内容」。 |
+| S3 `SHOW_PERFORMANCE` 会把正文写进 subtitle.log | **驳回** | 这是已有行为，默认关闭，只写本机文件，config.py:588-596 和 CLAUDE.md §34 已有隐私警告，与云端无关，不在本方案范围内。requirement 要求的是 **key** 不进日志和崩溃报告：在 §1.2 日志一行补「异常信息与 traceback 不得带请求头」，云端客户端捕获异常后只记状态码 / 异常类型，并加一条测试：注入假 key 后触发各类失败，断言日志和异常文本里都不含该 key。 |
+
+**结论**：没有阻塞项。以上 5 条接受 / 部分接受的修改在 `/sdd-rfc` 收敛时写进 RFC 正文与 TK 卡，本 draft 正文不改。下一步：`/sdd-rfc`（需用户触发）。
