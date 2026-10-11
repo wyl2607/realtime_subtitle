@@ -288,6 +288,12 @@ final class OverlayController: NSObject {
         statusMenu.addItem(smaller)
 
         statusMenu.addItem(.separator())
+        let settings = NSMenuItem(title: "设置…", action: #selector(openSettings), keyEquivalent: ",")
+        settings.keyEquivalentModifierMask = [.command]
+        settings.target = self
+        statusMenu.addItem(settings)
+
+        statusMenu.addItem(.separator())
         let quit = NSMenuItem(title: "退出", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
         statusMenu.addItem(quit)
@@ -717,6 +723,25 @@ final class OverlayController: NSObject {
         style.originX = x
         style.originY = y
         persistAndApply(stickStripToBottom: false)
+    }
+
+    @objc private func openSettings() {
+        SettingsWindow.open { [weak self] style in
+            self?.applyExternalStyle(style)
+        }
+    }
+
+    /// 设置窗口改样式走这里。位置和用户拖出的尺寸以悬浮窗自己为准，不用设置页从磁盘读到的那份，
+    /// 否则会和拖动/缩放的防抖落盘互相覆盖。
+    private func applyExternalStyle(_ incoming: OverlayStyle) {
+        var next = incoming
+        next.originX = style.originX
+        next.originY = style.originY
+        next.width = style.width
+        next.height = style.height
+        let stick = next.shape == .strip && style.shape != .strip
+        style = next
+        persistAndApply(stickStripToBottom: stick)
     }
 
     @objc private func togglePause() {
