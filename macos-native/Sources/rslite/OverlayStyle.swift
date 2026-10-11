@@ -37,26 +37,26 @@ struct OverlayStyle: Codable, Equatable {
     var width: Double?
     var height: Double?
 
-    static let defaultFontSize = 28.0
-    static let defaultSourceColor = "#F0F0F0"
-    static let defaultTranslationColor = "#FFE894"
-    static let defaultBackgroundColor = "#000000"
-    static let defaultBackgroundOpacity = 0.72
+    static let defaultFontSize = DesignTokens.TypeScale.subtitleDefault
+    static let defaultSourceColor = DesignTokens.Color.subtitleSource
+    static let defaultTranslationColor = DesignTokens.Color.subtitleTranslation
+    static let defaultBackgroundColor = DesignTokens.Color.background
+    static let defaultBackgroundOpacity = DesignTokens.Opacity.backgroundDefault
+    static let minimumFontSize = DesignTokens.TypeScale.subtitleMin
+    static let maximumFontSize = DesignTokens.TypeScale.subtitleMax
     static let defaultLines = 2
     static let minimumWindowSize = CGSize(width: 360, height: 80)
+    static let windowPadV = CGFloat(DesignTokens.Space.windowPadV)
+    static let windowPadH = CGFloat(DesignTokens.Space.windowPadH)
+    static let pairGap = CGFloat(DesignTokens.Space.pairGap)
+    static let statusFontSize = CGFloat(DesignTokens.TypeScale.status)
     static let fontSizePresets: [Double] = [24, 28, 32, 40, 48]
-    static let textColorPresets: [(title: String, hex: String)] = [
-        ("白", "#F0F0F0"),
-        ("暖黄", "#FFE894"),
-        ("浅蓝", "#9FD3FF"),
-        ("浅绿", "#B6F2A8"),
-        ("浅灰", "#C8C8C8"),
-    ]
-    static let backgroundColorPresets: [(title: String, hex: String)] = [
-        ("黑", "#000000"),
-        ("深灰", "#1E1E1E"),
-        ("深蓝", "#0B1A2E"),
-    ]
+    static let textColorPresets: [(title: String, hex: String)] = DesignTokens.Palette.text.map {
+        (title: $0.name, hex: $0.hex)
+    }
+    static let backgroundColorPresets: [(title: String, hex: String)] = DesignTokens.Palette.background.map {
+        (title: $0.name, hex: $0.hex)
+    }
     static let opacityPresets: [(title: String, value: Double)] = [
         ("50%", 0.50),
         ("72%", 0.72),
@@ -94,9 +94,14 @@ struct OverlayStyle: Codable, Equatable {
         height: nil
     )
 
-    /// 圆角 18；直角和贴底横条都不倒角。
+    /// 圆角卡片 16；直角和贴底横条用直角令牌。
     var cornerRadius: CGFloat {
-        shape == .rounded ? 18 : 0
+        switch shape {
+        case .rounded:
+            CGFloat(DesignTokens.Radius.card)
+        case .square, .strip:
+            CGFloat(DesignTokens.Radius.none)
+        }
     }
 
     /// 贴底横条宽 = 可见宽 − 40；圆角/直角沿用原来的卡片宽（不超过 1100，两侧留 80）。
@@ -155,7 +160,7 @@ struct OverlayStyle: Codable, Equatable {
             return .default
         }
         var style = OverlayStyle.default
-        if let fontSize = partial.fontSize, fontSize.isFinite, (8...96).contains(fontSize) {
+        if let fontSize = partial.fontSize, fontSize.isFinite, (minimumFontSize...maximumFontSize).contains(fontSize) {
             style.fontSize = fontSize
         }
         if let hex = partial.sourceColor, let canonical = canonicalHex(hex) {
@@ -321,23 +326,38 @@ struct OverlayStyle: Codable, Equatable {
         }
 
         let defaults = OverlayStyle.default
+        check(defaults.fontSize == DesignTokens.TypeScale.subtitleDefault, "令牌默认字号")
+        check(defaults.sourceColor == DesignTokens.Color.subtitleSource, "令牌默认原文色")
+        check(defaults.translationColor == DesignTokens.Color.subtitleTranslation, "令牌默认译文色")
+        check(defaults.backgroundColor == DesignTokens.Color.background, "令牌默认背景色")
+        check(defaults.backgroundOpacity == DesignTokens.Opacity.backgroundDefault, "令牌默认透明度")
         check(defaults.fontSize == 28, "默认字号 28")
         check(defaults.sourceColor == "#F0F0F0", "默认原文色")
         check(defaults.translationColor == "#FFE894", "默认译文色")
         check(defaults.backgroundColor == "#000000", "默认背景色")
         check(defaults.backgroundOpacity == 0.72, "默认透明度")
+        check(textColorPresets.map(\.hex) == DesignTokens.Palette.text.map(\.hex), "文字调色板来自令牌")
+        check(backgroundColorPresets.map(\.hex) == DesignTokens.Palette.background.map(\.hex), "背景调色板来自令牌")
+        check(textColorPresets.count == 5 && backgroundColorPresets.count == 5, "5+5 预设调色板")
+        check(minimumFontSize == DesignTokens.TypeScale.subtitleMin && maximumFontSize == DesignTokens.TypeScale.subtitleMax, "字号范围来自令牌")
+        check(windowPadV == 18 && windowPadH == 22, "内边距 18×22")
+        check(windowPadV == CGFloat(DesignTokens.Space.windowPadV) && windowPadH == CGFloat(DesignTokens.Space.windowPadH), "内边距来自令牌")
+        check(pairGap == CGFloat(DesignTokens.Space.pairGap) && pairGap == 8, "句对间距来自令牌")
+        check(statusFontSize == CGFloat(DesignTokens.TypeScale.status) && statusFontSize == 13, "状态行字号来自令牌")
+        check(CGFloat(DesignTokens.Radius.none) == 0 && CGFloat(DesignTokens.Radius.small) == 8 && CGFloat(DesignTokens.Radius.card) == 16, "圆角令牌 0/8/16")
         check(defaults.textEdge == .shadow, "默认文字边缘 shadow")
         check(defaults.shape == .rounded, "默认形状 rounded")
         check(defaults.lines == 2, "默认行数 2")
         check(defaults.displayMode == .bilingual, "默认显示模式 bilingual")
         check(defaults.originX == nil && defaults.originY == nil, "默认无原点")
         check(defaults.width == nil && defaults.height == nil, "默认无尺寸")
-        check(defaults.cornerRadius == 18, "圆角半径 18")
+        check(defaults.cornerRadius == CGFloat(DesignTokens.Radius.card), "圆角半径取卡片令牌")
+        check(defaults.cornerRadius == 16, "圆角半径 16")
         var square = defaults
         square.shape = .square
-        check(square.cornerRadius == 0, "直角半径 0")
+        check(square.cornerRadius == CGFloat(DesignTokens.Radius.none), "直角半径取 none")
         square.shape = .strip
-        check(square.cornerRadius == 0, "横条半径 0")
+        check(square.cornerRadius == CGFloat(DesignTokens.Radius.none), "横条半径 0")
         check(windowWidth(for: .strip, visibleWidth: 1440) == 1400, "横条宽=可见宽-40")
         check(windowWidth(for: .rounded, visibleWidth: 1440) == 1100, "圆角卡片宽")
         check(windowWidth(for: .square, visibleWidth: 800) == 720, "直角同卡片宽")
@@ -405,6 +425,10 @@ struct OverlayStyle: Codable, Equatable {
         check(fromJSON(Data(#"{"textEdge":"Shadow"}"#.utf8)).textEdge == .shadow, "大小写不对的 enum 回默认")
         check(fromJSON(Data(#"{"textEdge":"none"}"#.utf8)).textEdge == .none, "textEdge none")
         check(fromJSON(Data(#"{"textEdge":"outline"}"#.utf8)).textEdge == .outline, "textEdge outline")
+        check(fromJSON(Data(#"{"fontSize":15}"#.utf8)).fontSize == defaults.fontSize, "字号低于令牌下限回默认")
+        check(fromJSON(Data(#"{"fontSize":16}"#.utf8)).fontSize == 16, "字号等于下限保留")
+        check(fromJSON(Data(#"{"fontSize":72}"#.utf8)).fontSize == 72, "字号等于上限保留")
+        check(fromJSON(Data(#"{"fontSize":73}"#.utf8)).fontSize == defaults.fontSize, "字号高于令牌上限回默认")
         check(fromJSON(Data(#"{"lines":0}"#.utf8)).lines == 1, "行数低于 1 夹到 1")
         check(fromJSON(Data(#"{"lines":9}"#.utf8)).lines == 4, "行数高于 4 夹到 4")
         check(fromJSON(Data(#"{"backgroundOpacity":2}"#.utf8)).backgroundOpacity == 0.72, "透明度越界回默认")

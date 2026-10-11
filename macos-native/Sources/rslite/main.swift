@@ -347,6 +347,7 @@ struct RSLite {
         failures.append(contentsOf: Capability.selfTest().map { "Capability: \($0)" })
         failures.append(contentsOf: CloudConfigStore.selfTest().map { "CloudConfig: \($0)" })
         failures.append(contentsOf: OverlayStyle.selfTest().map { "OverlayStyle: \($0)" })
+        failures.append(contentsOf: OverlayMotion.selfTest().map { "OverlayMotion: \($0)" })
         failures.append(contentsOf: AppSettings.selfTest().map { "AppSettings: \($0)" })
         failures.append(contentsOf: QuotaLedger.selfTest().map { "QuotaLedger: \($0)" })
         failures.append(contentsOf: CloudClient.selfTest().map { "CloudClient: \($0)" })

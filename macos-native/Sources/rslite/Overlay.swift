@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import QuartzCore
 
 private final class OverlayPanel: NSPanel {
     var arrowKeyHandler: ((NSEvent) -> Bool)?
@@ -40,10 +41,122 @@ private final class OverlayDragSurfaceView: NSView {
         return bounds.contains(local) ? self : nil
     }
 
+    var scrollHandler: ((NSEvent) -> Void)?
+
     override func mouseDown(with event: NSEvent) {
         guard let window, !window.ignoresMouseEvents else { return }
         window.performDrag(with: event)
         window.makeKey()
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        if let scrollHandler {
+            scrollHandler(event)
+            return
+        }
+        super.scrollWheel(with: event)
+    }
+}
+
+/// 句对容器。源文和译文各一个标签，按 key 复用，不在每次重画时新建。
+private final class SubtitlePairView: NSStackView {
+    let key: Int
+    let sourceField = NSTextField(labelWithString: "")
+    let translationField = NSTextField(labelWithString: "")
+    var sourceSignature = ""
+    var translationSignature = ""
+    var didFadeIn = false
+    var appliedOpacity = -1.0
+
+    init(key: Int) {
+        self.key = key
+        super.init(frame: .zero)
+        orientation = .vertical
+        alignment = .leading
+        spacing = OverlayStyle.pairGap
+        translatesAutoresizingMaskIntoConstraints = false
+        setHuggingPriority(.required, for: .vertical)
+        configure(sourceField)
+        configure(translationField)
+        addArrangedSubview(sourceField)
+        addArrangedSubview(translationField)
+    }
+
+    required init?(coder: NSCoder) {
+        return nil
+    }
+
+    private func configure(_ field: NSTextField) {
+        field.translatesAutoresizingMaskIntoConstraints = false
+        field.lineBreakMode = .byWordWrapping
+        field.maximumNumberOfLines = 3
+        field.setContentCompressionResistancePriority(.required, for: .vertical)
+        if let cell = field.cell as? NSTextFieldCell {
+            cell.wraps = true
+            cell.isScrollable = false
+        }
+    }
+}
+
+/// 字幕区。内容高出窗口时由顶部渐隐裁切，而不是硬切。
+private final class FadingClipView: NSView {
+    var fadesTop = false {
+        didSet {
+            if fadesTop != oldValue { needsLayout = true }
+        }
+    }
+
+    private let gradient = CAGradientLayer()
+    private let topFade: CGFloat = 36
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) {
+        return nil
+    }
+
+    override func layout() {
+        super.layout()
+        guard let layer else { return }
+        layer.masksToBounds = true
+        guard fadesTop, bounds.height > 1 else {
+            layer.mask = nil
+            return
+        }
+        let fade = min(0.45, topFade / bounds.height)
+        gradient.frame = bounds
+        // 非翻转图层：y = 1 是顶边。顶边透明，往下很快恢复不透明。
+        gradient.startPoint = CGPoint(x: 0.5, y: 1)
+        gradient.endPoint = CGPoint(x: 0.5, y: 0)
+        gradient.colors = [
+            NSColor.clear.cgColor,
+            NSColor.white.cgColor,
+            NSColor.white.cgColor,
+        ]
+        gradient.locations = [0, NSNumber(value: Double(fade)), 1]
+        layer.mask = gradient
+    }
+}
+
+private final class ReviewBadgeButton: NSButton {
+    var scrollHandler: ((NSEvent) -> Void)?
+
+    override var intrinsicContentSize: NSSize {
+        var size = super.intrinsicContentSize
+        size.width += 16
+        size.height += 6
+        return size
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        if let scrollHandler {
+            scrollHandler(event)
+            return
+        }
+        super.scrollWheel(with: event)
     }
 }
 
@@ -54,6 +167,8 @@ final class OverlayController: NSObject {
     private let tint: NSView
     private let dragSurface: OverlayDragSurfaceView
     private let stack = NSStackView()
+    private let clipView = FadingClipView(frame: .zero)
+    private let reviewBadge = ReviewBadgeButton(title: OverlayMotion.newCaptionBadgeTitle, target: nil, action: nil)
     private let volatileLabel = NSTextField(labelWithString: "")
     /// 当前识别层。和草稿分开，避免 setStatus/setVolatile 把「云端·Groq」盖掉。
     private let tierLabel = NSTextField(labelWithString: "本机")
@@ -64,8 +179,17 @@ final class OverlayController: NSObject {
     private let pauseItem = NSMenuItem(title: "暂停", action: #selector(togglePause), keyEquivalent: "")
     private let clickThroughItem = NSMenuItem(title: "鼠标穿透", action: #selector(toggleClickThrough), keyEquivalent: "")
 
-    // 字幕历史（含已滚出屏幕的行）；界面只画末尾 style.lines 对。节点精修结果按 P5 在这里替换本机行。
+    // 字幕历史（含已滚出屏幕的行）。固定行数只画末尾 style.lines 对；瀑布流最多画 displayHistoryLimit 对。
     private var store = LineStore()
+    private var pairViews: [Int: SubtitlePairView] = [:]
+    private var appearedAt: [Int: Double] = [:]
+    private var renderedKeys: Set<Int> = []
+    private var review = CaptionReview.live
+    private var reviewIdleTask: Task<Void, Never>?
+    private var holdTask: Task<Void, Never>?
+    private var didRenderOnce = false
+    private var waterfallActive = false
+    private var scrollAccumulator: CGFloat = 0
     /// 译文可能先于 MainActor 上的 applyNode 回来。先按 key 记下，行出现再补上。
     private var pendingTranslation: [Int: String] = [:]
     private var style: OverlayStyle
@@ -101,9 +225,12 @@ final class OverlayController: NSObject {
         panel.arrowKeyHandler = { [weak self] event in
             self?.handleArrowKey(event) ?? false
         }
+        dragSurface.scrollHandler = { [weak self] event in
+            self?.handleScroll(event)
+        }
         applyChrome()
         applyTypography()
-        render()
+        render(animate: false)
     }
 
     func show() {
@@ -118,8 +245,10 @@ final class OverlayController: NSObject {
             let tail = shown.suffix(limit)
             shown = "…" + (tail.firstIndex(of: " ").map { String(tail[tail.index(after: $0)...]) } ?? String(tail))
         }
-        volatileLabel.stringValue = shown
-        fitHeight()
+        if volatileLabel.stringValue != shown {
+            volatileLabel.stringValue = shown
+        }
+        render()
     }
 
     func addFinal(id: Int, text: String, t0: Double? = nil, t1: Double? = nil) {
@@ -153,8 +282,10 @@ final class OverlayController: NSObject {
     }
 
     func setStatus(_ text: String) {
-        volatileLabel.stringValue = text
-        fitHeight()
+        if volatileLabel.stringValue != text {
+            volatileLabel.stringValue = text
+        }
+        render()
     }
 
     /// 菜单栏标题显示当前识别在哪里：音频是否正在离开本机，用户要能一眼看出来。
@@ -165,8 +296,10 @@ final class OverlayController: NSObject {
     func setModeLabel(_ label: String) {
         statusItem.length = NSStatusItem.variableLength
         statusItem.button?.title = "字·\(label)"
-        tierLabel.stringValue = label
-        fitHeight()
+        if tierLabel.stringValue != label {
+            tierLabel.stringValue = label
+        }
+        render()
     }
 
     private static func initialFrame(for style: OverlayStyle) -> NSRect {
@@ -229,8 +362,10 @@ final class OverlayController: NSObject {
 
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 8
+        stack.spacing = OverlayStyle.pairGap
         stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.setHuggingPriority(.required, for: .vertical)
+        stack.setContentCompressionResistancePriority(.required, for: .vertical)
 
         volatileLabel.textColor = .secondaryLabelColor
         volatileLabel.lineBreakMode = .byWordWrapping
@@ -238,26 +373,59 @@ final class OverlayController: NSObject {
         volatileLabel.preferredMaxLayoutWidth = textWidth
 
         tierLabel.textColor = .secondaryLabelColor
-        tierLabel.font = .systemFont(ofSize: 14)
+        tierLabel.font = .systemFont(ofSize: OverlayStyle.statusFontSize)
         tierLabel.lineBreakMode = .byTruncatingTail
         tierLabel.maximumNumberOfLines = 1
         tierLabel.preferredMaxLayoutWidth = textWidth
 
-        root.addSubview(stack)
+        clipView.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(clipView)
+        clipView.addSubview(stack)
+        stack.addArrangedSubview(volatileLabel)
+        stack.addArrangedSubview(tierLabel)
+
+        reviewBadge.target = self
+        reviewBadge.action = #selector(jumpToLatest)
+        reviewBadge.isBordered = false
+        reviewBadge.font = .systemFont(ofSize: OverlayStyle.statusFontSize, weight: .medium)
+        reviewBadge.wantsLayer = true
+        reviewBadge.layer?.backgroundColor = badgeBackgroundColor().cgColor
+        reviewBadge.layer?.cornerRadius = CGFloat(DesignTokens.Radius.small)
+        reviewBadge.attributedTitle = NSAttributedString(
+            string: OverlayMotion.newCaptionBadgeTitle,
+            attributes: [
+                .foregroundColor: nsColor(DesignTokens.Color.subtitleSource, fallback: OverlayStyle.defaultSourceColor),
+                .font: NSFont.systemFont(ofSize: OverlayStyle.statusFontSize, weight: .medium),
+            ]
+        )
+        reviewBadge.translatesAutoresizingMaskIntoConstraints = false
+        reviewBadge.isHidden = true
+        reviewBadge.scrollHandler = { [weak self] event in
+            self?.handleScroll(event)
+        }
+
         dragSurface.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(dragSurface)
+        root.addSubview(reviewBadge)
         panel.contentView = root
 
+        let padH = OverlayStyle.windowPadH
+        let padV = OverlayStyle.windowPadV
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 22),
-            stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -22),
-            // 用户把窗口拉高后，字幕要像视频字幕一样贴着底边出现，多出的空白留在上方。
-            stack.topAnchor.constraint(greaterThanOrEqualTo: root.topAnchor, constant: 18),
-            stack.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -18),
+            clipView.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: padH),
+            clipView.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -padH),
+            clipView.topAnchor.constraint(equalTo: root.topAnchor, constant: padV),
+            clipView.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -padV),
+            // 贴底。高出的句子从裁切区顶边溢出去，由渐隐遮罩收掉。
+            stack.leadingAnchor.constraint(equalTo: clipView.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: clipView.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: clipView.bottomAnchor),
             dragSurface.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             dragSurface.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             dragSurface.topAnchor.constraint(equalTo: root.topAnchor),
             dragSurface.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            reviewBadge.centerXAnchor.constraint(equalTo: root.centerXAnchor),
+            reviewBadge.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -(padV + 4)),
         ])
     }
 
@@ -324,9 +492,7 @@ final class OverlayController: NSObject {
         styleMenu.addItem(submenu("形状", OverlayStyle.shapeChoices.map { choice in
             checked(choice.title, on: style.shape == choice.value, action: #selector(chooseShape(_:)), object: choice.value.rawValue)
         }))
-        styleMenu.addItem(submenu("行数", (1...4).map { count in
-            checked("\(count)", on: style.lines == count, action: #selector(chooseLines(_:)), tag: count)
-        }))
+        styleMenu.addItem(submenu("行数", linesMenuItems()))
         styleMenu.addItem(submenu("显示模式", OverlayStyle.displayModeChoices.map { choice in
             checked(choice.title, on: style.displayMode == choice.value, action: #selector(chooseDisplayMode(_:)), object: choice.value.rawValue)
         }))
@@ -345,6 +511,23 @@ final class OverlayController: NSObject {
         return root
     }
 
+    private func linesMenuItems() -> [NSMenuItem] {
+        var items = (1...4).map { count in
+            checked("\(count)", on: style.lines == count, action: #selector(chooseLines(_:)), tag: count)
+        }
+        let hint = NSMenuItem(title: OverlayMotion.waterfallMenuHint, action: nil, keyEquivalent: "")
+        hint.attributedTitle = NSAttributedString(
+            string: OverlayMotion.waterfallMenuHint,
+            attributes: [
+                .foregroundColor: NSColor.secondaryLabelColor,
+                .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+            ]
+        )
+        hint.isEnabled = false
+        items.append(hint)
+        return items
+    }
+
     private func checked(_ title: String, on: Bool, action: Selector, object: Any? = nil, tag: Int = 0) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
         item.target = self
@@ -354,71 +537,238 @@ final class OverlayController: NSObject {
         return item
     }
 
-    private func render() {
-        stack.arrangedSubviews.forEach { view in
-            stack.removeArrangedSubview(view)
-            view.removeFromSuperview()
+    private func render(animate: Bool = true) {
+        updateWrapWidths()
+        let width = textWidth
+        let history = Array(store.lines.suffix(LineStore.displayHistoryLimit)).filter(isDisplayable)
+        noteArrivals(in: history)
+        review = review.clamped(historyCount: history.count)
+
+        let liveKeys = Set(history.map(\.key))
+        for key in pairViews.keys where !liveKeys.contains(key) {
+            if let view = pairViews.removeValue(forKey: key) {
+                stack.removeArrangedSubview(view)
+                view.removeFromSuperview()
+            }
+            appearedAt.removeValue(forKey: key)
+        }
+        for line in history {
+            let pair = pairViews[line.key] ?? SubtitlePairView(key: line.key)
+            pairViews[line.key] = pair
+            update(pair, line: line, width: width)
         }
 
-        let source = nsColor(style.sourceColor, fallback: OverlayStyle.defaultSourceColor)
-        let translation = nsColor(style.translationColor, fallback: OverlayStyle.defaultTranslationColor)
-        for line in store.lines.suffix(style.lines) {
-            if style.displayMode != .translationOnly {
-                stack.addArrangedSubview(subtitleField(line.srcText, color: source))
-            }
-            if style.displayMode != .sourceOnly,
-               let translated = line.dstText,
-               !translated.isEmpty {
-                stack.addArrangedSubview(subtitleField(translated, color: translation))
-            }
+        let heights = Dictionary(uniqueKeysWithValues: history.map { line in
+            (line.key, measuredPairHeight(pairViews[line.key]!, width: width))
+        })
+        let statusHeight = statusBlockHeight(width: width)
+        let fixedKeys = history.suffix(style.lines).map(\.key)
+        let linesHeight = blockHeight(pairHeights: fixedKeys.map { heights[$0] ?? 0 }, statusHeight: statusHeight)
+        if liveResizeStart == nil,
+           OverlayMotion.shouldClearUserHeight(
+            userHeight: style.height,
+            linesHeight: Double(linesHeight),
+            slack: OverlayMotion.waterfallSlack
+           ) {
+            style.height = nil
+            scheduleStyleSave()
         }
-        updateWrapWidths()
-        stack.addArrangedSubview(volatileLabel)
-        stack.addArrangedSubview(tierLabel)
-        fitHeight()
+        let effectiveHeight: Double? = liveResizeStart == nil ? style.height : Double(panel.frame.height)
+        let waterfall = OverlayMotion.isWaterfall(
+            userHeight: effectiveHeight,
+            linesHeight: Double(linesHeight),
+            slack: OverlayMotion.waterfallSlack
+        )
+        waterfallActive = waterfall
+
+        let now = Date().timeIntervalSinceReferenceDate
+        let visibleKeys: [Int]
+        let clipsTop: Bool
+        if waterfall {
+            let pool = Array(history.dropLast(min(review.offsetFromBottom, history.count)))
+                .filter { (heights[$0.key] ?? 0) > 0.5 }
+            let bottomFirst = pool.reversed().map { Double(heights[$0.key] ?? 0) }
+            let bridge = statusHeight > 0 && !pool.isEmpty ? OverlayStyle.pairGap : 0
+            let available = Double(panel.frame.height - OverlayStyle.windowPadV * 2 - statusHeight - bridge)
+            let fit = OverlayMotion.waterfallFit(
+                availableHeight: available,
+                pairHeightsBottomFirst: bottomFirst,
+                pairGap: Double(OverlayStyle.pairGap)
+            )
+            let count = min(fit.pairCount, pool.count)
+            visibleKeys = pool.suffix(count).map(\.key)
+            clipsTop = fit.clipsTop && count > 0
+            holdTask?.cancel()
+            holdTask = nil
+        } else {
+            if review.isReviewing || review.showsBadge {
+                review = .live
+                reviewIdleTask?.cancel()
+                reviewIdleTask = nil
+            }
+            let shown = history.map { line in
+                OverlayMotion.ShownLine(key: line.key, shownAt: appearedAt[line.key] ?? -.infinity)
+            }
+            visibleKeys = OverlayMotion.visibleLineKeys(shown: shown, now: now, lines: style.lines)
+            clipsTop = false
+            scheduleHoldRelease(history: history, now: now)
+        }
+        for key in visibleKeys where appearedAt[key] == nil {
+            appearedAt[key] = now
+        }
+
+        let pairs = visibleKeys.compactMap { pairViews[$0] }
+        let newestKey = history.last?.key
+        for pair in pairs where pair.key != newestKey {
+            pair.didFadeIn = true
+        }
+        for pair in pairs where !pair.didFadeIn {
+            pair.alphaValue = 0
+        }
+        let animateMotion = animate && didRenderOnce
+        arrange(pairs, animate: animateMotion)
+        applyOpacity(pairs: pairs, waterfall: waterfall, animate: animateMotion)
+        clipView.fadesTop = clipsTop
+        clipView.needsLayout = true
+        reviewBadge.isHidden = !(waterfall && review.showsBadge)
+        if liveResizeStart == nil {
+            stack.layoutSubtreeIfNeeded()
+            let content = ceil(stack.fittingSize.height) + OverlayStyle.windowPadV * 2
+            fitHeight(waterfall: waterfall, contentHeight: content, animate: animateMotion)
+        }
+        didRenderOnce = true
     }
 
-    // 底边是窗口 origin.y。高度只往上长，拖动记住的左下角才不会每次重排都往上爬。
-    private func fitHeight() {
-        updateWrapWidths()
-        stack.layoutSubtreeIfNeeded()
-        let contentHeight = ceil(stack.fittingSize.height) + 36
-        let userHeight = style.height.map { CGFloat($0) } ?? 0
-        var frame = panel.frame
-        frame.size.height = max(contentHeight, userHeight, OverlayStyle.minimumWindowSize.height)
-        frame = clampedFrame(frame)
-        if abs(panel.frame.size.width - frame.size.width) <= 1,
-           abs(panel.frame.size.height - frame.size.height) <= 1,
-           abs(panel.frame.origin.x - frame.origin.x) < 0.5,
-           abs(panel.frame.origin.y - frame.origin.y) < 0.5 {
+    /// 仅译文模式在译文到达前没有可画的行，不占可见行数。双语/仅原文保持旧行为：原文行始终占位。
+    private func isDisplayable(_ line: SubtitleLine) -> Bool {
+        if style.displayMode != .translationOnly { return true }
+        guard let translated = line.dstText else { return false }
+        return !translated.isEmpty
+    }
+
+    private func noteArrivals(in lines: [SubtitleLine]) {
+        let keys = Set(lines.map(\.key))
+        let arrivals = keys.subtracting(renderedKeys).count
+        let hadBaseline = didRenderOnce
+        renderedKeys = keys
+        guard hadBaseline, review.isReviewing, arrivals > 0 else { return }
+        for _ in 0..<arrivals {
+            review = review.newSentenceArrived()
+        }
+    }
+
+    private func scheduleHoldRelease(history: [SubtitleLine], now: Double) {
+        holdTask?.cancel()
+        holdTask = nil
+        let preferred = style.lines
+        guard history.count > preferred else { return }
+        let outside = history[history.count - preferred - 1]
+        guard let shown = appearedAt[outside.key] else { return }
+        let remain = DesignTokens.Motion.minHoldSec - (now - shown)
+        guard remain > 0 else { return }
+        let nanos = UInt64((remain + 0.05) * 1_000_000_000)
+        holdTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: nanos)
+            guard let self, !Task.isCancelled else { return }
+            self.render(animate: true)
+        }
+    }
+
+    private func arrange(_ pairs: [SubtitlePairView], animate: Bool) {
+        let desired: [NSView] = pairs + [volatileLabel, tierLabel]
+        let current = stack.arrangedSubviews
+        if current.count == desired.count, zip(current, desired).allSatisfy({ $0.0 === $0.1 }) {
             return
         }
-        setPanelFrame(frame, display: true)
-    }
-
-    // NSTextField 在 StackView 里不给最大宽度就不会折行
-    private var textWidth: CGFloat {
-        max(40, panel.frame.width - 44)
-    }
-
-    private func updateWrapWidths() {
-        let width = textWidth
-        volatileLabel.preferredMaxLayoutWidth = width
-        tierLabel.preferredMaxLayoutWidth = width
-    }
-
-    private func subtitleField(_ text: String, color: NSColor) -> NSTextField {
-        let field = NSTextField(labelWithString: "")
-        let font = NSFont.systemFont(ofSize: CGFloat(style.fontSize), weight: .semibold)
-        field.lineBreakMode = .byWordWrapping
-        field.maximumNumberOfLines = 3
-        field.preferredMaxLayoutWidth = textWidth
-        if let cell = field.cell as? NSTextFieldCell {
-            cell.wraps = true
-            cell.isScrollable = false
+        let duration = animate
+            ? OverlayMotion.motionSeconds(milliseconds: DesignTokens.Motion.shiftUpMs, reduceMotion: reduceMotion)
+            : 0
+        let updates = {
+            for view in self.stack.arrangedSubviews where !desired.contains(where: { $0 === view }) {
+                self.stack.removeArrangedSubview(view)
+                view.removeFromSuperview()
+            }
+            for (index, view) in desired.enumerated() {
+                if self.stack.arrangedSubviews.indices.contains(index), self.stack.arrangedSubviews[index] === view {
+                    continue
+                }
+                if self.stack.arrangedSubviews.contains(where: { $0 === view }) {
+                    self.stack.removeArrangedSubview(view)
+                }
+                let insertAt = min(index, self.stack.arrangedSubviews.count)
+                self.stack.insertArrangedSubview(view, at: insertAt)
+            }
+            self.stack.layoutSubtreeIfNeeded()
         }
-        switch style.textEdge {
-        case .outline:
+        guard duration > 0 else {
+            updates()
+            return
+        }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = duration
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            context.allowsImplicitAnimation = true
+            updates()
+        }
+    }
+
+    private func applyOpacity(pairs: [SubtitlePairView], waterfall: Bool, animate: Bool) {
+        let fade = animate
+            ? OverlayMotion.motionSeconds(milliseconds: DesignTokens.Motion.fadeInMs, reduceMotion: reduceMotion)
+            : 0
+        for (index, pair) in pairs.enumerated() {
+            let fromNewest = pairs.count - 1 - index
+            let target = OverlayMotion.pairOpacity(
+                indexFromNewest: fromNewest,
+                visibleCount: pairs.count,
+                waterfall: waterfall
+            )
+            if !pair.didFadeIn {
+                pair.didFadeIn = true
+                pair.appliedOpacity = target
+                if fade <= 0 {
+                    pair.alphaValue = CGFloat(target)
+                } else {
+                    pair.alphaValue = 0
+                    NSAnimationContext.runAnimationGroup { context in
+                        context.duration = fade
+                        context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                        pair.animator().alphaValue = CGFloat(target)
+                    }
+                }
+            } else if abs(pair.appliedOpacity - target) > 0.001 {
+                pair.appliedOpacity = target
+                pair.alphaValue = CGFloat(target)
+            }
+        }
+    }
+
+    private func update(_ pair: SubtitlePairView, line: SubtitleLine, width: CGFloat) {
+        pair.sourceField.preferredMaxLayoutWidth = width
+        pair.translationField.preferredMaxLayoutWidth = width
+        let showSource = style.displayMode != .translationOnly
+        let translated = line.dstText.flatMap { $0.isEmpty ? nil : $0 }
+        let showTranslation = style.displayMode != .sourceOnly && translated != nil
+        pair.sourceField.isHidden = !showSource
+        pair.translationField.isHidden = !showTranslation
+        if showSource {
+            applySubtitle(line.srcText, hex: style.sourceColor, to: pair.sourceField, signature: &pair.sourceSignature)
+        }
+        if let translated, showTranslation {
+            applySubtitle(translated, hex: style.translationColor, to: pair.translationField, signature: &pair.translationSignature)
+        }
+    }
+
+    private func applySubtitle(_ text: String, hex: String, to field: NSTextField, signature: inout String) {
+        let sig = "\(text)\u{1}\(hex)\u{1}\(style.fontSize)\u{1}\(style.textEdge.rawValue)"
+        guard sig != signature else { return }
+        let parts = signature.split(separator: "\u{1}", omittingEmptySubsequences: false).map(String.init)
+        let oldText = parts.first ?? ""
+        let oldEdge = parts.count >= 4 ? parts[3] : ""
+        signature = sig
+        let font = NSFont.systemFont(ofSize: CGFloat(style.fontSize), weight: .semibold)
+        let color = nsColor(hex, fallback: hex)
+        if style.textEdge == .outline {
             // strokeWidth 是字号的百分比；负值同时填充和描边。-8 在 28pt 上大约 2px。
             let paragraph = NSMutableParagraphStyle()
             paragraph.lineBreakMode = .byWordWrapping
@@ -430,22 +780,178 @@ final class OverlayController: NSObject {
                 .paragraphStyle: paragraph,
             ])
             field.shadow = nil
-        case .shadow:
-            field.stringValue = text
-            field.textColor = color
-            field.font = font
-            let shadow = NSShadow()
-            shadow.shadowColor = NSColor.black.withAlphaComponent(0.9)
-            shadow.shadowOffset = .zero
-            shadow.shadowBlurRadius = 3
-            field.shadow = shadow
-        case .none:
-            field.stringValue = text
-            field.textColor = color
-            field.font = font
-            field.shadow = nil
+            return
         }
-        return field
+        if oldText != text || oldEdge == TextEdge.outline.rawValue || field.stringValue != text {
+            field.stringValue = text
+        }
+        field.textColor = color
+        field.font = font
+        field.shadow = style.textEdge == .shadow ? textShadow() : nil
+    }
+
+    private func textShadow() -> NSShadow {
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.9)
+        shadow.shadowOffset = .zero
+        shadow.shadowBlurRadius = 3
+        return shadow
+    }
+
+    private func measuredFieldHeight(_ field: NSTextField, width: CGFloat) -> CGFloat {
+        field.preferredMaxLayoutWidth = width
+        guard let cell = field.cell else { return 0 }
+        let size = cell.cellSize(forBounds: NSRect(x: 0, y: 0, width: max(width, 1), height: .greatestFiniteMagnitude))
+        return ceil(size.height)
+    }
+
+    private func measuredPairHeight(_ pair: SubtitlePairView, width: CGFloat) -> CGFloat {
+        var total: CGFloat = 0
+        var parts = 0
+        if !pair.sourceField.isHidden {
+            total += measuredFieldHeight(pair.sourceField, width: width)
+            parts += 1
+        }
+        if !pair.translationField.isHidden {
+            total += measuredFieldHeight(pair.translationField, width: width)
+            parts += 1
+        }
+        if parts > 1 { total += OverlayStyle.pairGap }
+        return ceil(total)
+    }
+
+    private func statusBlockHeight(width: CGFloat) -> CGFloat {
+        let volatileHeight = measuredFieldHeight(volatileLabel, width: width)
+        let tierHeight = measuredFieldHeight(tierLabel, width: width)
+        if volatileHeight > 0, tierHeight > 0 {
+            return volatileHeight + OverlayStyle.pairGap + tierHeight
+        }
+        return volatileHeight + tierHeight
+    }
+
+    private func blockHeight(pairHeights: [CGFloat], statusHeight: CGFloat) -> CGFloat {
+        let gap = OverlayStyle.pairGap
+        let pairs = pairHeights.reduce(0, +)
+        let pairGaps = pairHeights.count > 1 ? gap * CGFloat(pairHeights.count - 1) : 0
+        let bridge = (pairs > 0 && statusHeight > 0) ? gap : 0
+        return pairs + pairGaps + bridge + statusHeight + OverlayStyle.windowPadV * 2
+    }
+
+    // 底边是窗口 origin.y。高度只往上长，拖动记住的左下角才不会每次重排都往上爬。
+    private func fitHeight(waterfall: Bool, contentHeight: CGFloat, animate: Bool) {
+        var frame = panel.frame
+        if !waterfall {
+            frame.size.height = max(contentHeight, OverlayStyle.minimumWindowSize.height)
+        }
+        frame = clampedFrame(frame)
+        guard !framesClose(panel.frame, frame) else { return }
+        let duration = animate
+            ? OverlayMotion.motionSeconds(milliseconds: DesignTokens.Motion.resizeMs, reduceMotion: reduceMotion)
+            : 0
+        guard duration > 0 else {
+            setPanelFrame(frame, display: true)
+            return
+        }
+        isApplyingProgrammaticFrame = true
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = duration
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            self.panel.animator().setFrame(frame, display: true)
+        }, completionHandler: {
+            Task { @MainActor in
+                self.isApplyingProgrammaticFrame = false
+            }
+        })
+    }
+
+    private func framesClose(_ lhs: NSRect, _ rhs: NSRect) -> Bool {
+        abs(lhs.size.width - rhs.size.width) <= 1
+            && abs(lhs.size.height - rhs.size.height) <= 1
+            && abs(lhs.origin.x - rhs.origin.x) < 0.5
+            && abs(lhs.origin.y - rhs.origin.y) < 0.5
+    }
+
+    // NSTextField 在 StackView 里不给最大宽度就不会折行
+    private var textWidth: CGFloat {
+        max(40, panel.frame.width - OverlayStyle.windowPadH * 2)
+    }
+
+    private func updateWrapWidths() {
+        let width = textWidth
+        volatileLabel.preferredMaxLayoutWidth = width
+        tierLabel.preferredMaxLayoutWidth = width
+        for pair in pairViews.values {
+            pair.sourceField.preferredMaxLayoutWidth = width
+            pair.translationField.preferredMaxLayoutWidth = width
+        }
+    }
+
+    private var reduceMotion: Bool {
+        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
+    private func badgeBackgroundColor() -> NSColor {
+        let rgb = OverlayStyle.parseHex(DesignTokens.Color.background) ?? (r: 0, g: 0, b: 0)
+        return NSColor(srgbRed: rgb.r, green: rgb.g, blue: rgb.b, alpha: 0.82)
+    }
+
+    private func handleScroll(_ event: NSEvent) {
+        let raw: Int
+        if event.hasPreciseScrollingDeltas {
+            scrollAccumulator += event.scrollingDeltaY
+            let step: CGFloat = 48
+            var steps = 0
+            while scrollAccumulator >= step {
+                scrollAccumulator -= step
+                steps += 1
+            }
+            while scrollAccumulator <= -step {
+                scrollAccumulator += step
+                steps -= 1
+            }
+            raw = steps
+        } else {
+            scrollAccumulator = 0
+            if event.scrollingDeltaY > 0 {
+                raw = 1
+            } else if event.scrollingDeltaY < 0 {
+                raw = -1
+            } else {
+                raw = 0
+            }
+        }
+        let delta = OverlayMotion.reviewScrollDelta(
+            rawSteps: raw,
+            clickThrough: panel.ignoresMouseEvents,
+            waterfall: waterfallActive
+        )
+        guard delta != 0 else { return }
+        let now = Date().timeIntervalSinceReferenceDate
+        let maxOffset = max(0, store.lines.suffix(LineStore.displayHistoryLimit).count - 1)
+        review = review.scrolled(by: delta, now: now, maxOffset: maxOffset)
+        scheduleReviewIdle()
+        render(animate: false)
+    }
+
+    private func scheduleReviewIdle() {
+        reviewIdleTask?.cancel()
+        reviewIdleTask = nil
+        guard review.isReviewing else { return }
+        let deadline = review.lastInputAt + CaptionReview.idleSec
+        reviewIdleTask = Task { @MainActor [weak self] in
+            let now = Date().timeIntervalSinceReferenceDate
+            let wait = max(0, deadline - now)
+            try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+            guard let self, !Task.isCancelled else { return }
+            let tickNow = Date().timeIntervalSinceReferenceDate
+            let next = self.review.tick(now: tickNow)
+            if next == self.review {
+                self.scheduleReviewIdle()
+                return
+            }
+            self.review = next
+            self.render(animate: true)
+        }
     }
 
     private func applyChrome() {
@@ -465,6 +971,7 @@ final class OverlayController: NSObject {
 
     private func applyTypography() {
         volatileLabel.font = .systemFont(ofSize: CGFloat(style.fontSize - 4))
+        tierLabel.font = .systemFont(ofSize: OverlayStyle.statusFontSize)
     }
 
     private func applyGeometry(stickStripToBottom: Bool) {
@@ -756,6 +1263,13 @@ final class OverlayController: NSObject {
         clickThroughItem.state = panel.ignoresMouseEvents ? .on : .off
     }
 
+    @objc private func jumpToLatest() {
+        review = review.jumpToBottom()
+        reviewIdleTask?.cancel()
+        reviewIdleTask = nil
+        render(animate: true)
+    }
+
     @objc private func quit() {
         let pending = originSaveTask != nil
         originSaveTask?.cancel()
@@ -785,8 +1299,11 @@ extension OverlayController: NSWindowDelegate {
     func windowDidResize(_ notification: Notification) {
         guard (notification.object as? NSWindow) === panel else { return }
         updateSizeLimits(for: panel.frame)
-        updateWrapWidths()
-        // 松手后再记尺寸并 fitHeight。这里如果先把高度抬回内容高度，用户拉高的值会被盖掉。
+        if liveResizeStart != nil {
+            render(animate: false)
+        } else {
+            updateWrapWidths()
+        }
     }
 
     func windowDidEndLiveResize(_ notification: Notification) {
@@ -797,7 +1314,7 @@ extension OverlayController: NSWindowDelegate {
             rememberSize(changedFrom: start)
         }
         syncStripWidthIfNeeded()
-        fitHeight()
+        render(animate: true)
     }
 }
 
