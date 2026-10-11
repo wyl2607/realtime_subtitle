@@ -212,6 +212,60 @@
             "backoff_index": 1,
             "action": "fallback"
           }
+        },
+        {
+          "event": {"type": "cooldown_expired"},
+          "expect": {
+            "tier": "cloud",
+            "cloud_state": "probe",
+            "action": "probe_once"
+          }
+        },
+        {
+          "event": {"type": "segment_failure"},
+          "expect": {
+            "tier": "local",
+            "cloud_state": "cooldown_backoff",
+            "cooldown_seconds": 120,
+            "backoff_index": 2,
+            "action": "fallback"
+          }
+        },
+        {
+          "event": {"type": "cooldown_expired"},
+          "expect": {
+            "tier": "cloud",
+            "cloud_state": "probe",
+            "action": "probe_once"
+          }
+        },
+        {
+          "event": {"type": "segment_failure"},
+          "expect": {
+            "tier": "local",
+            "cloud_state": "cooldown_backoff",
+            "cooldown_seconds": 300,
+            "backoff_index": 3,
+            "action": "fallback"
+          }
+        },
+        {
+          "event": {"type": "cooldown_expired"},
+          "expect": {
+            "tier": "cloud",
+            "cloud_state": "probe",
+            "action": "probe_once"
+          }
+        },
+        {
+          "event": {"type": "segment_failure"},
+          "expect": {
+            "tier": "local",
+            "cloud_state": "cooldown_backoff",
+            "cooldown_seconds": 300,
+            "backoff_index": 3,
+            "action": "fallback"
+          }
         }
       ]
     },

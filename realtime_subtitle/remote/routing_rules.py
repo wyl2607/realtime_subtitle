@@ -213,11 +213,15 @@ class P5LineStore:
         return replaced
 
     def serialise_for(self, expected_lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return [_filter_line(line, expected) for line, expected in zip(self.lines, expected_lines)]
+        if len(self.lines) != len(expected_lines):
+            raise AssertionError(f"expected {len(expected_lines)} lines, got {len(self.lines)}")
+        return [_filter_line(line, expected) for line, expected in zip(self.lines, expected_lines, strict=True)]
 
     def visible_for(self, limit: int, expected_lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
         visible = self.lines[-limit:] if limit > 0 else []
-        return [_filter_line(line, expected) for line, expected in zip(visible, expected_lines)]
+        if len(visible) != len(expected_lines):
+            raise AssertionError(f"expected {len(expected_lines)} visible lines, got {len(visible)}")
+        return [_filter_line(line, expected) for line, expected in zip(visible, expected_lines, strict=True)]
 
     def _insert(self, line: P5Line) -> None:
         if line.source == "remote" and line.t0 is not None:

@@ -251,12 +251,18 @@ enum P9FixtureSelfTest {
                 failures.append("\(testCase.name) unknown operation \(operation.type)")
             }
         }
+        if store.lines.count != testCase.expect.lines.count {
+            failures.append("\(testCase.name) lines count expected \(testCase.expect.lines.count) got \(store.lines.count)")
+        }
         let actualLines = filtered(store.lines, keeping: testCase.expect.lines)
         if actualLines != testCase.expect.lines {
             failures.append("\(testCase.name) lines expected \(testCase.expect.lines) got \(actualLines)")
         }
         let visibleLimit = max(testCase.visibleLimit ?? store.lines.count, 0)
         let visible = Array(store.lines.suffix(visibleLimit))
+        if visible.count != testCase.expect.visible.count {
+            failures.append("\(testCase.name) visible count expected \(testCase.expect.visible.count) got \(visible.count)")
+        }
         let actualVisible = filtered(visible, keeping: testCase.expect.visible)
         if actualVisible != testCase.expect.visible {
             failures.append("\(testCase.name) visible expected \(testCase.expect.visible) got \(actualVisible)")
