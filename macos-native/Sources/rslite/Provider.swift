@@ -30,6 +30,7 @@ struct CloudRouteContext {
     var nodeIsSelf: Bool
     var consecutiveFailures: Int
     var backoffIndex: Int
+    var keyInvalid: Bool
 
     private(set) var cooldownSeconds: Int?
     private(set) var cancelInflight = false
@@ -47,6 +48,7 @@ struct CloudRouteContext {
         nodeIsSelf = initial.nodeIsSelf ?? false
         consecutiveFailures = initial.consecutiveFailures ?? 0
         backoffIndex = initial.backoffIndex ?? 0
+        keyInvalid = initial.keyInvalid ?? (cloudState == .disabledInvalidKey)
     }
 
     mutating func apply(_ event: RouteEvent) {
@@ -82,12 +84,17 @@ struct CloudRouteContext {
         case "switch_on":
             cloudEnabled = true
             if hasKey {
-                resumeCloud()
+                if keyInvalid {
+                    cloudState = .disabledInvalidKey
+                } else {
+                    resumeCloud()
+                }
             }
         case "key_cleared":
             hasKey = false
             turnCloudOff()
         case "key_modified":
+            keyInvalid = false
             hasKey = true
             cloudEnabled = true
             resumeCloud()
@@ -116,6 +123,7 @@ struct CloudRouteContext {
             "cancel_inflight": .bool(cancelInflight),
             "discard_response": .bool(discardResponse),
             "action": .string(action),
+            "key_invalid": .bool(keyInvalid),
         ]
         return expected.reduce(into: [:]) { result, item in
             result[item.key] = full[item.key] ?? .null
@@ -148,6 +156,7 @@ struct CloudRouteContext {
 
     private mutating func httpStatus(_ status: Int, retryAfter: Int?) {
         if status == 401 || status == 403 {
+            keyInvalid = true
             cloudState = .disabledInvalidKey
             action = "mark_key_invalid"
             return
@@ -164,6 +173,9 @@ struct CloudRouteContext {
     }
 
     private mutating func quotaUpdate(_ usagePercent: Double) {
+        guard cloudEnabled && hasKey && cloudState != .disabledInvalidKey && cloudState != .off else {
+            return
+        }
         if usagePercent >= 90 {
             cloudState = .cooldownQuota
             action = "quota_cooldown"
@@ -409,6 +421,29 @@ struct RouteInitial: Decodable {
     var nodeIsSelf: Bool?
     var consecutiveFailures: Int?
     var backoffIndex: Int?
+    var keyInvalid: Bool?
+
+    init(
+        hasKey: Bool? = nil,
+        cloudEnabled: Bool? = nil,
+        cloudState: CloudState? = nil,
+        nodeEnabled: Bool? = nil,
+        nodeHealthy: Bool? = nil,
+        nodeIsSelf: Bool? = nil,
+        consecutiveFailures: Int? = nil,
+        backoffIndex: Int? = nil,
+        keyInvalid: Bool? = nil
+    ) {
+        self.hasKey = hasKey
+        self.cloudEnabled = cloudEnabled
+        self.cloudState = cloudState
+        self.nodeEnabled = nodeEnabled
+        self.nodeHealthy = nodeHealthy
+        self.nodeIsSelf = nodeIsSelf
+        self.consecutiveFailures = consecutiveFailures
+        self.backoffIndex = backoffIndex
+        self.keyInvalid = keyInvalid
+    }
 
     enum CodingKeys: String, CodingKey {
         case hasKey = "has_key"
@@ -419,6 +454,7 @@ struct RouteInitial: Decodable {
         case nodeIsSelf = "node_is_self"
         case consecutiveFailures = "consecutive_failures"
         case backoffIndex = "backoff_index"
+        case keyInvalid = "key_invalid"
     }
 }
 

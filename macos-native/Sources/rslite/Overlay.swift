@@ -6,12 +6,16 @@ final class OverlayController: NSObject {
     private let panel: NSPanel
     private let stack = NSStackView()
     private let volatileLabel = NSTextField(labelWithString: "")
-    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+    /// 当前识别层。和草稿分开，避免 setStatus/setVolatile 把「云端·Groq」盖掉。
+    private let tierLabel = NSTextField(labelWithString: "本机")
+    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let pauseItem = NSMenuItem(title: "暂停", action: #selector(togglePause), keyEquivalent: "")
     private let clickThroughItem = NSMenuItem(title: "鼠标穿透", action: #selector(toggleClickThrough), keyEquivalent: "")
 
     // 字幕历史（含已滚出屏幕的行）；界面只画末尾两行。节点精修结果按 P5 在这里替换本机行。
     private var store = LineStore()
+    /// 译文可能先于 MainActor 上的 applyNode 回来。先按 key 记下，行出现再补上。
+    private var pendingTranslation: [Int: String] = [:]
     private var isPaused = false
     private let onPauseChanged: (Bool) -> Void
     private let onQuit: () -> Void
@@ -61,13 +65,27 @@ final class OverlayController: NSObject {
     }
 
     func addTranslation(id: Int, text: String) {
-        store.setTranslation(key: id, text: text)
+        if store.lines.contains(where: { $0.key == id }) {
+            store.setTranslation(key: id, text: text)
+            pendingTranslation.removeValue(forKey: id)
+        } else {
+            pendingTranslation[id] = text
+        }
         render()
     }
 
     /// 节点的精修句到达（P5）：整体替换被它覆盖的本机行，找不到就按时间插入。
+    /// 云端译文未到时先继承被替换本机行的译文，到了再覆盖，避免替换瞬间空白。
     func addNodeFinal(nodeID: String, t0: Double?, t1: Double?, src: String, dst: String?) {
-        store.applyNode(nodeID: nodeID, t0: t0, t1: t1, srcText: src, dstText: dst)
+        let provided = dst?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let shown = (provided?.isEmpty == false ? provided : nil)
+            ?? inheritedSubtitleTranslation(lines: store.lines, t0: t0, t1: t1)
+        let before = Set(store.lines.map(\.key))
+        store.applyNode(nodeID: nodeID, t0: t0, t1: t1, srcText: src, dstText: shown)
+        if let created = store.lines.first(where: { !before.contains($0.key) }),
+           let pending = pendingTranslation.removeValue(forKey: created.key) {
+            store.setTranslation(key: created.key, text: pending)
+        }
         render()
     }
 
@@ -82,7 +100,10 @@ final class OverlayController: NSObject {
     }
 
     func setModeLabel(_ label: String) {
+        statusItem.length = NSStatusItem.variableLength
         statusItem.button?.title = "字·\(label)"
+        tierLabel.stringValue = label
+        fitHeight()
     }
 
     private func configurePanel() {
@@ -113,6 +134,12 @@ final class OverlayController: NSObject {
         volatileLabel.maximumNumberOfLines = 2
         volatileLabel.preferredMaxLayoutWidth = textWidth
 
+        tierLabel.textColor = .secondaryLabelColor
+        tierLabel.font = .systemFont(ofSize: 13)
+        tierLabel.lineBreakMode = .byTruncatingTail
+        tierLabel.maximumNumberOfLines = 1
+        tierLabel.preferredMaxLayoutWidth = textWidth
+
         root.addSubview(stack)
         panel.contentView = root
 
@@ -125,7 +152,7 @@ final class OverlayController: NSObject {
     }
 
     private func configureStatusItem() {
-        statusItem.button?.title = "字"
+        statusItem.button?.title = "字·本机"
 
         let menu = NSMenu()
         pauseItem.target = self
@@ -155,6 +182,7 @@ final class OverlayController: NSObject {
             }
         }
         stack.addArrangedSubview(volatileLabel)
+        stack.addArrangedSubview(tierLabel)
         fitHeight()
     }
 
