@@ -140,6 +140,8 @@ bash scripts/macos/start.sh
 bash scripts/macos/stop.sh
 ```
 
+`start.sh` checks GitHub for updates before each launch; skip once with `bash scripts/macos/start.sh --no-update` or set `RS_NO_UPDATE=1`.
+
 Logs are `subtitle.log` / `subtitle.err.log`. Hotkeys are the same as Windows: `Ctrl+Alt+P/L/M/G/C`; on Mac, press the physical **Control + Option** keys.
 
 Known differences: on Mac, subtitle refresh is about once every 2–3 seconds (M2 measured recognition at about 2.4 seconds per pass), slower than an NVIDIA GPU. Single-sentence translation is about 4 seconds with 4b and 1.6 seconds with 2b. Expected disk use: Python environment about 1.5 GB + Whisper 1.6 GB (`--lean`: 0.5 GB) + translation model 2.7–6.6 GB.
