@@ -97,12 +97,13 @@ class TimedSentence(str):
     只给后续按时间替换本机字幕使用，本 TK 只负责一路保存。
     """
 
-    def __new__(cls, text, t0=None, t1=None, key=None, source="local"):
+    def __new__(cls, text, t0=None, t1=None, key=None, source="local", revision=0):
         obj = str.__new__(cls, text or "")
         obj.t0 = t0
         obj.t1 = t1
         obj.key = key
         obj.source = source
+        obj.revision = revision
         return obj
 
 
@@ -534,6 +535,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
     _ollama_impostor = False         # 上次校验的结论是"有回应但不是 Ollama"
     _ollama_recheck_pending = False  # 连接断过/启动时没验成，恢复后要重新确认
     _ollama_verify_next = 0.0        # 下次允许重新校验的时刻（节流）
+    on_translate_failed = None
 
     def __init__(self):
         """初始化翻译器"""
@@ -624,6 +626,8 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             # 合并成一次Ollama请求（自带积压治理，说话快时翻译永远追得上）
             self._tx_lock = Lock()
             self._tx_queue = []      # 已入队待翻译
+            self._tx_retry_queue = []  # 失败后自动重试队列（低优先级）
+            self._failed_sentences = OrderedDict()  # 最近 N=50 条失败句 (key -> (src, t0, t1, key, revision))
             self._tx_inflight = []   # 正在翻译中
             self._tx_epoch = 0       # 切语言时+1：在飞的翻译完成时代数不符就丢弃
             # 语言对代数。☠️ 和 _tx_epoch 不是一回事：_tx_epoch 是"这批翻译还
@@ -672,6 +676,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             self.on_draft = None    # (chinese_draft) -> None 残句的草稿中文
             self.on_status = None   # (text) -> None 状态提示（如Ollama挂了）
             self.on_language_applied = None  # (src, tgt) -> None 语言对真正写进 config 之后
+            self.on_translate_failed = None  # (source_text, t0, t1, key, revision, reason) -> None
             self._ollama_down_notified = 0.0  # 上次提示"翻译服务未运行"的时间（节流）
 
             # 冷启动治理（2026-08-02）：模型没进显存前，翻译请求要等预热、用长超时、
@@ -790,6 +795,8 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         self._draft_last_text = ""
         with self._tx_lock:
             self._tx_queue.clear()
+            if hasattr(self, "_tx_retry_queue"):
+                self._tx_retry_queue.clear()
             self._tx_epoch += 1  # 使在飞的翻译/草稿作废
             self.context_history.clear()
         print("🧹 已清空识别与翻译上下文")
@@ -838,7 +845,11 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
     def _live_text(self):
         """live行的白色部分 = 翻译中 + 待翻译 + 未成句残句"""
         with self._tx_lock:
-            parts = list(self._tx_inflight) + list(self._tx_queue)
+            parts = (
+                list(self._tx_inflight)
+                + list(self._tx_queue)
+                + list(getattr(self, "_tx_retry_queue", []))
+            )
         # 确认换语言期间残句不上屏：它正是拿旧语言参数解码出来的那段废话。
         # 翻译中/待翻译的是扣住之前就成句的，照常显示
         if self.pending_text and not self._lang_hold_active():
@@ -858,17 +869,65 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
     # ------------------------------------------------------------------
     # 带语言代数的 UI 事件（O04）
     # ------------------------------------------------------------------
-    def _emit_pair(self, source_text, target_text, t0=None, t1=None, key=None):
+    def _emit_pair(self, source_text, target_text, t0=None, t1=None, key=None, revision=None):
         """句对上屏。带上发出这一刻的语言代数，UI 侧拒收过期的。
 
         ☠️ 不能只靠发出前再查一次代数：查完到真正 emit 之间锁是放开的，
         窗口关不掉。判据必须跟着事件走，由最后消费的那一端校验。
         on_pair 一律是 (source_text, target_text, t0, t1, key, revision)。
         """
+        if revision is None:
+            revision = getattr(self, "_lang_revision", 0)
         if self.on_pair:
-            self.on_pair(
-                source_text, target_text, t0, t1, key,
-                getattr(self, "_lang_revision", 0))
+            self.on_pair(source_text, target_text, t0, t1, key, revision)
+
+    def _emit_translate_failed(self, source_text, t0=None, t1=None, key=None,
+                               revision=None, reason="error"):
+        """翻译失败事件。随事件带语言代数，reason ∈ {"timeout", "error", "dropped"}。"""
+        if revision is None:
+            revision = getattr(self, "_lang_revision", 0)
+        cb = getattr(self, "on_translate_failed", None)
+        if cb:
+            cb(source_text, t0, t1, key, revision, reason)
+
+    def _record_failed_sentence_locked(self, src, t0, t1, key, revision):
+        if not key:
+            return
+        if not hasattr(self, "_failed_sentences"):
+            self._failed_sentences = OrderedDict()
+        self._failed_sentences[key] = (str(src), t0, t1, key, revision)
+        self._failed_sentences.move_to_end(key)
+        while len(self._failed_sentences) > 50:
+            self._failed_sentences.popitem(last=False)
+
+    def _record_failed_sentence(self, src, t0, t1, key, revision):
+        if not key:
+            return
+        with self._tx_lock:
+            self._record_failed_sentence_locked(src, t0, t1, key, revision)
+
+    def retry_translation(self, key):
+        """重新翻译失败句（用户手动点击重试）。
+
+        将最近失败句缓存中对应 key 的句子重新入主队列尾部。
+        key 不存在返回 False，成功入队返回 True。
+        """
+        if not key:
+            return False
+        with self._tx_lock:
+            if not hasattr(self, "_failed_sentences") or key not in self._failed_sentences:
+                return False
+            src, t0, t1, k, rev = self._failed_sentences.pop(key)
+            sentence = TimedSentence(src, t0=t0, t1=t1, key=k, source="local", revision=rev)
+            self._tx_queue.append(sentence)
+            dropped = self._trim_tx_queue_locked()
+        if dropped:
+            self._warn_tx_dropped(dropped)
+        try:
+            self._tx_executor.submit(self._translation_worker)
+        except RuntimeError:
+            pass
+        return True
 
     def _emit_draft(self, text):
         if self.on_draft:
@@ -906,8 +965,18 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         total = sum(len(s) for s in self._tx_queue)
         dropped = 0
         while total > cap and len(self._tx_queue) > 1:
-            total -= len(self._tx_queue.pop(0))
+            s = self._tx_queue.pop(0)
+            total -= len(s)
             dropped += 1
+            src = str(s)
+            t0 = getattr(s, "t0", None)
+            t1 = getattr(s, "t1", None)
+            key = getattr(s, "key", None)
+            if not key and t0 is not None and t1 is not None:
+                key = f"local:{t0:.3f}-{t1:.3f}"
+            rev = getattr(s, "revision", getattr(self, "_lang_revision", 0))
+            self._record_failed_sentence_locked(src, t0, t1, key, rev)
+            self._emit_translate_failed(src, t0, t1, key, rev, reason="dropped")
         self._tx_dropped += dropped
         return dropped
 
@@ -945,7 +1014,10 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         key = None
         if t0 is not None and t1 is not None:
             key = f"local:{t0:.3f}-{t1:.3f}:{self._sentence_seq}"
-        return TimedSentence(text, t0=t0, t1=t1, key=key, source="local")
+        return TimedSentence(
+            text, t0=t0, t1=t1, key=key, source="local",
+            revision=getattr(self, "_lang_revision", 0),
+        )
 
     def _take_pending_as_sentence(self):
         sentence = self._make_timed_sentence(
@@ -957,12 +1029,14 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
     def _span_for_sentences(self, sentences):
         timed = [s for s in sentences
                  if getattr(s, "t0", None) is not None and getattr(s, "t1", None) is not None]
+        keys = [getattr(s, "key", None) for s in sentences if getattr(s, "key", None)]
+        key = "+".join(keys) if keys else None
         if not timed:
-            return None, None, None
+            return None, None, key
         t0 = timed[0].t0
         t1 = timed[-1].t1
-        keys = [getattr(s, "key", None) for s in timed if getattr(s, "key", None)]
-        key = "+".join(keys) if keys else f"local:{t0:.3f}-{t1:.3f}"
+        if not key:
+            key = f"local:{t0:.3f}-{t1:.3f}"
         return t0, t1, key
 
     def _squash_timed_sentences(self, sentences):
@@ -988,7 +1062,9 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             if isinstance(sentence, TimedSentence):
                 out.append(TimedSentence(
                     text, t0=sentence.t0, t1=sentence.t1,
-                    key=sentence.key, source=sentence.source))
+                    key=sentence.key, source=sentence.source,
+                    revision=getattr(sentence, "revision", getattr(self, "_lang_revision", 0)),
+                ))
             else:
                 out.append(text)
         return out
@@ -1196,27 +1272,35 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         """
         max_chars = _batch_max_chars()
         with self._tx_lock:
-            if not self._tx_queue:
+            retry_q = getattr(self, "_tx_retry_queue", None)
+            if not self._tx_queue and not retry_q:
                 return
             epoch = self._tx_epoch  # 完成时代数变了（切了语言）就丢弃结果
             batch = []
             direct = []  # (德语, 词典中文)：队首的感叹词直接上屏不进Ollama
             total = 0
-            while self._tx_queue:
-                s = self._tx_queue[0]
-                if not batch:
-                    hit = _interjection_lookup(s)
-                    if hit is not None:
-                        # 只在batch还空时直发，保持上屏顺序不颠倒；
-                        # batch里已有句子时感叹词跟着batch合并翻（不多花请求）
-                        self._tx_queue.pop(0)
-                        direct.append((s, hit))
-                        continue
-                if batch and total + len(s) > max_chars:
-                    break
-                self._tx_queue.pop(0)
-                batch.append(s)
-                total += len(s)
+            is_retry = False
+            if self._tx_queue:
+                while self._tx_queue:
+                    s = self._tx_queue[0]
+                    if not batch:
+                        hit = _interjection_lookup(s)
+                        if hit is not None:
+                            # 只在batch还空时直发，保持上屏顺序不颠倒；
+                            # batch里已有句子时感叹词跟着batch合并翻（不多花请求）
+                            self._tx_queue.pop(0)
+                            direct.append((s, hit))
+                            continue
+                    if batch and total + len(s) > max_chars:
+                        break
+                    self._tx_queue.pop(0)
+                    batch.append(s)
+                    total += len(s)
+            elif retry_q:
+                item = self._tx_retry_queue.pop(0)
+                batch = [item]
+                is_retry = True
+
             self._tx_inflight = batch
             context = " ".join(self.context_history)
 
@@ -1229,7 +1313,8 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
                     if self.on_pair:
                         self._emit_pair(g, zh, getattr(g, "t0", None),
                                         getattr(g, "t1", None),
-                                        getattr(g, "key", None))
+                                        getattr(g, "key", None),
+                                        getattr(g, "revision", None))
                 with self._stats_lock:
                     self._stat_dict += len(direct)
 
@@ -1246,7 +1331,9 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         # 合并成一次请求时同样不能给中文插空格（见 _append_committed）
         german = ("" if _no_space_language() else " ").join(batch)
         batch_t0, batch_t1, batch_key = self._span_for_sentences(batch)
+        batch_rev = getattr(batch[0], "revision", getattr(self, "_lang_revision", 0))
         translation = None
+        self._last_tx_failure_reason = None
         try:
             t0 = time.time()
             # 流式：翻译的中文逐段推到live区的草稿行，不等整句翻完
@@ -1256,34 +1343,64 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             self._stat_note_tx(tx_elapsed)
             if config.SHOW_PERFORMANCE:
                 print(f"   🔤 翻译{len(batch)}句 {tx_elapsed:.1f}秒: {german[:50]}{'...' if len(german) > 50 else ''}")
+        except requests.ReadTimeout:
+            translation = german
+            self._last_tx_failure_reason = "timeout"
+        except Exception:
+            translation = german
+            self._last_tx_failure_reason = "error"
         finally:
             with self._tx_lock:
                 self._tx_inflight = []
 
+        failed = (translation is None or translation == german or not translation.strip())
+        fail_reason = (
+            getattr(self, "_last_tx_failure_reason", None)
+            or getattr(batch[0], "fail_reason", None)
+            or "error"
+        )
+
+        cb_failed = getattr(self, "on_translate_failed", None)
         with self._tx_lock:
             stale = (epoch != self._tx_epoch)
-            if not stale and translation:
+            if not stale and translation and (not failed or is_retry or cb_failed is None):
                 self.context_history.extend(batch)
         if stale or self.closing or translation is None:
             return  # 期间切了语言/正在退出：旧语言结果不上屏不写回
 
-        # ☠️ 翻译失败时 translation==german（原样返回）。屏幕上只显示一遍德语是
-        # 对的，但**存档必须照常写**：以前这里是 `if translation != german`，
-        # Ollama 挂掉/熔断的那几分钟里德语原文一条都不入档，而 transcripts/
-        # 的用途正是回看和学德语——用户事后完全无从知道那段说了什么。
-        # 中文留空，格式和"只有原文"的行一致
-        self._save_transcript(german, "" if translation == german else translation)
-        if self.on_pair:
-            # 翻译失败时 translation==german：只显示一遍德语，
-            # 不要"德语\n德语"重复两行（Ollama挂掉时实测很难看）
-            self._emit_pair(german, "" if translation == german else translation,
-                            batch_t0, batch_t1, batch_key)
-        self._draft_last_text = ""  # 正式句对上屏了，残句草稿从头再来
-        self._emit_display()
+        if failed and cb_failed is not None and not is_retry:
+            # 首次失败且注册了失败回调：放进低优先级重试队列，后台自动重试 1 次
+            retry_sentence = TimedSentence(
+                german, t0=batch_t0, t1=batch_t1, key=batch_key,
+                source=getattr(batch[0], "source", "local"),
+                revision=batch_rev,
+            )
+            retry_sentence.fail_reason = fail_reason
+            with self._tx_lock:
+                if not getattr(self, "_tx_retry_queue", None):
+                    self._tx_retry_queue = []
+                self._tx_retry_queue.append(retry_sentence)
+        else:
+            if failed:
+                # 终态失败（重试仍失败，或未设回调）
+                self._record_failed_sentence(german, batch_t0, batch_t1, batch_key, batch_rev)
+                if cb_failed is not None:
+                    self._emit_translate_failed(
+                        german, batch_t0, batch_t1, batch_key, batch_rev,
+                        reason=fail_reason,
+                    )
+            # ☠️ 翻译失败时 translation==german（原样返回）。屏幕上只显示一遍德语是对的，
+            # 但存档必须照常写（格式和"只有原文"的行一致）
+            out_target = "" if failed else translation
+            self._save_transcript(german, out_target)
+            if self.on_pair:
+                self._emit_pair(german, out_target, batch_t0, batch_t1, batch_key, batch_rev)
+            self._draft_last_text = ""  # 正式句对上屏了，残句草稿从头再来
+            self._emit_display()
 
-        # 本轮因batch上限留下的句子，自我再调度（不等下一次enqueue）
+        # 本轮因batch上限或重试队列留下的句子，自我再调度（不等下一次enqueue）
         with self._tx_lock:
-            leftover = bool(self._tx_queue)
+            leftover = bool(self._tx_queue or getattr(self, "_tx_retry_queue", None))
         if leftover:
             try:
                 self._tx_executor.submit(self._translation_worker)
@@ -1327,7 +1444,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             if len(self._audio_inbox) >= 2:
                 return  # 识别已在攒块（GPU被抢），草稿是奢侈品，先让路
         with self._tx_lock:
-            if self._tx_queue or self._tx_inflight:
+            if self._tx_queue or self._tx_inflight or getattr(self, "_tx_retry_queue", None):
                 return  # 正式翻译在忙，草稿让路
         self._draft_last_time = time.time()
         self._draft_last_text = text
@@ -1352,7 +1469,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
     def _draft_worker(self, snapshot):
         """在翻译线程里跑草稿（和正式翻译同一个单线程池，天然串行）"""
         with self._tx_lock:
-            if self._tx_queue:
+            if self._tx_queue or getattr(self, "_tx_retry_queue", None):
                 return  # 等草稿排到时已经来了正式句子，草稿没意义了
             epoch = self._tx_epoch
             context = " ".join(self.context_history)
@@ -1386,6 +1503,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         on_partial: 每~0.15秒把已生成的部分中文回调出去（流式上屏，
         中文首字延迟从"整句翻完"降到首token到达）。回调必须线程安全。
         """
+        self._last_tx_failure_reason = None
         try:
             lang_name = language_name(config.SOURCE_LANGUAGE)
             target_name = target_language_name(current_target_language())
@@ -1414,6 +1532,8 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
                 ) if apple is not None else None
                 ok = bool(translated and translated.strip())
                 self._note_tx_result(ok=ok)
+                if not ok:
+                    self._last_tx_failure_reason = "error"
                 return translated.strip() if ok else sentence
 
             # 术语表只注入当前句子/上下文里真出现的词条，prompt保持精简。
@@ -1473,15 +1593,18 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             # 熔断中：直接降级成德语，一个请求都不发——Ollama 半死时每句都付
             # 满超时，队列只会越堆越长（德语原文照常上屏，用户不是什么都看不到）
             if self._circuit_open():
+                self._last_tx_failure_reason = "error"
                 return sentence
 
             # 确认端口后面确实是 Ollama 才把转录发出去（见 _ollama_identity_ok）
             if not self._ollama_identity_ok():
+                self._last_tx_failure_reason = "error"
                 return sentence
 
             # 模型还没进显存时先等后台预热落地，并改用长超时
             self._await_model_ready()
             if self.closing:
+                self._last_tx_failure_reason = "error"
                 return sentence  # 等预热期间用户点了退出：别再发这个请求
 
             ollama_options = {
@@ -1574,11 +1697,15 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
                         # _note_tx_result 会把 _ollama_hot 置真、熔断计数清零、
                         # 超时从冷档翻回 15 秒——而这一句其实根本没有中文，
                         # 等于用一次空响应把所有降级保护都解除了
-                        self._note_tx_result(ok=bool(translation.strip()))
+                        ok = bool(translation.strip())
+                        self._note_tx_result(ok=ok)
+                        if not ok:
+                            self._last_tx_failure_reason = "error"
                         return _strip_translator_note(translation)
                     else:
                         print(f"   ⚠️  Ollama 返回错误 (HTTP {response.status_code})，显示德语原文")
                         self._note_tx_result(ok=False)
+                        self._last_tx_failure_reason = "error"
                         return sentence
                 except requests.ReadTimeout as e:
                     # 流式响应中途断流也是 ReadTimeout（首token前无数据最常见）
@@ -1597,6 +1724,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             # 打开，别再让后面的句子一句一句去烧满 105 秒（见 _note_tx_result）
             print(f"   ⚠️  翻译超时: {last_timeout}，显示德语原文")
             self._note_tx_result(ok=False, hard=True)
+            self._last_tx_failure_reason = "timeout"
             return sentence
 
         except requests.ConnectionError as e:
@@ -1611,10 +1739,12 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
                 self._ollama_down_notified = time.time()
                 self.on_status("⚠️ 翻译服务(Ollama)未运行，暂时只显示德语——请运行 启动字幕.bat 或 ollama serve")
             self._note_tx_result(ok=False)
+            self._last_tx_failure_reason = "error"
             return sentence
         except Exception as e:
             print(f"   ⚠️  翻译失败: {e}，显示德语原文")
             self._note_tx_result(ok=False)
+            self._last_tx_failure_reason = "error"
             return sentence
 
     # ------------------------------------------------------------------
