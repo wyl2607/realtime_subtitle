@@ -116,20 +116,29 @@ def test_day_request_header_hysteresis_and_later_local_requests(tmp_path):
     assert state.cloud_state == "cooldown_quota"
     assert ledger.usage(now=0).day_requests == 1900
 
+    # 窗口内更宽裕的 remaining 只能被忽略，不能把日请求水位从 1900 洗到 1700。
     stayed = ledger.note(1, now=10, remaining_requests=300)
-    assert stayed.day_requests == 1700
-    assert stayed.usage_percent == 85
+    assert stayed.day_requests == 1900
+    assert stayed.usage_percent == 95
     assert state.cloud_state == "cooldown_quota"
 
-    resumed = ledger.note(1, now=20, remaining_requests=500)
-    assert resumed.day_requests == 1500
-    assert resumed.usage_percent == 75
-    assert state.cloud_state == "available"
+    raised = ledger.note(1, now=20, remaining_requests=50)
+    assert raised.day_requests == 1950
+    assert raised.usage_percent == 97.5
+    assert state.cloud_state == "cooldown_quota"
 
     extra = ledger.note(1, now=21)
     assert extra.minute_requests == 4
-    assert extra.day_requests == 1501
+    assert extra.day_requests == 1951
+    assert state.cloud_state == "cooldown_quota"
+
+    # 高水位跟着自己的时间戳过 24h，不是永久饱和。
+    expired = ledger.usage(now=21 + 86401)
+    assert expired.day_requests == 0
+    assert expired.usage_percent == 0
+    assert expired.saturated is False
     assert state.cloud_state == "available"
+    assert state.action == "resume_cloud"
 
 
 def test_low_usage_does_not_clear_a_rate_limit_cooldown(tmp_path):
@@ -274,6 +283,79 @@ def test_save_fsyncs_then_replaces_in_the_same_directory(tmp_path, monkeypatch):
     assert parent == path.parent
     assert dst == path
     assert list(path.parent.glob(".quota-*")) == []
+
+
+def test_corrupt_ledger_is_capped_for_24h_then_expires(tmp_path):
+    path = tmp_path / "quota.json"
+    corrupt = tmp_path / "quota.json.corrupt"
+    corrupt.write_bytes(b"old-corrupt")
+    original = b"NOT-JSON{{"
+    path.write_bytes(original)
+    t0 = 10_000.0
+    state = RoutingState(has_key=True, cloud_enabled=True)
+    ledger = QuotaLedger(path, routing=state, now=lambda: t0)
+    usage = ledger.usage(now=t0)
+    assert usage.usage_percent == 100
+    assert usage.saturated is True
+    assert usage.day_requests == 2000
+    assert state.cloud_state == "cooldown_quota"
+    assert corrupt.read_bytes() == original
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["server_day_used"] == 2000
+    assert saved["server_day_used_at"] == t0
+    assert "saturated" not in saved
+
+    assert ledger.usage(now=t0 + 86399).usage_percent == 100
+    reloaded = QuotaLedger(path, routing=RoutingState(has_key=True, cloud_enabled=True), now=lambda: t0 + 86399)
+    assert reloaded.usage(now=t0 + 86399).usage_percent == 100
+    assert reloaded.usage(now=t0 + 86399).saturated is True
+    # 封顶还在窗口里时，更宽裕的 remaining 不能把 2000 洗掉。用另一实例，避免污染上面的空事件列表。
+    held = reloaded.note(1, now=t0 + 10, remaining_requests=1999)
+    assert held.usage_percent == 100
+    assert held.day_requests == 2000
+    assert held.saturated is True
+
+    fallen = ledger.usage(now=t0 + 86401)
+    assert fallen.usage_percent == 0
+    assert fallen.day_requests == 0
+    assert fallen.saturated is False
+    assert state.cloud_state == "available"
+    resumed = ledger.note(12, now=t0 + 86401)
+    assert resumed.hour_audio_s == 12
+    assert resumed.day_requests == 1
+    assert resumed.usage_percent < 90
+
+
+def test_negative_nan_and_inf_events_are_dropped(tmp_path):
+    path = tmp_path / "quota.json"
+    path.write_bytes(
+        b'{"version":1,"events":['
+        b'{"ts":10000,"billed_s":-4,"in_server_day":false},'
+        b'{"ts":10000,"billed_s":NaN,"in_server_day":false},'
+        b'{"ts":10000,"billed_s":Infinity,"in_server_day":false},'
+        b'{"ts":10000,"billed_s":-Infinity,"in_server_day":false},'
+        b'{"ts":10000,"billed_s":+Infinity,"in_server_day":false},'
+        b'{"ts":10000,"billed_s":10,"in_server_day":false},'
+        b'{"ts":10000,"billed_s":12.5,"in_server_day":false}'
+        b'],"server_day_used":null,"server_day_used_at":null}'
+    )
+    ledger, state = _ledger(tmp_path, now=lambda: 10000)
+    usage = ledger.usage(now=10000)
+    assert usage.day_requests == 2
+    assert usage.day_audio_s == 22.5
+    assert usage.usage_percent != 100
+    assert state.cloud_state == "available"
+    assert path.exists()
+    assert not (tmp_path / "quota.json.corrupt").exists()
+
+
+def test_note_still_rejects_negative_nan_and_inf(tmp_path):
+    ledger, _state = _ledger(tmp_path)
+    for bad in (-1, float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError):
+            ledger.note(bad, now=1)
+    assert ledger.usage(now=1).minute_requests == 0
+    assert ledger.usage(now=1).saturated is False
 
 
 def test_quota_publishes_routing_events_and_does_not_own_cloud_state():

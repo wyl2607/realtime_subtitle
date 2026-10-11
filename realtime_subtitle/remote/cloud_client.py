@@ -23,13 +23,37 @@ import requests
 
 from realtime_subtitle.node.segmenter import SAMPLE_RATE
 
-# 任务卡指定 requests 的 timeout=(5, 10)：连接 5s、读取 10s。
+# 任务卡指定 requests 的 timeout=(5, 10)：连接 5s、相邻两次读之间 10s。
+# 这挡不住「每 2s 来一小块、整次拖到几十秒」。整次另用墙钟截止。
 TIMEOUT = (5, 10)
+REQUEST_DEADLINE_S = 10.0
 GROQ_TRANSCRIPTIONS_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 MODEL = "whisper-large-v3"
 RESPONSE_FORMAT = "verbose_json"
 
 logger = logging.getLogger(__name__)
+
+
+class _BearerAuth(requests.auth.AuthBase):
+    """在 prepare 阶段写入 Bearer。
+
+    Session.trust_env 保持默认 True 时，没传 auth 的请求会被 ~/.netrc / $NETRC
+    的 Basic 盖掉手写的 Authorization。auth 对象在 __call__ 里设置头，netrc 就不会
+    介入。repr/str 不能带 key：异常和日志有时会打印 auth。
+    """
+
+    def __init__(self, key: str):
+        self._key = key
+
+    def __call__(self, request: Any) -> Any:
+        request.headers["Authorization"] = f"Bearer {self._key}"
+        return request
+
+    def __repr__(self) -> str:
+        return "BearerAuth(redacted)"
+
+    def __str__(self) -> str:
+        return "BearerAuth(redacted)"
 
 
 class CloudError(Exception):
@@ -167,24 +191,67 @@ class CloudClient:
             self._log(secret=key, groq_id=None, audio_s=audio_s, status=None, reason="cancelled", exc_type="CloudCancelled")
             raise CloudCancelled(audio_s=audio_s, secret=key) from None
         wav = _wav_bytes(samples)
-        try:
-            response = session.post(
-                GROQ_TRANSCRIPTIONS_URL,
-                files={"file": ("audio.wav", wav, "audio/wav")},
-                data={
-                    "model": MODEL,
-                    "language": language,
-                    "response_format": RESPONSE_FORMAT,
-                },
-                headers={"Authorization": f"Bearer {key}"},
-                timeout=TIMEOUT,
-            )
-        except requests.Timeout as exc:
-            self._transport_failure(generation, audio_s, "timeout", exc, key)
-        except requests.ConnectionError as exc:
-            self._transport_failure(generation, audio_s, "connection_error", exc, key)
-        except requests.RequestException as exc:
-            self._transport_failure(generation, audio_s, "request_error", exc, key)
+        outcome: dict[str, Any] = {}
+        finished = threading.Event()
+
+        def _post() -> None:
+            try:
+                try:
+                    response = session.post(
+                        GROQ_TRANSCRIPTIONS_URL,
+                        files={"file": ("audio.wav", wav, "audio/wav")},
+                        data={
+                            "model": MODEL,
+                            "language": language,
+                            "response_format": RESPONSE_FORMAT,
+                        },
+                        auth=_BearerAuth(key),
+                        timeout=TIMEOUT,
+                        # 重定向会走 rebuild_auth，trust_env 下再次套上 netrc Basic。
+                        allow_redirects=False,
+                    )
+                except Exception as exc:
+                    outcome["error"] = exc
+                    return
+                if self._generation_now() != generation:
+                    _close_quietly(response)
+                    outcome["discarded"] = response
+                    return
+                outcome["response"] = response
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=_post, name="groq-transcribe", daemon=True)
+        worker.start()
+        if not finished.wait(REQUEST_DEADLINE_S):
+            # 先关掉连接，晚到的成功结果不能再当成识别结果。
+            self.cancel()
+            _close_quietly(outcome.get("response"))
+            _close_quietly(outcome.get("discarded"))
+            self._log(secret=key, groq_id=None, audio_s=audio_s, status=None, reason="timeout", exc_type="Timeout")
+            raise CloudError(
+                status=None,
+                reason="timeout",
+                exc_type="Timeout",
+                audio_s=audio_s,
+                secret=key,
+            ) from None
+        error = outcome.get("error")
+        if error is not None:
+            if isinstance(error, requests.Timeout):
+                self._transport_failure(generation, audio_s, "timeout", error, key)
+            elif isinstance(error, requests.ConnectionError):
+                self._transport_failure(generation, audio_s, "connection_error", error, key)
+            elif isinstance(error, requests.RequestException):
+                self._transport_failure(generation, audio_s, "request_error", error, key)
+            raise error
+        if "response" not in outcome:
+            discarded = outcome.get("discarded")
+            groq_id = _header(getattr(discarded, "headers", None), "x-groq-id")
+            status = _status_code(discarded) if discarded is not None else None
+            self._log(secret=key, groq_id=groq_id, audio_s=audio_s, status=status, reason="cancelled", exc_type="CloudCancelled")
+            raise CloudCancelled(audio_s=audio_s, groq_id=groq_id, status=status, secret=key) from None
+        response = outcome["response"]
         if self._generation_now() != generation:
             _close_quietly(response)
             groq_id = _header(getattr(response, "headers", None), "x-groq-id")

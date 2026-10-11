@@ -1,10 +1,13 @@
 """云端客户端：假 session，不连 Groq。假 key 只存在于这个文件。"""
 import ast
+import base64
 import io
 import logging
+import os
 import re
 import sys
 import threading
+import time
 import wave
 from pathlib import Path
 
@@ -83,6 +86,25 @@ def _assert_clean(caplog, exc):
     assert "Bearer" not in blob
 
 
+def _sent_authorization(kwargs):
+    """AuthBase 在 prepare 时写入 Bearer。repr/str 不得含 key。"""
+    assert kwargs["allow_redirects"] is False
+    auth = kwargs["auth"]
+    prepared = requests.PreparedRequest()
+    prepared.prepare(
+        method="POST",
+        url=GROQ_TRANSCRIPTIONS_URL,
+        headers=kwargs.get("headers"),
+        auth=auth,
+    )
+    header = prepared.headers["Authorization"]
+    token = header.split(" ", 1)[1]
+    assert token not in repr(auth)
+    assert token not in str(auth)
+    assert not header.startswith("Basic")
+    return header
+
+
 def test_post_is_verbose_json_wav_and_maps_segments_onto_a0(tmp_path, caplog):
     caplog.set_level(logging.DEBUG)
     pcm = _pcm(1.0)
@@ -120,7 +142,7 @@ def test_post_is_verbose_json_wav_and_maps_segments_onto_a0(tmp_path, caplog):
         "language": "de",
         "response_format": "verbose_json",
     }
-    assert kwargs["headers"]["Authorization"] == f"Bearer {FAKE_KEY}"
+    assert _sent_authorization(kwargs) == f"Bearer {FAKE_KEY}"
     name, wav, content_type = kwargs["files"]["file"]
     assert name == "audio.wav"
     assert content_type == "audio/wav"
@@ -164,8 +186,8 @@ def test_env_key_does_not_override_file(tmp_path, monkeypatch):
     session = FakeSession(FakeResponse(200, {}, {"text": "ok", "segments": []}))
     client = _client(tmp_path, session)
     client.transcribe(_pcm(0.1), a0=0.0, language="de")
-    assert session.calls[0][1]["headers"]["Authorization"] == f"Bearer {FAKE_KEY}"
-    assert ENV_KEY not in session.calls[0][1]["headers"]["Authorization"]
+    assert _sent_authorization(session.calls[0][1]) == f"Bearer {FAKE_KEY}"
+    assert ENV_KEY not in _sent_authorization(session.calls[0][1])
 
 
 def test_rewritten_key_file_is_used_on_the_next_request(tmp_path):
@@ -176,8 +198,8 @@ def test_rewritten_key_file_is_used_on_the_next_request(tmp_path):
     client.transcribe(_pcm(0.1), a0=0.0, language="de")
     key_path.write_text("gsk_test_SECOND_KEY_abcdef\n", encoding="utf-8")
     client.transcribe(_pcm(0.1), a0=0.0, language="de")
-    assert session.calls[0][1]["headers"]["Authorization"] == f"Bearer {FAKE_KEY}"
-    assert session.calls[1][1]["headers"]["Authorization"] == "Bearer gsk_test_SECOND_KEY_abcdef"
+    assert _sent_authorization(session.calls[0][1]) == f"Bearer {FAKE_KEY}"
+    assert _sent_authorization(session.calls[1][1]) == "Bearer gsk_test_SECOND_KEY_abcdef"
 
 
 @pytest.mark.parametrize(
@@ -435,6 +457,96 @@ def test_read_groq_key_uses_only_the_first_line(tmp_path):
     assert read_groq_key(path) == FAKE_KEY
     path.write_text("   \n", encoding="utf-8")
     assert read_groq_key(path) is None
+
+
+def test_netrc_cannot_override_bearer(tmp_path, monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
+    netrc_path = tmp_path / "netrc"
+    netrc_path.write_text("default login x password y\n", encoding="utf-8")
+    os.chmod(netrc_path, 0o600)
+    monkeypatch.setenv("NETRC", str(netrc_path))
+    captured = {}
+
+    class CaptureSession(requests.Session):
+        def send(self, request, **kwargs):
+            captured["headers"] = dict(request.headers)
+            captured["allow_redirects"] = kwargs.get("allow_redirects", True)
+            captured["trust_env"] = self.trust_env
+            response = requests.Response()
+            response.status_code = 200
+            response.url = GROQ_TRANSCRIPTIONS_URL
+            response.encoding = "utf-8"
+            response.headers["x-groq-id"] = "req_netrc"
+            response._content = b'{"text":"ok","duration":0.1,"segments":[]}'
+            return response
+
+    session = CaptureSession()
+    assert session.trust_env is True
+    client = _client(tmp_path, session)
+    result = client.transcribe(_pcm(0.1), a0=0.0, language="de")
+    basic = "Basic " + base64.b64encode(b"x:y").decode("ascii")
+    assert captured["trust_env"] is True
+    assert captured["allow_redirects"] is False
+    assert captured["headers"]["Authorization"] == f"Bearer {FAKE_KEY}"
+    assert captured["headers"]["Authorization"] != basic
+    assert result.text == "ok"
+    assert FAKE_KEY not in caplog.text
+    assert "Bearer" not in caplog.text
+
+
+def test_wall_clock_deadline_aborts_a_slow_stream(tmp_path, caplog):
+    caplog.set_level(logging.DEBUG)
+
+    class SlowChunkSession:
+        def __init__(self):
+            self.closed = threading.Event()
+            self.succeeded = threading.Event()
+            self.calls = []
+            self.chunks = 0
+            self.worker = None
+
+        def post(self, url, **kwargs):
+            self.worker = threading.current_thread()
+            self.calls.append((url, kwargs))
+            # 每 2s 一块，共 30s。相邻间隔小于读取超时，整次仍必须在墙钟 10s 失败。
+            for _ in range(15):
+                if self.closed.is_set():
+                    raise requests.ConnectionError("closed")
+                time.sleep(2)
+                self.chunks += 1
+            self.succeeded.set()
+            return FakeResponse(200, {"x-groq-id": "req_late"}, {"text": "LATE_OK", "segments": []})
+
+        def close(self):
+            self.closed.set()
+
+    session = SlowChunkSession()
+    client = _client(tmp_path, session)
+    started = time.monotonic()
+    try:
+        with pytest.raises(CloudError) as caught:
+            client.transcribe(_pcm(0.2), a0=0.0, language="de")
+        elapsed = time.monotonic() - started
+        assert 8.5 <= elapsed <= 11.5
+        err = caught.value
+        assert not isinstance(err, CloudCancelled)
+        assert err.reason == "timeout"
+        assert err.status is None
+        assert err.exc_type == "Timeout"
+        assert "reason=timeout" in caplog.text
+        assert "exc=Timeout" in caplog.text
+        _assert_clean(caplog, err)
+        assert session.calls[0][1]["timeout"] == (5, 10)
+        assert session.calls[0][1]["allow_redirects"] is False
+        assert session.closed.is_set()
+    finally:
+        session.close()
+        if session.worker is not None:
+            session.worker.join(5)
+    assert session.worker is not None
+    assert not session.worker.is_alive()
+    assert not session.succeeded.is_set()
+    assert 1 <= session.chunks < 15
 
 
 def test_remote_source_never_disables_tls_or_reads_a_key_from_the_environment():

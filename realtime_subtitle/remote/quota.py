@@ -53,7 +53,12 @@ class _Event:
 
 
 class QuotaLedger:
-    """事件日志 + 原子替换。损坏的文件按已用满处理，避免坏账被当成 0 继续上传。"""
+    """事件日志 + 原子替换。
+
+    损坏的文件隔离成 `<name>.corrupt`，并写一条带时间戳的日请求封顶（2000）。
+    这等价于 24h 窗口里已经用满，usage=100%。满 24h 后随 prune 失效，用量回到真实事件。
+    没有无时间戳的永久饱和标志。窗口里的 remaining 头只能抬高日请求水位，不能降低。
+    """
 
     def __init__(
         self,
@@ -67,7 +72,6 @@ class QuotaLedger:
         self._now = now
         self._lock = threading.Lock()
         self._events: list[_Event] = []
-        self._saturated = False
         self._server_day_used: int | None = None
         self._server_day_used_at: float | None = None
         # 自己记得「已经把额度打进冷却」，恢复事件才发得出去。
@@ -92,12 +96,11 @@ class QuotaLedger:
             ts = self._clock(now)
             self._events.append(_Event(ts, billed, False))
             if remaining_requests is not None and remaining_requests >= 0:
-                # 响应头是这一次请求之后的每日剩余。只覆盖 24h 请求窗口。
+                # 响应头是这一次请求之后的每日剩余。只动 24h 请求窗口，而且只升不降。
                 used = LIMIT_REQUESTS_PER_DAY - remaining_requests
                 if used < 0:
                     used = 0
-                self._server_day_used = used
-                self._server_day_used_at = ts
+                self._raise_day_request_floor(used, ts)
                 for event in self._events:
                     event.in_server_day = True
             self._prune(ts)
@@ -131,27 +134,39 @@ class QuotaLedger:
             self._publish(self._measure(self._clock(None)))
             return
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-            self._apply_payload(data)
+            data = json.loads(_normalize_nonfinite(self.path.read_bytes()))
+            legacy_saturated = self._apply_payload(data)
         except Exception:
-            self._become_saturated()
+            self._quarantine_and_cap()
             return
         now = self._clock(None)
         before = (len(self._events), self._server_day_used, self._server_day_used_at)
         self._prune(now)
+        if legacy_saturated:
+            # 旧文件只有无时间戳的 saturated。迁成从这次读取起算的 24h 封顶，然后把标志抹掉。
+            self._raise_day_request_floor(LIMIT_REQUESTS_PER_DAY, now)
         self._publish(self._measure(now))
-        if (len(self._events), self._server_day_used, self._server_day_used_at) != before:
+        if legacy_saturated or (len(self._events), self._server_day_used, self._server_day_used_at) != before:
             self.save()
 
-    def _apply_payload(self, data: Any) -> None:
+    def _apply_payload(self, data: Any) -> bool:
+        """应用一份账本。返回 True 表示带了旧的永久 saturated 哨兵，需要迁成带时间戳的封顶。"""
         if not isinstance(data, dict) or data.get("version") != _VERSION:
             raise ValueError("schema")
         events = data.get("events")
         if not isinstance(events, list):
             raise ValueError("events")
         parsed: list[_Event] = []
+        dropped = False
         for item in events:
-            parsed.append(_parse_event(item))
+            event = _parse_event(item)
+            if event is None:
+                dropped = True
+                continue
+            parsed.append(event)
+        # 全是坏数字时不能当成空账本：那会把写坏的文件读成 0。
+        if dropped and not parsed:
+            raise ValueError("event")
         used = data.get("server_day_used", None)
         used_at = data.get("server_day_used_at", None)
         if used is None and used_at is None:
@@ -159,23 +174,35 @@ class QuotaLedger:
             server_at = None
         else:
             server_used, server_at = _parse_server(used, used_at)
-        saturated = data.get("saturated", False)
-        if not isinstance(saturated, bool):
-            raise ValueError("saturated")
+        legacy_saturated = False
+        if "saturated" in data:
+            saturated = data["saturated"]
+            if not isinstance(saturated, bool):
+                raise ValueError("saturated")
+            legacy_saturated = saturated
         self._events = parsed
-        self._saturated = saturated
         self._server_day_used = server_used
         self._server_day_used_at = server_at
+        return legacy_saturated
 
-    def _become_saturated(self) -> None:
-        # 解析不了就不能假设没用过。写成明确的饱和账本，避免下次又读坏文件当 0。
-        self._events = []
-        self._server_day_used = None
-        self._server_day_used_at = None
-        self._saturated = True
+    def _quarantine_and_cap(self) -> None:
+        # 解析不了就不能假设没用过。原文件改名为 .corrupt（已存在则覆盖），
+        # 再写一条「现在起 24h 内已用满 2000 次」的封顶。过窗后 prune 会把它丢掉。
+        moved = _quarantine(self.path)
         now = self._clock(None)
+        self._events = []
+        self._server_day_used = LIMIT_REQUESTS_PER_DAY
+        self._server_day_used_at = now
         self._publish(self._measure(now))
-        self.save()
+        if moved:
+            self.save()
+
+    def _raise_day_request_floor(self, used: int, ts: float) -> None:
+        # 当前 24h 窗口里已经见过的日请求数只升不降。更宽裕的 remaining 不能把封顶洗掉。
+        if self._server_active(ts) and self._server_day_used is not None and used <= self._server_day_used:
+            return
+        self._server_day_used = used
+        self._server_day_used_at = ts
 
     def _publish(self, usage: QuotaUsage) -> None:
         # 没到阈值就别发事件：apply() 每次都会清掉 cooldown_seconds，
@@ -198,15 +225,14 @@ class QuotaLedger:
         percent = max(percent, _percent(hour_audio, LIMIT_AUDIO_PER_HOUR_S))
         percent = max(percent, _percent(day_audio, LIMIT_AUDIO_PER_DAY_S))
         percent = max(percent, _percent(day_requests, LIMIT_REQUESTS_PER_DAY))
-        if self._saturated:
-            percent = 100.0
+        capped = self._server_active(now) and (self._server_day_used or 0) >= LIMIT_REQUESTS_PER_DAY
         return QuotaUsage(
             minute_requests=minute,
             hour_audio_s=hour_audio,
             day_audio_s=day_audio,
             day_requests=day_requests,
             usage_percent=percent,
-            saturated=self._saturated,
+            saturated=capped,
         )
 
     def _day_requests(self, now: float) -> int:
@@ -246,7 +272,6 @@ class QuotaLedger:
     def _snapshot(self) -> dict[str, Any]:
         return {
             "version": _VERSION,
-            "saturated": self._saturated,
             "events": [
                 {"ts": event.ts, "billed_s": event.billed_s, "in_server_day": event.in_server_day}
                 for event in self._events
@@ -275,20 +300,25 @@ def _percent(value: float, limit: float) -> float:
     return (value / limit) * 100.0
 
 
-def _parse_event(item: Any) -> _Event:
+def _parse_event(item: Any) -> _Event | None:
+    """结构坏了就抛，让整份账本隔离。负数 / NaN / inf 只丢掉这一条。"""
     if not isinstance(item, dict):
+        raise ValueError("event")
+    if "ts" not in item or "billed_s" not in item:
         raise ValueError("event")
     ts = item.get("ts")
     billed = item.get("billed_s")
     flag = item.get("in_server_day", False)
-    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
-        raise ValueError("event")
-    if isinstance(billed, bool) or not isinstance(billed, (int, float)):
-        raise ValueError("event")
     if not isinstance(flag, bool):
         raise ValueError("event")
-    if not math.isfinite(float(ts)) or not math.isfinite(float(billed)) or float(billed) < 0:
+    if isinstance(ts, bool) or (ts is not None and not isinstance(ts, (int, float))):
         raise ValueError("event")
+    if isinstance(billed, bool) or (billed is not None and not isinstance(billed, (int, float))):
+        raise ValueError("event")
+    if ts is None or not math.isfinite(float(ts)):
+        return None
+    if billed is None or not math.isfinite(float(billed)) or float(billed) < 0:
+        return None
     return _Event(float(ts), float(billed), flag)
 
 
@@ -298,6 +328,66 @@ def _parse_server(used: Any, used_at: Any) -> tuple[int, float]:
     if isinstance(used_at, bool) or not isinstance(used_at, (int, float)) or not math.isfinite(float(used_at)):
         raise ValueError("server")
     return used, float(used_at)
+
+
+_NONFINITE_TOKENS = (b"-Infinity", b"+Infinity", b"Infinity", b"NaN")
+
+
+def _normalize_nonfinite(payload: bytes) -> bytes:
+    """JSON 不接受 NaN / Infinity。字符串外面的这些记号换成 null，旁边的好事件还能留。"""
+    out = bytearray()
+    in_string = False
+    escaped = False
+    index = 0
+    limit = len(payload)
+    while index < limit:
+        byte = payload[index]
+        if in_string:
+            out.append(byte)
+            if escaped:
+                escaped = False
+            elif byte == 0x5C:
+                escaped = True
+            elif byte == 0x22:
+                in_string = False
+            index += 1
+            continue
+        if byte == 0x22:
+            in_string = True
+            out.append(byte)
+            index += 1
+            continue
+        previous = None if index == 0 else payload[index - 1]
+        if _is_json_boundary(previous):
+            replaced = False
+            for token in _NONFINITE_TOKENS:
+                end = index + len(token)
+                if payload.startswith(token, index) and (end == limit or _is_json_boundary(payload[end])):
+                    out.extend(b"null")
+                    index = end
+                    replaced = True
+                    break
+            if replaced:
+                continue
+        out.append(byte)
+        index += 1
+    return bytes(out)
+
+
+def _is_json_boundary(byte: int | None) -> bool:
+    if byte is None:
+        return True
+    return byte in b" \n\r\t,:[]{}"
+
+
+def _quarantine(path: Path) -> bool:
+    """原文件改名为 `<name>.corrupt`。目标已存在时 os.replace 覆盖。失败则不动原文件。"""
+    corrupt = path.with_name(path.name + ".corrupt")
+    try:
+        os.replace(path, corrupt)
+    except OSError:
+        return False
+    return True
 
 
 def _encode(payload: dict[str, Any]) -> bytes:
