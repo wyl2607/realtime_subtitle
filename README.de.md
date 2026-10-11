@@ -1,8 +1,16 @@
 # Realtime Subtitle
 
-**Offline-Live-Untertitel für Windows (Deutsch / Englisch)** — Systemton aufnehmen, Sprache lokal erkennen, lokal übersetzen und als zweisprachiges Always-on-Top-Overlay anzeigen.
+**Live-Untertitel für Windows und macOS** — Systemton aufnehmen, Sprache erkennen, lokal übersetzen und als zweisprachiges Always-on-Top-Overlay anzeigen. Standardmäßig vollständig lokal; Audio wird nur an den Cloud-Erkennungsdienst gesendet, wenn ein Groq-Schlüssel in den Programmeinstellungen konfiguriert ist. Aktuelle Version **v3.2.0**.
 
-Erkennung und Übersetzung laufen offline; Audio und Transkripte verlassen den Rechner nicht.
+> **Datenschutzversprechen & Datenwege außerhalb des Rechners:**
+>
+> Standardmäßig laufen Erkennung und Übersetzung vollständig lokal; weder Audio noch Transkripte verlassen den Rechner. Es gibt nur zwei optionale Wege, auf denen Audio den Rechner verlässt, und beide erfordern eine explizite Konfiguration:
+> 1. **Eigener Rechenknoten:** Audio wird an einen Rechner im eigenen Tailscale-Netzwerk (`100.64.0.0/10`) gesendet, ohne Beteiligung Dritter;
+> 2. **Cloud-Groq (Drittanbieter):** Audio wird nur dann an den Groq-Cloud-Dienst gesendet, wenn ein Groq-Schlüssel in den Programmeinstellungen hinterlegt ist. Liest keine Umgebungsvariablen (verhindert versehentliches Hochladen durch systemweite Variablen); kann im Einstellungsfenster oder per CLI mit einem Klick deaktiviert werden.
+>
+> Die Statuszeile im Overlay zeigt den aktuellen Erkennungsursprung eindeutig an: „云端·Groq“ / „混合·<Knotenname>“ / „本机“.
+> Bei Verwendung eines Netzwerk-Proxys kann der Proxy die hochgeladenen **Roh-Audiofragmente** (WAV) sehen.
+> Bezüglich der Datenspeicherung durch Drittanbieter: Laut der [offiziellen Groq-Datenschutzrichtlinie](https://console.groq.com/docs/your-data) speichert Groq Inferenzanfragen standardmäßig nicht; zur Behebung von Zuverlässigkeitsproblemen oder Missbrauch können Daten vorübergehend bis zu 30 Tage gespeichert werden. Bei Bedenken aktivieren Sie Zero Data Retention (ZDR) unter Data Controls in der Groq-Konsole.
 
 > **Das wird durchgesetzt, nicht nur auf dem Papier.** Beim Start löst das Programm
 > `OLLAMA_BASE_URL` auf und bricht den Start ab, wenn nicht alle aufgelösten Adressen
@@ -149,7 +157,21 @@ Kleines natives Programm mit Systemerkennung und Systemübersetzung; kein Python
 
 ### Rechenknoten (experimentell)
 
-Erkennung an einen anderen Apple-Silicon-Mac oder NVIDIA-Windows-PC im Tailnet auslagern: dieses Gerät zeigt Untertitel zuerst, dann ersetzen genauere Ergebnisse des Knotens sie; bei Verbindungsabbruch laufen Untertitel weiter und fallen automatisch auf lokale Verarbeitung zurück, bei Rückkehr des Knotens wieder verbunden. Installation: Mac-Knoten `bash scripts/node/install_node.sh <ssh-Alias>`, Windows-Knoten `bash scripts/node/install_node_windows.sh <ssh-Alias>` (beide auf dem Mac ausführen). Datenschutzgrenze: Knoten lauscht nur auf Tailscale-Adressen (`100.64.0.0/10`), Token-Authentifizierung, nur Dateien, Audio bleibt im Speicher (keine Festplatte), Logs enthalten keinen Untertiteltext; Audio verlässt dieses Gerät nur zu Ihrem eigenen Knoten. Derzeit unterstützt nur rslite Knoten; das Windows-Desktop-Untertitelprogramm ist für v3.2.0 geplant. Protokolldetails: `docs/protocol-v2.md`.
+Erkennung an einen anderen Apple-Silicon-Mac oder NVIDIA-Windows-PC im Tailnet auslagern: dieses Gerät zeigt Untertitel zuerst, dann ersetzen genauere Ergebnisse des Knotens sie; bei Verbindungsabbruch laufen Untertitel weiter und fallen automatisch auf lokale Verarbeitung zurück, bei Rückkehr des Knotens wieder verbunden. Installation: Mac-Knoten `bash scripts/node/install_node.sh <ssh-Alias>`, Windows-Knoten `bash scripts/node/install_node_windows.sh <ssh-Alias>` (beide auf dem Mac ausführen). Datenschutzgrenze: Knoten lauscht nur auf Tailscale-Adressen (`100.64.0.0/10`), Token-Authentifizierung, nur Dateien, Audio bleibt im Speicher (keine Festplatte), Logs enthalten keinen Untertiteltext; Audio verlässt dieses Gerät nur zu Ihrem eigenen Knoten. Sowohl rslite als auch das Windows-Desktop-Programm unterstützen Rechenknoten (siehe unten „Windows: Rechenknoten nutzen“). Protokolldetails: `docs/protocol-v2.md`.
+
+## Cloud-Erkennung (optional)
+
+- **Mac rslite**: Schlüssel über `rslite --set-groq-key` von Standard-Input einlesen, mit `rslite --clear-groq-key` löschen und Cloud-Modus mit `rslite --cloud on|off` umschalten.
+- **Windows**: Groq-Schlüssel im Passwortfeld unter „Cloud-Erkennung“ im ⚙️-Einstellungsfenster eingeben und Schalter umlegen.
+- **Kostenloses Kontingent**: 20 Anfragen pro Minute, 7.200 Sekunden Audio pro Stunde, 2.000 Anfragen / 28.800 Sekunden pro Tag, mindestens 10 Sekunden pro Anfrage.
+- **Automatischer Fallback**: Bei fast vollem Kontingent automatischer Wechsel auf eigene Knoten oder lokal; nach Erholung Umschaltung an Sprechpause.
+- **Fallback-Reihenfolge**: Cloud → Eigener Knoten → Lokal.
+
+## Windows: Rechenknoten nutzen
+
+- Knotenschalter standardmäßig aus.
+- Vom Mac mit `bash scripts/node/install_node_windows.sh <Knoten> --client <windows-ssh-alias>` (oder `install_node.sh` mit gleichen Parametern) in einem Schritt bereitstellen.
+- Ist ein Rechner gleichzeitig Knoten und Client, überspringt er sich automatisch selbst.
 
 ## Update & Deinstallation
 

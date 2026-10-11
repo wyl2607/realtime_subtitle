@@ -1,8 +1,16 @@
 # 实时字幕翻译系统
 
-**Windows 全离线实时字幕**：捕获系统声音 → 本地语音识别 → 本地翻译 → 置顶悬浮窗双语显示。
+**实时字幕**：捕获系统声音 → 本地/云端语音识别 → 本地翻译 → 置顶悬浮窗双语显示。默认完全本地；只有在程序配置里填了 Groq key 才会把音频发送到云端识别服务。当前版本 **v3.2.0**。
 
-识别与翻译均在本机完成，不向任何云端发送音频或文本。当前版本 **v3.1.0**。
+> **隐私承诺与出本机路径**：
+>
+> 默认情况下，识别与翻译均在完全本地运行，不向任何云端发送音频或文本。音频离开本机只有两条可选路径，且均须主动显式配置：
+> 1. **自己的算力节点**：发送到你自己 Tailscale 内网中的机器（`100.64.0.0/10`），不经过第三方；
+> 2. **云端 Groq（第三方）**：只有在程序配置里填了 Groq key 才会把音频发送到云端识别服务。不读环境变量（避免因系统变量意外开启上传）；可在设置面板或命令行一键关掉云端开关。
+>
+> 界面状态行会明确显示当前识别模式与来源：「云端·Groq」/「混合·节点名」/「本机」。
+> 若网络经由代理，经代理时代理可见上传的**原始音频**片段（WAV）。
+> 关于第三方数据保留：[Groq 官方数据政策](https://console.groq.com/docs/your-data) 默认不保留识别请求；排查故障或滥用时可能临时保存最多 30 天。介意的话可在 Groq 控制台 Data Controls 打开 Zero Data Retention（ZDR）。
 
 > **给朋友用（三步）**
 > 1. 克隆到**纯英文路径**（推荐 `C:\realtime_subtitle`，中文用户名目录会把启动脚本弄坏）
@@ -147,7 +155,21 @@ bash scripts/macos/stop.sh
 
 ### 算力节点（实验性）
 
-把识别交给 tailnet 里另一台 Apple Silicon Mac 或 NVIDIA Windows 电脑：本机先出字幕，节点精修结果随后替换上去；节点掉线时字幕不断、自动回到本机，节点恢复后自动接回。装法：Mac 节点 `bash scripts/node/install_node.sh <ssh 别名>`，Windows 节点 `bash scripts/node/install_node_windows.sh <ssh 别名>`（都在 Mac 上运行）。隐私边界：节点只监听 Tailscale 地址（`100.64.0.0/10`），token 鉴权、只经文件传递，音频只进内存不落盘，日志不写字幕正文；音频会离开本机、但只到你自己的节点机器。目前只有 rslite 能用节点，Windows 桌面字幕程序计划在 v3.2.0。协议细节见 `docs/protocol-v2.md`。
+把识别交给 tailnet 里另一台 Apple Silicon Mac 或 NVIDIA Windows 电脑：本机先出字幕，节点精修结果随后替换上去；节点掉线时字幕不断、自动回到本机，节点恢复后自动接回。装法：Mac 节点 `bash scripts/node/install_node.sh <ssh 别名>`，Windows 节点 `bash scripts/node/install_node_windows.sh <ssh 别名>`（都在 Mac 上运行）。隐私边界：节点只监听 Tailscale 地址（`100.64.0.0/10`），token 鉴权、只经文件传递，音频只进内存不落盘，日志不写字幕正文；音频会离开本机、但只到你自己的节点机器。rslite 与 Windows 桌面字幕程序均已支持算力节点（Windows 配置见下文）。协议细节见 `docs/protocol-v2.md`。
+
+## 云端识别（可选）
+
+- **Mac rslite**：通过 `rslite --set-groq-key` 从标准输入读取 key，`rslite --clear-groq-key` 清除 key，`rslite --cloud on|off` 开关云端模式。
+- **Windows**：在 ⚙️ 面板「云端识别」密码框输入 Groq key，使用开关启用/禁用云端识别。
+- **免费额度**：每分钟 20 次、每小时 7200 秒音频、每天 2000 次 / 28800 秒，每次最少按 10 秒计。
+- **自动切换**：额度快满自动切到自己的节点/本机、恢复后静音点切回。
+- **回退顺序**：云端 → 自己的节点 → 本机。
+
+## Windows：使用算力节点
+
+- 节点开关默认关。
+- 在 Mac 上 `bash scripts/node/install_node_windows.sh <节点> --client <windows-ssh 别名>`（或 `install_node.sh` 同参数）一次下发。
+- 同一台机器既是节点又是客户端会自动跳过自己。
 
 ## 更新与卸载
 
