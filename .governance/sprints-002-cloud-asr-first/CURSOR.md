@@ -38,4 +38,4 @@
 
 ## 下一步
 - /sprint-tick → Scheduler：第一批 ready = TK-001 / TK-002 / TK-005（写入范围互不覆盖），并行派给非 Claude lane。
-- 2026-10-11 14:05 CEST: TK-004 done（CR-004 R1 状态机 keyInvalid + R2 grok 修 T1/ARCH-01/02/04/05/F1/F2/F5；协调者复核 build+selftest OK、pytest 1060 passed、ruff 绿；merge 38dbf3c）。TK-008 文档部分 merge 53a169a（协调者改 4 处事实）。TK-007 评审中（agy default + grok security）
+- 2026-10-11 13:38 CEST: TK-004 done（CR-004 R1 状态机 keyInvalid + R2 grok 修 T1/ARCH-01/02/04/05/F1/F2/F5；协调者复核 build+selftest OK、pytest 1060 passed、ruff 绿；merge 38dbf3c）。TK-008 文档部分 merge 53a169a（协调者改 4 处事实）。TK-007 评审中（agy default + grok security）

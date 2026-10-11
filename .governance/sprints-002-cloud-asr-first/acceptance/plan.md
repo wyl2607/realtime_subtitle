@@ -1,6 +1,6 @@
 # Sprint 002 真机验收方案（Mac 云端优先 + Windows 节点客户端）
 
-> **协调者核对（2026-10-11 14:20，执行前必读，优先于正文）**：agy 起草，命令已逐条对过仓库。以下是正文中的错误和缺口：
+> **协调者核对（2026-10-11 13:42，执行前必读，优先于正文）**：agy 起草，命令已逐条对过仓库。以下是正文中的错误和缺口：
 > 1. **Done 9 的 `python -m realtime_subtitle.app --test-playback ... --mode` 是编的**，Windows 程序没有这个参数。Windows 混合档只能真机放音频人工计时，评分方式明天现场定。
 > 2. Done 8 的文件名写错了：实际是 `README.md` / `README.en.md` / `README.de.md`（还有指向桩 `README.zh.md`），不是 `README.zh-CN.md` / `README.de-DE.md`。
 > 3. Done 7 的 `swift test` 删掉：本机没有 Xcode，XCTest 跑不了。Swift 侧以 `rslite --selftest` 为准。
