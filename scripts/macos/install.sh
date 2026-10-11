@@ -148,7 +148,7 @@ if [[ "${USE_MIRROR}" -eq 1 ]]; then
     UV_PIP_ARGS+=(--index-url https://pypi.tuna.tsinghua.edu.cn/simple)
 fi
 # uv 遇到已存在的 venv 直接报错（不替换）；重跑 install.sh 时沿用，依赖由下一行补齐
-if [[ -x "${REPO_ROOT}/venv/bin/python" ]]; then
+if [[ "${DRY_RUN}" -eq 0 && -x "${REPO_ROOT}/venv/bin/python" ]]; then
     echo "  ℹ️ 已有 venv，沿用"
 else
     run_cmd "uv venv" uv venv venv -p 3.12
