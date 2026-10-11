@@ -1142,3 +1142,103 @@ def test_ssh_passes_dashdash_before_host(env):
         idx = args.index(host)
         assert idx > 0
         assert args[idx - 1] == "--", f"argument before {host} is {args[idx - 1]}, expected '--'"
+
+
+def test_client_dry_run_prints_push_and_does_not_ssh(env):
+    e, _home, logdir = env
+    r = _run(["--dry-run", "mini2", "--client", "winbox"], e)
+    assert r.returncode == 0, r.stderr
+    assert "PushClient" in r.stdout
+    assert "<redacted>" in r.stdout
+    assert not (logdir / "ssh.argv").exists()
+    assert not (logdir / "scp.argv").exists()
+
+
+def test_client_flag_requires_an_alias(env):
+    e, _home, logdir = env
+    r = _run(["mini2", "--client"], e)
+    assert r.returncode != 0
+    assert not (logdir / "ssh.argv").exists()
+
+
+def test_help_mentions_client(env):
+    e, _home, _logdir = env
+    r = _run(["--help"], e)
+    assert r.returncode == 0
+    assert "--client" in r.stdout
+
+
+def _push_stubs(tmp_path):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    log = tmp_path / "log"
+    log.mkdir()
+    (bindir / "ssh").write_text(
+        "#!/bin/bash\n"
+        'printf "%s\\0" "$@" >> "$STUB_LOG/ssh.argv"\n'
+        'printf "\\n---\\n" >> "$STUB_LOG/ssh.argv"\n'
+        'cat >> "$STUB_LOG/ssh.stdin"\n'
+        "exit 0\n"
+    )
+    (bindir / "scp").write_text(
+        "#!/bin/bash\n"
+        'printf "%s\\0" "$@" >> "$STUB_LOG/scp.argv"\n'
+        'printf "\\n---\\n" >> "$STUB_LOG/scp.argv"\n'
+        "exit 0\n"
+    )
+    (bindir / "ssh").chmod(0o755)
+    (bindir / "scp").chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env.get('PATH', '')}"
+    env["STUB_LOG"] = str(log)
+    env["HOME"] = str(tmp_path / "home")
+    return log, env
+
+
+def test_push_windows_client_puts_token_on_stdin_only(tmp_path):
+    log, env = _push_stubs(tmp_path)
+    token = "ab" * 32
+    r = subprocess.run(
+        ["bash", "-c", 'source "$1"; shift; push_windows_client "$@"',
+         "x", str(SCRIPT), "winbox", "mynode", "c" * 16, "node.tail.ts.net", "8791", token],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert r.returncode == 0, r.stderr
+    argv = (log / "ssh.argv").read_bytes()
+    stdin = (log / "ssh.stdin").read_text(encoding="utf-8")
+    assert token.encode() not in argv
+    assert token in stdin
+    text = argv.decode()
+    assert "-File" in text
+    assert "PushClient" in text
+    scp = (log / "scp.argv").read_text(encoding="utf-8", errors="replace")
+    assert "node_setup.ps1" in scp
+    assert "push_client.ps1" in scp
+    assert token not in scp
+
+
+def test_push_windows_client_rejects_bad_token_before_ssh(tmp_path):
+    log, env = _push_stubs(tmp_path)
+    r = subprocess.run(
+        ["bash", "-c", 'source "$1"; shift; push_windows_client "$@"',
+         "x", str(SCRIPT), "winbox", "mynode", "c" * 16, "node.tail.ts.net", "8791", "not-a-token"],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert r.returncode != 0
+    assert not (log / "ssh.argv").exists()
+
+
+@pytest.mark.parametrize("port", ["8791&calc", "0", "65536", "80 91", "-1"])
+def test_push_windows_client_rejects_bad_port_before_ssh(tmp_path, port):
+    """S1：port 含 shell 元字符或越界时，拼 remote 之前就 die，且不 ssh。"""
+    log, env = _push_stubs(tmp_path)
+    token = "ab" * 32
+    r = subprocess.run(
+        ["bash", "-c", 'source "$1"; shift; push_windows_client "$@"',
+         "x", str(SCRIPT), "winbox", "mynode", "c" * 16, "node.tail.ts.net", port, token],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert r.returncode != 0
+    assert not (log / "ssh.argv").exists()
+    assert not (log / "scp.argv").exists()
+
