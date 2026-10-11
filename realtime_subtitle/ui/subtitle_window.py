@@ -94,7 +94,7 @@ class SubtitleSignals(QObject):
     # 是 2026-07-06 双层显示重写之前的旧接口，此后零调用方，已删
     status = pyqtSignal(str)  # 状态提示（如暂停/继续），不进字幕历史
     live = pyqtSignal(str, str)  # live德语行更新 (committed, unstable)
-    pair = pyqtSignal(str, str, int)  # 句对完成 (原文, 译文, 语言代数)
+    pair = pyqtSignal(object, object, object)  # 句对完成 (原文, 译文, meta/语言代数)
     draft = pyqtSignal(str, int)  # 草稿译文 + 语言代数（正式句对完成后被替换）
     lookup = pyqtSignal(str, str, bool, str)  # (word, 词典文本, 是否流式中间态, request_id)
     ai_analysis = pyqtSignal(str, int)  # 🤖 背景总结结果 (text, seq)
@@ -146,7 +146,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         # 内存里多留一些句对（HISTORY_KEEP条），实际显示条数由窗口高度自适应决定：
         # 窗口拉大 → 自动多显示历史；拉小 → 只留最新的
         self.HISTORY_KEEP = 50
-        self.sentence_pairs = []  # 已完成句对 [(german, chinese, timestamp)]
+        self.sentence_pairs = []  # 已完成句对 [(原文, 译文, 墙钟, t0, t1, source, key)]
         self.live_committed = ""  # live行：已提交未翻译的德语
         self.live_unstable = ""   # live行：未稳定尾部（灰色）
         self.live_draft = ""      # live行的草稿中文（等正式翻译时先显示）
@@ -759,7 +759,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         if self.tv_window.isVisible():
             self.tv_window.hide()
         else:
-            self.tv_window.backfill([zh for _, zh, _ in self.sentence_pairs])
+            self.tv_window.backfill([item[1] for item in self.sentence_pairs])
             self.tv_window.open_fullscreen(
                 avoid_center=self.container.frameGeometry().center())
 
@@ -775,7 +775,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         self.cinema_bar.open_on(
             prefer_center=self.container.frameGeometry().center())
         if self.sentence_pairs:
-            de, zh, _ = self.sentence_pairs[-1]
+            de, zh = self.sentence_pairs[-1][0], self.sentence_pairs[-1][1]
             self.cinema_bar.append_pair(de, zh)
 
     def _on_ai_analysis_clicked(self):

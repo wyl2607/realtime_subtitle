@@ -40,6 +40,20 @@ _WORD_PUNCT = ".!?…,;:\"'«»„“”-–—"
 _CJK_CHAR = re.compile(r'[぀-ヿ㐀-䶿一-鿿]')
 
 
+class TimedText(str):
+    """兼容旧字符串调用点，同时把对应词时间带给下游。
+
+    句子时间必须从客户端样本时钟来的词时间推导；单独返回 str 会在 ASR
+    这一层把时间丢掉。做成 str 子类是为了让旧的相等判断、join/strip 语义
+    继续成立，只让需要时间的调用方读取 words。
+    """
+
+    def __new__(cls, text, words=None):
+        obj = str.__new__(cls, text or "")
+        obj.words = list(words or [])
+        return obj
+
+
 class HypothesisBuffer:
     """两次连续识别结果的最长公共词前缀才提交（local agreement-2）
 
@@ -380,10 +394,14 @@ class OnlineASRProcessor:
         return self._collapse_word_runs(self._apply_corrections(out))
 
     def process_iter(self):
-        """识别当前整个音频缓冲，返回 (新提交的文本, 未稳定尾部文本)"""
+        """识别当前整个音频缓冲，返回 (新提交文本, 未稳定尾部文本)。
+
+        新提交文本是 TimedText：像 str 一样用，但 `.words` 保留
+        (start, end, text)，供下游给句子打样本时钟时间。
+        """
         self._flush_audio_chunks()
         if len(self.audio_buffer) == 0:
-            return "", ""
+            return TimedText("", []), ""
         prompt = self._prompt()
         segments, _info = self.model.transcribe(
             self.audio_buffer,
@@ -428,7 +446,10 @@ class OnlineASRProcessor:
                 print(f"   ✂️  缓冲{cur_sec:.0f}秒无可裁词（音乐/噪音），硬裁至{config.BUFFER_KEEP_SEC:.0f}秒")
             self._chunk_at(self.buffer_time_offset + cur_sec - config.BUFFER_KEEP_SEC)
 
-        committed_text = "".join(t for _, _, t in committed).strip()
+        committed_text = TimedText(
+            "".join(t for _, _, t in committed).strip(),
+            committed,
+        )
         unstable_text = "".join(t for _, _, t in self.transcript_buffer.complete()).strip()
         return committed_text, unstable_text
 
@@ -492,7 +513,7 @@ class OnlineASRProcessor:
         self.transcript_buffer.pop_commited(self.buffer_time_offset)
         self.audio_buffer = np.array([], dtype=np.float32)
         self._audio_chunks = []
-        return "".join(t for _, _, t in o).strip()
+        return TimedText("".join(t for _, _, t in o).strip(), o)
 
     def buffer_seconds(self):
         """当前音频缓冲长度（秒），性能日志用（含尚未合并的 chunks）"""
