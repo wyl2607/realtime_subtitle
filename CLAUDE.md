@@ -1061,7 +1061,7 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     - **做法**：云端客户端保持系统代理（trust_env 默认）；节点客户端必须显式设置 `trust_env=False`，且必须在解析并验证目标 IP 属于 `100.64.0.0/10` 后，直接钉住该 IP 发起连接，禁止使用域名进行二次解析。
 
 48. **requests 在 trust_env 下会用 `~/.netrc` 的 Basic 覆盖 Bearer**（2026-10-11，CR-006B 评审发现）。
-    - **现象**：只用 `headers={\"Authorization\": \"Bearer …\"}` 时，若 `~/.netrc` 里有 api.groq.com 的条目，发出去的是 netrc 的 Basic 认证，Groq 会按 key 无效处理。
+    - **现象**：只用 `headers={"Authorization": "Bearer …"}` 时，若 `~/.netrc` 里有 api.groq.com 的条目，发出去的是 netrc 的 Basic 认证，Groq 会按 key 无效处理。
     - **根因**：`requests` 库在 `trust_env=True` 模式下会自动读取用户家目录的 `~/.netrc` 文件；如果里面恰好存在对应域名或默认机器凭据，requests 的默认行为是用 netrc 中的用户名密码生成 Basic Auth 并直接覆盖掉我们在 `headers` 里显式传入的 `Authorization` 请求头。
     - **做法**：云端 HTTP 请求不能只靠 `headers={"Authorization": f"Bearer {key}"}`，必须自定义 `requests.auth.AuthBase` 子类，在 auth 回调中显式设置 Bearer 头，防止被 requests 内部的 netrc 逻辑覆写。
 
