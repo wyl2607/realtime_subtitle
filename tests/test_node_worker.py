@@ -255,7 +255,9 @@ def test_translator_unavailable_still_delivers_finals():
 def test_translate_failure_reports_status_and_keeps_going():
     stream = hello() + audio_frames(np.concatenate([tone(1.0), silence(1.0)])) + ctl(type="drain")
     _c, ev, *_ = run_worker(stream, translator=FakeTr(result=None))
-    assert len([e for e in ev if e["ev"] == "status" and e["code"] == "translate_failed"]) == 2
+    statuses = [e for e in ev if e["ev"] == "status" and e["code"] == "translate_failed"]
+    assert len(statuses) == 2
+    assert [e["id"] for e in statuses] == [1, 2]
     assert ev[-1] == {"ev": "drained"}
 
 
@@ -348,6 +350,8 @@ def test_log_never_contains_transcript_or_translation_text():
     assert err.strip(), "日志不应为空，否则这条测试什么也没证明"
     for secret in (SECRET_SRC, SECRET_DST, "Zweiter", "Äpfel", "机密", "boom"):
         assert secret not in err
+    statuses = [e for e in ev if e["ev"] == "status" and e["code"] == "translate_failed"]
+    assert [e["id"] for e in statuses] == [1, 2]
     # 事件流里则必须有正文（它们是产品输出，不是日志）
     assert any(SECRET_SRC in json.dumps(e, ensure_ascii=False) for e in ev)
 

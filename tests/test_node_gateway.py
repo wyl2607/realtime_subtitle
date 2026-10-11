@@ -1227,30 +1227,92 @@ def test_info_matches_p1_and_leaks_nothing_raw(tmp_path, mac_probes):
         {"model": "whisper-large-v3-turbo", "backend": "mlx", "rtf": 0.08, "translator": "ollama:qwen3.5:4b"}),
         encoding="utf-8")
     system = FakeSystem(idle_ns=7_654_321_000)
+    monkeypatch_probe = pytest.MonkeyPatch()
+    monkeypatch_probe.setattr(info_mod, "probe_translator_ok", lambda translator: False, raising=False)
     info = info_mod.NodeInfo(run=system, state_dir=state)
 
-    async def scenario():
-        async with running(tmp_path, info=info) as (gw, _rec):
-            status, body = await http_get("/v1/info", port=gw.tcp_port, token=TOKEN)
-            raw = await _raw_info(gw)
-            ws = await uds_connect(gw)
-            await hello_ready(ws)
-            _, busy_body = await http_get("/v1/info", port=gw.tcp_port, token=TOKEN)
-            await ws.close()
-            return status, body, raw, busy_body
+    try:
+        async def scenario():
+            async with running(tmp_path, info=info) as (gw, _rec):
+                status, body = await http_get("/v1/info", port=gw.tcp_port, token=TOKEN)
+                raw = await _raw_info(gw)
+                ws = await tcp_connect(gw)
+                await hello_ready(ws)
+                _, busy_body = await http_get("/v1/info", port=gw.tcp_port, token=TOKEN)
+                await ws.close()
+                return status, body, raw, busy_body
 
-    status, body, raw, busy_body = asyncio.run(scenario())
+        status, body, raw, busy_body = asyncio.run(scenario())
+    finally:
+        monkeypatch_probe.undo()
     assert status == 200
-    assert set(body) == {"v", "node_id", "hw_hash", "asr", "translator", "busy", "on_ac", "in_use", "worker"}
+    assert set(body) == {
+        "v", "node_id", "hw_hash", "asr", "translator", "translator_ok",
+        "busy", "on_ac", "in_use", "worker",
+    }
     assert body["v"] == 2 and body["node_id"] == "node-abc"
     assert body["hw_hash"] == hashlib.sha256(FakeSystem.UUID.encode()).hexdigest()[:16]
     assert body["asr"] == {"model": "whisper-large-v3-turbo", "backend": "mlx", "rtf": 0.08}
     assert body["translator"] == "ollama:qwen3.5:4b"
+    assert body["translator_ok"] is False
     assert body["busy"] is False and body["on_ac"] is True and body["in_use"] is True
     assert body["worker"] == "cold"
     assert busy_body["busy"] is True and busy_body["worker"] == "warm"
     # S8：原始空闲时长 / 原始 UUID 不出现在响应里
     assert "7654321" not in raw and "7.65" not in raw and FakeSystem.UUID not in raw
+
+
+def test_info_translator_ok_defaults_true_for_non_ollama(tmp_path, mac_probes, monkeypatch):
+    (tmp_path / "asr_state.json").write_text(json.dumps({"translator": "apple"}), encoding="utf-8")
+    called = False
+
+    def probe(translator):
+        nonlocal called
+        called = True
+        return False
+
+    monkeypatch.setattr(info_mod, "probe_translator_ok", probe, raising=False)
+    body = info_mod.NodeInfo(run=FakeSystem(), state_dir=tmp_path).collect(busy=False, worker="cold")
+    assert body["translator"] == "apple"
+    assert body["translator_ok"] is True
+    assert called is False
+
+
+def test_probe_translator_ok_checks_ollama_version_with_cache(monkeypatch):
+    calls = []
+    clock = {"t": 10.0}
+
+    class _Resp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"version":"0.6.0"}'
+
+    class _Opener:
+        def open(self, request, timeout):
+            calls.append((request.full_url, timeout, request.has_header("Proxy-Authorization")))
+            return _Resp()
+
+    def opener_factory(proxy_handler):
+        assert proxy_handler.proxies == {}
+        return _Opener()
+
+    monkeypatch.setattr(info_mod.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(info_mod.urllib.request, "build_opener", opener_factory)
+    monkeypatch.setattr(info_mod, "_OLLAMA_CHECK_CACHE", None, raising=False)
+
+    assert info_mod.probe_translator_ok("ollama:qwen") is True
+    assert info_mod.probe_translator_ok("ollama:qwen") is True
+    clock["t"] += 11.0
+    assert info_mod.probe_translator_ok("ollama:qwen") is True
+    assert len(calls) == 2
+    assert all(item[0] == "http://127.0.0.1:11434/api/version" and item[1] == 0.5 for item in calls)
 
 
 async def _raw_info(gw) -> str:

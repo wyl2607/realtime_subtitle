@@ -157,8 +157,10 @@ class Worker:
                 # gateway 已经走了：不再写，主循环会在读到 EOF 时正常退出
                 self._pipe_dead = True
 
-    def _status(self, code: str, text: str) -> None:
-        self._emit({"ev": "status", "code": code, "text": text})
+    def _status(self, code: str, text: str, **fields) -> None:
+        event = {"ev": "status", "code": code, "text": text}
+        event.update(fields)
+        self._emit(event)
 
     def log(self, event: str, **fields) -> None:
         _log(self._err, event, **fields)
@@ -487,7 +489,7 @@ class Worker:
                     if out:
                         self._emit({"ev": "translation", "id": sid, "text": out})
                     else:
-                        self._status("translate_failed", "一句翻译失败，已跳过")
+                        self._status("translate_failed", "一句翻译失败，已跳过", id=sid)
                 if out:
                     self.log("translated", id=sid, tx_s=time.perf_counter() - t0)
                 else:
@@ -496,7 +498,7 @@ class Worker:
                 self.log("translate_error", id=sid, err=type(e).__name__)
                 with self._state_lock:
                     if gen == self._gen:
-                        self._status("translate_failed", "一句翻译失败，已跳过")
+                        self._status("translate_failed", "一句翻译失败，已跳过", id=sid)
             finally:
                 self._tx_q.task_done()
 

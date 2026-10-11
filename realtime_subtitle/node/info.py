@@ -21,6 +21,8 @@ import os
 import re
 import subprocess
 import sys
+import time
+import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -59,6 +61,9 @@ DEFAULT_TRANSLATOR = "apple"
 _TRANSLATOR_RE = re.compile(r"^(apple|ollama:[A-Za-z0-9_.:/-]{1,64})$")
 _HID_IDLE_RE = re.compile(r'"HIDIdleTime"\s*=\s*(\d+)')
 _PLATFORM_UUID_RE = re.compile(r'"IOPlatformUUID"\s*=\s*"([^"]+)"')
+_OLLAMA_VERSION_URL = "http://127.0.0.1:11434/api/version"
+_OLLAMA_CHECK_TTL_S = 10.0
+_OLLAMA_CHECK_CACHE: tuple[float, bool] | None = None
 
 Runner = Callable[[list[str]], str]
 
@@ -68,6 +73,33 @@ def run_command(argv: list[str], timeout: float = 3.0) -> str:
     return subprocess.run(
         argv, capture_output=True, text=True, timeout=timeout, check=True
     ).stdout
+
+
+def probe_translator_ok(translator: str) -> bool:
+    """Cheap translator health exposed by /v1/info; never returns raw endpoint/errors."""
+    if not translator.startswith("ollama:"):
+        return True
+    global _OLLAMA_CHECK_CACHE
+    now = time.monotonic()
+    if _OLLAMA_CHECK_CACHE is not None:
+        checked_at, cached_ok = _OLLAMA_CHECK_CACHE
+        if now - checked_at < _OLLAMA_CHECK_TTL_S:
+            return cached_ok
+    ok = False
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        req = urllib.request.Request(_OLLAMA_VERSION_URL, headers={"Accept": "application/json"})
+        with opener.open(req, timeout=0.5) as resp:
+            status = getattr(resp, "status", getattr(resp, "code", None))
+            raw = resp.read()
+        if status == 200:
+            data = json.loads(raw.decode("utf-8"))
+            ok = isinstance(data, dict) and isinstance(data.get("version"), str) and bool(data["version"])
+    except Exception as e:  # noqa: BLE001 - do not leak URL/error text into info
+        log.warning("probe_failed what=translator_ok err=%s", type(e).__name__)
+        ok = False
+    _OLLAMA_CHECK_CACHE = (now, ok)
+    return ok
 
 
 def parse_hid_idle_seconds(ioreg_output: str) -> float:
@@ -222,12 +254,16 @@ class NodeInfo:
     def collect(self, *, busy: bool, worker: str) -> dict[str, Any]:
         """返回 P1 规定的 JSON。会阻塞（跑子进程），gateway 在线程池里调它。"""
         asr, translator = self.asr_and_translator()
+        translator_ok = True
+        if translator.startswith("ollama:"):
+            translator_ok = probe_translator_ok(translator)
         return {
             "v": 2,
             "node_id": self.node_id(),
             "hw_hash": self.hw_hash(),
             "asr": asr,
             "translator": translator,
+            "translator_ok": translator_ok,
             "busy": bool(busy),
             "on_ac": self.on_ac(),
             "in_use": self.in_use(),

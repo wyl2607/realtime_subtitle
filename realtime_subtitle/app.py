@@ -246,6 +246,9 @@ class RemoteBridge:
         self._offline_until = {}
         self._node_dst_keys = {}
         self._early_node_dst = {}
+        self._node_src_by_id = {}
+        self._node_translate_failed = set()
+        self._node_translate_failed_notified = set()
         self._fed_samples = 0
         self._language_revision = 0
         # 冷却时长只存在 routing_rules.cooldown_seconds，到点与否由桥自己记。
@@ -612,6 +615,8 @@ class RemoteBridge:
             on_final=self._on_node_final,
             on_translation=self._on_node_translation,
             on_status=self._on_node_status,
+            on_status_event=self._on_node_status_event,
+            on_translate_failed=self._on_node_translate_failed,
             on_closed=self._on_node_closed,
         )
         try:
@@ -748,18 +753,20 @@ class RemoteBridge:
         text = (body or "").strip()
         if not text or self._closed:
             return
+        node_key = (node_id, final_id)
+        self._node_src_by_id[node_key] = text
 
         def work():
             if self._closed:
                 return
             # 节点译文通常晚于 final。先用本机翻译顶上，译文到了再覆盖。
             # 已经先到的译文直接用，不再打一次 Ollama。
-            early = self._early_node_dst.pop((node_id, final_id), None)
-            dst = early if early else self._translate(text)
+            early = self._early_node_dst.pop(node_key, None)
+            dst = early if early and node_key not in self._node_translate_failed else self._translate(text)
             if self._closed:
                 return
             remote_key = self._publish_remote(node_id, t0, t1, text, dst)
-            self._node_dst_keys[(node_id, final_id)] = remote_key
+            self._node_dst_keys[node_key] = remote_key
 
         self._pool.submit(work)
 
@@ -767,16 +774,54 @@ class RemoteBridge:
         del generation
         if self._closed:
             return
+        node_key = (node_id, tx_id)
+        if node_key in self._node_translate_failed or not (body or ""):
+            return
 
         def work():
-            key = self._node_dst_keys.get((node_id, tx_id))
+            key = self._node_dst_keys.get(node_key)
             if key is None:
-                self._early_node_dst[(node_id, tx_id)] = body or ""
+                self._early_node_dst[node_key] = body or ""
                 return
             with self._lock:
                 self.line_store.set_translation(key, body or "")
             if self._ui_update_dst is not None:
                 self._ui_update_dst(key, body or "")
+
+        self._pool.submit(work)
+
+    def _notify_node_translate_failed_once(self, node_id, generation):
+        marker = (node_id, generation)
+        if marker in self._node_translate_failed_notified:
+            return
+        self._node_translate_failed_notified.add(marker)
+        if self._ui_status is not None:
+            self._ui_status(f"节点 {node_id}：翻译暂不可用，改用本机翻译")
+
+    def _on_node_status_event(self, node_id, generation, event):
+        code = event.get("code") if isinstance(event, dict) else None
+        if code == "translate_failed":
+            self._notify_node_translate_failed_once(node_id, generation)
+
+    def _on_node_translate_failed(self, node_id, generation, tx_id):
+        if self._closed:
+            return
+        self._notify_node_translate_failed_once(node_id, generation)
+        node_key = (node_id, tx_id)
+        self._node_translate_failed.add(node_key)
+
+        def work():
+            src = self._node_src_by_id.get(node_key, "")
+            key = self._node_dst_keys.get(node_key)
+            if not src or key is None or self._closed:
+                return
+            dst = self._translate(src)
+            if self._closed or not dst:
+                return
+            with self._lock:
+                self.line_store.set_translation(key, dst)
+            if self._ui_update_dst is not None:
+                self._ui_update_dst(key, dst)
 
         self._pool.submit(work)
 

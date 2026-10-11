@@ -294,6 +294,37 @@ def test_node_feed_connects_once_and_skips_self(tmp_path, monkeypatch):
     assert nodes[0][1].closed
 
 
+def test_node_translate_failed_with_id_uses_local_fallback_once_and_blocks_late_translation(tmp_path):
+    statuses: list[str] = []
+    bridge, ui, translator = _open(
+        cloud_on=True,
+        node_on=False,
+        ui_status=statuses.append,
+        cloud_client_factory=lambda key_path=None: _Cloud(),
+        segmenter_factory=_Segmenter,
+        ledger_factory=lambda path, routing=None: _Ledger(path, routing),
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs),
+        quota_path=tmp_path / "quota.json",
+    )
+    try:
+        bridge._on_node_status_event("desk", 7, {"ev": "status", "code": "translate_failed", "id": 42})
+        bridge._on_node_translate_failed("desk", 7, 42)
+        bridge._on_node_status_event("desk", 7, {"ev": "status", "code": "translate_failed", "id": 43})
+        bridge._on_node_translate_failed("desk", 7, 43)
+
+        bridge._on_node_final("desk", 7, 42, "Hallo", 1.0, 2.0)
+        bridge.flush()
+        assert statuses == ["节点 desk：翻译暂不可用，改用本机翻译"]
+        assert translator.calls == [("Hallo", "")]
+        assert ui.lines[-1]["dst"] == "中文译文"
+
+        bridge._on_node_translation("desk", 7, 42, "")
+        bridge.flush()
+        assert ui.lines[-1]["dst"] == "中文译文"
+    finally:
+        bridge.close()
+
+
 def test_cloud_defaults_use_the_remote_classes(monkeypatch, tmp_path):
     import realtime_subtitle.remote.cloud_client as cloud_client
     import realtime_subtitle.remote.cloud_segmenter as cloud_segmenter

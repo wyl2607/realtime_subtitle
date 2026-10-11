@@ -27,6 +27,7 @@
 | `hw_hash` | str | `sha256(IOPlatformUUID)` 的前 16 位（`HW_HASH_LEN = 16`，`info.py:30`）；探测失败为空串 |
 | `asr` | object | `{model, backend, rtf}`；默认 `whisper-large-v3-turbo` / `mlx` / `null`（`info.py:39`），之后读 `asr_state.json` |
 | `translator` | str | `apple` 或 `ollama:<model>`（正则 `info.py:42`）；默认 `apple` |
+| `translator_ok` | bool | 翻译器当前是否可用。`ollama:<model>` 时 gateway 探测本机 `127.0.0.1:11434/api/version`（0.5s 超时、10s 缓存、不走系统代理），200 且 JSON 含 `version` 才为 `true`；其它翻译器恒为 `true`。只暴露布尔值，不暴露 URL 或错误文本 |
 | `busy` | bool | 当前是否有会话（`gateway.py:863`） |
 | `on_ac` | bool | `pmset -g batt` 首行含 `AC Power` 为真；探测不出按 `False`（`info.py:71-78, 97-102`） |
 | `in_use` | bool | `HIDIdleTime < 60s`（`IN_USE_IDLE_THRESHOLD_S = 60.0`，`info.py:29`）；探测不出按 `True`。**只给布尔值，不给原始空闲秒数** |
@@ -59,7 +60,7 @@ gateway 不原样转发 hello，而是重建（只放行校验过的 `src`/`dst`
 | `ready` | `{"ev":"ready","cold":bool,"load_s":float,"engine":{...,"translator":str}}` | `worker.py:301-304`；`engine` 来自引擎 `info()`，再加 `translator`（翻译器不可用时为 `"none"`） |
 | `final` | `{"ev":"final","id":int,"a0":float,"a1":float,"text":str}` | `worker.py:468-469`；`id` 每会话从 1 起；`a0`/`a1` 是从 hello 起算的音频秒数（按收到的样本数计，保留 3 位小数），夹在不含垫的段边界内（`worker.py:454-465`） |
 | `translation` | `{"ev":"translation","id":int,"text":str}` | `worker.py:488`；`id` 对应某条 `final`，晚于 `final` 到达 |
-| `status` | `{"ev":"status","code":str,"text":str}` | 见下表 |
+| `status` | `{"ev":"status","code":str,"text":str}`；`translate_failed` 额外带 `id:int` | 见下表 |
 | `drained` | `{"ev":"drained"}` | `worker.py:423` |
 
 gateway 只向客户端放行这五种事件（`_CLIENT_EVENTS`，`gateway.py:103`），其它事件丢弃并记日志。节点**不发** volatile/draft；流式模式留作后续扩展。
@@ -75,7 +76,7 @@ gateway 只向客户端放行这五种事件（`_CLIENT_EVENTS`，`gateway.py:10
 | `engine_load_failed` | worker 自发 + gateway 映射 | worker 退出码 3（`worker.py:270-272`） |
 | `internal_error` | worker 自发 + gateway 映射 / 仅 gateway 映射 | worker 退出码 4（主线程异常 `worker.py:208-211`；工作线程 BaseException 直接 `os._exit(4)` `worker.py:545-555`） |
 | `translator_unavailable` | worker（`worker.py:288`） | 翻译器构造失败，只输出原文；会话继续 |
-| `translate_failed` | worker（`worker.py:490, 499`） | 一句翻译失败或异常，已跳过；会话继续 |
+| `translate_failed` | worker（`worker.py:490, 499`） | 一句翻译失败或异常，事件带同一句 `final`/`translation` 使用的 `id`；客户端应按该 `id` 用本机翻译补齐，并避免把原始码 `translate_failed` 直接显示给用户；会话继续 |
 | `asr_error` | worker（`worker.py:446`） | 一段识别失败，已跳过；会话继续 |
 
 其中 `protocol_error`/`engine_load_failed`/`internal_error` 对客户端是**致命**的：通常路径下 worker 先自发一条 status，退出后 gateway 把 worker 退出前已产出的事件刷完，再补发一条同码的 status，然后以 close `1011` 关闭连接（`gateway.py:590-597`）；但 `internal_error` 存在两种路径：主线程异常走上述自发+补发，若为工作线程致命异常退出（`worker.py:545-555` 直接 `os._exit(4)`），worker 无法自发 status，仅由 gateway 映射发出。客户端可能因此看到同一个 code 两次（或仅一次），应按 code 去重。
@@ -152,7 +153,7 @@ v1（`realtime_subtitle/remote/server.py`，已在 TK-006 删除）是外包算�
 - **token**：至少 32 字符（`MIN_TOKEN_CHARS`）；文件权限含 group/other 位即拒绝（要求 0600）；只能经 `--token-file` 或 `--token-stdin` 传入，不进命令行，避免出现在 `ps` 里；常量时间比较，重复的 `Authorization` 头一律不认；错误信息里不带 token（`gateway.py:146-163, 825-833, 948-963`）。
 - **日志无正文无 token**：gateway 和 worker 都只记事件类型、时长、字节数、帧数、错误码/类名；转录/译文正文、token、hello 字段值都不进日志。websockets 自带的 DEBUG 日志会逐帧打印文本，所以给它单独一个钉在 WARNING 的 logger（`gateway.py:14-16, 49-50`）；worker 的 `_log` 还会把形状不像「代号」的字符串值抹成 `?`，异常只记类名不记消息（`worker.py:25-28, 91-102`）。
 - **音频不落盘**：音频只在内存队列和管道里流转，不写任何文件；worker 写盘的只有 `asr_state.json`（模型名、后端、rtf、翻译器名），权限 0600，原子替换（`worker.py:379-386`）。
-- **`/v1/info` 的最小暴露**：`in_use` 只给布尔值，`hw_hash` 只给哈希前 16 位，原始空闲秒数和硬件 UUID 不出 `info.py`（`info.py:9-10`）。
+- **`/v1/info` 的最小暴露**：`in_use` 只给布尔值，`translator_ok` 只给布尔值，`hw_hash` 只给哈希前 16 位；原始空闲秒数、Ollama URL/错误文本和硬件 UUID 不出 `info.py`（`info.py:9-10`）。
 
 ## 客户端侧：Windows Python 客户端
 
@@ -178,4 +179,3 @@ v1（`realtime_subtitle/remote/server.py`，已在 TK-006 删除）是外包算�
    - 节点开关在 Windows 客户端上默认关闭；
    - 客户端通过 `node_id` 识别本机身份：当同一台机器既是算力节点又是客户端时，自动跳过自身以避免环回连接；
    - 节点连接异常或超时时无缝回退本机识别；从云端退到节点时，等一段静音再连，避免一句话被切成两半。
-
