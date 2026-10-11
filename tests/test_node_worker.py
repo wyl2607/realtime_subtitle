@@ -194,9 +194,10 @@ class SpanAsr(FakeAsr):
 
 
 def test_force_cut_finals_are_monotonic_non_overlapping_and_within_speech():
-    # 20s 连续说话（13.0s 处有短凹口让强切落在那里），说完 1s 静音
-    dip = int(13.0 * SR)
-    voice = tone(20.0)
+    # 12s 连续说话（6.5s 处有短凹口，落在 8s 上限前 3s 的搜索窗里，强切切在那里），说完 1s 静音
+    assert worker_mod.NODE_MAX_SEGMENT_S == 8.0
+    dip = int(6.5 * SR)
+    voice = tone(12.0)
     voice[dip:dip + SR // 10] //= 20
     pcm = np.concatenate([voice, silence(1.0)])
     _c, ev, *_ = run_worker(hello() + audio_frames(pcm) + ctl(type="drain"), asr=SpanAsr())
@@ -205,7 +206,8 @@ def test_force_cut_finals_are_monotonic_non_overlapping_and_within_speech():
     for a, b in zip(finals, finals[1:]):
         assert a["a0"] <= a["a1"] <= b["a0"] <= b["a1"]  # 单调且不重叠
     assert finals[0]["a0"] >= -0.001
-    assert finals[-1]["a1"] <= 20.0 + 0.04  # 不越过语音终点
+    assert finals[0]["a1"] == pytest.approx(6.5, abs=0.15)  # 切在凹口
+    assert finals[-1]["a1"] <= 12.0 + 0.04  # 不越过语音终点
 
 
 def test_flush_closes_running_segment():

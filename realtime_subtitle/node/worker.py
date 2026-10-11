@@ -51,6 +51,11 @@ from realtime_subtitle.node.info import (
 )
 from realtime_subtitle.node.segmenter import Segmenter, Segment, VadFn
 
+# 节点段长上限比 Segmenter 默认（15s）短。2026-10-11 网页视频实测：连续人声/背景乐里 Silero 找不到
+# 0.6s 静音，几乎每段都顶到 13.5–14.6s 才切，精修结果 15s 一批整屏替换，用户觉得「卡」。
+# 8s 加段尾 3s 找能量低点，实际 5–8s。云端分段不改：Groq 每次请求按至少 10s 计费（CLAUDE.md 第 49 条）。
+NODE_MAX_SEGMENT_S = 8.0
+
 EXIT_OK = 0
 EXIT_PROTOCOL = 2
 EXIT_ENGINE = 3
@@ -297,7 +302,7 @@ class Worker:
             self._src, self._dst = src, dst
             if hasattr(self._vad, "reset"):
                 self._vad.reset()
-            self._seg = Segmenter(self._vad)
+            self._seg = Segmenter(self._vad, max_s=NODE_MAX_SEGMENT_S)
         self._start_threads()
 
         engine = dict(self._asr.info())
