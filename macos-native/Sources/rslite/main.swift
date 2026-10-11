@@ -286,6 +286,7 @@ struct RSLite {
     private static func runSelfTest() {
         var failures: [String] = []
         failures.append(contentsOf: LineStore.selfTest().map { "LineStore: \($0)" })
+        failures.append(contentsOf: P9FixtureSelfTest.selfTest().map { "P9Fixture: \($0)" })
         failures.append(contentsOf: Capability.selfTest().map { "Capability: \($0)" })
         if #available(macOS 27.0, *) {
             failures.append(contentsOf: NodeRouter.selfTest().map { "NodeRouter: \($0)" })
