@@ -42,3 +42,4 @@
 - 2026-10-11 14:21 CEST: TK-007 done（CR-007 R1 grok 修 10 条，各带回归；协调者复跑 1213 passed / 31 skipped、ruff 绿；merge 09a0cc4）。剩 TK-008 真机验收（明天）
 - 2026-10-11 14:25 CEST: v3.2.0-beta 预发布（tag 69c9604，feat/macos-native，master 未动）。Windows 真机 pytest 1026 passed，修 3 个测试的 Windows 适配；PushClient 真机幂等通过。剩 TK-008 真机验收（明天）→ 正式 v3.2.0 合 master
 - 2026-10-11 16:50 CEST: 真机直播验收（tagesschau24 → rslite tap，节点 yzwdmsnlmm）：稳定 23min；发现节点 Ollama 未运行致每句 translate_failed、info 不反映、UI 挂英文码 → 远程 WMI 启动 ollama serve（用户批准）后恢复（tx 0.18–0.35s）；新开 TK-009 两路派活
+- 2026-10-11 17:40 CEST: TK-009 done（A codex 30733cf / B grok d4e1fdd，协调者复核 pytest 1224 passed、selftest OK）；Windows UI 视觉优化 3e17b3c；rslite 深色底+字号 28；spec 003 字幕界面四期立项；节点切 Windows（临时移除 mini2）

@@ -16,7 +16,7 @@
 | TK-006B | remote/ cloud_client + quota + cloud_segmenter | done | TK-002, TK-001(429 结论) | realtime_subtitle/remote/{cloud_client,quota,cloud_segmenter}.py, tests/test_remote_{cloud_client,quota,cloud_segmenter}.py | default,security | grok |
 | TK-007 | Windows 面板 + 接线 + --client 下发 | done | TK-006 | realtime_subtitle/ui/settings_window.py, realtime_subtitle/app.py, scripts/node/**, scripts/windows/node_setup.ps1, tests/test_settings_*.py, tests/test_install_node*.py | security | key 写入/ACL/下发 token 由 Coordinator 自审 |
 | TK-008 | 文档 + v3.2.0 + 端到端验收 | executing | TK-004, TK-007 | README*.md, CLAUDE.md, docs/**, version.py, .governance/sprints-002-cloud-asr-first/acceptance/** | default,security | 文档含隐私承诺改写（需 security lens）；验收 Coordinator 自留 |
-| TK-009 | 节点翻译失败三缺口（info.translator_ok / 客户端本机补译 / 状态文案） | executing | — | realtime_subtitle/node/{worker,info,gateway}.py, realtime_subtitle/remote/{router,node_client}.py, realtime_subtitle/app.py, docs/protocol-v2.md, macos-native/Sources/rslite/{NodeClient,NodeRouter,HybridEngine,Overlay,Pipeline}.swift, tests | default | 真机直播验收发现（Win 节点 Ollama 未起 → 每句 translate_failed）；A=Python(codex) / B=Swift(grok) |
+| TK-009 | 节点翻译失败三缺口（info.translator_ok / 客户端本机补译 / 状态文案） | done | — | realtime_subtitle/node/{worker,info,gateway}.py, realtime_subtitle/remote/{router,node_client}.py, realtime_subtitle/app.py, docs/protocol-v2.md, macos-native/Sources/rslite/{NodeClient,NodeRouter,HybridEngine,Overlay,Pipeline}.swift, tests | default | 真机直播验收发现（Win 节点 Ollama 未起 → 每句 translate_failed）；A=Python(codex) / B=Swift(grok) |
 
 ## 字段说明
 - **write_scope**：路径前缀白名单，Executor 仅能写其中文件
