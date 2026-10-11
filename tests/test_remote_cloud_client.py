@@ -555,7 +555,9 @@ def test_remote_source_never_disables_tls_or_reads_a_key_from_the_environment():
         text = path.read_text(encoding="utf-8")
         assert not re.search(r"verify\s*=\s*False", text), path.name
         assert "GROQ_API_KEY" not in text, path.name
-        assert not re.search(r"trust_env\s*=\s*False", text), path.name
+        if path.name == "cloud_client.py":
+            # 云端按 RFC 走系统/环境代理；节点客户端恰好相反、必须 trust_env=False（不走代理），所以只约束云端
+            assert not re.search(r"trust_env\s*=\s*False", text), path.name
         tree = ast.parse(text)
         for name in _env_names(tree):
             assert name == "APPDATA", f"{path.name} reads env {name}"
