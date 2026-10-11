@@ -92,6 +92,14 @@ struct RSLite {
 
     private static func parse(_ args: [String]) throws -> Options {
         var options = Options()
+        // 未在命令行给出的 source/src/dst/mode 取自 AppSettings；显式参数由下面的 switch 再覆盖。
+        let resolved = AppSettings.resolve(argv: args, settings: AppSettingsStore.load())
+        options.source = resolved.source
+        options.src = resolved.src
+        options.dst = resolved.dst
+        if let mode = RSLiteMode(rawValue: resolved.mode) {
+            options.mode = mode
+        }
         var i = 0
         while i < args.count {
             let key = args[i]
@@ -339,6 +347,7 @@ struct RSLite {
         failures.append(contentsOf: Capability.selfTest().map { "Capability: \($0)" })
         failures.append(contentsOf: CloudConfigStore.selfTest().map { "CloudConfig: \($0)" })
         failures.append(contentsOf: OverlayStyle.selfTest().map { "OverlayStyle: \($0)" })
+        failures.append(contentsOf: AppSettings.selfTest().map { "AppSettings: \($0)" })
         failures.append(contentsOf: QuotaLedger.selfTest().map { "QuotaLedger: \($0)" })
         failures.append(contentsOf: CloudClient.selfTest().map { "CloudClient: \($0)" })
         if #available(macOS 27.0, *) {
