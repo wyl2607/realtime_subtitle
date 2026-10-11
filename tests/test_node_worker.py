@@ -1323,3 +1323,216 @@ def test_subprocess_sigterm_mid_session_still_updates_rtf(tmp_path):
     assert set(data) == {"model", "backend", "rtf", "translator"}
     assert "Hallo Welt" not in f.read_text(encoding="utf-8") + err
     assert "你好世界" not in f.read_text(encoding="utf-8") + err
+
+
+# ---------------------------------------------------------------- 多会话（spec 007 M0）
+
+def sid_frame(sid, pcm):
+    data = pcm.astype("<i2").tobytes()
+    return b"\x01" + int(sid).to_bytes(4, "big") + len(data).to_bytes(4, "big") + data
+
+
+def sid_audio(sid, pcm, chunk=1600):
+    return b"".join(sid_frame(sid, pcm[i:i + chunk]) for i in range(0, len(pcm), chunk))
+
+
+def _utt(pcm):
+    """一段刚好能收口的语音：0.5s 音 + 0.8s 静音。"""
+    return np.concatenate([tone(0.5), silence(0.8)])
+
+
+class LangAsr(FakeAsr):
+    """识别结果就是语言代号，用来看会话有没有串。"""
+
+    def transcribe(self, audio, language):
+        self.calls += 1
+        self.seen_lang.append(language)
+        return [Utterance(0.05, 0.25, language)]
+
+
+def _pair_tr(src, dst):
+    tr = FakeTr(result=f"{src}-{dst}")
+    return tr
+
+
+class GrowingBuffer:
+    """read(n) 凑满 n 字节才返回（EOF 除外）。os.pipe 的短读会被 worker 当成协议错误。"""
+
+    def __init__(self):
+        self._buf = bytearray()
+        self._cv = threading.Condition()
+        self._eof = False
+
+    def write(self, data: bytes) -> None:
+        with self._cv:
+            self._buf += data
+            self._cv.notify_all()
+
+    def close(self) -> None:
+        with self._cv:
+            self._eof = True
+            self._cv.notify_all()
+
+    def read(self, n=-1):
+        with self._cv:
+            if n is None or n < 0:
+                while not self._eof:
+                    self._cv.wait()
+                data = bytes(self._buf)
+                self._buf.clear()
+                return data
+            while len(self._buf) < n and not self._eof:
+                self._cv.wait()
+            take = min(n, len(self._buf))
+            data = bytes(self._buf[:take])
+            del self._buf[:take]
+            return data
+
+    def readline(self, limit=-1):
+        with self._cv:
+            while True:
+                nl = self._buf.find(b"\n")
+                if nl >= 0 and (limit is None or limit < 0 or nl < limit):
+                    take = nl + 1
+                    break
+                if limit is not None and limit > 0 and len(self._buf) >= limit:
+                    take = limit
+                    break
+                if self._eof:
+                    take = len(self._buf) if limit is None or limit < 0 else min(limit, len(self._buf))
+                    break
+                self._cv.wait()
+            data = bytes(self._buf[:take])
+            del self._buf[:take]
+            return data
+
+
+def test_two_sessions_finals_stay_on_their_own_sid():
+    made = []
+
+    def vad_factory():
+        made.append(1)
+        return EnergyVad()
+
+    pcm = _utt(None)
+    stream = (
+        hello(sid=1, src="de", dst="zh") + hello(sid=2, src="en", dst="ja")
+        + sid_audio(1, pcm) + sid_audio(2, pcm)
+        + ctl(type="drain", sid=1) + ctl(type="drain", sid=2)
+    )
+    out, err = io.BytesIO(), io.StringIO()
+    w = Worker(io.BytesIO(stream), out, LangAsr(), vad_factory=vad_factory,
+               translator_factory=_pair_tr, err=err)
+    assert w.run() == EXIT_OK
+    assert len(made) == 2  # 每个会话一份 VAD，分段器不共享
+    ev = [json.loads(line) for line in out.getvalue().decode().splitlines()]
+    finals = [e for e in ev if e["ev"] == "final"]
+    trans = [e for e in ev if e["ev"] == "translation"]
+    assert [(e["sid"], e["id"], e["text"]) for e in finals] == [(1, 1, "de"), (2, 1, "en")]
+    assert [(e["sid"], e["id"], e["text"]) for e in trans] == [(1, 1, "de-zh"), (2, 1, "en-ja")]
+    assert {e["sid"] for e in ev if e["ev"] == "drained"} == {1, 2}
+    assert {e["sid"] for e in ev if e["ev"] == "ready"} == {1, 2}
+    # drain 只等结果，不摘会话；end 才摘
+    assert set(w._sessions) == {1, 2}
+
+
+def test_end_one_session_leaves_the_other_running():
+    pcm = _utt(None)
+    stream = (
+        hello(sid=1, src="de") + sid_audio(1, tone(0.4))  # 还在说话，没有收口
+        + hello(sid=2, src="en") + sid_audio(2, pcm)
+        + ctl(type="end", sid=1)
+        + sid_audio(1, silence(1.0))  # 已经 end 的 sid：丢掉，不能变成协议错误
+        + ctl(type="flush", sid=1)
+        + ctl(type="drain", sid=2)
+    )
+    out, err = io.BytesIO(), io.StringIO()
+    w = Worker(io.BytesIO(stream), out, LangAsr(), vad_factory=EnergyVad,
+               translator_factory=_pair_tr, err=err)
+    assert w.run() == EXIT_OK
+    ev = [json.loads(line) for line in out.getvalue().decode().splitlines()]
+    finals = [e for e in ev if e["ev"] == "final"]
+    assert finals and all(e["sid"] == 2 and e["text"] == "en" and e["id"] == 1 for e in finals)
+    assert any(e["ev"] == "drained" and e["sid"] == 2 for e in ev)
+    assert 1 not in w._sessions and 2 in w._sessions
+    text = err.getvalue()
+    assert "protocol_error" not in text
+    assert "ignored_unknown_sid" in text
+
+
+def test_sid_frame_before_hello_is_protocol_error():
+    code, ev, err, *_ = run_worker(sid_frame(3, tone(0.2)))
+    assert code == EXIT_PROTOCOL
+    assert any(e["ev"] == "status" and e["code"] == "protocol_error" for e in ev)
+    assert "protocol_error" in err
+
+
+def test_end_before_hello_is_ignored():
+    pcm = _utt(None)
+    stream = ctl(type="end", sid=1) + hello(sid=1, src="de") + sid_audio(1, pcm) + ctl(type="drain", sid=1)
+    out, err = io.BytesIO(), io.StringIO()
+    w = Worker(io.BytesIO(stream), out, LangAsr(), vad_factory=EnergyVad,
+               translator_factory=_pair_tr, err=err)
+    assert w.run() == EXIT_OK
+    ev = [json.loads(line) for line in out.getvalue().decode().splitlines()]
+    assert [(e["sid"], e["text"]) for e in ev if e["ev"] == "final"] == [(1, "de")]
+    assert "protocol_error" not in err.getvalue()
+
+
+def test_round_robin_lets_the_other_session_progress():
+    """一个会话把识别队列塞满时，另一个会话的段仍会插进来，而不是排到队尾。"""
+    class GateAsr(FakeAsr):
+        def __init__(self):
+            super().__init__(utterances=[Utterance(0.05, 0.2, "x")])
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def transcribe(self, audio, language):
+            self.calls += 1
+            self.seen_lang.append(language)
+            if self.calls == 1:
+                self.entered.set()
+                if not self.release.wait(8):
+                    raise TimeoutError("gate")
+            return [Utterance(0.05, 0.2, language)]
+
+    asr = GateAsr()
+    buf, out, err = GrowingBuffer(), io.BytesIO(), io.StringIO()
+    w = Worker(buf, out, asr, vad_factory=EnergyVad, translator_factory=_pair_tr, err=err)
+    code = []
+
+    def runner():
+        code.append(w.run())
+
+    th = threading.Thread(target=runner, name="worker-run")
+    th.start()
+    try:
+        utt = _utt(None)
+        buf.write(hello(sid=1, src="de") + b"".join(sid_audio(1, utt) for _ in range(6)))
+        assert _wait(lambda: asr.entered.is_set() and w._asr_q.qsize() >= 5)
+        assert asr.calls == 1
+        buf.write(hello(sid=2, src="en") + sid_audio(2, utt))
+
+        def en_queued():
+            with w._asr_q._cv:
+                q = w._asr_q._qs.get(2)
+                return q is not None and len(q) >= 1
+
+        assert _wait(en_queued)
+        assert asr.calls == 1  # 第一段还堵着，en 只是进了队列
+        asr.release.set()
+        buf.write(ctl(type="drain", sid=1) + ctl(type="drain", sid=2))
+        buf.close()
+        th.join(20)
+    finally:
+        asr.release.set()
+        buf.close()
+        th.join(5)
+    assert not th.is_alive(), f"worker hung seen={asr.seen_lang}"
+    assert code == [EXIT_OK]
+    # 纯 FIFO 会把 6 段 de 全部做完才轮到 en，index("en") == count("de")。
+    assert asr.seen_lang.count("de") == 6
+    assert asr.seen_lang.index("en") < asr.seen_lang.count("de")
+    ev = [json.loads(line) for line in out.getvalue().decode().splitlines()]
+    finals = {(e["sid"], e["text"]) for e in ev if e["ev"] == "final"}
+    assert (1, "de") in finals and (2, "en") in finals
