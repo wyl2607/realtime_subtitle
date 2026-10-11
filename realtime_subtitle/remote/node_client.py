@@ -115,6 +115,7 @@ class NodeInfo:
     on_ac: bool
     in_use: bool
     worker: str
+    translator_ok: bool = True
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> NodeInfo:
@@ -133,6 +134,7 @@ class NodeInfo:
             on_ac=bool(data.get("on_ac", False)),
             in_use=bool(data.get("in_use", False)),
             worker=str(data.get("worker", "")),
+            translator_ok=bool(data.get("translator_ok", True)),
         )
 
 
@@ -148,6 +150,8 @@ class NodeCallbacks:
     on_final: Callable[[str, int, int, str, float | None, float | None], None] = lambda *_: None
     on_translation: Callable[[str, int, int, str], None] = lambda *_: None
     on_status: Callable[[str], None] = lambda *_: None
+    on_status_event: Callable[[str, int, dict[str, Any]], None] = lambda *_: None
+    on_translate_failed: Callable[[str, int, int], None] = lambda *_: None
     on_closed: Callable[[str, int, Exception | None], None] = lambda *_: None
 
 
@@ -657,6 +661,17 @@ class NodeClient:
                 self.callbacks.on_translation(self.config.id, self.session_generation, int(tx_id), body)
         elif ev == "status":
             code = event.get("code", "")
+            if code == "translate_failed":
+                self.callbacks.on_status_event(self.config.id, self.session_generation, event)
+                sid = event.get("id")
+                if sid is not None:
+                    try:
+                        self.callbacks.on_translate_failed(
+                            self.config.id, self.session_generation, int(sid)
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                return
             self.callbacks.on_status(f"节点 {self.config.id}：{code}")
         elif ev == "drained":
             self._drained_event.set()

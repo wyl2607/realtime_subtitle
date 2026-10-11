@@ -37,6 +37,7 @@ def _make_info(
     busy: bool = False,
     on_ac: bool = True,
     in_use: bool = False,
+    translator_ok: bool = True,
 ) -> NodeInfo:
     return NodeInfo(
         v=2,
@@ -44,6 +45,7 @@ def _make_info(
         hw_hash="h",
         asr=NodeASRInfo(model=model, backend="mlx", rtf=rtf),
         translator=translator,
+        translator_ok=translator_ok,
         busy=busy,
         on_ac=on_ac,
         in_use=in_use,
@@ -134,6 +136,18 @@ def test_routing_decider_penalties_and_bonuses():
     assert score_local_good is not None and score_local_bad is not None
     assert score_local_good.score > score_ac.score  # 无网络加分
     assert score_local_bad.score < score_ac.score - 500  # P8 不满足大幅扣分
+
+
+def test_routing_decider_translator_ok_false_zeroes_translation_quality_only():
+    ok_info = _make_info(node_id="n1", translator="ollama:qwen", translator_ok=True)
+    bad_info = _make_info(node_id="n2", translator="ollama:qwen", translator_ok=False)
+    ok = RoutingDecider.score(RouteCandidate(id="ok", expected_node_id="n1", info=ok_info, rtt_ms=10), now=0.0)
+    bad = RoutingDecider.score(RouteCandidate(id="bad", expected_node_id="n2", info=bad_info, rtt_ms=10), now=0.0)
+
+    assert ok is not None and bad is not None
+    assert ok.score - bad.score == 16.0
+    assert "quality=56.0" in ok.reason
+    assert "quality=40.0" in bad.reason
 
 
 # --- 3. MigrationGate 测试 ---

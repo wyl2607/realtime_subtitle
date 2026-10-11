@@ -196,6 +196,14 @@ def test_prepare_success(tmp_path: Path):
         assert captured["trust_env"] is False
         assert captured["kwargs"]["allow_redirects"] is False
         assert urllib.parse.urlsplit(captured["url"]).hostname == "100.64.0.10"
+        assert info.translator_ok is True
+
+
+def test_node_info_translator_ok_missing_defaults_true_and_false_is_preserved():
+    assert NodeInfo.from_dict(_info_payload()).translator_ok is True
+    payload = _info_payload()
+    payload["translator_ok"] = False
+    assert NodeInfo.from_dict(payload).translator_ok is False
 
 
 def test_prepare_pins_resolved_ipv4_literal(tmp_path: Path):
@@ -460,6 +468,27 @@ def test_node_client_flow_with_mock_server(tmp_path: Path):
         await server.wait_closed()
 
     asyncio.run(_run())
+
+
+def test_node_client_translate_failed_status_is_structured_and_not_raw_ui_text():
+    config = NodeConfig(id="desk", node_id="n1", url="ws://100.64.0.5:8791", token_file="unused")
+    info = NodeInfo.from_dict(_info_payload(node_id="n1"))
+    ui_statuses: list[str] = []
+    status_events: list[tuple[str, int, dict]] = []
+    failed: list[tuple[str, int, int]] = []
+    callbacks = NodeCallbacks(
+        on_status=ui_statuses.append,
+        on_status_event=lambda node_id, gen, event: status_events.append((node_id, gen, event)),
+        on_translate_failed=lambda node_id, gen, sid: failed.append((node_id, gen, sid)),
+    )
+    client = NodeClient(config=config, token="token", info=info, callbacks=callbacks, session_generation=3)
+
+    client._handle_event_text(json.dumps({"ev": "status", "code": "translate_failed", "id": 42, "text": "x"}))
+    client._handle_event_text(json.dumps({"ev": "status", "code": "audio_dropped", "text": "x"}))
+
+    assert ui_statuses == ["节点 desk：audio_dropped"]
+    assert status_events == [("desk", 3, {"ev": "status", "code": "translate_failed", "id": 42, "text": "x"})]
+    assert failed == [("desk", 3, 42)]
 
 
 def test_node_client_distinguishes_busy_1013(tmp_path: Path):

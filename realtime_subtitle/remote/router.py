@@ -167,7 +167,9 @@ class RoutingDecider:
         translator = info.translator
         asr = weights.asr_rank.get(model, 25.0)
 
-        if translator in weights.translator_rank:
+        if getattr(info, "translator_ok", True) is False:
+            tr = 0.0
+        elif translator in weights.translator_rank:
             tr = weights.translator_rank[translator]
         elif translator.startswith("ollama:"):
             tr = 16.0
