@@ -6,7 +6,7 @@
 
 ## macOS（Apple Silicon）
 
-macOS 版仅支持 Apple Silicon（M1 及以后），Intel Mac 不支持。识别走 MLX（Apple GPU），翻译走本地 Ollama，音频与文本都在本机处理。完整说明见 [README.md 的 macOS（Apple Silicon）章节](README.md#macosapple-silicon)。
+macOS 版仅支持 Apple Silicon（M1 及以后），Intel Mac 不支持。识别走 MLX（Apple GPU），翻译走本地 Ollama，默认完全本地；只有在程序配置里填了 Groq key 才会把音频发送到云端识别服务。完整说明见 [README.md 的 macOS（Apple Silicon）章节](README.md#macosapple-silicon)。
 
 ```bash
 brew install uv ollama

@@ -6,11 +6,17 @@
 > 目录分级见 [docs/STRUCTURE.md](docs/STRUCTURE.md)；Windows 脚本在 `scripts/windows/`，macOS 脚本在 `scripts/macos/`（见第 7 节）。
  — 给接手这台电脑的 AI 助手（Claude Code 等）
 
-这是一个**完全本地运行**的实时字幕系统：捕获 Windows 正在播放的声音（直播/视频/
+这是一个**默认完全本地运行**的实时字幕系统：捕获 Windows 正在播放的声音（直播/视频/
 语音聊天），Faster-Whisper 实时识别德语，Ollama 本地大模型翻译成中文，PyQt6
-置顶悬浮窗双语显示。不向任何云端发送音频或文本。**支持 Windows**（音频捕获
-用 WASAPI Loopback）**和 Apple Silicon macOS**（识别走 MLX，抓系统声音靠
-BlackHole 虚拟声卡；差异和坑见第 7 节——在 Mac 上干活先读第 7 节）。
+置顶悬浮窗双语显示。默认不向任何云端发送音频或文本；只有在程序配置里填了 Groq key
+才会把音频发送到云端识别服务。音频出本机路径仅两条且须主动配置：一是自己的算力节点
+（自己的机器，Tailscale 内网 100.64.0.0/10，不经第三方），二是云端 Groq（第三方）。
+程序不读环境变量，可在设置面板或命令行一键关掉云端开关。界面状态行显示「云端·Groq」/
+「混合·节点名」/「本机」。经网络代理时代理可见上传的**原始音频**片段（WAV）。
+Groq 数据保留遵循官方数据政策（https://console.groq.com/docs/your-data）：默认不保留
+识别请求；排查故障或滥用时可能临时保存最多 30 天；介意可在 Groq 控制台 Data Controls 打开
+Zero Data Retention（ZDR）。**支持 Windows**（音频捕获用 WASAPI Loopback）**和 Apple Silicon macOS**
+（识别走 MLX，抓系统声音靠 BlackHole 虚拟声卡；差异和坑见第 7 节——在 Mac 上干活先读第 7 节）。
 
 如果用户让你"帮我装上/配好这个字幕"，你的任务是：**按本文件把系统装好、
 按这台电脑的硬件把模型档位配对、验证能跑，并把坑绕开**。本文件就是为此写的，
@@ -1049,6 +1055,21 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     别名，于是从根目录调用时那几个参数直接报"找不到参数"，而且**只在真用到
     那个参数时才暴露**。
 
+47. **云端客户端必须走系统代理（trust_env 默认），而节点客户端必须 trust_env=False 且钉 IP 连接**（2026-10-11，CR-006A/006B 评审发现）。
+    - **现象**：节点客户端若沿用 requests/websockets 默认行为，会读 HTTP(S)_PROXY / ALL_PROXY 把 Tailscale 流量交给代理，并在连接时对主机名再解析一次。
+    - **根因**：先校验 100.64.0.0/10、后按主机名连接，两次解析之间 DNS 可以变（TOCTOU），代理也可以把连接带出 tailnet；云端相反，Groq 在公网，有的用户只能经系统代理访问。
+    - **做法**：云端客户端保持系统代理（trust_env 默认）；节点客户端必须显式设置 `trust_env=False`，且必须在解析并验证目标 IP 属于 `100.64.0.0/10` 后，直接钉住该 IP 发起连接，禁止使用域名进行二次解析。
+
+48. **requests 在 trust_env 下会用 `~/.netrc` 的 Basic 覆盖 Bearer**（2026-10-11，CR-006B 评审发现）。
+    - **现象**：只用 `headers={\"Authorization\": \"Bearer …\"}` 时，若 `~/.netrc` 里有 api.groq.com 的条目，发出去的是 netrc 的 Basic 认证，Groq 会按 key 无效处理。
+    - **根因**：`requests` 库在 `trust_env=True` 模式下会自动读取用户家目录的 `~/.netrc` 文件；如果里面恰好存在对应域名或默认机器凭据，requests 的默认行为是用 netrc 中的用户名密码生成 Basic Auth 并直接覆盖掉我们在 `headers` 里显式传入的 `Authorization` 请求头。
+    - **做法**：云端 HTTP 请求不能只靠 `headers={"Authorization": f"Bearer {key}"}`，必须自定义 `requests.auth.AuthBase` 子类，在 auth 回调中显式设置 Bearer 头，防止被 requests 内部的 netrc 逻辑覆写。
+
+49. **Groq 的 x-ratelimit-remaining-requests 是每日剩余（令牌桶回补），不能校正分钟窗口；没有音频秒数头**（2026-10-11，TK-001 探针实测响应头）。
+    - **现象**：试图用响应头中的 `x-ratelimit-remaining-requests` 校正分钟限流窗口时，计算出的请求配额产生严重偏差；同时找不到任何返回音频秒数限额的响应头。
+    - **根因**：Groq API 返回的 `x-ratelimit-remaining-requests` 对应的是**每日**（Day）维度的剩余请求数（由令牌桶持续回补），并不是 1 分钟窗口内的剩余请求数；此外 Groq 响应头中完全没有音频时间（audio seconds / duration）相关的限流额度头（例如无 `x-ratelimit-remaining-audio-seconds`）。
+    - **做法**：本地配额记账必须由客户端独立维护本地滑动窗口记录（1 分钟请求数、1 小时音频秒数、24 小时请求数与音频秒数）；`x-ratelimit-remaining-requests` 仅可用于校正 24 小时每日请求数，绝不能用来校正 1 分钟窗口；音频秒数完全依赖客户端上传时长（按每次至少 10 秒下限计费）在本地日志记账。
+
 ## 5. 目录地图
 
 ```
@@ -1273,3 +1294,7 @@ macOS 避坑（每一条都是这次迁移真实踩过的）：
     `pgrep -f` 按命令行子串匹配，不分是谁的进程。做法：测试里用桩 pgrep，
     只返回自己起的 PID；涉及真实进程命令行的逻辑，用逐字的真实形状做用例；
     并发跑两份测试是发现这类互杀的便宜办法。
+24. **SpeechTranscriber volatile 结果没有词级时间，rslite 云端分段采用 20ms RMS 0.005 能量 VAD**（2026-10-11，TK-001 探针）。
+    - **现象**：尝试在 rslite 中利用 SpeechTranscriber 的 `audioTimeRange` 进行词级时间驱动分段时，无法获取中间词的时间戳，分段点判定不准或滞后。
+    - **根因**：macOS SpeechTranscriber 的 volatile（未定稿）流式识别结果不提供词级（word-level）时间戳，只有从当前段首到当前位置的宽区间（段首→当前的宽区间），无法直接通过词边界静音（≥0.6s）进行切段。
+    - **做法**：rslite 放弃依赖 SpeechTranscriber 词时间分段，云端切段改用 20ms 帧、RMS 0.005 阈值的本地能量 VAD 算法；静音 ≥0.6s 收段、15s 强切、<1.5s 的段并入相邻段。阈值的真机测量（concat5 / FLEURS 60）见 `.governance/sprints-002-cloud-asr-first/probes/segmentation.md`，结果待补。
