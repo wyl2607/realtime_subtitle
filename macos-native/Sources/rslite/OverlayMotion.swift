@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 /// 字幕动效、最短停留、瀑布流和回看的纯逻辑。不建窗口，`--selftest` 直接调用。
@@ -167,6 +168,138 @@ enum OverlayMotion {
         return rawSteps
     }
 
+    /// 译文位失败标记的字号 = 译文号 × 这个比例。
+    static let markerFontScale = 0.8
+    /// retry 返回 false 后，过这么久锁定为不可再点的静态「已过期」。
+    static let expiredLockSec = 3.0
+    static let retryingText = "翻译中…"
+    static let expiredText = "已过期"
+
+    /// 一句的翻译结局。`.none` 表示还没失败（可能已有译文，也可能还在等）。
+    enum FailureState: Equatable {
+        case none
+        case failed
+        case retrying
+        case expired(isStatic: Bool)
+    }
+
+    /// 第二行怎么画。颜色和字号由 `secondLineColorHex` / `secondLineFontScale` 决定，不建窗口。
+    enum SecondLineStyle: Equatable {
+        case hidden
+        case translation
+        case untranslated
+        case retrying
+        case expired
+    }
+
+    /// 一句在某个显示模式下的两行。`nil` 表示这一行不画。
+    struct PairLines: Equatable {
+        var first: String?
+        var second: String?
+        var secondStyle: SecondLineStyle
+    }
+
+    /// 点击重试的即时结果。false 先进入未锁定的「已过期」，满 `expiredLockSec` 后变成静态。
+    static func markerAfterRetry(accepted: Bool) -> FailureState {
+        accepted ? .retrying : .expired(isStatic: false)
+    }
+
+    /// 已过期满 3 秒后锁定为静态；其它状态不变。已经锁定的不会退回。
+    static func markerSettled(_ state: FailureState, elapsed: Double) -> FailureState {
+        guard case .expired(let isStatic) = state else { return state }
+        if isStatic || elapsed >= expiredLockSec {
+            return .expired(isStatic: true)
+        }
+        return .expired(isStatic: false)
+    }
+
+    static func secondLineFontScale(_ style: SecondLineStyle) -> Double {
+        switch style {
+        case .hidden, .translation:
+            return 1
+        case .untranslated, .retrying, .expired:
+            return markerFontScale
+        }
+    }
+
+    /// 正常译文的颜色来自用户样式，这里返回 nil。失败标记用未翻译灰。
+    static func secondLineColorHex(_ style: SecondLineStyle) -> String? {
+        switch style {
+        case .hidden, .translation:
+            return nil
+        case .untranslated, .retrying, .expired:
+            return DesignTokens.Color.untranslated
+        }
+    }
+
+    /// 只有「未翻译 ⟳」能点。翻译中和已过期是静态文字。
+    static func secondLineClickable(_ style: SecondLineStyle) -> Bool {
+        style == .untranslated
+    }
+
+    /// 标记文字在字段里的命中矩形：左对齐，宽高按文字本身，不占满整行。
+    static func markerTextRect(fieldRect: CGRect, textSize: CGSize) -> CGRect {
+        let width = min(max(textSize.width.rounded(.up), 0), fieldRect.width)
+        let height = min(max(textSize.height.rounded(.up), 0), fieldRect.height)
+        let y = fieldRect.minY + (fieldRect.height - height) / 2
+        return CGRect(x: fieldRect.minX, y: y, width: width, height: height)
+    }
+
+    /// 鼠标穿透、不可点、或点在文字矩形外，都不算命中标记。
+    static func markerClickHits(point: CGPoint, textRect: CGRect, clickThrough: Bool, clickable: Bool) -> Bool {
+        if clickThrough || !clickable || textRect.isNull || textRect.isEmpty {
+            return false
+        }
+        return textRect.contains(point)
+    }
+
+    /// 每句显示什么。(原文, 译文?, 失败状态, 显示模式) → (第一行, 第二行, 第二行样式)。
+    /// 非空译文优先：失败之后译文到达，第二行恢复成正常译文。
+    static func pairLines(
+        source: String,
+        translation: String?,
+        failure: FailureState,
+        mode: DisplayMode
+    ) -> PairLines {
+        let translated = translation?.isEmpty == false ? translation : nil
+        let cue: FailureState = translated == nil ? failure : .none
+        let marker = markerLine(cue)
+        switch mode {
+        case .sourceOnly:
+            return PairLines(first: source, second: nil, secondStyle: .hidden)
+        case .bilingual:
+            if let marker {
+                return PairLines(first: source, second: marker.text, secondStyle: marker.style)
+            }
+            if let translated {
+                return PairLines(first: source, second: translated, secondStyle: .translation)
+            }
+            return PairLines(first: source, second: nil, secondStyle: .hidden)
+        case .translationOnly:
+            // 仅译文在失败时改画出原文，避免这一句因为没有译文而整行消失。
+            if let marker {
+                return PairLines(first: source, second: marker.text, secondStyle: marker.style)
+            }
+            if let translated {
+                return PairLines(first: nil, second: translated, secondStyle: .translation)
+            }
+            return PairLines(first: nil, second: nil, secondStyle: .hidden)
+        }
+    }
+
+    private static func markerLine(_ cue: FailureState) -> (text: String, style: SecondLineStyle)? {
+        switch cue {
+        case .none:
+            return nil
+        case .failed:
+            return (DesignTokens.Text.untranslated, .untranslated)
+        case .retrying:
+            return (retryingText, .retrying)
+        case .expired:
+            return (expiredText, .expired)
+        }
+    }
+
     static func selfTest() -> [String] {
         var failures: [String] = []
         func check(_ ok: Bool, _ name: String) {
@@ -287,6 +420,71 @@ enum OverlayMotion {
         check(waterfallMenuHint == "拉高窗口可显示更多（瀑布流）", "行数菜单说明文案")
         check(newCaptionBadgeTitle == "↓ 新字幕", "新字幕标签文案")
         check(CaptionReview.idleSec == 8, "回看无操作 8 秒")
+
+        let source = "Hallo"
+        let translated = "你好"
+        let untranslated = DesignTokens.Text.untranslated
+        let rows: [(String, String?, FailureState, DisplayMode, String?, String?, SecondLineStyle)] = [
+            ("未翻译：双语·有译文", translated, .none, .bilingual, source, translated, .translation),
+            ("未翻译：双语·失败", nil, .failed, .bilingual, source, untranslated, .untranslated),
+            ("未翻译：双语·重试中", nil, .retrying, .bilingual, source, retryingText, .retrying),
+            ("未翻译：双语·已过期", nil, .expired(isStatic: true), .bilingual, source, expiredText, .expired),
+            ("未翻译：双语·失败后译文到达", translated, .failed, .bilingual, source, translated, .translation),
+            ("未翻译：仅译文·有译文", translated, .none, .translationOnly, nil, translated, .translation),
+            ("未翻译：仅译文·失败", nil, .failed, .translationOnly, source, untranslated, .untranslated),
+            ("未翻译：仅译文·重试中", nil, .retrying, .translationOnly, source, retryingText, .retrying),
+            ("未翻译：仅译文·已过期", nil, .expired(isStatic: false), .translationOnly, source, expiredText, .expired),
+            ("未翻译：仅译文·失败后译文到达", translated, .retrying, .translationOnly, nil, translated, .translation),
+            ("未翻译：仅原文·有译文", translated, .none, .sourceOnly, source, nil, .hidden),
+            ("未翻译：仅原文·失败", nil, .failed, .sourceOnly, source, nil, .hidden),
+            ("未翻译：仅原文·重试中", nil, .retrying, .sourceOnly, source, nil, .hidden),
+            ("未翻译：仅原文·已过期", nil, .expired(isStatic: true), .sourceOnly, source, nil, .hidden),
+            ("未翻译：仅原文·失败后译文到达", translated, .expired(isStatic: true), .sourceOnly, source, nil, .hidden),
+        ]
+        for row in rows {
+            let got = pairLines(source: source, translation: row.1, failure: row.2, mode: row.3)
+            check(
+                got.first == row.4 && got.second == row.5 && got.secondStyle == row.6,
+                row.0
+            )
+        }
+        let waiting = pairLines(source: source, translation: nil, failure: .none, mode: .translationOnly)
+        check(waiting.first == nil && waiting.second == nil && waiting.secondStyle == .hidden, "未翻译：仅译文·等待中不显示")
+        let empty = pairLines(source: source, translation: "", failure: .failed, mode: .bilingual)
+        check(empty.second == untranslated && empty.secondStyle == .untranslated, "未翻译：空译文视为失败标记")
+        let holding = pairLines(source: source, translation: nil, failure: .expired(isStatic: false), mode: .bilingual)
+        let locked = pairLines(source: source, translation: nil, failure: .expired(isStatic: true), mode: .bilingual)
+        check(holding == locked && holding.second == expiredText, "未翻译：已过期锁定前后文案一致")
+        check(markerFontScale == 0.8, "未翻译：标记字号比例 0.8")
+        check(expiredLockSec == 3, "未翻译：已过期锁定 3 秒")
+        check(secondLineFontScale(.untranslated) == markerFontScale, "未翻译：失败标记字号")
+        check(secondLineFontScale(.retrying) == markerFontScale, "未翻译：翻译中字号")
+        check(secondLineFontScale(.expired) == markerFontScale, "未翻译：已过期字号")
+        check(secondLineFontScale(.translation) == 1, "未翻译：正常译文字号不变")
+        check(secondLineColorHex(.untranslated) == DesignTokens.Color.untranslated, "未翻译：失败标记颜色")
+        check(secondLineColorHex(.retrying) == DesignTokens.Color.untranslated, "未翻译：翻译中颜色")
+        check(secondLineColorHex(.expired) == DesignTokens.Color.untranslated, "未翻译：已过期灰色")
+        check(secondLineColorHex(.translation) == nil, "未翻译：正常译文沿用译文色")
+        check(secondLineClickable(.untranslated), "未翻译：失败标记可点")
+        check(!secondLineClickable(.retrying), "未翻译：翻译中不可点")
+        check(!secondLineClickable(.expired), "未翻译：已过期不可点")
+        check(!secondLineClickable(.translation) && !secondLineClickable(.hidden), "未翻译：正常译文和空行不可点")
+        check(markerAfterRetry(accepted: true) == .retrying, "未翻译：重试接受进入翻译中")
+        check(markerAfterRetry(accepted: false) == .expired(isStatic: false), "未翻译：重试拒绝先显示已过期")
+        check(markerSettled(.expired(isStatic: false), elapsed: 2.9) == .expired(isStatic: false), "未翻译：已过期未满 3 秒")
+        check(markerSettled(.expired(isStatic: false), elapsed: 3) == .expired(isStatic: true), "未翻译：已过期满 3 秒锁定静态")
+        check(markerSettled(.expired(isStatic: true), elapsed: 0) == .expired(isStatic: true), "未翻译：已锁定不再退回")
+        check(markerSettled(.retrying, elapsed: 9) == .retrying, "未翻译：翻译中不因计时变成已过期")
+        let field = CGRect(x: 0, y: 100, width: 400, height: 36)
+        let textRect = markerTextRect(fieldRect: field, textSize: CGSize(width: 70.2, height: 16))
+        check(textRect.width == 71 && textRect.height == 16 && textRect.minX == field.minX, "未翻译：命中矩形只取文字宽")
+        check(textRect.maxX < field.maxX, "未翻译：命中矩形不占满整行")
+        let inside = CGPoint(x: textRect.midX, y: textRect.midY)
+        let beside = CGPoint(x: textRect.maxX + 4, y: textRect.midY)
+        check(markerClickHits(point: inside, textRect: textRect, clickThrough: false, clickable: true), "未翻译：文字内可点")
+        check(!markerClickHits(point: beside, textRect: textRect, clickThrough: false, clickable: true), "未翻译：文字右侧空白不点")
+        check(!markerClickHits(point: inside, textRect: textRect, clickThrough: true, clickable: true), "未翻译：鼠标穿透不点")
+        check(!markerClickHits(point: inside, textRect: textRect, clickThrough: false, clickable: false), "未翻译：已过期静态文字不点")
         return failures
     }
 }

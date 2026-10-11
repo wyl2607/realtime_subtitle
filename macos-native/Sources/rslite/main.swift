@@ -276,6 +276,12 @@ struct RSLite {
                         app.terminate(nil)
                     }
                 }
+            },
+            onRetry: { id in
+                guard let pipeline else {
+                    return false
+                }
+                return pipeline.retryTranslation(id: id)
             }
         )
 
@@ -291,8 +297,8 @@ struct RSLite {
                 onTranslation: { id, text in
                     Task { @MainActor in overlay.addTranslation(id: id, text: text) }
                 },
-                onTranslationFailed: { _, _ in
-                    // TODO(P2b-mac): Overlay 显示「未翻译 ⟳」
+                onTranslationFailed: { id, reason in
+                    Task { @MainActor in overlay.markUntranslated(id: id, reason: reason) }
                 },
                 onStatus: { text in
                     Task { @MainActor in overlay.setStatus(text) }
