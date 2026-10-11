@@ -42,3 +42,4 @@ codex；key 存储/ACL/下发 token 部分由 Coordinator 逐行 security 审，
 
 ## 状态历史
 - 2026-10-11 CST: planned（/sdd-rfc）
+- 2026-10-11 18:42 CST: executing（批次 5）

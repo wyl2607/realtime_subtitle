@@ -11,6 +11,7 @@
 | CR-006A | TK-006A | 2 | resolved | 2026-10-11 18:08 CST: round-2 recheck clean，已合并；全量 1100 passed |
 | CR-005 | TK-005 | 2 | resolved | 2026-10-11 18:41 CST: round-2 recheck clean，已合并；全量 1173 passed |
 | CR-006B | TK-006B | 2 | resolved | 2026-10-11 18:36 CST: round-2 recheck clean，已合并；全量 1161 passed |
+| CR-004 | TK-004 | 2 | resolved | 2026-10-11 19:03 CST: initial 10 accepted → R1 状态机(agy) / R2 本体(grok)；R1 3ec3049 + R2 3e33d7a 复核通过，merge 38dbf3c |
 
 ## 字段说明
 - **rounds**：已完成 review 轮数（initial = 1，第一次 recheck = 2，以此类推）

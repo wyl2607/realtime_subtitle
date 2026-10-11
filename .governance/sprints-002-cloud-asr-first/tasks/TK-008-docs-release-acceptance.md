@@ -39,3 +39,4 @@ README 三语与 CLAUDE.md 隐私承诺改写、云端与节点使用说明、v3
 
 ## 状态历史
 - 2026-10-11 CST: planned（/sdd-rfc）
+- 2026-10-11 19:19 CST: executing（文档部分，批次 6）
