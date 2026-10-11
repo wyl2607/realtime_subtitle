@@ -112,6 +112,59 @@ enum NodeClientError: Error, CustomStringConvertible {
     }
 }
 
+private struct WireAudio {
+    var startSeconds: Double
+    var data: Data
+
+    var samples: Int { data.count / 2 }
+}
+
+private struct ReadyAudioBuffer {
+    private(set) var maxBytes: Int
+    private var chunks: [WireAudio] = []
+    private var byteCount = 0
+
+    var isEmpty: Bool { chunks.isEmpty }
+
+    mutating func append(_ audio: WireAudio) {
+        guard maxBytes > 0, !audio.data.isEmpty else {
+            return
+        }
+        var next = audio
+        if next.data.count > maxBytes {
+            let keepBytes = maxBytes - (maxBytes % 2)
+            guard keepBytes > 0 else {
+                return
+            }
+            let droppedSamples = (next.data.count - keepBytes) / 2
+            next = WireAudio(
+                startSeconds: next.startSeconds + Double(droppedSamples) / 16_000,
+                data: Data(next.data.suffix(keepBytes))
+            )
+        }
+        while byteCount + next.data.count > maxBytes, !chunks.isEmpty {
+            let dropped = chunks.removeFirst()
+            byteCount -= dropped.data.count
+        }
+        guard next.data.count <= maxBytes else {
+            return
+        }
+        chunks.append(next)
+        byteCount += next.data.count
+    }
+
+    mutating func drainAll() -> [WireAudio] {
+        let drained = chunks
+        removeAll()
+        return drained
+    }
+
+    mutating func removeAll() {
+        chunks.removeAll()
+        byteCount = 0
+    }
+}
+
 /// 节点会话的身份：节点 id + 该节点的会话代号。
 struct NodeSessionRef: Hashable, Sendable {
     var nodeID: String
@@ -160,8 +213,10 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         commonFormat: .pcmFormatInt16, sampleRate: 16_000, channels: 1, interleaved: true
     )!
     private static let frameBytes = 3200
+    static let preReadyAudioSeconds = 15
     // 冷启动＝拉起 worker + import MLX + 加载权重，mini2 实测 >5s；预算对齐 RFC「冷启动后首条精修 ≤15s」，等待期间本机 B 照常出字
-    private static let readyTimeout: Duration = .seconds(15)
+    private static let readyTimeout: Duration = .seconds(preReadyAudioSeconds)
+    private static let readyBufferMaxBytes = preReadyAudioSeconds * 16_000 * 2
     private static let closeTimeout: Duration = .seconds(2)
 
     private let config: NodeConfig
@@ -179,6 +234,8 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
     private var session: URLSession?
     private var converter: AVAudioConverter?
     private var isClosed = false
+    private var isReady = false
+    private var readyBuffer = ReadyAudioBuffer(maxBytes: NodeClient.readyBufferMaxBytes)
     private var remoteCloseCode: Int?
     private var closedNotified = false
     private var heartbeatTask: Task<Void, Never>?
@@ -288,17 +345,19 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
             }
             try await socket.send(.string(Self.jsonString(hello)))
             try await awaitReady(socket)
+            try await flushReadyBuffer(socket)
             callbacks.onReady(config.id, sessionGeneration, info)
             Task { await receiveLoop(socket) }
             let heartbeat = Task { await self.heartbeatLoop(socket) }
             lock.withLockVoid { heartbeatTask = heartbeat }
         } catch {
+            discardReadyBuffer()
             throw await classify(error, currentSocket())
         }
     }
 
     func send(_ audio: TimedAudio) async throws {
-        guard let socket = currentSocket() else {
+        if lock.withLockValue({ isClosed }) {
             throw NodeClientError.connection("socket closed")
         }
         if converter == nil {
@@ -311,6 +370,31 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
             return
         }
         let data = try Self.convert(audio.buffer, using: converter)
+        guard !data.isEmpty else {
+            return
+        }
+        let wire = WireAudio(startSeconds: audio.startSeconds, data: data)
+        let buffered = lock.withLockValue { () -> Bool in
+            guard !isReady else {
+                return false
+            }
+            if !clockStarted {
+                clockStarted = true
+                offsetSeconds = audio.startSeconds
+            }
+            readyBuffer.append(wire)
+            return true
+        }
+        if buffered {
+            return
+        }
+        guard let socket = currentSocket() else {
+            throw NodeClientError.connection("socket closed")
+        }
+        try await sendWireAudio(wire, to: socket)
+    }
+
+    private func sendWireAudio(_ audio: WireAudio, to socket: NodeWebSocketTask) async throws {
         // 节点按收到的样本数推时钟（P2）。会话建立期间/发送变慢时 AudioFanout 会丢旧帧，
         // 客户端时钟前进了而节点没收到：用零 PCM 补上这段，节点 a0 才不会永久偏前（P5 替换对得上行）。
         let padResult = lock.withLockValue { () -> Int? in
@@ -334,16 +418,36 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
             }
             lock.withLockVoid { sentSamples += pad }
         }
-        guard !data.isEmpty else {
-            return
-        }
-        var pending = data
+        var pending = audio.data
         while !pending.isEmpty {
             let n = min(Self.frameBytes, pending.count)
             try await socket.send(.data(Data(pending.prefix(n))))
             pending.removeFirst(n)
         }
-        lock.withLockVoid { sentSamples += data.count / 2 }
+        lock.withLockVoid { sentSamples += audio.samples }
+    }
+
+    private func flushReadyBuffer(_ socket: NodeWebSocketTask) async throws {
+        while true {
+            let batch = lock.withLockValue { readyBuffer.drainAll() }
+            for audio in batch {
+                try await sendWireAudio(audio, to: socket)
+            }
+            let done = lock.withLockValue { () -> Bool in
+                if readyBuffer.isEmpty {
+                    isReady = true
+                    return true
+                }
+                return false
+            }
+            if done {
+                return
+            }
+        }
+    }
+
+    private func discardReadyBuffer() {
+        lock.withLockVoid { readyBuffer.removeAll() }
     }
 
     /// 纯函数：该块音频开始前，节点时钟落后客户端时钟多少个样本需要补零（≤ 容差视为连续）。
@@ -393,6 +497,7 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
                 return nil
             }
             isClosed = true
+            readyBuffer.removeAll()
             return (socket, session)
         }
         guard let (socket, session) = pair else {
@@ -788,6 +893,49 @@ extension NodeClient {
         check(boundedGapPadSamples(offset: 100, sentSamples: 16_000, audioStart: 1900) == nil, "R4-2：30 分钟断档不补零")
         check(boundedGapPadSamples(offset: 100, sentSamples: 16_000, audioStart: 101) == 0, "R4-2：连续仍为 0")
         check(gapPadSamples(offset: 100, sentSamples: 16_000, audioStart: 100.5) == 0, "时钟重叠不补零")
+        // ready 前缓冲：ready 后按原顺序发送，连续帧不补零
+        do {
+            let frameBytes = 4
+            var buffer = ReadyAudioBuffer(maxBytes: frameBytes * 3)
+            buffer.append(WireAudio(startSeconds: 0, data: Data(repeating: 1, count: frameBytes)))
+            buffer.append(WireAudio(startSeconds: 2.0 / 16_000, data: Data(repeating: 2, count: frameBytes)))
+            buffer.append(WireAudio(startSeconds: 4.0 / 16_000, data: Data(repeating: 3, count: frameBytes)))
+            let drained = buffer.drainAll()
+            check(drained.map { $0.data.first ?? 0 } == [1, 2, 3],
+                  "ready 前缓冲应在 ready 后按入队顺序发送")
+            var sentSamples = 0
+            var offset = drained.first?.startSeconds ?? 0
+            var pads: [Int] = []
+            for (index, audio) in drained.enumerated() {
+                if index == 0 {
+                    offset = audio.startSeconds
+                    pads.append(0)
+                } else {
+                    pads.append(boundedGapPadSamples(
+                        offset: offset,
+                        sentSamples: sentSamples,
+                        audioStart: audio.startSeconds,
+                        tolerance: 0
+                    ) ?? -1)
+                }
+                sentSamples += (pads.last ?? 0) + audio.samples
+            }
+            check(pads == [0, 0, 0] && sentSamples == 6,
+                  "ready 前连续缓冲帧 flush 时样本时钟应连续且不补零")
+        }
+        do {
+            let oneSecond = 16_000 * 2
+            var buffer = ReadyAudioBuffer(maxBytes: oneSecond * 2)
+            buffer.append(WireAudio(startSeconds: 0, data: Data(repeating: 1, count: oneSecond)))
+            buffer.append(WireAudio(startSeconds: 1, data: Data(repeating: 2, count: oneSecond)))
+            buffer.append(WireAudio(startSeconds: 2, data: Data(repeating: 3, count: oneSecond)))
+            let drained = buffer.drainAll()
+            check(drained.map { $0.data.first ?? 0 } == [2, 3],
+                  "ready 前缓冲超过上限时应丢最早帧")
+            let pad = boundedGapPadSamples(offset: 0, sentSamples: 0, audioStart: drained.first?.startSeconds ?? 0, tolerance: 0)
+            check(pad == 16_000,
+                  "ready 前缓冲丢最早帧后应让补零逻辑看到真实断档")
+        }
         // drained 按节点+会话代匹配
         let waiters = NodeDrainWaiters()
         let oldGate = OneShotGate()

@@ -116,6 +116,44 @@ struct MigrationGate {
     }
 }
 
+private struct TimedAudioReplayBuffer {
+    private let maxSeconds: Double
+    private var frames: [TimedAudio] = []
+
+    init(maxSeconds: Double) {
+        self.maxSeconds = max(0, maxSeconds)
+    }
+
+    mutating func append(_ audio: TimedAudio) {
+        guard maxSeconds > 0, audio.duration > 0 else {
+            return
+        }
+        frames.append(audio)
+        trim(keepingAudioAfter: Self.audioEndSeconds(audio) - maxSeconds)
+    }
+
+    func frames(after cursor: Double?) -> [TimedAudio] {
+        guard let cursor else {
+            return frames
+        }
+        return frames.filter { Self.audioEndSeconds($0) > cursor }
+    }
+
+    mutating func removeAll() {
+        frames.removeAll()
+    }
+
+    private mutating func trim(keepingAudioAfter cutoff: Double) {
+        while let first = frames.first, Self.audioEndSeconds(first) <= cutoff {
+            frames.removeFirst()
+        }
+    }
+
+    private static func audioEndSeconds(_ audio: TimedAudio) -> Double {
+        audio.startSeconds + audio.duration
+    }
+}
+
 @available(macOS 27.0, *)
 final class NodeRouter: @unchecked Sendable {
     static let localUDSID = "local_uds"
@@ -123,6 +161,7 @@ final class NodeRouter: @unchecked Sendable {
     private static let offlineDuration = 60.0
     private static let silenceThreshold = 0.003
     private static let silenceSecondsForMigration = 0.6
+    private static let replayBufferSeconds = Double(NodeClient.preReadyAudioSeconds)
 
     private let sourceLocaleID: String
     private let targetLanguageID: String
@@ -141,6 +180,9 @@ final class NodeRouter: @unchecked Sendable {
     private var currentToken: String?
     private var currentInfo: NodeInfo?
     private var currentSession: NodeSessionRef?
+    private var connectingClient: NodeClient?
+    private var connectingSession: NodeSessionRef?
+    private var connectingReplaySession: NodeSessionRef?
     private var failedSessions = Set<NodeSessionRef>()
     private var switchTask: Task<Void, Never>?
     private var drainTasks: [UUID: Task<Void, Never>] = [:]
@@ -155,6 +197,9 @@ final class NodeRouter: @unchecked Sendable {
     private var switchGeneration = 0
     private var nodeSessionGenerations: [String: Int] = [:]
     private var confirmedLocalHWHash: String?
+    private var replayBuffer = TimedAudioReplayBuffer(maxSeconds: replayBufferSeconds)
+    private var nodeAudioSentThrough: Double?
+    private var connectingAudioSentThrough: Double?
 
     init(
         sourceLocaleID: String,
@@ -198,6 +243,9 @@ final class NodeRouter: @unchecked Sendable {
             stopped = false
             nodes = Self.loadNodes(from: nodesURL)
             states = Self.loadState(from: stateURL)
+            replayBuffer.removeAll()
+            nodeAudioSentThrough = nil
+            connectingAudioSentThrough = nil
         }
         let stream = fanout.subscribe(capacity: AudioFanout.defaultCapacity)
         probeTask = Task { await self.probeLoop() }
@@ -213,14 +261,23 @@ final class NodeRouter: @unchecked Sendable {
         probeTask?.cancel()
         audioTask?.cancel()
         lock.withLockValue { switchTask }?.cancel()
-        let client = lock.withLockValue { currentClient }
+        let (client, connecting) = lock.withLockValue { (currentClient, connectingClient) }
         await client?.close()
+        if let connecting, !Self.sameClient(connecting, client) {
+            await connecting.close()
+        }
         lock.withLockVoid {
             currentClient = nil
             currentSession = nil
+            connectingClient = nil
+            connectingSession = nil
+            connectingReplaySession = nil
             currentNode = nil
             currentToken = nil
             currentInfo = nil
+            replayBuffer.removeAll()
+            nodeAudioSentThrough = nil
+            connectingAudioSentThrough = nil
             pendingMigrationID = nil
         }
     }
@@ -429,10 +486,69 @@ final class NodeRouter: @unchecked Sendable {
         )
     }
 
+    private static func sameClient(_ lhs: NodeClient?, _ rhs: NodeClient?) -> Bool {
+        guard let lhs, let rhs else {
+            return lhs == nil && rhs == nil
+        }
+        return lhs === rhs
+    }
+
+    private static func audioEndSeconds(_ audio: TimedAudio) -> Double {
+        audio.startSeconds + audio.duration
+    }
+
+    private static func shouldReplayBufferedAudio(currentClient: NodeClient?, currentNode: NodeConfig?) -> Bool {
+        currentClient == nil && currentNode == nil
+    }
+
+    private func markAudioDeliveredToNode(_ audio: TimedAudio) {
+        let end = Self.audioEndSeconds(audio)
+        lock.withLockVoid {
+            nodeAudioSentThrough = max(nodeAudioSentThrough ?? end, end)
+        }
+    }
+
+    private func markAudioDeliveredToConnecting(_ audio: TimedAudio, session: NodeSessionRef?) {
+        guard let session else {
+            return
+        }
+        let end = Self.audioEndSeconds(audio)
+        lock.withLockVoid {
+            if connectingSession == session {
+                connectingAudioSentThrough = max(connectingAudioSentThrough ?? end, end)
+            } else if currentSession == session {
+                nodeAudioSentThrough = max(nodeAudioSentThrough ?? end, end)
+            }
+        }
+    }
+
+    private func commitConnectingAudioCursor() {
+        if let cursor = connectingAudioSentThrough {
+            nodeAudioSentThrough = max(nodeAudioSentThrough ?? cursor, cursor)
+        }
+        connectingAudioSentThrough = nil
+    }
+
+    private static func maxCursor(_ lhs: Double?, _ rhs: Double?) -> Double? {
+        switch (lhs, rhs) {
+        case let (lhs?, rhs?):
+            return max(lhs, rhs)
+        case let (lhs?, nil):
+            return lhs
+        case let (nil, rhs?):
+            return rhs
+        case (nil, nil):
+            return nil
+        }
+    }
+
     private func audioLoop(stream: AsyncStream<TimedAudio>, fanout: AudioFanout) async {
         for await audio in stream {
             if Task.isCancelled { return }
-            lock.withLockVoid { latestClock = audio.startSeconds }
+            lock.withLockVoid {
+                latestClock = audio.startSeconds
+                replayBuffer.append(audio)
+            }
             updateSilence(audio)
             // prepare/connect 最长十几秒：放到独立 Task，音频循环不能被它堵住，
             // 否则 AudioFanout 丢旧帧、节点时钟落后（R3-2）。switching 由 switchToPending 内部预约防重入。
@@ -445,9 +561,28 @@ final class NodeRouter: @unchecked Sendable {
                 let task = Task { await self.switchToPending(atSilence: atSilence) }
                 lock.withLockVoid { switchTask = task }
             }
-            let (client, session) = lock.withLockValue { (currentClient, currentSession) }
+            let (client, session, connecting, connectingSession, connectingIsReplaying) = lock.withLockValue {
+                (
+                    currentClient,
+                    currentSession,
+                    connectingClient,
+                    connectingSession,
+                    connectingSession != nil && connectingReplaySession == connectingSession
+                )
+            }
             do {
-                try await client?.send(audio)
+                if let connecting, !Self.sameClient(connecting, client), !connectingIsReplaying {
+                    do {
+                        try await connecting.send(audio)
+                        markAudioDeliveredToConnecting(audio, session: connectingSession)
+                    } catch {
+                        await handleConnectingSendError(error, session: connectingSession)
+                    }
+                }
+                if let client {
+                    try await client.send(audio)
+                    markAudioDeliveredToNode(audio)
+                }
             } catch {
                 if Self.isAudioGap(error) {
                     if let session {
@@ -466,20 +601,28 @@ final class NodeRouter: @unchecked Sendable {
     }
 
     private func switchToPending(atSilence: Bool) async {
-        let reservation = lock.withLockValue { () -> (NodeConfig?, Int)? in
+        let reservation = lock.withLockValue { () -> (NodeConfig?, Int, Bool)? in
             guard !switching, !stopped, let id = pendingMigrationID else { return nil }
+            let shouldReplayBufferedAudio = Self.shouldReplayBufferedAudio(
+                currentClient: currentClient,
+                currentNode: currentNode
+            )
             switching = true
             switchGeneration += 1
             if id == Self.localUDSID {
-                return (NodeConfig(id: Self.localUDSID, nodeID: "", url: "", tokenFile: ""), switchGeneration)
+                return (
+                    NodeConfig(id: Self.localUDSID, nodeID: "", url: "", tokenFile: ""),
+                    switchGeneration,
+                    shouldReplayBufferedAudio
+                )
             }
             guard let node = nodes.first(where: { $0.id == id }) else {
                 switching = false
                 return nil
             }
-            return (node, switchGeneration)
+            return (node, switchGeneration, shouldReplayBufferedAudio)
         }
-        guard let (nodeOpt, generation) = reservation, var node = nodeOpt else {
+        guard let (nodeOpt, generation, shouldReplayBufferedAudio) = reservation, var node = nodeOpt else {
             return
         }
         defer {
@@ -490,6 +633,7 @@ final class NodeRouter: @unchecked Sendable {
             }
         }
         var created: NodeClient?
+        var createdSession: NodeSessionRef?
         var published = false
         do {
             let token: String
@@ -543,6 +687,17 @@ final class NodeRouter: @unchecked Sendable {
                 callbacks: wrapped
             )
             created = client
+            let newSession = NodeSessionRef(nodeID: node.id, generation: sessionGeneration)
+            createdSession = newSession
+            lock.withLockVoid {
+                connectingClient = client
+                connectingSession = newSession
+                connectingReplaySession = shouldReplayBufferedAudio ? newSession : nil
+                connectingAudioSentThrough = nil
+            }
+            if shouldReplayBufferedAudio {
+                try await replayBufferedAudio(to: client, session: newSession)
+            }
             try await client.connect()
             // 检查与发布在同一把锁内：并发 select 不能在两者之间改写 pendingMigrationID（R4-1）
             let old = lock.withLockValue { () -> NodeClient?? in
@@ -557,8 +712,12 @@ final class NodeRouter: @unchecked Sendable {
                     return nil
                 }
                 let previous = currentClient
+                commitConnectingAudioCursor()
                 currentClient = client
-                currentSession = NodeSessionRef(nodeID: node.id, generation: sessionGeneration)
+                currentSession = newSession
+                connectingClient = nil
+                connectingSession = nil
+                connectingReplaySession = nil
                 currentNode = node
                 currentToken = token
                 currentInfo = info
@@ -568,6 +727,14 @@ final class NodeRouter: @unchecked Sendable {
             }
             guard let old = old else {
                 await client.close()
+                lock.withLockVoid {
+                    if Self.sameClient(connectingClient, client) {
+                        connectingClient = nil
+                        connectingSession = nil
+                        connectingReplaySession = nil
+                        connectingAudioSentThrough = nil
+                    }
+                }
                 return
             }
             published = true
@@ -585,20 +752,68 @@ final class NodeRouter: @unchecked Sendable {
                 await old?.close()
             }
         } catch {
+            if Self.isAudioGap(error) {
+                if let createdSession {
+                    await endConnectingSessionForAudioGap(createdSession)
+                } else if !published {
+                    await created?.close()
+                }
+                return
+            }
             if !published {
                 await created?.close()
+                lock.withLockVoid {
+                    if Self.sameClient(connectingClient, created) {
+                        connectingClient = nil
+                        connectingSession = nil
+                        connectingReplaySession = nil
+                        connectingAudioSentThrough = nil
+                    }
+                }
             }
             if isCancellationOrStopped(error) {
                 return
             }
             routeLog("select local reason=switch_failed node=\(node.id) err=\(routeErrorCode(error))")
             lock.withLockVoid {
+                if Self.sameClient(connectingClient, created) {
+                    connectingClient = nil
+                    connectingSession = nil
+                    connectingReplaySession = nil
+                    connectingAudioSentThrough = nil
+                }
                 states[node.id] = NodeStateRecord(info: nil, rtf: nil, offlineUntil: nowSeconds() + Self.offlineDuration)
                 Self.clearPendingIfMatches(&pendingMigrationID, nodeID: node.id)
             }
             persistState()
             if lock.withLockValue({ currentNode == nil }) {
                 onMode(.local)
+            }
+        }
+    }
+
+    private func replayBufferedAudio(to client: NodeClient, session: NodeSessionRef) async throws {
+        while true {
+            let batch = lock.withLockValue { () -> [TimedAudio]? in
+                guard !stopped, connectingSession == session else {
+                    return nil
+                }
+                let cursor = Self.maxCursor(nodeAudioSentThrough, connectingAudioSentThrough)
+                let frames = replayBuffer.frames(after: cursor)
+                if frames.isEmpty {
+                    connectingReplaySession = nil
+                }
+                return frames
+            }
+            guard let batch else {
+                return
+            }
+            guard !batch.isEmpty else {
+                return
+            }
+            for audio in batch {
+                try await client.send(audio)
+                markAudioDeliveredToConnecting(audio, session: session)
             }
         }
     }
@@ -622,6 +837,37 @@ final class NodeRouter: @unchecked Sendable {
         guard let old else { return }
         routeLog("audio_gap session_end node=\(session.nodeID) (not a node fault)")
         onMode(.local)
+        await old.close()
+    }
+
+    private func handleConnectingSendError(_ error: Error, session: NodeSessionRef?) async {
+        guard let session else {
+            return
+        }
+        if Self.isAudioGap(error) {
+            await endConnectingSessionForAudioGap(session)
+            return
+        }
+        if isCancellationOrStopped(error) {
+            return
+        }
+    }
+
+    private func endConnectingSessionForAudioGap(_ session: NodeSessionRef) async {
+        let old = lock.withLockValue { () -> NodeClient? in
+            guard connectingSession == session else { return nil }
+            let client = connectingClient
+            connectingClient = nil
+            connectingSession = nil
+            connectingReplaySession = nil
+            connectingAudioSentThrough = nil
+            if pendingMigrationID == nil {
+                pendingMigrationID = session.nodeID
+            }
+            return client
+        }
+        guard let old else { return }
+        routeLog("audio_gap session_end node=\(session.nodeID) connecting (not a node fault)")
         await old.close()
     }
 
@@ -931,6 +1177,70 @@ final class NodeRouter: @unchecked Sendable {
         )
         check(localClient.udsPathForSelfTest() == Self.localUDSPath,
               "NodeClient 本机 UDS 会话路径必须来自 NodeRouter.localUDSPath")
+        let audioFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false)!
+        func makeTimedAudio(start: Double, seconds: Double, value: Float = 0.01) -> TimedAudio {
+            let frames = AVAudioFrameCount((seconds * audioFormat.sampleRate).rounded())
+            let buffer = AVAudioPCMBuffer(pcmFormat: audioFormat, frameCapacity: frames)!
+            buffer.frameLength = frames
+            if let channel = buffer.floatChannelData?[0] {
+                for i in 0..<Int(frames) {
+                    channel[i] = value
+                }
+            }
+            return TimedAudio(buffer: buffer, startSeconds: start)
+        }
+        do {
+            var buffer = TimedAudioReplayBuffer(maxSeconds: Self.replayBufferSeconds)
+            for i in 0..<3 {
+                buffer.append(makeTimedAudio(start: Double(i) * 0.1, seconds: 0.1))
+            }
+            let replayed = buffer.frames(after: nil)
+            var offset: Double?
+            var sentSamples = 0
+            var pads: [Int] = []
+            for audio in replayed {
+                if offset == nil {
+                    offset = audio.startSeconds
+                    pads.append(0)
+                } else {
+                    pads.append(NodeClient.boundedGapPadSamples(
+                        offset: offset ?? 0,
+                        sentSamples: sentSamples,
+                        audioStart: audio.startSeconds,
+                        tolerance: 0
+                    ) ?? -1)
+                }
+                sentSamples += (pads.last ?? 0) + Int((audio.duration * 16_000).rounded())
+            }
+            check(replayed.map { String(format: "%.1f", $0.startSeconds) } == ["0.0", "0.1", "0.2"],
+                  "无客户端期间的音频应按样本时钟顺序回放")
+            check(offset == replayed.first?.startSeconds && pads == [0, 0, 0] && sentSamples == 4_800,
+                  "回放首帧应成为节点 offset，连续帧不补零")
+            check(Self.shouldReplayBufferedAudio(currentClient: nil, currentNode: nil),
+                  "首次接入 / 回退本机后重连应启用回放")
+            check(!Self.shouldReplayBufferedAudio(
+                currentClient: localClient,
+                currentNode: NodeConfig(id: "remote", nodeID: "n2", url: "ws://remote:8791", tokenFile: "/tmp/t")
+            ), "已有当前节点的迁移不得回放历史音频")
+        }
+        do {
+            var buffer = TimedAudioReplayBuffer(maxSeconds: Self.replayBufferSeconds)
+            for i in 0...NodeClient.preReadyAudioSeconds {
+                buffer.append(makeTimedAudio(start: Double(i), seconds: 1.0))
+            }
+            let replayed = buffer.frames(after: nil)
+            check(replayed.count == NodeClient.preReadyAudioSeconds && replayed.first?.startSeconds == 1.0,
+                  "路由回放缓冲超过 15s 应丢最早音频")
+        }
+        do {
+            var buffer = TimedAudioReplayBuffer(maxSeconds: Self.replayBufferSeconds)
+            for i in 0..<5 {
+                buffer.append(makeTimedAudio(start: Double(i), seconds: 1.0))
+            }
+            let replayed = buffer.frames(after: 2.0)
+            check(replayed.map(\.startSeconds) == [2.0, 3.0, 4.0],
+                  "路由回放只应取尚未发给任何节点的音频")
+        }
         check(Self.sameNonEmptyHash("", "") == false, "hw_hash 空串不得匹配")
         check(Self.sameNonEmptyHash("h", "h"), "非空 hw_hash 相同才匹配")
         check(!Self.hasNonEmptyHashMismatch("", "h"), "本机 hw_hash 复核：空串不得判 mismatch")
