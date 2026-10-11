@@ -10,6 +10,7 @@
 | CR-003 | TK-003 | 2 | resolved | 2026-10-11 17:59 CST: round-2 recheck clean，已合并 |
 | CR-006A | TK-006A | 2 | resolved | 2026-10-11 18:08 CST: round-2 recheck clean，已合并；全量 1100 passed |
 | CR-005 | TK-005 | 1 | needs_fix | 2026-10-11 17:53 CST: initial 7 accepted → repair (lane-chain grok>agy) |
+| CR-006B | TK-006B | 2 | resolved | 2026-10-11 18:36 CST: round-2 recheck clean，已合并；全量 1161 passed |
 
 ## 字段说明
 - **rounds**：已完成 review 轮数（initial = 1，第一次 recheck = 2，以此类推）

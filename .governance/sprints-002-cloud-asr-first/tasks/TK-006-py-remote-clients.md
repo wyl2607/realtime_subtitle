@@ -42,3 +42,4 @@ Windows 桌面程序具备与 rslite 同构的远端能力：节点 WS v2 客户
 
 ## 状态历史
 - 2026-10-11 CST: planned（/sdd-rfc）
+- 2026-10-11 18:36 CST: done（006A/006B 均 resolved 并合并）

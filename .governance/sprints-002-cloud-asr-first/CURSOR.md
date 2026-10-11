@@ -3,7 +3,7 @@
 ## 当前状态
 <!-- Machine fields: new writes must use "- key: `value`". Legacy variants are read-only compatibility. -->
 - current_phase: `execution`
-- current_tk: `TK-005,TK-006B,TK-004`
+- current_tk: `TK-005,TK-004`
 - current_cr: `—`
 - current_round: `—`
 - escalated: `false`
@@ -17,11 +17,12 @@
 | TK-003 | rslite 云端：CloudClient + QuotaLedger + key/开关 | done |
 | TK-004 | rslite CloudSegmenter + 分级路由接入 HybridEngine | executing |
 | TK-005 | Windows 客户端句子带时间 + 样本时钟连续性 | executing |
-| TK-006 | Python remote/：node_client + router + line_store + cloud_client + quota | split |
+| TK-006 | Python remote/：node_client + router + line_store + cloud_client + quota | done |
 | TK-007 | Windows 面板 + 接线 + --client 下发 | planned |
 | TK-008 | 文档 + v3.2.0 + 端到端验收 | planned |
 
 ## 最近动作
+- 2026-10-11 18:36 CST: delivery TK-006B / CR-006B resolved（netrc 覆盖 Bearer、账本 24h、10s 墙钟）；父 TK-006 done（A/B 均 done，合并后全量 1161 passed）；TK-007 解锁
 - 2026-10-11 18:08 CST: delivery TK-006A / CR-006A resolved（2 轮：grok+agy 评审 2 blocker（钉 IP、ALL_PROXY）→ grok 修复 → 复验绿）；合并后全量 1100 passed
 - 2026-10-11 17:59 CST: scheduler 批次 4 = TK-004（依赖 001/002/003 已齐），lane-chain grok>agy；A3' rms 0.005
 - 2026-10-11 17:59 CST: delivery TK-003 / CR-003 resolved（2 轮：agy+grok 评审 + 协调者 429 实测 C1 → grok 修复 → 复验绿）；已合并
