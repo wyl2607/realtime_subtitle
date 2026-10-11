@@ -151,7 +151,7 @@ bash scripts/macos/stop.sh
 
 ### rslite（实验性，Mac 原生极简版）
 
-系统识别 + 系统翻译的原生小程序，不需要 Python 和 Ollama；不插电运行时整机功耗只比空闲多约 0.1W。构建：`cd macos-native && swift build -c release`；运行：`.build/release/rslite`（界面模式）。完整说明见 `macos-native/README.md`。
+系统识别 + 系统翻译的原生小程序，不需要 Python 和 Ollama；不插电运行时整机功耗只比空闲多约 0.1W。构建：`cd macos-native && swift build -c release`；运行：`.build/release/rslite`（界面模式）。菜单栏状态项（标题为「字·」加当前模式，例如「字·本机」）里的「设置…」（⌘,）打开「rslite 设置」。完整说明见 `macos-native/README.md`。
 
 ### 算力节点（实验性）
 

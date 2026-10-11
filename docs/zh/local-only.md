@@ -15,9 +15,9 @@
   - 「使用算力节点」复选框为**关闭**；
   - 「云端识别」复选框为**关闭**；
   - 下方显示「当前路由：本机」。
-- **macOS 原生版（rslite）**：
-  - 确认执行过 `rslite --cloud off`；
-  - 确认配置文件 `~/.config/rslite/nodes.json` 不存在（或为空）。
+- **macOS 原生版（rslite）**：默认就是仅本机。`settings.json` 的字段是 `source`、`src`、`dst`、`mode`、`pinnedNode`。缺 `mode`，或 `mode` 不是 `auto`、`local`、`hybrid` 时，按 `local`。`pinnedNode` 缺失、null、空白或类型不对，都视为不指定。
+  - 菜单栏状态项（标题为「字·」加当前模式，例如「字·本机」）里的「设置…」（⌘,）打开「rslite 设置」。四个分页是「字幕样式」「云端识别」「识别与语言」「算力节点」。在「识别与语言」→「运行模式」确认为「仅本机（默认）」。
+  - 命令行备选：`rslite --mode local`。只写 `--node ID` 而 mode 仍是 local 时不连节点。
 
 ## 如何从云端/节点退回纯本机模式
 
@@ -26,9 +26,9 @@
   2. 取消勾选「云端识别」复选框；
   3. 取消勾选「使用算力节点」复选框。
 - **macOS 原生版（rslite）**：
-  1. 清除云端密钥：`.build/release/rslite --clear-groq-key`；
-  2. 显式关闭云端：`.build/release/rslite --cloud off`；
-  3. 移除算力节点：删除或重命名 `~/.config/rslite/nodes.json` 文件（例如 `rm -f ~/.config/rslite/nodes.json`）。
+  1. 菜单栏状态项里的「设置…」（⌘,）→「识别与语言」→「运行模式」选择「仅本机（默认）」，点「保存」。这一项写入 `mode` 为 `local`，并且不指定 `pinnedNode`。`mode` 为 `local` 时不启动节点路由，也不建立云端调度。
+  2. 保存成功显示「已写入 settings.json。重启 rslite 后生效。」「识别与语言」页写着「重启 rslite 后生效」。
+  3. 命令行备选：`rslite --mode local`。usage 原文是 `usage: rslite [--source tap|mic|file:PATH] [--src de-DE] [--dst zh-Hans] [--headless] [--mode auto|local|hybrid] [--node ID] [--selftest] [--set-groq-key|--clear-groq-key|--cloud on|off]`。`--mode` 只能是 auto、local 或 hybrid。只写 `--node ID` 而 mode 仍是 local 时不连节点。命令行上的 `--mode` 和 `--node` 只覆盖这一次启动，不写回 `settings.json`。
 
 ## 纯本机下的性能预期
 
