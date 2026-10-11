@@ -31,3 +31,8 @@
 {"ts":"2026-10-11T17:59:27+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-003","cr":"CR-003","phase":"review","action":"repair","agent_role":"repairer","round":1,"notes":"grok"}
 {"ts":"2026-10-11T17:59:27+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-003","cr":"CR-003","phase":"review","action":"round-2-recheck","agent_role":"coordinator","round":2,"notes":"clean"}
 {"ts":"2026-10-11T17:59:27+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-003","cr":"CR-003","phase":"delivery","action":"synced","agent_role":"coordinator","notes":"merged"}
+{"ts":"2026-10-11T17:59:49+08:00","sprint":"sprints-002-cloud-asr-first","tk":null,"phase":"scheduler","action":"dispatched","agent_role":"coordinator","tks":["TK-004"]}
+{"ts":"2026-10-11T17:59:49+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-004","phase":"execution","action":"spawn","agent_role":"executor","notes":"lane-chain grok>agy"}
+{"ts":"2026-10-11T18:08:57+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-006A","cr":"CR-006A","phase":"review","action":"repair","agent_role":"repairer","round":1,"notes":"lane-chain grok try1"}
+{"ts":"2026-10-11T18:08:57+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-006A","cr":"CR-006A","phase":"review","action":"round-2-recheck","agent_role":"coordinator","round":2,"notes":"clean"}
+{"ts":"2026-10-11T18:08:57+08:00","sprint":"sprints-002-cloud-asr-first","tk":"TK-006A","cr":"CR-006A","phase":"delivery","action":"synced","agent_role":"coordinator","notes":"merged; full pytest 1100 passed"}

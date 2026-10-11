@@ -42,3 +42,4 @@ codex（high）；可能 split 为 A 分段器 / B 路由接入。真机由 Coor
 
 ## 状态历史
 - 2026-10-11 CST: planned（/sdd-rfc）
+- 2026-10-11 17:59 CST: executing（批次 4）
