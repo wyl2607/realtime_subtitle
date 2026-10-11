@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QFont
 import realtime_subtitle.config as config
+import realtime_subtitle.ui.design_tokens as design_tokens
 from realtime_subtitle import language_policy
 from realtime_subtitle.ui.window_frame import DraggableWidget
 from realtime_subtitle.ui.window_geometry import (
@@ -26,20 +27,14 @@ from realtime_subtitle.ui.window_geometry import (
 # 只乘 screen_scale_factor，不开 AA_EnableHighDpiScaling（见 CLAUDE.md 第 24 条）。
 PANEL_FONT_PX_AT_100 = 17
 
-STYLE_TEXT_COLORS = (
-    ("白", "#F0F0F0"),
-    ("暖黄", "#FFE894"),
-    ("浅蓝", "#9FD3FF"),
-    ("浅绿", "#B6F2A8"),
-    ("浅灰", "#C8C8C8"),
-)
-BACKGROUND_COLORS = (
-    ("黑", "#000000"),
-    ("深灰", "#1E1E1E"),
-    ("深蓝", "#0B1A2E"),
-)
+STYLE_TEXT_COLORS = design_tokens.PALETTE_TEXT
+BACKGROUND_COLORS = design_tokens.PALETTE_BACKGROUND
 TEXT_EDGE_OPTIONS = (("none", "无"), ("shadow", "阴影"))
-WINDOW_RADIUS_OPTIONS = (0, 8, 16)
+WINDOW_RADIUS_OPTIONS = (
+    design_tokens.RADIUS_NONE,
+    design_tokens.RADIUS_SMALL,
+    design_tokens.RADIUS_CARD,
+)
 DISPLAY_MODE_OPTIONS = (
     ("bilingual", "双语"),
     ("target", "仅译文"),
@@ -652,7 +647,7 @@ class SettingsWindow(DraggableWidget):
                 self._on_font_change()
 
         self.font_size_slider = self._create_spinbox(
-            "字幕字号", 14, 72, config.FONT_SIZE, set_font_size
+            "字幕字号", design_tokens.TYPE_SUBTITLE_MIN, design_tokens.TYPE_SUBTITLE_MAX, config.FONT_SIZE, set_font_size
         )
 
         def set_bg_opacity(v):
@@ -694,13 +689,6 @@ class SettingsWindow(DraggableWidget):
         style_layout.addWidget(self.corner_radius_row['widget'])
         style_layout.addWidget(self.display_mode_row['widget'])
         style_group.setLayout(style_layout)
-
-        # 只显中文：旧二态入口保留，和「显示模式」双向同步。
-        self.chinese_only_cb = QCheckBox("只显中文（隐藏德语原文）")
-        self.chinese_only_cb.setFont(self.font())
-        self.chinese_only_cb.setToolTip("兼容旧开关；等同于显示模式里的「仅译文」")
-        self.chinese_only_cb.setChecked(getattr(config, "DISPLAY_MODE", "bilingual") == "target")
-        self.chinese_only_cb.toggled.connect(self._on_chinese_only_toggled)
 
         # 草稿中文：游戏模式会禁用此开关
         self.draft_cb = QCheckBox("草稿中文（残句先出浅蓝译文）")
@@ -745,7 +733,6 @@ class SettingsWindow(DraggableWidget):
         display_layout.addWidget(self.max_length_slider['widget'])
         display_layout.addWidget(self.max_pairs_slider['widget'])
         display_layout.addWidget(style_group)
-        display_layout.addWidget(self.chinese_only_cb)
         display_layout.addWidget(self.draft_cb)
         display_layout.addWidget(color_row)
         display_layout.addWidget(font_row)
@@ -1152,9 +1139,6 @@ class SettingsWindow(DraggableWidget):
             btn.blockSignals(True)
             btn.setChecked(value == mode)
             btn.blockSignals(False)
-        self.chinese_only_cb.blockSignals(True)
-        self.chinese_only_cb.setChecked(mode == "target")
-        self.chinese_only_cb.blockSignals(False)
 
     def _sync_style_option_buttons(self):
         edge = getattr(config, "TEXT_EDGE", "none")
@@ -1189,16 +1173,6 @@ class SettingsWindow(DraggableWidget):
             bar.clear_text()
         bar._apply_font()
         bar._relayout()
-
-    def _on_chinese_only_toggled(self, checked):
-        """勾上=仅译文；取消=双语。仅原文需用「显示模式」三态按钮。"""
-        self._mark_custom()
-        mode = "target" if checked else "bilingual"
-        _set_display_mode(mode)
-        self._sync_display_controls(mode)
-        print(f"📊 只显中文: {'开' if checked else '关'} (DISPLAY_MODE={config.DISPLAY_MODE})")
-        if self._on_font_change:
-            self._on_font_change()
 
     def _on_draft_toggled(self, checked):
         self._mark_custom()

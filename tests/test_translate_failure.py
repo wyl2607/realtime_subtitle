@@ -29,6 +29,7 @@ def _make_test_translator():
     t.pending_text = ""
     t._last_unstable = ""
     t._tx_dropped = 0
+    t._tx_drop_warned = 0
     t._tx_slow_until = 0.0
     t._ollama_hot = True
     t._sentence_seq = 0
@@ -73,25 +74,26 @@ def test_timeout_retry_success_emits_pair_once_no_failed():
 
     t._translate_single_sentence = mock_translate
 
-    # 第 1 次 worker 执行：初试超时 -> 缓冲到 _tx_retry_queue，不 emit pair，不 emit failed
+    # 第 1 次 worker 执行：初试超时 -> 立即发 on_pair 让原文先上屏，缓冲到 _tx_retry_queue，不 emit failed
     t._translation_worker()
     assert len(t._tx_queue) == 0
     assert len(t._tx_retry_queue) == 1
-    assert pairs == []
+    assert pairs == [("Guten Morgen", "", "k1", 0)]
     assert failed_events == []
     assert t._tx_retry_queue[0].key == "k1"
 
-    # 第 2 次 worker 执行：从重试队列取 -> 成功 -> emit on_pair，不 emit failed
+    # 第 2 次 worker 执行：从重试队列取 -> 成功 -> 按同一 key 再次 emit on_pair，不 emit failed
     t._translation_worker()
     assert len(t._tx_queue) == 0
     assert len(t._tx_retry_queue) == 0
-    assert len(pairs) == 1
-    assert pairs[0] == ("Guten Morgen", "早上好", "k1", 0)
+    assert len(pairs) == 2
+    assert pairs[0] == ("Guten Morgen", "", "k1", 0)
+    assert pairs[1] == ("Guten Morgen", "早上好", "k1", 0)
     assert failed_events == []
 
 
 def test_timeout_retry_failure_emits_failed_timeout_once():
-    """超时→自动重试仍失败：发一次 on_translate_failed(reason='timeout')，发一次 on_pair('', ...)。"""
+    """超时→自动重试仍失败：首试发 on_pair('', ...)，重试失败发 on_translate_failed(reason='timeout')。"""
     t = _make_test_translator()
     pairs = []
     failed_events = []
@@ -110,10 +112,10 @@ def test_timeout_retry_failure_emits_failed_timeout_once():
 
     t._translate_single_sentence = mock_translate
 
-    # 第 1 次 worker 执行：初试超时 -> 进重试队列
+    # 第 1 次 worker 执行：初试超时 -> 立即发 on_pair('', ...)，进重试队列
     t._translation_worker()
     assert len(t._tx_retry_queue) == 1
-    assert pairs == []
+    assert pairs == [("Hallo Welt", "", "kw1", 1)]
     assert failed_events == []
 
     # 第 2 次 worker 执行：重试仍超时 -> 终态失败
@@ -127,7 +129,7 @@ def test_timeout_retry_failure_emits_failed_timeout_once():
 
 
 def test_error_retry_success_emits_pair_once_no_failed():
-    """普通错误→自动重试成功：只发一次 on_pair，不发 on_translate_failed。"""
+    """普通错误→自动重试成功：首试发 on_pair('', ...)，重试成功按同一 key 发译文。"""
     t = _make_test_translator()
     pairs = []
     failed_events = []
@@ -153,18 +155,19 @@ def test_error_retry_success_emits_pair_once_no_failed():
 
     t._translation_worker()
     assert len(t._tx_retry_queue) == 1
-    assert pairs == []
+    assert pairs == [("Wie geht es dir?", "", "ke1", 0)]
     assert failed_events == []
 
     t._translation_worker()
     assert len(t._tx_retry_queue) == 0
-    assert len(pairs) == 1
-    assert pairs[0] == ("Wie geht es dir?", "你好吗？", "ke1", 0)
+    assert len(pairs) == 2
+    assert pairs[0] == ("Wie geht es dir?", "", "ke1", 0)
+    assert pairs[1] == ("Wie geht es dir?", "你好吗？", "ke1", 0)
     assert failed_events == []
 
 
 def test_error_retry_failure_emits_failed_error_once():
-    """普通错误→自动重试仍失败：发一次 on_translate_failed(reason='error')。"""
+    """普通错误→自动重试仍失败：首试发 on_pair('', ...)，终态发一次 on_translate_failed(reason='error')。"""
     t = _make_test_translator()
     pairs = []
     failed_events = []
@@ -184,7 +187,7 @@ def test_error_retry_failure_emits_failed_error_once():
 
     t._translation_worker()
     assert len(t._tx_retry_queue) == 1
-    assert pairs == []
+    assert pairs == [("Schwerer Fehler", "", "ke2", 2)]
     assert failed_events == []
 
     t._translation_worker()
@@ -195,23 +198,26 @@ def test_error_retry_failure_emits_failed_error_once():
 
 
 def test_queue_backlog_dropped_emits_failed_dropped_no_retry(monkeypatch):
-    """队列积压丢弃：每条被丢句各发一次 on_translate_failed(reason='dropped') 且不进重试队列。"""
+    """队列积压丢弃：锁外发 on_translate_failed(reason='dropped')，回调中不得持有 _tx_lock。"""
     monkeypatch.setattr(config, "TRANSLATE_QUEUE_MAX_CHARS", 30)
     t = _make_test_translator()
     failed_events = []
-    t.on_translate_failed = lambda src, t0, t1, key, rev, reason: failed_events.append(
-        (src, t0, t1, key, rev, reason)
-    )
+    lock_states = []
 
-    # 塞入超过 30 字符的句子
+    def on_failed(src, t0, t1, key, rev, reason):
+        # 回调被调用时，_tx_lock 必须未被持有
+        lock_states.append(t._tx_lock.locked())
+        failed_events.append((src, t0, t1, key, rev, reason))
+
+    t.on_translate_failed = on_failed
+
+    # 塞入超过 30 字符的句子，通过 _enqueue_sentences 触发丢弃
     s1 = TimedSentence("12345678901234567890", t0=0.0, t1=1.0, key="d1", revision=0)
     s2 = TimedSentence("abcdefghijklmnopqrst", t0=1.0, t1=2.0, key="d2", revision=0)
     s3 = TimedSentence("restliche Zeichen hier", t0=2.0, t1=3.0, key="d3", revision=0)
-    with t._tx_lock:
-        t._tx_queue.extend([s1, s2, s3])
-        dropped = t._trim_tx_queue_locked()
 
-    assert dropped == 2
+    t._enqueue_sentences([s1, s2, s3])
+
     assert len(t._tx_queue) == 1
     assert t._tx_queue[0].key == "d3"
     # 丢弃的句子不应进重试队列
@@ -220,6 +226,8 @@ def test_queue_backlog_dropped_emits_failed_dropped_no_retry(monkeypatch):
     assert len(failed_events) == 2
     assert failed_events[0] == ("12345678901234567890", 0.0, 1.0, "d1", 0, "dropped")
     assert failed_events[1] == ("abcdefghijklmnopqrst", 1.0, 2.0, "d2", 0, "dropped")
+    # 严格保证回调执行时未持锁
+    assert lock_states == [False, False]
 
     # 丢弃的句子保留在 _failed_sentences 中供手动重试
     assert "d1" in t._failed_sentences

@@ -6,6 +6,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import QGraphicsDropShadowEffect
 import realtime_subtitle.config as config
+import realtime_subtitle.ui.design_tokens as design_tokens
 from realtime_subtitle.ui.window_frame import ResizableFramelessWidget
 
 
@@ -119,7 +120,7 @@ class WindowChromeMixin:
         if not event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             return False
         step = 1 if event.angleDelta().y() > 0 else -1
-        size = max(14, min(72, config.FONT_SIZE + step))
+        size = max(design_tokens.TYPE_SUBTITLE_MIN, min(design_tokens.TYPE_SUBTITLE_MAX, config.FONT_SIZE + step))
         if size != config.FONT_SIZE:
             # 通过设置面板滑块走，数值标签/config/样式一次同步
             s = self.settings_window.font_size_slider
@@ -144,12 +145,12 @@ class WindowChromeMixin:
     def _apply_styles(self):
         """按当前config刷新字幕标签/历史窗口的样式（字号滑块实时调用）"""
         bg = _hex_to_rgba(
-            getattr(config, "BACKGROUND_COLOR", "#000000"),
-            getattr(config, "BACKGROUND_OPACITY", 235),
+            getattr(config, "BACKGROUND_COLOR", design_tokens.COLOR_BACKGROUND),
+            getattr(config, "BACKGROUND_OPACITY", round(design_tokens.OPACITY_BACKGROUND_DEFAULT * 255)),
         )
-        source_color = getattr(config, "SOURCE_TEXT_COLOR", getattr(config, "TEXT_COLOR", "#F0F0F0"))
+        source_color = getattr(config, "SOURCE_TEXT_COLOR", getattr(config, "TEXT_COLOR", design_tokens.COLOR_SUBTITLE_SOURCE))
         radius = int(getattr(config, "WINDOW_CORNER_RADIUS",
-                             getattr(config, "BORDER_RADIUS", 8)))
+                             getattr(config, "BORDER_RADIUS", design_tokens.RADIUS_SMALL)))
         self.window.setStyleSheet(f"""
             QLabel {{
                 background-color: {bg};

@@ -14,6 +14,7 @@ from PyQt6.QtCore import Qt, QEvent, QTimer
 # QShortcut 在 Qt6 里从 QtWidgets 搬到了 QtGui（它不是控件，本来就不该在那）
 from PyQt6.QtGui import QTextCursor, QTextBlockFormat, QKeySequence, QShortcut
 import realtime_subtitle.config as config
+import realtime_subtitle.ui.design_tokens as design_tokens
 class TVWindow(QWidget):
     """全屏滚动大字窗：新句从底部进入自动上滚；上翻回看时不打扰。"""
 
@@ -25,6 +26,7 @@ class TVWindow(QWidget):
         # 持久化恢复用；None = 首开走默认选屏（非主字幕窗所在屏）
         self.screen_index = None
         self._has_draft = False  # 草稿永远只占文档最后一个 block
+        self._entries = []  # 记录句子 [{"key": k, "text": t}]
 
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -69,16 +71,60 @@ class TVWindow(QWidget):
     # ------------------------------------------------------------------
     # 内容
     # ------------------------------------------------------------------
-    def append_pair(self, chinese):
+    def append_pair(self, chinese, key=None, german=None):
         """正式中文句子追加为新段；替换掉当前草稿行（草稿已被它取代）。"""
+        chinese = (chinese or "").strip()
+        is_untranslated = (chinese in (design_tokens.TEXT_UNTRANSLATED, "翻译中…"))
+        if not chinese and not (german and is_untranslated):
+            return
+        text = f"{german} {chinese}" if (german and is_untranslated) else chinese
+        if not text.strip():
+            return
+        if key:
+            for entry in self._entries:
+                if entry.get("key") == key:
+                    entry["text"] = text
+                    if self.isVisible():
+                        self._rebuild()
+                    return
+            self._entries.append({"key": key, "text": text})
+            if len(self._entries) > 2000:
+                self._entries.pop(0)
         if not self.isVisible():
             return  # 藏着就不攒：打开时由 backfill 回填最近内容
-        if not chinese or not chinese.strip():
-            return
         sb = self.text.verticalScrollBar()
         at_bottom = sb.value() >= sb.maximum() - 10
         self._remove_draft()
-        self._append_block(html.escape(chinese.strip()), draft=False)
+        self._append_block(html.escape(text.strip()), draft=False)
+        self._update_bottom_anchor()
+        if at_bottom:
+            sb.setValue(sb.maximum())
+
+    def update_dst(self, key, dst, german=None):
+        """按 key 原地更新译文（若之前是未翻译标记，更新为正式译文）"""
+        if not key:
+            return
+        changed = False
+        dst = (dst or "").strip()
+        is_untranslated = (dst in (design_tokens.TEXT_UNTRANSLATED, "翻译中…"))
+        text = f"{german} {dst}" if (german and is_untranslated) else dst
+        for entry in self._entries:
+            if entry.get("key") == key:
+                entry["text"] = text
+                changed = True
+                break
+        if changed and self.isVisible():
+            self._rebuild()
+
+    def _rebuild(self):
+        sb = self.text.verticalScrollBar()
+        at_bottom = sb.value() >= sb.maximum() - 10
+        self.text.clear()
+        self._has_draft = False
+        for entry in self._entries:
+            t = entry.get("text", "")
+            if t and t.strip():
+                self._append_block(html.escape(t.strip()), draft=False)
         self._update_bottom_anchor()
         if at_bottom:
             sb.setValue(sb.maximum())
@@ -97,13 +143,25 @@ class TVWindow(QWidget):
         if at_bottom:
             sb.setValue(sb.maximum())
 
-    def backfill(self, chinese_list):
+    def backfill(self, items):
         """打开时回填最近句子（清空重建；隐藏期间内容不做增量维护）。"""
         self.text.clear()
         self._has_draft = False
-        for zh in chinese_list:
-            if zh and zh.strip():
-                self._append_block(html.escape(zh.strip()), draft=False)
+        self._entries.clear()
+        for item in items:
+            if isinstance(item, (tuple, list)):
+                g = item[0] if len(item) > 0 else ""
+                c = item[1] if len(item) > 1 else ""
+                k = item[6] if len(item) >= 7 else None
+                is_untranslated = (c in (design_tokens.TEXT_UNTRANSLATED, "翻译中…"))
+                t = f"{g} {c}" if (g and is_untranslated) else c
+            else:
+                t = str(item or "")
+                k = None
+            t = t.strip()
+            if t:
+                self._entries.append({"key": k, "text": t})
+                self._append_block(html.escape(t), draft=False)
         self._update_bottom_anchor()
         sb = self.text.verticalScrollBar()
         sb.setValue(sb.maximum())

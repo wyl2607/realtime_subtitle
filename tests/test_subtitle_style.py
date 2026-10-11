@@ -89,19 +89,19 @@ def test_style_controls_render_and_persist_via_tuning(tmp_path, monkeypatch):
         panel = win.settings_window
 
         panel.font_size_slider["slider"].setValue(34)
-        panel.source_color_palette["buttons"]["#b6f2a8"].click()
-        panel.target_color_palette["buttons"]["#9fd3ff"].click()
-        panel.background_color_palette["buttons"]["#0b1a2e"].click()
+        panel.source_color_palette["buttons"]["#b8f2b0"].click()
+        panel.target_color_palette["buttons"]["#9fe7f5"].click()
+        panel.background_color_palette["buttons"]["#0f1b2d"].click()
         panel.bg_opacity_slider["slider"].setValue(round(210 / panel.bg_opacity_slider["step"]))
         panel.text_edge_row["buttons"]["shadow"].click()
         panel.corner_radius_row["buttons"][16].click()
         panel.display_mode_row["buttons"]["target"].click()
 
         assert config.FONT_SIZE == 34
-        assert config.SOURCE_TEXT_COLOR == "#b6f2a8"
-        assert config.TEXT_COLOR == "#B6F2A8"
-        assert config.CHINESE_TEXT_COLOR == "#9fd3ff"
-        assert config.BACKGROUND_COLOR == "#0b1a2e"
+        assert config.SOURCE_TEXT_COLOR == "#b8f2b0"
+        assert config.TEXT_COLOR == "#B8F2B0"
+        assert config.CHINESE_TEXT_COLOR == "#9fe7f5"
+        assert config.BACKGROUND_COLOR == "#0f1b2d"
         assert config.BACKGROUND_OPACITY == 210
         assert config.TEXT_EDGE == "shadow"
         assert config.WINDOW_CORNER_RADIUS == 16
@@ -114,10 +114,10 @@ def test_style_controls_render_and_persist_via_tuning(tmp_path, monkeypatch):
         html = win._last_html
         assert "译文" in html
         assert "Quelle" not in html
-        assert "#9fd3ff" in html
+        assert "#9fe7f5" in html
 
         style = win.window.styleSheet()
-        assert "rgba(11, 26, 46, 210)" in style
+        assert "rgba(15, 27, 45, 210)" in style
         assert "border-radius: 16px" in style
         assert isinstance(win.window.graphicsEffect(), QGraphicsDropShadowEffect)
 
@@ -156,9 +156,9 @@ def test_style_controls_render_and_persist_via_tuning(tmp_path, monkeypatch):
         restored = SubtitleWindow()
         restored._state_timer.stop()
         assert config.FONT_SIZE == 34
-        assert config.SOURCE_TEXT_COLOR == "#b6f2a8"
-        assert config.CHINESE_TEXT_COLOR == "#9fd3ff"
-        assert config.BACKGROUND_COLOR == "#0b1a2e"
+        assert config.SOURCE_TEXT_COLOR == "#b8f2b0"
+        assert config.CHINESE_TEXT_COLOR == "#9fe7f5"
+        assert config.BACKGROUND_COLOR == "#0f1b2d"
         assert config.TEXT_EDGE == "shadow"
         assert config.WINDOW_CORNER_RADIUS == 16
         assert config.DISPLAY_MODE == "target"

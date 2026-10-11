@@ -135,7 +135,7 @@ def test_refresh_from_config_syncs_controls_after_mode_applied():
             expected["CHUNK_SUBMIT_SECONDS"] / win.chunk_submit_slider["step"])
         assert win.max_pairs_slider["slider"].value() == round(
             expected["MAX_SENTENCE_PAIRS"] / win.max_pairs_slider["step"])
-        assert win.chinese_only_cb.isChecked() is (not expected["SHOW_BILINGUAL"])
+        assert win.display_mode_row["buttons"]["target"].isChecked() is (not expected["SHOW_BILINGUAL"])
         assert win.draft_cb.isChecked() is bool(expected["DRAFT_TRANSLATION"])
     finally:
         _restore(snap)
