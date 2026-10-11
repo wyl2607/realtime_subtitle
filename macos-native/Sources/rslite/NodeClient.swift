@@ -31,6 +31,11 @@ struct NodeInfo: Codable, Equatable, Sendable {
     var onAC: Bool
     var inUse: Bool
     var worker: String
+    /// 缺失按 true（旧节点没有这个字段）。false 只表示翻译质量项记 0。
+    var translatorOK: Bool? = nil
+
+    /// 字段缺失或 true 都算翻译可用；显式 false 才关闭翻译质量分。
+    var translatorQualityEnabled: Bool { translatorOK != false }
 
     enum CodingKeys: String, CodingKey {
         case v
@@ -42,6 +47,7 @@ struct NodeInfo: Codable, Equatable, Sendable {
         case onAC = "on_ac"
         case inUse = "in_use"
         case worker
+        case translatorOK = "translator_ok"
     }
 }
 
@@ -203,6 +209,8 @@ struct NodeCallbacks: Sendable {
     var onFinal: @Sendable (String, Int, Int, String, Double?, Double?) -> Void = { _, _, _, _, _, _ in }
     var onTranslation: @Sendable (String, Int, Int, String) -> Void = { _, _, _, _ in }
     var onStatus: @Sendable (String) -> Void = { _ in }
+    /// 带 id 的 translate_failed。用户可见文案走 onStatus，这里只交句子 id。
+    var onTranslateFailed: @Sendable (String, Int, Int) -> Void = { _, _, _ in }
     var onClosed: @Sendable (String, Int, Error?) -> Void = { _, _, _ in }
 }
 
@@ -239,6 +247,8 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
     private var remoteCloseCode: Int?
     private var closedNotified = false
     private var heartbeatTask: Task<Void, Never>?
+    /// 同一条 WebSocket 会话里，翻译不可用只对用户说一次。
+    private var translateFailureAnnounced = false
     /// 节点时钟 = 已发给节点的样本数 / 16000；首个音频块到来时把 offset 对齐到它的 startSeconds。
     private var clockStarted = false
     private var sentSamples = 0
@@ -644,17 +654,31 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         }
         switch ev {
         case "final":
-            guard let id = event["id"] as? Int, let body = event["text"] as? String else { return }
+            guard let id = Self.eventInt(event["id"]), let body = event["text"] as? String else { return }
             let offset = lock.withLockValue { offsetSeconds }
             let t0 = (event["a0"] as? Double).map { $0 + offset }
             let t1 = (event["a1"] as? Double).map { $0 + offset }
             callbacks.onFinal(config.id, sessionGeneration, id, body, t0, t1)
         case "translation":
-            guard let id = event["id"] as? Int, let body = event["text"] as? String else { return }
+            guard let id = Self.eventInt(event["id"]), let body = event["text"] as? String else { return }
             callbacks.onTranslation(config.id, sessionGeneration, id, body)
         case "status":
-            if let code = event["code"] as? String {
-                callbacks.onStatus("节点 \(config.id)：\(code)")
+            guard let code = event["code"] as? String else { return }
+            let effect = lock.withLockValue { () -> NodeStatusEffect in
+                let effect = Self.presentNodeStatus(
+                    nodeID: config.id,
+                    code: code,
+                    sentenceID: Self.eventInt(event["id"]),
+                    alreadyAnnounced: translateFailureAnnounced
+                )
+                translateFailureAnnounced = effect.announced
+                return effect
+            }
+            if let text = effect.text {
+                callbacks.onStatus(text)
+            }
+            if let id = effect.translateFailedID {
+                callbacks.onTranslateFailed(config.id, sessionGeneration, id)
             }
         case "drained":
             NodeDrainWaiters.shared.open(session: NodeSessionRef(nodeID: config.id, generation: sessionGeneration))
@@ -777,6 +801,45 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
     private static func jsonString(_ object: [String: Any]) -> String {
         let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
         return String(data: data ?? Data(), encoding: .utf8) ?? "{}"
+    }
+
+    private struct NodeStatusEffect {
+        var text: String?
+        var translateFailedID: Int?
+        var announced: Bool
+    }
+
+    /// 同一会话第一次 translate_failed 给一句人话；之后只回传 id，不再刷原始码。
+    private static func presentNodeStatus(
+        nodeID: String,
+        code: String,
+        sentenceID: Int?,
+        alreadyAnnounced: Bool
+    ) -> NodeStatusEffect {
+        if code == "translate_failed" {
+            let text = alreadyAnnounced ? nil : "节点 \(nodeID)：翻译暂不可用，改用本机翻译"
+            return NodeStatusEffect(text: text, translateFailedID: sentenceID, announced: true)
+        }
+        return NodeStatusEffect(
+            text: "节点 \(nodeID)：\(code)",
+            translateFailedID: nil,
+            announced: alreadyAnnounced
+        )
+    }
+
+    /// JSON 数字在 JSONSerialization 里是 NSNumber。`is Bool` 会把 0 和 1 当成布尔，所以用 CFBoolean 区分。
+    private static func eventInt(_ value: Any?) -> Int? {
+        guard let number = value as? NSNumber else { return nil }
+        if CFGetTypeID(number as CFTypeRef) == CFBooleanGetTypeID() {
+            return nil
+        }
+        let double = number.doubleValue
+        guard double.rounded() == double,
+              double >= Double(Int.min),
+              double <= Double(Int.max) else {
+            return nil
+        }
+        return Int(double)
     }
 
     private static func parseEvent(_ text: String) -> [String: Any]? {
@@ -1003,11 +1066,86 @@ extension NodeClient {
         }
         check(Self.directSessionConfiguration(timeout: 1).connectionProxyDictionary?.isEmpty == true,
               "NodeClient URLSession 应显式直连不走系统代理")
+        do {
+            let down = """
+            {"v":2,"node_id":"yzwdmsnlmm","hw_hash":"h","asr":{"model":"whisper-large-v3-turbo","rtf":0.08},"translator":"ollama:qwen","busy":false,"on_ac":true,"in_use":false,"worker":"warm","translator_ok":false}
+            """
+            let info = try JSONDecoder().decode(NodeInfo.self, from: Data(down.utf8))
+            check(info.translatorOK == false && info.translatorQualityEnabled == false,
+                  "translator_ok=false 应解码且关闭翻译质量")
+            let up = """
+            {"v":2,"node_id":"yzwdmsnlmm","hw_hash":"h","asr":{},"translator":"apple","busy":false,"on_ac":true,"in_use":false,"worker":"warm","translator_ok":true}
+            """
+            let upInfo = try JSONDecoder().decode(NodeInfo.self, from: Data(up.utf8))
+            check(upInfo.translatorOK == true && upInfo.translatorQualityEnabled,
+                  "translator_ok=true 应保持翻译质量")
+            let old = """
+            {"v":2,"node_id":"yzwdmsnlmm","hw_hash":"h","asr":{},"translator":"apple","busy":false,"on_ac":true,"in_use":false,"worker":"warm"}
+            """
+            let oldInfo = try JSONDecoder().decode(NodeInfo.self, from: Data(old.utf8))
+            check(oldInfo.translatorOK == nil && oldInfo.translatorQualityEnabled,
+                  "translator_ok 缺失按 true")
+        } catch {
+            check(false, "NodeInfo translator_ok 解码失败：\(error)")
+        }
+        final class StatusCapture: @unchecked Sendable {
+            var texts: [String] = []
+            var failed: [(String, Int, Int)] = []
+        }
+        let friendly = "节点 yzwdmsnlmm：翻译暂不可用，改用本机翻译"
+        let info = NodeInfo(
+            v: 2, nodeID: "n", hwHash: "h", asr: .init(),
+            translator: "ollama:qwen", busy: false, onAC: true, inUse: false, worker: "warm"
+        )
+        func makeClient(_ capture: StatusCapture, generation: Int) -> NodeClient {
+            NodeClient(
+                config: NodeConfig(id: "yzwdmsnlmm", nodeID: "n", url: "ws://x", tokenFile: "/tmp/t"),
+                token: "",
+                info: info,
+                sourceLocaleID: "de-DE",
+                targetLanguageID: "zh-Hans",
+                offsetSeconds: 0,
+                sessionGeneration: generation,
+                callbacks: NodeCallbacks(
+                    onStatus: { capture.texts.append($0) },
+                    onTranslateFailed: { capture.failed.append(($0, $1, $2)) }
+                )
+            )
+        }
+        let first = StatusCapture()
+        let client = makeClient(first, generation: 3)
+        client.acceptForSelfTest(#"{"ev":"status","code":"translate_failed"}"#)
+        client.acceptForSelfTest(#"{"ev":"status","code":"translate_failed","id":7}"#)
+        client.acceptForSelfTest(#"{"ev":"status","code":"translate_failed","id":8}"#)
+        client.acceptForSelfTest(#"{"ev":"status","code":"audio_dropped"}"#)
+        check(first.texts == [friendly, "节点 yzwdmsnlmm：audio_dropped"],
+              "同一会话只提示一次翻译暂不可用，其它状态码保持原样")
+        check(first.texts.allSatisfy { !$0.contains("translate_failed") },
+              "用户可见文案不得包含 translate_failed")
+        check(first.failed.count == 2
+              && first.failed[0].0 == "yzwdmsnlmm" && first.failed[0].1 == 3 && first.failed[0].2 == 7
+              && first.failed[1].0 == "yzwdmsnlmm" && first.failed[1].1 == 3 && first.failed[1].2 == 8,
+              "同会话后续带 id 的 translate_failed 仍要交回本机翻译")
+        let second = StatusCapture()
+        let client2 = makeClient(second, generation: 4)
+        client2.acceptForSelfTest(#"{"ev":"status","code":"translate_failed","id":1}"#)
+        check(second.texts == [friendly]
+              && second.failed.count == 1
+              && second.failed[0].0 == "yzwdmsnlmm" && second.failed[0].1 == 4 && second.failed[0].2 == 1,
+              "新会话的第一次 translate_failed 应再次提示，id=1 也要交回")
+        check(Self.eventInt(Self.parseEvent(#"{"id":1,"ok":true}"#)?["id"]) == 1,
+              "JSON 整数 1 不得被当成布尔")
+        check(Self.eventInt(Self.parseEvent(#"{"id":true}"#)?["id"]) == nil,
+              "JSON 布尔不是句子 id")
         return failures
     }
 
     func udsPathForSelfTest() -> String? {
         udsPath
+    }
+
+    func acceptForSelfTest(_ text: String) {
+        handle(text)
     }
 }
 
