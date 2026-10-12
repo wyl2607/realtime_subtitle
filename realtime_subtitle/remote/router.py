@@ -131,6 +131,30 @@ class RouteWeights:
     migration_margin: float = 8.0
 
 
+def canonical_asr_model(model: str) -> str:
+    """节点报的模型名 → 打分表的键。
+
+    2026-10-12 实测三台节点报的都不是表里的键：Mac 是
+    `mlx-community/whisper-large-v3-turbo`，Windows 是 `large-v3-turbo`，
+    于是全部落到默认 25 分，质量分形同虚设。去掉仓库前缀、补上 whisper- 前缀。
+    """
+    name = model.strip().rsplit("/", 1)[-1].lower()
+    if name and not name.startswith("whisper-") and name != "fake":
+        name = "whisper-" + name
+    return name
+
+
+def asr_rank_for(model: str, ranks: dict[str, float], default: float = 25.0) -> float:
+    """先精确匹配；量化/变体后缀（-q4、-8bit）按最长前缀匹配并扣 2 分。"""
+    name = canonical_asr_model(model)
+    if name in ranks:
+        return ranks[name]
+    prefixes = [k for k in ranks if name.startswith(k + "-")]
+    if prefixes:
+        return ranks[max(prefixes, key=len)] - 2.0
+    return default
+
+
 @dataclass
 class RouteCandidate:
     id: str
@@ -172,7 +196,7 @@ class RoutingDecider:
 
         model = (info.asr.model or "") if info.asr else ""
         translator = info.translator
-        asr = weights.asr_rank.get(model, 25.0)
+        asr = asr_rank_for(model, weights.asr_rank)
 
         if getattr(info, "translator_ok", True) is False:
             tr = 0.0
