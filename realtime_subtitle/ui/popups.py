@@ -127,6 +127,21 @@ class HistoryWindow(QWidget):
             return
         self._rebuild()
 
+    def drop_keys(self, keys):
+        """按句 id 移除句对（远端句替换本机句时调用）。
+
+        ☠️ 替换=「删掉本机句 + 由远端句重新上屏」，不是就地改文本：远端句在
+        LineStore 里是负数新 key，后面的节点译文更新按那个 key 找，就地改文本会
+        让更新找不到条目。找不到的 key 静默忽略（已滚出/已清空属正常）。
+        """
+        drop = set(keys or [])
+        if not drop:
+            return
+        before = len(self._entries)
+        self._entries = [e for e in self._entries if e.get("key") not in drop]
+        if len(self._entries) != before:
+            self._rebuild()
+
     def _rebuild(self):
         sb = self.text.verticalScrollBar()
         val = sb.value()

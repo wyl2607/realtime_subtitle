@@ -1306,6 +1306,14 @@ class SubtitleApp:
                 item for item in window.sentence_pairs
                 if not (len(item) >= 7 and item[6] in drop)
             ]
+            # 远端句替换本机句：历史窗/电视窗/影院条也按同一句 id 去掉最初那条
+            # 本机句，否则它们会保留旧内容、随后又多出一条远端句（同一内容两遍）。
+            # 缺这些属性的测试替身用 getattr 兜底。
+            for name in ("history_window", "tv_window", "cinema_bar"):
+                view = getattr(window, name, None)
+                drop_fn = getattr(view, "drop_keys", None)
+                if drop_fn is not None:
+                    drop_fn(drop)
             window._render()
         self._ui_invoke(_go)
 

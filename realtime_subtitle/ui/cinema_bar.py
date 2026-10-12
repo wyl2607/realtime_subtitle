@@ -118,6 +118,17 @@ class CinemaBar(QWidget):
         self._set_line(self.chinese_label, dst, draft=False)
         self._restart_hold()
 
+    def drop_keys(self, keys):
+        """按句 id 移除当前句（远端句替换本机句时调用）。
+
+        影院条只显示最新一句，所以只有"被替换的正是当前这句"才需要动：清空，
+        紧接着远端句 append_pair 会把两行重写成远端文本。其余 key 静默忽略。
+        """
+        if self._current_key is not None and self._current_key in set(keys or []):
+            self._current_key = None
+            self._hold_timer.stop()
+            self.clear_text()
+
     def update_draft(self, chinese):
         """草稿中文：原地替换中文行，德语行保持不动（它已经是定稿原文）。
 
