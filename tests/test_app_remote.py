@@ -1,5 +1,6 @@
 """app 把 remote/ 接进主链路。不实例化 SubtitleApp，不连网络。"""
 import os
+import threading
 
 os.environ["REALTIME_SUBTITLE_NO_SINGLETON"] = "1"
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -61,6 +62,18 @@ class _Cloud:
 
     def cancel(self):
         self.cancelled += 1
+
+
+class _BlockingCloud(_Cloud):
+    def __init__(self):
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def transcribe(self, pcm, *, a0, language):
+        self.entered.set()
+        assert self.release.wait(timeout=2)
+        return super().transcribe(pcm, a0=a0, language=language)
 
 
 class _Segmenter:
@@ -307,20 +320,105 @@ def test_node_translate_failed_with_id_uses_local_fallback_once_and_blocks_late_
         quota_path=tmp_path / "quota.json",
     )
     try:
-        bridge._on_node_status_event("desk", 7, {"ev": "status", "code": "translate_failed", "id": 42})
-        bridge._on_node_translate_failed("desk", 7, 42)
-        bridge._on_node_status_event("desk", 7, {"ev": "status", "code": "translate_failed", "id": 43})
-        bridge._on_node_translate_failed("desk", 7, 43)
+        generation = bridge._generation
+        bridge._on_node_status_event("desk", generation, {"ev": "status", "code": "translate_failed", "id": 42})
+        bridge._on_node_translate_failed("desk", generation, 42)
+        bridge._on_node_status_event("desk", generation, {"ev": "status", "code": "translate_failed", "id": 43})
+        bridge._on_node_translate_failed("desk", generation, 43)
 
-        bridge._on_node_final("desk", 7, 42, "Hallo", 1.0, 2.0)
+        bridge._on_node_final("desk", generation, 42, "Hallo", 1.0, 2.0)
         bridge.flush()
         assert statuses == ["节点 desk：翻译暂不可用，改用本机翻译"]
         assert translator.calls == [("Hallo", "")]
         assert ui.lines[-1]["dst"] == "中文译文"
 
-        bridge._on_node_translation("desk", 7, 42, "")
+        bridge._on_node_translation("desk", generation, 42, "")
         bridge.flush()
         assert ui.lines[-1]["dst"] == "中文译文"
+    finally:
+        bridge.close()
+
+
+def test_cloud_result_sent_before_language_switch_is_discarded(tmp_path, caplog):
+    cloud = _BlockingCloud()
+    bridge, ui, _translator = _open(
+        cloud_on=True,
+        node_on=False,
+        cloud_client_factory=lambda key_path=None: cloud,
+        segmenter_factory=_Segmenter,
+        ledger_factory=lambda path, routing=None: _Ledger(path, routing),
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs),
+        quota_path=tmp_path / "quota.json",
+    )
+    try:
+        with caplog.at_level("DEBUG"):
+            bridge.feed_audio(np.zeros(320, dtype=np.float32))
+            assert cloud.entered.wait(timeout=2)
+            bridge.on_language_applied("en", "zh", 1)
+            cloud.release.set()
+            bridge.flush()
+        assert ui.lines == []
+        assert not bridge.line_store.lines
+        assert cloud.cancelled == 1
+        assert any("stale remote" in record.message for record in caplog.records)
+    finally:
+        bridge.close()
+
+
+def test_cloud_result_sent_after_language_switch_is_displayed(tmp_path):
+    cloud = _Cloud()
+    bridge, ui, _translator = _open(
+        cloud_on=True,
+        node_on=False,
+        cloud_client_factory=lambda key_path=None: cloud,
+        segmenter_factory=_Segmenter,
+        ledger_factory=lambda path, routing=None: _Ledger(path, routing),
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs),
+        quota_path=tmp_path / "quota.json",
+    )
+    try:
+        bridge.on_language_applied("en", "zh", 1)
+        bridge.feed_audio(np.zeros(320, dtype=np.float32))
+        bridge.flush()
+        assert len(ui.lines) == 1
+        assert ui.lines[0]["source"] == "remote"
+        assert ui.lines[0]["revision"] == 1
+        assert bridge.line_store.lines[0].src == "Hallo"
+    finally:
+        bridge.close()
+
+
+def test_node_continuous_language_switches_accept_only_latest_generation(tmp_path, caplog):
+    bridge, ui, _translator = _open(
+        cloud_on=True,
+        node_on=False,
+        cloud_client_factory=lambda key_path=None: _Cloud(),
+        segmenter_factory=_Segmenter,
+        ledger_factory=lambda path, routing=None: _Ledger(path, routing),
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs),
+        quota_path=tmp_path / "quota.json",
+    )
+    try:
+        bridge.on_language_applied("en", "zh", 1)
+        stale_generation = bridge._generation
+        bridge.on_language_applied("de", "zh", 2)
+        current_generation = bridge._generation
+        with caplog.at_level("DEBUG"):
+            bridge._on_node_final("desk", stale_generation, 1, "Alt", 0.0, 1.0)
+            bridge._on_node_translation("desk", stale_generation, 1, "旧译文")
+            bridge.flush()
+        assert ui.lines == []
+        assert any("stale remote" in record.message for record in caplog.records)
+
+        bridge._on_node_final("desk", current_generation, 1, "Neu", 1.0, 2.0)
+        bridge.flush()
+        assert len(ui.lines) == 1
+        assert ui.lines[0]["src"] == "Neu"
+        assert ui.lines[0]["revision"] == 2
+        bridge._on_node_translation("desk", stale_generation, 1, "旧译文")
+        bridge._on_node_translation("desk", current_generation, 1, "新译文")
+        bridge.flush()
+        assert ui.lines[0]["dst"] == "新译文"
     finally:
         bridge.close()
 
