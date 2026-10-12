@@ -29,13 +29,15 @@ struct RouteWeights: Sendable {
     var batteryPenalty = 10.0
     var rttPenalty = 6.0
     var localUnderP8Penalty = 1_000.0
-    // 机器状态，与 Python router.RouteWeights 同一套（2026-10-12 Acrobat 泄漏 → swap 35GB）
+    // 机器状态，与 Python router.RouteWeights 同一套（2026-10-12 Acrobat 退出后 swap_used_gb 仍高）
     var memWarnPenalty = 8.0
     var memCriticalPenalty = 25.0
     var swapPenalty = 6.0
     var swapHeavyPenalty = 15.0
-    var swapGB = 8.0
-    var swapHeavyGB = 20.0
+    // macOS vm_stat 页按 16KB 估算：500 页/分≈8MB/分，5000 页/分≈80MB/分。
+    // 用当前换出速率判定内存压力；累计 swapUsedGB 只展示，不参与罚分。
+    var swapoutRate = 500.0
+    var swapoutHeavyRate = 5_000.0
     var noNetworkBonus = 4.0
     var migrationMargin = 8.0
 
@@ -107,10 +109,10 @@ enum RoutingDecider {
         if candidate.isLocal && !localAccurate { penalties += weights.localUnderP8Penalty }
         if info.memPressure == "warn" { penalties += weights.memWarnPenalty }
         if info.memPressure == "critical" { penalties += weights.memCriticalPenalty }
-        if let swap = info.swapUsedGB {
-            if swap > weights.swapHeavyGB {
+        if let rate = info.swapoutRate {
+            if rate > weights.swapoutHeavyRate {
                 penalties += weights.swapHeavyPenalty
-            } else if swap > weights.swapGB {
+            } else if rate > weights.swapoutRate {
                 penalties += weights.swapPenalty
             }
         }
@@ -119,7 +121,7 @@ enum RoutingDecider {
         let reason = String(
             format: "quality=%.1f speed=%.1f penalties=%.1f bonus=%.1f rtt_ms=%.0f mem=%@/%@",
             asr + tr, -weights.speedK * rtf, penalties, bonus, candidate.rttMS,
-            info.memPressure ?? "-", info.swapUsedGB.map { String(format: "%.1f", $0) } ?? "-"
+            info.memPressure ?? "-", info.swapoutRate.map { String(format: "%.1f", $0) } ?? "-"
         )
         return RouteScore(id: candidate.id, score: score, reason: reason)
     }
@@ -1555,7 +1557,7 @@ final class NodeRouter: @unchecked Sendable {
         check(RoutingDecider.asrRank("large-v3-turbo", ranks) == 40, "Windows 节点模型名无 whisper- 前缀")
         check(RoutingDecider.asrRank("mlx-community/whisper-large-v3-turbo-q4", ranks) == 38, "量化变体按前缀扣 2 分")
         check(RoutingDecider.asrRank("whisper-small", ranks) == 25, "未知模型默认 25")
-        // 机器状态：更快的节点在内存严重 / 大量交换时应让位；字段缺失（旧节点）不罚分
+        // 机器状态：更快的节点在内存严重 / 正在大量换页时应让位；字段缺失（旧节点）不罚分
         var sickInfo = betterInfo
         sickInfo.memPressure = "critical"
         let sick = RouteCandidate(id: "sick", expectedNodeID: "n2", info: sickInfo, rttMS: 20, isLocal: false, offlineUntil: nil)
@@ -1563,21 +1565,32 @@ final class NodeRouter: @unchecked Sendable {
               "内存严重的节点应让位")
         var swappyInfo = betterInfo
         swappyInfo.swapUsedGB = 35
+        swappyInfo.swapoutRate = 6_000
         let swappy = RouteCandidate(id: "swappy", expectedNodeID: "n2", info: swappyInfo, rttMS: 20, isLocal: false, offlineUntil: nil)
         check(RoutingDecider.choose(candidates: [base, swappy], now: 0, localAccurate: true)?.id == "base",
-              "交换 35GB 的节点应让位")
+              "正在大量换页的节点应让位")
+        var accumulatedSwap = betterInfo
+        accumulatedSwap.swapUsedGB = 35
+        accumulatedSwap.swapoutRate = 0
+        let accumulated = RouteCandidate(
+            id: "accumulated", expectedNodeID: "n2", info: accumulatedSwap, rttMS: 20, isLocal: false, offlineUntil: nil
+        )
+        check(RoutingDecider.choose(candidates: [base, accumulated], now: 0, localAccurate: true)?.id == "accumulated",
+              "只有累计 swap 高但换页率为 0 时不罚分")
         let plainScore = RoutingDecider.score(better, now: 0, localAccurate: true)?.score
         var lightSwap = betterInfo
-        lightSwap.swapUsedGB = 4
+        lightSwap.swapUsedGB = 35
+        lightSwap.swapoutRate = nil
         lightSwap.memPressure = "normal"
         let light = RouteCandidate(id: "light", expectedNodeID: "n2", info: lightSwap, rttMS: 20, isLocal: false, offlineUntil: nil)
         check(RoutingDecider.score(light, now: 0, localAccurate: true)?.score == plainScore,
-              "正常内存与少量交换不罚分")
-        if let data = #"{"v":2,"node_id":"n","hw_hash":"h","asr":{},"translator":"apple","busy":false,"on_ac":true,"in_use":false,"worker":"warm","mem_pressure":"warn","swap_used_gb":12.5}"#.data(using: .utf8),
+              "正常内存与未知换页率不罚分")
+        if let data = #"{"v":2,"node_id":"n","hw_hash":"h","asr":{},"translator":"apple","busy":false,"on_ac":true,"in_use":false,"worker":"warm","mem_pressure":"warn","swap_used_gb":12.5,"swapout_rate":6000}"#.data(using: .utf8),
            let decoded = try? JSONDecoder().decode(NodeInfo.self, from: data) {
-            check(decoded.memPressure == "warn" && decoded.swapUsedGB == 12.5, "解析 mem_pressure / swap_used_gb")
+            check(decoded.memPressure == "warn" && decoded.swapUsedGB == 12.5 && decoded.swapoutRate == 6_000,
+                  "解析 mem_pressure / swap_used_gb / swapout_rate")
         } else {
-            check(false, "解析 mem_pressure / swap_used_gb")
+            check(false, "解析 mem_pressure / swap_used_gb / swapout_rate")
         }
         let localCandidate = RouteCandidate(
             id: localUDSID, expectedNodeID: "n1", info: goodInfo, rttMS: 5, isLocal: true, offlineUntil: nil

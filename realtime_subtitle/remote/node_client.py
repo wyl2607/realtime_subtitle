@@ -116,9 +116,10 @@ class NodeInfo:
     in_use: bool
     worker: str
     translator_ok: bool = True
-    # 节点自报的机器状态（2026-10-12）：旧节点没有这两个字段，None 不罚分
+    # 节点自报的机器状态（2026-10-12）：旧节点没有这些字段，None 不罚分
     mem_pressure: str | None = None
     swap_used_gb: float | None = None
+    swapout_rate: float | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> NodeInfo:
@@ -142,6 +143,9 @@ class NodeInfo:
             swap_used_gb=(float(data["swap_used_gb"])
                           if isinstance(data.get("swap_used_gb"), int | float)
                           and not isinstance(data.get("swap_used_gb"), bool) else None),
+            swapout_rate=(float(data["swapout_rate"])
+                          if isinstance(data.get("swapout_rate"), int | float)
+                          and not isinstance(data.get("swapout_rate"), bool) else None),
         )
 
 

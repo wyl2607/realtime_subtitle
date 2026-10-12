@@ -1223,8 +1223,9 @@ def mac_probes(monkeypatch):
 class FakeSystem:
     UUID = "11111111-2222-3333-4444-555555555555"
 
-    def __init__(self, idle_ns=5_000_000_000, power="AC Power", fail=()):
+    def __init__(self, idle_ns=5_000_000_000, power="AC Power", swapouts=10_000, fail=()):
         self.idle_ns, self.power, self.fail = idle_ns, power, set(fail)
+        self.swapouts = swapouts
         self.calls: list[list[str]] = []
 
     def __call__(self, argv):
@@ -1241,6 +1242,8 @@ class FakeSystem:
             return "1\n"
         if argv[:2] == ["sysctl", "-n"] and argv[2] == "vm.swapusage":
             return "total = 2048.00M  used = 1536.00M  free = 512.00M  (encrypted)\n"
+        if argv[0] == "vm_stat":
+            return f"Swapouts:                              {self.swapouts}.\n"
         raise AssertionError(argv)
 
 
@@ -1273,9 +1276,9 @@ def test_info_matches_p1_and_leaks_nothing_raw(tmp_path, mac_probes):
     assert set(body) == {
         "v", "node_id", "hw_hash", "asr", "translator", "translator_ok",
         "busy", "sessions", "capacity", "on_ac", "in_use", "worker",
-        "mem_pressure", "swap_used_gb",
+        "mem_pressure", "swap_used_gb", "swapout_rate",
     }
-    assert body["mem_pressure"] == "normal" and body["swap_used_gb"] == 1.5
+    assert body["mem_pressure"] == "normal" and body["swap_used_gb"] == 1.5 and body["swapout_rate"] is None
     assert body["v"] == 2 and body["node_id"] == "node-abc"
     assert body["hw_hash"] == hashlib.sha256(FakeSystem.UUID.encode()).hexdigest()[:16]
     assert body["asr"] == {"model": "whisper-large-v3-turbo", "backend": "mlx", "rtf": 0.08}

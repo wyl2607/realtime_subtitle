@@ -107,7 +107,7 @@ def node_status(node: dict) -> dict:
         "rtf": asr.get("rtf"), "translator": info.get("translator"),
         "translator_ok": info.get("translator_ok"), "sessions": info.get("sessions"),
         "capacity": info.get("capacity"), "mem_pressure": info.get("mem_pressure"),
-        "swap_used_gb": info.get("swap_used_gb"),
+        "swap_used_gb": info.get("swap_used_gb"), "swapout_rate": info.get("swapout_rate"),
     })
     return row
 
@@ -124,11 +124,11 @@ def _fmt(v) -> str:
 
 
 def print_table(rows: list[dict]) -> None:
-    head = ["节点", "状态", "延迟ms", "识别模型", "rtf", "翻译", "翻译在线", "会话", "内存", "swapGB"]
+    head = ["节点", "状态", "延迟ms", "识别模型", "rtf", "翻译", "翻译在线", "会话", "内存", "swapGB", "换页/分"]
     lines = [head]
     for r in rows:
         if not r["online"]:
-            lines.append([r["id"], f"离线({r.get('reason', '?')})"] + ["—"] * 8)
+            lines.append([r["id"], f"离线({r.get('reason', '?')})"] + ["—"] * 9)
             continue
         model = (r.get("asr_model") or "—").rsplit("/", 1)[-1]
         sess = f"{_fmt(r.get('sessions'))}/{_fmt(r.get('capacity'))}"
@@ -136,7 +136,7 @@ def print_table(rows: list[dict]) -> None:
         ok = "是" if tok is True else "否" if tok is False else "—"
         lines.append([r["id"], "在线", _fmt(r.get("latency_ms")), model, _fmt(r.get("rtf")),
                       _fmt(r.get("translator")), ok, sess, _fmt(r.get("mem_pressure")),
-                      _fmt(r.get("swap_used_gb"))])
+                      _fmt(r.get("swap_used_gb")), _fmt(r.get("swapout_rate"))])
     widths = [max(len(str(line[i])) for line in lines) for i in range(len(head))]
     for line in lines:
         print("  ".join(str(c).ljust(w) for c, w in zip(line, widths)).rstrip())

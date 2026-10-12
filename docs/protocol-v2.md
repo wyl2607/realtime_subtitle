@@ -29,7 +29,8 @@
 | `translator` | str | `apple` 或 `ollama:<model>`（正则 `info.py:42`）；默认 `apple` |
 | `translator_ok` | bool | 翻译器当前是否可用。`ollama:<model>` 时 gateway 探测本机 `127.0.0.1:11434/api/version`（0.5s 超时、10s 缓存、不走系统代理），200 且 JSON 含 `version` 才为 `true`；其它翻译器恒为 `true`。只暴露布尔值，不暴露 URL 或错误文本 |
 | `mem_pressure` | string \| null | 机器内存状态 `normal` / `warn` / `critical`。macOS 取 `sysctl kern.memorystatus_vm_pressure_level`（1/2/4），Windows 取 `GlobalMemoryStatusEx` 的内存负载（≤80 / ≤92 / 更高）。探测失败为 `null`；10s 缓存。客户端打分：warn +8、critical +25 罚分，`null` 不罚 |
-| `swap_used_gb` | number \| null | 已用交换空间（GB，一位小数）。macOS 取 `sysctl -n vm.swapusage` 的 used，Windows 估算为已提交量超出物理已用的部分。>8 罚 6、>20 罚 15（2026-10-12：节点机上某程序内存泄漏导致交换 35GB、翻译慢一倍，客户端此前无从得知） |
+| `swap_used_gb` | number \| null | 已用交换空间（GB，一位小数）。macOS 取 `sysctl -n vm.swapusage` 的 used，Windows 估算为已提交量超出物理已用的部分。只展示，不再参与路由罚分；macOS 可能在压力解除后仍长期保留已写出的交换文件 |
+| `swapout_rate` | number \| null | 当前换出速率（页/分，一位小数）。macOS 取 `vm_stat` 的 `Swapouts:` 累计页数，与同一 `NodeInfo` 实例上一次采样相减后除以分钟；首次采样、两次采样间隔 <5s、解析/命令失败为 `null`。Windows 暂为 `null`，避免从累计页面文件使用量编阈值。客户端打分：>500 页/分 +6、>5000 页/分 +15；页按 16KB 估算，500 页/分约 8MB/分，5000 页/分约 80MB/分 |
 | `busy` | bool | 当前会话数是否达到容量（`sessions >= capacity`，旧客户端兼容；`gateway.py:1165`） |
 | `sessions` | int | 当前正在进行的会话数（`gateway.py:1163`） |
 | `capacity` | int | 节点配置的会话容量，缺省 2，范围 1–4（`gateway.py:85-87, 1164`） |

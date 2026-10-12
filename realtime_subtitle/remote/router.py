@@ -120,13 +120,15 @@ class RouteWeights:
     battery_penalty: float = 10.0
     rtt_penalty: float = 6.0
     local_under_p8_penalty: float = 1000.0
-    # 机器状态（2026-10-12 lmm 的 mini：Acrobat 泄漏 → swap 35GB、翻译慢一倍，客户端毫不知情）
+    # 机器状态（2026-10-12 lmm 的 mini：Acrobat 退出后 swap_used_gb 仍高，但 Swapouts 不再增长）
     mem_warn_penalty: float = 8.0
     mem_critical_penalty: float = 25.0
     swap_penalty: float = 6.0
     swap_heavy_penalty: float = 15.0
-    swap_gb: float = 8.0
-    swap_heavy_gb: float = 20.0
+    # macOS vm_stat 页按 16KB 估算：500 页/分≈8MB/分，5000 页/分≈80MB/分。
+    # 用当前换出速率判定内存压力；累计 swap_used_gb 只展示，不参与罚分。
+    swapout_rate: float = 500.0
+    swapout_heavy_rate: float = 5000.0
     no_network_bonus: float = 4.0
     migration_margin: float = 8.0
 
@@ -226,10 +228,10 @@ class RoutingDecider:
             penalties += weights.mem_warn_penalty
         elif info.mem_pressure == "critical":
             penalties += weights.mem_critical_penalty
-        swap = info.swap_used_gb
-        if swap is not None and swap > weights.swap_heavy_gb:
+        swapout_rate = info.swapout_rate
+        if swapout_rate is not None and swapout_rate > weights.swapout_heavy_rate:
             penalties += weights.swap_heavy_penalty
-        elif swap is not None and swap > weights.swap_gb:
+        elif swapout_rate is not None and swapout_rate > weights.swapout_rate:
             penalties += weights.swap_penalty
 
         bonus = weights.no_network_bonus if candidate.is_local else 0.0
@@ -237,7 +239,7 @@ class RoutingDecider:
         reason = (
             f"quality={asr + tr:.1f} speed={-weights.speed_k * rtf:.1f} "
             f"penalties={penalties:.1f} bonus={bonus:.1f} rtt_ms={candidate.rtt_ms:.0f}"
-            f" mem={info.mem_pressure or '-'}/{'-' if swap is None else swap}"
+            f" mem={info.mem_pressure or '-'}/{'-' if swapout_rate is None else swapout_rate}"
         )
         return RouteScore(id=candidate.id, score=score, reason=reason)
 
