@@ -212,3 +212,15 @@ token 在控制端用 `openssl rand -hex 32` 生成，只经 ssh 的标准输入
 写完之后，脚本用这把 token 去请求节点的 `/v1/info`：token 从临时文件读，不放进命令行；连接钉在节点自己的 Tailscale IPv4（`100.64.0.0/10`）上，不连 `url` 里的主机名。返回的 `node_id` 必须和 `nodes.json` 一致，否则删掉刚写的 token 并报错。日志里 token 写成 `<redacted>`。二维码就是密钥，不要截图外传。
 
 吊销只删这一把设备 token。Mac 客户端自己的节点 token 不动。确认到 401 才算吊销完成；如果节点仍接受旧 token，脚本会把文件写回去并报错。
+
+## 八、集群运维：一条命令看所有节点 / 批量更新
+
+```bash
+python3 scripts/node/cluster.py status          # 表格：在线、延迟、识别模型、rtf、翻译、会话数
+python3 scripts/node/cluster.py status --json   # 机器可读
+python3 scripts/node/cluster.py update          # 逐台重装（有会话在用的节点默认跳过）
+python3 scripts/node/cluster.py update --force mini2   # 只更新指定节点，且不管有没有人在用
+```
+
+- 节点清单读 `~/.config/rslite/nodes.json`；查状态不 ssh，用本机 Tailscale 把节点名解析成 IP（必须在 100.64.0.0/10），直连 `/v1/info`，不走代理，token 只进请求头。
+- 更新时先 ssh `uname -s` 判断 Mac / Windows，分别调用 `install_node.sh` / `install_node_windows.sh`，装完再查一次状态；一台失败不影响其他台，最后给汇总。
