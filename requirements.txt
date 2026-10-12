@@ -16,6 +16,7 @@ ctranslate2>=4.8.2,<5.0.0      # RTX 50系(Blackwell/sm_120)最低要 4.6.2：�
 requests>=2.34.2,<3.0.0         # Ollama API 调用
 websockets>=14.0,<18.0          # 节点 WebSocket 客户端（协议 v2）
 yt-dlp>=2026.8.19,<2027.0.0      # 下载视频/音频
+opencc-python-reimplemented>=0.1.7,<1.0.0  # 译文繁体转简体（目标语言为中文时兜底）
 torch>=2.13.0,<3.0.0             # CPU版即可：项目本身不用torch，但ctranslate2内部会import它
 numpy>=2.2.0,<3.0.0            # 数值计算。下限必须停在 2.2：2.3 起要 3.11，
                                # 2.5 起要 3.12。抬高下限会让 install.ps1 仍接受

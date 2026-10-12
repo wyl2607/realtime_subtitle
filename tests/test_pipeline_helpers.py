@@ -867,6 +867,26 @@ def test_translate_cold_then_warm_timeout():
     assert seen == [config.OLLAMA_TIMEOUT_COLD, config.OLLAMA_TIMEOUT]
 
 
+def test_translate_converts_traditional_to_simplified_for_chinese_target(monkeypatch):
+    """目标语言是中文时，桌面本机 Ollama 译文出口要把繁体兜底转成简体。
+
+    小模型即使被要求"简体中文"仍会偶发繁体（实测「Mews的這種概念」），
+    所以出口必须再过一次 to_simplified_if_target。"""
+    from realtime_subtitle.translate import text_rules
+
+    monkeypatch.setattr(text_rules, "_opencc_converter", None)
+    monkeypatch.setattr(text_rules, "_opencc_failed", False)
+
+    class _Session:
+        def post(self, url, json=None, stream=None, timeout=None):
+            return _FakeStreamResponse(
+                [{"response": "Mews的這種概念", "done": True}])
+
+    t = _translator_for_tx(ollama_session=_Session())
+    assert config.TARGET_LANGUAGE == "zh"  # 前提：当前目标语言是中文
+    assert t._translate_single_sentence("Mews' concept.", "") == "Mews的这种概念"
+
+
 def test_translate_uses_long_timeout_while_asr_backlogged():
     """☠️ issue #16：模型热着不等于 15 秒够用。
 
