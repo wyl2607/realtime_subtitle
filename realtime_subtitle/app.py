@@ -72,6 +72,7 @@ os.environ['PYTHONWARNINGS'] = 'ignore'
 # 压掉三方库的日志噪音，但保留ERROR——之前全禁到CRITICAL，
 # faster-whisper的真实报错也被吞掉了，排障时什么都看不到
 logging.basicConfig(level=logging.ERROR)
+_LOG = logging.getLogger(__name__)
 
 # ⚠️ torch 必须在任何 Qt 导入【之前】——这条在 PyQt5 时代是硬伤：先 PyQt5
 # 后 torch = `OSError WinError 1114`（c10.dll 初始化例程失败），100% 复现。
@@ -315,6 +316,34 @@ class RemoteBridge:
         self._sync_provider()
         self._announce_route()
 
+    def on_language_applied(self, src=None, tgt=None, revision=0):
+        """语言对真正生效的边界：作废此前发出的远端请求/节点会话。"""
+        del src, tgt
+        self._language_revision = _coerce_revision(revision)
+        self._generation += 1
+        self._early_node_dst.clear()
+        self._node_src_by_id.clear()
+        self._node_dst_keys.clear()
+        self._node_translate_failed.clear()
+        if self.cloud is not None:
+            try:
+                self.cloud.cancel()
+            except Exception as exc:
+                print(f"⚠️  取消云端请求失败: {type(exc).__name__}")
+        self._close_node()
+
+    def _stale_remote_generation(self, generation, where):
+        if generation == self._generation and not self._closed:
+            return False
+        _LOG.debug(
+            "stale remote %s discarded: generation=%s current=%s closed=%s",
+            where,
+            generation,
+            self._generation,
+            self._closed,
+        )
+        return True
+
     def route_label(self):
         self._sync_provider()
         tier = "local"
@@ -388,7 +417,7 @@ class RemoteBridge:
         self._send_node_bytes(pcm.tobytes(), start)
 
     def _transcribe_one(self, a0, a1, pcm, generation):
-        if generation != self._generation or self._closed:
+        if self._stale_remote_generation(generation, "cloud_start"):
             return
         try:
             # 分段器的 a0 从开桥算起，交给客户端时加上原点，返回的 start/end 已是绝对时间。
@@ -397,7 +426,7 @@ class RemoteBridge:
         except Exception as exc:
             self._on_cloud_exception(exc, generation)
             return
-        if generation != self._generation or self._closed:
+        if self._stale_remote_generation(generation, "cloud_result"):
             return
         try:
             self.routing.apply({"type": "segment_success"})
@@ -413,20 +442,20 @@ class RemoteBridge:
         if not segments and getattr(transcript, "text", ""):
             segments = [_LooseSegment(self._origin_seconds + a0, self._origin_seconds + a1, transcript.text)]
         for seg in segments:
-            if generation != self._generation or self._closed:
+            if self._stale_remote_generation(generation, "cloud_segment"):
                 return
             text = (getattr(seg, "text", "") or "").strip()
             if not text:
                 continue
             dst = self._translate(text)
-            if generation != self._generation or self._closed:
+            if self._stale_remote_generation(generation, "cloud_translation"):
                 return
             self._publish_remote("cloud", getattr(seg, "start", None), getattr(seg, "end", None), text, dst)
         self._announce_route()
 
     def _on_cloud_exception(self, exc, generation):
         from realtime_subtitle.remote.cloud_client import CloudCancelled, CloudError
-        if isinstance(exc, CloudCancelled) or generation != self._generation:
+        if isinstance(exc, CloudCancelled) or self._stale_remote_generation(generation, "cloud_exception"):
             return
         if isinstance(exc, CloudError):
             status = exc.status
@@ -669,6 +698,7 @@ class RemoteBridge:
             info,
             source_locale_id=str(getattr(config, "SOURCE_LANGUAGE", "de")),
             target_language_id=str(getattr(config, "TARGET_LANGUAGE", "zh")),
+            session_generation=self._generation,
             callbacks=callbacks,
         )
 
@@ -749,21 +779,20 @@ class RemoteBridge:
         self._stop_node_loop()
 
     def _on_node_final(self, node_id, generation, final_id, body, t0, t1):
-        del generation
         text = (body or "").strip()
-        if not text or self._closed:
+        if not text or self._stale_remote_generation(generation, "node_final"):
             return
         node_key = (node_id, final_id)
         self._node_src_by_id[node_key] = text
 
         def work():
-            if self._closed:
+            if self._stale_remote_generation(generation, "node_final_work"):
                 return
             # 节点译文通常晚于 final。先用本机翻译顶上，译文到了再覆盖。
             # 已经先到的译文直接用，不再打一次 Ollama。
             early = self._early_node_dst.pop(node_key, None)
             dst = early if early and node_key not in self._node_translate_failed else self._translate(text)
-            if self._closed:
+            if self._stale_remote_generation(generation, "node_final_translate"):
                 return
             remote_key = self._publish_remote(node_id, t0, t1, text, dst)
             self._node_dst_keys[node_key] = remote_key
@@ -771,14 +800,15 @@ class RemoteBridge:
         self._pool.submit(work)
 
     def _on_node_translation(self, node_id, generation, tx_id, body):
-        del generation
-        if self._closed:
+        if self._stale_remote_generation(generation, "node_translation"):
             return
         node_key = (node_id, tx_id)
         if node_key in self._node_translate_failed or not (body or ""):
             return
 
         def work():
+            if self._stale_remote_generation(generation, "node_translation_work"):
+                return
             key = self._node_dst_keys.get(node_key)
             if key is None:
                 self._early_node_dst[node_key] = body or ""
@@ -799,24 +829,28 @@ class RemoteBridge:
             self._ui_status(f"节点 {node_id}：翻译暂不可用，改用本机翻译")
 
     def _on_node_status_event(self, node_id, generation, event):
+        if self._stale_remote_generation(generation, "node_status_event"):
+            return
         code = event.get("code") if isinstance(event, dict) else None
         if code == "translate_failed":
             self._notify_node_translate_failed_once(node_id, generation)
 
     def _on_node_translate_failed(self, node_id, generation, tx_id):
-        if self._closed:
+        if self._stale_remote_generation(generation, "node_translate_failed"):
             return
         self._notify_node_translate_failed_once(node_id, generation)
         node_key = (node_id, tx_id)
         self._node_translate_failed.add(node_key)
 
         def work():
+            if self._stale_remote_generation(generation, "node_translate_failed_work"):
+                return
             src = self._node_src_by_id.get(node_key, "")
             key = self._node_dst_keys.get(node_key)
-            if not src or key is None or self._closed:
+            if not src or key is None:
                 return
             dst = self._translate(src)
-            if self._closed or not dst:
+            if self._stale_remote_generation(generation, "node_translate_failed_retry") or not dst:
                 return
             with self._lock:
                 self.line_store.set_translation(key, dst)
@@ -830,7 +864,8 @@ class RemoteBridge:
             self._ui_status(text)
 
     def _on_node_closed(self, node_id, generation, error):
-        del generation
+        if self._stale_remote_generation(generation, "node_closed"):
+            return
         if error is not None:
             print(f"⚠️  节点断开 {node_id}: {type(error).__name__}")
         self._node_client = None
@@ -1089,7 +1124,7 @@ class SubtitleApp:
             translator.on_pair = self.subtitle_window.add_pair
             translator.on_draft = self.subtitle_window.update_draft
             translator.on_status = self.subtitle_window.show_status
-            translator.on_language_applied = self.subtitle_window.notify_language_applied
+            translator.on_language_applied = self._on_language_applied
             translator.on_translate_failed = self.subtitle_window.on_translate_failed
             self.subtitle_window.on_retry_translation = (
                 lambda k: self.translator.retry_translation(k) if self.translator else False
@@ -1248,6 +1283,15 @@ class SubtitleApp:
             self.subtitle_window.add_pair(src, tgt, t0, t1, key, revision)
             return
         remote.on_local_pair(src, tgt, t0, t1, key, revision)
+
+    def _on_language_applied(self, src, tgt, revision=0):
+        self.subtitle_window.notify_language_applied(src, tgt, revision)
+        remote = getattr(self, "remote", None)
+        if remote is not None:
+            try:
+                remote.on_language_applied(src, tgt, revision)
+            except Exception as exc:
+                print(f"⚠️  远端语言代切换失败: {type(exc).__name__}")
 
     def _ui_invoke(self, fn):
         caller = getattr(self, "_gui_caller", None)

@@ -12,6 +12,10 @@ protocol SubtitleEngine: AnyObject, Sendable {
     func retryTranslation(id: Int) -> Bool
 }
 
+private func hybridLog(_ message: String) {
+    FileHandle.standardError.write(Data("rslite.route \(message)\n".utf8))
+}
+
 @available(macOS 27.0, *)
 extension Pipeline: SubtitleEngine {}
 
@@ -77,7 +81,9 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
     private var local: Pipeline?
     private var router: NodeRouter?
     private var currentFanout: AudioFanout?
+    private var languageGeneration = 0
     private var activeNodeSessions: [String: Int] = [:]
+    private var nodeSessionLanguage: [NodeSessionKey: Int] = [:]
     private var selectedNodeSession: NodeSessionKey?
     private var pendingNodeFinals: [NodeSessionKey: [Int: (String, Double?, Double?)]] = [:]
     private var settledNodeSentences: [NodeSessionKey: Set<Int>] = [:]
@@ -269,6 +275,7 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
                 currentFanout = nil
             }
             activeNodeSessions.removeAll()
+            nodeSessionLanguage.removeAll()
             selectedNodeSession = nil
             if clearPending {
                 pendingNodeFinals.removeAll()
@@ -284,13 +291,16 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
         pendingNodeFinals = pendingNodeFinals.filter { $0.key.nodeID != nodeID }
         settledNodeSentences = settledNodeSentences.filter { $0.key.nodeID != nodeID }
         earlyTranslateFailures = earlyTranslateFailures.filter { $0.key.nodeID != nodeID }
+        nodeSessionLanguage = nodeSessionLanguage.filter { $0.key.nodeID != nodeID }
     }
 
     private func openNodeSession(nodeID: String, generation: Int) {
         lock.withLockVoid {
             clearPending(for: nodeID)
             activeNodeSessions[nodeID] = generation
-            pendingNodeFinals[NodeSessionKey(nodeID: nodeID, generation: generation)] = [:]
+            let key = NodeSessionKey(nodeID: nodeID, generation: generation)
+            nodeSessionLanguage[key] = languageGeneration
+            pendingNodeFinals[key] = [:]
         }
     }
 
@@ -318,9 +328,11 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
             let key = NodeSessionKey(nodeID: nodeID, generation: generation)
             settledNodeSentences.removeValue(forKey: key)
             earlyTranslateFailures.removeValue(forKey: key)
+            nodeSessionLanguage.removeValue(forKey: key)
             if closingActive {
                 settledNodeSentences = settledNodeSentences.filter { $0.key.nodeID != nodeID }
                 earlyTranslateFailures = earlyTranslateFailures.filter { $0.key.nodeID != nodeID }
+                nodeSessionLanguage = nodeSessionLanguage.filter { $0.key.nodeID != nodeID }
             }
         }
     }
@@ -335,9 +347,13 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
             Bool
         ) -> T
     ) -> T? {
-        lock.withLockValue {
+        lock.withLockValue { () -> T? in
             guard activeNodeSessions[nodeID] == generation else { return nil }
             let key = NodeSessionKey(nodeID: nodeID, generation: generation)
+            guard nodeSessionLanguage[key] == languageGeneration else {
+                hybridLog("stale_language_generation node=\(nodeID) session=\(generation) current=\(languageGeneration)")
+                return nil
+            }
             var pending = pendingNodeFinals[key] ?? [:]
             var settled = settledNodeSentences[key] ?? []
             var early = earlyTranslateFailures[key] ?? []
@@ -685,6 +701,50 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
             engine.ingestNodeTranslateFailed(nodeID: "yzwdmsnlmm", generation: 9, id: 5)
             check(capture.enqueued.count == 1, "旧会话的 translate_failed 不得入队")
         }
+        do {
+            let capture = NodeCapture()
+            let engine = makeEngine(capture)
+            select(engine, "yzwdmsnlmm", 1)
+            let staleLanguageGeneration = engine.currentLanguageGeneration()
+            engine.advanceLanguageGenerationForSelfTest()
+            let currentLanguageGeneration = engine.currentLanguageGeneration()
+
+            engine.ingestNodeFinal(nodeID: "yzwdmsnlmm", generation: 1, id: 1, text: "Alt", t0: 0, t1: 1)
+            engine.ingestNodeTranslation(nodeID: "yzwdmsnlmm", generation: 1, id: 1, text: "旧译文")
+            check(capture.finals.isEmpty && capture.enqueued.isEmpty,
+                  "语言切换前的节点 final/translation 不得上屏或入本机翻译队列")
+
+            select(engine, "yzwdmsnlmm", 2)
+            engine.ingestNodeFinal(nodeID: "yzwdmsnlmm", generation: 2, id: 2, text: "Neu", t0: 1, t1: 2)
+            engine.ingestNodeTranslation(nodeID: "yzwdmsnlmm", generation: 2, id: 2, text: "新译文")
+            check(capture.finals.count == 1 && capture.finals[0].0 == "Neu" && capture.finals[0].1 == "新译文",
+                  "语言切换后的节点结果应按最新代正常上屏")
+
+            let staleCloud = CloudControlEffect(
+                mode: .cloud,
+                nodeTierEnabled: false,
+                lines: [CloudP5Line(t0: 3, t1: 4, text: "Cloud alt")],
+                discard: false,
+                cancelInflight: false,
+                publishStatus: false,
+                yieldStatusToNode: false
+            )
+            engine.applyCloudEffect(staleCloud, generation: staleLanguageGeneration)
+            check(capture.finals.count == 1, "语言切换前发出的云端结果不得上屏")
+
+            let currentCloud = CloudControlEffect(
+                mode: .cloud,
+                nodeTierEnabled: false,
+                lines: [CloudP5Line(t0: 4, t1: 5, text: "Cloud neu")],
+                discard: false,
+                cancelInflight: false,
+                publishStatus: false,
+                yieldStatusToNode: false
+            )
+            engine.applyCloudEffect(currentCloud, generation: currentLanguageGeneration)
+            check(capture.finals.count == 2 && capture.finals[1].0 == "Cloud neu",
+                  "语言切换后发出的云端结果应按最新代正常上屏")
+        }
         failures.append(contentsOf: CloudSegmenter.selfTest())
         failures.append(contentsOf: CloudUploadController.selfTest())
         return failures
@@ -740,6 +800,25 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
 
     static func displayKey(at index: Int) -> Int {
         -1 - index
+    }
+
+    private func currentLanguageGeneration() -> Int {
+        lock.withLockValue { languageGeneration }
+    }
+
+    private func isStaleLanguageGeneration(_ generation: Int, where label: String) -> Bool {
+        let current = currentLanguageGeneration()
+        guard generation == current else {
+            hybridLog("stale_language_generation \(label) generation=\(generation) current=\(current)")
+            return true
+        }
+        return false
+    }
+
+    private func advanceLanguageGenerationForSelfTest() {
+        lock.withLockVoid {
+            languageGeneration += 1
+        }
     }
 
     private func allocateDisplayKey() -> Int {
@@ -829,6 +908,7 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
 
     private func enqueueUpload(_ segment: EmittedCloudSegment, controller: CloudUploadController) {
         let id = UUID()
+        let languageGeneration = currentLanguageGeneration()
         let task = Task { [weak self] in
             guard !Task.isCancelled else { return }
             let now = Date()
@@ -836,7 +916,7 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
             let facts = self?.currentNodeFacts() ?? NodeTierFacts(enabled: false, healthy: false, activeNodeID: nil, isSelf: false)
             if Task.isCancelled {
                 let effect = controller.resolveFailure(id: segment.id, error: CancellationError(), now: Date(), node: facts)
-                self?.applyCloudEffect(effect)
+                self?.applyCloudEffect(effect, generation: languageGeneration)
                 return
             }
             do {
@@ -847,10 +927,10 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
                     language: controller.groqLanguageCode
                 )
                 let effect = controller.resolveSuccess(id: segment.id, result: result, now: Date(), node: self?.currentNodeFacts() ?? facts)
-                self?.applyCloudEffect(effect)
+                self?.applyCloudEffect(effect, generation: languageGeneration)
             } catch {
                 let effect = controller.resolveFailure(id: segment.id, error: error, now: Date(), node: self?.currentNodeFacts() ?? facts)
-                self?.applyCloudEffect(effect)
+                self?.applyCloudEffect(effect, generation: languageGeneration)
             }
         }
         lock.withLockVoid { uploadTasks[id] = task }
@@ -860,7 +940,10 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
         }
     }
 
-    private func applyCloudEffect(_ effect: CloudControlEffect) {
+    private func applyCloudEffect(_ effect: CloudControlEffect, generation: Int? = nil) {
+        if let generation, isStaleLanguageGeneration(generation, where: "cloud_result") {
+            return
+        }
         let decision = lock.withLockValue { () -> (Bool, Bool, NodeRouter?) in
             if effect.yieldStatusToNode {
                 cloudOwnsLabel = false
