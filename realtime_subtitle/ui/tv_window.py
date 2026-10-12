@@ -116,6 +116,20 @@ class TVWindow(QWidget):
         if changed and self.isVisible():
             self._rebuild()
 
+    def drop_keys(self, keys):
+        """按句 id 移除句对（远端句替换本机句时调用）。理由同 HistoryWindow.drop_keys。
+
+        藏起来时也只清 _entries、不动文档——隐藏期间内容本来就不增量维护，
+        打开时由 backfill 回填。
+        """
+        drop = set(keys or [])
+        if not drop:
+            return
+        before = len(self._entries)
+        self._entries = [e for e in self._entries if e.get("key") not in drop]
+        if len(self._entries) != before and self.isVisible():
+            self._rebuild()
+
     def _rebuild(self):
         sb = self.text.verticalScrollBar()
         at_bottom = sb.value() >= sb.maximum() - 10
