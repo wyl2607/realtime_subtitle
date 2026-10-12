@@ -171,9 +171,11 @@ def windows_on_ac(ctypes_mod: Any | None = None) -> bool:
 # 不自己拿空闲百分比编阈值——CLAUDE.md 第 7 节第 10 条）
 _PRESSURE_LEVELS = {1: "normal", 2: "warn", 4: "critical"}
 _SWAP_USED_RE = re.compile(r"used\s*=\s*([0-9.]+)([KMG])")
+_SWAPOUTS_RE = re.compile(r"^\s*Swapouts:\s*([0-9,]+)\.", re.MULTILINE)
 _UNIT_GB = {"K": 1 / (1024 * 1024), "M": 1 / 1024, "G": 1.0}
 #: 内存探测要跑子进程，/v1/info 每次都跑太浪费；10 秒内复用
 MEMORY_CACHE_S = 10.0
+SWAPOUT_MIN_INTERVAL_S = 5.0
 
 
 def parse_pressure_level(text: str) -> str | None:
@@ -189,6 +191,14 @@ def parse_swap_used_gb(sysctl_output: str) -> float | None:
     if not m:
         return None
     return round(float(m.group(1)) * _UNIT_GB[m.group(2)], 1)
+
+
+def parse_vm_stat_swapouts(vm_stat_output: str) -> int | None:
+    """`vm_stat` 里的 Swapouts 累计页数。真机格式：`Swapouts: 10772944.`。"""
+    m = _SWAPOUTS_RE.search(vm_stat_output)
+    if not m:
+        return None
+    return int(m.group(1).replace(",", ""))
 
 
 def windows_memory(ctypes_mod: Any | None = None) -> tuple[str | None, float | None]:
@@ -241,7 +251,8 @@ class NodeInfo:
         self._run = run
         self._state_dir = Path(state_dir) if state_dir is not None else STATE_DIR
         self._hw_hash: str | None = None
-        self._memory: tuple[float, str | None, float | None] | None = None
+        self._memory: tuple[float, str | None, float | None, float | None] | None = None
+        self._swapouts: tuple[float, int] | None = None
 
     # 每一项都单独成方法：一项探测失败不影响其它字段。
 
@@ -279,24 +290,54 @@ class NodeInfo:
             self._hw_hash = hashlib.sha256(uuid.encode("utf-8")).hexdigest()[:HW_HASH_LEN]
         return self._hw_hash
 
-    def memory(self) -> tuple[str | None, float | None]:
-        """(mem_pressure, swap_used_gb)。探测失败给 None——None 不罚分。"""
+    def _swapout_rate(self, now: float) -> float | None:
+        """macOS 当前换出速率（页/分，一位小数）。首次/间隔太短/失败都返回 None。"""
+        try:
+            count = parse_vm_stat_swapouts(self._run(["vm_stat"]))
+            if count is None:
+                raise ValueError("no_swapouts")
+        except Exception as e:  # noqa: BLE001
+            log.warning("probe_failed what=swapout_rate err=%s", type(e).__name__)
+            return None
+        previous = self._swapouts
+        self._swapouts = (now, count)
+        if previous is None:
+            return None
+        previous_at, previous_count = previous
+        elapsed = now - previous_at
+        delta = count - previous_count
+        if elapsed < SWAPOUT_MIN_INTERVAL_S or delta < 0:
+            return None
+        return round(delta * 60.0 / elapsed, 1)
+
+    def memory(self) -> tuple[str | None, float | None, float | None]:
+        """(mem_pressure, swap_used_gb, swapout_rate)。探测失败给 None——None 不罚分。"""
         now = time.monotonic()
         if self._memory is not None and now - self._memory[0] < MEMORY_CACHE_S:
-            return self._memory[1], self._memory[2]
+            return self._memory[1], self._memory[2], self._memory[3]
         pressure: str | None = None
         swap: float | None = None
-        try:
-            if sys.platform == "win32":
+        swapout_rate: float | None = None
+        if sys.platform == "win32":
+            try:
                 pressure, swap = windows_memory()
-            else:
+            except Exception as e:  # noqa: BLE001
+                log.warning("probe_failed what=memory err=%s", type(e).__name__)
+            # Windows has pagefile counters, but no current, cross-version Swapouts-equivalent here;
+            # keep swapout_rate unknown rather than inventing thresholds from cumulative pagefile use.
+        else:
+            try:
                 pressure = parse_pressure_level(
                     self._run(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"]))
+            except Exception as e:  # noqa: BLE001
+                log.warning("probe_failed what=mem_pressure err=%s", type(e).__name__)
+            try:
                 swap = parse_swap_used_gb(self._run(["sysctl", "-n", "vm.swapusage"]))
-        except Exception as e:  # noqa: BLE001
-            log.warning("probe_failed what=memory err=%s", type(e).__name__)
-        self._memory = (now, pressure, swap)
-        return pressure, swap
+            except Exception as e:  # noqa: BLE001
+                log.warning("probe_failed what=swap_used_gb err=%s", type(e).__name__)
+            swapout_rate = self._swapout_rate(now)
+        self._memory = (now, pressure, swap, swapout_rate)
+        return pressure, swap, swapout_rate
 
     def node_id(self) -> str:
         try:
@@ -336,7 +377,7 @@ class NodeInfo:
         translator_ok = True
         if translator.startswith("ollama:"):
             translator_ok = probe_translator_ok(translator)
-        mem_pressure, swap_used_gb = self.memory()
+        mem_pressure, swap_used_gb, swapout_rate = self.memory()
         return {
             "v": 2,
             "node_id": self.node_id(),
@@ -352,4 +393,5 @@ class NodeInfo:
             "worker": worker,
             "mem_pressure": mem_pressure,
             "swap_used_gb": swap_used_gb,
+            "swapout_rate": swapout_rate,
         }
