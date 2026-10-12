@@ -296,3 +296,26 @@ def test_router_excludes_self_node_candidate():
     filtered = router.filter_candidates()
     assert len(filtered) == 1
     assert filtered[0].config.id == "other"
+
+
+# --- 模型名归一（2026-10-12：三台节点报的名字都不在打分表里，全落默认 25 分） ---
+
+
+def test_asr_rank_matches_real_node_model_names():
+    from realtime_subtitle.remote.router import asr_rank_for, canonical_asr_model
+
+    ranks = RouteWeights().asr_rank
+    assert canonical_asr_model("mlx-community/whisper-large-v3-turbo") == "whisper-large-v3-turbo"
+    assert asr_rank_for("mlx-community/whisper-large-v3-turbo", ranks) == 40.0
+    assert asr_rank_for("large-v3-turbo", ranks) == 40.0
+    assert asr_rank_for("mlx-community/whisper-large-v3-turbo-q4", ranks) == 38.0
+    assert asr_rank_for("whisper-small", ranks) == 25.0
+    assert asr_rank_for("", ranks) == 25.0
+
+
+def test_fast_windows_node_beats_mac_node_once_names_match():
+    mac = RouteCandidate(id="mini2", expected_node_id="n1", rtt_ms=96.0,
+                         info=_make_info(node_id="n1", model="mlx-community/whisper-large-v3-turbo", rtf=0.366))
+    win = RouteCandidate(id="win", expected_node_id="n2", rtt_ms=40.0,
+                         info=_make_info(node_id="n2", model="large-v3-turbo", rtf=0.02, translator="ollama:qwen3.5:4b"))
+    assert RoutingDecider.choose([mac, win], now=0).id == "win"

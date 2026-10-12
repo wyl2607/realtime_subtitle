@@ -58,6 +58,29 @@ struct RouteScore: Sendable {
 }
 
 enum RoutingDecider {
+    /// 节点报的模型名 → 打分表的键（与 Python router.canonical_asr_model 同口径）。
+    /// 2026-10-12：Mac 报 `mlx-community/whisper-large-v3-turbo`、Windows 报 `large-v3-turbo`，
+    /// 都查不到表、全落默认 25 分。
+    static func canonicalASRModel(_ model: String) -> String {
+        var name = (model.split(separator: "/").last.map(String.init) ?? "")
+            .trimmingCharacters(in: .whitespaces).lowercased()
+        if !name.isEmpty, !name.hasPrefix("whisper-"), name != "fake" {
+            name = "whisper-" + name
+        }
+        return name
+    }
+
+    /// 先精确匹配；量化/变体后缀（-q4、-8bit）按最长前缀匹配并扣 2 分。
+    static func asrRank(_ model: String, _ ranks: [String: Double], default fallback: Double = 25) -> Double {
+        let name = canonicalASRModel(model)
+        if let exact = ranks[name] { return exact }
+        let prefixes = ranks.keys.filter { name.hasPrefix($0 + "-") }
+        if let best = prefixes.max(by: { $0.count < $1.count }), let rank = ranks[best] {
+            return rank - 2
+        }
+        return fallback
+    }
+
     static func score(
         _ candidate: RouteCandidate,
         now: Double,
@@ -72,7 +95,7 @@ enum RoutingDecider {
         }
         let model = info.asr.model ?? ""
         let translator = info.translator
-        let asr = weights.asrRank[model] ?? 25
+        let asr = RoutingDecider.asrRank(model, weights.asrRank)
         // translator_ok 缺失按 true。false 只把 tr 记 0，节点仍可当识别用，不加额外罚分。
         let ranked = weights.translatorRank[translator] ?? (translator.hasPrefix("ollama:") ? 16 : 12)
         let tr = info.translatorQualityEnabled ? ranked : 0
@@ -1527,6 +1550,11 @@ final class NodeRouter: @unchecked Sendable {
         let better = RouteCandidate(id: "better", expectedNodeID: "n2", info: betterInfo, rttMS: 20, isLocal: false, offlineUntil: nil)
         check(RoutingDecider.choose(candidates: [base, better], now: 0, localAccurate: true)?.id == "better",
               "更优节点上线应被选中")
+        let ranks = RouteWeights.default.asrRank
+        check(RoutingDecider.asrRank("mlx-community/whisper-large-v3-turbo", ranks) == 40, "Mac 节点模型名带仓库前缀")
+        check(RoutingDecider.asrRank("large-v3-turbo", ranks) == 40, "Windows 节点模型名无 whisper- 前缀")
+        check(RoutingDecider.asrRank("mlx-community/whisper-large-v3-turbo-q4", ranks) == 38, "量化变体按前缀扣 2 分")
+        check(RoutingDecider.asrRank("whisper-small", ranks) == 25, "未知模型默认 25")
         // 机器状态：更快的节点在内存严重 / 大量交换时应让位；字段缺失（旧节点）不罚分
         var sickInfo = betterInfo
         sickInfo.memPressure = "critical"
