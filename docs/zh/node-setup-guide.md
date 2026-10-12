@@ -170,3 +170,45 @@ curl -s -H "Authorization: Bearer $TOKEN" http://<节点Tailscale-IP>:8791/v1/in
 
 - **客户端清理**：
   在控制端或客户端机器上，打开 `~/.config/rslite/nodes.json`（Windows 为 `%APPDATA%\realtime_subtitle\nodes.json`），删除该节点对应的 JSON 对象；并删除 `tokens/` 目录下对应的 `<节点别名>.token` 文件即可。
+
+---
+
+## 七、手机配对
+
+节点装好之后，在控制端（Mac）为手机单独发一把设备 token，并在终端打出二维码。手机用配套 App 扫码即可，不需要 ssh，也不需要手抄密钥。`nodes.json` 里要已经有这台节点（安装脚本会写）。设备名只允许字母、数字、点、下划线、连字符，长度 1–64。
+
+```bash
+# 先看计划（不 ssh、不写 token；token 显示为 <redacted>）
+bash scripts/node/pair_device.sh --dry-run mini2 phone
+
+# 配对。同名设备已存在会拒绝
+bash scripts/node/pair_device.sh mini2 phone
+
+# 更换这把 token
+bash scripts/node/pair_device.sh --rotate mini2 phone
+
+# 只列出设备名，不读 token
+bash scripts/node/pair_device.sh --list mini2
+
+# 吊销。删掉节点上的 token，并用旧 token 请求 /v1/info，必须得到 401
+bash scripts/node/pair_device.sh --revoke phone mini2
+```
+
+`ssh-host` 写成 `user@mini2` 也可以；`nodes.json` 用 `@` 后面的 `mini2` 对上条目。
+
+成功后终端先打印配对链接，再用二维码显示同一串内容：
+
+```text
+rsnode://pair?v=1&id=<node_id>&host=<tailnet 主机名>&port=<端口>&tok=<64 位十六进制>&name=<设备名>
+```
+
+`id`、`host`、`port` 来自本机 `~/.config/rslite/nodes.json` 里该节点的 `node_id` 和 `url`，不是 ssh 别名。控制端装了 `qrencode` 时用 `qrencode -t ANSIUTF8` 出码；没装则只打印链接，并多一行 `brew install qrencode`。
+
+token 在控制端用 `openssl rand -hex 32` 生成，只经 ssh 的标准输入写到节点：
+
+- Mac 节点：`~/.config/rs-node/tokens/<设备名>.token`，目录 `0700`，文件 `0600`。写完给 gateway 发 `SIGHUP`（`com.realtimesubtitle.node`），让新 token 生效。
+- Windows 节点：`%LOCALAPPDATA%\rs-node\tokens\<设备名>.token`。`icacls` 去掉继承，只留给当前用户和 SYSTEM。gateway 靠目录时间自己重载，可能要等大约 10 秒。
+
+写完之后，脚本用这把 token 去请求节点的 `/v1/info`：token 从临时文件读，不放进命令行；连接钉在节点自己的 Tailscale IPv4（`100.64.0.0/10`）上，不连 `url` 里的主机名。返回的 `node_id` 必须和 `nodes.json` 一致，否则删掉刚写的 token 并报错。日志里 token 写成 `<redacted>`。二维码就是密钥，不要截图外传。
+
+吊销只删这一把设备 token。Mac 客户端自己的节点 token 不动。确认到 401 才算吊销完成；如果节点仍接受旧 token，脚本会把文件写回去并报错。
