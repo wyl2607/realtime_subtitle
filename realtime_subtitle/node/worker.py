@@ -103,7 +103,7 @@ class _Sess:
 
     __slots__ = (
         "sid", "explicit", "gen", "src", "dst", "seg",
-        "translator", "tr_pair", "next_id", "audio_s", "asr_s",
+        "translator", "tr_pair", "next_id", "audio_s", "asr_s", "prev_src",
     )
 
     def __init__(self, sid: int, explicit: bool, gen: int, src: str, dst: str, seg: Segmenter) -> None:
@@ -118,6 +118,8 @@ class _Sess:
         self.next_id = 1
         self.audio_s = 0.0
         self.asr_s = 0.0
+        # 同会话上一句原文，给翻译当上下文（只在本会话内，不跨 sid）
+        self.prev_src = ""
 
 
 class FairQueue:
@@ -431,6 +433,7 @@ class Worker:
 
         sess = self._open_session(sid, explicit, src, dst)
         tr_note = self._bind_translator(sess, src, dst, carried)
+        self._warm_translator(sess.translator)
         self._start_threads()
 
         engine = dict(self._asr.info())
@@ -459,6 +462,24 @@ class Worker:
             self.log("translator_unavailable", err=type(e).__name__)
             return ("translator_unavailable", "翻译不可用，只输出原文")
         return None
+
+    def _warm_translator(self, translator: Translator | None) -> None:
+        """后台预热翻译模型：节点空闲 3 分钟后模型已卸载，第一句要等 9–15 秒（2026-10-12 实测）。
+        不阻塞 hello→ready；失败只记日志，正式翻译时照常再加载。"""
+        warm = getattr(translator, "warm", None)
+        if warm is None:
+            return
+
+        def _run() -> None:
+            t0 = time.perf_counter()
+            try:
+                warm()
+            except Exception as e:  # noqa: BLE001
+                self.log("translator_warm_failed", err=type(e).__name__)
+                return
+            self.log("translator_warm", warm_s=time.perf_counter() - t0)
+
+        threading.Thread(target=_run, name="tx-warm", daemon=True).start()
 
     def _open_session(self, sid: int, explicit: bool, src: str, dst: str) -> _Sess:
         vad = self._vad_factory()
@@ -715,8 +736,13 @@ class Worker:
                     if sess is None or sess.gen != gen or sess.translator is None:
                         continue
                     tr, src, dst = sess.translator, sess.src, sess.dst
+                    context, sess.prev_src = sess.prev_src, text
                 t0 = time.perf_counter()
-                out = tr.translate(text, src, dst)
+                translate_ctx = getattr(tr, "translate_ctx", None)
+                if translate_ctx is not None:
+                    out = translate_ctx(text, src, dst, context)
+                else:
+                    out = tr.translate(text, src, dst)
                 # 「查代数 + 发事件」必须在同一把锁里：翻译期间 hello/end 可能已收掉这个 sid
                 with self._state_lock:
                     sess = self._sessions.get(qsid)

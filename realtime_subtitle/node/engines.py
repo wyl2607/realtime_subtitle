@@ -13,6 +13,8 @@
 """
 from __future__ import annotations
 
+import logging
+import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -24,6 +26,7 @@ from realtime_subtitle.translate.apple_translate import AppleTranslator
 from realtime_subtitle.translate.text_rules import (
     _no_space_language,
     _split_sentences,
+    _normalize_clock_times,
     _strip_translator_note,
     to_simplified_if_target,
 )
@@ -34,6 +37,10 @@ APPLE_TIMEOUT_S = 5.0
 
 # 节点翻译请求的 Ollama 租期。见下方 post 处注释。
 NODE_OLLAMA_KEEP_ALIVE = "3m"
+# keep_alive 3 分钟内用过的模型还在显存里，预热跳过；留 30 秒余量
+WARM_SKIP_S = 150.0
+
+_log = logging.getLogger("node.engines")
 
 
 @dataclass
@@ -65,6 +72,13 @@ class Translator(ABC):
     @abstractmethod
     def translate(self, text: str, src: str, dst: str) -> str | None:
         """失败返回 None（调用方只发 status，不重试、不阻塞后面的句子）。"""
+
+    def translate_ctx(self, text: str, src: str, dst: str, context: str = "") -> str | None:
+        """带上一句原文的翻译。默认忽略上下文（Apple 翻译不吃上下文）。"""
+        return self.translate(text, src, dst)
+
+    def warm(self) -> None:
+        """会话开始时预热（后台线程调用，不阻塞 ready）。默认什么都不做。"""
 
     def close(self) -> None:
         pass
@@ -203,6 +217,129 @@ class AppleBackend(Translator):
         self._helper.close()
 
 
+# ---------------------------------------------------------------- 数字一致性
+# 只做「原文数字 ⊆ 译文数字」：译文多出来的数字（如 Mai→5 月、一些里的「一」）不算错，
+# 少了或变了（2.1 → 1.2）才重试。冠词 ein/eine 不当数字，只认 eins。
+
+_DE_UNITS = {
+    "null": 0, "eins": 1, "zwei": 2, "drei": 3, "vier": 4, "fünf": 5, "sechs": 6,
+    "sieben": 7, "acht": 8, "neun": 9, "zehn": 10, "elf": 11, "zwölf": 12,
+    "dreizehn": 13, "vierzehn": 14, "fünfzehn": 15, "sechzehn": 16, "siebzehn": 17,
+    "achtzehn": 18, "neunzehn": 19,
+}
+_DE_TENS = {
+    "zwanzig": 20, "dreißig": 30, "vierzig": 40, "fünfzig": 50, "sechzig": 60,
+    "siebzig": 70, "achtzig": 80, "neunzig": 90,
+}
+# 复合词里的个位用词干：einundzwanzig、siebenundzwanzig
+_DE_STEMS = {"ein": 1, **{k: v for k, v in _DE_UNITS.items() if 2 <= v <= 9}}
+
+
+def _de_word_number(word: str) -> int | None:
+    w = word.lower()
+    if w in _DE_UNITS:
+        return _DE_UNITS[w]
+    if w in _DE_TENS:
+        return _DE_TENS[w]
+    if w in ("hundert", "einhundert"):
+        return 100
+    if w in ("tausend", "eintausend"):
+        return 1000
+    if "und" in w:
+        unit, _, tens = w.partition("und")
+        if unit in _DE_STEMS and tens in _DE_TENS:
+            return _DE_STEMS[unit] + _DE_TENS[tens]
+    for stem, v in _DE_STEMS.items():
+        if v >= 2 and w == stem + "hundert":
+            return v * 100
+    return None
+
+
+def _canon(value: float) -> str:
+    return str(int(value)) if value == int(value) else f"{value:.6f}".rstrip("0").rstrip(".")
+
+
+_DE_TOKEN = re.compile(r"\d+(?:\.\d{3})+(?!\d)|\d+(?:,\d+)?|[A-Za-zÄÖÜäöüß]+")
+
+
+def source_numbers(text: str) -> set[str]:
+    """德语原文里的数字（阿拉伯数字、1.000 千分位、2,1 小数、数词与「X Komma Y」）。"""
+    vals: list[float | None] = []
+    words: list[str] = []
+    for tok in _DE_TOKEN.findall(text or ""):
+        if tok[0].isdigit():
+            if "." in tok:
+                vals.append(float(tok.replace(".", "")))
+            else:
+                vals.append(float(tok.replace(",", ".")))
+            words.append("")
+        else:
+            n = _de_word_number(tok)
+            vals.append(None if n is None else float(n))
+            words.append(tok.lower())
+    out: set[str] = set()
+    i = 0
+    while i < len(vals):
+        v = vals[i]
+        if (v is not None and i + 2 < len(vals) and words[i + 1] == "komma"
+                and vals[i + 2] is not None and vals[i + 2] == int(vals[i + 2])):
+            out.add(_canon(float(f"{int(v)}.{int(vals[i + 2])}")))
+            i += 3
+            continue
+        if v is not None:
+            out.add(_canon(v))
+        i += 1
+    return out
+
+
+_ZH_DIGIT = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+             "六": 6, "七": 7, "八": 8, "九": 9}
+_ZH_NUM = re.compile(r"[零〇一二两三四五六七八九十百千万]+(?:点[零〇一二三四五六七八九]+(?!分))?")
+_AR_NUM = re.compile(r"\d{1,3}(?:,\d{3})+(?!\d)|\d+(?:\.\d+)?")
+
+
+def _zh_int(s: str) -> int | None:
+    if not s:
+        return None
+    if all(c in _ZH_DIGIT for c in s) and len(s) > 1:  # 二〇二六 这种逐位写法
+        return int("".join(str(_ZH_DIGIT[c]) for c in s))
+    total, section, num = 0, 0, 0
+    for c in s:
+        if c in _ZH_DIGIT:
+            num = _ZH_DIGIT[c]
+        elif c == "十":
+            section += (num or 1) * 10
+            num = 0
+        elif c == "百":
+            section += num * 100
+            num = 0
+        elif c == "千":
+            section += num * 1000
+            num = 0
+        elif c == "万":
+            total += (section + num) * 10000
+            section, num = 0, 0
+    return total + section + num
+
+
+def target_numbers(text: str) -> set[str]:
+    """中文译文里的数字（阿拉伯数字含千分位/小数，中文数字含「X点Y」小数）。"""
+    out: set[str] = set()
+    t = text or ""
+    for m in _AR_NUM.findall(t):
+        out.add(_canon(float(m.replace(",", ""))))
+    for m in _ZH_NUM.findall(t):
+        whole, _, frac = m.partition("点")
+        n = _zh_int(whole)
+        if n is None or (n == 0 and not any(c in "零〇" for c in whole)):
+            continue
+        if frac:
+            out.add(_canon(float(f"{n}." + "".join(str(_ZH_DIGIT[c]) for c in frac))))
+        else:
+            out.add(_canon(float(n)))
+    return out
+
+
 _LANG_NAMES = {"de": "德语", "en": "英语", "zh": "中文", "ja": "日语", "da": "丹麦语"}
 
 
@@ -233,39 +370,78 @@ class OllamaBackend(Translator):
         self._session.trust_env = False
         self._model = config.OLLAMA_MODEL
         self.name = f"ollama:{self._model}"
+        self._last_used = float("-inf")
 
     def translate(self, text: str, src: str, dst: str) -> str | None:
+        return self.translate_ctx(text, src, dst)
+
+    def translate_ctx(self, text: str, src: str, dst: str, context: str = "") -> str | None:
         s, d = _LANG_NAMES.get(src, src), _LANG_NAMES.get(dst, dst)
+        # 德语 "19.10 Uhr" 先规范成 19:10，与桌面 translator_queue 同口径
+        text = _normalize_clock_times(text)
+        context = _normalize_clock_times(context or "")
+        ctx = f"上一句（仅供理解，不要翻译它）：\n{context}\n\n" if context else ""
         prompt = (
             f"你是{s}字幕翻译。请把下面这一条字幕翻译成自然、准确的{d}。\n"
             f"只翻译当前这一条，不要补充、解释、拒答，也不要输出{s}原文；"
             f"数字、人名、机构名和地名不得改写。\n\n"
-            f"{s}原文：\n{text}\n\n{d}译文："
+            f"{ctx}{s}原文：\n{text}\n\n{d}译文："
         )
-        try:
-            resp = self._session.post(
-                f"{self._tq.ollama_url()}/api/generate",
-                json={
-                    "model": self._model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "think": False,
-                    # 节点机往往也是用户自己的游戏/工作机：会话结束 2 分钟 worker 回收，
-                    # 翻译模型再多留 1 分钟就让出显存（2026-10-11 用户问「为什么 GPU 还被占着」）。
-                    "keep_alive": NODE_OLLAMA_KEEP_ALIVE,
-                    # 与翻译/查词共用 num_ctx，否则 Ollama 会换 runner 重装模型
-                    # （CLAUDE.md 第 4 节第 21 条）
-                    "options": {"temperature": 0.2, "num_predict": 512,
-                                "num_ctx": getattr(config, "OLLAMA_NUM_CTX", 4096)},
-                },
-                timeout=max(30, int(getattr(config, "OLLAMA_TIMEOUT_COLD", 90))),
-            )
-            resp.raise_for_status()
-            out = _strip_translator_note(str(resp.json().get("response", "")).strip())
-        except Exception:
+        out = self._generate(prompt)
+        if out is None:
             return None
+        # 数字一致性（2026-10-12 真机：qwen3.5:4b 把 "zwei Komma eins Prozent" 译成 1.2%）：
+        # 原文的数字必须都出现在译文里，缺了就带着数字清单重试一次；仍不对就用第二次结果。
+        want = source_numbers(text) if src == "de" else set()
+        if want and not want <= target_numbers(out):
+            hint = "、".join(sorted(want, key=float))
+            retry = self._generate(prompt + f"\n（原文中的数字是：{hint}。译文必须准确保留这些数字。）\n{d}译文：")
+            if retry is not None:
+                if not want <= target_numbers(retry):
+                    _log.warning("tx_number_mismatch want=%d", len(want))
+                out = retry
         # 出口统一繁转简：目标语言是中文时小模型仍会偶发繁体（见 text_rules）
         return to_simplified_if_target(out, dst) or None
+
+    def warm(self) -> None:
+        # Ollama 约定：空 prompt 的 generate 只加载模型。keep_alive 内用过就不重复
+        if time.monotonic() - self._last_used < WARM_SKIP_S:
+            return
+        self._post({"model": self._model, "prompt": "", "stream": False,
+                    "keep_alive": NODE_OLLAMA_KEEP_ALIVE, "options": self._options()})
+        self._last_used = time.monotonic()
+
+    def _options(self) -> dict:
+        # 与翻译/查词共用 num_ctx，否则 Ollama 会换 runner 重装模型（CLAUDE.md 第 4 节第 21 条）；
+        # 预热也必须同一份，不然预热的 runner 用不上
+        return {"temperature": 0.2, "num_predict": 512,
+                "num_ctx": getattr(config, "OLLAMA_NUM_CTX", 4096)}
+
+    def _post(self, body: dict) -> dict:
+        resp = self._session.post(
+            f"{self._tq.ollama_url()}/api/generate", json=body,
+            timeout=max(30, int(getattr(config, "OLLAMA_TIMEOUT_COLD", 90))),
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def _generate(self, prompt: str) -> str | None:
+        try:
+            data = self._post({
+                "model": self._model,
+                "prompt": prompt,
+                "stream": False,
+                "think": False,
+                # 节点机往往也是用户自己的游戏/工作机：会话结束 2 分钟 worker 回收，
+                # 翻译模型再多留 1 分钟就让出显存（2026-10-11 用户问「为什么 GPU 还被占着」）。
+                "keep_alive": NODE_OLLAMA_KEEP_ALIVE,
+                "options": self._options(),
+            })
+            out = _strip_translator_note(str(data.get("response", "")).strip())
+        except Exception:
+            return None
+        self._last_used = time.monotonic()
+        return out or None
 
     def close(self) -> None:
         self._session.close()
