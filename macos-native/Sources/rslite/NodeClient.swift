@@ -33,6 +33,9 @@ struct NodeInfo: Codable, Equatable, Sendable {
     var worker: String
     /// 缺失按 true（旧节点没有这个字段）。false 只表示翻译质量项记 0。
     var translatorOK: Bool? = nil
+    /// 节点自报的机器状态（normal/warn/critical）与已用交换空间 GB。旧节点没有，nil 不罚分。
+    var memPressure: String? = nil
+    var swapUsedGB: Double? = nil
 
     /// 字段缺失或 true 都算翻译可用；显式 false 才关闭翻译质量分。
     var translatorQualityEnabled: Bool { translatorOK != false }
@@ -48,6 +51,8 @@ struct NodeInfo: Codable, Equatable, Sendable {
         case inUse = "in_use"
         case worker
         case translatorOK = "translator_ok"
+        case memPressure = "mem_pressure"
+        case swapUsedGB = "swap_used_gb"
     }
 }
 

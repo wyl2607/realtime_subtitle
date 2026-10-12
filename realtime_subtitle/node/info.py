@@ -167,6 +167,61 @@ def windows_on_ac(ctypes_mod: Any | None = None) -> bool:
     return int(status.ACLineStatus) == 1
 
 
+# kern.memorystatus_vm_pressure_level：1 正常 / 2 警告 / 4 严重（macOS 内核自己的判定，
+# 不自己拿空闲百分比编阈值——CLAUDE.md 第 7 节第 10 条）
+_PRESSURE_LEVELS = {1: "normal", 2: "warn", 4: "critical"}
+_SWAP_USED_RE = re.compile(r"used\s*=\s*([0-9.]+)([KMG])")
+_UNIT_GB = {"K": 1 / (1024 * 1024), "M": 1 / 1024, "G": 1.0}
+#: 内存探测要跑子进程，/v1/info 每次都跑太浪费；10 秒内复用
+MEMORY_CACHE_S = 10.0
+
+
+def parse_pressure_level(text: str) -> str | None:
+    try:
+        return _PRESSURE_LEVELS.get(int(text.strip()))
+    except ValueError:
+        return None
+
+
+def parse_swap_used_gb(sysctl_output: str) -> float | None:
+    """`sysctl -n vm.swapusage` → 已用交换空间（GB，一位小数）。"""
+    m = _SWAP_USED_RE.search(sysctl_output)
+    if not m:
+        return None
+    return round(float(m.group(1)) * _UNIT_GB[m.group(2)], 1)
+
+
+def windows_memory(ctypes_mod: Any | None = None) -> tuple[str | None, float | None]:
+    """GlobalMemoryStatusEx：物理内存负载分级 + 估算的页面文件已用量（GB）。"""
+    if ctypes_mod is None:
+        import ctypes as ctypes_mod  # noqa: PLC0415 - Windows-only branch
+
+    class MEMORYSTATUSEX(ctypes_mod.Structure):
+        _fields_ = [
+            ("dwLength", ctypes_mod.c_ulong),
+            ("dwMemoryLoad", ctypes_mod.c_ulong),
+            ("ullTotalPhys", ctypes_mod.c_ulonglong),
+            ("ullAvailPhys", ctypes_mod.c_ulonglong),
+            ("ullTotalPageFile", ctypes_mod.c_ulonglong),
+            ("ullAvailPageFile", ctypes_mod.c_ulonglong),
+            ("ullTotalVirtual", ctypes_mod.c_ulonglong),
+            ("ullAvailVirtual", ctypes_mod.c_ulonglong),
+            ("ullAvailExtendedVirtual", ctypes_mod.c_ulonglong),
+        ]
+
+    st = MEMORYSTATUSEX()
+    st.dwLength = ctypes_mod.sizeof(MEMORYSTATUSEX)
+    if not ctypes_mod.windll.kernel32.GlobalMemoryStatusEx(ctypes_mod.byref(st)):
+        raise OSError("GlobalMemoryStatusEx")
+    load = int(st.dwMemoryLoad)
+    pressure = "normal" if load <= 80 else "warn" if load <= 92 else "critical"
+    # 提交总量里超出物理内存的那部分 ≈ 落到页面文件上的量
+    committed = int(st.ullTotalPageFile) - int(st.ullAvailPageFile)
+    in_ram = int(st.ullTotalPhys) - int(st.ullAvailPhys)
+    swap = round(max(0, committed - in_ram) / (1024 ** 3), 1)
+    return pressure, swap
+
+
 def windows_machine_guid(winreg_mod: Any | None = None) -> str:
     if winreg_mod is None:
         import winreg as winreg_mod  # noqa: PLC0415 - Windows-only branch
@@ -186,6 +241,7 @@ class NodeInfo:
         self._run = run
         self._state_dir = Path(state_dir) if state_dir is not None else STATE_DIR
         self._hw_hash: str | None = None
+        self._memory: tuple[float, str | None, float | None] | None = None
 
     # 每一项都单独成方法：一项探测失败不影响其它字段。
 
@@ -222,6 +278,25 @@ class NodeInfo:
                 return ""
             self._hw_hash = hashlib.sha256(uuid.encode("utf-8")).hexdigest()[:HW_HASH_LEN]
         return self._hw_hash
+
+    def memory(self) -> tuple[str | None, float | None]:
+        """(mem_pressure, swap_used_gb)。探测失败给 None——None 不罚分。"""
+        now = time.monotonic()
+        if self._memory is not None and now - self._memory[0] < MEMORY_CACHE_S:
+            return self._memory[1], self._memory[2]
+        pressure: str | None = None
+        swap: float | None = None
+        try:
+            if sys.platform == "win32":
+                pressure, swap = windows_memory()
+            else:
+                pressure = parse_pressure_level(
+                    self._run(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"]))
+                swap = parse_swap_used_gb(self._run(["sysctl", "-n", "vm.swapusage"]))
+        except Exception as e:  # noqa: BLE001
+            log.warning("probe_failed what=memory err=%s", type(e).__name__)
+        self._memory = (now, pressure, swap)
+        return pressure, swap
 
     def node_id(self) -> str:
         try:
@@ -261,6 +336,7 @@ class NodeInfo:
         translator_ok = True
         if translator.startswith("ollama:"):
             translator_ok = probe_translator_ok(translator)
+        mem_pressure, swap_used_gb = self.memory()
         return {
             "v": 2,
             "node_id": self.node_id(),
@@ -274,4 +350,6 @@ class NodeInfo:
             "on_ac": self.on_ac(),
             "in_use": self.in_use(),
             "worker": worker,
+            "mem_pressure": mem_pressure,
+            "swap_used_gb": swap_used_gb,
         }

@@ -29,6 +29,13 @@ struct RouteWeights: Sendable {
     var batteryPenalty = 10.0
     var rttPenalty = 6.0
     var localUnderP8Penalty = 1_000.0
+    // 机器状态，与 Python router.RouteWeights 同一套（2026-10-12 Acrobat 泄漏 → swap 35GB）
+    var memWarnPenalty = 8.0
+    var memCriticalPenalty = 25.0
+    var swapPenalty = 6.0
+    var swapHeavyPenalty = 15.0
+    var swapGB = 8.0
+    var swapHeavyGB = 20.0
     var noNetworkBonus = 4.0
     var migrationMargin = 8.0
 
@@ -75,11 +82,21 @@ enum RoutingDecider {
         if !info.onAC { penalties += weights.batteryPenalty }
         if candidate.rttMS > 100 { penalties += weights.rttPenalty }
         if candidate.isLocal && !localAccurate { penalties += weights.localUnderP8Penalty }
+        if info.memPressure == "warn" { penalties += weights.memWarnPenalty }
+        if info.memPressure == "critical" { penalties += weights.memCriticalPenalty }
+        if let swap = info.swapUsedGB {
+            if swap > weights.swapHeavyGB {
+                penalties += weights.swapHeavyPenalty
+            } else if swap > weights.swapGB {
+                penalties += weights.swapPenalty
+            }
+        }
         let bonus = candidate.isLocal ? weights.noNetworkBonus : 0
         let score = asr + tr - weights.speedK * rtf - penalties + bonus
         let reason = String(
-            format: "quality=%.1f speed=%.1f penalties=%.1f bonus=%.1f rtt_ms=%.0f",
-            asr + tr, -weights.speedK * rtf, penalties, bonus, candidate.rttMS
+            format: "quality=%.1f speed=%.1f penalties=%.1f bonus=%.1f rtt_ms=%.0f mem=%@/%@",
+            asr + tr, -weights.speedK * rtf, penalties, bonus, candidate.rttMS,
+            info.memPressure ?? "-", info.swapUsedGB.map { String(format: "%.1f", $0) } ?? "-"
         )
         return RouteScore(id: candidate.id, score: score, reason: reason)
     }
@@ -1510,6 +1527,30 @@ final class NodeRouter: @unchecked Sendable {
         let better = RouteCandidate(id: "better", expectedNodeID: "n2", info: betterInfo, rttMS: 20, isLocal: false, offlineUntil: nil)
         check(RoutingDecider.choose(candidates: [base, better], now: 0, localAccurate: true)?.id == "better",
               "更优节点上线应被选中")
+        // 机器状态：更快的节点在内存严重 / 大量交换时应让位；字段缺失（旧节点）不罚分
+        var sickInfo = betterInfo
+        sickInfo.memPressure = "critical"
+        let sick = RouteCandidate(id: "sick", expectedNodeID: "n2", info: sickInfo, rttMS: 20, isLocal: false, offlineUntil: nil)
+        check(RoutingDecider.choose(candidates: [base, sick], now: 0, localAccurate: true)?.id == "base",
+              "内存严重的节点应让位")
+        var swappyInfo = betterInfo
+        swappyInfo.swapUsedGB = 35
+        let swappy = RouteCandidate(id: "swappy", expectedNodeID: "n2", info: swappyInfo, rttMS: 20, isLocal: false, offlineUntil: nil)
+        check(RoutingDecider.choose(candidates: [base, swappy], now: 0, localAccurate: true)?.id == "base",
+              "交换 35GB 的节点应让位")
+        let plainScore = RoutingDecider.score(better, now: 0, localAccurate: true)?.score
+        var lightSwap = betterInfo
+        lightSwap.swapUsedGB = 4
+        lightSwap.memPressure = "normal"
+        let light = RouteCandidate(id: "light", expectedNodeID: "n2", info: lightSwap, rttMS: 20, isLocal: false, offlineUntil: nil)
+        check(RoutingDecider.score(light, now: 0, localAccurate: true)?.score == plainScore,
+              "正常内存与少量交换不罚分")
+        if let data = #"{"v":2,"node_id":"n","hw_hash":"h","asr":{},"translator":"apple","busy":false,"on_ac":true,"in_use":false,"worker":"warm","mem_pressure":"warn","swap_used_gb":12.5}"#.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode(NodeInfo.self, from: data) {
+            check(decoded.memPressure == "warn" && decoded.swapUsedGB == 12.5, "解析 mem_pressure / swap_used_gb")
+        } else {
+            check(false, "解析 mem_pressure / swap_used_gb")
+        }
         let localCandidate = RouteCandidate(
             id: localUDSID, expectedNodeID: "n1", info: goodInfo, rttMS: 5, isLocal: true, offlineUntil: nil
         )
