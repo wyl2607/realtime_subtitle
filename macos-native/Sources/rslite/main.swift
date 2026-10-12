@@ -249,6 +249,10 @@ struct RSLite {
     @available(macOS 27.0, *)
     @MainActor
     private static func runApp(_ options: Options) {
+        // AppKit 默认吞掉事件循环里的 ObjC 异常继续跑；异常若穿过 MainActor 任务，
+        // Swift 运行时的「当前执行器」会留在已销毁的栈帧上，几分钟后在无关代码里崩
+        // （CLAUDE.md §7 第 26 条）。宁可当场崩。
+        UserDefaults.standard.register(defaults: ["NSApplicationCrashOnExceptions": true])
         NSApplication.shared.setActivationPolicy(.accessory)
 
         var pipeline: SubtitleEngine?

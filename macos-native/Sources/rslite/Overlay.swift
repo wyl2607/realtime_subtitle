@@ -723,7 +723,11 @@ final class OverlayController: NSObject {
         let liveKeys = Set(history.map(\.key))
         for key in pairViews.keys where !liveKeys.contains(key) {
             if let view = pairViews.removeValue(forKey: key) {
-                stack.removeArrangedSubview(view)
+                // 不在 stack 里的视图（建了但还没轮到上屏）调 removeArrangedSubview 会抛
+                // NSInternalInconsistencyException，见 CLAUDE.md §7 第 26 条。
+                if stack.arrangedSubviews.contains(where: { $0 === view }) {
+                    stack.removeArrangedSubview(view)
+                }
                 view.removeFromSuperview()
             }
             appearedAt.removeValue(forKey: key)
