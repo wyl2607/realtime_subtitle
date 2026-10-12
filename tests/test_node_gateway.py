@@ -1237,6 +1237,10 @@ class FakeSystem:
             return f'    "IOPlatformUUID" = "{self.UUID}"\n'
         if argv[0] == "pmset":
             return f"Now drawing from '{self.power}'\n -InternalBattery-0\t100%; charged\n"
+        if argv[:2] == ["sysctl", "-n"] and argv[2] == "kern.memorystatus_vm_pressure_level":
+            return "1\n"
+        if argv[:2] == ["sysctl", "-n"] and argv[2] == "vm.swapusage":
+            return "total = 2048.00M  used = 1536.00M  free = 512.00M  (encrypted)\n"
         raise AssertionError(argv)
 
 
@@ -1269,7 +1273,9 @@ def test_info_matches_p1_and_leaks_nothing_raw(tmp_path, mac_probes):
     assert set(body) == {
         "v", "node_id", "hw_hash", "asr", "translator", "translator_ok",
         "busy", "sessions", "capacity", "on_ac", "in_use", "worker",
+        "mem_pressure", "swap_used_gb",
     }
+    assert body["mem_pressure"] == "normal" and body["swap_used_gb"] == 1.5
     assert body["v"] == 2 and body["node_id"] == "node-abc"
     assert body["hw_hash"] == hashlib.sha256(FakeSystem.UUID.encode()).hexdigest()[:16]
     assert body["asr"] == {"model": "whisper-large-v3-turbo", "backend": "mlx", "rtf": 0.08}
