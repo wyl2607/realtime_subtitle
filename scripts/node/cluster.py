@@ -143,9 +143,11 @@ def print_table(rows: list[dict]) -> None:
 
 
 def detect_os(host: str) -> str:
+    # 中文 Windows 的 cmd 会用 GBK 回「'uname' 不是内部或外部命令」，按 UTF-8 解会抛错：
+    # 只认 Darwin，其余字节一律容错解码
     out = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, "uname -s"],
-                         capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL).stdout
-    return "mac" if out.strip().splitlines()[:1] == ["Darwin"] else "windows"
+                         capture_output=True, timeout=20, stdin=subprocess.DEVNULL).stdout
+    return "mac" if out.decode("utf-8", "replace").strip().splitlines()[:1] == ["Darwin"] else "windows"
 
 
 def update(nodes: list[dict], ids: list[str], force: bool) -> int:

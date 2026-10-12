@@ -148,3 +148,14 @@ def test_update_failure_does_not_stop_others(cl, monkeypatch, capsys):
 
 def test_update_unknown_id(cl, monkeypatch, capsys):
     assert cl.main(["update", "nope"]) == 2
+
+
+def test_detect_os_tolerates_gbk_error_from_windows(cl, monkeypatch):
+    class R:
+        def __init__(self, out):
+            self.stdout = out
+    gbk = "'uname' 不是内部或外部命令".encode("gbk")
+    monkeypatch.setattr(cl.subprocess, "run", lambda *a, **k: R(gbk))
+    assert cl.detect_os("w1") == "windows"
+    monkeypatch.setattr(cl.subprocess, "run", lambda *a, **k: R(b"Darwin\n"))
+    assert cl.detect_os("m1") == "mac"
