@@ -93,6 +93,9 @@ def default_spawn() -> None:
 
     env = dict(os.environ)
     env.pop("OLLAMA_HOST", None)
+    # cwd 必须在节点目录之外：子进程继承网关的 cwd（~/rs-node），Windows 上被当作 cwd 的目录
+    # 不能改名，节点重装时 Move-Item rs-node → rs-node.prev 就会失败回滚（2026-10-13 真机）
+    cwd = str(exe.parent)
 
     if sys.platform == "win32":
         creationflags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
@@ -103,6 +106,7 @@ def default_spawn() -> None:
             stderr=subprocess.DEVNULL,
             creationflags=creationflags,
             env=env,
+            cwd=cwd,
         )
     else:
         subprocess.Popen(
@@ -112,6 +116,7 @@ def default_spawn() -> None:
             stderr=subprocess.DEVNULL,
             start_new_session=True,
             env=env,
+            cwd=cwd,
         )
 
 

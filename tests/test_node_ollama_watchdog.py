@@ -322,3 +322,16 @@ def test_gateway_integration_watchdog_started_and_stopped():
 # Need to import subprocess for the monkeypatch tests
 import subprocess
 import os
+
+def test_default_spawn_runs_outside_node_dir(monkeypatch, tmp_path):
+    """真机回归（2026-10-13）：ollama 继承网关 cwd=~/rs-node，Windows 上节点重装改名目录失败。"""
+    from realtime_subtitle.node import ollama_watchdog as ow
+
+    exe = tmp_path / "Ollama" / "ollama"
+    exe.parent.mkdir()
+    exe.write_text("")
+    monkeypatch.setattr(ow, "_find_ollama_exe_default", lambda: exe)
+    seen = {}
+    monkeypatch.setattr(ow.subprocess, "Popen", lambda argv, **kw: seen.update(kw))
+    ow.default_spawn()
+    assert seen["cwd"] == str(exe.parent)
