@@ -31,6 +31,21 @@ System audio ──WASAPI loopback──▶ Faster-Whisper (CUDA or CPU)
                          Overlay: source first + draft + final bilingual lines
 ```
 
+## Platform status
+
+> As of **2026-10-12**, current version **v3.1.0**. Stage: ✅ stable · 🟢 usable · 🧪 experimental · ⬜ not started.
+> Update this table in the same PR whenever a release ships or a platform changes stage (all three READMEs together).
+
+| Platform | Form | Stage | Works today | Open items / next |
+|---|---|---|---|---|
+| **Windows 10/11** | Python + PyQt6 overlay (main line) | ✅ stable | Live bilingual subtitles, zh↔de, cinema bar, click-to-look-up, AI summary, offline bilingual SRT for YouTube/local videos; full test suite runs on Windows CI | HiDPI not yet verified on a real 125%/150% display ([docs/TODO.md](docs/TODO.md)); **v3.2.0** adds compute-node hybrid mode (off by default, design under review) |
+| **macOS (Apple Silicon)** | Same Python app, MLX ASR + system translation/Ollama | 🟢 usable (new in v3.1.0) | One-step install/start/auto-update, memory-based auto tiering, same hotkeys as Windows | Refresh ~every 2–3 s (architecture floor); system audio needs BlackHole; no device hot-plug; Intel Macs unsupported |
+| **macOS native rslite** | Minimal Swift app, system ASR + system translation | 🧪 experimental | Only ~0.1 W above idle; hybrid refinement via compute nodes with automatic local fallback | Node cold-start first refinement too slow (Sprint-001: 15.7–18.1 s, target ≤15 s); **v3.2.0** plans cloud ASR (Groq) as a node type |
+| **Compute nodes** (Mac / Windows) | Node gateway on your tailnet + on-demand ASR worker | 🧪 experimental | One-step install, on-demand load and idle reclaim, multi-node routing; Windows node verified on real hardware | Only rslite can use nodes so far; Windows client support in v3.2.0; acceptance log in [docs/node-acceptance.md](docs/node-acceptance.md) |
+| **Android** | Separate repo (Kotlin, sherpa-onnx Whisper + Opus-MT, fully on-device) | 🧪 preview v0.4.0-quality | Mic / in-app playback capture, overlay + full screen, four Whisper tiers, German draft first | Repo not public yet; next: Silero VAD (57–64% of sentences are still cut by length), 30-min bare-device thermal run; no commits since 2026-08-07 |
+| **Linux** | — | ⬜ not started | — | No plan (system-audio capture relies on WASAPI / BlackHole) |
+| **iOS** | — | ⬜ not started | — | No plan |
+
 ## Features
 
 - **Source text first** — partial recognition appears immediately (grey = still revisable); translation follows

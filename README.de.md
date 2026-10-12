@@ -32,6 +32,21 @@ Systemton ──WASAPI-Loopback──▶ Faster-Whisper (CUDA oder CPU)
                     Overlay: Quelle zuerst + Entwurf + finale Zweizeiler
 ```
 
+## Entwicklungsstand je Plattform
+
+> Stand **2026-10-12**, aktuelle Version **v3.1.0**. Stufe: ✅ stabil · 🟢 nutzbar · 🧪 experimentell · ⬜ nicht begonnen.
+> Bei jedem Release oder Stufenwechsel einer Plattform diese Tabelle im selben PR aktualisieren (alle drei READMEs).
+
+| Plattform | Form | Stufe | Funktioniert heute | Offen / als Nächstes |
+|---|---|---|---|---|
+| **Windows 10/11** | Python + PyQt6-Overlay (Hauptlinie) | ✅ stabil | Live-Untertitel zweisprachig, zh↔de, Kino-Leiste, Wort-Nachschlagen, KI-Zusammenfassung, Offline-SRT für YouTube/lokale Videos; komplette Testsuite in Windows-CI | HiDPI auf echtem 125-%/150-%-Display noch nicht geprüft ([docs/TODO.md](docs/TODO.md)); **v3.2.0** bringt Hybridmodus mit Rechenknoten (standardmäßig aus, Entwurf im Review) |
+| **macOS (Apple Silicon)** | Dieselbe Python-App, MLX-ASR + Systemübersetzung/Ollama | 🟢 nutzbar (neu in v3.1.0) | Ein-Schritt-Installation/Start/Auto-Update, speicherabhängige Stufenwahl, Hotkeys wie unter Windows | Aktualisierung ca. alle 2–3 s (Architekturgrenze); Systemton braucht BlackHole; kein Geräte-Hot-Plug; Intel-Macs nicht unterstützt |
+| **macOS nativ (rslite)** | Minimale Swift-App, System-ASR + Systemübersetzung | 🧪 experimentell | Nur ca. 0,1 W über Leerlauf; Hybrid-Nachbesserung über Rechenknoten mit automatischem lokalen Fallback | Erste Nachbesserung nach Kaltstart des Knotens zu langsam (Sprint-001: 15,7–18,1 s, Ziel ≤15 s); **v3.2.0** plant Cloud-ASR (Groq) als Knotentyp |
+| **Rechenknoten** (Mac / Windows) | Knoten-Gateway im Tailnet + ASR-Worker bei Bedarf | 🧪 experimentell | Ein-Schritt-Installation, Laden bei Bedarf und Freigabe im Leerlauf, Multi-Knoten-Routing; Windows-Knoten auf echter Hardware abgenommen | Bisher nur rslite nutzt Knoten; Windows-Client folgt in v3.2.0; Abnahmeprotokoll in [docs/node-acceptance.md](docs/node-acceptance.md) |
+| **Android** | Eigenes Repo (Kotlin, sherpa-onnx Whisper + Opus-MT, komplett auf dem Gerät) | 🧪 Vorschau v0.4.0-quality | Mikrofon / Wiedergabe-Mitschnitt, Overlay + Vollbild, vier Whisper-Stufen, deutscher Entwurf zuerst | Repo noch nicht öffentlich; als Nächstes Silero VAD (57–64 % der Sätze werden noch nach Länge geschnitten), 30-min-Langtest ohne Kühler; seit 2026-08-07 keine Commits |
+| **Linux** | — | ⬜ nicht begonnen | — | Kein Plan (Systemton-Aufnahme basiert auf WASAPI / BlackHole) |
+| **iOS** | — | ⬜ nicht begonnen | — | Kein Plan |
+
 ## Funktionen
 
 - **Quelltext zuerst** — Teilerkennung erscheint sofort (grau = noch änderbar); Übersetzung folgt
