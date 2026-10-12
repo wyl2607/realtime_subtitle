@@ -25,6 +25,7 @@ from realtime_subtitle.translate.text_rules import (
     _no_space_language,
     _split_sentences,
     _strip_translator_note,
+    to_simplified_if_target,
 )
 
 SAMPLE_RATE = 16000
@@ -263,7 +264,8 @@ class OllamaBackend(Translator):
             out = _strip_translator_note(str(resp.json().get("response", "")).strip())
         except Exception:
             return None
-        return out or None
+        # 出口统一繁转简：目标语言是中文时小模型仍会偶发繁体（见 text_rules）
+        return to_simplified_if_target(out, dst) or None
 
     def close(self) -> None:
         self._session.close()

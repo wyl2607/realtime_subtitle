@@ -17,9 +17,12 @@ import 即可；但**别删那段 re-export**（理由写在那边）。
 `_glossary_applies` / `_interjection_lookup` 没有跟过来：它们判的是
 "当前语言对"（翻译策略），不是文本规则，留在 translator_queue。
 """
+import logging
 import re
 
 import realtime_subtitle.config as config
+
+_log = logging.getLogger(__name__)
 
 
 # 句子结束符：只认 .!?（旧管线按逗号切句是碎句/上下文错乱的来源之一）。
@@ -86,6 +89,42 @@ def _strip_translator_note(text):
     cleaned = _TRANSLATOR_NOTE_INLINE.sub("", text)
     cleaned = _TRANSLATOR_NOTE.sub("", cleaned).strip()
     return cleaned or text.strip()
+
+
+# 译文目标语言是简体中文时的繁→简兜底。小模型（qwen3.5:4b 等）即使 prompt
+# 里已写"简体中文"（config.TRANSLATION_TARGET_NAMES），仍会偶发繁体，实测例
+# 「Mews的這種概念」。节点（node/engines.py）和桌面本机 Ollama
+# （translator_queue.py）共用本函数，在译文出口做最后一道转换。
+# ☠️ 只在目标语言是简体中文时转；de/en 等原样返回，一个字都不动。
+# 目标语言码可能是 "zh"（config）或 "zh-Hans"（Apple Translation 的写法），
+# 两个都收；大小写不敏感。opencc 是纯 Python 库，模块级懒加载一次。
+_SIMPLIFIED_TARGETS = {"zh", "zh-hans", "zh-hans-cn", "zh-cn"}
+_opencc_converter = None
+_opencc_failed = False
+
+
+def to_simplified_if_target(text, target_language):
+    """目标语言是简体中文时把译文繁转简；其余语言/空文本原样返回。
+
+    缺 opencc 时**只记一次 warning 并原样返回**，绝不因为这层兜底崩掉整条
+    翻译链路（节点上 opencc 是单独装的，落下了也只是不转，不是不能用）。
+    """
+    global _opencc_converter, _opencc_failed
+    if not text or not target_language:
+        return text
+    if str(target_language).lower() not in _SIMPLIFIED_TARGETS:
+        return text
+    if _opencc_failed:
+        return text
+    if _opencc_converter is None:
+        try:
+            from opencc import OpenCC
+            _opencc_converter = OpenCC("t2s")
+        except Exception as exc:  # noqa: BLE001 - 可选依赖，缺了也只是不转
+            _opencc_failed = True
+            _log.warning("opencc 不可用，译文不做繁转简：%s", exc)
+            return text
+    return _opencc_converter.convert(text)
 
 
 # 德语时间是"点"分隔（19.10 Uhr = 19:10），模型经常把这个点当小数点或序数点，

@@ -58,6 +58,7 @@ from realtime_subtitle.translate.text_rules import (  # noqa: F401
     _TRANSLATOR_NOTE,
     _TRANSLATOR_NOTE_INLINE,
     _strip_translator_note,
+    to_simplified_if_target,
     _DE_CLOCK,
     _normalize_clock_times,
     _boundary_is_real,
@@ -1711,7 +1712,11 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
                         self._note_tx_result(ok=ok)
                         if not ok:
                             self._last_tx_failure_reason = "error"
-                        return _strip_translator_note(translation)
+                        # 出口统一繁转简：小模型即使被要求"简体中文"仍会偶发繁体
+                        return to_simplified_if_target(
+                            _strip_translator_note(translation),
+                            current_target_language(),
+                        )
                     else:
                         print(f"   ⚠️  Ollama 返回错误 (HTTP {response.status_code})，显示德语原文")
                         self._note_tx_result(ok=False)

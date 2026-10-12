@@ -1,1 +1,2 @@
 websockets>=14.0,<18.0
+opencc-python-reimplemented>=0.1.7,<1.0.0  # 译文繁体转简体（目标语言为中文时兜底）
