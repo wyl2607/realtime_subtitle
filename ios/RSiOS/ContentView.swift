@@ -5,11 +5,17 @@ import AVKit
 import CoreMedia
 import CoreVideo
 import os
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @StateObject private var pipManager = PiPManager()
     @StateObject private var statusMonitor = StatusMonitor()
+    @StateObject private var linesMonitor = LinesMonitor()
     @ObservedObject private var appStateMonitor = AppStateMonitor.shared
+
+    @State private var pairingLinkText = ""
+    @State private var pairingStatus = ""
+    @State private var pairedConfigDisplay = ""
 
     var body: some View {
         NavigationStack {
@@ -23,6 +29,45 @@ struct ContentView: View {
                         .font(.headline)
                     BroadcastPickerView()
                         .frame(height: 50)
+                }
+
+                Divider()
+
+                VStack(spacing: 12) {
+                    Text("节点配对")
+                        .font(.headline)
+
+                    HStack {
+                        TextField("粘贴 rsnode://pair?... 链接", text: $pairingLinkText)
+                            .textFieldStyle(.roundedBorder)
+                            .autocapitalization(.none)
+                            .disableAutocorrection(true)
+
+                        Button("粘贴配对链接") {
+                            if let pasteboard = UIPasteboard.general.string {
+                                pairingLinkText = pasteboard
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                    }
+
+                    Button("应用配对") {
+                        applyPairingLink()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(pairingLinkText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                    if !pairingStatus.isEmpty {
+                        Text(pairingStatus)
+                            .font(.caption)
+                            .foregroundColor(pairingStatus.hasPrefix("已配对") ? .green : .red)
+                    }
+
+                    if !pairedConfigDisplay.isEmpty {
+                        Text("已配对：\(pairedConfigDisplay)")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
                 }
 
                 Divider()
@@ -85,9 +130,39 @@ struct ContentView: View {
                 }
 
                 VStack(spacing: 8) {
+                    Text("最近句对 (来自扩展)")
+                        .font(.headline)
+                    if linesMonitor.lines.isEmpty {
+                        Text("暂无字幕")
+                            .font(.system(.body, design: .monospaced))
+                            .foregroundColor(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding()
+                            .background(Color(.systemGray6))
+                            .cornerRadius(8)
+                    } else {
+                        ForEach(linesMonitor.lines.indices, id: \.self) { idx in
+                            let line = linesMonitor.lines[idx]
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("[\(line.id)] \(line.src)")
+                                    .font(.system(.body, design: .monospaced))
+                                    .foregroundColor(.primary)
+                                Text(line.dst.isEmpty ? "…" : line.dst)
+                                    .font(.system(.body, design: .monospaced))
+                                    .foregroundColor(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding()
+                            .background(Color(.systemGray6))
+                            .cornerRadius(8)
+                        }
+                    }
+                }
+
+                VStack(spacing: 8) {
                     Text("Darwin Notifications")
                         .font(.headline)
-                    Text("Received: \(statusMonitor.darwinNotificationCount) times")
+                    Text("Tick: \(statusMonitor.darwinNotificationCount)  Lines: \(linesMonitor.darwinNotificationCount)")
                         .font(.system(.body, design: .monospaced))
                         .foregroundColor(.secondary)
                 }
@@ -96,6 +171,40 @@ struct ContentView: View {
             }
             .padding()
             .navigationTitle("RSiOS")
+            .onAppear {
+                loadPairedConfig()
+            }
+        }
+    }
+
+    private func applyPairingLink() {
+        let trimmed = pairingLinkText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            pairingStatus = "配对链接为空"
+            return
+        }
+
+        if let config = PairingLink.parse(trimmed) {
+            let jsonData = try? JSONEncoder().encode(config)
+            let jsonString = jsonData.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            if SharedKeychain.writeNodeConfig(jsonString) {
+                pairingStatus = "已配对"
+                pairedConfigDisplay = config.displayName
+                pairingLinkText = ""
+            } else {
+                pairingStatus = "配对写入失败"
+            }
+        } else {
+            pairingStatus = "配对链接无效"
+            pairedConfigDisplay = ""
+        }
+    }
+
+    private func loadPairedConfig() {
+        if let json = SharedKeychain.readNodeConfig(),
+           let data = json.data(using: .utf8),
+           let config = try? JSONDecoder().decode(NodeConfig.self, from: data) {
+            pairedConfigDisplay = config.displayName
         }
     }
 }
@@ -143,6 +252,12 @@ final class PiPHostUIView: UIView {
     }
 }
 
+struct RecentLine: Codable, Identifiable {
+    let id: Int
+    let src: String
+    var dst: String
+}
+
 final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBufferPlaybackDelegate {
     @Published var isPiPActive = false
     @Published var isStarting = false
@@ -155,13 +270,20 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
     private var renderTimer: Timer?
     private var frameCount = 0
     private var pipPossibleObservation: NSKeyValueObservation?
+    private var linesObserver: UnsafeRawPointer?
+    private var pollTimer: Timer?
+    private var appStateObserver: NSObjectProtocol?
 
     var pipStatusLine: String {
         let timeString = DateFormatter.timeFormatter.string(from: Date())
+        var parts: [String] = [timeString]
         if backgroundFrameCount > 0 {
-            return "\(timeString) · 后台刷新 \(backgroundFrameCount) 帧"
+            parts.append("后台刷新 \(backgroundFrameCount) 帧")
         }
-        return timeString
+        if let statusLine = extractStatusLine() {
+            parts.append(statusLine)
+        }
+        return parts.joined(separator: " · ")
     }
 
     override init() {
@@ -169,7 +291,21 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
         setupAudioSession()
         setupPiPLayerAndController()
         observePiPPossible()
+        registerLinesNotification()
+        startPolling()
+        observeAppState()
         startRendering()
+    }
+
+    deinit {
+        stopRendering()
+        stopPolling()
+        if let observer = linesObserver {
+            CFNotificationCenterRemoveObserver(CFNotificationCenterGetDarwinNotifyCenter(), observer, nil, nil)
+        }
+        if let observer = appStateObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
     }
 
     private func setupAudioSession() {
@@ -213,6 +349,67 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
         }
     }
 
+    private func observeAppState() {
+        appStateObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.backgroundFrameCount = 0
+        }
+    }
+
+    private func registerLinesNotification() {
+        let center = CFNotificationCenterGetDarwinNotifyCenter()
+        let name = "com.wyl2607.rsios.spike.lines" as CFString
+        let observer = UnsafeRawPointer(Unmanaged.passUnretained(self).toOpaque())
+
+        CFNotificationCenterAddObserver(center, observer, { _, observer, _, _, _ in
+            guard let observer = observer else { return }
+            let manager = Unmanaged<PiPManager>.fromOpaque(observer).takeUnretainedValue()
+            DispatchQueue.main.async {
+                manager.refreshLinesFromKeychain()
+            }
+        }, name, nil, .deliverImmediately)
+
+        self.linesObserver = observer
+        refreshLinesFromKeychain()
+    }
+
+    private func startPolling() {
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.refreshLinesFromKeychain()
+        }
+        pollTimer?.fire()
+    }
+
+    private func stopPolling() {
+        pollTimer?.invalidate()
+        pollTimer = nil
+    }
+
+    private func refreshLinesFromKeychain() {
+        if let json = SharedKeychain.readLatestLines(),
+           let data = json.data(using: .utf8),
+           let lines = try? JSONDecoder().decode([RecentLine].self, from: data) {
+            DispatchQueue.main.async {
+                self.objectWillChange.send()
+            }
+        }
+    }
+
+    private func extractStatusLine() -> String? {
+        guard let status = SharedKeychain.readExtStatus() else { return nil }
+        let parts = status.split(separator: " ")
+        var nodeInfo: [String] = []
+        for part in parts {
+            if part.hasPrefix("node=") || part.hasPrefix("ready=") || part.hasPrefix("sent=") || part.hasPrefix("finals=") || part.hasPrefix("tx=") || part.hasPrefix("last=") {
+                nodeInfo.append(String(part))
+            }
+        }
+        return nodeInfo.isEmpty ? nil : nodeInfo.joined(separator: " ")
+    }
+
     func startPiP() {
         guard !isStarting, !isPiPActive else { return }
 
@@ -248,7 +445,7 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
     private func renderFrame() {
         guard let layer = sampleBufferDisplayLayer else { return }
 
-        let status = SharedKeychain.read() ?? "无"
+        let status = SharedKeychain.readExtStatus() ?? "无"
         let timeString = DateFormatter.timeFormatter.string(from: Date())
 
         let image = renderSubtitleImage(status: status, time: timeString)
@@ -297,7 +494,17 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
         }
     }
 
+    private var cachedLines: [RecentLine] = []
+
     private func renderSubtitleImage(status: String, time: String) -> UIImage {
+        if let json = SharedKeychain.readLatestLines(),
+           let data = json.data(using: .utf8),
+           let lines = try? JSONDecoder().decode([RecentLine].self, from: data) {
+            cachedLines = lines
+        }
+
+        let displayLines = Array(cachedLines.suffix(2))
+
         let size = CGSize(width: 1280, height: 360)
         let renderer = UIGraphicsImageRenderer(size: size)
         return renderer.image { ctx in
@@ -305,34 +512,74 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
             ctx.fill(CGRect(origin: .zero, size: size))
 
             let paragraphStyle = NSMutableParagraphStyle()
-            paragraphStyle.alignment = .center
+            paragraphStyle.alignment = .left
 
-            let line1Attrs: [NSAttributedString.Key: Any] = [
+            let srcAttrs: [NSAttributedString.Key: Any] = [
                 .font: UIFont.systemFont(ofSize: 48, weight: .medium),
                 .foregroundColor: UIColor(red: 0xF0/255, green: 0xF0/255, blue: 0xF0/255, alpha: 1.0),
                 .paragraphStyle: paragraphStyle
             ]
-            let line2Attrs: [NSAttributedString.Key: Any] = [
+            let dstAttrs: [NSAttributedString.Key: Any] = [
                 .font: UIFont.systemFont(ofSize: 42, weight: .regular),
                 .foregroundColor: UIColor(red: 0xFF/255, green: 0xE8/255, blue: 0x94/255, alpha: 1.0),
                 .paragraphStyle: paragraphStyle
             ]
+            let dstEmptyAttrs: [NSAttributedString.Key: Any] = [
+                .font: UIFont.systemFont(ofSize: 42, weight: .regular),
+                .foregroundColor: UIColor(red: 0xFF/255, green: 0xE8/255, blue: 0x94/255, alpha: 0.5),
+                .paragraphStyle: paragraphStyle
+            ]
+            let statusAttrs: [NSAttributedString.Key: Any] = [
+                .font: UIFont.systemFont(ofSize: 28, weight: .regular),
+                .foregroundColor: UIColor.white.withAlphaComponent(0.7),
+                .paragraphStyle: paragraphStyle
+            ]
 
-            let line1 = "扩展: \(status)" as NSString
-            let line2 = time as NSString
+            let statusLine = extractStatusLine() ?? ""
+            let statusStr = "\(time) · \(statusLine)" as NSString
 
-            let line1Height = line1.boundingRect(with: CGSize(width: 1200, height: 200),
-                                                  options: .usesLineFragmentOrigin,
-                                                  attributes: line1Attrs, context: nil).height
-            let line2Height = line2.boundingRect(with: CGSize(width: 1200, height: 200),
-                                                  options: .usesLineFragmentOrigin,
-                                                  attributes: line2Attrs, context: nil).height
+            let lineHeight: CGFloat = 56
+            let gap: CGFloat = 8
+            let pairGap: CGFloat = 16
+            let startY: CGFloat = 20
 
-            let totalHeight = line1Height + line2Height + 16
-            let startY = (360 - totalHeight) / 2
+            var y = startY
+            for (idx, line) in displayLines.enumerated() {
+                let alpha = idx == 0 ? 1.0 : 0.55
 
-            line1.draw(in: CGRect(x: 40, y: startY, width: 1200, height: line1Height), withAttributes: line1Attrs)
-            line2.draw(in: CGRect(x: 40, y: startY + line1Height + 16, width: 1200, height: line2Height), withAttributes: line2Attrs)
+                let srcText = "[\(line.id)] \(line.src)" as NSString
+                let srcAttrsWithAlpha = idx == 0 ? srcAttrs : srcAttrs.mapValues { value in
+                    if let color = value as? UIColor {
+                        return color.withAlphaComponent(0.55)
+                    }
+                    return value
+                }
+                let srcHeight = srcText.boundingRect(with: CGSize(width: 1200, height: 200),
+                                                      options: .usesLineFragmentOrigin,
+                                                      attributes: srcAttrsWithAlpha, context: nil).height
+                srcText.draw(in: CGRect(x: 40, y: y, width: 1200, height: srcHeight), withAttributes: srcAttrsWithAlpha)
+                y += srcHeight + gap
+
+                let dstText = (line.dst.isEmpty ? "…" : line.dst) as NSString
+                let dstAttrsFinal = line.dst.isEmpty ? dstEmptyAttrs : dstAttrs
+                let dstAttrsWithAlpha = idx == 0 ? dstAttrsFinal : dstAttrsFinal.mapValues { value in
+                    if let color = value as? UIColor {
+                        return color.withAlphaComponent(0.55)
+                    }
+                    return value
+                }
+                let dstHeight = dstText.boundingRect(with: CGSize(width: 1200, height: 200),
+                                                      options: .usesLineFragmentOrigin,
+                                                      attributes: dstAttrsWithAlpha, context: nil).height
+                dstText.draw(in: CGRect(x: 40, y: y, width: 1200, height: dstHeight), withAttributes: dstAttrsWithAlpha)
+                y += dstHeight + pairGap
+            }
+
+            let statusHeight = statusStr.boundingRect(with: CGSize(width: 1200, height: 100),
+                                                       options: .usesLineFragmentOrigin,
+                                                       attributes: statusAttrs, context: nil).height
+            let statusY = size.height - statusHeight - 20
+            statusStr.draw(in: CGRect(x: 40, y: statusY, width: 1200, height: statusHeight), withAttributes: statusAttrs)
         }
     }
 
@@ -461,7 +708,7 @@ final class StatusMonitor: ObservableObject {
 
     private func updateKeychainStatus() {
         DispatchQueue.main.async {
-            self.keychainStatus = SharedKeychain.read() ?? "无"
+            self.keychainStatus = SharedKeychain.readExtStatus() ?? "无"
         }
     }
 
@@ -479,6 +726,66 @@ final class StatusMonitor: ObservableObject {
         }, name, nil, .deliverImmediately)
 
         self.darwinObserver = observer
+    }
+}
+
+final class LinesMonitor: ObservableObject {
+    @Published var lines: [RecentLine] = []
+    @Published var darwinNotificationCount: Int = 0
+
+    private var linesObserver: UnsafeRawPointer?
+    private var pollTimer: Timer?
+
+    init() {
+        registerLinesNotification()
+        startPolling()
+        refreshFromKeychain()
+    }
+
+    deinit {
+        stopPolling()
+        if let observer = linesObserver {
+            CFNotificationCenterRemoveObserver(CFNotificationCenterGetDarwinNotifyCenter(), observer, nil, nil)
+        }
+    }
+
+    private func registerLinesNotification() {
+        let center = CFNotificationCenterGetDarwinNotifyCenter()
+        let name = "com.wyl2607.rsios.spike.lines" as CFString
+        let observer = UnsafeRawPointer(Unmanaged.passUnretained(self).toOpaque())
+
+        CFNotificationCenterAddObserver(center, observer, { _, observer, _, _, _ in
+            guard let observer = observer else { return }
+            let monitor = Unmanaged<LinesMonitor>.fromOpaque(observer).takeUnretainedValue()
+            DispatchQueue.main.async {
+                monitor.darwinNotificationCount += 1
+                monitor.refreshFromKeychain()
+            }
+        }, name, nil, .deliverImmediately)
+
+        self.linesObserver = observer
+    }
+
+    private func startPolling() {
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.refreshFromKeychain()
+        }
+        pollTimer?.fire()
+    }
+
+    private func stopPolling() {
+        pollTimer?.invalidate()
+        pollTimer = nil
+    }
+
+    private func refreshFromKeychain() {
+        if let json = SharedKeychain.readLatestLines(),
+           let data = json.data(using: .utf8),
+           let lines = try? JSONDecoder().decode([RecentLine].self, from: data) {
+            DispatchQueue.main.async {
+                self.lines = lines
+            }
+        }
     }
 }
 

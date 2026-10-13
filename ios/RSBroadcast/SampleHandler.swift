@@ -3,6 +3,7 @@ import CoreMedia
 import AudioToolbox
 import os
 import Darwin.Mach
+import Foundation
 
 class SampleHandler: RPBroadcastSampleHandler {
     private let logger = Logger(subsystem: "com.wyl2607.rsios.spike", category: "ext")
@@ -17,13 +18,69 @@ class SampleHandler: RPBroadcastSampleHandler {
     private var formatFlags: UInt32 = 0
     private var isNonInterleaved: Bool = false
 
+    private var converter: PCMConverter?
+    private var session: NodeSession?
+    private var nodeName: String = ""
+    private var readyReceived = false
+    private var framesSent: UInt64 = 0
+    private var finalsCount: Int = 0
+    private var translationsCount: Int = 0
+    private var preReadyDropped: UInt64 = 0
+    private var lastStatusCode: String = ""
+    private var fatalErrorOccurred = false
+
+    private var recentLines: [RecentLine] = []
+    private let maxRecentLines = 3
+
+    struct RecentLine: Codable {
+        let id: Int
+        let src: String
+        var dst: String
+    }
+
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
         logger.info("Broadcast started")
         writeStatus("started")
+
+        guard let json = SharedKeychain.readNodeConfig(),
+              let data = json.data(using: .utf8),
+              let config = try? JSONDecoder().decode(NodeConfig.self, from: data) else {
+            writeStatus("no_config")
+            return
+        }
+
+        nodeName = config.name
+        converter = PCMConverter()
+        readyReceived = false
+        framesSent = 0
+        finalsCount = 0
+        translationsCount = 0
+        preReadyDropped = 0
+        lastStatusCode = ""
+        fatalErrorOccurred = false
+        recentLines = []
+
+        session = NodeSession(
+            url: config.sessionURL,
+            token: config.token,
+            src: config.src,
+            dst: config.dst,
+            onEvent: { [weak self] event in
+                self?.handleNodeEvent(event)
+            },
+            onClose: { [weak self] code in
+                self?.handleNodeClose(code)
+            }
+        )
+        session?.start()
     }
 
     override func broadcastFinished() {
         logger.info("Broadcast finished")
+        session?.flush()
+        session?.close()
+        session = nil
+        converter = nil
         writeStatus("finished")
     }
 
@@ -66,25 +123,75 @@ class SampleHandler: RPBroadcastSampleHandler {
             let avgRMS = rmsSampleCount > 0 ? accumulatedRMS / Float(rmsSampleCount) : 0
             let memMB = residentMemoryMB()
             let interleavedStr = isNonInterleaved ? "0" : "1"
-            let status = "blocks=\(blockCount) rate=\(Int(sampleRate)) ch=\(channelCount) fmt=\(formatString) flags=\(formatFlags) ileave=\(interleavedStr) rms=\(String(format: "%.3f", avgRMS)) mem=\(memMB)"
+            let readyStr = readyReceived ? "1" : "0"
+            let status = "blocks=\(blockCount) rate=\(Int(sampleRate)) ch=\(channelCount) fmt=\(formatString) flags=\(formatFlags) ileave=\(interleavedStr) rms=\(String(format: "%.3f", avgRMS)) mem=\(memMB) node=\(nodeName) ready=\(readyStr) sent=\(framesSent) finals=\(finalsCount) tx=\(translationsCount) last=\(lastStatusCode.isEmpty ? "-" : lastStatusCode)"
             writeStatus(status)
             lastWriteTime = now
             accumulatedRMS = 0
             rmsSampleCount = 0
         }
+
+        guard let converter = converter, let session = session, !fatalErrorOccurred else { return }
+
+        let frames = converter.append(sampleBuffer)
+        for frame in frames {
+            if readyReceived {
+                session.send(pcm16k: frame)
+                framesSent += 1
+            } else {
+                preReadyDropped += 1
+            }
+        }
+    }
+
+    private func handleNodeEvent(_ event: NodeEvent) {
+        switch event {
+        case .ready(let cold):
+            readyReceived = true
+            logger.info("Node ready cold=\(cold)")
+        case .final(let id, _, _, let text):
+            finalsCount += 1
+            recentLines.append(RecentLine(id: id, src: text, dst: ""))
+            if recentLines.count > maxRecentLines {
+                recentLines.removeFirst()
+            }
+            writeLatestLines()
+        case .translation(let id, let text):
+            translationsCount += 1
+            if let idx = recentLines.firstIndex(where: { $0.id == id }) {
+                recentLines[idx].dst = text
+                writeLatestLines()
+            }
+        case .status(let code, let text, _):
+            lastStatusCode = code
+            logger.info("Node status: \(code) \(text)")
+            if NodeEvent.isFatal(code: code) {
+                fatalErrorOccurred = true
+            }
+        case .drained:
+            break
+        }
+    }
+
+    private func handleNodeClose(_ code: Int) {
+        let displayCode = code == 1013 ? "busy" : "\(code)"
+        lastStatusCode = "closed=\(displayCode)"
+        fatalErrorOccurred = true
+        logger.info("Node closed: \(code)")
     }
 
     private func computeRMS(sampleBuffer: CMSampleBuffer, asbd: AudioStreamBasicDescription) -> Float {
         guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return 0 }
 
-        var length: Int = 0
+        var lengthAtOffset: Int = 0
+        var totalLength: Int = 0
         var dataPointer: UnsafeMutablePointer<Int8>?
-        CMBlockBufferGetDataPointer(dataBuffer, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &length, dataPointerOut: &dataPointer)
-        guard length > 0, let ptr = dataPointer else { return 0 }
+        CMBlockBufferGetDataPointer(dataBuffer, atOffset: 0, lengthAtOffsetOut: &lengthAtOffset, totalLengthOut: &totalLength, dataPointerOut: &dataPointer)
+        guard lengthAtOffset > 0, let ptr = dataPointer else { return 0 }
 
         let bitsPerChannel = Int(asbd.mBitsPerChannel)
         let bytesPerSample = bitsPerChannel / 8
-        let sampleCount = length / bytesPerSample
+        let sampleCount = lengthAtOffset / bytesPerSample
         guard sampleCount > 0 else { return 0 }
 
         var sumSquares: Float = 0
@@ -130,16 +237,35 @@ class SampleHandler: RPBroadcastSampleHandler {
     }
 
     private func writeStatus(_ text: String) {
-        let success = SharedKeychain.write(text)
+        let success = SharedKeychain.writeExtStatus(text)
         if !success {
-            logger.error("Failed to write status to keychain: \(text, privacy: .public)")
+            logger.error("Failed to write status to keychain")
         }
         postDarwinNotification()
+    }
+
+    private func writeLatestLines() {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = []
+        if let data = try? encoder.encode(recentLines),
+           let json = String(data: data, encoding: .utf8) {
+            let success = SharedKeychain.writeLatestLines(json)
+            if !success {
+                logger.error("Failed to write latest_lines to keychain")
+            }
+            postLinesNotification()
+        }
     }
 
     private func postDarwinNotification() {
         let center = CFNotificationCenterGetDarwinNotifyCenter()
         let name = "com.wyl2607.rsios.spike.tick" as CFString
+        CFNotificationCenterPostNotification(center, CFNotificationName(name), nil, nil, true)
+    }
+
+    private func postLinesNotification() {
+        let center = CFNotificationCenterGetDarwinNotifyCenter()
+        let name = "com.wyl2607.rsios.spike.lines" as CFString
         CFNotificationCenterPostNotification(center, CFNotificationName(name), nil, nil, true)
     }
 }
