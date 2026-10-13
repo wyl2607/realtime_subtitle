@@ -17,6 +17,7 @@ struct NodeSelftest {
         testCloseReason(check)
         pcmChecks(sampleRate: 48_000, channels: 2, check: check)
         pcmChecks(sampleRate: 44_100, channels: 1, check: check)
+        testCMSampleBufferPaths(check)
 
         if failures.isEmpty {
             print("SELFTEST OK")
@@ -244,5 +245,306 @@ struct NodeSelftest {
             sampleBufferOut: &sampleBuffer
         ) == noErr, let sampleBuffer else { return nil }
         return sampleBuffer
+    }
+
+    /// 造指定格式的 1 秒 440Hz 正弦 CMSampleBuffer，用于测试 PCMConverter.append
+    static func makeTestSampleBuffer(
+        sampleRate: Double,
+        channels: Int,
+        isFloat: Bool,
+        isBigEndian: Bool,
+        isNonInterleaved: Bool
+    ) -> CMSampleBuffer? {
+        let frames = Int(sampleRate)
+        let amplitude = 0.5
+        let freq = 440.0
+        var samples: [Float] = []
+        samples.reserveCapacity(frames * channels)
+        for f in 0..<frames {
+            let t = Double(f) / sampleRate
+            let v = Float(amplitude * sin(2.0 * Double.pi * freq * t))
+            for _ in 0..<channels { samples.append(v) }
+        }
+
+        let bytesPerSample = isFloat ? 4 : 2
+        let byteCount = samples.count * bytesPerSample
+        var data = Data(count: byteCount)
+
+        data.withUnsafeMutableBytes { (dst: UnsafeMutableRawBufferPointer) in
+            guard let base = dst.baseAddress else { return }
+            let bytePtr = base.assumingMemoryBound(to: UInt8.self)
+
+            if isFloat {
+                if isNonInterleaved {
+                    for ch in 0..<channels {
+                        for f in 0..<frames {
+                            let sample = samples[f * channels + ch]
+                            let offset = (ch * frames + f) * bytesPerSample
+                            let bits = sample.bitPattern
+                            if isBigEndian {
+                                bytePtr[offset] = UInt8(bits >> 24)
+                                bytePtr[offset + 1] = UInt8((bits >> 16) & 0xFF)
+                                bytePtr[offset + 2] = UInt8((bits >> 8) & 0xFF)
+                                bytePtr[offset + 3] = UInt8(bits & 0xFF)
+                            } else {
+                                bytePtr[offset] = UInt8(bits & 0xFF)
+                                bytePtr[offset + 1] = UInt8((bits >> 8) & 0xFF)
+                                bytePtr[offset + 2] = UInt8((bits >> 16) & 0xFF)
+                                bytePtr[offset + 3] = UInt8(bits >> 24)
+                            }
+                        }
+                    }
+                } else {
+                    for f in 0..<frames {
+                        for ch in 0..<channels {
+                            let sample = samples[f * channels + ch]
+                            let offset = (f * channels + ch) * bytesPerSample
+                            let bits = sample.bitPattern
+                            if isBigEndian {
+                                bytePtr[offset] = UInt8(bits >> 24)
+                                bytePtr[offset + 1] = UInt8((bits >> 16) & 0xFF)
+                                bytePtr[offset + 2] = UInt8((bits >> 8) & 0xFF)
+                                bytePtr[offset + 3] = UInt8(bits & 0xFF)
+                            } else {
+                                bytePtr[offset] = UInt8(bits & 0xFF)
+                                bytePtr[offset + 1] = UInt8((bits >> 8) & 0xFF)
+                                bytePtr[offset + 2] = UInt8((bits >> 16) & 0xFF)
+                                bytePtr[offset + 3] = UInt8(bits >> 24)
+                            }
+                        }
+                    }
+                }
+            } else {
+                var intSamples: [Int16] = []
+                intSamples.reserveCapacity(samples.count)
+                for s in samples {
+                    intSamples.append(Int16(max(-32768, min(32767, Int(s * 32767.0)))))
+                }
+                if isNonInterleaved {
+                    for ch in 0..<channels {
+                        for f in 0..<frames {
+                            let sample = intSamples[f * channels + ch]
+                            let offset = (ch * frames + f) * bytesPerSample
+                            if isBigEndian {
+                                bytePtr[offset] = UInt8((sample >> 8) & 0xFF)
+                                bytePtr[offset + 1] = UInt8(sample & 0xFF)
+                            } else {
+                                bytePtr[offset] = UInt8(sample & 0xFF)
+                                bytePtr[offset + 1] = UInt8((sample >> 8) & 0xFF)
+                            }
+                        }
+                    }
+                } else {
+                    for f in 0..<frames {
+                        for ch in 0..<channels {
+                            let sample = intSamples[f * channels + ch]
+                            let offset = (f * channels + ch) * bytesPerSample
+                            if isBigEndian {
+                                bytePtr[offset] = UInt8((sample >> 8) & 0xFF)
+                                bytePtr[offset + 1] = UInt8(sample & 0xFF)
+                            } else {
+                                bytePtr[offset] = UInt8(sample & 0xFF)
+                                bytePtr[offset + 1] = UInt8((sample >> 8) & 0xFF)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        var flags = AudioFormatFlags(kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked)
+        if isFloat {
+            flags = flags | kAudioFormatFlagIsFloat
+        }
+        if isBigEndian {
+            flags = flags | kAudioFormatFlagIsBigEndian
+        }
+        if isNonInterleaved {
+            flags = flags | kAudioFormatFlagIsNonInterleaved
+        }
+
+        var asbd = AudioStreamBasicDescription(
+            mSampleRate: sampleRate,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: flags,
+            mBytesPerPacket: UInt32(bytesPerSample * (isNonInterleaved ? 1 : channels)),
+            mFramesPerPacket: 1,
+            mBytesPerFrame: UInt32(bytesPerSample * (isNonInterleaved ? 1 : channels)),
+            mChannelsPerFrame: UInt32(channels),
+            mBitsPerChannel: UInt32(bytesPerSample * 8),
+            mReserved: 0
+        )
+
+        var formatDescription: CMAudioFormatDescription?
+        guard CMAudioFormatDescriptionCreate(
+            allocator: nil,
+            asbd: &asbd,
+            layoutSize: 0,
+            layout: nil,
+            magicCookieSize: 0,
+            magicCookie: nil,
+            extensions: nil,
+            formatDescriptionOut: &formatDescription
+        ) == noErr, let formatDescription else { return nil }
+
+        var blockBuffer: CMBlockBuffer?
+        guard CMBlockBufferCreateWithMemoryBlock(
+            allocator: nil,
+            memoryBlock: nil,
+            blockLength: byteCount,
+            blockAllocator: nil,
+            customBlockSource: nil,
+            offsetToData: 0,
+            dataLength: byteCount,
+            flags: 0,
+            blockBufferOut: &blockBuffer
+        ) == kCMBlockBufferNoErr, let blockBuffer else { return nil }
+
+        let copied = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> OSStatus in
+            guard let base = raw.baseAddress else { return -1 }
+            return CMBlockBufferReplaceDataBytes(
+                with: base,
+                blockBuffer: blockBuffer,
+                offsetIntoDestination: 0,
+                dataLength: byteCount
+            )
+        }
+        guard copied == kCMBlockBufferNoErr else { return nil }
+
+        var timing = CMSampleTimingInfo(
+            duration: CMTime(value: 1, timescale: Int32(sampleRate)),
+            presentationTimeStamp: CMTime(value: 0, timescale: Int32(sampleRate)),
+            decodeTimeStamp: CMTime.invalid
+        )
+        var sampleBuffer: CMSampleBuffer?
+        guard CMSampleBufferCreate(
+            allocator: nil,
+            dataBuffer: blockBuffer,
+            dataReady: true,
+            makeDataReadyCallback: nil,
+            refcon: nil,
+            formatDescription: formatDescription,
+            sampleCount: frames,
+            sampleTimingEntryCount: 1,
+            sampleTimingArray: &timing,
+            sampleSizeEntryCount: 0,
+            sampleSizeArray: nil,
+            sampleBufferOut: &sampleBuffer
+        ) == noErr, let sampleBuffer else { return nil }
+        return sampleBuffer
+    }
+
+    static func testCMSampleBufferPaths(_ check: (Bool, String) -> Void) {
+        let expectedTotal = 32000
+        let tolerance = 3200
+        let expectedNormRMS = 0.5 / sqrt(2.0)
+        let rmsTolerance = 0.20
+
+        func runTest(
+            name: String,
+            sampleRate: Double,
+            channels: Int,
+            isFloat: Bool,
+            isBigEndian: Bool,
+            isNonInterleaved: Bool
+        ) {
+            guard let sampleBuffer = makeTestSampleBuffer(
+                sampleRate: sampleRate,
+                channels: channels,
+                isFloat: isFloat,
+                isBigEndian: isBigEndian,
+                isNonInterleaved: isNonInterleaved
+            ) else {
+                check(false, "\(name) 构造 CMSampleBuffer 失败")
+                return
+            }
+
+            let converter = PCMConverter()
+            let frames = converter.append(sampleBuffer)
+
+            var total = 0
+            var all3200 = true
+            for fr in frames {
+                total += fr.count
+                if fr.count != 3200 { all3200 = false }
+            }
+            check(all3200, "\(name) 每帧 3200 字节")
+            check(!frames.isEmpty, "\(name) append 有帧")
+            check(abs(total - expectedTotal) <= tolerance,
+                  "\(name) 总字节 ≈ 32000（实际 \(total)）")
+
+            let outputNormRMS = rmsInt16DataNormalized(Data(frames.joined()))
+            let relDiff = expectedNormRMS > 0 ? abs(outputNormRMS - expectedNormRMS) / expectedNormRMS : 0
+            check(relDiff < rmsTolerance, "\(name) 归一化 RMS 相差 <20%（预期 \(expectedNormRMS)，实际 \(outputNormRMS)，相对差 \(relDiff)）")
+        }
+
+        runTest(name: "44.1kHz立体声Int16大端交错", sampleRate: 44100, channels: 2, isFloat: false, isBigEndian: true, isNonInterleaved: false)
+        runTest(name: "48kHz立体声Int16小端交错", sampleRate: 48000, channels: 2, isFloat: false, isBigEndian: false, isNonInterleaved: false)
+        runTest(name: "48kHz立体声Float32非交错", sampleRate: 48000, channels: 2, isFloat: true, isBigEndian: false, isNonInterleaved: true)
+    }
+
+    static func rmsInt16DataNormalized(_ data: Data) -> Double {
+        let count = data.count / 2
+        guard count > 0 else { return 0 }
+        var sum = 0.0
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.baseAddress else { return }
+            let p = base.assumingMemoryBound(to: Int16.self)
+            for i in 0..<count {
+                let v = Double(p[i]) / 32768.0
+                sum += v * v
+            }
+        }
+        return (sum / Double(count)).squareRoot()
+    }
+
+    static func extractFrames(from sampleBuffer: CMSampleBuffer, startFrame: Int, frameCount: Int) -> CMSampleBuffer? {
+        guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer) else { return nil }
+        let duration = CMSampleBufferGetDuration(sampleBuffer)
+        let presTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let timescale = duration.timescale
+        let timing = CMSampleTimingInfo(
+            duration: CMTime(value: Int64(frameCount), timescale: timescale),
+            presentationTimeStamp: CMTime(value: Int64(startFrame), timescale: presTime.timescale),
+            decodeTimeStamp: CMTime.invalid
+        )
+        var newBuffer: CMSampleBuffer?
+        let status = CMSampleBufferCreateCopyWithNewTiming(
+            allocator: nil,
+            sampleBuffer: sampleBuffer,
+            sampleTimingEntryCount: 1,
+            sampleTimingArray: [timing],
+            sampleBufferOut: &newBuffer
+        )
+        guard status == noErr, let newBuffer else { return nil }
+
+        let totalFrames = CMSampleBufferGetNumSamples(newBuffer)
+        guard totalFrames >= frameCount else { return newBuffer }
+
+        let duration2 = CMSampleBufferGetDuration(newBuffer)
+        let presTime2 = CMSampleBufferGetPresentationTimeStamp(newBuffer)
+        let timescale2 = duration2.timescale
+        var timing2 = CMSampleTimingInfo(
+            duration: CMTime(value: Int64(frameCount), timescale: timescale2),
+            presentationTimeStamp: CMTime(value: 0, timescale: presTime2.timescale),
+            decodeTimeStamp: CMTime.invalid
+        )
+        var finalBuffer: CMSampleBuffer?
+        let status2 = CMSampleBufferCreate(
+            allocator: nil,
+            dataBuffer: CMSampleBufferGetDataBuffer(newBuffer),
+            dataReady: true,
+            makeDataReadyCallback: nil,
+            refcon: nil,
+            formatDescription: formatDescription,
+            sampleCount: frameCount,
+            sampleTimingEntryCount: 1,
+            sampleTimingArray: &timing2,
+            sampleSizeEntryCount: 0,
+            sampleSizeArray: nil,
+            sampleBufferOut: &finalBuffer
+        )
+        guard status2 == noErr, let finalBuffer else { return nil }
+        return finalBuffer
     }
 }

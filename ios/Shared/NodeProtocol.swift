@@ -176,7 +176,7 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
     /// 发 close 1000 并结束会话。
     func close() {
         socket?.cancel(with: .normalClosure, reason: nil)
-        session?.invalidateAndCancel()
+        session?.finishTasksAndInvalidate()
     }
 
     private func receiveLoop() {
@@ -189,7 +189,11 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
                 }
                 self?.receiveLoop()
             case .failure:
-                self?.notifyClosed(1006)
+                if socket.closeCode != .invalid {
+                    self?.notifyClosed(NodeEvent.closeReason(code: socket.closeCode.rawValue, reasonData: socket.closeReason))
+                } else {
+                    self?.notifyClosed(1006)
+                }
             }
         }
     }

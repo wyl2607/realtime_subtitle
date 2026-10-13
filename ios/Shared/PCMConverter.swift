@@ -205,9 +205,9 @@ final class PCMConverter {
     }
 
     private func int16(from bytes: UnsafePointer<UInt8>, offset: Int, bigEndian: Bool) -> Int16 {
-        let lo = bytes[offset]
-        let hi = bytes[offset + 1]
-        let value: UInt16 = bigEndian ? (UInt16(hi) << 8) | UInt16(lo) : (UInt16(lo) << 8) | UInt16(hi)
+        let b0 = bytes[offset]
+        let b1 = bytes[offset + 1]
+        let value: UInt16 = bigEndian ? (UInt16(b0) << 8) | UInt16(b1) : UInt16(b0) | (UInt16(b1) << 8)
         return Int16(bitPattern: value)
     }
 
