@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -142,6 +143,205 @@ def print_table(rows: list[dict]) -> None:
         print("  ".join(str(c).ljust(w) for c, w in zip(line, widths)).rstrip())
 
 
+def _run_ssh(host: str, cmd: list[str]) -> tuple[int, bytes]:
+    result = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host] + cmd,
+        capture_output=True, timeout=20, stdin=subprocess.DEVNULL,
+    )
+    # 只要 stdout：stderr 里是 ssh 警告和命令报错（中文 Windows 还是 GBK），混进来会被当成结果
+    return result.returncode, result.stdout
+
+
+def _decode_bytes(data: bytes) -> str:
+    return data.decode("utf-8", "replace")
+
+
+def doctor_node(node: dict) -> dict:
+    nid = node.get("id", "?")
+    row = {
+        "id": nid,
+        "ollama": "—",
+        "tailscale": "—",
+        "disk_gb": None,
+        "auto_login": False,
+        "commit": "—",
+        "issues": "—",
+    }
+    # 先判断 OS；若 ssh 完全失败则标记离线
+    # ssh 自身连不上返回 255；Windows 没有 uname，stdout 为空但能连上
+    try:
+        rc, out_bytes = _run_ssh(nid, ["uname", "-s"])
+    except Exception:
+        rc, out_bytes = 255, b""
+    if rc == 255:
+        return {**row, "issues": "离线（ssh 失败）"}
+    text_uname = _decode_bytes(out_bytes)
+    os_kind = "mac" if text_uname.strip().splitlines()[:1] == ["Darwin"] else "windows"
+
+    # Ollama
+    if os_kind == "mac":
+        ollama_cmd = ["curl", "-s", "http://127.0.0.1:11434/api/version"]
+    else:
+        ollama_cmd = ["curl.exe", "-s", "http://127.0.0.1:11434/api/version"]
+    try:
+        rc, out_bytes = _run_ssh(nid, ollama_cmd)
+        text = _decode_bytes(out_bytes)
+        # 尝试解析 JSON 提取 version
+        try:
+            data = json.loads(text)
+            ver = data.get("version")
+            row["ollama"] = ver if ver else "未运行"
+        except Exception:
+            if '"version"' in text or text.strip().startswith("{"):
+                m = re.search(r'"version"\s*:\s*"([^"]+)"', text)
+                row["ollama"] = m.group(1) if m else "有响应"
+            else:
+                row["ollama"] = "未运行"
+    except Exception:
+        row["ollama"] = "未运行"
+
+    # Tailscale
+    if os_kind == "mac":
+        env_cmd = [
+            "env", "TAILSCALE_BE_CLI=1",
+            "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+            "status", "--json",
+        ]
+    else:
+        env_cmd = ['"C:\\Program Files\\Tailscale\\tailscale.exe"', "status", "--json"]
+    try:
+        rc, out_bytes = _run_ssh(nid, env_cmd)
+        text = _decode_bytes(out_bytes)
+        try:
+            data = json.loads(text)
+            state = data.get("BackendState")
+            row["tailscale"] = state if state else "—"
+        except Exception:
+            row["tailscale"] = "—"
+    except Exception:
+        row["tailscale"] = "—"
+
+    # 磁盘余量（GB）
+    if os_kind == "mac":
+        disk_cmd = ["sh -c 'df -k \"$HOME\" | tail -1'"]
+    else:
+        disk_cmd = ["powershell", "-NoProfile", "-Command", "(Get-PSDrive C).Free/1GB"]
+    try:
+        rc, out_bytes = _run_ssh(nid, disk_cmd)
+        text = _decode_bytes(out_bytes)
+        lines = text.strip().splitlines()
+        if lines:
+            parts = lines[-1].split()
+            if os_kind == "mac" and len(parts) >= 4:
+                try:
+                    row["disk_gb"] = round(float(parts[3]) / 1024 / 1024, 1)
+                except ValueError:
+                    pass
+            else:
+                m = re.search(r"([\d\.]+)", text)
+                if m:
+                    try:
+                        row["disk_gb"] = float(m.group(1))
+                    except ValueError:
+                        pass
+    except Exception:
+        pass
+
+    # 自动登录
+    if os_kind == "mac":
+        auto_cmd = ["defaults", "read", "/Library/Preferences/com.apple.loginwindow", "autoLoginUser"]
+    else:
+        auto_cmd = [
+            "reg", "query",
+            "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
+            "/v", "AutoAdminLogon",
+        ]
+    try:
+        rc, out_bytes = _run_ssh(nid, auto_cmd)
+        text = _decode_bytes(out_bytes) if rc == 0 else ""
+        if os_kind == "mac":
+            row["auto_login"] = bool(text.strip() and text.strip() != "(null)")
+        else:
+            # 只认 AutoAdminLogon 这一行的值为 1（任意输出里出现字符 "1" 不算）
+            row["auto_login"] = re.search(r"AutoAdminLogon\s+REG_\w+\s+(0x)?1\s*$", text, re.MULTILINE) is not None
+    except Exception:
+        row["auto_login"] = False
+
+    # 节点代码版本
+    if os_kind == "mac":
+        commit_cmd = ["cat", "~/rs-node/.rs_commit", "2>/dev/null"]
+    else:
+        commit_cmd = ["cmd", "/c", "type", "%LOCALAPPDATA%\\rs-node\\app\\.rs_commit"]
+    try:
+        rc, out_bytes = _run_ssh(nid, commit_cmd)
+        text = _decode_bytes(out_bytes) if rc == 0 else ""
+        val = text.strip()
+        row["commit"] = val if val else "—"
+    except Exception:
+        row["commit"] = "—"
+
+    # 结论列
+    issues = []
+    if row["ollama"] == "未运行":
+        issues.append("Ollama 未运行")
+    if row["tailscale"] not in ("Running", "—"):
+        issues.append(f"Tailscale {row['tailscale']}")
+    if row["disk_gb"] is not None and row["disk_gb"] < 10:
+        issues.append("磁盘<10GB")
+    if not row["auto_login"]:
+        issues.append("未开自动登录：重启后需手动登录")
+    if not issues:
+        row["issues"] = "OK"
+    else:
+        row["issues"] = "; ".join(issues)
+    return row
+
+
+def doctor(nodes: list[dict], ids: list[str]) -> list[dict]:
+    chosen = [n for n in nodes if not ids or n.get("id") in ids]
+    unknown = set(ids) - {n.get("id") for n in chosen}
+    # 不打印 error，只在结果里标记
+    results: list[dict] = []
+    def work(node: dict) -> dict:
+        return doctor_node(node)
+    if not chosen:
+        return []
+    with ThreadPoolExecutor(max_workers=max(1, len(chosen))) as pool:
+        results = list(pool.map(work, chosen))
+    # 对未知 id 的处理：若有，附加离线记录（不影响主流）
+    for unk in sorted(unknown):
+        results.append({
+            "id": unk,
+            "ollama": "—",
+            "tailscale": "—",
+            "disk_gb": None,
+            "auto_login": False,
+            "commit": "—",
+            "issues": "节点不存在",
+        })
+    return results
+
+
+def print_doctor_table(rows: list[dict]) -> None:
+    head = ["节点", "Ollama", "Tailscale", "磁盘GB", "自动登录", "代码版本", "结论"]
+    lines = [head]
+    for r in rows:
+        auto_text = "是" if r.get("auto_login") else "否"
+        disk_text = f"{r['disk_gb']:.1f}" if r.get("disk_gb") is not None else "—"
+        lines.append([
+            r.get("id", "?"),
+            r.get("ollama", "—"),
+            r.get("tailscale", "—"),
+            disk_text,
+            auto_text,
+            r.get("commit", "—"),
+            r.get("issues", "—"),
+        ])
+    widths = [max(len(str(line[i])) for line in lines) for i in range(len(head))]
+    for line in lines:
+        print("  ".join(str(c).ljust(w) for c, w in zip(line, widths)).rstrip())
+
+
 def detect_os(host: str) -> str:
     # 中文 Windows 的 cmd 会用 GBK 回「'uname' 不是内部或外部命令」，按 UTF-8 解会抛错：
     # 只认 Darwin，其余字节一律容错解码
@@ -191,8 +391,18 @@ def main(argv: list[str] | None = None) -> int:
     u = sub.add_parser("update")
     u.add_argument("--force", action="store_true")
     u.add_argument("ids", nargs="*")
+    d = sub.add_parser("doctor")
+    d.add_argument("--json", action="store_true")
+    d.add_argument("ids", nargs="*")
     args = ap.parse_args(argv)
     nodes = load_nodes()
+    if args.cmd == "doctor":
+        rows = doctor(nodes, args.ids or [])
+        if args.json:
+            print(json.dumps(rows, ensure_ascii=False, indent=1))
+        else:
+            print_doctor_table(rows)
+        return 0
     if args.cmd == "status":
         rows = all_status(nodes)
         if args.json:

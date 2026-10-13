@@ -1026,6 +1026,9 @@ def test_asr_thread_baseexception_death_makes_worker_exit_internal():
     assert _SECRET not in err and _SECRET not in out
 
 
+@pytest.mark.skipif(sys.platform == "darwin" and os.environ.get("RS_TEST_SEGV") != "1",
+                    reason="故意段错误会让 macOS 每跑一次就弹一份 Python 崩溃报告（2026-10-12 用户误以为是故障）；"
+                           "需要时设 RS_TEST_SEGV=1 再跑，Windows/CI 照常跑")
 def test_faulthandler_dumps_frames_without_locals_on_native_crash():
     p = _spawn_death("segv")
     try:

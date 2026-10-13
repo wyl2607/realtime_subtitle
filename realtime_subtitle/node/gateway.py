@@ -50,6 +50,7 @@ except ImportError:  # pragma: no cover - depends on platform/websockets build
     unix_serve = None
 
 from realtime_subtitle.node import info as node_info
+from realtime_subtitle.node.ollama_watchdog import OllamaWatchdog, create_macos_launchctl_spawn, default_spawn
 
 log = logging.getLogger("realtime_subtitle.node.gateway")
 _ws_log = logging.getLogger("realtime_subtitle.node.gateway.ws")
@@ -993,12 +994,22 @@ class Gateway:
             normalize_max_sessions(max_sessions) if max_sessions is not None else read_max_sessions(self._uds_dir)
         )
         self._token_poll: asyncio.Task | None = None
+        self._watchdog_task: asyncio.Task | None = None
         self._uds_server = None
         self._tcp_server = None
         self._tcp_task: asyncio.Task | None = None
         self.tcp_ready = asyncio.Event()
         self.tcp_host: str | None = None
         self.tcp_port: int | None = None
+
+        # Ollama watchdog: uses translator from asr_state.json (same source as info)
+        translator = self._info.asr_and_translator()[1]
+        self._watchdog = OllamaWatchdog(
+            translator,
+            probe=lambda: node_info.probe_translator_ok(translator),
+            # macOS 上 brew services 托管的 ollama 要用 launchctl kickstart，直接 serve 会和它抢端口
+            spawn=create_macos_launchctl_spawn() if sys.platform == "darwin" else default_spawn,
+        )
 
     @property
     def uds_path(self) -> Path:
@@ -1041,6 +1052,9 @@ class Gateway:
         if sys.platform == "win32" and self._token_file is not None:
             self._token_poll = asyncio.create_task(self._token_poll_loop())
 
+        # Ollama watchdog: tick every 60s in thread pool (probe does HTTP, spawn does Popen)
+        self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+
     async def _token_poll_loop(self) -> None:
         while True:
             await asyncio.sleep(TOKEN_POLL_S)
@@ -1049,7 +1063,22 @@ class Gateway:
             except Exception as e:  # noqa: BLE001
                 log.warning("tokens_reload_failed err=%s", type(e).__name__)
 
+    async def _watchdog_loop(self) -> None:
+        while True:
+            await asyncio.sleep(60.0)
+            try:
+                # probe/spawn do blocking I/O; run in thread pool to avoid blocking event loop
+                await asyncio.get_running_loop().run_in_executor(None, self._watchdog.tick)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 - tick 不能把 gateway 打崩
+                log.warning("watchdog_tick_failed err=%s", type(e).__name__)
+
     async def stop(self) -> None:
+        if self._watchdog_task is not None:
+            self._watchdog_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._watchdog_task
         if self._token_poll is not None:
             self._token_poll.cancel()
             with contextlib.suppress(asyncio.CancelledError):
