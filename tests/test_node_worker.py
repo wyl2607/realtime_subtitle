@@ -566,7 +566,8 @@ def test_whisper_engine_calls_model_without_second_vad():
     eng._backend, eng._model_name = "mlx", "m"
     out = eng.transcribe(np.zeros(SR, dtype=np.float32), "de")
     assert [u.text for u in out] == ["Hallo."]
-    assert calls["vad_filter"] is False and calls["word_timestamps"] is True
+    # 2026-10-13 起节点默认不要词时间戳（M4 每段 1.78s → 0.98s），句子时间由伪词插值
+    assert calls["vad_filter"] is False and calls["word_timestamps"] is False
     assert calls["language"] == "de" and calls["condition_on_previous_text"] is False
     info = eng.info()
     assert info["backend"] == "mlx" and info["model"] == "m" and info["rtf"] is not None
@@ -1541,3 +1542,54 @@ def test_round_robin_lets_the_other_session_progress():
     ev = [json.loads(line) for line in out.getvalue().decode().splitlines()]
     finals = {(e["sid"], e["text"]) for e in ev if e["ev"] == "final"}
     assert (1, "de") in finals and (2, "en") in finals
+
+
+# ---------------------------------------------------------------- 无词时间戳（2026-10-13：M4 每段 1.78s → 0.98s）
+
+
+def SNW(text, start, end, no_speech=0.0):
+    return SimpleNamespace(text=text, start=start, end=end, no_speech_prob=no_speech, words=None)
+
+
+def test_no_words_three_sentences_get_cumulative_times():
+    # 每句 10 个字符（含前导空格），3.0s 平均分：0-1、1-2、2-3
+    seg = SNW(" Eins zwei. Drei vier. Fünf sechs.", 0.0, 3.0)
+    got = utterances_from_segments([seg], "de")
+    assert [u.text for u in got] == ["Eins zwei.", "Drei vier.", "Fünf sechs."]
+    starts = [round(u.start, 2) for u in got]
+    ends = [round(u.end, 2) for u in got]
+    assert starts == sorted(starts) and ends == sorted(ends)
+    assert all(u.start <= u.end for u in got)
+    assert got[0].start == pytest.approx(0.03, abs=0.1) and got[-1].end == pytest.approx(3.0, abs=0.01)
+    assert got[1].start == pytest.approx(1.0, abs=0.15) and got[1].end == pytest.approx(2.0, abs=0.15)
+
+
+def test_no_words_sentence_spanning_two_segments_stays_one_utterance():
+    segs = [SNW(" Die Regierung hat heute", 0.0, 2.0), SNW(" neue Maßnahmen beschlossen.", 2.0, 4.0)]
+    got = utterances_from_segments(segs, "de")
+    assert [u.text for u in got] == ["Die Regierung hat heute neue Maßnahmen beschlossen."]
+    assert got[0].start == pytest.approx(0.0, abs=0.1) and got[0].end == pytest.approx(4.0, abs=0.01)
+
+
+def test_no_words_chinese_has_no_spaces_and_splits():
+    got = utterances_from_segments([SNW("你好。再见。", 0.0, 1.2)], "zh")
+    assert [u.text for u in got] == ["你好。", "再见。"]
+    assert got[0].end == pytest.approx(0.6, abs=0.01) and got[1].end == pytest.approx(1.2, abs=0.01)
+
+
+def test_no_words_matches_word_path_sentence_split():
+    with_words = S(" Das ist gut. Wir gehen.", [W(0.0, 0.3, " Das"), W(0.3, 0.5, " ist"), W(0.5, 0.9, " gut."),
+                                                W(1.2, 1.5, " Wir"), W(1.5, 2.0, " gehen.")])
+    a = [u.text for u in utterances_from_segments([with_words], "de")]
+    b = [u.text for u in utterances_from_segments([SNW(" Das ist gut. Wir gehen.", 0.0, 2.0)], "de")]
+    assert a == b == ["Das ist gut.", "Wir gehen."]
+
+
+def test_no_words_drops_no_speech_and_empty():
+    got = utterances_from_segments([SNW(" Hallo.", 0.0, 1.0, no_speech=0.95), SNW("", 1.0, 2.0)], "de")
+    assert got == []
+
+
+def test_engine_requests_no_word_timestamps_by_default():
+    from realtime_subtitle.node import engines
+    assert engines.NODE_WORD_TIMESTAMPS is False
