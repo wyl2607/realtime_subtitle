@@ -40,6 +40,12 @@ NODE_OLLAMA_KEEP_ALIVE = "3m"
 # keep_alive 3 分钟内用过的模型还在显存里，预热跳过；留 30 秒余量
 WARM_SKIP_S = 150.0
 
+# 节点识别是否开启词级时间戳。False 时每个 segment 按字符位置插值出「伪词」时间，
+# 切句逻辑与真词完全相同；客户端只用 a0/a1 做秒级重叠/回放判定，±0.5s 可接受。
+# 真机实测（M4 mini，2 分钟 tagesschau 切 7s 段，MLX turbo）：
+# word_timestamps=True：p50 1.78s；False：p50 0.98s（两轮一致）。
+NODE_WORD_TIMESTAMPS = False
+
 _log = logging.getLogger("node.engines")
 
 
@@ -103,6 +109,25 @@ def _is_hallucination(text: str) -> bool:
     return any(p in lowered for p in config.HALLUCINATION_BLACKLIST)
 
 
+def _pseudo_words(seg, strip_spaces: bool) -> list[tuple[float, float, str]]:
+    """没有词时间戳时，把一个 segment 的文本拆成「伪词」，按字符位置在 [start, end]
+    里线性插值时间。拉丁语系按「前导空白+非空白」切，保持与 Whisper 词带前导空格一致；
+    无空格语言逐字。之后走与真词完全相同的切句与映射逻辑。"""
+    text = seg.text or ""
+    toks = list(text.replace(" ", "")) if strip_spaces else re.findall(r"\s*\S+", text)
+    total = sum(len(t) for t in toks)
+    t0, t1 = float(seg.start), float(seg.end)
+    if total == 0 or t1 < t0:
+        return []
+    out: list[tuple[float, float, str]] = []
+    pos = 0
+    for t in toks:
+        a = t0 + (t1 - t0) * pos / total
+        pos += len(t)
+        out.append((a, t0 + (t1 - t0) * pos / total, t))
+    return out
+
+
 def utterances_from_segments(segments, language: str) -> list[Utterance]:
     """Whisper 的 segment（带词时间戳）→ 按句拆分的 Utterance。
 
@@ -117,8 +142,11 @@ def utterances_from_segments(segments, language: str) -> list[Utterance]:
             continue
         if _is_hallucination(seg.text):
             continue
-        for w in seg.words:
-            words.append((w.start, w.end, w.word.lstrip() if strip_spaces else w.word))
+        if getattr(seg, "words", None):
+            for w in seg.words:
+                words.append((w.start, w.end, w.word.lstrip() if strip_spaces else w.word))
+        else:
+            words.extend(_pseudo_words(seg, strip_spaces))
     if not words:
         return []
 
@@ -177,11 +205,12 @@ class WhisperEngine(AsrEngine):
         # vad_filter=False：段本身就是 Silero 切出来的，再过一遍 VAD 只是白耗时，
         # 还会让词时间戳多一层映射。condition_on_previous_text=False：每段独立
         # 识别，上一段的错字不该带进这一段
+        word_ts = NODE_WORD_TIMESTAMPS
         segments, _info = self._model.transcribe(
             audio,
             language=language,
             task=config.WHISPER_TASK,
-            word_timestamps=True,
+            word_timestamps=word_ts,
             condition_on_previous_text=False,
             vad_filter=False,
         )

@@ -220,7 +220,10 @@ python3 scripts/node/cluster.py status          # 表格：在线、延迟、识
 python3 scripts/node/cluster.py status --json   # 机器可读
 python3 scripts/node/cluster.py update          # 逐台重装（有会话在用的节点默认跳过）
 python3 scripts/node/cluster.py update --force mini2   # 只更新指定节点，且不管有没有人在用
+python3 scripts/node/cluster.py doctor [id ...]        # 逐台 ssh 体检（Ollama、Tailscale、磁盘、自动登录、代码版本）
+python3 scripts/node/cluster.py doctor --json m1        # 机器可读体检结果
 ```
 
 - 节点清单读 `~/.config/rslite/nodes.json`；查状态不 ssh，用本机 Tailscale 把节点名解析成 IP（必须在 100.64.0.0/10），直连 `/v1/info`，不走代理，token 只进请求头。
 - 更新时先 ssh `uname -s` 判断 Mac / Windows，分别调用 `install_node.sh` / `install_node_windows.sh`，装完再查一次状态；一台失败不影响其他台，最后给汇总。
+- `doctor` 子命令通过 ssh 对节点逐台检查 Ollama、Tailscale 状态、磁盘余量（GB）、自动登录状态及节点代码版本，并给出结论列（OK 或问题短语）；支持 `--json` 输出，单台失败不影响其他台，token 不出现在任何输出中。
