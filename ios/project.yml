@@ -14,7 +14,6 @@ options:
   groups:
     - RSiOS
     - RSBroadcast
-    - Shared
 settings:
   base:
     SWIFT_VERSION: "5.0"
@@ -41,21 +40,20 @@ targets:
     platform: iOS
     sources:
       - path: RSiOS
-    resources:
-      - path: RSiOS/Resources
+      - path: Shared
+        excludes:
+          - "**/Resources/**"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.wyl2607.rsios.spike
         INFOPLIST_FILE: RSiOS/Info.plist
         CODE_SIGN_ENTITLEMENTS: RSiOS/RSiOS.entitlements
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks @executable_path/../Frameworks"
-        FRAMEWORK_SEARCH_PATHS: "$(inherited) $(PROJECT_DIR)"
         ENABLE_BITCODE: "NO"
         TARGETED_DEVICE_FAMILY: "1,2"
     dependencies:
       - target: RSBroadcast
         embed: true
-      - target: Shared
     scheme:
       testTargets: []
   RSBroadcast:
@@ -63,8 +61,9 @@ targets:
     platform: iOS
     sources:
       - path: RSBroadcast
-    resources:
-      - path: RSBroadcast/Resources
+      - path: Shared
+        excludes:
+          - "**/Resources/**"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.wyl2607.rsios.spike.broadcast
@@ -72,28 +71,8 @@ targets:
         CODE_SIGN_ENTITLEMENTS: RSBroadcast/RSBroadcast.entitlements
         NSEXTENSION_POINT_IDENTIFIER: com.apple.broadcast-services-upload
         NSEXTENSION_PRINCIPAL_CLASS: $(PRODUCT_MODULE_NAME).SampleHandler
-        RPBROADCAST_PROCESS_MODE: RPBroadcastProcessModeSampleBuffer
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks @executable_path/../Frameworks"
-        FRAMEWORK_SEARCH_PATHS: "$(inherited) $(PROJECT_DIR)"
         ENABLE_BITCODE: "NO"
         TARGETED_DEVICE_FAMILY: "1,2"
-    dependencies:
-      - target: Shared
     scheme:
       testTargets: []
-  Shared:
-    type: framework
-    platform: iOS
-    productName: Shared
-    sources:
-      - path: Shared
-    resources:
-      - path: Shared/Resources
-    settings:
-      base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.wyl2607.rsios.shared
-        INFOPLIST_FILE: Shared/Resources/Info.plist
-        DEFINES_MODULE: "YES"
-        SKIP_INSTALL: "YES"
-        BUILD_LIBRARY_FOR_DISTRIBUTION: "YES"
-        ENABLE_BITCODE: "NO"

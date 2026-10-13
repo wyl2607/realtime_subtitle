@@ -5,11 +5,11 @@ import AVKit
 import CoreMedia
 import CoreVideo
 import os
-import Shared
 
 struct ContentView: View {
     @StateObject private var pipManager = PiPManager()
     @StateObject private var statusMonitor = StatusMonitor()
+    @ObservedObject private var appStateMonitor = AppStateMonitor.shared
 
     var body: some View {
         NavigationStack {
@@ -28,8 +28,18 @@ struct ContentView: View {
                 Divider()
 
                 VStack(spacing: 12) {
+                    Text("App State: \(appStateMonitor.isInBackground ? "后台" : "前台")")
+                        .font(.headline)
+                        .foregroundColor(appStateMonitor.isInBackground ? .orange : .green)
+
                     Text("Picture-in-Picture")
                         .font(.headline)
+
+                    PiPHostView(pipManager: pipManager)
+                        .frame(width: 320, height: 90)
+                        .background(Color(.systemGray6))
+                        .cornerRadius(8)
+
                     Button(action: {
                         if pipManager.isPiPActive {
                             pipManager.stopPiP()
@@ -42,6 +52,16 @@ struct ContentView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(pipManager.isStarting)
+
+                    HStack {
+                        Text("PiP Possible: \(pipManager.isPictureInPicturePossible ? "Yes" : "No")")
+                            .font(.caption)
+                            .foregroundColor(pipManager.isPictureInPicturePossible ? .green : .red)
+                        Spacer()
+                        Text(pipManager.pipStatusLine)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
 
                     if let error = pipManager.lastError {
                         Text("Error: \(error)")
@@ -91,19 +111,65 @@ struct BroadcastPickerView: UIViewRepresentable {
     func updateUIView(_ uiView: RPSystemBroadcastPickerView, context: Context) {}
 }
 
+struct PiPHostView: UIViewRepresentable {
+    @ObservedObject var pipManager: PiPManager
+
+    func makeUIView(context: Context) -> PiPHostUIView {
+        let view = PiPHostUIView()
+        view.pipManager = pipManager
+        return view
+    }
+
+    func updateUIView(_ uiView: PiPHostUIView, context: Context) {
+        uiView.pipManager = pipManager
+        uiView.updateLayerFrame()
+    }
+}
+
+final class PiPHostUIView: UIView {
+    weak var pipManager: PiPManager?
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        updateLayerFrame()
+    }
+
+    func updateLayerFrame() {
+        guard let layer = pipManager?.sampleBufferDisplayLayer else { return }
+        if layer.superlayer != self.layer {
+            self.layer.addSublayer(layer)
+        }
+        layer.frame = bounds
+    }
+}
+
 final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBufferPlaybackDelegate {
     @Published var isPiPActive = false
     @Published var isStarting = false
     @Published var lastError: String?
+    @Published var isPictureInPicturePossible = false
+    @Published var backgroundFrameCount = 0
 
     private var pipController: AVPictureInPictureController?
-    private var sampleBufferDisplayLayer: AVSampleBufferDisplayLayer?
+    fileprivate var sampleBufferDisplayLayer: AVSampleBufferDisplayLayer?
     private var renderTimer: Timer?
     private var frameCount = 0
+    private var pipPossibleObservation: NSKeyValueObservation?
+
+    var pipStatusLine: String {
+        let timeString = DateFormatter.timeFormatter.string(from: Date())
+        if backgroundFrameCount > 0 {
+            return "\(timeString) · 后台刷新 \(backgroundFrameCount) 帧"
+        }
+        return timeString
+    }
 
     override init() {
         super.init()
         setupAudioSession()
+        setupPiPLayerAndController()
+        observePiPPossible()
+        startRendering()
     }
 
     private func setupAudioSession() {
@@ -116,11 +182,7 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
         }
     }
 
-    func startPiP() {
-        guard !isStarting, !isPiPActive else { return }
-        isStarting = true
-        lastError = nil
-
+    private func setupPiPLayerAndController() {
         let layer = AVSampleBufferDisplayLayer()
         layer.videoGravity = .resizeAspect
         layer.backgroundColor = UIColor.clear.cgColor
@@ -133,7 +195,6 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
 
         guard AVPictureInPictureController.isPictureInPictureSupported() else {
             lastError = "PiP not supported on this device"
-            isStarting = false
             return
         }
 
@@ -141,25 +202,38 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
         controller.canStartPictureInPictureAutomaticallyFromInline = true
         controller.delegate = self
         self.pipController = controller
+    }
 
-        controller.startPictureInPicture()
+    private func observePiPPossible() {
+        guard let controller = pipController else { return }
+        pipPossibleObservation = controller.observe(\.isPictureInPicturePossible, options: [.initial, .new]) { [weak self] _, change in
+            DispatchQueue.main.async {
+                self?.isPictureInPicturePossible = change.newValue ?? false
+            }
+        }
+    }
 
-        startRendering()
+    func startPiP() {
+        guard !isStarting, !isPiPActive else { return }
+
+        guard isPictureInPicturePossible else {
+            lastError = "PiP 尚不可用（isPictureInPicturePossible=false）"
+            return
+        }
+
+        isStarting = true
+        lastError = nil
+        pipController?.startPictureInPicture()
     }
 
     func stopPiP() {
         pipController?.stopPictureInPicture()
-        stopRendering()
-        sampleBufferDisplayLayer?.flush()
-        sampleBufferDisplayLayer?.removeFromSuperlayer()
-        sampleBufferDisplayLayer = nil
-        pipController = nil
-        isPiPActive = false
     }
 
     private func startRendering() {
         stopRendering()
         frameCount = 0
+        backgroundFrameCount = 0
         renderTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             self?.renderFrame()
         }
@@ -180,9 +254,10 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
         let image = renderSubtitleImage(status: status, time: timeString)
         guard let pixelBuffer = pixelBuffer(from: image) else { return }
 
+        let hostTime = CMClockGetTime(CMClockGetHostTimeClock())
         var timingInfo = CMSampleTimingInfo(
             duration: CMTime(value: 1, timescale: 2),
-            presentationTimeStamp: CMTime(value: Int64(frameCount), timescale: 2),
+            presentationTimeStamp: hostTime,
             decodeTimeStamp: .invalid
         )
         frameCount += 1
@@ -209,10 +284,16 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
         guard sbStatus == noErr, let sb = sampleBuffer else { return }
 
         let sbWithAttachment = setDisplayImmediately(sb)
-        layer.enqueue(sbWithAttachment)
 
         if layer.status == .failed {
             layer.flush()
+        }
+        layer.enqueue(sbWithAttachment)
+
+        if AppStateMonitor.shared.isInBackground {
+            DispatchQueue.main.async {
+                self.backgroundFrameCount += 1
+            }
         }
     }
 
@@ -328,7 +409,6 @@ extension PiPManager: AVPictureInPictureControllerDelegate {
         DispatchQueue.main.async {
             self.isPiPActive = false
             self.isStarting = false
-            self.stopRendering()
         }
     }
 
@@ -399,5 +479,28 @@ final class StatusMonitor: ObservableObject {
         }, name, nil, .deliverImmediately)
 
         self.darwinObserver = observer
+    }
+}
+
+final class AppStateMonitor: ObservableObject {
+    static let shared = AppStateMonitor()
+
+    @Published var isInBackground = false
+
+    private init() {
+        NotificationCenter.default.addObserver(self, selector: #selector(didEnterBackground), name: UIApplication.didEnterBackgroundNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(willEnterForeground), name: UIApplication.willEnterForegroundNotification, object: nil)
+    }
+
+    @objc private func didEnterBackground() {
+        DispatchQueue.main.async {
+            self.isInBackground = true
+        }
+    }
+
+    @objc private func willEnterForeground() {
+        DispatchQueue.main.async {
+            self.isInBackground = false
+        }
     }
 }
