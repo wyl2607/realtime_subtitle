@@ -1,0 +1,403 @@
+import SwiftUI
+import ReplayKit
+import AVFoundation
+import AVKit
+import CoreMedia
+import CoreVideo
+import os
+import Shared
+
+struct ContentView: View {
+    @StateObject private var pipManager = PiPManager()
+    @StateObject private var statusMonitor = StatusMonitor()
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 24) {
+                Text("RSiOS Spike")
+                    .font(.largeTitle)
+                    .fontWeight(.bold)
+
+                VStack(spacing: 12) {
+                    Text("Broadcast Extension Picker")
+                        .font(.headline)
+                    BroadcastPickerView()
+                        .frame(height: 50)
+                }
+
+                Divider()
+
+                VStack(spacing: 12) {
+                    Text("Picture-in-Picture")
+                        .font(.headline)
+                    Button(action: {
+                        if pipManager.isPiPActive {
+                            pipManager.stopPiP()
+                        } else {
+                            pipManager.startPiP()
+                        }
+                    }) {
+                        Text(pipManager.isPiPActive ? "Stop PiP" : "Start PiP")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(pipManager.isStarting)
+
+                    if let error = pipManager.lastError {
+                        Text("Error: \(error)")
+                            .font(.caption)
+                            .foregroundColor(.red)
+                    }
+                }
+
+                Divider()
+
+                VStack(spacing: 8) {
+                    Text("Extension Status (Keychain)")
+                        .font(.headline)
+                    Text(statusMonitor.keychainStatus)
+                        .font(.system(.body, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding()
+                        .background(Color(.systemGray6))
+                        .cornerRadius(8)
+                }
+
+                VStack(spacing: 8) {
+                    Text("Darwin Notifications")
+                        .font(.headline)
+                    Text("Received: \(statusMonitor.darwinNotificationCount) times")
+                        .font(.system(.body, design: .monospaced))
+                        .foregroundColor(.secondary)
+                }
+
+                Spacer()
+            }
+            .padding()
+            .navigationTitle("RSiOS")
+        }
+    }
+}
+
+struct BroadcastPickerView: UIViewRepresentable {
+    func makeUIView(context: Context) -> RPSystemBroadcastPickerView {
+        let picker = RPSystemBroadcastPickerView()
+        picker.preferredExtension = "com.wyl2607.rsios.spike.broadcast"
+        picker.showsMicrophoneButton = false
+        return picker
+    }
+
+    func updateUIView(_ uiView: RPSystemBroadcastPickerView, context: Context) {}
+}
+
+final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBufferPlaybackDelegate {
+    @Published var isPiPActive = false
+    @Published var isStarting = false
+    @Published var lastError: String?
+
+    private var pipController: AVPictureInPictureController?
+    private var sampleBufferDisplayLayer: AVSampleBufferDisplayLayer?
+    private var renderTimer: Timer?
+    private var frameCount = 0
+
+    override init() {
+        super.init()
+        setupAudioSession()
+    }
+
+    private func setupAudioSession() {
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            try session.setActive(true)
+        } catch {
+            print("Audio session setup failed: \(error)")
+        }
+    }
+
+    func startPiP() {
+        guard !isStarting, !isPiPActive else { return }
+        isStarting = true
+        lastError = nil
+
+        let layer = AVSampleBufferDisplayLayer()
+        layer.videoGravity = .resizeAspect
+        layer.backgroundColor = UIColor.clear.cgColor
+        self.sampleBufferDisplayLayer = layer
+
+        let contentSource = AVPictureInPictureController.ContentSource(
+            sampleBufferDisplayLayer: layer,
+            playbackDelegate: self
+        )
+
+        guard AVPictureInPictureController.isPictureInPictureSupported() else {
+            lastError = "PiP not supported on this device"
+            isStarting = false
+            return
+        }
+
+        let controller = AVPictureInPictureController(contentSource: contentSource)
+        controller.canStartPictureInPictureAutomaticallyFromInline = true
+        controller.delegate = self
+        self.pipController = controller
+
+        controller.startPictureInPicture()
+
+        startRendering()
+    }
+
+    func stopPiP() {
+        pipController?.stopPictureInPicture()
+        stopRendering()
+        sampleBufferDisplayLayer?.flush()
+        sampleBufferDisplayLayer?.removeFromSuperlayer()
+        sampleBufferDisplayLayer = nil
+        pipController = nil
+        isPiPActive = false
+    }
+
+    private func startRendering() {
+        stopRendering()
+        frameCount = 0
+        renderTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.renderFrame()
+        }
+        renderTimer?.fire()
+    }
+
+    private func stopRendering() {
+        renderTimer?.invalidate()
+        renderTimer = nil
+    }
+
+    private func renderFrame() {
+        guard let layer = sampleBufferDisplayLayer else { return }
+
+        let status = SharedKeychain.read() ?? "无"
+        let timeString = DateFormatter.timeFormatter.string(from: Date())
+
+        let image = renderSubtitleImage(status: status, time: timeString)
+        guard let pixelBuffer = pixelBuffer(from: image) else { return }
+
+        var timingInfo = CMSampleTimingInfo(
+            duration: CMTime(value: 1, timescale: 2),
+            presentationTimeStamp: CMTime(value: Int64(frameCount), timescale: 2),
+            decodeTimeStamp: .invalid
+        )
+        frameCount += 1
+
+        var formatDescription: CMVideoFormatDescription?
+        let fmtStatus = CMVideoFormatDescriptionCreateForImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: pixelBuffer,
+            formatDescriptionOut: &formatDescription
+        )
+        guard fmtStatus == noErr, let fmtDesc = formatDescription else { return }
+
+        var sampleBuffer: CMSampleBuffer?
+        let sbStatus = CMSampleBufferCreateForImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: pixelBuffer,
+            dataReady: true,
+            makeDataReadyCallback: nil,
+            refcon: nil,
+            formatDescription: fmtDesc,
+            sampleTiming: &timingInfo,
+            sampleBufferOut: &sampleBuffer
+        )
+        guard sbStatus == noErr, let sb = sampleBuffer else { return }
+
+        let sbWithAttachment = setDisplayImmediately(sb)
+        layer.enqueue(sbWithAttachment)
+
+        if layer.status == .failed {
+            layer.flush()
+        }
+    }
+
+    private func renderSubtitleImage(status: String, time: String) -> UIImage {
+        let size = CGSize(width: 1280, height: 360)
+        let renderer = UIGraphicsImageRenderer(size: size)
+        return renderer.image { ctx in
+            UIColor.black.withAlphaComponent(0.85).setFill()
+            ctx.fill(CGRect(origin: .zero, size: size))
+
+            let paragraphStyle = NSMutableParagraphStyle()
+            paragraphStyle.alignment = .center
+
+            let line1Attrs: [NSAttributedString.Key: Any] = [
+                .font: UIFont.systemFont(ofSize: 48, weight: .medium),
+                .foregroundColor: UIColor(red: 0xF0/255, green: 0xF0/255, blue: 0xF0/255, alpha: 1.0),
+                .paragraphStyle: paragraphStyle
+            ]
+            let line2Attrs: [NSAttributedString.Key: Any] = [
+                .font: UIFont.systemFont(ofSize: 42, weight: .regular),
+                .foregroundColor: UIColor(red: 0xFF/255, green: 0xE8/255, blue: 0x94/255, alpha: 1.0),
+                .paragraphStyle: paragraphStyle
+            ]
+
+            let line1 = "扩展: \(status)" as NSString
+            let line2 = time as NSString
+
+            let line1Height = line1.boundingRect(with: CGSize(width: 1200, height: 200),
+                                                  options: .usesLineFragmentOrigin,
+                                                  attributes: line1Attrs, context: nil).height
+            let line2Height = line2.boundingRect(with: CGSize(width: 1200, height: 200),
+                                                  options: .usesLineFragmentOrigin,
+                                                  attributes: line2Attrs, context: nil).height
+
+            let totalHeight = line1Height + line2Height + 16
+            let startY = (360 - totalHeight) / 2
+
+            line1.draw(in: CGRect(x: 40, y: startY, width: 1200, height: line1Height), withAttributes: line1Attrs)
+            line2.draw(in: CGRect(x: 40, y: startY + line1Height + 16, width: 1200, height: line2Height), withAttributes: line2Attrs)
+        }
+    }
+
+    private func pixelBuffer(from image: UIImage) -> CVPixelBuffer? {
+        let attrs: [String: Any] = [
+            kCVPixelBufferCGImageCompatibilityKey as String: true,
+            kCVPixelBufferCGBitmapContextCompatibilityKey as String: true,
+            kCVPixelBufferWidthKey as String: 1280,
+            kCVPixelBufferHeightKey as String: 360,
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+        ]
+
+        var pixelBuffer: CVPixelBuffer?
+        let status = CVPixelBufferCreate(kCFAllocatorDefault, 1280, 360,
+                                          kCVPixelFormatType_32BGRA, attrs as CFDictionary,
+                                          &pixelBuffer)
+        guard status == kCVReturnSuccess, let pb = pixelBuffer else { return nil }
+
+        CVPixelBufferLockBaseAddress(pb, [])
+        defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+
+        guard let context = CGContext(data: CVPixelBufferGetBaseAddress(pb),
+                                       width: 1280, height: 360,
+                                       bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(pb),
+                                       space: CGColorSpaceCreateDeviceRGB(),
+                                       bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue),
+              let cgImage = image.cgImage else { return nil }
+
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: 1280, height: 360))
+        return pb
+    }
+
+    private func setDisplayImmediately(_ sampleBuffer: CMSampleBuffer) -> CMSampleBuffer {
+        CMSetAttachment(sampleBuffer, key: kCMSampleAttachmentKey_DisplayImmediately, value: kCFBooleanTrue, attachmentMode: kCMAttachmentMode_ShouldNotPropagate)
+        return sampleBuffer
+    }
+
+    // MARK: - AVPictureInPictureSampleBufferPlaybackDelegate
+
+    func pictureInPictureControllerTimeRangeForPlayback(_ pictureInPictureController: AVPictureInPictureController) -> CMTimeRange {
+        return CMTimeRange(start: .negativeInfinity, duration: .positiveInfinity)
+    }
+
+    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, isPlaybackPausedForItemAt time: CMTime) -> Bool {
+        return false
+    }
+
+    func pictureInPictureControllerIsPlaybackPaused(_ pictureInPictureController: AVPictureInPictureController) -> Bool {
+        return false
+    }
+
+    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, didChangePlaybackRate rate: Float) {}
+
+    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, didChangeSeekPosition seekPosition: CMTime) {}
+
+    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, setPlaying playing: Bool) {}
+
+    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, skipByInterval skipInterval: CMTime, completion: @escaping @Sendable () -> Void) {
+        completion()
+    }
+
+    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, didTransitionToRenderSize newRenderSize: CMVideoDimensions) {}
+}
+
+extension PiPManager: AVPictureInPictureControllerDelegate {
+    func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
+        DispatchQueue.main.async {
+            self.isPiPActive = true
+            self.isStarting = false
+        }
+    }
+
+    func pictureInPictureControllerDidStopPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
+        DispatchQueue.main.async {
+            self.isPiPActive = false
+            self.isStarting = false
+            self.stopRendering()
+        }
+    }
+
+    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, failedToStartPictureInPictureWithError error: Error) {
+        DispatchQueue.main.async {
+            self.lastError = error.localizedDescription
+            self.isStarting = false
+        }
+    }
+}
+
+extension DateFormatter {
+    static let timeFormatter: DateFormatter = {
+        let df = DateFormatter()
+        df.dateFormat = "HH:mm:ss"
+        return df
+    }()
+}
+
+final class StatusMonitor: ObservableObject {
+    @Published var keychainStatus: String = "无"
+    @Published var darwinNotificationCount: Int = 0
+
+    private var timer: Timer?
+    private var darwinObserver: UnsafeRawPointer?
+
+    init() {
+        startMonitoring()
+        registerDarwinNotification()
+    }
+
+    deinit {
+        stopMonitoring()
+        if let observer = darwinObserver {
+            CFNotificationCenterRemoveObserver(CFNotificationCenterGetDarwinNotifyCenter(), observer, nil, nil)
+        }
+    }
+
+    private func startMonitoring() {
+        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.updateKeychainStatus()
+        }
+        timer?.fire()
+    }
+
+    private func stopMonitoring() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    private func updateKeychainStatus() {
+        DispatchQueue.main.async {
+            self.keychainStatus = SharedKeychain.read() ?? "无"
+        }
+    }
+
+    private func registerDarwinNotification() {
+        let center = CFNotificationCenterGetDarwinNotifyCenter()
+        let name = "com.wyl2607.rsios.spike.tick" as CFString
+        let observer = UnsafeRawPointer(Unmanaged.passUnretained(self).toOpaque())
+
+        CFNotificationCenterAddObserver(center, observer, { _, observer, _, _, _ in
+            guard let observer = observer else { return }
+            let monitor = Unmanaged<StatusMonitor>.fromOpaque(observer).takeUnretainedValue()
+            DispatchQueue.main.async {
+                monitor.darwinNotificationCount += 1
+            }
+        }, name, nil, .deliverImmediately)
+
+        self.darwinObserver = observer
+    }
+}
