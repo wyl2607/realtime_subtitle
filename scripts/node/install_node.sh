@@ -31,6 +31,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 NODE_PORT=8791
 HAD_PREV=0
 LABEL="com.realtimesubtitle.node"
+TS_LABEL="com.realtimesubtitle.tskeepalive"
 # venv(~3GB) + 依赖缓存 + Whisper 模型(~2.1GB)，且 .new 与 .prev 会同时存在
 MIN_FREE_GB=8
 
@@ -817,11 +818,12 @@ print_dry_run() {
     plan "7. 停止 v1 realtime_subtitle.remote.server 进程（精确匹配本人进程；先记录其命令行与 cwd；保留 ~/rs-remote 目录）"
     plan "8. 原子换名：~/rs-node → ~/rs-node.prev，~/rs-node.new → ~/rs-node"
     plan "9. 渲染 plist（不含 IP、不含 token）→ ~/Library/LaunchAgents/${LABEL}.plist；launchctl bootstrap gui/\$UID + kickstart -k"
-    plan "10. 经 UDS 请求 /v1/info，要求 200 且 v=2、node_id 匹配；再有界等待（RS_TCP_WAIT，默认 30 秒）确认 gateway 进程在 <Tailscale IP>:${NODE_PORT} LISTEN 且该端口无 */0.0.0.0 监听；任一失败 → 回滚（有 .prev 则恢复；无则删 plist、失败版留作 ~/rs-node.failed），并按记录重新拉起 v1、告警"
+    plan "10. 渲染 Tailscale 保活 plist（无参数）→ ~/Library/LaunchAgents/${TS_LABEL}.plist；launchctl bootstrap gui/\$UID（幂等：已存在先 bootout 再 bootstrap）"
+    plan "11. 经 UDS 请求 /v1/info，要求 200 且 v=2、node_id 匹配；再有界等待（RS_TCP_WAIT，默认 30 秒）确认 gateway 进程在 <Tailscale IP>:${NODE_PORT} LISTEN 且该端口无 */0.0.0.0 监听；任一失败 → 回滚（有 .prev 则恢复；无则删 plist、失败版留作 ~/rs-node.failed），并按记录重新拉起 v1、告警"
     if [[ "${LOCAL}" -eq 0 ]]; then
-        plan "11. 写 ~/.config/rslite/nodes.json（0600、按 id=${HOST##*@} 去重、原子写）：url=ws://<MagicDNS 名>:${NODE_PORT}"
+        plan "12. 写 ~/.config/rslite/nodes.json（0600、按 id=${HOST##*@} 去重、原子写）：url=ws://<MagicDNS 名>:${NODE_PORT}"
     else
-        plan "11. --local：不写 nodes.json（本机节点靠 UDS 发现）"
+        plan "12. --local：不写 nodes.json（本机节点靠 UDS 发现）"
     fi
     if [[ -n "${CLIENT}" ]]; then
         plan "另：下发到 Windows 客户端 ${CLIENT}：scp push_client.ps1，再 powershell -File PushClient；按 id 合并 %APPDATA%\\realtime_subtitle\\nodes.json；token 经 stdin 写入 tokens\\<id>.token 并 icacls；内容 <redacted>"
@@ -926,9 +928,9 @@ step_selfcheck() {
 }
 
 step_swap() {
-    info "[7/9] 停止 v1 远程服务..."
+    info "[7/10] 停止 v1 远程服务..."
     tgt_script "${STOP_V1_SH}" || warn "停止 v1 进程时出现问题，继续安装"
-    info "[8/9] 换名并启动 LaunchAgent..."
+    info "[8/10] 换名并启动 LaunchAgent..."
     local out
     out="$(tgt_script "${SWAP_SH}" "${LABEL}" "${NODE_PORT}")" || {
         printf '%s\n' "${out:-}" >&2
@@ -938,12 +940,37 @@ step_swap() {
     if grep -qx 'prev-kept' <<<"${out}"; then HAD_PREV=1; fi
 }
 
+step_ts_keepalive() {
+    info "[9/10] 安装 Tailscale 保活 LaunchAgent..."
+    local script='
+export PATH=${RS_TOOL_PATH_PREFIX:-/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS}:$PATH
+label="$1"
+plist="$HOME/Library/LaunchAgents/$label.plist"
+template="$HOME/rs-node/scripts/node/com.realtimesubtitle.tskeepalive.plist.template"
+mkdir -p "$HOME/Library/LaunchAgents"
+content=$(cat "$template") || { echo "读不到 tskeepalive plist 模板"; exit 1; }
+content=${content//@HOME@/$HOME}
+tmp="$plist.tmp.$$"
+printf "%s\n" "$content" > "$tmp" || { echo "写 plist 失败"; exit 1; }
+plutil -lint "$tmp" >/dev/null || { rm -f "$tmp"; echo "plist 校验失败"; exit 1; }
+mv "$tmp" "$plist" || { echo "plist 落盘失败"; exit 1; }
+# 幂等：已存在先 bootout 再 bootstrap
+launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+if ! launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null; then
+    echo "launchctl bootstrap 失败（目标机用户是否已登录桌面？LaunchAgent 需要登录会话）"
+    exit 1
+fi
+echo "tskeepalive-ok"
+'
+    tgt_script "$script" "$TS_LABEL" || die "Tailscale 保活 Agent 安装失败"
+}
+
 step_nodes_json() {
     if [[ "${LOCAL}" -eq 1 ]]; then
-        info "[9/9] --local：不写 nodes.json（本机节点靠 UDS 发现）"
+        info "[10/10] --local：不写 nodes.json（本机节点靠 UDS 发现）"
         return 0
     fi
-    info "[9/9] 写客户端 nodes.json..."
+    info "[10/10] 写客户端 nodes.json..."
     local dns id
     dns="$(resolve_magicdns)"
     NODE_DNS="${dns}"
@@ -966,6 +993,7 @@ main() {
     step_deploy
     step_selfcheck
     step_swap
+    step_ts_keepalive
     step_nodes_json
     step_push_client
     info ""

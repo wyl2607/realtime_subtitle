@@ -27,6 +27,9 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "node" / "install_node.sh"
 PLIST_TEMPLATE = REPO_ROOT / "scripts" / "node" / "com.realtimesubtitle.node.plist.template"
+TS_KEEPALIVE_SCRIPT = REPO_ROOT / "scripts" / "node" / "ts_keepalive.sh"
+TS_KEEPALIVE_PLIST = REPO_ROOT / "scripts" / "node" / "com.realtimesubtitle.tskeepalive.plist.template"
+REAL_GIT = shutil.which("git")
 
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="依赖 bash/pgrep/chmod，仅在类 Unix 系统上运行")
 
@@ -44,6 +47,33 @@ shift   # host
 tee -a "$log/ssh.stdin" | bash -c "$1"
 """
 
+_STUB_GIT = '''#!/bin/bash
+REAL_GIT="{real_git}"
+# 处理 git -C <dir> archive --format=tar HEAD 形式
+args=("$@")
+# 找到 archive 的位置
+archive_idx=-1
+for i in "${{!args[@]}}"; do
+    if [ "${{args[i]}}" = "archive" ]; then
+        archive_idx=$i
+        break
+    fi
+done
+if [ $archive_idx -ge 0 ] && [ "${{args[archive_idx+1]:-}}" = "--format=tar" ] && [ "${{args[archive_idx+2]:-}}" = "HEAD" ]; then
+  # 真实归档 + 追加两个未提交的新文件
+  tmpdir=$(mktemp -d)
+  trap "rm -rf $tmpdir" EXIT
+  "$REAL_GIT" "${{args[@]}}" | tar -x -C "$tmpdir"
+  # 复制 ts_keepalive.sh
+  mkdir -p "$tmpdir/scripts/node"
+  cp "{repo_root}/scripts/node/ts_keepalive.sh" "$tmpdir/scripts/node/"
+  cp "{repo_root}/scripts/node/com.realtimesubtitle.tskeepalive.plist.template" "$tmpdir/scripts/node/"
+  tar -C "$tmpdir" -cf - .
+  exit 0
+fi
+exec "$REAL_GIT" "$@"
+'''.format(real_git=REAL_GIT, repo_root=str(REPO_ROOT))
+
 _STUBS = {
     "ssh": _STUB_SSH,
     "uname": '#!/bin/bash\n[ "${1:-}" = "-m" ] && echo arm64 || echo Darwin\n',
@@ -56,6 +86,7 @@ _STUBS = {
     "uv": '#!/bin/bash\n'
           'if [ "${1:-}" = "venv" ]; then mkdir -p venv/bin; ln -sf "$STUB_FAKE_PYTHON" venv/bin/python; fi\n'
           'exit 0\n',
+    "git": _STUB_GIT,
     "tailscale": '#!/bin/bash\n'
                  'if [ "${1:-}" = "ip" ]; then [ -n "${TS_IP-100.64.0.7}" ] && echo "${TS_IP-100.64.0.7}"; exit 0; fi\n'
                  'if [ "${1:-}" = "status" ]; then echo "{\\"Self\\":{\\"DNSName\\":\\"${TS_DNS:-mini2.tail1234.ts.net}.\\"}}"; exit 0; fi\n'
@@ -1241,4 +1272,224 @@ def test_push_windows_client_rejects_bad_port_before_ssh(tmp_path, port):
     assert r.returncode != 0
     assert not (log / "ssh.argv").exists()
     assert not (log / "scp.argv").exists()
+
+
+# ------------------------------------------------------------ Tailscale 保活 (TSKA-001)
+
+TS_KEEPALIVE_SCRIPT = REPO_ROOT / "scripts" / "node" / "ts_keepalive.sh"
+TS_KEEPALIVE_PLIST = REPO_ROOT / "scripts" / "node" / "com.realtimesubtitle.tskeepalive.plist.template"
+
+
+def test_ts_keepalive_bash_syntax_ok():
+    assert subprocess.run(["bash", "-n", str(TS_KEEPALIVE_SCRIPT)]).returncode == 0
+
+
+def test_ts_keepalive_no_bash4_features():
+    """macOS 自带 bash 3.2：没有关联数组 / mapfile / ${var,,} 等。"""
+    text = TS_KEEPALIVE_SCRIPT.read_text(encoding="utf-8")
+    for pat in [r"declare\s+-A", r"\bmapfile\b", r"\breadarray\b", r"\$\{[A-Za-z_]+(,,|\^\^)\}",
+                r"\[\[\s+-v\s", r"&>>", r"\|&"]:
+        assert not re.search(pat, text), f"bash 3.2 不支持：{pat}"
+
+
+def test_ts_keepalive_plist_template_contract():
+    text = TS_KEEPALIVE_PLIST.read_text(encoding="utf-8")
+    assert not re.search(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", text), "plist 里不许写死 IP"
+    assert "--token-file" not in text and "--token-stdin" not in text
+    assert "@HOME@/rs-node/scripts/node/ts_keepalive.sh" in text
+    d = plistlib.loads(text.replace("@HOME@", "/Users/x").encode())
+    assert d["Label"] == "com.realtimesubtitle.tskeepalive"
+    assert d["StartInterval"] == 300
+    assert d["RunAtLoad"] is True
+    assert d["StandardOutPath"] == "/dev/null"
+    assert d["StandardErrorPath"] == "/dev/null"
+    assert d["ProgramArguments"] == ["/bin/bash", "/Users/x/rs-node/scripts/node/ts_keepalive.sh"]
+
+
+def test_dry_run_includes_ts_keepalive_step(env):
+    e, home, logdir = env
+    r = _run(["--dry-run", "mini2"], e)
+    assert r.returncode == 0, r.stderr
+    out = r.stdout
+    assert "Tailscale 保活" in out
+    assert "com.realtimesubtitle.tskeepalive" in out
+    assert "幂等" in out
+    assert "bootout" in out
+    assert "bootstrap" in out
+
+
+def _run_ts_keepalive(e, ts_status_json):
+    """在桩环境里运行 ts_keepalive.sh，返回 stdout/stderr/log 内容。"""
+    home = Path(e["HOME"])
+    logdir = Path(e["STUB_LOG_DIR"])
+    # 写一个桩 tailscale 返回指定的 status JSON
+    ts_stub = logdir / "tailscale_stub.sh"
+    ts_stub.write_text(f'#!/bin/bash\nif [ "${{1:-}}" = "status" ]; then cat <<\'EOF\'\n{ts_status_json}\nEOF\nfi\n')
+    ts_stub.chmod(0o755)
+    # 把桩放在 PATH 最前面
+    e = dict(e)
+    e["PATH"] = f"{logdir}:{e['PATH']}"
+    # 创建一个叫 tailscale 的桩脚本
+    (logdir / "tailscale").write_text(f'#!/bin/bash\n"$STUB_LOG_DIR/tailscale_stub.sh" "$@"\n')
+    (logdir / "tailscale").chmod(0o755)
+    # 运行 ts_keepalive.sh
+    r = subprocess.run(["bash", str(TS_KEEPALIVE_SCRIPT)], env=e, capture_output=True, text=True, timeout=30)
+    log_file = home / "Library" / "Logs" / "rs-node" / "ts_keepalive.log"
+    log_content = log_file.read_text() if log_file.exists() else ""
+    return r, log_content
+
+
+def test_ts_keepalive_stopped_calls_up(env):
+    """BackendState=Stopped -> 执行 tailscale up 并记日志。"""
+    e, home, logdir = env
+    # 准备桩：status 返回 Stopped，up 返回成功
+    ts_stub = logdir / "tailscale_stub.sh"
+    ts_stub.write_text("""#!/bin/bash
+if [ "${1:-}" = "status" ]; then
+    cat <<'EOF'
+{"BackendState":"Stopped"}
+EOF
+    exit 0
+fi
+if [ "${1:-}" = "up" ]; then
+    echo "Tailscale started successfully"
+    exit 0
+fi
+exit 1
+""")
+    ts_stub.chmod(0o755)
+    e = dict(e)
+    e["RS_TOOL_PATH_PREFIX"] = str(logdir)
+    e["PATH"] = f"{logdir}:{e['PATH']}"
+    (logdir / "tailscale").write_text('#!/bin/bash\n"$STUB_LOG_DIR/tailscale_stub.sh" "$@"\n')
+    (logdir / "tailscale").chmod(0o755)
+
+    r = subprocess.run(["bash", str(TS_KEEPALIVE_SCRIPT)], env=e, capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+
+    log_file = home / "Library" / "Logs" / "rs-node" / "ts_keepalive.log"
+    log_content = log_file.read_text()
+    assert "BackendState=Stopped" in log_content
+    assert "执行 tailscale up" in log_content
+    assert "Tailscale started successfully" in log_content
+
+
+def test_ts_keepalive_running_no_action(env):
+    """BackendState=Running -> 静默，不动作。"""
+    e, home, logdir = env
+    ts_stub = logdir / "tailscale_stub.sh"
+    ts_stub.write_text("""#!/bin/bash
+if [ "${1:-}" = "status" ]; then
+    cat <<'EOF'
+{"BackendState":"Running"}
+EOF
+    exit 0
+fi
+exit 1
+""")
+    ts_stub.chmod(0o755)
+    e = dict(e)
+    e["RS_TOOL_PATH_PREFIX"] = str(logdir)
+    e["PATH"] = f"{logdir}:{e['PATH']}"
+    (logdir / "tailscale").write_text('#!/bin/bash\n"$STUB_LOG_DIR/tailscale_stub.sh" "$@"\n')
+    (logdir / "tailscale").chmod(0o755)
+
+    r = subprocess.run(["bash", str(TS_KEEPALIVE_SCRIPT)], env=e, capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+
+    log_file = home / "Library" / "Logs" / "rs-node" / "ts_keepalive.log"
+    # Running 状态不应产生日志（静默），日志文件可能不存在
+    assert not log_file.exists() or log_file.read_text() == ""
+
+
+def test_ts_keepalive_needslogin_logs_only(env):
+    """BackendState=NeedsLogin -> 只记日志，不执行 up。"""
+    e, home, logdir = env
+    ts_stub = logdir / "tailscale_stub.sh"
+    ts_stub.write_text("""#!/bin/bash
+if [ "${1:-}" = "status" ]; then
+    cat <<'EOF'
+{"BackendState":"NeedsLogin"}
+EOF
+    exit 0
+fi
+exit 1
+""")
+    ts_stub.chmod(0o755)
+    e = dict(e)
+    e["RS_TOOL_PATH_PREFIX"] = str(logdir)
+    e["PATH"] = f"{logdir}:{e['PATH']}"
+    (logdir / "tailscale").write_text('#!/bin/bash\n"$STUB_LOG_DIR/tailscale_stub.sh" "$@"\n')
+    (logdir / "tailscale").chmod(0o755)
+
+    r = subprocess.run(["bash", str(TS_KEEPALIVE_SCRIPT)], env=e, capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+
+    log_file = home / "Library" / "Logs" / "rs-node" / "ts_keepalive.log"
+    log_content = log_file.read_text()
+    assert "BackendState=NeedsLogin" in log_content
+    assert "需要人工登录" in log_content
+    assert "执行 tailscale up" not in log_content
+
+
+def test_ts_keepalive_log_truncation(env, tmp_path):
+    """日志超过 1MB 时保留最后 200 行。"""
+    e, home, logdir = env
+    ts_stub = logdir / "tailscale_stub.sh"
+    ts_stub.write_text("""#!/bin/bash
+if [ "${1:-}" = "status" ]; then
+    cat <<'EOF'
+{"BackendState":"Stopped"}
+EOF
+    exit 0
+fi
+if [ "${1:-}" = "up" ]; then
+    echo "up ok"
+    exit 0
+fi
+exit 1
+""")
+    ts_stub.chmod(0o755)
+    e = dict(e)
+    e["RS_TOOL_PATH_PREFIX"] = str(logdir)
+    e["PATH"] = f"{logdir}:{e['PATH']}"
+    (logdir / "tailscale").write_text('#!/bin/bash\n"$STUB_LOG_DIR/tailscale_stub.sh" "$@"\n')
+    (logdir / "tailscale").chmod(0o755)
+
+    log_file = home / "Library" / "Logs" / "rs-node" / "ts_keepalive.log"
+    # 先写入超过 1MB 的内容（约 1.1MB，每行 ~100 字符，约 11000 行）
+    long_line = "x" * 100 + "\n"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_text(long_line * 11000)
+
+    r = subprocess.run(["bash", str(TS_KEEPALIVE_SCRIPT)], env=e, capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+
+    # 日志应被截断为最后 200 行 + 新增的几行
+    lines = log_file.read_text().splitlines()
+    assert len(lines) <= 210, f"日志行数 {len(lines)} 超过预期 210"
+
+
+def test_install_node_renders_tskeepalive_plist(env, tmp_path):
+    """安装时会渲染并 bootstrap tskeepalive plist。"""
+    e, home, logdir = env
+    # 先跑一遍完整安装（前面的测试已经验证了主流程）
+    r = _run(["mini2"], e, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+    # 检查 tskeepalive plist 是否已生成并包含正确路径
+    plist = home / "Library" / "LaunchAgents" / "com.realtimesubtitle.tskeepalive.plist"
+    assert plist.exists(), "tskeepalive plist 应该被创建"
+    content = plist.read_text()
+    assert str(home) in content, "plist 中的 @HOME@ 应该被替换为实际家目录"
+    assert "ts_keepalive.sh" in content
+    assert "StartInterval" in content
+    assert "300" in content
+    assert "RunAtLoad" in content
+    assert "true" in content.lower()
+
+    # 检查 launchctl 是否被调用 bootstrap tskeepalive
+    calls = (logdir / "launchctl.log").read_text().splitlines()
+    assert any("com.realtimesubtitle.tskeepalive" in c and "bootstrap" in c for c in calls), \
+        "launchctl bootstrap 应该被调用 for tskeepalive"
 
