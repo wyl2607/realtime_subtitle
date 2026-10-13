@@ -164,6 +164,7 @@ v1（`realtime_subtitle/remote/server.py`，已在 TK-006 删除）是外包算�
   - 启动加载，Mac 收到 `SIGHUP` 信号重载，Windows 每 10s 检查目录 `mtime` 重载。吊销 = 删除对应 `*.token` 文件。
   - 鉴权逻辑（`TokenBook.match`）对账本中每把 token 常量时间比较（`hmac.compare_digest`），全部比完再出结论，杜绝提前返回的时序泄露。重复的 `Authorization` 头一律不认。
 - **日志无正文无 token**：gateway 和 worker 都只记事件类型、时长、字节数、帧数、错误码/类名；转录/译文正文、token、hello 字段值都不进日志。日志中仅记录设备代号（如 `device=mac`），绝不记 token。websockets 自带的 DEBUG 日志会逐帧打印文本，所以给它单独一个钉在 WARNING 的 logger（`gateway.py:55-56`）；worker 的 `_log` 还会把形状不像「代号」的字符串值抹成 `?`，异常只记类名不记消息（`worker.py:69, 213-225`）。
+- **Ollama 翻译自愈**：gateway 常驻进程内置看护，每 60 秒探测一次本机 `127.0.0.1:11434/api/version`（同 `/v1/info` 的 `translator_ok` 逻辑）。`ollama:` 翻译器连续 2 次探测失败（约 2 分钟）会自动拉起 `ollama serve`；两次拉起至少间隔 5 分钟（含失败）；找不到可执行文件只告警一次不再重试。日志见 `ollama_restart attempt=N` / `ollama_restart_skipped reason=not_found`。
 - **音频不落盘**：音频只在内存队列和管道里流转，不写任何文件；worker 写盘的只有 `asr_state.json`（模型名、后端、rtf、翻译器名），权限 0600，原子替换（`worker.py:379-386`）。
 - **`/v1/info` 的最小暴露**：`in_use` 只给布尔值，`translator_ok` 只给布尔值，`hw_hash` 只给哈希前 16 位；原始空闲秒数、Ollama URL/错误文本和硬件 UUID 不出 `info.py`（`info.py:9-10`）。
 
