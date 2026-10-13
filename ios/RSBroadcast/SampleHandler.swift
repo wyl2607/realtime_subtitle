@@ -10,6 +10,8 @@ class SampleHandler: RPBroadcastSampleHandler {
 
     private var blockCount: UInt64 = 0
     private var lastWriteTime: CFAbsoluteTime = 0
+    private var lastStatusWriteTime: CFAbsoluteTime = 0
+    private var lastLinesJSON: String = ""
     private var accumulatedRMS: Float = 0
     private var rmsSampleCount: Int = 0
     private var sampleRate: Double = 0
@@ -28,9 +30,11 @@ class SampleHandler: RPBroadcastSampleHandler {
     private var preReadyDropped: UInt64 = 0
     private var lastStatusCode: String = ""
     private var fatalErrorOccurred = false
+    private var fatalErrorReason: String = ""
 
     private var recentLines: [RecentLine] = []
     private let maxRecentLines = 3
+    private let stateQueue = DispatchQueue(label: "com.wyl2607.rsios.spike.state")
 
     struct RecentLine: Codable {
         let id: Int
@@ -51,14 +55,17 @@ class SampleHandler: RPBroadcastSampleHandler {
 
         nodeName = config.name
         converter = PCMConverter()
-        readyReceived = false
-        framesSent = 0
-        finalsCount = 0
-        translationsCount = 0
-        preReadyDropped = 0
-        lastStatusCode = ""
-        fatalErrorOccurred = false
-        recentLines = []
+        stateQueue.sync {
+            readyReceived = false
+            framesSent = 0
+            finalsCount = 0
+            translationsCount = 0
+            preReadyDropped = 0
+            lastStatusCode = ""
+            fatalErrorOccurred = false
+            fatalErrorReason = ""
+            recentLines = []
+        }
 
         session = NodeSession(
             url: config.sessionURL,
@@ -120,26 +127,38 @@ class SampleHandler: RPBroadcastSampleHandler {
 
         let now = CFAbsoluteTimeGetCurrent()
         if now - lastWriteTime >= 1.0 {
+            accumulatedRMS = 0
+            rmsSampleCount = 0
+            lastWriteTime = now
+        }
+        if now - lastStatusWriteTime >= 5.0 {
             let avgRMS = rmsSampleCount > 0 ? accumulatedRMS / Float(rmsSampleCount) : 0
             let memMB = residentMemoryMB()
             let interleavedStr = isNonInterleaved ? "0" : "1"
-            let readyStr = readyReceived ? "1" : "0"
-            let status = "blocks=\(blockCount) rate=\(Int(sampleRate)) ch=\(channelCount) fmt=\(formatString) flags=\(formatFlags) ileave=\(interleavedStr) rms=\(String(format: "%.3f", avgRMS)) mem=\(memMB) node=\(nodeName) ready=\(readyStr) sent=\(framesSent) finals=\(finalsCount) tx=\(translationsCount) last=\(lastStatusCode.isEmpty ? "-" : lastStatusCode)"
+            let state = stateQueue.sync {
+                (readyReceived, framesSent, finalsCount, translationsCount, lastStatusCode, preReadyDropped, fatalErrorOccurred, fatalErrorReason)
+            }
+            let readyStr = state.0 ? "1" : "0"
+            var status = "blocks=\(blockCount) rate=\(Int(sampleRate)) ch=\(channelCount) fmt=\(formatString) flags=\(formatFlags) ileave=\(interleavedStr) rms=\(String(format: "%.3f", avgRMS)) mem=\(memMB) node=\(nodeName) ready=\(readyStr) sent=\(state.1) finals=\(state.2) tx=\(state.3) last=\(state.4.isEmpty ? "-" : state.4) drop=\(state.5)"
+            if state.6, !state.7.isEmpty {
+                status += " \(state.7)"
+            }
             writeStatus(status)
-            lastWriteTime = now
-            accumulatedRMS = 0
-            rmsSampleCount = 0
+            lastStatusWriteTime = now
         }
 
-        guard let converter = converter, let session = session, !fatalErrorOccurred else { return }
+        guard let converter = converter, let session = session else { return }
+        let fatal = stateQueue.sync { fatalErrorOccurred }
+        guard !fatal else { return }
 
         let frames = converter.append(sampleBuffer)
         for frame in frames {
-            if readyReceived {
+            let ready = stateQueue.sync { readyReceived }
+            if ready {
                 session.send(pcm16k: frame)
-                framesSent += 1
+                stateQueue.sync { framesSent += 1 }
             } else {
-                preReadyDropped += 1
+                stateQueue.sync { preReadyDropped += 1 }
             }
         }
     }
@@ -147,26 +166,33 @@ class SampleHandler: RPBroadcastSampleHandler {
     private func handleNodeEvent(_ event: NodeEvent) {
         switch event {
         case .ready(let cold):
-            readyReceived = true
+            stateQueue.sync { readyReceived = true }
             logger.info("Node ready cold=\(cold)")
         case .final(let id, _, _, let text):
-            finalsCount += 1
-            recentLines.append(RecentLine(id: id, src: text, dst: ""))
-            if recentLines.count > maxRecentLines {
-                recentLines.removeFirst()
+            stateQueue.sync {
+                finalsCount += 1
+                recentLines.append(RecentLine(id: id, src: text, dst: ""))
+                if recentLines.count > maxRecentLines {
+                    recentLines.removeFirst()
+                }
             }
             writeLatestLines()
         case .translation(let id, let text):
-            translationsCount += 1
-            if let idx = recentLines.firstIndex(where: { $0.id == id }) {
-                recentLines[idx].dst = text
-                writeLatestLines()
+            stateQueue.sync {
+                translationsCount += 1
+                if let idx = recentLines.firstIndex(where: { $0.id == id }) {
+                    recentLines[idx].dst = text
+                }
             }
+            writeLatestLines()
         case .status(let code, let text, _):
-            lastStatusCode = code
+            stateQueue.sync { lastStatusCode = code }
             logger.info("Node status: \(code) \(text)")
             if NodeEvent.isFatal(code: code) {
-                fatalErrorOccurred = true
+                stateQueue.sync {
+                    fatalErrorOccurred = true
+                    fatalErrorReason = "fatal:\(code)"
+                }
             }
         case .drained:
             break
@@ -175,8 +201,11 @@ class SampleHandler: RPBroadcastSampleHandler {
 
     private func handleNodeClose(_ code: Int) {
         let displayCode = code == 1013 ? "busy" : "\(code)"
-        lastStatusCode = "closed=\(displayCode)"
-        fatalErrorOccurred = true
+        stateQueue.sync { lastStatusCode = "closed=\(displayCode)" }
+        stateQueue.sync {
+            fatalErrorOccurred = true
+            fatalErrorReason = "fatal:closed=\(displayCode)"
+        }
         logger.info("Node closed: \(code)")
     }
 
@@ -249,11 +278,14 @@ class SampleHandler: RPBroadcastSampleHandler {
         encoder.outputFormatting = []
         if let data = try? encoder.encode(recentLines),
            let json = String(data: data, encoding: .utf8) {
-            let success = SharedKeychain.writeLatestLines(json)
-            if !success {
-                logger.error("Failed to write latest_lines to keychain")
+            if json != lastLinesJSON {
+                lastLinesJSON = json
+                let success = SharedKeychain.writeLatestLines(json)
+                if !success {
+                    logger.error("Failed to write latest_lines to keychain")
+                }
+                postLinesNotification()
             }
-            postLinesNotification()
         }
     }
 

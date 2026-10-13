@@ -448,8 +448,8 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
         let status = SharedKeychain.readExtStatus() ?? "无"
         let timeString = DateFormatter.timeFormatter.string(from: Date())
 
-        let image = renderSubtitleImage(status: status, time: timeString)
-        guard let pixelBuffer = pixelBuffer(from: image) else { return }
+        guard let image = renderSubtitleImage(status: status, time: timeString),
+              let pixelBuffer = pixelBuffer(from: image) else { return }
 
         let hostTime = CMClockGetTime(CMClockGetHostTimeClock())
         var timingInfo = CMSampleTimingInfo(
@@ -495,13 +495,23 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
     }
 
     private var cachedLines: [RecentLine] = []
+    private var lastRenderedLinesJSON: String = ""
+    private var lastRenderedStatus: String = ""
 
-    private func renderSubtitleImage(status: String, time: String) -> UIImage {
+    private func renderSubtitleImage(status: String, time: String) -> UIImage? {
+        var linesJSON = ""
         if let json = SharedKeychain.readLatestLines(),
            let data = json.data(using: .utf8),
            let lines = try? JSONDecoder().decode([RecentLine].self, from: data) {
             cachedLines = lines
+            linesJSON = json
         }
+
+        if linesJSON == lastRenderedLinesJSON && status == lastRenderedStatus {
+            return nil
+        }
+        lastRenderedLinesJSON = linesJSON
+        lastRenderedStatus = status
 
         let displayLines = Array(cachedLines.suffix(2))
 
@@ -545,15 +555,15 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
 
             var y = startY
             for (idx, line) in displayLines.enumerated() {
-                let alpha = idx == 0 ? 1.0 : 0.55
+                let alpha = idx == 0 ? 0.55 : 1.0
 
                 let srcText = "[\(line.id)] \(line.src)" as NSString
-                let srcAttrsWithAlpha = idx == 0 ? srcAttrs : srcAttrs.mapValues { value in
+                let srcAttrsWithAlpha = idx == 0 ? srcAttrs.mapValues { value in
                     if let color = value as? UIColor {
                         return color.withAlphaComponent(0.55)
                     }
                     return value
-                }
+                } : srcAttrs
                 let srcHeight = srcText.boundingRect(with: CGSize(width: 1200, height: 200),
                                                       options: .usesLineFragmentOrigin,
                                                       attributes: srcAttrsWithAlpha, context: nil).height
@@ -562,12 +572,12 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
 
                 let dstText = (line.dst.isEmpty ? "…" : line.dst) as NSString
                 let dstAttrsFinal = line.dst.isEmpty ? dstEmptyAttrs : dstAttrs
-                let dstAttrsWithAlpha = idx == 0 ? dstAttrsFinal : dstAttrsFinal.mapValues { value in
+                let dstAttrsWithAlpha = idx == 0 ? dstAttrsFinal.mapValues { value in
                     if let color = value as? UIColor {
                         return color.withAlphaComponent(0.55)
                     }
                     return value
-                }
+                } : dstAttrsFinal
                 let dstHeight = dstText.boundingRect(with: CGSize(width: 1200, height: 200),
                                                       options: .usesLineFragmentOrigin,
                                                       attributes: dstAttrsWithAlpha, context: nil).height
