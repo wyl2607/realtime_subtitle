@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Tailscale 保活的 LaunchAgent 模板（install_node.sh 把 @HOME@ 替换成目标机的家目录）。
+  - 用 LaunchAgent 而不是 LaunchDaemon：Tailscale CLI 需要用户登录会话
+  - StartInterval 300 秒（5 分钟）轮询一次
+  - RunAtLoad true：加载后立即跑一次
+  - 标准输出/错误重定向到 /dev/null（有自己的日志文件）
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.realtimesubtitle.tskeepalive</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>@HOME@/rs-node/scripts/node/ts_keepalive.sh</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/dev/null</string>
+    <key>StandardErrorPath</key>
+    <string>/dev/null</string>
+</dict>
+</plist>
