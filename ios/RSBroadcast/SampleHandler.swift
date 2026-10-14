@@ -4,6 +4,8 @@ import AudioToolbox
 import os
 import Darwin.Mach
 import Foundation
+import Speech
+import Translation
 
 class SampleHandler: RPBroadcastSampleHandler {
     private let logger = Logger(subsystem: "com.wyl2607.rsios.spike", category: "ext")
@@ -22,6 +24,8 @@ class SampleHandler: RPBroadcastSampleHandler {
 
     private var converter: PCMConverter?
     private var session: NodeSession?
+    private var localEngine: AnyObject?
+    private var engineMode: String = "node"
     private var nodeName: String = ""
     private var readyReceived = false
     private var framesSent: UInt64 = 0
@@ -47,6 +51,21 @@ class SampleHandler: RPBroadcastSampleHandler {
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
         logger.info("Broadcast started")
         writeStatus("started")
+
+        engineMode = SharedKeychain.readEngineMode() ?? "node"
+
+        if engineMode == "local" {
+            if #available(iOS 26.0, *) {
+                startLocalEngine()
+            } else {
+                writeStatus("last=local_needs_ios26")
+                stateQueue.sync {
+                    fatalErrorOccurred = true
+                    fatalErrorReason = "fatal:local_needs_ios26"
+                }
+            }
+            return
+        }
 
         guard let json = SharedKeychain.readNodeConfig(),
               let data = json.data(using: .utf8),
@@ -76,6 +95,17 @@ class SampleHandler: RPBroadcastSampleHandler {
 
     override func broadcastFinished() {
         logger.info("Broadcast finished")
+        
+        if engineMode == "local" {
+            if #available(iOS 26.0, *) {
+                (localEngine as? LocalEngine)?.stop()
+                localEngine = nil
+            }
+            converter = nil
+            writeStatus("finished")
+            return
+        }
+
         let currentSession = stateQueue.sync { () -> NodeSession? in
             broadcastActive = false
             let currentSession = session
@@ -86,6 +116,72 @@ class SampleHandler: RPBroadcastSampleHandler {
         currentSession?.close()
         converter = nil
         writeStatus("finished")
+    }
+
+    @available(iOS 26.0, *)
+    private func startLocalEngine() {
+        converter = PCMConverter()
+        stateQueue.sync {
+            readyReceived = true
+            framesSent = 0
+            finalsCount = 0
+            translationsCount = 0
+            preReadyDropped = 0
+            lastStatusCode = ""
+            fatalErrorOccurred = false
+            fatalErrorReason = ""
+            recentLines = []
+            broadcastActive = true
+        }
+
+        let engine = LocalEngine(
+            onFinal: { [weak self] id, text in
+                self?.handleLocalFinal(id: id, text: text)
+            },
+            onTranslation: { [weak self] id, text in
+                self?.handleLocalTranslation(id: id, text: text)
+            },
+            onStatus: { [weak self] status in
+                self?.handleLocalStatus(status)
+            }
+        )
+        localEngine = engine
+        Task {
+            await engine.start()
+        }
+    }
+
+    private func handleLocalFinal(id: Int, text: String) {
+        stateQueue.sync {
+            finalsCount += 1
+            recentLines.append(RecentLine(id: id, src: text, dst: ""))
+            if recentLines.count > maxRecentLines {
+                recentLines.removeFirst()
+            }
+        }
+        writeLatestLines()
+    }
+
+    private func handleLocalTranslation(id: Int, text: String) {
+        stateQueue.sync {
+            translationsCount += 1
+            if let idx = recentLines.firstIndex(where: { $0.id == id }) {
+                recentLines[idx].dst = text
+            }
+        }
+        writeLatestLines()
+    }
+
+    private func handleLocalStatus(_ status: String) {
+        stateQueue.sync { lastStatusCode = status }
+        logger.info("Local engine status: \(status)")
+        if status == "asr_assets_missing" || status == "asr_unsupported" || status == "analyzer_format_failed" || status == "asr_failed" || status == "asr_result_failed" {
+            stateQueue.sync {
+                fatalErrorOccurred = true
+                fatalErrorReason = "fatal:\(status)"
+            }
+        }
+        writeStatus("last=\(status)")
     }
 
     override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer, with sampleBufferType: RPSampleBufferType) {
@@ -136,12 +232,30 @@ class SampleHandler: RPBroadcastSampleHandler {
                 (readyReceived, framesSent, finalsCount, translationsCount, lastStatusCode, preReadyDropped, fatalErrorOccurred, fatalErrorReason)
             }
             let readyStr = state.0 ? "1" : "0"
-            var status = "blocks=\(blockCount) rate=\(Int(sampleRate)) ch=\(channelCount) fmt=\(formatString) flags=\(formatFlags) ileave=\(interleavedStr) rms=\(String(format: "%.3f", avgRMS)) mem=\(memMB) node=\(nodeName) ready=\(readyStr) sent=\(state.1) finals=\(state.2) tx=\(state.3) last=\(state.4.isEmpty ? "-" : state.4) drop=\(state.5)"
+            let engineStr = engineMode == "local" ? "local" : "node"
+            var status = "blocks=\(blockCount) rate=\(Int(sampleRate)) ch=\(channelCount) fmt=\(formatString) flags=\(formatFlags) ileave=\(interleavedStr) rms=\(String(format: "%.3f", avgRMS)) mem=\(memMB) engine=\(engineStr)"
+            if engineMode == "node" {
+                status += " node=\(nodeName) ready=\(readyStr) sent=\(state.1) finals=\(state.2) tx=\(state.3) last=\(state.4.isEmpty ? "-" : state.4) drop=\(state.5)"
+            }
             if state.6, !state.7.isEmpty {
                 status += " \(state.7)"
             }
             writeStatus(status)
             lastStatusWriteTime = now
+        }
+
+        if engineMode == "local" {
+            if #available(iOS 26.0, *) {
+                guard let converter = converter, let engine = localEngine as? LocalEngine else { return }
+                let fatal = stateQueue.sync { fatalErrorOccurred }
+                guard !fatal else { return }
+
+                let frames = converter.append(sampleBuffer)
+                for frame in frames {
+                    engine.append(pcm16k: frame)
+                }
+            }
+            return
         }
 
         let currentSession = stateQueue.sync { session }

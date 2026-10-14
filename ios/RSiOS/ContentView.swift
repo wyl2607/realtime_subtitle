@@ -6,6 +6,8 @@ import CoreMedia
 import CoreVideo
 import os
 import UniformTypeIdentifiers
+import Speech
+import Translation
 
 struct ContentView: View {
     @StateObject private var pipManager = PiPManager()
@@ -16,6 +18,10 @@ struct ContentView: View {
     @State private var pairingLinkText = ""
     @State private var pairingStatus = ""
     @State private var pairedConfigDisplay = ""
+
+    @State private var engineMode: String = "node"
+    @State private var prepareStatus = ""
+    @State private var isPreparing = false
 
     var body: some View {
         NavigationStack {
@@ -67,6 +73,43 @@ struct ContentView: View {
                         Text("已配对：\(pairedConfigDisplay)")
                             .font(.caption)
                             .foregroundColor(.secondary)
+                    }
+                }
+
+                Divider()
+
+                VStack(spacing: 12) {
+                    Text("识别引擎")
+                        .font(.headline)
+
+                    Picker("引擎", selection: $engineMode) {
+                        Text("电脑节点").tag("node")
+                        Text("本机").tag("local")
+                    }
+                    .pickerStyle(.segmented)
+                    .onChange(of: engineMode) { _, newValue in
+                        SharedKeychain.writeEngineMode(newValue)
+                    }
+                    .onAppear {
+                        engineMode = SharedKeychain.readEngineMode() ?? "node"
+                    }
+
+                    Button(action: prepareLocalAssets) {
+                        HStack {
+                            if isPreparing {
+                                ProgressView().scaleEffect(0.8)
+                            }
+                            Text(isPreparing ? "准备中..." : "准备本机识别资源")
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isPreparing)
+
+                    if !prepareStatus.isEmpty {
+                        Text(prepareStatus)
+                            .font(.caption)
+                            .foregroundColor(prepareStatus.hasPrefix("错误") || prepareStatus.hasPrefix("需要") ? .red : .green)
                     }
                 }
 
@@ -205,6 +248,57 @@ struct ContentView: View {
            let data = json.data(using: .utf8),
            let config = try? JSONDecoder().decode(NodeConfig.self, from: data) {
             pairedConfigDisplay = config.displayName
+        }
+    }
+
+    private func prepareLocalAssets() {
+        guard #available(iOS 26.0, *) else {
+            prepareStatus = "需要 iOS 26"
+            return
+        }
+
+        isPreparing = true
+        prepareStatus = "检查资源状态..."
+
+        Task {
+            do {
+                let locale = Locale(identifier: "de-DE")
+                guard let supported = await SpeechTranscriber.supportedLocale(equivalentTo: locale) else {
+                    await MainActor.run {
+                        isPreparing = false
+                        prepareStatus = "错误：不支持德语识别"
+                    }
+                    return
+                }
+
+                let transcriber = SpeechTranscriber(
+                    locale: supported,
+                    transcriptionOptions: [],
+                    reportingOptions: [.volatileResults, .fastResults],
+                    attributeOptions: [.audioTimeRange]
+                )
+
+                let assetStatus = await AssetInventory.status(forModules: [transcriber])
+                let txStatus = await LanguageAvailability().status(from: Locale.Language(identifier: "de"), to: Locale.Language(identifier: "zh-Hans"))
+
+                await MainActor.run {
+                    isPreparing = false
+                    var parts: [String] = ["ASR资源: \(assetStatus)"]
+                    parts.append("翻译 de→zh-Hans: \(txStatus)")
+                    prepareStatus = parts.joined(separator: " · ")
+                }
+
+                if assetStatus != .installed {
+                    await MainActor.run {
+                        prepareStatus += " · 点击再次准备将下载资源"
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    isPreparing = false
+                    prepareStatus = "错误: \(error.localizedDescription)"
+                }
+            }
         }
     }
 }
