@@ -10,6 +10,7 @@ public enum SharedKeychain {
         public static let extStatus = "ext_status"
         public static let nodeConfig = "node_config"
         public static let latestLines = "latest_lines"
+        public static let engineMode = "engine_mode"
     }
 
     private static let logger = Logger(subsystem: "com.wyl2607.rsios.spike", category: "shared-keychain")
@@ -103,6 +104,15 @@ public enum SharedKeychain {
 
     public static func readLatestLines() -> String? {
         read(account: Account.latestLines)
+    }
+
+    @discardableResult
+    public static func writeEngineMode(_ string: String) -> Bool {
+        write(string, account: Account.engineMode)
+    }
+
+    public static func readEngineMode() -> String? {
+        read(account: Account.engineMode)
     }
 
     public static func delete(account: String) -> Bool {

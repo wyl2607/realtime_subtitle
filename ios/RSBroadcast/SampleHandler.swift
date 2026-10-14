@@ -4,6 +4,8 @@ import AudioToolbox
 import os
 import Darwin.Mach
 import Foundation
+import Speech
+import Translation
 
 class SampleHandler: RPBroadcastSampleHandler {
     private let logger = Logger(subsystem: "com.wyl2607.rsios.spike", category: "ext")
@@ -22,6 +24,8 @@ class SampleHandler: RPBroadcastSampleHandler {
 
     private var converter: PCMConverter?
     private var session: NodeSession?
+    private var localEngine: AnyObject?
+    private var engineMode: String = "node"
     private var nodeName: String = ""
     private var readyReceived = false
     private var framesSent: UInt64 = 0
@@ -31,6 +35,11 @@ class SampleHandler: RPBroadcastSampleHandler {
     private var lastStatusCode: String = ""
     private var fatalErrorOccurred = false
     private var fatalErrorReason: String = ""
+
+    // 重连状态
+    private var reconnectPolicy = ReconnectPolicy()
+    private var reconnectCount: Int = 0
+    private var nodeConfig: NodeConfig?
 
     private var recentLines: [RecentLine] = []
     private let maxRecentLines = 3
@@ -48,6 +57,21 @@ class SampleHandler: RPBroadcastSampleHandler {
         logger.info("Broadcast started")
         writeStatus("started")
 
+        engineMode = SharedKeychain.readEngineMode() ?? "node"
+
+        if engineMode == "local" {
+            if #available(iOS 26.0, *) {
+                startLocalEngine()
+            } else {
+                writeStatus("last=local_needs_ios26")
+                stateQueue.sync {
+                    fatalErrorOccurred = true
+                    fatalErrorReason = "fatal:local_needs_ios26"
+                }
+            }
+            return
+        }
+
         guard let json = SharedKeychain.readNodeConfig(),
               let data = json.data(using: .utf8),
               let config = try? JSONDecoder().decode(NodeConfig.self, from: data) else {
@@ -56,6 +80,7 @@ class SampleHandler: RPBroadcastSampleHandler {
         }
 
         nodeName = config.name
+        nodeConfig = config
         converter = PCMConverter()
         stateQueue.sync {
             readyReceived = false
@@ -69,6 +94,8 @@ class SampleHandler: RPBroadcastSampleHandler {
             recentLines = []
             session = nil
             broadcastActive = true
+            reconnectPolicy = ReconnectPolicy()
+            reconnectCount = 0
         }
 
         startPinnedSession(config)
@@ -76,6 +103,17 @@ class SampleHandler: RPBroadcastSampleHandler {
 
     override func broadcastFinished() {
         logger.info("Broadcast finished")
+        
+        if engineMode == "local" {
+            if #available(iOS 26.0, *) {
+                (localEngine as? LocalEngine)?.stop()
+                localEngine = nil
+            }
+            converter = nil
+            writeStatus("finished")
+            return
+        }
+
         let currentSession = stateQueue.sync { () -> NodeSession? in
             broadcastActive = false
             let currentSession = session
@@ -86,6 +124,72 @@ class SampleHandler: RPBroadcastSampleHandler {
         currentSession?.close()
         converter = nil
         writeStatus("finished")
+    }
+
+    @available(iOS 26.0, *)
+    private func startLocalEngine() {
+        converter = PCMConverter()
+        stateQueue.sync {
+            readyReceived = true
+            framesSent = 0
+            finalsCount = 0
+            translationsCount = 0
+            preReadyDropped = 0
+            lastStatusCode = ""
+            fatalErrorOccurred = false
+            fatalErrorReason = ""
+            recentLines = []
+            broadcastActive = true
+        }
+
+        let engine = LocalEngine(
+            onFinal: { [weak self] id, text in
+                self?.handleLocalFinal(id: id, text: text)
+            },
+            onTranslation: { [weak self] id, text in
+                self?.handleLocalTranslation(id: id, text: text)
+            },
+            onStatus: { [weak self] status in
+                self?.handleLocalStatus(status)
+            }
+        )
+        localEngine = engine
+        Task {
+            await engine.start()
+        }
+    }
+
+    private func handleLocalFinal(id: Int, text: String) {
+        stateQueue.sync {
+            finalsCount += 1
+            recentLines.append(RecentLine(id: id, src: text, dst: ""))
+            if recentLines.count > maxRecentLines {
+                recentLines.removeFirst()
+            }
+        }
+        writeLatestLines()
+    }
+
+    private func handleLocalTranslation(id: Int, text: String) {
+        stateQueue.sync {
+            translationsCount += 1
+            if let idx = recentLines.firstIndex(where: { $0.id == id }) {
+                recentLines[idx].dst = text
+            }
+        }
+        writeLatestLines()
+    }
+
+    private func handleLocalStatus(_ status: String) {
+        stateQueue.sync { lastStatusCode = status }
+        logger.info("Local engine status: \(status)")
+        if status == "asr_assets_missing" || status == "asr_unsupported" || status == "analyzer_format_failed" || status == "asr_failed" || status == "asr_result_failed" {
+            stateQueue.sync {
+                fatalErrorOccurred = true
+                fatalErrorReason = "fatal:\(status)"
+            }
+        }
+        writeStatus("last=\(status)")
     }
 
     override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer, with sampleBufferType: RPSampleBufferType) {
@@ -133,15 +237,33 @@ class SampleHandler: RPBroadcastSampleHandler {
             let memMB = residentMemoryMB()
             let interleavedStr = isNonInterleaved ? "0" : "1"
             let state = stateQueue.sync {
-                (readyReceived, framesSent, finalsCount, translationsCount, lastStatusCode, preReadyDropped, fatalErrorOccurred, fatalErrorReason)
+                (readyReceived, framesSent, finalsCount, translationsCount, lastStatusCode, preReadyDropped, fatalErrorOccurred, fatalErrorReason, reconnectCount)
             }
             let readyStr = state.0 ? "1" : "0"
-            var status = "blocks=\(blockCount) rate=\(Int(sampleRate)) ch=\(channelCount) fmt=\(formatString) flags=\(formatFlags) ileave=\(interleavedStr) rms=\(String(format: "%.3f", avgRMS)) mem=\(memMB) node=\(nodeName) ready=\(readyStr) sent=\(state.1) finals=\(state.2) tx=\(state.3) last=\(state.4.isEmpty ? "-" : state.4) drop=\(state.5)"
+            let engineStr = engineMode == "local" ? "local" : "node"
+            var status = "blocks=\(blockCount) rate=\(Int(sampleRate)) ch=\(channelCount) fmt=\(formatString) flags=\(formatFlags) ileave=\(interleavedStr) rms=\(String(format: "%.3f", avgRMS)) mem=\(memMB) engine=\(engineStr)"
+            if engineMode == "node" {
+                status += " node=\(nodeName) ready=\(readyStr) sent=\(state.1) finals=\(state.2) tx=\(state.3) last=\(state.4.isEmpty ? "-" : state.4) drop=\(state.5) reconn=\(state.8)"
+            }
             if state.6, !state.7.isEmpty {
                 status += " \(state.7)"
             }
             writeStatus(status)
             lastStatusWriteTime = now
+        }
+
+        if engineMode == "local" {
+            if #available(iOS 26.0, *) {
+                guard let converter = converter, let engine = localEngine as? LocalEngine else { return }
+                let fatal = stateQueue.sync { fatalErrorOccurred }
+                guard !fatal else { return }
+
+                let frames = converter.append(sampleBuffer)
+                for frame in frames {
+                    engine.append(pcm16k: frame)
+                }
+            }
+            return
         }
 
         let currentSession = stateQueue.sync { session }
@@ -211,7 +333,10 @@ class SampleHandler: RPBroadcastSampleHandler {
     private func handleNodeEvent(_ event: NodeEvent) {
         switch event {
         case .ready(let cold):
-            stateQueue.sync { readyReceived = true }
+            stateQueue.sync {
+                readyReceived = true
+                reconnectPolicy.reset()
+            }
             logger.info("Node ready cold=\(cold)")
         case .final(let id, _, _, let text):
             stateQueue.sync {
@@ -247,11 +372,34 @@ class SampleHandler: RPBroadcastSampleHandler {
     private func handleNodeClose(_ code: Int) {
         let displayCode = code == 1013 ? "busy" : "\(code)"
         stateQueue.sync { lastStatusCode = "closed=\(displayCode)" }
-        stateQueue.sync {
-            fatalErrorOccurred = true
-            fatalErrorReason = "fatal:closed=\(displayCode)"
-        }
         logger.info("Node closed: \(code)")
+
+        // 只在 node 模式下尝试重连
+        guard engineMode == "node" else { return }
+
+        // 由 NodeSession 通过 closeReason 还原过 1005→真实码
+        let shouldReconnect = stateQueue.sync { () -> (TimeInterval?, NodeConfig?) in
+            guard broadcastActive else { return (nil, nil) }
+            guard !fatalErrorOccurred else { return (nil, nil) }
+            let delay = reconnectPolicy.next(closeCode: code)
+            guard let delay else { return (nil, nil) }
+            reconnectCount += 1
+            return (delay, nodeConfig)
+        }
+
+        guard let delay = shouldReconnect.0, let config = shouldReconnect.1 else { return }
+
+        // 重连前把 readyReceived 置 false（ready 之前的帧照旧丢弃计入 drop）
+        stateQueue.sync { readyReceived = false }
+
+        // 延迟后在 connectionQueue 上重新走 startPinnedSession（含 TailnetPin 校验）
+        connectionQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            self.stateQueue.sync {
+                guard self.broadcastActive else { return }
+                self.startPinnedSession(config)
+            }
+        }
     }
 
     private func computeRMS(sampleBuffer: CMSampleBuffer, asbd: AudioStreamBasicDescription) -> Float {
