@@ -503,8 +503,9 @@ struct NodeSelftest {
         runTest(name: "48kHz立体声Float32非交错", sampleRate: 48000, channels: 2, isFloat: true, isBigEndian: false, isNonInterleaved: true)
 
         // 新增：左声道 440Hz、右声道静音的 48kHz Int16 小端交错
-        // 预期：混音后单声道幅度减半 → RMS = (0.5/√2)/2 = 0.5/(2√2) = 0.5/2.828 ≈ 0.1768
-        let leftOnlyExpectedRMS = 0.5 / sqrt(2.0)  // PCMConverter 取左声道，不做平均混音
+        // PCMConverter（AVAudioConverter 默认 2→1 声道映射）只取左声道、不做平均混音，
+        // 所以预期 RMS 与满幅单声道相同 = 0.5/√2；若取错声道，RMS≈0、相关性≈0 会失败
+        let leftOnlyExpectedRMS = 0.5 / sqrt(2.0)
         runTest(
             name: "48kHz左声道440Hz右声道静音Int16小端交错",
             sampleRate: 48000,
@@ -595,17 +596,6 @@ struct NodeSelftest {
             if corr > maxCorr { maxCorr = corr }
         }
         return maxCorr
-    }
-
-    /// 生成 16kHz 下的理想 440Hz 正弦波用于对比
-    static func generateIdealSine16k(frames: Int, amplitude: Double = 1.0) -> [Double] {
-        var samples: [Double] = []
-        samples.reserveCapacity(frames)
-        for i in 0..<frames {
-            let t = Double(i) / 16000.0
-            samples.append(amplitude * sin(2.0 * Double.pi * 440.0 * t))
-        }
-        return samples
     }
 
     static func extractFrames(from sampleBuffer: CMSampleBuffer, startFrame: Int, frameCount: Int) -> CMSampleBuffer? {
