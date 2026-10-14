@@ -183,7 +183,7 @@ class SampleHandler: RPBroadcastSampleHandler {
     private func handleLocalStatus(_ status: String) {
         stateQueue.sync { lastStatusCode = status }
         logger.info("Local engine status: \(status)")
-        if status == "asr_assets_missing" || status == "asr_unsupported" || status == "analyzer_format_failed" || status == "asr_failed" || status == "asr_result_failed" {
+        if ["asr_assets_missing", "asr_unsupported", "analyzer_format_failed", "asr_failed", "asr_result_failed"].contains(where: { status.hasPrefix($0) }) {
             stateQueue.sync {
                 fatalErrorOccurred = true
                 fatalErrorReason = "fatal:\(status)"
@@ -244,6 +244,8 @@ class SampleHandler: RPBroadcastSampleHandler {
             var status = "blocks=\(blockCount) rate=\(Int(sampleRate)) ch=\(channelCount) fmt=\(formatString) flags=\(formatFlags) ileave=\(interleavedStr) rms=\(String(format: "%.3f", avgRMS)) mem=\(memMB) engine=\(engineStr)"
             if engineMode == "node" {
                 status += " node=\(nodeName) ready=\(readyStr) sent=\(state.1) finals=\(state.2) tx=\(state.3) last=\(state.4.isEmpty ? "-" : state.4) drop=\(state.5) reconn=\(state.8)"
+            } else {
+                status += " finals=\(state.2) tx=\(state.3) last=\(state.4.isEmpty ? "-" : state.4)"
             }
             if state.6, !state.7.isEmpty {
                 status += " \(state.7)"

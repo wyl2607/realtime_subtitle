@@ -30,6 +30,8 @@ final class LocalEngine {
         interleaved: true
     )!
     private var analyzerFormat: AVAudioFormat?
+    // 每帧新建 converter 会丢掉重采样器状态；格式相同时直接送原 buffer
+    private var converter: AVAudioConverter?
 
     init(
         onFinal: @escaping (Int, String) -> Void,
@@ -133,8 +135,7 @@ final class LocalEngine {
 
         let frameCount = pcm16k.count / 2
         guard frameCount > 0,
-              let sourceBuffer = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: AVAudioFrameCount(frameCount)),
-              let outputBuffer = AVAudioPCMBuffer(pcmFormat: analyzerFormat, frameCapacity: AVAudioFrameCount(Double(frameCount) * analyzerFormat.sampleRate / sourceFormat.sampleRate) + 1024) else {
+              let sourceBuffer = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: AVAudioFrameCount(frameCount)) else {
             return
         }
 
@@ -144,9 +145,20 @@ final class LocalEngine {
             memcpy(dst, base, pcm16k.count)
         }
 
+        if analyzerFormat == sourceFormat {
+            continuation.yield(AnalyzerInput(buffer: sourceBuffer))
+            return
+        }
+
+        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: analyzerFormat, frameCapacity: AVAudioFrameCount(Double(frameCount) * analyzerFormat.sampleRate / sourceFormat.sampleRate) + 1024) else {
+            return
+        }
+        if converter == nil {
+            converter = AVAudioConverter(from: sourceFormat, to: analyzerFormat)
+        }
+        guard let converter else { return }
         var didProvideInput = false
         var convertError: NSError?
-        guard let converter = AVAudioConverter(from: sourceFormat, to: analyzerFormat) else { return }
         let status = converter.convert(to: outputBuffer, error: &convertError) { _, outStatus in
             if didProvideInput {
                 outStatus.pointee = .noDataNow
@@ -178,6 +190,7 @@ final class LocalEngine {
         transcriber = nil
         translationSession = nil
         analyzerFormat = nil
+        converter = nil
     }
 
     private func handleResult(_ result: SpeechTranscriber.Result) async {
