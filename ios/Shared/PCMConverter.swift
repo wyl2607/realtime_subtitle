@@ -16,13 +16,6 @@ final class PCMConverter {
         interleaved: true
     )!
 
-    private static let mixdownFormatTemplate = AVAudioFormat(
-        commonFormat: .pcmFormatFloat32,
-        sampleRate: 0,
-        channels: 1,
-        interleaved: false
-    )!
-
     private var pending = Data()
     private var cachedInputFormat: AVAudioFormat?
     private var cachedConverter: AVAudioConverter?
