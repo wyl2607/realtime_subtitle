@@ -20,6 +20,7 @@ struct NodeSelftest {
         testCMSampleBufferPaths(check)
         runPairingSelftest(check)
         runTailnetPinSelftest(check)
+        runReconnectSelftest(check)
 
         if failures.isEmpty {
             print("SELFTEST OK")

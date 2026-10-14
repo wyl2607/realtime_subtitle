@@ -36,6 +36,11 @@ class SampleHandler: RPBroadcastSampleHandler {
     private var fatalErrorOccurred = false
     private var fatalErrorReason: String = ""
 
+    // 重连状态
+    private var reconnectPolicy = ReconnectPolicy()
+    private var reconnectCount: Int = 0
+    private var nodeConfig: NodeConfig?
+
     private var recentLines: [RecentLine] = []
     private let maxRecentLines = 3
     private let stateQueue = DispatchQueue(label: "com.wyl2607.rsios.spike.state")
@@ -75,6 +80,7 @@ class SampleHandler: RPBroadcastSampleHandler {
         }
 
         nodeName = config.name
+        nodeConfig = config
         converter = PCMConverter()
         stateQueue.sync {
             readyReceived = false
@@ -88,6 +94,8 @@ class SampleHandler: RPBroadcastSampleHandler {
             recentLines = []
             session = nil
             broadcastActive = true
+            reconnectPolicy = ReconnectPolicy()
+            reconnectCount = 0
         }
 
         startPinnedSession(config)
@@ -229,13 +237,13 @@ class SampleHandler: RPBroadcastSampleHandler {
             let memMB = residentMemoryMB()
             let interleavedStr = isNonInterleaved ? "0" : "1"
             let state = stateQueue.sync {
-                (readyReceived, framesSent, finalsCount, translationsCount, lastStatusCode, preReadyDropped, fatalErrorOccurred, fatalErrorReason)
+                (readyReceived, framesSent, finalsCount, translationsCount, lastStatusCode, preReadyDropped, fatalErrorOccurred, fatalErrorReason, reconnectCount)
             }
             let readyStr = state.0 ? "1" : "0"
             let engineStr = engineMode == "local" ? "local" : "node"
             var status = "blocks=\(blockCount) rate=\(Int(sampleRate)) ch=\(channelCount) fmt=\(formatString) flags=\(formatFlags) ileave=\(interleavedStr) rms=\(String(format: "%.3f", avgRMS)) mem=\(memMB) engine=\(engineStr)"
             if engineMode == "node" {
-                status += " node=\(nodeName) ready=\(readyStr) sent=\(state.1) finals=\(state.2) tx=\(state.3) last=\(state.4.isEmpty ? "-" : state.4) drop=\(state.5)"
+                status += " node=\(nodeName) ready=\(readyStr) sent=\(state.1) finals=\(state.2) tx=\(state.3) last=\(state.4.isEmpty ? "-" : state.4) drop=\(state.5) reconn=\(state.8)"
             }
             if state.6, !state.7.isEmpty {
                 status += " \(state.7)"
@@ -325,7 +333,10 @@ class SampleHandler: RPBroadcastSampleHandler {
     private func handleNodeEvent(_ event: NodeEvent) {
         switch event {
         case .ready(let cold):
-            stateQueue.sync { readyReceived = true }
+            stateQueue.sync {
+                readyReceived = true
+                reconnectPolicy.reset()
+            }
             logger.info("Node ready cold=\(cold)")
         case .final(let id, _, _, let text):
             stateQueue.sync {
@@ -361,11 +372,34 @@ class SampleHandler: RPBroadcastSampleHandler {
     private func handleNodeClose(_ code: Int) {
         let displayCode = code == 1013 ? "busy" : "\(code)"
         stateQueue.sync { lastStatusCode = "closed=\(displayCode)" }
-        stateQueue.sync {
-            fatalErrorOccurred = true
-            fatalErrorReason = "fatal:closed=\(displayCode)"
-        }
         logger.info("Node closed: \(code)")
+
+        // 只在 node 模式下尝试重连
+        guard engineMode == "node" else { return }
+
+        // 由 NodeSession 通过 closeReason 还原过 1005→真实码
+        let shouldReconnect = stateQueue.sync { () -> (TimeInterval?, NodeConfig?) in
+            guard broadcastActive else { return (nil, nil) }
+            guard !fatalErrorOccurred else { return (nil, nil) }
+            let delay = reconnectPolicy.next(closeCode: code)
+            guard let delay else { return (nil, nil) }
+            reconnectCount += 1
+            return (delay, nodeConfig)
+        }
+
+        guard let delay = shouldReconnect.0, let config = shouldReconnect.1 else { return }
+
+        // 重连前把 readyReceived 置 false（ready 之前的帧照旧丢弃计入 drop）
+        stateQueue.sync { readyReceived = false }
+
+        // 延迟后在 connectionQueue 上重新走 startPinnedSession（含 TailnetPin 校验）
+        connectionQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            self.stateQueue.sync {
+                guard self.broadcastActive else { return }
+                self.startPinnedSession(config)
+            }
+        }
     }
 
     private func computeRMS(sampleBuffer: CMSampleBuffer, asbd: AudioStreamBasicDescription) -> Float {
