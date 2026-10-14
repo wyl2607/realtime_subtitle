@@ -35,6 +35,8 @@ class SampleHandler: RPBroadcastSampleHandler {
     private var recentLines: [RecentLine] = []
     private let maxRecentLines = 3
     private let stateQueue = DispatchQueue(label: "com.wyl2607.rsios.spike.state")
+    private let connectionQueue = DispatchQueue(label: "com.wyl2607.rsios.spike.connection")
+    private var broadcastActive = false
 
     struct RecentLine: Codable {
         let id: Int
@@ -65,28 +67,23 @@ class SampleHandler: RPBroadcastSampleHandler {
             fatalErrorOccurred = false
             fatalErrorReason = ""
             recentLines = []
+            session = nil
+            broadcastActive = true
         }
 
-        session = NodeSession(
-            url: config.sessionURL,
-            token: config.token,
-            src: config.src,
-            dst: config.dst,
-            onEvent: { [weak self] event in
-                self?.handleNodeEvent(event)
-            },
-            onClose: { [weak self] code in
-                self?.handleNodeClose(code)
-            }
-        )
-        session?.start()
+        startPinnedSession(config)
     }
 
     override func broadcastFinished() {
         logger.info("Broadcast finished")
-        session?.flush()
-        session?.close()
-        session = nil
+        let currentSession = stateQueue.sync { () -> NodeSession? in
+            broadcastActive = false
+            let currentSession = session
+            session = nil
+            return currentSession
+        }
+        currentSession?.flush()
+        currentSession?.close()
         converter = nil
         writeStatus("finished")
     }
@@ -147,7 +144,8 @@ class SampleHandler: RPBroadcastSampleHandler {
             lastStatusWriteTime = now
         }
 
-        guard let converter = converter, let session = session else { return }
+        let currentSession = stateQueue.sync { session }
+        guard let converter = converter, let session = currentSession else { return }
         let fatal = stateQueue.sync { fatalErrorOccurred }
         guard !fatal else { return }
 
@@ -159,6 +157,53 @@ class SampleHandler: RPBroadcastSampleHandler {
                 stateQueue.sync { framesSent += 1 }
             } else {
                 stateQueue.sync { preReadyDropped += 1 }
+            }
+        }
+    }
+
+    private func startPinnedSession(_ config: NodeConfig) {
+        connectionQueue.async { [weak self] in
+            guard let self else { return }
+            let pinnedURL: URL
+            do {
+                pinnedURL = try TailnetPin.pinned(config.sessionURL)
+            } catch {
+                let status: String
+                if case TailnetPin.PinError.notTailnet = error {
+                    status = "not_tailnet"
+                } else {
+                    status = "resolve_failed"
+                }
+                let shouldReport = self.stateQueue.sync { () -> Bool in
+                    guard self.broadcastActive else { return false }
+                    self.lastStatusCode = status
+                    return true
+                }
+                if shouldReport {
+                    self.writeStatus("last=\(status)")
+                }
+                return
+            }
+
+            let newSession = NodeSession(
+                url: pinnedURL,
+                token: config.token,
+                src: config.src,
+                dst: config.dst,
+                onEvent: { [weak self] event in
+                    self?.handleNodeEvent(event)
+                },
+                onClose: { [weak self] code in
+                    self?.handleNodeClose(code)
+                }
+            )
+            let shouldStart = self.stateQueue.sync { () -> Bool in
+                guard self.broadcastActive else { return false }
+                self.session = newSession
+                return true
+            }
+            if shouldStart {
+                newSession.start()
             }
         }
     }

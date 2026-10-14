@@ -19,6 +19,7 @@ struct NodeSelftest {
         pcmChecks(sampleRate: 44_100, channels: 1, check: check)
         testCMSampleBufferPaths(check)
         runPairingSelftest(check)
+        runTailnetPinSelftest(check)
 
         if failures.isEmpty {
             print("SELFTEST OK")
