@@ -250,12 +250,14 @@ struct NodeSelftest {
     }
 
     /// 造指定格式的 1 秒 440Hz 正弦 CMSampleBuffer，用于测试 PCMConverter.append
+    /// 若 leftChannelOnly=true，仅左声道有信号，右声道全 0
     static func makeTestSampleBuffer(
         sampleRate: Double,
         channels: Int,
         isFloat: Bool,
         isBigEndian: Bool,
-        isNonInterleaved: Bool
+        isNonInterleaved: Bool,
+        leftChannelOnly: Bool = false
     ) -> CMSampleBuffer? {
         let frames = Int(sampleRate)
         let amplitude = 0.5
@@ -265,7 +267,13 @@ struct NodeSelftest {
         for f in 0..<frames {
             let t = Double(f) / sampleRate
             let v = Float(amplitude * sin(2.0 * Double.pi * freq * t))
-            for _ in 0..<channels { samples.append(v) }
+            for ch in 0..<channels {
+                if leftChannelOnly && ch > 0 {
+                    samples.append(0.0)
+                } else {
+                    samples.append(v)
+                }
+            }
         }
 
         let bytesPerSample = isFloat ? 4 : 2
@@ -441,6 +449,7 @@ struct NodeSelftest {
         let tolerance = 3200
         let expectedNormRMS = 0.5 / sqrt(2.0)
         let rmsTolerance = 0.20
+        let minCorrelation = 0.95
 
         func runTest(
             name: String,
@@ -448,14 +457,17 @@ struct NodeSelftest {
             channels: Int,
             isFloat: Bool,
             isBigEndian: Bool,
-            isNonInterleaved: Bool
+            isNonInterleaved: Bool,
+            expectedRMS: Double? = nil,
+            leftChannelOnly: Bool = false
         ) {
             guard let sampleBuffer = makeTestSampleBuffer(
                 sampleRate: sampleRate,
                 channels: channels,
                 isFloat: isFloat,
                 isBigEndian: isBigEndian,
-                isNonInterleaved: isNonInterleaved
+                isNonInterleaved: isNonInterleaved,
+                leftChannelOnly: leftChannelOnly
             ) else {
                 check(false, "\(name) 构造 CMSampleBuffer 失败")
                 return
@@ -475,14 +487,34 @@ struct NodeSelftest {
             check(abs(total - expectedTotal) <= tolerance,
                   "\(name) 总字节 ≈ 32000（实际 \(total)）")
 
-            let outputNormRMS = rmsInt16DataNormalized(Data(frames.joined()))
-            let relDiff = expectedNormRMS > 0 ? abs(outputNormRMS - expectedNormRMS) / expectedNormRMS : 0
-            check(relDiff < rmsTolerance, "\(name) 归一化 RMS 相差 <20%（预期 \(expectedNormRMS)，实际 \(outputNormRMS)，相对差 \(relDiff)）")
+            let outputData = Data(frames.joined())
+            let outputNormRMS = rmsInt16DataNormalized(outputData)
+            let targetRMS = expectedRMS ?? expectedNormRMS
+            let relDiff = targetRMS > 0 ? abs(outputNormRMS - targetRMS) / targetRMS : 0
+            check(relDiff < rmsTolerance, "\(name) 归一化 RMS 相差 <20%（预期 \(targetRMS)，实际 \(outputNormRMS)，相对差 \(relDiff)）")
+
+            let corr = maxNormalizedCrossCorrelation(output: outputData)
+            check(corr >= minCorrelation, "\(name) 波形相关性 ≥ 0.95（实际 \(corr)）")
         }
 
+        // 原有三组测试
         runTest(name: "44.1kHz立体声Int16大端交错", sampleRate: 44100, channels: 2, isFloat: false, isBigEndian: true, isNonInterleaved: false)
         runTest(name: "48kHz立体声Int16小端交错", sampleRate: 48000, channels: 2, isFloat: false, isBigEndian: false, isNonInterleaved: false)
         runTest(name: "48kHz立体声Float32非交错", sampleRate: 48000, channels: 2, isFloat: true, isBigEndian: false, isNonInterleaved: true)
+
+        // 新增：左声道 440Hz、右声道静音的 48kHz Int16 小端交错
+        // 预期：混音后单声道幅度减半 → RMS = (0.5/√2)/2 = 0.5/(2√2) = 0.5/2.828 ≈ 0.1768
+        let leftOnlyExpectedRMS = 0.5 / sqrt(2.0)  // PCMConverter 取左声道，不做平均混音
+        runTest(
+            name: "48kHz左声道440Hz右声道静音Int16小端交错",
+            sampleRate: 48000,
+            channels: 2,
+            isFloat: false,
+            isBigEndian: false,
+            isNonInterleaved: false,
+            expectedRMS: leftOnlyExpectedRMS,
+            leftChannelOnly: true
+        )
     }
 
     static func rmsInt16DataNormalized(_ data: Data) -> Double {
@@ -498,6 +530,82 @@ struct NodeSelftest {
             }
         }
         return (sum / Double(count)).squareRoot()
+    }
+
+    /// 归一化互相关：在 ±maxShift 范围内寻找最大相关性
+    /// 输入：输出波形与同频率理想正弦波（16kHz 采样）
+    /// 返回：最大相关性系数（-1 到 1），要求 ≥ 0.95
+    static func maxNormalizedCrossCorrelation(
+        output: Data,
+        expectedFrequency: Double = 440.0,
+        outputSampleRate: Double = 16000.0,
+        maxShift: Int = 40
+    ) -> Double {
+        let count = output.count / 2
+        guard count > 0 else { return 0 }
+
+        var outputSamples: [Double] = []
+        outputSamples.reserveCapacity(count)
+        output.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.baseAddress else { return }
+            let p = base.assumingMemoryBound(to: Int16.self)
+            for i in 0..<count {
+                outputSamples.append(Double(p[i]) / 32768.0)
+            }
+        }
+
+        // 生成理想正弦波
+        var idealSamples: [Double] = []
+        idealSamples.reserveCapacity(count)
+        for i in 0..<count {
+            let t = Double(i) / outputSampleRate
+            idealSamples.append(sin(2.0 * Double.pi * expectedFrequency * t))
+        }
+
+        // 归一化
+        let outputMean = outputSamples.reduce(0, +) / Double(count)
+        let idealMean = idealSamples.reduce(0, +) / Double(count)
+
+        var outputCentered: [Double] = []
+        var idealCentered: [Double] = []
+        outputCentered.reserveCapacity(count)
+        idealCentered.reserveCapacity(count)
+        for i in 0..<count {
+            outputCentered.append(outputSamples[i] - outputMean)
+            idealCentered.append(idealSamples[i] - idealMean)
+        }
+
+        let outputNorm = (outputCentered.map { $0 * $0 }.reduce(0, +)).squareRoot()
+        let idealNorm = (idealCentered.map { $0 * $0 }.reduce(0, +)).squareRoot()
+
+        guard outputNorm > 0 && idealNorm > 0 else { return 0 }
+
+        var maxCorr = 0.0
+        for shift in -maxShift...maxShift {
+            var corr = 0.0
+            let startOut = max(0, shift)
+            let startIdeal = max(0, -shift)
+            let len = min(count - startOut, count - startIdeal)
+            guard len > 100 else { continue } // 需要足够重叠
+
+            for k in 0..<len {
+                corr += outputCentered[startOut + k] * idealCentered[startIdeal + k]
+            }
+            corr /= outputNorm * idealNorm
+            if corr > maxCorr { maxCorr = corr }
+        }
+        return maxCorr
+    }
+
+    /// 生成 16kHz 下的理想 440Hz 正弦波用于对比
+    static func generateIdealSine16k(frames: Int, amplitude: Double = 1.0) -> [Double] {
+        var samples: [Double] = []
+        samples.reserveCapacity(frames)
+        for i in 0..<frames {
+            let t = Double(i) / 16000.0
+            samples.append(amplitude * sin(2.0 * Double.pi * 440.0 * t))
+        }
+        return samples
     }
 
     static func extractFrames(from sampleBuffer: CMSampleBuffer, startFrame: Int, frameCount: Int) -> CMSampleBuffer? {
