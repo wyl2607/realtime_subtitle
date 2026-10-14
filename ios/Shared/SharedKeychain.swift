@@ -4,7 +4,7 @@ import os
 
 public enum SharedKeychain {
     public static let service = "rsios.spike"
-    public static let accessGroupPrefix = "com.wyl2607.rsios.shared"
+    public static let accessGroupPrefix = "com.yilinwang.realtimesubtitle.shared"
 
     public enum Account {
         public static let extStatus = "ext_status"

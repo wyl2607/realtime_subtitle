@@ -67,7 +67,7 @@ ios/
 - 部署目标 iOS 17.0，Swift 5.0（避免 Swift 6 严格并发）。
 - 扩展类型 `app-extension`，`NSExtensionPointIdentifier = com.apple.broadcast-services-upload`。
 - `RPBroadcastProcessMode = RPBroadcastProcessModeSampleBuffer`。
-- 共享 Keychain access group：`$(AppIdentifierPrefix)com.wyl2607.rsios.shared`。
+- 共享 Keychain access group：`$(AppIdentifierPrefix)com.yilinwang.realtimesubtitle.shared`。
 - 主 App `UIBackgroundModes: [audio]` 以支持后台 PiP。
 - 扩展只处理 `.audioApp`，计算 RMS，每秒写一次 Keychain + 发 Darwin 通知。
 - 主 App 每 0.5 秒读 Keychain、刷新 PiP 字幕帧（1280×360 BGRA → CMSampleBuffer → AVSampleBufferDisplayLayer）。
