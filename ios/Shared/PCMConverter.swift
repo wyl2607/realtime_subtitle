@@ -16,6 +16,13 @@ final class PCMConverter {
         interleaved: true
     )!
 
+    private static let mixdownFormatTemplate = AVAudioFormat(
+        commonFormat: .pcmFormatFloat32,
+        sampleRate: 0,
+        channels: 1,
+        interleaved: false
+    )!
+
     private var pending = Data()
     private var cachedInputFormat: AVAudioFormat?
     private var cachedConverter: AVAudioConverter?
@@ -60,11 +67,22 @@ final class PCMConverter {
     }
 
     private func convertToWire(_ input: AVAudioPCMBuffer, format: AVAudioFormat) -> Data {
-        guard input.frameLength > 0, let converter = converter(for: format) else {
-            return Data()
-        }
-        let ratio = Self.outputFormat.sampleRate / format.sampleRate
-        let capacity = AVAudioFrameCount(Double(input.frameLength) * ratio) + 1024
+        guard input.frameLength > 0 else { return Data() }
+
+        let monoInput = mixdownToMono(input)
+        guard let mono = monoInput else { return Data() }
+
+        let monoFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: format.sampleRate,
+            channels: 1,
+            interleaved: false
+        )!
+
+        guard let converter = converter(for: monoFormat) else { return Data() }
+
+        let ratio = Self.outputFormat.sampleRate / monoFormat.sampleRate
+        let capacity = AVAudioFrameCount(Double(mono.frameLength) * ratio) + 1024
         guard let output = AVAudioPCMBuffer(pcmFormat: Self.outputFormat, frameCapacity: capacity) else {
             return Data()
         }
@@ -77,7 +95,7 @@ final class PCMConverter {
             }
             didProvideInput = true
             outStatus.pointee = .haveData
-            return input
+            return mono
         }
         if convertError != nil || status == .error {
             return Data()
@@ -105,6 +123,109 @@ final class PCMConverter {
             a.sampleRate == b.sampleRate &&
             a.channelCount == b.channelCount &&
             a.isInterleaved == b.isInterleaved
+    }
+
+    /// 将任意声道数的 buffer 混音为单声道（按帧平均各声道）。
+    /// 输入 buffer 可为 Int16 或 Float32、交错或非交错。
+    /// 返回 Float32 非交错单声道 buffer，采样率不变；单声道输入直接返回。
+    private func mixdownToMono(_ input: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        let channels = Int(input.format.channelCount)
+        let frames = Int(input.frameLength)
+        guard channels > 0, frames > 0 else { return nil }
+
+        if channels == 1 {
+            // 已是单声道，转为 Float32 非交错
+            return convertToFloat32Mono(input, frames: frames)
+        }
+
+        let monoFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: input.format.sampleRate,
+            channels: 1,
+            interleaved: false
+        )!
+        guard let monoBuffer = AVAudioPCMBuffer(pcmFormat: monoFormat, frameCapacity: AVAudioFrameCount(frames)) else {
+            return nil
+        }
+        monoBuffer.frameLength = AVAudioFrameCount(frames)
+
+        guard let dst = monoBuffer.floatChannelData?[0] else { return nil }
+
+        let isFloat = input.format.commonFormat == .pcmFormatFloat32
+        let isInterleaved = input.format.isInterleaved
+
+        if isFloat {
+            if isInterleaved {
+                guard let src = input.floatChannelData?[0] else { return nil }
+                for f in 0..<frames {
+                    var sum: Float = 0
+                    for ch in 0..<channels {
+                        sum += src[f * channels + ch]
+                    }
+                    dst[f] = sum / Float(channels)
+                }
+            } else {
+                guard let ptrs = input.floatChannelData else { return nil }
+                for f in 0..<frames {
+                    var sum: Float = 0
+                    for ch in 0..<channels {
+                        sum += ptrs[ch][f]
+                    }
+                    dst[f] = sum / Float(channels)
+                }
+            }
+        } else {
+            // Int16 -> 归一化到 [-1, 1] 再求平均
+            if isInterleaved {
+                guard let src = input.int16ChannelData?[0] else { return nil }
+                for f in 0..<frames {
+                    var sum: Float = 0
+                    for ch in 0..<channels {
+                        sum += Float(src[f * channels + ch]) / 32768.0
+                    }
+                    dst[f] = sum / Float(channels)
+                }
+            } else {
+                guard let ptrs = input.int16ChannelData else { return nil }
+                for f in 0..<frames {
+                    var sum: Float = 0
+                    for ch in 0..<channels {
+                        sum += Float(ptrs[ch][f]) / 32768.0
+                    }
+                    dst[f] = sum / Float(channels)
+                }
+            }
+        }
+        return monoBuffer
+    }
+
+    /// 单声道 buffer 转为 Float32 非交错格式
+    private func convertToFloat32Mono(_ input: AVAudioPCMBuffer, frames: Int) -> AVAudioPCMBuffer? {
+        let monoFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: input.format.sampleRate,
+            channels: 1,
+            interleaved: false
+        )!
+        guard let monoBuffer = AVAudioPCMBuffer(pcmFormat: monoFormat, frameCapacity: AVAudioFrameCount(frames)) else {
+            return nil
+        }
+        monoBuffer.frameLength = AVAudioFrameCount(frames)
+        guard let dst = monoBuffer.floatChannelData?[0] else { return nil }
+
+        let isFloat = input.format.commonFormat == .pcmFormatFloat32
+        if isFloat {
+            guard let src = input.floatChannelData?[0] else { return nil }
+            for f in 0..<frames {
+                dst[f] = src[f]
+            }
+        } else {
+            guard let src = input.int16ChannelData?[0] else { return nil }
+            for f in 0..<frames {
+                dst[f] = Float(src[f]) / 32768.0
+            }
+        }
+        return monoBuffer
     }
 
     private func extractPCMBuffer(from sampleBuffer: CMSampleBuffer) -> AVAudioPCMBuffer? {

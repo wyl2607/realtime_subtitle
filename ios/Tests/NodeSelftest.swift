@@ -249,32 +249,36 @@ struct NodeSelftest {
         return sampleBuffer
     }
 
-    /// 造指定格式的 1 秒 440Hz 正弦 CMSampleBuffer，用于测试 PCMConverter.append
-    /// 若 leftChannelOnly=true，仅左声道有信号，右声道全 0
-    static func makeTestSampleBuffer(
-        sampleRate: Double,
-        channels: Int,
-        isFloat: Bool,
-        isBigEndian: Bool,
-        isNonInterleaved: Bool,
-        leftChannelOnly: Bool = false
-    ) -> CMSampleBuffer? {
-        let frames = Int(sampleRate)
-        let amplitude = 0.5
-        let freq = 440.0
-        var samples: [Float] = []
-        samples.reserveCapacity(frames * channels)
-        for f in 0..<frames {
-            let t = Double(f) / sampleRate
-            let v = Float(amplitude * sin(2.0 * Double.pi * freq * t))
-            for ch in 0..<channels {
-                if leftChannelOnly && ch > 0 {
-                    samples.append(0.0)
-                } else {
-                    samples.append(v)
+/// 造指定格式的 1 秒 440Hz 正弦 CMSampleBuffer，用于测试 PCMConverter.append
+        /// 若 leftChannelOnly=true，仅左声道有信号，右声道全 0
+        /// 若 rightChannelOnly=true，仅右声道有信号，左声道全 0
+        static func makeTestSampleBuffer(
+            sampleRate: Double,
+            channels: Int,
+            isFloat: Bool,
+            isBigEndian: Bool,
+            isNonInterleaved: Bool,
+            leftChannelOnly: Bool = false,
+            rightChannelOnly: Bool = false
+        ) -> CMSampleBuffer? {
+            let frames = Int(sampleRate)
+            let amplitude = 0.5
+            let freq = 440.0
+            var samples: [Float] = []
+            samples.reserveCapacity(frames * channels)
+            for f in 0..<frames {
+                let t = Double(f) / sampleRate
+                let v = Float(amplitude * sin(2.0 * Double.pi * freq * t))
+                for ch in 0..<channels {
+                    if leftChannelOnly && ch > 0 {
+                        samples.append(0.0)
+                    } else if rightChannelOnly && ch == 0 {
+                        samples.append(0.0)
+                    } else {
+                        samples.append(v)
+                    }
                 }
             }
-        }
 
         let bytesPerSample = isFloat ? 4 : 2
         let byteCount = samples.count * bytesPerSample
@@ -448,6 +452,7 @@ struct NodeSelftest {
         let expectedTotal = 32000
         let tolerance = 3200
         let expectedNormRMS = 0.5 / sqrt(2.0)
+        let monoMixExpectedRMS = expectedNormRMS / 2.0  // (L+R)/2 混音：单声道幅度减半
         let rmsTolerance = 0.20
         let minCorrelation = 0.95
 
@@ -459,7 +464,8 @@ struct NodeSelftest {
             isBigEndian: Bool,
             isNonInterleaved: Bool,
             expectedRMS: Double? = nil,
-            leftChannelOnly: Bool = false
+            leftChannelOnly: Bool = false,
+            rightChannelOnly: Bool = false
         ) {
             guard let sampleBuffer = makeTestSampleBuffer(
                 sampleRate: sampleRate,
@@ -467,7 +473,8 @@ struct NodeSelftest {
                 isFloat: isFloat,
                 isBigEndian: isBigEndian,
                 isNonInterleaved: isNonInterleaved,
-                leftChannelOnly: leftChannelOnly
+                leftChannelOnly: leftChannelOnly,
+                rightChannelOnly: rightChannelOnly
             ) else {
                 check(false, "\(name) 构造 CMSampleBuffer 失败")
                 return
@@ -497,15 +504,13 @@ struct NodeSelftest {
             check(corr >= minCorrelation, "\(name) 波形相关性 ≥ 0.95（实际 \(corr)）")
         }
 
-        // 原有三组测试
+        // 原有三组测试（双声道同信号，混音后幅度不变）
         runTest(name: "44.1kHz立体声Int16大端交错", sampleRate: 44100, channels: 2, isFloat: false, isBigEndian: true, isNonInterleaved: false)
         runTest(name: "48kHz立体声Int16小端交错", sampleRate: 48000, channels: 2, isFloat: false, isBigEndian: false, isNonInterleaved: false)
         runTest(name: "48kHz立体声Float32非交错", sampleRate: 48000, channels: 2, isFloat: true, isBigEndian: false, isNonInterleaved: true)
 
         // 新增：左声道 440Hz、右声道静音的 48kHz Int16 小端交错
-        // PCMConverter（AVAudioConverter 默认 2→1 声道映射）只取左声道、不做平均混音，
-        // 所以预期 RMS 与满幅单声道相同 = 0.5/√2；若取错声道，RMS≈0、相关性≈0 会失败
-        let leftOnlyExpectedRMS = 0.5 / sqrt(2.0)
+        // 混音 (L+R)/2 后幅度减半，预期 RMS = (0.5/√2)/2 ≈ 0.1768
         runTest(
             name: "48kHz左声道440Hz右声道静音Int16小端交错",
             sampleRate: 48000,
@@ -513,8 +518,21 @@ struct NodeSelftest {
             isFloat: false,
             isBigEndian: false,
             isNonInterleaved: false,
-            expectedRMS: leftOnlyExpectedRMS,
+            expectedRMS: monoMixExpectedRMS,
             leftChannelOnly: true
+        )
+
+        // 新增：右声道 440Hz、左声道静音的 48kHz Int16 小端交错
+        // 证明是混音而不是挑声道：只取左声道时 RMS≈0 会失败
+        runTest(
+            name: "48kHz右声道440Hz左声道静音Int16小端交错",
+            sampleRate: 48000,
+            channels: 2,
+            isFloat: false,
+            isBigEndian: false,
+            isNonInterleaved: false,
+            expectedRMS: monoMixExpectedRMS,
+            rightChannelOnly: true
         )
     }
 
