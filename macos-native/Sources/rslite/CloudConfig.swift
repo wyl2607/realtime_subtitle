@@ -24,8 +24,13 @@ enum CloudConfigStore {
     static let configFileName = "cloud.json"
     static let minimumKeyLength = 20
 
+    // 和 NodeRouter.configDir 同一个入口：homeDirectoryForCurrentUser 不认 $HOME，
+    // 不看 RSLITE_CONFIG_DIR 的话，验收脚本的配置隔离对 key/开关/账本无效（2026-10-18 假 key 写进了真实目录）。
     static var defaultDirectory: URL {
-        FileManager.default.homeDirectoryForCurrentUser
+        if let dir = ProcessInfo.processInfo.environment["RSLITE_CONFIG_DIR"] {
+            return URL(fileURLWithPath: dir, isDirectory: true)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".config", isDirectory: true)
             .appendingPathComponent("rslite", isDirectory: true)
     }
