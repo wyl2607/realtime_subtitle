@@ -20,10 +20,10 @@
 | 4 | 回退：额度满 | 🔑 | 构造账本；没有真实 key 时看不出与「无 key」的区别 |
 | 4 | 回退：拔网 | 👤🔑 | 用户在场时手动关 Wi-Fi |
 | 1 | 有 key 默认走云端，悬浮窗显示「云端」 | 👤🔑 | 本机目前**没有** groq.key |
-| 2 | FLEURS 60 WER ≤ 4.5%；concat5 ≤ 2.63% | 🔑 | |
-| 3 | 段尾 → 上屏中位数 ≤ 2s | 🔑 | |
-| 5 | 故障消失后在静音点切回 Groq | 🔑 | |
-| 6 | 1 小时长测：0 次 429，记账一致 | 🔑👤 | 要在 mini2 上 scp release 版 rslite 和 1 小时素材（远程操作，先问用户） |
+| 2 | FLEURS 60 WER ≤ 4.5%；concat5 ≤ 2.63% | 🔑 | concat5 部分已有脚本（run_mac_key.sh cloud）；FLEURS 60 没有经 rslite 走 Groq 的评测入口（asr_bench.py 只测本机模型），可以拿 10-09 的 Groq 实测 3.62% 当佐证，或者另写入口 |
+| 3 | 段尾 → 上屏中位数 ≤ 2s | 🔑⚠️ | 脚本已写好（run_mac_key.sh latency），但**目前没法严格验收**：headless 事件的 `t`（启动后的墙钟秒）和 `t1`（样本时钟秒）没有共同零点，脚本只给参考值，结果标 NOT_EVALUABLE。要补一个埋点：headless 输出第一块样本相对 startedAt 的偏移 |
+| 5 | 故障消失后在静音点切回 Groq | 🔑 | 脚本已写好（run_mac_key.sh recover：第 15 秒 cloud on） |
+| 6 | 1 小时长测：0 次 429，记账一致 | 🔑⚠️ | 用户已批准（只拷文件、跑测试，不改 mini2 的服务配置）；脚本 run_mini2_hour.sh 已写好，只用 mini2 的 ~/rs-accept-v320。可以验 429 次数和账本形状；**`N_local == Delta_R` 和逐段 `billed_s == max(10, dur)` 目前做不到**：账本不记段时长，`x-ratelimit-remaining-requests` 也不写日志。要补埋点，或者按 requirement 的退回口径签字 |
 
 Mac 自动验收记录：`~/projects/rs-mac-native-data/accept-v320/fallback2/`（仓库外）。跑法：`bash .governance/sprints-002-cloud-asr-first/acceptance/run_mac_auto.sh [--only gates|docs|fallback]`。
 
@@ -51,7 +51,7 @@ Mac 自动验收记录：`~/projects/rs-mac-native-data/accept-v320/fallback2/`�
 ## 发布动作（每一步都要用户点头）
 
 1. Windows 和 🔑 项做完，把本表和发布说明「测试」一节填上实际数字。
-2. feat/macos-native 推到 origin（本地比 origin 多 4 个提交）。
+2. ✅ 10-18 已推 a210da6（用户批准）。之后的 33ea32a（需 key 的验收脚本）和本清单的更新只在本地。
 3. 合入 master：origin/master（b44350f）已经是 feat 的祖先，可以直接快进，不会冲突。注意：deps-batch 会话正在 ~/lanes/wt/rs-deps-20261018 做新一批 Dependabot，合并前先和它对齐顺序。
 4. 打 `v3.2.0` tag，发 GitHub Release（只发源码），正文用 `release-notes-v3.2.0.md`。
 5. 更新各节点：`cluster.py update`。
