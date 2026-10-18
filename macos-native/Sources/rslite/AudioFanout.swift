@@ -39,6 +39,11 @@ final class AudioFanout: @unchecked Sendable {
     /// 本次运行已送出的秒数。
     private var runSeconds = 0.0
     private var runFormat: AVAudioFormat?
+    /// 第一块样本送出时回调一次，参数是该样本在统一样本时钟上的起点（秒）。
+    /// 供 headless 验收把墙钟和统一样本时钟对齐；GUI 不设置，保持默认 nil。
+    /// 约定在 start() 之前写入，之后不再改；dispatch 在锁内读取。
+    var onFirstSample: (@Sendable (Double) -> Void)?
+    private var didEmitFirstSample = false
 
     init(makeSource: @escaping @Sendable () throws -> AudioSource) {
         self.makeSource = makeSource
@@ -130,7 +135,13 @@ final class AudioFanout: @unchecked Sendable {
         let timed = TimedAudio(buffer: buffer, startSeconds: elapsedBeforeRun + runSeconds)
         runSeconds += seconds
         let targets = Array(subscribers.values)
+        let firstSample = didEmitFirstSample ? nil : timed.startSeconds
+        didEmitFirstSample = true
+        let callback = onFirstSample
         lock.unlock()
+        if let firstSample, let callback {
+            callback(firstSample)
+        }
         // yield 不阻塞：满了由各自的 bufferingNewest 丢最旧的，慢消费者影响不到别人
         for target in targets {
             target.yield(timed)

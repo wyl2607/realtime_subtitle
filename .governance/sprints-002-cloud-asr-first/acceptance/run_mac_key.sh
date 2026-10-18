@@ -188,10 +188,10 @@ PY
 
 check_latency_clock_contract() {
     # main.swift:203,336-345,347-359: t is runHeadless-started monotonic elapsed time.
-    # AudioFanout.swift:4-13/130: t1 is a sample clock.  No event exposes the
-    # offset from runHeadless start to the first sample, so t - t1 is not proven
-    # to be segment-end latency.  Keep raw candidates for debugging, but never
-    # use them as a pass/fail value.
+    # AudioFanout.swift:4-13/130: t1 is a sample clock.  The headless clock event
+    # (ev=clock) records the shared zero point between the wall clock (t) and the
+    # sample clock (t0).  latency = t_final - (clock.t + (t1 - clock.t0)).
+    # 没有 clock 事件就仍是 NOT_EVALUABLE，绝不硬算 t - t1。
     local events_file="$1"
     local latency_file="$2"
     "$PYTHON" - "$events_file" "$latency_file" <<'PY'
@@ -205,24 +205,46 @@ with open(events_path, encoding="utf-8") as handle:
     for line in handle:
         if line.strip().startswith("{"):
             events.append(json.loads(line))
-candidates = [
-    e["t"] - e["t1"]
-    for e in events
-    if e.get("ev") == "final" and e.get("id") is not None
+
+criterion = "cloud final (id null, text [cloud:groq]) median latency <= 2.0s"
+clock = next((e for e in events if e.get("ev") == "clock"), None)
+
+def write_result(result, extra):
+    with open(out_path, "w", encoding="utf-8") as handle:
+        json.dump({"result": result, "criterion": criterion, **extra}, handle,
+                  ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+
+if clock is None or not isinstance(clock.get("t"), (int, float)) or not isinstance(clock.get("t0"), (int, float)):
+    write_result("NOT_EVALUABLE", {
+        "reason": "events 中没有有效的 clock 事件（第一样本共同零点），无法计算严格延迟",
+    })
+    print("NOT_EVALUABLE: 缺少 clock 事件（共同零点）")
+    sys.exit(0)
+
+cloud_finals = [
+    e for e in events
+    if e.get("ev") == "final" and e.get("id") is None
+    and isinstance(e.get("text"), str) and str(e["text"]).startswith("[cloud:groq]")
     and isinstance(e.get("t"), (int, float)) and isinstance(e.get("t1"), (int, float))
 ]
-result = {
-    "result": "NOT_EVALUABLE",
-    "criterion": "cloud final (id non-empty and t1) median <= 2.0s",
-    "reason": "main.swift records t from runHeadless startup, while t1 is AudioFanout sample time; the events contain no shared-origin calibration marker.",
-    "source": ["macos-native/Sources/rslite/main.swift:203", "macos-native/Sources/rslite/main.swift:336-345,347-359", "macos-native/Sources/rslite/AudioFanout.swift:4-13", "macos-native/Sources/rslite/AudioFanout.swift:127-134"],
-    "raw_unaligned_candidates_s": candidates,
-    "raw_unaligned_median_s": statistics.median(candidates) if candidates else None,
+latencies = [e["t"] - (clock["t"] + (e["t1"] - clock["t0"])) for e in cloud_finals]
+median = statistics.median(latencies) if latencies else None
+passed = median is not None and median <= 2.0
+extra = {
+    "clock_t": clock["t"],
+    "clock_t0": clock["t0"],
+    "n_cloud_finals": len(cloud_finals),
+    "latencies_s": [round(v, 3) for v in latencies],
+    "median_latency_s": round(median, 3) if median is not None else None,
 }
-with open(out_path, "w", encoding="utf-8") as handle:
-    json.dump(result, handle, ensure_ascii=False, indent=2, sort_keys=True)
-    handle.write("\n")
-print("NOT_EVALUABLE: no common time-origin marker; raw candidates retained only")
+if passed:
+    write_result("PASS", extra)
+    print("PASS: n_cloud_finals=%d median_latency=%.3fs" % (len(cloud_finals), median))
+else:
+    write_result("FAIL", {**extra, "reason": "median_latency > 2.0s" if median is not None else "没有云端 final 样本"})
+    print("FAIL: median_latency=%s" % ("%.3fs" % median if median is not None else "n/a"))
+sys.exit(0)
 PY
 }
 
@@ -295,11 +317,11 @@ run_latency() {
         return 1
     fi
     detail="$(check_latency_clock_contract "$events" "$latency" 2>&1)"
-    if [ "$?" -ne 0 ]; then
-        log_result "latency" "FAIL" "$detail"
-        return 1
-    fi
-    log_result "latency" "NOT_EVALUABLE" "$detail；未硬算 t - t1，见 $latency"
+    case "$detail" in
+        PASS*) log_result "latency" "PASS" "$detail；见 $latency" ;;
+        NOT_EVALUABLE*) log_result "latency" "NOT_EVALUABLE" "$detail；见 $latency" ;;
+        *) log_result "latency" "FAIL" "$detail；见 $latency" ;;
+    esac
 }
 
 run_recover() {

@@ -167,6 +167,11 @@ final class CloudClient: @unchecked Sendable {
         do {
             let decoded = try JSONDecoder().decode(GroqVerboseResponse.self, from: data)
             logger(CloudLogEntry(xGroqID: groqID, duration: duration, statusCode: http.statusCode, reason: "ok", errorType: nil))
+            let remaining = QuotaLedger.remainingRequests(from: http.allHeaderFields)
+            if let remaining {
+                // 只写这个整数，不写 key / URL / 正文 / 其它响应头。风格照抄 rslite.route。
+                FileHandle.standardError.write(Data("rslite.cloud remaining_requests=\(remaining)\n".utf8))
+            }
             return CloudTranscriptionResult(
                 text: decoded.text ?? decoded.segments.map(\.text).joined(separator: " "),
                 segments: decoded.segments.map {
@@ -174,7 +179,7 @@ final class CloudClient: @unchecked Sendable {
                 },
                 statusCode: http.statusCode,
                 xGroqID: groqID,
-                remainingRequests: QuotaLedger.remainingRequests(from: http.allHeaderFields)
+                remainingRequests: remaining
             )
         } catch {
             logger(CloudLogEntry(xGroqID: groqID, duration: duration, statusCode: http.statusCode, reason: "decode_failed", errorType: "decode"))

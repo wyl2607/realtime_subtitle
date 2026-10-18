@@ -225,6 +225,13 @@ struct RSLite {
                 },
                 onStatus: { text in
                     writeEvent(clock: clock, startedAt: startedAt, ev: "status", id: nil, text: text)
+                },
+                onFanoutReady: { fanout in
+                    // 墙钟与统一样本时钟的共同零点：第一块样本送出时记一次，之后不再记。
+                    // 之后每个句子的 t1 都在这条样本时钟上，延迟 = t_final - (clock.t + (t1 - clock.t0))。
+                    fanout.onFirstSample = { sampleSeconds in
+                        writeClockEvent(clock: clock, startedAt: startedAt, sampleSeconds: sampleSeconds)
+                    }
                 }
             ),
             onMode: { mode in
@@ -361,6 +368,23 @@ struct RSLite {
 
     private static func round3(_ value: Double) -> Double {
         (value * 1000).rounded() / 1000
+    }
+
+    private static func writeClockEvent(
+        clock: ContinuousClock,
+        startedAt: ContinuousClock.Instant,
+        sampleSeconds: Double
+    ) {
+        let object: [String: Any] = [
+            "t": round3(startedAt.duration(to: clock.now).seconds),
+            "ev": "clock",
+            "t0": round3(sampleSeconds),
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else {
+            return
+        }
+        FileHandle.standardOutput.write(data)
+        FileHandle.standardOutput.write(Data([0x0A]))
     }
 
     private static func runSelfTest() async -> Int32 {

@@ -152,9 +152,9 @@ except Exception:
     s_local = None
     billable_shape = False
 
-# CloudClient does not emit this header to stderr.  If a future build does,
-# use only an actual start/end pair; a lone end value is not a Delta_R.
-remaining = [int(value) for value in re.findall(r"x-ratelimit-remaining-requests\\s*[=:]\\s*(\\d+)", stderr, flags=re.I)]
+# CloudClient 成功响应读到剩余请求数时写 stderr `rslite.cloud remaining_requests=<n>`。
+# 只有真实的 start/end 成对值才能构成 Delta_R；单个值不算。
+remaining = [int(value) for value in re.findall(r"rslite\.cloud remaining_requests=(\d+)", stderr)]
 if len(remaining) >= 2:
     delta_r = remaining[0] - remaining[-1]
     header_result = "PASS" if delta_r == n_local else "FAIL"
@@ -162,13 +162,21 @@ if len(remaining) >= 2:
 else:
     delta_r = None
     header_result = "NOT_EVALUABLE"
-    header_reason = "stderr has no recorded start/end x-ratelimit-remaining-requests values"
+    header_reason = "stderr 的 rslite.cloud remaining_requests 记录不足 2 个，无法构成 Delta_R"
 
-# The ledger stores only billed_s.  CloudSegmenter passes segment.duration to
-# recordRequest, but neither it nor events.jsonl persists that duration, so
-# equality for every segment cannot be independently recomputed afterwards.
-duration_result = "NOT_EVALUABLE"
-duration_reason = "ledger/events do not persist segment.duration; only billed_s is available (sanity billed_s>=10: %s)" % billable_shape
+# 账本现在写 dur_s（round 3 位实际音频秒）。逐段重算 billed_s == max(10, dur_s)，
+# 容差 0.001 覆盖 dur_s 的 3 位舍入；没有 dur_s 的旧账本仍是 NOT_EVALUABLE。
+durations = [event.get("dur_s") for event in events]
+if events and all(d is not None for d in durations):
+    per_segment_ok = all(
+        abs(float(event["billed_s"]) - max(10.0, float(event["dur_s"]))) <= 0.001
+        for event in events
+    )
+    duration_result = "PASS" if per_segment_ok else "FAIL"
+    duration_reason = "逐段 billed_s == max(10, dur_s)（dur_s 3 位，容差 0.001）: %s" % ("全部成立" if per_segment_ok else "存在不成立")
+else:
+    duration_result = "NOT_EVALUABLE"
+    duration_reason = "账本事件缺 dur_s（旧格式），无法逐段重算；仅可见 billed_s>=10: %s" % billable_shape
 rows = [
     ("http_429", "PASS" if http_429 == 0 else "FAIL", "count=%d; detector literal Groq HTTP 429" % http_429),
     ("ledger", "PASS" if ledger_error is None else "FAIL", "N_local=%d; S_local=%s" % (n_local, "n/a" if s_local is None else "%.3f" % s_local) if ledger_error is None else ledger_error),
@@ -193,8 +201,8 @@ with report_path.open("w", encoding="utf-8") as handle:
     else:
         handle.write("- 本地账本：`N_local=%d`、`S_local=%.3f`，来自 `events[].billed_s`；账本文件名与字段见 `macos-native/Sources/rslite/QuotaLedger.swift:19-36,101-113`。\n" % (n_local, s_local))
         handle.write("- 账本的响应头校正记录数：`%d`（`request_corrections[].used_requests`）。这不是开始/结束的剩余请求数，不能独自构成 Delta_R。\n" % len(corrections))
-    handle.write("- 响应头比对：`%s` — %s。`CloudClient` 将成功响应头读进内存并传给账本（`CloudClient.swift:170-178`; `CloudSegmenter.swift:689-691`），但默认 logger 不把 header 写到本次允许收集的 artifacts，因此没有编造 `Delta_R`。\n" % (header_result, header_reason))
-    handle.write("- 逐段计费公式：`%s` — %s。源码实际在发送前将 `segment.duration` 传给 `recordRequest`（`CloudSegmenter.swift:646-675`），再写入 `max(10, duration)`（`QuotaLedger.swift:105-113`）。\n" % (duration_result, duration_reason))
+    handle.write("- 响应头比对：`%s` — %s。`CloudClient` 成功响应读到 `x-ratelimit-remaining-requests` 时往 stderr 写 `rslite.cloud remaining_requests=<n>`（`CloudClient.swift:170-178`），只写整数，不写 key / URL / 正文 / 其它响应头。\n" % (header_result, header_reason))
+    handle.write("- 逐段计费公式：`%s` — %s。源码实际在发送前将 `segment.duration` 传给 `recordRequest`（`CloudSegmenter.swift:646-675`），再写入 `max(10, duration)` 与 round 3 位的 `dur_s`（`QuotaLedger.swift:105-113`）。\n" % (duration_result, duration_reason))
     handle.write("- 自动云端路径：`--mode auto` 是合法非 local 模式（`HybridEngine.swift:42-46,753-772,797-799`）；有 key 且开关开启时控制器初始化为 cloud available（`CloudSegmenter.swift:588-603`）。\n")
 PY
 }

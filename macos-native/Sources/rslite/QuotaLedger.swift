@@ -29,15 +29,19 @@ struct QuotaLedgerSnapshot: Codable, Equatable {
 struct QuotaLedgerEvent: Codable, Equatable {
     var ts: Double
     var billedS: Double
+    /// 实际音频秒（round 3 位）。旧账本没有这个字段，读出时是 nil。
+    var durS: Double?
 
     enum CodingKeys: String, CodingKey {
         case ts
         case billedS = "billed_s"
+        case durS = "dur_s"
     }
 
-    init(ts: Double, billedS: Double) {
+    init(ts: Double, billedS: Double, durS: Double? = nil) {
         self.ts = ts
         self.billedS = billedS
+        self.durS = durS
     }
 
     init(from decoder: Decoder) throws {
@@ -49,12 +53,15 @@ struct QuotaLedgerEvent: Codable, Equatable {
         } else {
             billedS = .nan
         }
+        // dur_s 是可选：旧账本没有它，NaN/Infinity 被换成 null 后也按缺失处理。
+        durS = try? container.decodeIfPresent(Double.self, forKey: .durS)
     }
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(ts, forKey: .ts)
         try container.encode(billedS, forKey: .billedS)
+        try container.encodeIfPresent(durS, forKey: .durS)
     }
 }
 
@@ -107,7 +114,7 @@ final class QuotaLedger: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         let billed = max(10, duration)
-        snapshot.events.append(QuotaLedgerEvent(ts: now.timeIntervalSince1970, billedS: billed))
+        snapshot.events.append(QuotaLedgerEvent(ts: now.timeIntervalSince1970, billedS: billed, durS: Self.round3(duration)))
         snapshot = Self.pruned(snapshot, now: now)
         try persistLocked()
         return billed
@@ -284,6 +291,10 @@ final class QuotaLedger: @unchecked Sendable {
         return nil
     }
 
+    private static func round3(_ value: Double) -> Double {
+        (value * 1000).rounded() / 1000
+    }
+
     static func selfTest() -> [String] {
         var failures: [String] = []
         func check(_ ok: Bool, _ name: String) {
@@ -381,6 +392,31 @@ final class QuotaLedger: @unchecked Sendable {
             check(mixedUsage.dayAudioSeconds == 22.5, "非有限与负数 billed_s 不应累加")
             check(FileManager.default.fileExists(atPath: mixedURL.path), "可过滤的坏事件不应整文件隔离")
             check(!FileManager.default.fileExists(atPath: dir.appendingPathComponent("quota-mixed.json.corrupt").path), "负数/NaN 事件不应生成 .corrupt")
+
+            // 新字段：recordRequest 应把实际音频秒按 3 位小数写进 dur_s，billed_s 仍按 max(10, duration)。
+            let durURL = dir.appendingPathComponent("quota-dur.json")
+            let durLedger = QuotaLedger(url: durURL, now: t0)
+            try durLedger.recordRequest(duration: 2.3456, at: t0)
+            if let data = try? Data(contentsOf: durURL),
+               let decoded = try? JSONDecoder().decode(QuotaLedgerSnapshot.self, from: data) {
+                check(decoded.events.first?.durS == 2.346, "dur_s 应按 3 位小数入账，实际 \(String(describing: decoded.events.first?.durS))")
+                check(decoded.events.first?.billedS == 10, "billed_s 仍按 max(10, duration) 入账")
+            } else {
+                check(false, "dur_s 新字段用例应能读回账本")
+            }
+
+            // 旧账本兼容：没有 dur_s 的事件照常读出，dur_s 为 nil。
+            let oldURL = dir.appendingPathComponent("quota-old.json")
+            let oldJSON = #"{"events":[{"ts":10000,"billed_s":12.5}],"request_corrections":[]}"#
+            try Data(oldJSON.utf8).write(to: oldURL)
+            let oldLedger = QuotaLedger(url: oldURL, now: t0)
+            check(oldLedger.usage(at: t0).dayAudioSeconds == 12.5, "旧账本无 dur_s 应照常累加 billed_s")
+            if let data = try? Data(contentsOf: oldURL),
+               let decoded = try? JSONDecoder().decode(QuotaLedgerSnapshot.self, from: data) {
+                check(decoded.events.first?.durS == nil, "旧账本事件的 dur_s 应为 nil")
+            } else {
+                check(false, "旧账本兼容用例应能解码")
+            }
         } catch {
             failures.append("QuotaLedger selftest 异常：\(error)")
         }
