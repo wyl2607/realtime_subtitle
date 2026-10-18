@@ -1,7 +1,17 @@
 import plistlib
 import re
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
+
+# build_rslite_app.sh 依赖 macOS 专用打包工具链（swift build / codesign / ditto），
+# Windows 上 bash 是 WSL 存根，会直接失败（WinError 1920），所以只在 macOS 运行。
+pytestmark = pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="build_rslite_app.sh 只在 macOS 上用（打 rslite .app）",
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]

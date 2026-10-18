@@ -202,15 +202,17 @@ def test_default_spawn_windows_flags(monkeypatch):
     if sys.platform != "win32":
         pytest.skip("Windows-specific test")
 
+    fake = Path("C:/fake/ollama.exe")
     popen_mock = MagicMock()
     monkeypatch.setattr("subprocess.Popen", popen_mock)
-    monkeypatch.setattr("realtime_subtitle.node.ollama_watchdog._find_ollama_exe_default", lambda: Path("C:/fake/ollama.exe"))
+    monkeypatch.setattr("realtime_subtitle.node.ollama_watchdog._find_ollama_exe_default", lambda: fake)
 
     default_spawn()
 
     popen_mock.assert_called_once()
     args, kwargs = popen_mock.call_args
-    assert args[0] == ["C:/fake/ollama.exe", "serve"]
+    # str(Path) 平台相关（Windows 用反斜杠），所以不能写死字面量
+    assert args[0] == [str(fake), "serve"]
     assert kwargs["stdin"] == subprocess.DEVNULL
     assert kwargs["stdout"] == subprocess.DEVNULL
     assert kwargs["stderr"] == subprocess.DEVNULL
