@@ -156,7 +156,9 @@ except Exception:
 # 只有真实的 start/end 成对值才能构成 Delta_R；单个值不算。
 remaining = [int(value) for value in re.findall(r"rslite\.cloud remaining_requests=(\d+)", stderr)]
 if len(remaining) >= 2:
-    delta_r = remaining[0] - remaining[-1]
+    # 第一个 remaining 是第一次请求扣完之后读到的，所以首尾差只覆盖 N-1 次请求，要 +1。
+    # 2026-10-19 mini2 实测：390 条 remaining 逐次恰好减 1，首尾差 389、账本 390。
+    delta_r = remaining[0] - remaining[-1] + 1
     header_result = "PASS" if delta_r == n_local else "FAIL"
     header_reason = "Delta_R=%d, N_local=%d" % (delta_r, n_local)
 else:
