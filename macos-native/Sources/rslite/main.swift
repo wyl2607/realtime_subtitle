@@ -403,6 +403,7 @@ struct RSLite {
         failures.append(contentsOf: TailnetPin.selfTest().map { "TailnetPin: \($0)" })
         failures.append(contentsOf: QuotaLedger.selfTest().map { "QuotaLedger: \($0)" })
         failures.append(contentsOf: CloudClient.selfTest().map { "CloudClient: \($0)" })
+        failures.append(contentsOf: FileSource.selfTest().map { "FileSource: \($0)" })
         if #available(macOS 27.0, *) {
             failures.append(contentsOf: NodeRouter.selfTest().map { "NodeRouter: \($0)" })
             failures.append(contentsOf: HybridEngine.selfTest().map { "HybridEngine: \($0)" })
