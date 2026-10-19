@@ -203,6 +203,9 @@ struct RSLite {
     private static func runHeadless(_ options: Options) async throws {
         let startedAt = ContinuousClock().now
         let clock = ContinuousClock()
+        CloudTiming.shared.setNowProvider {
+            startedAt.duration(to: clock.now).seconds
+        }
         // 与 Overlay 同一套 P5 逻辑（LineStore），让 headless 也能观察到「节点句替换了几条本机句」
         let store = HeadlessLineStore()
 

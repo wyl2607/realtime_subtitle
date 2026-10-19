@@ -1,5 +1,24 @@
 import Foundation
 
+/// 仅供云端延迟诊断使用的单调时钟。headless 运行时由 main.swift 注入与 events.jsonl
+/// 相同的起点；非 headless 运行没有 events.jsonl，则退回到进程 uptime。
+final class CloudTiming: @unchecked Sendable {
+    static let shared = CloudTiming()
+
+    private let lock = NSLock()
+    private var nowProvider: @Sendable () -> Double = { ProcessInfo.processInfo.systemUptime }
+
+    func setNowProvider(_ provider: @escaping @Sendable () -> Double) {
+        lock.withLockVoid { nowProvider = provider }
+    }
+
+    func write(_ line: @escaping (Double) -> String) {
+        lock.withLockVoid {
+            FileHandle.standardError.write(Data(line(nowProvider()).utf8))
+        }
+    }
+}
+
 struct CloudSegment: Codable, Equatable {
     var t0: Double
     var t1: Double
@@ -131,7 +150,8 @@ final class CloudClient: @unchecked Sendable {
         pcm16Mono16k: Data,
         a0: Double,
         duration: Double,
-        language: String
+        language: String,
+        segmentID: Int? = nil
     ) async throws -> CloudTranscriptionResult {
         let wav = Self.wavData(pcm16Mono16k: pcm16Mono16k, sampleRate: 16_000, channels: 1)
         var request = URLRequest(url: endpointURL)
@@ -153,10 +173,21 @@ final class CloudClient: @unchecked Sendable {
         )
 
         let generation = lock.withLockValue { cancelGeneration }
-        let (data, response) = try await data(for: request, duration: duration, generation: generation)
+        let (data, response) = try await data(for: request, duration: duration, generation: generation, segmentID: segmentID)
         guard let http = response as? HTTPURLResponse else {
             logger(CloudLogEntry(xGroqID: nil, duration: duration, statusCode: nil, reason: "invalid_response", errorType: nil))
             throw CloudClientError.invalidResponse
+        }
+        if let segmentID {
+            CloudTiming.shared.write { now in
+                String(
+                    format: "rslite.cloud recv id=%d status=%d t=%.3f\n",
+                    locale: Locale(identifier: "en_US_POSIX"),
+                    segmentID,
+                    http.statusCode,
+                    now
+                )
+            }
         }
         let groqID = Self.groqID(from: http)
         guard (200..<300).contains(http.statusCode) else {
@@ -187,7 +218,12 @@ final class CloudClient: @unchecked Sendable {
         }
     }
 
-    private func data(for request: URLRequest, duration: Double, generation: Int) async throws -> (Data, URLResponse) {
+    private func data(
+        for request: URLRequest,
+        duration: Double,
+        generation: Int,
+        segmentID: Int?
+    ) async throws -> (Data, URLResponse) {
         Self.testBeforeRegister?()
         let id = lock.withLockValue { () -> Int? in
             if cancelGeneration != generation {
@@ -247,6 +283,16 @@ final class CloudClient: @unchecked Sendable {
                     }
                     self.slots[id] = .running(task)
                     return false
+                }
+                if let segmentID {
+                    CloudTiming.shared.write { now in
+                        String(
+                            format: "rslite.cloud send id=%d t=%.3f\n",
+                            locale: Locale(identifier: "en_US_POSIX"),
+                            segmentID,
+                            now
+                        )
+                    }
                 }
                 task.resume()
                 if cancelNow {

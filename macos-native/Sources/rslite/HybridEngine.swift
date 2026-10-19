@@ -907,6 +907,18 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
     }
 
     private func enqueueUpload(_ segment: EmittedCloudSegment, controller: CloudUploadController) {
+        CloudTiming.shared.write { now in
+            String(
+                format: "rslite.cloud seg id=%d a0=%.3f a1=%.3f dur=%.3f reason=%@ t=%.3f\n",
+                locale: Locale(identifier: "en_US_POSIX"),
+                segment.id,
+                segment.speechA0,
+                segment.speechA1,
+                segment.duration,
+                segment.reason,
+                now
+            )
+        }
         let id = UUID()
         let languageGeneration = currentLanguageGeneration()
         let task = Task { [weak self] in
@@ -924,7 +936,8 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
                     pcm16Mono16k: segment.pcm16,
                     a0: segment.audioOrigin,
                     duration: segment.duration,
-                    language: controller.groqLanguageCode
+                    language: controller.groqLanguageCode,
+                    segmentID: segment.id
                 )
                 let effect = controller.resolveSuccess(id: segment.id, result: result, now: Date(), node: self?.currentNodeFacts() ?? facts)
                 self?.applyCloudEffect(effect, generation: languageGeneration)

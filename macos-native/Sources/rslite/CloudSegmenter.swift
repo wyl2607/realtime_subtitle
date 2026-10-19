@@ -509,7 +509,7 @@ private struct ClosureProvider: Provider {
 }
 
 protocol CloudTranscribing: AnyObject, Sendable {
-    func transcribe(pcm16Mono16k: Data, a0: Double, duration: Double, language: String) async throws -> CloudTranscriptionResult
+    func transcribe(pcm16Mono16k: Data, a0: Double, duration: Double, language: String, segmentID: Int?) async throws -> CloudTranscriptionResult
     func cancelInflightRequests()
 }
 
@@ -1265,7 +1265,7 @@ private final class SwitchBox: @unchecked Sendable {
 
 private final class FakeCloud: CloudTranscribing, @unchecked Sendable {
     var cancelled = 0
-    func transcribe(pcm16Mono16k: Data, a0: Double, duration: Double, language: String) async throws -> CloudTranscriptionResult {
+    func transcribe(pcm16Mono16k: Data, a0: Double, duration: Double, language: String, segmentID: Int?) async throws -> CloudTranscriptionResult {
         CloudTranscriptionResult(text: "", segments: [], statusCode: 200, xGroqID: nil, remainingRequests: nil)
     }
     func cancelInflightRequests() { cancelled += 1 }
