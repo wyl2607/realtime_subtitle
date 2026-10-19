@@ -142,8 +142,14 @@ switch ($Action) {
         Stop-Gateway
         if (Test-Path $Cur) {
             if (Test-Path $Prev) { Remove-Item -Recurse -Force $Prev }
-            Move-Item $Cur $Prev
-            "PREV=kept"
+            try {
+                Move-Item -ErrorAction Stop $Cur $Prev
+                "PREV=kept"
+            } catch {
+                # rs-node is in use by another process (common cause: a process has it as working directory), old version restarted
+                Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+                throw "Move-Item $Cur -> $Prev failed: $($_.Exception.Message). rs-node is in use by another process (common cause: a process has it as working directory), old version restarted."
+            }
         }
         Move-Item $New $Cur
         Register-Gateway
@@ -153,13 +159,26 @@ switch ($Action) {
     }
     'Rollback' {
         Stop-Gateway
+        $curMoved = $false
         if (Test-Path $Failed) { Remove-Item -Recurse -Force $Failed }
-        if (Test-Path $Cur) { Move-Item $Cur $Failed }
+        if (Test-Path $Cur) {
+            try {
+                Move-Item -ErrorAction Stop $Cur $Failed
+                $curMoved = $true
+            } catch {
+                # $Cur cannot be moved (in use), keep in place and try to restore
+            }
+        }
         if (Test-Path $Prev) {
             Move-Item $Prev $Cur
             Register-Gateway
             Start-ScheduledTask -TaskName $TaskName
             "ROLLBACK=restored-prev"
+        } elseif (-not $curMoved -and (Test-Path (Join-Path $Cur '.venv\Scripts\pythonw.exe'))) {
+            # $Prev missing but $Cur is still a complete old version -> restore in place and start
+            Register-Gateway
+            Start-ScheduledTask -TaskName $TaskName
+            "ROLLBACK=restarted-current"
         } else {
             Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
             "ROLLBACK=removed"
