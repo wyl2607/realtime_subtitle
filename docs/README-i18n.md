@@ -22,6 +22,7 @@ Tracks [issue #27](https://github.com/wyl2607/realtime_subtitle/issues/27).
    - install / update / uninstall commands
    - system requirements
    - important troubleshooting entries
+   - the platform status table (各平台开发进展 / Platform status / Entwicklungsstand je Plattform)
 2. Prefer **linking** long tables (VRAM tiers, full pitfall list) to `CLAUDE.md` instead of copying them three times.
 3. Install commands must mention:
    - `scripts\windows\install.ps1` (canonical)
