@@ -898,6 +898,11 @@ step_deploy() {
     git -C "${REPO_ROOT}" archive --format=tar HEAD \
         | tgt_run 'rm -rf "$HOME/rs-node.new"; mkdir -p "$HOME/rs-node.new"; tar -x -C "$HOME/rs-node.new"' \
         || die "部署失败"
+    # 写入代码版本（短哈希）到 .rs_commit，供 cluster.py doctor 读取
+    local short_commit
+    short_commit=$(git -C "${REPO_ROOT}" rev-parse --short HEAD)
+    tgt_run "printf '%s\n' '${short_commit}' > \"\$HOME/rs-node.new/.rs_commit\"" \
+        || die "写入 .rs_commit 失败"
     info "[5/9] 安装 Python 环境（可能要几分钟）..."
     tgt_script "${BUILD_SH}" || { cleanup_new; die "目标机安装失败（旧版未受影响）"; }
 }

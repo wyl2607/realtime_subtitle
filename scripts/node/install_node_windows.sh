@@ -140,6 +140,11 @@ main_win() {
     git -C "${REPO_ROOT}" archive --format=tar HEAD \
         | win_run '(if exist "%USERPROFILE%\rs-node.new" rmdir /s /q "%USERPROFILE%\rs-node.new") & mkdir "%USERPROFILE%\rs-node.new" && tar -xf - -C "%USERPROFILE%\rs-node.new"' \
         || die "部署失败"
+    # 写入代码版本（短哈希）到 .rs_commit，供 cluster.py doctor 读取
+    local short_commit
+    short_commit=$(git -C "${REPO_ROOT}" rev-parse --short HEAD)
+    win_run "cmd /c echo ${short_commit} > \"%USERPROFILE%\\rs-node.new\\.rs_commit\"" \
+        || die "写入 .rs_commit 失败"
     if [[ -f "${SELFCHECK_WAV_SRC}" ]]; then
         local wav_tmp
         wav_tmp="$(mktemp -t rs-selfcheck).wav"

@@ -237,7 +237,7 @@ def test_doctor_windows_ollama_down(cl, monkeypatch, capsys):
         elif "AutoAdminLogon" in str(cmd_args) or "reg" in str(cmd_args[3]) if len(argv) > 3 else False:
             # 简化：假设命令中包含 reg query 则返回无值（未开）
             out = b"\n"
-        elif cmd_args == ["cmd", "/c", "type", "%LOCALAPPDATA%\\rs-node\\app\\.rs_commit"]:
+        elif cmd_args == ["cmd", "/c", "type", "%USERPROFILE%\\rs-node\\.rs_commit"]:
             out = b"w1commit\n"
         else:
             out = b""

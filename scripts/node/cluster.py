@@ -271,7 +271,7 @@ def doctor_node(node: dict) -> dict:
     if os_kind == "mac":
         commit_cmd = ["cat", "~/rs-node/.rs_commit", "2>/dev/null"]
     else:
-        commit_cmd = ["cmd", "/c", "type", "%LOCALAPPDATA%\\rs-node\\app\\.rs_commit"]
+        commit_cmd = ["cmd", "/c", "type", "%USERPROFILE%\\rs-node\\.rs_commit"]
     try:
         rc, out_bytes = _run_ssh(nid, commit_cmd)
         text = _decode_bytes(out_bytes) if rc == 0 else ""
