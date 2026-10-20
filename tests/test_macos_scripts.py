@@ -406,7 +406,8 @@ def test_start_polls_ollama_quickly_instead_of_fixed_two_second_sleeps(tmp_path)
     (repo / "scripts" / "macos").mkdir(parents=True)
     shutil.copy(MACOS / "start.sh", repo / "scripts" / "macos" / "start.sh")
     (repo / "venv" / "bin").mkdir(parents=True)
-    _write_exe(repo / "venv" / "bin" / "python", "#!/usr/bin/env bash\nexit 0\n")
+    # `python -` 是 start.sh 的 Apple 后端探测：这里答"不是 Apple"，才会走等 Ollama 的轮询
+    _write_exe(repo / "venv" / "bin" / "python", "#!/usr/bin/env bash\n[ \"$1\" = \"-\" ] && exit 1\nexit 0\n")
     (repo / "main.py").write_text("", encoding="utf-8")
 
     fake_bin = tmp_path / "bin"
@@ -439,3 +440,42 @@ def test_start_polls_ollama_quickly_instead_of_fixed_two_second_sleeps(tmp_path)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "已启动" in result.stdout
     assert elapsed < 2.0, f"启动脚本等了 {elapsed:.1f}s，轮询粒度太粗（{result.stdout}）"
+
+
+def test_start_does_not_wait_for_ollama_when_apple_translation_is_the_backend(tmp_path):
+    """句子翻译走 Apple 时主字幕不需要 Ollama：照样拉起 ollama serve，但不干等它就绪。"""
+    repo = tmp_path / "repo"
+    (repo / "scripts" / "macos").mkdir(parents=True)
+    shutil.copy(MACOS / "start.sh", repo / "scripts" / "macos" / "start.sh")
+    (repo / "venv" / "bin").mkdir(parents=True)
+    _write_exe(repo / "venv" / "bin" / "python", "#!/usr/bin/env bash\nexit 0\n")  # 探测答"是 Apple"
+    (repo / "main.py").write_text("", encoding="utf-8")
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_exe(fake_bin / "curl", "#!/usr/bin/env bash\nexit 7\n")  # Ollama 永远没就绪
+    serve_log = tmp_path / "ollama.calls"
+    _write_exe(fake_bin / "ollama", f"#!/usr/bin/env bash\necho \"$*\" >> {serve_log}\n")
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    env["RS_NO_UPDATE"] = "1"
+    started = time.monotonic()
+    result = subprocess.run(
+        ["/bin/bash", str(repo / "scripts" / "macos" / "start.sh")],
+        cwd=repo,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    elapsed = time.monotonic() - started
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "已启动" in result.stdout
+    assert "不等 Ollama" in result.stdout
+    assert elapsed < 2.0, f"Apple 后端下仍在等 Ollama：{elapsed:.1f}s"
+    deadline = time.monotonic() + 5  # serve 在后台子 shell 里跑，脚本退出时可能还没写完
+    while not serve_log.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert "serve" in serve_log.read_text(encoding="utf-8")

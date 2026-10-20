@@ -91,21 +91,55 @@ ollama_ready() {
     curl -fsS --max-time 3 "http://127.0.0.1:11434/api/version" >/dev/null
 }
 
+# 句子翻译会不会走 Apple Translation：判据与 translator_queue._select_translate_backend
+# 相同（同一个 choose_translate_backend）。走 Apple 时主字幕不需要 Ollama，只有
+# 查词/AI 分析要它，所以不必在启动前干等它冷启动（本机实测约 8.7 秒）。
+apple_backend_ready() {
+    "${REPO_ROOT}/venv/bin/python" - >/dev/null 2>&1 <<'PY'
+import os
+import platform
+import sys
+
+from realtime_subtitle import config
+from realtime_subtitle.paths import repo_path
+from realtime_subtitle.translate.apple_translate import AppleTranslator
+
+helper = repo_path("macos-native", ".build", "release", "rstranslate")
+configured = getattr(config, "TRANSLATE_BACKEND", "auto")
+status = None
+if (configured or "auto").strip().lower() == "auto" and os.path.isfile(helper):
+    apple = AppleTranslator(helper_path=helper)
+    status = apple.status(config.SOURCE_LANGUAGE, config.TARGET_LANGUAGE, timeout=5.0)
+    apple.close()
+backend, _ = config.choose_translate_backend(
+    configured,
+    is_macos=platform.system() == "Darwin",
+    helper_exists=os.path.isfile(helper),
+    apple_status=status,
+)
+sys.exit(0 if backend == "apple" else 1)
+PY
+}
+
 echo "检查 Ollama 服务..."
 if ! ollama_ready; then
     echo "正在启动 Ollama..."
     (ollama serve >> "${REPO_ROOT}/ollama.log" 2>> "${REPO_ROOT}/ollama.err.log" &)
-    # 200ms 轮询：Ollama 冷启动本机实测 ~8.7 秒，固定 sleep 2 平均多等 1 秒
-    # （最坏 2 秒）。总预算仍是 60 秒，只是把"检查→睡 2 秒"换成细粒度重试。
-    for _ in $(seq 1 300); do
-        if ollama_ready; then
-            break
+    if apple_backend_ready; then
+        echo "句子翻译走 Apple Translation，不等 Ollama（它在后台继续启动，查词/AI 分析稍后可用）。"
+    else
+        # 200ms 轮询：Ollama 冷启动本机实测 ~8.7 秒，固定 sleep 2 平均多等 1 秒
+        # （最坏 2 秒）。总预算仍是 60 秒，只是把"检查→睡 2 秒"换成细粒度重试。
+        for _ in $(seq 1 300); do
+            if ollama_ready; then
+                break
+            fi
+            sleep 0.2
+        done
+        if ! ollama_ready; then
+            echo "❌ 等了 60 秒 Ollama 服务还没就绪。可手动运行 ollama serve 查看报错。"
+            exit 1
         fi
-        sleep 0.2
-    done
-    if ! ollama_ready; then
-        echo "❌ 等了 60 秒 Ollama 服务还没就绪。可手动运行 ollama serve 查看报错。"
-        exit 1
     fi
 fi
 
