@@ -1446,14 +1446,27 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         # _tx_executor 异步跑的，真正打 Ollama 的时刻 ASR 早就开始下一轮
         # process_iter 了。所以让路检查搬进 _draft_worker（跑在 tx 线程，
         # 那里 _asr_busy 才可能真是 True），见那里的注释。
-        if self._lookup_inflight:
+        # 查词/AI 分析仍然走 Ollama：Apple 草稿和它不共享任何东西（helper 是
+        # 独立进程、草稿也在 _tx_executor 而不是 lookup 的池里），所以这条
+        # "让给人工请求"的闸门对 Apple 也只在 Ollama 下才成立。
+        apple_backend = getattr(self, "_translate_backend", "ollama") == "apple"
+        if not apple_backend and self._lookup_inflight:
             return  # 用户点了查词/AI分析在等结果，草稿让路（这类是一次性人工
                      # 请求，比"每1.5秒一次"的草稿更该优先拿到GPU）
-        if getattr(self, "_translate_backend", "ollama") != "apple" and not self._ollama_hot:
+        # ☠️ 下面两道"让路给识别"的闸门只对 Ollama 有意义：草稿和正式翻译共用
+        # 同一张卡上的 Ollama，识别一忙就该让。Apple Translation 是另一个常驻
+        # 系统进程（helper 实测单句 p50 53ms，见 scripts/bench/translate_bench.py），
+        # 不占 MLX 的 GPU，而 Mac 上 ASR 每轮 ~2.4s、音频块每 0.5s 来一个——
+        # 这两条闸门在本机是**恒真**的：_process_items 结束时收件箱里必然攒着
+        # 4~5 块，_draft_worker 排到时 _asr_busy 又必然是 True。实测模拟
+        # Mac 节奏 24 秒 / 10 轮识别，草稿 0 次；不跳过这两条时每轮都能出。
+        # 结果就是 Mac 上"德语上屏后中文要等整句"，而 Apple 路径本该更快。
+        if not apple_backend and not self._ollama_hot:
             return  # 模型还没进显存：那唯一一次冷加载要留给正式句子，草稿别去排队占坑
-        with self._asr_lock:
-            if len(self._audio_inbox) >= 2:
-                return  # 识别已在攒块（GPU被抢），草稿是奢侈品，先让路
+        if not apple_backend:
+            with self._asr_lock:
+                if len(self._audio_inbox) >= 2:
+                    return  # 识别已在攒块（GPU被抢），草稿是奢侈品，先让路
         with self._tx_lock:
             if self._tx_queue or self._tx_inflight or getattr(self, "_tx_retry_queue", None):
                 return  # 正式翻译在忙，草稿让路
@@ -1488,7 +1501,9 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         # 上、且刚好在 process_iter 结束之后，_asr_busy 恒为 False（这个判断在
         # 那边当了很久的死代码）。到了这一刻才是真的要发请求，ASR 也确实可能
         # 正占着 GPU——草稿是奢侈品，让给识别。
-        if self._asr_busy:
+        # Apple 后端例外：它不跑 Ollama/MLX，Mac 上 ASR 几乎 24 小时占着
+        # _asr_busy，照这条让路等于草稿永远不出（实测 24 秒 10 轮 = 0 次）。
+        if self._asr_busy and getattr(self, "_translate_backend", "ollama") != "apple":
             return
         translation = self._translate_single_sentence(
             snapshot, context, on_partial=self._epoch_gated_draft(epoch))
