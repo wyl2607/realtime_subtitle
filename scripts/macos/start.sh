@@ -95,11 +95,13 @@ echo "检查 Ollama 服务..."
 if ! ollama_ready; then
     echo "正在启动 Ollama..."
     (ollama serve >> "${REPO_ROOT}/ollama.log" 2>> "${REPO_ROOT}/ollama.err.log" &)
-    for _ in $(seq 1 30); do
+    # 200ms 轮询：Ollama 冷启动本机实测 ~8.7 秒，固定 sleep 2 平均多等 1 秒
+    # （最坏 2 秒）。总预算仍是 60 秒，只是把"检查→睡 2 秒"换成细粒度重试。
+    for _ in $(seq 1 300); do
         if ollama_ready; then
             break
         fi
-        sleep 2
+        sleep 0.2
     done
     if ! ollama_ready; then
         echo "❌ 等了 60 秒 Ollama 服务还没就绪。可手动运行 ollama serve 查看报错。"

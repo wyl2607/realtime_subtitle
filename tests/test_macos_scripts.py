@@ -394,3 +394,48 @@ def test_stop_survives_bash32_with_no_pid_and_no_ollama(tmp_path):
                        capture_output=True, text=True, env=env, timeout=30)
     assert r.returncode == 0, r.stderr
     assert (repo / ".stop").exists()
+
+
+def test_start_polls_ollama_quickly_instead_of_fixed_two_second_sleeps(tmp_path):
+    """Ollama 冷启动要好几秒；固定 sleep 2 会在每次未就绪后白等 2 秒。
+
+    用第 4 次 curl 才成功模拟"服务需要一点时间才起来"：旧逻辑 3 次
+    sleep 2 = 6 秒，200ms 轮询约 0.6 秒。
+    """
+    repo = tmp_path / "repo"
+    (repo / "scripts" / "macos").mkdir(parents=True)
+    shutil.copy(MACOS / "start.sh", repo / "scripts" / "macos" / "start.sh")
+    (repo / "venv" / "bin").mkdir(parents=True)
+    _write_exe(repo / "venv" / "bin" / "python", "#!/usr/bin/env bash\nexit 0\n")
+    (repo / "main.py").write_text("", encoding="utf-8")
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    counter = tmp_path / "curl.count"
+    _write_exe(
+        fake_bin / "curl",
+        "#!/usr/bin/env bash\n"
+        f"n=$(cat {counter} 2>/dev/null || echo 0)\n"
+        "n=$((n + 1))\n"
+        f"echo $n > {counter}\n"
+        "[ \"$n\" -ge 4 ]\n",
+    )
+    _write_exe(fake_bin / "ollama", "#!/usr/bin/env bash\nexit 0\n")
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    env["RS_NO_UPDATE"] = "1"
+    started = time.monotonic()
+    result = subprocess.run(
+        ["/bin/bash", str(repo / "scripts" / "macos" / "start.sh")],
+        cwd=repo,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    elapsed = time.monotonic() - started
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "已启动" in result.stdout
+    assert elapsed < 2.0, f"启动脚本等了 {elapsed:.1f}s，轮询粒度太粗（{result.stdout}）"
