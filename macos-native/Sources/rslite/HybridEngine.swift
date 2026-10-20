@@ -312,7 +312,8 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
     private enum IngestStep {
         case none
         case refining
-        case publish(NodeSentenceAction, isSelected: Bool)
+        /// sentenceID 是节点会话里的句子 id，只用于 stderr 计时对账。
+        case publish(Int, NodeSentenceAction, isSelected: Bool)
     }
 
     private func closeNodeSession(nodeID: String, generation: Int) {
@@ -426,14 +427,14 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
                 id: id, text: text, t0: t0, t1: t1,
                 pending: &pending, settled: &settled, early: &early
             ) {
-                return IngestStep.publish(action, isSelected: selected)
+                return IngestStep.publish(id, action, isSelected: selected)
             }
             if selected, pending[id] != nil {
                 return IngestStep.refining
             }
             return IngestStep.none
         } ?? .none
-        apply(nodeID: nodeID, step: step)
+        apply(nodeID: nodeID, id: id, step: step)
     }
 
     private func ingestNodeTranslation(nodeID: String, generation: Int, id: Int, text: String) {
@@ -441,9 +442,9 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
             guard let action = Self.claimTranslation(id: id, dst: text, pending: &pending, settled: &settled) else {
                 return IngestStep.none
             }
-            return IngestStep.publish(action, isSelected: selected)
+            return IngestStep.publish(id, action, isSelected: selected)
         } ?? .none
-        apply(nodeID: nodeID, step: step)
+        apply(nodeID: nodeID, id: id, step: step)
     }
 
     private func ingestNodeTranslateFailed(nodeID: String, generation: Int, id: Int) {
@@ -453,12 +454,12 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
             ) else {
                 return IngestStep.none
             }
-            return IngestStep.publish(action, isSelected: selected)
+            return IngestStep.publish(id, action, isSelected: selected)
         } ?? .none
-        apply(nodeID: nodeID, step: step)
+        apply(nodeID: nodeID, id: id, step: step)
     }
 
-    private func apply(nodeID: String, step: IngestStep) {
+    private func apply(nodeID: String, id: Int, step: IngestStep) {
         switch step {
         case .none:
             return
@@ -466,15 +467,16 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
             if !lock.withLockValue({ cloudOwnsLabel }) {
                 onMode(.refining)
             }
-        case .publish(let action, let isSelected):
-            publish(nodeID: nodeID, isSelected: isSelected, action: action)
+        case .publish(let sentenceID, let action, let isSelected):
+            publish(nodeID: nodeID, id: sentenceID, isSelected: isSelected, action: action)
         }
     }
 
     /// 节点译文和本机回退都占一个显示键，好跟 LineStore 的负数键对齐。
     /// 回退的译文走 Apple 翻译队列，按这个键回来；先到的一边已经占坑，后到的不再覆盖。
-    private func publish(nodeID: String, isSelected: Bool, action: NodeSentenceAction) {
+    private func publish(nodeID: String, id: Int, isSelected: Bool, action: NodeSentenceAction) {
         let key = allocateDisplayKey()
+        logNodeShow(nodeID: nodeID, id: id, action: action)
         switch action {
         case .showTranslation(let text, let t0, let t1, let dst):
             _ = consumeLocalTranslations(t0: t0, t1: t1)
@@ -489,6 +491,32 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
         }
         if isSelected, !lock.withLockValue({ cloudOwnsLabel }) {
             onMode(.hybrid(nodeID))
+        }
+    }
+
+    /// 上屏时刻（与 headless 事件同一时钟）。`dst=1` 表示用的是节点译文，
+    /// `dst=0` 表示节点翻译失败、走本机兜底/继承——配合 recv 行就能拆出
+    /// 「节点侧等待」「翻译」「客户端合并」三段。
+    private func logNodeShow(nodeID: String, id: Int, action: NodeSentenceAction) {
+        let t0: Double?
+        let t1: Double?
+        let hasTranslation: Bool
+        switch action {
+        case .showTranslation(_, let start, let end, _):
+            t0 = start
+            t1 = end
+            hasTranslation = true
+        case .fallback(_, let start, let end):
+            t0 = start
+            t1 = end
+            hasTranslation = false
+        }
+        NodeTiming.write { now in
+            String(
+                format: "rslite.node show node=%@ id=%d t0=%.3f t1=%.3f dst=%d t=%.3f\n",
+                locale: Locale(identifier: "en_US_POSIX"),
+                nodeID, id, t0 ?? -1, t1 ?? -1, hasTranslation ? 1 : 0, now
+            )
         }
     }
 

@@ -244,6 +244,15 @@ private struct ReadyAudioBuffer {
     }
 }
 
+/// 混合档的耗时诊断：send / recv / show 三行，时间戳与 headless 的 `t` 共用同一
+/// 个零点（main.swift 注入 CloudTiming），所以可以直接和事件流里的 t/t1 对账。
+/// 只写节点 id、句子 id、音频秒数和时刻——绝不写正文、音频或 token。
+enum NodeTiming {
+    static func write(_ line: @escaping (Double) -> String) {
+        CloudTiming.shared.write(line)
+    }
+}
+
 /// 节点会话的身份：节点 id + 该节点的会话代号。
 struct NodeSessionRef: Hashable, Sendable {
     var nodeID: String
@@ -325,6 +334,8 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
     /// 节点时钟 = 已发给节点的样本数 / 16000；首个音频块到来时把 offset 对齐到它的 startSeconds。
     private var clockStarted = false
     private var sentSamples = 0
+    /// send 埋点按音频秒整数边界节流：一段 run 只留 ~1 行/秒，够看发送是否落后。
+    private var lastSendLogSecond = -1
     private let closeFrameReceived = OneShotGate()
     private let finished = OneShotGate()
 
@@ -525,6 +536,27 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
             pending.removeFirst(n)
         }
         lock.withLockVoid { sentSamples += audio.samples }
+        logSend(audio)
+    }
+
+    /// 发送是否落后于墙钟：audio_end 是样本时钟，t 是同一个零点上的墙钟。
+    private func logSend(_ audio: WireAudio) {
+        let end = audio.startSeconds + Double(audio.samples) / 16_000
+        let second = Int(end.rounded(.down))
+        let shouldLog = lock.withLockValue { () -> Bool in
+            guard second > lastSendLogSecond else { return false }
+            lastSendLogSecond = second
+            return true
+        }
+        guard shouldLog else { return }
+        let nodeID = config.id
+        NodeTiming.write { now in
+            String(
+                format: "rslite.node send node=%@ audio_end=%.3f t=%.3f\n",
+                locale: Locale(identifier: "en_US_POSIX"),
+                nodeID, end, now
+            )
+        }
     }
 
     private func flushReadyBuffer(_ socket: NodeWebSocketTask) async throws {
@@ -748,9 +780,26 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
             let offset = lock.withLockValue { offsetSeconds }
             let t0 = (event["a0"] as? Double).map { $0 + offset }
             let t1 = (event["a1"] as? Double).map { $0 + offset }
+            // final 到达时刻 - a1 = 节点侧「段尾静音等待 + 识别 + 回传」；与 t 同源。
+            let nodeID = config.id
+            NodeTiming.write { now in
+                String(
+                    format: "rslite.node recv node=%@ ev=final id=%d a1=%.3f t=%.3f\n",
+                    locale: Locale(identifier: "en_US_POSIX"),
+                    nodeID, id, t1 ?? -1, now
+                )
+            }
             callbacks.onFinal(config.id, sessionGeneration, id, body, t0, t1)
         case "translation":
             guard let id = Self.eventInt(event["id"]), let body = event["text"] as? String else { return }
+            let nodeID = config.id
+            NodeTiming.write { now in
+                String(
+                    format: "rslite.node recv node=%@ ev=translation id=%d t=%.3f\n",
+                    locale: Locale(identifier: "en_US_POSIX"),
+                    nodeID, id, now
+                )
+            }
             callbacks.onTranslation(config.id, sessionGeneration, id, body)
         case "status":
             guard let code = event["code"] as? String else { return }

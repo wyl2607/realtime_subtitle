@@ -2,6 +2,11 @@
 # 混合档端到端验收脚本：依次跑 B、C、混合档，评估 RFC Done criteria 4
 # 用法：scripts/bench/hybrid_e2e.sh [wav文件路径]
 # 默认使用 ~/projects/rs-mac-native-data/concat5.wav
+#
+# 配置隔离：rslite 会往配置目录写 node-state.json。想接节点就事先在临时目录放好
+# nodes.json，再用 RSLITE_CONFIG_DIR=<临时目录> 跑，别让验收写用户的 ~/.config/rslite。
+# 混合档的 stderr 里带 rslite.node send/recv/show 计时行，hybrid_score.py 会自动
+# 从 hybrid.stderr.log 拆出「段尾+识别 / 翻译 / 上屏」三段。
 
 set -euo pipefail
 
@@ -53,6 +58,7 @@ echo "音频时长: ${SECS}秒（含缓冲）"
 echo "输出目录: $OUT_DIR"
 echo "Python: $PY"
 echo "refs: $REFS"
+echo "rslite 配置目录: ${RSLITE_CONFIG_DIR:-~/.config/rslite}"
 echo ""
 
 run_mode() {
