@@ -647,7 +647,13 @@ class Worker:
 
     def _enqueue(self, sess: _Sess, segments: list[Segment]) -> None:
         gen, sid = sess.gen, sess.sid
+        # 只给诊断用：段尾静音等待按样本轴算（客户端实时送音频，1s 样本≈1s 墙钟），
+        # 排队时长用 perf_counter。segmenter 本身刻意不读墙钟，所以补在这里。
+        received_at = time.perf_counter()
+        received_seconds = sess.seg.samples_received / SAMPLE_RATE
         for s in segments:
+            s.close_wait_s = max(received_seconds - s.a1, 0.0)
+            s.enqueued_at = received_at
             self._put_bounded(self._asr_q, sid, (gen, s), MAX_ASR_BACKLOG, "asr", sess)
 
     def _drain(self, sess: _Sess) -> None:
@@ -696,6 +702,7 @@ class Worker:
 
     def _recognize(self, gen: int, seg: Segment, src: str) -> None:
         t0 = time.perf_counter()
+        queue_s = 0.0 if seg.enqueued_at is None else max(t0 - seg.enqueued_at, 0.0)
         utts = self._asr.transcribe(seg.audio, src)
         asr_s = time.perf_counter() - t0
         # 夹到不含垫的 [a0, a1]：垫只为多喂一点上下文，不是语音的一部分；
@@ -725,7 +732,8 @@ class Worker:
                 event["sid"] = session_sid
             self._emit(event)
             self._put_bounded(self._tx_q, session_sid, (gen, sentence_id, text), MAX_TX_BACKLOG, "tx", sess)
-        self.log("segment", seg_s=seg.a1 - seg.a0, asr_s=asr_s, sentences=len(utts))
+        self.log("segment", seg_s=seg.a1 - seg.a0, asr_s=asr_s, wait_s=seg.close_wait_s,
+                 queue_s=queue_s, sentences=len(utts))
 
     def _tx_loop(self) -> None:
         while True:
