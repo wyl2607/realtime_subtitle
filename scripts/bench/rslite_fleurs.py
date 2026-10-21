@@ -113,32 +113,92 @@ def score_sample(ref: str, events: list[dict]) -> dict:
     }
 
 
-def aggregate(items: list[dict]) -> float:
-    """整体 WER 按所有句子拼起来算 corpus 级，而不是每条 WER 取平均。"""
-    refs = [norm(item["ref"]) for item in items]
-    hyps = [item["hyp"] for item in items]
+def aggregate(items: list[dict]) -> float | None:
+    """整体 WER 按所有句子拼起来算 corpus 级，而不是每条 WER 取平均。
+
+    失败/超时的样本没有 hyp，不能参与 corpus WER；一条都没跑成时返回 None，
+    免得把「没有结果」显示成 0% 错误率。
+    """
+    scored = [item for item in items if item.get("status", "ok") == "ok"]
+    if not scored:
+        return None
+    refs = [norm(item["ref"]) for item in scored]
+    hyps = [item["hyp"] for item in scored]
     return float(jiwer.wer(refs, hyps))
 
 
-def run_one(rslite: str, sample: dict, config_dir: str) -> dict:
+def _tail_lines(text: str | bytes | None, limit: int = 20) -> list[str]:
+    if text is None:
+        return []
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    return text.splitlines()[-limit:]
+
+
+def run_one(
+    rslite: str,
+    sample: dict,
+    config_dir: str,
+    timeout: float = UTTERANCE_TIMEOUT_S,
+) -> dict:
+    """跑一条样本。失败/超时只标记这一条，让整批继续往下跑。"""
     command = build_command(rslite, sample["wav"])
-    done = subprocess.run(
-        command,
-        env=rslite_env(config_dir),
-        capture_output=True,
-        text=True,
-        timeout=UTTERANCE_TIMEOUT_S,
-    )
+    base = {"id": sample["id"], "wav": sample["wav"], "ref": sample["ref"]}
+    try:
+        done = subprocess.run(
+            command,
+            env=rslite_env(config_dir),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            **base,
+            "status": "timeout",
+            "error": f"timeout after {timeout:g}s",
+            "stderr_tail": _tail_lines(exc.stderr),
+        }
+    if done.returncode != 0:
+        return {
+            **base,
+            "status": "failed",
+            "returncode": done.returncode,
+            "stderr_tail": _tail_lines(done.stderr),
+        }
     events = parse_events(done.stdout)
     scored = score_sample(sample["ref"], events)
     return {
-        "id": sample["id"],
-        "wav": sample["wav"],
-        "ref": sample["ref"],
+        **base,
+        "status": "ok",
         "hyp": scored["hyp"],
         "wer": round(scored["wer"], 4),
         "problems": scored["problems"],
         "returncode": done.returncode,
+    }
+
+
+def write_results(out_dir: Path, result: dict) -> None:
+    """原子落盘：先写同目录临时文件再 replace，中途崩溃不会留下半份 JSON。"""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    target = out_dir / "results.json"
+    tmp = out_dir / "results.json.tmp"
+    tmp.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, target)
+
+
+def build_result(dataset: Path, config_dir: str, items: list[dict]) -> dict:
+    scored = [item for item in items if item["status"] == "ok"]
+    overall = aggregate(items)
+    return {
+        "dataset": str(dataset),
+        "config_dir": str(config_dir),
+        "n": len(items),
+        "scored": len(scored),
+        "failed": sum(1 for item in items if item["status"] == "failed"),
+        "timeout": sum(1 for item in items if item["status"] == "timeout"),
+        "wer": None if overall is None else round(overall, 4),
+        "items": items,
     }
 
 
@@ -165,25 +225,27 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("--out 在非 --dry-run 时必填")
 
     items = []
+    out_dir = Path(a.out).expanduser()
     for sample in samples:
         record = run_one(a.rslite, sample, a.config_dir)
         items.append(record)
-        print(f"{record['id']} wer={record['wer']:.4f} problems={record['problems']}")
+        if record["status"] == "ok":
+            print(f"{record['id']} wer={record['wer']:.4f} problems={record['problems']}")
+        else:
+            tail = record["stderr_tail"][-1] if record["stderr_tail"] else ""
+            print(f"{record['id']} {record['status']} returncode={record.get('returncode', '-')} {tail}".rstrip())
+        # 每跑完一条就落盘，中途崩溃不丢已跑结果。
+        write_results(out_dir, build_result(dataset, a.config_dir, items))
 
-    overall = aggregate(items)
-    out_dir = Path(a.out).expanduser()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    result = {
-        "dataset": str(dataset),
-        "config_dir": str(a.config_dir),
-        "n": len(items),
-        "wer": round(overall, 4),
-        "items": items,
-    }
-    (out_dir / "results.json").write_text(
-        json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(f"overall n={len(items)} wer={overall:.4f}")
-    return 0
+    result = build_result(dataset, a.config_dir, items)
+    write_results(out_dir, result)
+    overall = result["wer"]
+    shown = "n/a" if overall is None else f"{overall:.4f}"
+    print(
+        f"overall scored={result['scored']} wer={shown} "
+        f"failed={result['failed']} timeout={result['timeout']}"
+    )
+    return 1 if result["failed"] or result["timeout"] else 0
 
 
 if __name__ == "__main__":

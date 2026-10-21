@@ -1516,7 +1516,7 @@ final class NodeRouter: @unchecked Sendable {
             return nil
         }
         guard bestID != id else { return nil }
-        return "\(id) 不可用，已用本机"
+        return id + DesignTokens.Text.nodeUnavailableSuffix
     }
 
     static func pinnedMissingStatus(id: String) -> String {
@@ -1635,9 +1635,9 @@ final class NodeRouter: @unchecked Sendable {
               "指定节点不可用且没有本机节点会话时应断开")
         check(!Self.shouldDropPinnedSession(nodeIDs: manifestIDs, pinnedNode: nil, bestID: nil, currentNodeID: "win"),
               "未指定时不因这条规则断开")
-        check(Self.pinnedUnavailableNotice(nodeIDs: manifestIDs, pinnedNode: "win", bestID: nil) == "win 不可用，已用本机",
+        check(Self.pinnedUnavailableNotice(nodeIDs: manifestIDs, pinnedNode: "win", bestID: nil) == "win" + DesignTokens.Text.nodeUnavailableSuffix,
               "指定节点不可用的状态文案")
-        check(Self.pinnedUnavailableNotice(nodeIDs: manifestIDs, pinnedNode: "win", bestID: localUDSID) == "win 不可用，已用本机",
+        check(Self.pinnedUnavailableNotice(nodeIDs: manifestIDs, pinnedNode: "win", bestID: localUDSID) == "win" + DesignTokens.Text.nodeUnavailableSuffix,
               "回到本机节点时也提示指定节点不可用")
         check(Self.pinnedUnavailableNotice(nodeIDs: manifestIDs, pinnedNode: "win", bestID: "win") == nil,
               "指定节点可用时不报不可用")

@@ -1,5 +1,6 @@
 """rslite_fleurs.py 的夹具测试：解析 headless 事件、算 WER，不真跑 rslite。"""
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -10,6 +11,18 @@ sys.path.insert(0, str(REPO))
 
 from scripts.bench import rslite_fleurs as rf  # noqa: E402
 from scripts.bench.asr_bench import norm  # noqa: E402
+
+
+def _fake_rslite(tmp_path: Path, posix_body: str, windows_body: str) -> str:
+    """造一个不联网的假 rslite；Windows 走 .cmd，POSIX 走带 shebang 的脚本。"""
+    if os.name == "nt":
+        path = tmp_path / "fake-rslite.cmd"
+        path.write_text("@echo off\r\n" + windows_body + "\r\n", encoding="utf-8")
+    else:
+        path = tmp_path / "fake-rslite"
+        path.write_text("#!/bin/sh\n" + posix_body + "\n", encoding="utf-8")
+        path.chmod(0o755)
+    return str(path)
 
 
 def _events(*records: dict) -> str:
@@ -95,3 +108,72 @@ def test_load_samples_reads_refs_and_wavs(tmp_path):
     assert [sample["id"] for sample in samples] == ["0000", "0001"]
     assert samples[0]["wav"].endswith("0000.wav")
     assert samples[1]["ref"] == "Guten Tag"
+
+
+def test_run_one_marks_nonzero_exit_failed(tmp_path):
+    fake = _fake_rslite(
+        tmp_path,
+        "echo 'boom from fake rslite' >&2\nexit 1",
+        "echo boom from fake rslite 1>&2\r\nexit /b 1",
+    )
+    sample = {"id": "0000", "wav": str(tmp_path / "0000.wav"), "ref": "Hallo Welt"}
+    record = rf.run_one(fake, sample, str(tmp_path))
+    assert record["status"] == "failed"
+    assert record["returncode"] == 1
+    assert record["stderr_tail"][-1].strip() == "boom from fake rslite"
+    assert len(record["stderr_tail"]) <= 20
+    assert "wer" not in record
+    assert rf.aggregate([record]) is None
+
+
+def test_run_one_marks_timeout_without_aborting_batch(tmp_path):
+    fake = _fake_rslite(
+        tmp_path,
+        "sleep 1 >/dev/null 2>&1\nexit 0",
+        "ping -n 2 127.0.0.1 >nul 2>&1\r\nexit /b 0",
+    )
+    sample = {"id": "0000", "wav": str(tmp_path / "0000.wav"), "ref": "Hallo Welt"}
+    record = rf.run_one(fake, sample, str(tmp_path), timeout=0.05)
+    assert record["status"] == "timeout"
+    assert record["error"].startswith("timeout")
+    assert "wer" not in record
+    assert rf.aggregate([record]) is None
+
+
+def test_main_writes_results_incrementally_and_exits_nonzero_on_failure(tmp_path, monkeypatch):
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    (dataset / "refs.jsonl").write_text(
+        json.dumps({"id": "0001", "ref": "Guten Tag"}) + "\n"
+        + json.dumps({"id": "0000", "ref": "Hallo Welt"}) + "\n",
+        encoding="utf-8",
+    )
+    for sid in ("0000", "0001"):
+        (dataset / f"{sid}.wav").write_bytes(b"RIFF")
+    fake = _fake_rslite(tmp_path, "exit 1", "exit /b 1")
+    out = tmp_path / "out"
+
+    snapshots = []
+    real_write = rf.write_results
+
+    def recording_write(out_dir, result):
+        snapshots.append([item["id"] for item in result["items"]])
+        real_write(out_dir, result)
+
+    monkeypatch.setattr(rf, "write_results", recording_write)
+    rc = rf.main([
+        "--dataset", str(dataset),
+        "--config-dir", str(tmp_path / "config"),
+        "--rslite", fake,
+        "--out", str(out),
+    ])
+
+    assert rc == 1
+    assert snapshots[:2] == [["0000"], ["0000", "0001"]]
+    saved = json.loads((out / "results.json").read_text(encoding="utf-8"))
+    assert saved["n"] == 2
+    assert saved["scored"] == 0
+    assert saved["failed"] == 2
+    assert saved["timeout"] == 0
+    assert saved["wer"] is None
+    assert not (out / "results.json.tmp").exists()
