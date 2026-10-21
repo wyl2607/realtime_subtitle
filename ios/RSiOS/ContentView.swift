@@ -24,6 +24,8 @@ struct ContentView: View {
     @State private var engineMode: String = "auto"
     @State private var prepareStatus = ""
     @State private var isPreparing = false
+    /// 每次收到新句对就 +1：「今天的字幕」页面靠它触发重新读存档文件。
+    @State private var transcriptRefresh = 0
 
     var body: some View {
         NavigationStack {
@@ -213,6 +215,18 @@ struct ContentView: View {
                         .foregroundColor(.secondary)
                 }
 
+                Divider()
+
+                VStack(spacing: 12) {
+                    Text("今天的字幕")
+                        .font(.headline)
+                    NavigationLink {
+                        TranscriptView(store: transcriptStore, refreshToken: transcriptRefresh)
+                    } label: {
+                        Text("查看今天的字幕")
+                    }
+                }
+
                 Spacer()
             }
             .padding()
@@ -222,8 +236,9 @@ struct ContentView: View {
             }
             .onReceive(linesMonitor.$lines) { lines in
                 transcriptStore.ingest(lines.map {
-                    TranscriptStore.Sentence(id: $0.id, src: $0.src, dst: $0.dst)
+                    TranscriptStore.Sentence(id: $0.id, session: $0.session, src: $0.src, dst: $0.dst)
                 })
+                transcriptRefresh += 1
             }
         }
     }
@@ -358,6 +373,9 @@ struct RecentLine: Codable, Identifiable {
     let id: Int
     let src: String
     var dst: String
+    /// 产生这一句的引擎会话代号：各引擎的 id 都从 1 重新计数，
+    /// 存档靠「代号 + id」去重，不然后一个会话会覆盖前一个会话的句子。
+    let session: String
 }
 
 final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBufferPlaybackDelegate {
@@ -516,7 +534,7 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
         guard !isStarting, !isPiPActive else { return }
 
         guard isPictureInPicturePossible else {
-            lastError = "PiP 尚不可用（isPictureInPicturePossible=false）"
+            lastError = "PiP 尚未就绪（isPictureInPicturePossible=false）"
             return
         }
 
