@@ -142,6 +142,11 @@ class RoutingState:
             self.action = "mark_key_invalid"
             return
         if status == 429:
+            if self.key_invalid:
+                # 失效 key 只有 key_modified 能解除。401 之后迟到的 429 是并发在飞请求的
+                # 回执，若照常进限流冷却，冷却到期会 probe→tier() 回到 cloud，
+                # 把已经失效的 key 又带回云端发请求，所以这里整条忽略。
+                return
             self.cloud_state = "cooldown_rate_limited"
             self.cooldown_seconds = int(retry_after) if retry_after is not None else 60
             self.action = "rate_limited"

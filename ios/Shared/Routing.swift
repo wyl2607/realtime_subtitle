@@ -176,6 +176,12 @@ struct CloudRouteContext {
             return
         }
         if status == 429 {
+            if keyInvalid {
+                // 失效 key 只有 key_modified 能解除。401 之后迟到的 429 是并发在飞请求的
+                // 回执，若照常进限流冷却，冷却到期会 probe→tier() 回到 cloud，
+                // 把已经失效的 key 又带回云端发请求，所以这里整条忽略。
+                return
+            }
             cloudState = .cooldownRateLimited
             cooldownSeconds = retryAfter ?? 60
             action = "rate_limited"

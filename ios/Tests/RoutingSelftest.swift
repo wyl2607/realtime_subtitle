@@ -59,7 +59,7 @@ func runRoutingSelftest(_ check: @escaping (Bool, String) -> Void) {
         let fixture: RouteFixture = try SelftestFixture.load("route_cases.json")
         let failures = fixture.routeCases.flatMap { routeFailures($0) }
         check(failures.isEmpty, "route_cases 失败: \(failures.joined(separator: "; "))")
-        check(fixture.routeCases.count == 15, "route_cases 数量应为 15（实际 \(fixture.routeCases.count)）")
+        check(fixture.routeCases.count == 16, "route_cases 数量应为 16（实际 \(fixture.routeCases.count)）")
         if failures.isEmpty {
             print("route_cases: \(fixture.routeCases.count)/\(fixture.routeCases.count)")
         }
