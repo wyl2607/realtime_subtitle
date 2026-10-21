@@ -40,7 +40,9 @@ class RoutingState:
         )
 
     def apply(self, event: dict[str, Any]) -> None:
-        self.cooldown_seconds = None
+        # A confirmed RPD reset cannot shorten an unrelated HTTP 429 cooldown.
+        if not (event["type"] == "quota_reset_confirmed" and self.cloud_state == "cooldown_rate_limited"):
+            self.cooldown_seconds = None
         self.cancel_inflight = False
         self.discard_response = False
         self.action = "none"
@@ -64,8 +66,16 @@ class RoutingState:
         if event_type == "quota_update":
             self._quota_update(float(event["usage_percent"]))
             return
+        if event_type == "quota_reset_confirmed":
+            # Caller must verify a server-period rollover and recompute *all*
+            # quota windows before emitting this event.
+            if self.cloud_enabled and self.has_key and not self.key_invalid and self.cloud_state == "cooldown_quota":
+                self._quota_update(float(event.get("usage_percent", 100)))
+            return
         if event_type == "cooldown_expired":
-            if self.cloud_state.startswith("cooldown_"):
+            # Quota recovery requires fresh usage measurement or verified RPD rollover.
+            # A generic timer must never reopen cloud while daily quota is exhausted.
+            if self.cloud_state in {"cooldown_backoff", "cooldown_rate_limited"}:
                 self.cloud_state = "probe"
                 self.action = "probe_once"
             return
@@ -142,6 +152,8 @@ class RoutingState:
             self.action = "mark_key_invalid"
             return
         if status == 429:
+            if self.key_invalid or self.cloud_state == "disabled_invalid_key":
+                return
             self.cloud_state = "cooldown_rate_limited"
             self.cooldown_seconds = int(retry_after) if retry_after is not None else 60
             self.action = "rate_limited"
