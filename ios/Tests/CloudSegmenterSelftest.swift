@@ -18,6 +18,36 @@ func runCloudSegmenterSelftest(_ check: @escaping (Bool, String) -> Void) {
         return output.segments
     }
 
+    // I5 问题 5：大缺口（断流）前还没发出的段，必须在换缓冲之前用旧缓冲切出来；
+    // 否则之后 flush 时切片落在新时间轴上，产出空 PCM 段（白烧一次计费请求、空译文）。
+    do {
+        // 短段（< 1.5s 被拿住等合并）后紧跟缺口。
+        let segmenter = CloudSegmenter()
+        var clock = 0.0
+        var got = feed(segmenter, 0.05, 1.0, &clock)
+        got += feed(segmenter, 0, 0.1, &clock)
+        clock += 1.0
+        got += feed(segmenter, 0, 0.6, &clock)
+        got += segmenter.finish()
+        check(got.count == 1, "缺口前的短段应发出一段，实际 \(got.count)")
+        check(got.allSatisfy { !$0.pcm16.isEmpty }, "缺口前的短段不得切出空 PCM")
+    }
+    do {
+        // 长段收尾后只过了 0.1s 静音（后垫 0.2s 未满）就断流。
+        let segmenter = CloudSegmenter()
+        var clock = 0.0
+        var got = feed(segmenter, 0.05, 2.0, &clock)
+        got += feed(segmenter, 0, 0.1, &clock)
+        clock += 5.0
+        got += feed(segmenter, 0, 0.6, &clock)
+        got += segmenter.finish()
+        check(got.count == 1, "缺口前的长段应发出一段，实际 \(got.count)")
+        check(got.allSatisfy { !$0.pcm16.isEmpty }, "缺口前的长段不得切出空 PCM")
+        if let segment = got.first {
+            check(segment.pcm16.count >= Int(2.0 * sampleRate) * 2, "缺口前的长段应带上完整语音，字节 \(segment.pcm16.count)")
+        }
+    }
+
     do {
         let segmenter = CloudSegmenter()
         var clock = 10.0

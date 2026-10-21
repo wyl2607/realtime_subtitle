@@ -105,7 +105,7 @@ class SampleHandler: RPBroadcastSampleHandler {
     /// 切回节点要等它们收尾，否则最后一句只剩原文。
     private var pendingLocalSettles: Set<Int> = []
 
-    struct RecentLine: Codable {
+    struct RecentLine: Codable, SessionScopedLine {
         let id: Int
         let src: String
         var dst: String
@@ -120,6 +120,8 @@ class SampleHandler: RPBroadcastSampleHandler {
         engineMode = SharedKeychain.readEngineMode()
 
         if engineMode == "local" {
+            // broadcastActive 只在这里（和 auto/node 的启动处）置真：startLocalEngine 会先确认它。
+            stateQueue.sync { broadcastActive = true }
             if #available(iOS 26.0, *) {
                 startLocalEngine()
             } else {
@@ -170,6 +172,7 @@ class SampleHandler: RPBroadcastSampleHandler {
         logger.info("Broadcast finished")
         
         if engineMode == "local" {
+            stateQueue.sync { broadcastActive = false }
             stopLocalEngine()
             converter = nil
             writeStatus("finished")
@@ -415,8 +418,7 @@ class SampleHandler: RPBroadcastSampleHandler {
     private func updateCloudAvailability(_ availability: CloudAvailability) {
         // key 换了：客户端要换（Authorization 头里带的是旧 key）。
         if let key = SharedKeychain.readGroqKey(), key.hashValue != cloudKeyRevision {
-            cloudClient = CloudClient(key: key)
-            cloudKeyRevision = key.hashValue
+            rotateCloudClient(key: key)
         }
         let outcome = stateQueue.sync { () -> (AutoFallbackDecision?, Bool) in
             guard engineMode == "auto", var fallback = autoFallback else { return (nil, false) }
@@ -427,10 +429,30 @@ class SampleHandler: RPBroadcastSampleHandler {
         // 开关关了 / key 被清了：在飞请求要作废，迟到的结果要丢掉。
         if outcome.1 {
             cloudClient?.cancelInflightRequests()
-            stateQueue.sync { cloudGeneration &+= 1 }
+            // 作废的回执不再清 busy，这里推进代次时一并清掉，否则之后的段全被当成「在飞」丢掉。
+            stateQueue.sync {
+                cloudGeneration &+= 1
+                cloudUploadBusy = false
+            }
         }
         guard let decision = outcome.0 else { return }
         applyAutoDecision(decision)
+    }
+
+    /// 换 key：先作废旧 key 的在飞请求（推进代次 + 取消旧客户端），再建新客户端。
+    /// 顺序不能反——先换的话取消会落到新客户端上，旧 key 的迟到 401 还能把新 key 打成无效。
+    private func rotateCloudClient(key: String) {
+        let old = cloudClient
+        if HandoffRules.keyRotated(clientRevision: old == nil ? nil : cloudKeyRevision, keyRevision: key.hashValue) {
+            stateQueue.sync {
+                cloudGeneration &+= 1
+                cloudUploadBusy = false
+                cloudProbeUsed = false
+            }
+            old?.cancelInflightRequests()
+        }
+        cloudClient = CloudClient(key: key)
+        cloudKeyRevision = key.hashValue
     }
 
     /// 进云端档：音频改喂云端分段器，译文走本机翻译。
@@ -438,9 +460,11 @@ class SampleHandler: RPBroadcastSampleHandler {
         guard #available(iOS 26.0, *) else { return }
         guard let key = SharedKeychain.readGroqKey() else { return }
         let revision = key.hashValue
-        if cloudClient == nil || cloudKeyRevision != revision {
+        if cloudClient == nil {
             cloudClient = CloudClient(key: key)
             cloudKeyRevision = revision
+        } else if cloudKeyRevision != revision {
+            rotateCloudClient(key: key)
         }
         if cloudLedger == nil {
             cloudLedger = QuotaLedger(url: Self.quotaLedgerURL())
@@ -566,13 +590,14 @@ class SampleHandler: RPBroadcastSampleHandler {
         segment: EmittedCloudSegment,
         generation: UInt64
     ) {
-        let decision = handleAutoEvent(.cloudSegmentSucceeded)
-        let stale = stateQueue.sync { generation != cloudGeneration }
-        stateQueue.sync { cloudUploadBusy = false }
-        guard !stale else {
-            applyAutoDecision(decision)
-            return
+        // 先判作废：旧代次（换过 key / 关过开关）的结果不进路由状态机、不记额度、不上屏。
+        let stale = stateQueue.sync { () -> Bool in
+            let stale = HandoffRules.isStaleCloudResponse(requestGeneration: generation, currentGeneration: cloudGeneration)
+            if !stale { cloudUploadBusy = false }
+            return stale
         }
+        guard !stale else { return }
+        let decision = handleAutoEvent(.cloudSegmentSucceeded)
         // 响应头里的每日剩余请求数：只用来校正 24 小时的计数，不校正分钟窗口。
         if let remaining = result.remainingRequests {
             try? cloudLedger?.correctRemainingRequests(
@@ -594,8 +619,12 @@ class SampleHandler: RPBroadcastSampleHandler {
     /// 云端这一段失败：HTTP 状态码喂给状态机（401/429/5xx 各自的规则在 Routing.swift 里），
     /// 其余按段失败处理。
     private func handleCloudFailure(_ error: CloudClientError, generation: UInt64) {
-        let stale = stateQueue.sync { generation != cloudGeneration }
-        stateQueue.sync { cloudUploadBusy = false }
+        let stale = stateQueue.sync { () -> Bool in
+            let stale = HandoffRules.isStaleCloudResponse(requestGeneration: generation, currentGeneration: cloudGeneration)
+            // 旧代次的回执不能清 busy：那会放行新 key 的第二段并发上传。作废时 busy 已在推进代次处清掉。
+            if !stale { cloudUploadBusy = false }
+            return stale
+        }
         guard !stale else { return }
         switch error {
         case .httpStatus(let status, let retryAfter, _):
@@ -640,7 +669,7 @@ class SampleHandler: RPBroadcastSampleHandler {
     private func handleCloudTranslation(id: Int, text: String) {
         stateQueue.sync {
             translationsCount += 1
-            if let index = recentLines.firstIndex(where: { $0.session == cloudSessionCode && $0.id == id }) {
+            if let index = RecentLineLookup.index(in: recentLines, session: cloudSessionCode, id: id) {
                 recentLines[index].dst = text
             }
         }
@@ -657,6 +686,10 @@ class SampleHandler: RPBroadcastSampleHandler {
     private func startLocalEngine() {
         // 自动回退时 converter 已经在跑节点链路：复用同一个实例，
         // 既避免和音频线程抢写，也保住重采样器的滤波状态。
+        // 广播可能已经结束（节点 close / 解析失败的回调晚于 broadcastFinished 到达）：
+        // 在锁内确认，结束了就什么都不做。broadcastActive 只由 broadcastStarted / broadcastFinished 写。
+        let allowed = stateQueue.sync { HandoffRules.mayStartLocal(broadcastActive: broadcastActive) }
+        guard allowed else { return }
         if converter == nil {
             converter = PCMConverter()
         }
@@ -672,7 +705,6 @@ class SampleHandler: RPBroadcastSampleHandler {
             fatalErrorOccurred = false
             fatalErrorReason = ""
             recentLines = []
-            broadcastActive = true
             routingTier = .local
             localSentenceActive = false
             pendingLocalSettles.removeAll()
@@ -743,8 +775,12 @@ class SampleHandler: RPBroadcastSampleHandler {
         let shouldReport = stateQueue.sync { () -> Bool in
             guard broadcastActive else { return false }
             guard pendingLocalSettles.remove(id) != nil else { return false }
-            // 还有别的句子没收尾就继续等：一次只切一句，切早了会截断后面的半句。
-            return pendingLocalSettles.isEmpty
+            // 还有别的句子没收尾、或用户已经开始说下一句，就继续等：
+            // 切早了下一句已喂进本机 analyzer 的音频会随引擎一起丢掉。下一句收尾时再判断。
+            return HandoffRules.canHandBackToNode(
+                pendingSettles: pendingLocalSettles,
+                sentenceActive: localSentenceActive
+            )
         }
         guard shouldReport else { return }
         applyAutoDecision(handleAutoEvent(.localSentenceFinalized))
@@ -754,7 +790,7 @@ class SampleHandler: RPBroadcastSampleHandler {
         stateQueue.sync {
             translationsCount += 1
             // 会话代号一起比：本机句与云端句的 id 是两套号段，只比 id 会串行。
-            if let idx = recentLines.firstIndex(where: { $0.session == localSessionCode && $0.id == id }) {
+            if let idx = RecentLineLookup.index(in: recentLines, session: localSessionCode, id: id) {
                 recentLines[idx].dst = text
             }
         }
@@ -1030,7 +1066,8 @@ class SampleHandler: RPBroadcastSampleHandler {
         case .translation(let id, let text):
             stateQueue.sync {
                 translationsCount += 1
-                if let idx = recentLines.firstIndex(where: { $0.id == id }) {
+                // 节点前后两个会话的 id 都从 1 计：只比 id 会把译文写到旧会话那一行。
+                if let idx = RecentLineLookup.index(in: recentLines, session: nodeSessionCode, id: id) {
                     recentLines[idx].dst = text
                 }
             }
