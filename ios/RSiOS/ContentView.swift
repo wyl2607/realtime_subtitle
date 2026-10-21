@@ -288,6 +288,12 @@ struct ContentView: View {
                 loadPairedConfig()
                 loadCloudSettings()
             }
+            // 相机扫配对码 / 点 rsnode://pair 链接：只把链接填进配对框，用户点「应用配对」才写入钥匙串。
+            .onOpenURL { url in
+                guard let text = PairingLink.prefillText(for: url) else { return }
+                pairingLinkText = text
+                pairingStatus = "已填入配对链接，确认后点「应用配对」"
+            }
             .onReceive(linesMonitor.$lines) { lines in
                 transcriptStore.ingest(lines.map {
                     TranscriptStore.Sentence(id: $0.id, session: $0.session, src: $0.src, dst: $0.dst)
