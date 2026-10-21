@@ -11,3 +11,8 @@ xcrun swiftc -O ios/Shared/NodeProtocol.swift ios/Shared/PCMConverter.swift ios/
 # 单独编一个入口（RoutingSelftest 是 @main），这样不用改 NodeSelftest 的入口。
 xcrun swiftc -O ios/Shared/Routing.swift ios/Shared/LineStore.swift ios/Shared/AutoFallback.swift ios/RSiOS/TranscriptStore.swift ios/Tests/RoutingSelftest.swift ios/Tests/LineStoreSelftest.swift ios/Tests/AutoFallbackSelftest.swift ios/Tests/TranscriptStoreSelftest.swift -o .tmp/parityselftest
 .tmp/parityselftest
+# 云端档纯逻辑（Groq 请求/响应、额度账本、分段器）：第三个独立入口，
+# 只编这三个 Shared 文件 + QuotaLedger 需要的 Routing.swift（滞回判定在路由状态机里）。
+# 不发网络请求，也不读任何真实 key。
+xcrun swiftc -O ios/Shared/Routing.swift ios/Shared/CloudClient.swift ios/Shared/QuotaLedger.swift ios/Shared/CloudSegmenter.swift ios/Tests/CloudSelftestMain.swift ios/Tests/CloudClientSelftest.swift ios/Tests/QuotaLedgerSelftest.swift ios/Tests/CloudSegmenterSelftest.swift -o .tmp/cloudselftest
+.tmp/cloudselftest
