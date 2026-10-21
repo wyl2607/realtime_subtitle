@@ -52,7 +52,10 @@ struct CloudRouteContext {
     }
 
     mutating func apply(_ event: RouteEvent) {
-        cooldownSeconds = nil
+        // Confirming RPD rollover cannot erase an unrelated HTTP 429 retry-after.
+        if !(event.type == "quota_reset_confirmed" && cloudState == .cooldownRateLimited) {
+            cooldownSeconds = nil
+        }
         cancelInflight = false
         discardResponse = false
         action = "none"

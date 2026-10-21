@@ -732,7 +732,8 @@
           "expect": {
             "tier": "node",
             "cloud_state": "cooldown_rate_limited",
-            "action": "none"
+            "action": "none",
+            "cooldown_seconds": 120
           }
         }
       ]
