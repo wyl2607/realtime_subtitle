@@ -79,6 +79,9 @@ os.environ['PYTHONWARNINGS'] = 'ignore'
 # faster-whisper的真实报错也被吞掉了，排障时什么都看不到
 logging.basicConfig(level=logging.ERROR)
 _LOG = logging.getLogger(__name__)
+# 节点 connect 外层兜底超时 = ready 截止上限（loading 续期最长 60s）+ 这点余量。
+# 余量覆盖 websockets 建连（默认 open_timeout 10s）和收尾；外层不能比 connect 自己先到期。
+NODE_CONNECT_MARGIN_SECONDS = 15.0
 
 # ⚠️ torch 必须在任何 Qt 导入【之前】——这条在 PyQt5 时代是硬伤：先 PyQt5
 # 后 torch = `OSError WinError 1114`（c10.dll 初始化例程失败），100% 复现。
@@ -627,7 +630,8 @@ class RemoteBridge:
         prepare = self._prepare
         if prepare is None:
             from realtime_subtitle.remote.node_client import prepare as prepare
-        from realtime_subtitle.remote.node_client import NodeCallbacks, SelfNodeError
+        from realtime_subtitle.remote.node_client import (
+            READY_LOADING_MAX_SECONDS, NodeCallbacks, SelfNodeError)
         from realtime_subtitle.remote.router import NodeStateRecord, RouteCandidate
         configs = []
         try:
@@ -694,7 +698,11 @@ class RemoteBridge:
         self._announce_route()
         try:
             self._start_node_loop()
-            self._run_on_loop(client.connect())
+            # 不能用 _run_on_loop 默认的 5s：节点冷启动要 15s 起、收到 loading 最长续到 60s，
+            # 5s 就放弃会让桌面端永远连不上冷启动中的节点。connect 自己的截止才是唯一真相。
+            self._run_on_loop(
+                client.connect(),
+                timeout=READY_LOADING_MAX_SECONDS + NODE_CONNECT_MARGIN_SECONDS)
         except Exception as exc:
             print(f"⚠️  节点连接失败 {cfg.id}: {type(exc).__name__}")
             self._abandon_client(client)

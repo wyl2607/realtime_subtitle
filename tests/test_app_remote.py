@@ -841,3 +841,74 @@ def test_ensure_node_drops_client_if_closed_or_generation_moved(tmp_path, monkey
         assert bridge._node_client is None
     finally:
         bridge.close()
+
+
+def _open_slow_node(tmp_path, monkeypatch, connect):
+    monkeypatch.setattr(
+        "realtime_subtitle.remote.router.read_self_node_id", lambda: "this-machine")
+    box = {}
+
+    def factory(cfg, info, callbacks):
+        node = _Node()
+        node.connect = connect
+        box["node"] = node
+        return node
+
+    bridge, _ui, _translator = _open(
+        cloud_on=False,
+        node_on=True,
+        cloud_client_factory=_boom,
+        segmenter_factory=_boom,
+        ledger_factory=_boom,
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs),
+        prepare=lambda cfg: ("100.64.0.8", object()),
+        node_client_factory=factory,
+        node_entries=[
+            NodeConfig(id="desk", node_id="tk007nodeid0001", url="ws://100.64.0.8:8791", token_file="x"),
+        ],
+        quota_path=tmp_path / "quota.json",
+    )
+    return bridge, box
+
+
+def test_node_connect_outer_timeout_covers_loading_cap(tmp_path, monkeypatch):
+    """P1：connect 外层兜底超时不能比 connect 自己的截止（loading 最长 60s）先到期。"""
+    from realtime_subtitle.remote import node_client
+
+    async def connect():
+        return None
+
+    bridge, _box = _open_slow_node(tmp_path, monkeypatch, connect)
+    seen = []
+    real_run = bridge._run_on_loop
+
+    def spy(coro, timeout=5):
+        seen.append((getattr(coro, "__qualname__", ""), timeout))
+        return real_run(coro, timeout=timeout)
+
+    bridge._run_on_loop = spy
+    try:
+        bridge.feed_audio(np.zeros(320, dtype=np.float32))
+        connects = [t for name, t in seen if name.endswith("connect")]
+        assert len(connects) == 1
+        assert connects[0] > node_client.READY_LOADING_MAX_SECONDS
+        assert bridge._node_client is _box["node"]
+    finally:
+        bridge.close()
+
+
+def test_node_connect_slower_than_5s_is_not_abandoned(tmp_path, monkeypatch):
+    """P1：节点冷启动 >5s 才 ready 时，桌面端不能 5 秒就放弃（真实计时，约 5.5s）。"""
+    import asyncio
+
+    async def connect():
+        await asyncio.sleep(5.5)
+
+    bridge, box = _open_slow_node(tmp_path, monkeypatch, connect)
+    try:
+        bridge.feed_audio(np.zeros(320, dtype=np.float32))
+        assert bridge._node_client is box["node"]
+        assert box["node"].closed is False
+        assert bridge._node_backoff_until == 0.0
+    finally:
+        bridge.close()
