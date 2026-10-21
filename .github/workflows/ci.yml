@@ -17,6 +17,7 @@ permissions:
 # - windows:       full pytest suite except standalone GUI harness scripts
 #   (those open real windows and sys.exit; still manual / optional)
 # - rslite-macos:  Swift 客户端编译 + 自检 + 设计令牌生成物同步（spec 006 E1）
+# - ios:           iOS 自测入口 + xcodegen 模拟器构建 + 扩展 plist 校验 + 跨端夹具/令牌一致性（spec 010）
 
 jobs:
   # 静态检查单独一个 job：十几秒出结果，不用等 windows 那边装完 torch 才知道
@@ -99,7 +100,8 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           # translator_queue lazy-loads torch/faster-whisper on construct
-          pip install "numpy>=1.24,<3" "requests>=2.28,<3" "soxr>=0.5,<2" -r requirements-dev.txt
+          # opencc：中文目标译文繁转简的出口测试要它（纯 Python，与 requirements.txt 同范围）
+          pip install "numpy>=1.24,<3" "requests>=2.28,<3" "soxr>=0.5,<2" "opencc-python-reimplemented>=0.1.7,<1.0.0" -r requirements-dev.txt
       - name: Run pure pipeline unit tests
         # test_runtime_paths 必须在这里跑（不只 windows）：它盯的是运行时文件
         # 有没有掉出仓库根，纯 pathlib + 静态扫描，不需要 Qt/torch/WASAPI
@@ -118,7 +120,7 @@ jobs:
           python -m pip install --upgrade pip
           # CPU torch is enough: tests only need import-before-Qt ordering
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install "PyQt6>=6.6,<7" "numpy>=1.24,<3" "requests>=2.28,<3" "soxr>=0.5,<2" "PyAudioWPatch>=0.2.12" -r requirements-dev.txt
+          pip install "PyQt6>=6.6,<7" "numpy>=1.24,<3" "requests>=2.28,<3" "soxr>=0.5,<2" "PyAudioWPatch>=0.2.12" "websockets>=14.0,<18.0" "opencc-python-reimplemented>=0.1.7,<1.0.0" -r requirements-dev.txt
       - name: Run pytest suite (skip standalone GUI harness scripts)
         shell: bash
         run: |
@@ -168,3 +170,38 @@ jobs:
           esac
       - name: Check design tokens are up to date
         run: python3 scripts/design/gen_tokens.py --check
+
+  # iOS（spec 010）：四个纯逻辑自测入口 + xcodegen 模拟器构建 + 扩展 plist 键
+  # 校验 + 跨端夹具/设计令牌副本一致性。覆盖的是"能编译、自测过、两端副本没漂"
+  # 这三件不依赖真机/签名的检查。
+  #
+  # ☠️ 不加 continue-on-error（与上面的 rslite-macos 不同）：iOS 代码只用到
+  # iOS 26 API（@available(iOS 26.0, *)），macos-26 runner 自带的 Xcode 26
+  # 就能编过；这里的红是真回归，容忍失败会把信号废掉。
+  #
+  # ☠️ 用 brew 装 xcodegen 而不是第三方 action：本 workflow 的 action 全部按
+  # commit SHA 钉死，引入新 action 就是多一个信任根；xcodegen 只是一次 CLI
+  # 安装，brew 在 macOS runner 上本来就有。
+  ios:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - name: Xcode version
+        run: xcodebuild -version
+      - name: Install xcodegen
+        run: brew install xcodegen
+      - name: iOS selftests
+        run: bash ios/Tests/run-selftest.sh
+      - name: Build for simulator and check extension plist
+        run: bash ios/Tests/build-check.sh
+      # build-check.sh 把 xcodebuild 输出吞进 grep -q，挂了只看得到退出码；
+      # 失败时重新生成并构建一次，把编译错误原样打到日志里。
+      - name: Show simulator build errors
+        if: failure()
+        working-directory: ios
+        run: |
+          xcodegen generate -q
+          xcodebuild -project RSiOS.xcodeproj -scheme RSiOS -sdk iphonesimulator -configuration Debug -derivedDataPath build CODE_SIGNING_ALLOWED=NO -quiet build
+      - name: Check cross-platform fixtures and tokens
+        run: python3 scripts/design/check_parity.py
