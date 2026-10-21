@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import dataclass
 from functools import wraps
+import importlib
 from types import SimpleNamespace
 import gc
 import time
@@ -47,6 +49,218 @@ class MlxSegment:
     avg_logprob: float = 0.0
 
 
+class _MlxAlignmentEncoderCache:
+    """让词级对齐复用紧邻 decode 已算出的 audio features。
+
+    mlx-whisper 0.4.x 的 ``forward_with_cross_qk`` 又会完整调用一次 encoder。
+    它紧跟同一 mel window 的 ``model.decode``，其 encoder 输出语义相同；只在
+    这一次 transcribe 调用、且由单一 MLX 线程执行时临时替换，结束立即恢复。
+    """
+
+    def __init__(self, model):
+        self.model = model
+        self._restore = []
+        self._audio_features = None
+
+    def __enter__(self):
+        try:
+            encoder = self.model.encoder
+            forward = self.model.forward_with_cross_qk
+
+            @wraps(encoder)
+            def cache_encoder(mel):
+                features = encoder(mel)
+                self._audio_features = features
+                return features
+
+            @wraps(forward)
+            def reuse_encoder(_mel, tokens):
+                # forward_with_cross_qk 只由 add_word_timestamps 在紧随 decode 的
+                # 同一个窗口调用；没有可复用结果时保留第三方原实现。
+                if self._audio_features is None:
+                    return forward(_mel, tokens)
+                logits, _cache, cross_qk = self.model.decoder(tokens, self._audio_features)
+                return logits, cross_qk
+
+            self._replace("encoder", cache_encoder, encoder)
+            self._replace("forward_with_cross_qk", reuse_encoder, forward)
+            return self
+        except Exception:
+            self.__exit__()
+            raise
+
+    def __exit__(self, *_exc):
+        for name, original, was_state_item, was_instance_attr in reversed(self._restore):
+            if was_state_item or was_instance_attr:
+                setattr(self.model, name, original)
+            else:
+                delattr(self.model, name)
+
+    def _replace(self, name, value, original):
+        self._restore.append((
+            name,
+            original,
+            isinstance(self.model, dict) and name in self.model,
+            name in vars(self.model),
+        ))
+        setattr(self.model, name, value)
+
+
+class _MlxTranscribeProfiler:
+    """仅基准模式下记录互斥的 MLX 转写阶段墙钟，退出时恢复原函数。"""
+
+    def __init__(self, module, model, mx):
+        self.module = module
+        self.model = model
+        self.mx = mx
+        self.values = {name: 0.0 for name in ("mel", "encoder", "decoder", "alignment")}
+        self._restore = []
+        self._align_depth = 0
+        self._decode_encoder_s = 0.0
+
+    def _replace(self, obj, name, wrapper):
+        original = getattr(obj, name)
+        was_state_item = isinstance(obj, dict) and name in obj
+        was_instance_attr = name in vars(obj)
+        setattr(obj, name, wrapper(original))
+        self._restore.append((
+            obj,
+            name,
+            original,
+            was_state_item,
+            was_instance_attr,
+        ))
+
+    def _eval(self, value):
+        evaluator = getattr(self.mx, "eval", None)
+        if evaluator is not None:
+            evaluator(value)
+
+    def _timed(self, name, original):
+        @wraps(original)
+        def run(*args, **kwargs):
+            started = time.perf_counter()
+            try:
+                value = original(*args, **kwargs)
+                self._eval(value)
+                return value
+            finally:
+                self.values[name] += time.perf_counter() - started
+        return run
+
+    def __enter__(self):
+        try:
+            self._replace(self.module, "log_mel_spectrogram", lambda original: self._timed("mel", original))
+
+            def record_encoder(original):
+                @wraps(original)
+                def run(*args, **kwargs):
+                    if self._align_depth:
+                        return original(*args, **kwargs)
+                    started = time.perf_counter()
+                    try:
+                        value = original(*args, **kwargs)
+                        self._eval(value)
+                        return value
+                    finally:
+                        elapsed = time.perf_counter() - started
+                        self.values["encoder"] += elapsed
+                        self._decode_encoder_s += elapsed
+                return run
+
+            def record_decode(original):
+                @wraps(original)
+                def run(*args, **kwargs):
+                    encoder_before = self._decode_encoder_s
+                    started = time.perf_counter()
+                    try:
+                        return original(*args, **kwargs)
+                    finally:
+                        elapsed = time.perf_counter() - started
+                        # model.decode 包住一次 encoder 和所有自回归 decoder 调用；
+                        # 把已单独计入的 encoder 扣掉，避免阶段相加时双计。
+                        self.values["decoder"] += max(
+                            elapsed - (self._decode_encoder_s - encoder_before), 0.0,
+                        )
+                return run
+
+            def alignment_phase(original):
+                @wraps(original)
+                def run(*args, **kwargs):
+                    started = time.perf_counter()
+                    self._align_depth += 1
+                    try:
+                        return original(*args, **kwargs)
+                    finally:
+                        self._align_depth -= 1
+                        self.values["alignment"] += time.perf_counter() - started
+                return run
+
+            self._replace(self.model, "encoder", record_encoder)
+            self._replace(self.model, "decode", record_decode)
+            self._replace(self.module, "add_word_timestamps", alignment_phase)
+            return self
+        except Exception:
+            self.__exit__()
+            raise
+
+    def __exit__(self, *_exc):
+        for obj, name, original, was_state_item, was_instance_attr in reversed(self._restore):
+            if was_state_item or was_instance_attr:
+                setattr(obj, name, original)
+            else:
+                delattr(obj, name)
+
+
+class _MlxTranscribeContext:
+    """应用一次性对齐优化，并按需附加细粒度基准计时。"""
+
+    def __init__(self, repo, collect_timing):
+        self.repo = repo
+        self.collect_timing = collect_timing
+        self._stack = ExitStack()
+
+    def __enter__(self):
+        try:
+            module = importlib.import_module("mlx_whisper.transcribe")
+            import mlx.core as mx
+            model = module.ModelHolder.get_model(self.repo, mx.float16)
+        except Exception:
+            return None
+
+        try:
+            self._stack.enter_context(_MlxAlignmentEncoderCache(model))
+            if self.collect_timing:
+                return self._stack.enter_context(_MlxTranscribeProfiler(module, model, mx))
+            return None
+        except Exception:
+            # 第三方模型内部接口变了时宁可放弃优化/分段，不影响正常识别。
+            self._stack.close()
+            return None
+
+    def __exit__(self, *exc):
+        return self._stack.__exit__(*exc)
+
+
+def _timing_record(total_s, vad_s, profiler):
+    """分段互斥：alignment 含其内部 cross-attention 与 CPU DTW。"""
+    values = getattr(profiler, "values", {})
+    mel_s = values.get("mel", 0.0)
+    encoder_s = values.get("encoder", 0.0)
+    decoder_s = values.get("decoder", 0.0)
+    alignment_s = values.get("alignment", 0.0)
+    python_s = max(total_s - vad_s - mel_s - encoder_s - decoder_s - alignment_s, 0.0)
+    return {
+        "total_s": total_s,
+        "vad_s": vad_s,
+        "mel_s": mel_s,
+        "encoder_s": encoder_s,
+        "decoder_s": decoder_s,
+        "alignment_s": alignment_s,
+        "python_s": python_s,
+    }
+
+
 @_on_mlx_thread
 def load_mlx_model(repo: str) -> "MlxWhisperModel":
     """解析本地路径并预加载权重，再包成 MlxWhisperModel。"""
@@ -78,6 +292,9 @@ class MlxWhisperModel:
     def __init__(self, repo: str):
         self.repo = repo
         self.bits = 16
+        # 默认不碰第三方模块属性；基准脚本显式打开后才记录分段耗时。
+        self.profile_enabled = False
+        self.last_timing = None
 
     @_on_mlx_thread
     def set_bits(self, bits: int) -> float:
@@ -129,34 +346,45 @@ class MlxWhisperModel:
         word_timestamps=True,
         condition_on_previous_text=True,
         vad_filter=True,
+        collect_timing=None,
     ):
         # mlx-whisper does not expose beam search; accept the faster-whisper
         # argument so callers can keep using the same configuration.
         del beam_size
 
+        if collect_timing is None:
+            collect_timing = self.profile_enabled
+        started = time.perf_counter() if collect_timing else None
+        vad_started = time.perf_counter() if collect_timing else None
         mlx_audio, ts_map = _apply_vad(audio, vad_filter=vad_filter)
+        vad_s = time.perf_counter() - vad_started if vad_started is not None else 0.0
         if vad_filter and len(mlx_audio) == 0:
+            if collect_timing:
+                self.last_timing = _timing_record(time.perf_counter() - started, vad_s, None)
             return iter(()), SimpleNamespace(language=language or "", duration=0.0)
 
         import mlx_whisper
 
-        result = mlx_whisper.transcribe(
-            mlx_audio,
-            path_or_hf_repo=self.repo,
-            language=language,
-            task=task,
-            initial_prompt=initial_prompt,
-            word_timestamps=word_timestamps,
-            condition_on_previous_text=condition_on_previous_text,
-            # 温度回退最多到 0.2：默认 0.0→1.0 每档都把整段重解一遍，命中时单轮
-            # 4~6 倍耗时（M4 实测 11.7s，正是"偶发卡顿"）。流式每轮本来就重识别
-            # 整个缓冲、只提交两轮一致的前缀，不靠回退纠错。M4 上 187 轮对照：
-            # WER 三者相同；上限 0.2 最慢 6.6s、p99 不变；完全不回退 p99 反而
-            # 变差（重复解码一路生成到上限）
-            temperature=(0.0, 0.2),
-            verbose=None,
-        )
+        with _MlxTranscribeContext(self.repo, collect_timing) as active_profiler:
+            result = mlx_whisper.transcribe(
+                mlx_audio,
+                path_or_hf_repo=self.repo,
+                language=language,
+                task=task,
+                initial_prompt=initial_prompt,
+                word_timestamps=word_timestamps,
+                condition_on_previous_text=condition_on_previous_text,
+                # 温度回退最多到 0.2：默认 0.0→1.0 每档都把整段重解一遍，命中时单轮
+                # 4~6 倍耗时（M4 实测 11.7s，正是"偶发卡顿"）。流式每轮本来就重识别
+                # 整个缓冲、只提交两轮一致的前缀，不靠回退纠错。M4 上 187 轮对照：
+                # WER 三者相同；上限 0.2 最慢 6.6s、p99 不变；完全不回退 p99 反而
+                # 变差（重复解码一路生成到上限）
+                temperature=(0.0, 0.2),
+                verbose=None,
+            )
         segments = [_segment_from_dict(s, ts_map) for s in result.get("segments", [])]
+        if collect_timing:
+            self.last_timing = _timing_record(time.perf_counter() - started, vad_s, active_profiler)
         info = SimpleNamespace(
             language=(result.get("language") or language or ""),
             duration=float(result.get("duration") or _duration_seconds(audio)),
@@ -260,4 +488,3 @@ def _clear_mlx_cache(mx) -> None:
 def _set_mlx_cache_limit(mx, limit) -> None:
     setter = getattr(mx, "set_cache_limit", None) or mx.metal.set_cache_limit
     setter(limit)
-

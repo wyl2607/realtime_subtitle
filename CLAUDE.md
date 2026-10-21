@@ -1144,7 +1144,7 @@ FLEURS 德中平行句 chrF。复测脚本在 `scripts/bench/`）：
 
 | 识别（MLX） | WER | 12 秒缓冲单次 | 内存峰值 | 结论 |
 |---|---|---|---|---|
-| turbo fp16 `mlx-community/whisper-large-v3-turbo` | 4.05% | 2.4s | 2.1GB | 12GB 以上默认 |
+| turbo fp16 `mlx-community/whisper-large-v3-turbo` | 4.05% | 2.4s（复用 encoder 后 1.33s，见下第 1 条） | 2.1GB | 12GB 以上默认 |
 | turbo q8（本地量化） | 3.83% | 3.5s | 1.5GB | 词时间戳在量化模型上慢 1.8s，不做默认 |
 | turbo q4 `mlx-community/whisper-large-v3-turbo-q4` | 4.84% | 3.4s | 1.1GB | <12GB / `--lean` |
 | medium | 5.28% | 2.9s | 2.2GB | 全面劣于 turbo，别用 |
@@ -1160,12 +1160,19 @@ FLEURS 德中平行句 chrF。复测脚本在 `scripts/bench/`）：
 
 macOS 避坑（每一条都是这次迁移真实踩过的）：
 
-1. **Mac 上识别更新一次约 2.4 秒，这是现有架构的下限，不是 bug。**
+1. **Mac 上识别更新一次约 1.4 秒（M2），节奏 = 每轮识别耗时。**
    `CHUNK_SUBMIT_SECONDS=0.5` 在 Mac 上实际不成立：收件箱积压的块会被
    `_process_inbox` 整批合并成一次识别，节奏自动退化成"每轮识别耗时"。
    缩短缓冲**省不了时间**（6 秒缓冲 2.57s vs 12 秒 2.37s）——和第 4 节第 20 条
-   同理，编码器每次都补到 30 秒，M2 上这块固定 ~1.7s；词时间戳再加 ~0.6s。
-   词时间戳是 local agreement 的前提，不能关。
+   同理，编码器每次都补到 30 秒。词时间戳是 local agreement 的前提，不能关。
+   ☠️ ~~"约 2.4 秒是现有架构的下限"~~ **是错的**（2026-10-21 推翻）：mlx-whisper
+   0.4.x 做词时间戳对齐时，`forward_with_cross_qk` 会把同一窗口的 mel **再编码
+   一遍**，原来那 ~0.6s"词时间戳开销"里大半其实是第二次 encoder。
+   `asr/mlx_backend.py` 的 `_MlxAlignmentEncoderCache` 在单次 transcribe 内复用
+   decode 已算出的 features（接口对不上就退回原实现）。M2 串行实测（12 秒缓冲、
+   开 VAD）：fp16 2.40→1.33s、原地 8bit 2.58→1.42s；FLEURS 60 条 WER 不变
+   （4.77%，逐句一致），366 个词的时间戳逐个相等，MLX active/peak 内存不变。
+   升级 mlx-whisper 时先看 `forward_with_cross_qk` 还在不在、是不是仍然自己调 encoder。
 2. **mlx-community 上同名模型有两种格式。** `-8bit`/`-4bit` 后缀的是
    mlx-audio-plus 格式（`model.safetensors`），mlx_whisper 加载直接报
    `[load_npz] Input must be a zip file`；能用的是 `weights.safetensors` /
