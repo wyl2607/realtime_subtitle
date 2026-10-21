@@ -1,0 +1,130 @@
+{
+  "version": 1,
+  "p5_cases": [
+    {
+      "name": "remote_replaces_local_at_50_percent",
+      "visible_limit": 3,
+      "operations": [
+        {"type": "add_local", "key": 1, "t0": 0, "t1": 10, "src": "local"},
+        {
+          "type": "apply_remote",
+          "node_id": "cloud:groq",
+          "t0": 5,
+          "t1": 20,
+          "src": "remote",
+          "dst": "远端",
+          "expect_replaced": [1]
+        }
+      ],
+      "expect": {
+        "lines": [{"source": "remote", "src": "remote", "dst": "远端", "t0": 5, "t1": 20}],
+        "visible": [{"source": "remote", "src": "remote"}]
+      }
+    },
+    {
+      "name": "remote_under_50_percent_does_not_replace",
+      "visible_limit": 3,
+      "operations": [
+        {"type": "add_local", "key": 1, "t0": 0, "t1": 10, "src": "local"},
+        {
+          "type": "apply_remote",
+          "node_id": "cloud:groq",
+          "t0": 5.01,
+          "t1": 20,
+          "src": "remote",
+          "expect_replaced": []
+        }
+      ],
+      "expect": {
+        "lines": [
+          {"source": "local", "key": 1, "src": "local", "t0": 0, "t1": 10},
+          {"source": "remote", "src": "remote", "t0": 5.01, "t1": 20}
+        ],
+        "visible": [
+          {"source": "local", "src": "local"},
+          {"source": "remote", "src": "remote"}
+        ]
+      }
+    },
+    {
+      "name": "multiple_remote_union_replaces_local",
+      "visible_limit": 4,
+      "operations": [
+        {"type": "add_local", "key": 1, "t0": 0, "t1": 10, "src": "local"},
+        {
+          "type": "apply_remote",
+          "node_id": "cloud:groq",
+          "t0": 0,
+          "t1": 3.4,
+          "src": "remote a",
+          "expect_replaced": []
+        },
+        {
+          "type": "apply_remote",
+          "node_id": "cloud:groq",
+          "t0": 4.2,
+          "t1": 9,
+          "src": "remote b",
+          "expect_replaced": [1]
+        }
+      ],
+      "expect": {
+        "lines": [
+          {"source": "remote", "src": "remote a", "t0": 0, "t1": 3.4},
+          {"source": "remote", "src": "remote b", "t0": 4.2, "t1": 9}
+        ],
+        "visible": [
+          {"source": "remote", "src": "remote a"},
+          {"source": "remote", "src": "remote b"}
+        ]
+      }
+    },
+    {
+      "name": "remote_first_drops_later_covered_local",
+      "visible_limit": 3,
+      "operations": [
+        {
+          "type": "apply_remote",
+          "node_id": "cloud:groq",
+          "t0": 5,
+          "t1": 20,
+          "src": "remote",
+          "expect_replaced": []
+        },
+        {"type": "add_local", "key": 1, "t0": 0, "t1": 10, "src": "local"}
+      ],
+      "expect": {
+        "lines": [{"source": "remote", "src": "remote", "t0": 5, "t1": 20}],
+        "visible": [{"source": "remote", "src": "remote"}]
+      }
+    },
+    {
+      "name": "rolled_off_screen_replacement_does_not_change_visible_tail",
+      "visible_limit": 2,
+      "operations": [
+        {"type": "add_local", "key": 1, "t0": 0, "t1": 10, "src": "old local"},
+        {"type": "add_local", "key": 2, "t0": 10, "t1": 20, "src": "visible one"},
+        {"type": "add_local", "key": 3, "t0": 20, "t1": 30, "src": "visible two"},
+        {
+          "type": "apply_remote",
+          "node_id": "cloud:groq",
+          "t0": 0,
+          "t1": 10,
+          "src": "old remote",
+          "expect_replaced": [1]
+        }
+      ],
+      "expect": {
+        "lines": [
+          {"source": "remote", "src": "old remote", "t0": 0, "t1": 10},
+          {"source": "local", "key": 2, "src": "visible one", "t0": 10, "t1": 20},
+          {"source": "local", "key": 3, "src": "visible two", "t0": 20, "t1": 30}
+        ],
+        "visible": [
+          {"source": "local", "key": 2, "src": "visible one"},
+          {"source": "local", "key": 3, "src": "visible two"}
+        ]
+      }
+    }
+  ]
+}

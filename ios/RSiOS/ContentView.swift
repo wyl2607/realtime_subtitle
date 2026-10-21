@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 import ReplayKit
 import AVFoundation
 import AVKit
@@ -13,13 +14,14 @@ struct ContentView: View {
     @StateObject private var pipManager = PiPManager()
     @StateObject private var statusMonitor = StatusMonitor()
     @StateObject private var linesMonitor = LinesMonitor()
+    @StateObject private var transcriptStore = TranscriptStore()
     @ObservedObject private var appStateMonitor = AppStateMonitor.shared
 
     @State private var pairingLinkText = ""
     @State private var pairingStatus = ""
     @State private var pairedConfigDisplay = ""
 
-    @State private var engineMode: String = "node"
+    @State private var engineMode: String = "auto"
     @State private var prepareStatus = ""
     @State private var isPreparing = false
 
@@ -83,6 +85,7 @@ struct ContentView: View {
                         .font(.headline)
 
                     Picker("引擎", selection: $engineMode) {
+                        Text("自动").tag("auto")
                         Text("电脑节点").tag("node")
                         Text("本机").tag("local")
                     }
@@ -91,7 +94,7 @@ struct ContentView: View {
                         SharedKeychain.writeEngineMode(newValue)
                     }
                     .onAppear {
-                        engineMode = SharedKeychain.readEngineMode() ?? "node"
+                        engineMode = SharedKeychain.readEngineMode()
                     }
 
                     Button(action: prepareLocalAssets) {
@@ -216,6 +219,11 @@ struct ContentView: View {
             .navigationTitle("RSiOS")
             .onAppear {
                 loadPairedConfig()
+            }
+            .onReceive(linesMonitor.$lines) { lines in
+                transcriptStore.ingest(lines.map {
+                    TranscriptStore.Sentence(id: $0.id, src: $0.src, dst: $0.dst)
+                })
             }
         }
     }

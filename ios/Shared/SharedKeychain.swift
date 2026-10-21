@@ -111,8 +111,10 @@ public enum SharedKeychain {
         write(string, account: Account.engineMode)
     }
 
-    public static func readEngineMode() -> String? {
-        read(account: Account.engineMode)
+    /// 没写过或读到不认识的旧值都按 `auto` 处理：升级后的老用户默认获得自动回退，
+    /// 已有的 `node` / `local` 值原样返回，显式选择不会被改掉。
+    public static func readEngineMode() -> String {
+        EngineMode.normalized(read(account: Account.engineMode)).rawValue
     }
 
     public static func delete(account: String) -> Bool {

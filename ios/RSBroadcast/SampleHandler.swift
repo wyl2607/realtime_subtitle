@@ -25,7 +25,10 @@ class SampleHandler: RPBroadcastSampleHandler {
     private var converter: PCMConverter?
     private var session: NodeSession?
     private var localEngine: AnyObject?
-    private var engineMode: String = "node"
+    private var engineMode: String = "auto"
+    private var autoFallback: AutoFallback?
+    private var routingLocal = false
+    private var localSentenceActive = false
     private var nodeName: String = ""
     private var readyReceived = false
     private var framesSent: UInt64 = 0
@@ -57,7 +60,7 @@ class SampleHandler: RPBroadcastSampleHandler {
         logger.info("Broadcast started")
         writeStatus("started")
 
-        engineMode = SharedKeychain.readEngineMode() ?? "node"
+        engineMode = SharedKeychain.readEngineMode()
 
         if engineMode == "local" {
             if #available(iOS 26.0, *) {
@@ -69,6 +72,11 @@ class SampleHandler: RPBroadcastSampleHandler {
                     fatalErrorReason = "fatal:local_needs_ios26"
                 }
             }
+            return
+        }
+
+        if engineMode == "auto" {
+            startAutoMode()
             return
         }
 
@@ -105,10 +113,7 @@ class SampleHandler: RPBroadcastSampleHandler {
         logger.info("Broadcast finished")
         
         if engineMode == "local" {
-            if #available(iOS 26.0, *) {
-                (localEngine as? LocalEngine)?.stop()
-                localEngine = nil
-            }
+            stopLocalEngine()
             converter = nil
             writeStatus("finished")
             return
@@ -122,15 +127,106 @@ class SampleHandler: RPBroadcastSampleHandler {
         }
         currentSession?.flush()
         currentSession?.close()
+        if engineMode == "auto" {
+            stopLocalEngine()
+        }
         converter = nil
         writeStatus("finished")
     }
 
+    // MARK: - 自动模式（C1/C2）：决策全在 AutoFallback，这里只做接线
+
+    private var autoLocalEngineAvailable: Bool {
+        if #available(iOS 26.0, *) { return true }
+        return false
+    }
+
+    private func startAutoMode() {
+        converter = PCMConverter()
+        autoFallback = AutoFallback(nodeName: "电脑节点", localAvailable: autoLocalEngineAvailable)
+        stateQueue.sync {
+            readyReceived = false
+            framesSent = 0
+            finalsCount = 0
+            translationsCount = 0
+            preReadyDropped = 0
+            lastStatusCode = ""
+            fatalErrorOccurred = false
+            fatalErrorReason = ""
+            recentLines = []
+            session = nil
+            broadcastActive = true
+            reconnectPolicy = ReconnectPolicy()
+            reconnectCount = 0
+            routingLocal = false
+            localSentenceActive = false
+        }
+
+        guard let json = SharedKeychain.readNodeConfig(),
+              let data = json.data(using: .utf8),
+              let config = try? JSONDecoder().decode(NodeConfig.self, from: data) else {
+            // 没配对过节点：自动模式直接落到本机（iOS < 26 则只显示状态）。
+            writeStatus("no_config")
+            applyAutoDecision(handleAutoEvent(.nodeFailed))
+            return
+        }
+
+        nodeName = config.name
+        nodeConfig = config
+        autoFallback?.nodeName = config.name
+        startPinnedSession(config)
+    }
+
+    /// 在 stateQueue 上改 AutoFallback 并取回决策；动作本身在锁外执行，
+    /// 因为启动/停止本机引擎也会进 stateQueue。
+    private func handleAutoEvent(_ event: AutoFallbackEvent) -> AutoFallbackDecision? {
+        stateQueue.sync {
+            guard engineMode == "auto", var fallback = autoFallback else { return nil }
+            let decision = fallback.handle(event)
+            autoFallback = fallback
+            return decision
+        }
+    }
+
+    private func applyAutoDecision(_ decision: AutoFallbackDecision?) {
+        guard let decision else { return }
+        switch decision.action {
+        case .keep:
+            break
+        case .startLocal:
+            if #available(iOS 26.0, *) {
+                startLocalEngine()
+            }
+        case .stopLocalAndSwitchToNode:
+            stopLocalEngine()
+            stateQueue.sync {
+                routingLocal = false
+                localSentenceActive = false
+            }
+        }
+        if let status = decision.status {
+            writeStatus("last=\(status)")
+        }
+    }
+
+    private func stopLocalEngine() {
+        if #available(iOS 26.0, *) {
+            (localEngine as? LocalEngine)?.stop()
+        }
+        localEngine = nil
+    }
+
     @available(iOS 26.0, *)
     private func startLocalEngine() {
-        converter = PCMConverter()
+        // 自动回退时 converter 已经在跑节点链路：复用同一个实例，
+        // 既避免和音频线程抢写，也保住重采样器的滤波状态。
+        if converter == nil {
+            converter = PCMConverter()
+        }
         stateQueue.sync {
-            readyReceived = true
+            // 只有显式「本机」模式才把节点就绪视为真；自动模式正在等节点，
+            // 这里写 true 会让切回节点之前就把音频发给一个尚未 ready 的会话。
+            readyReceived = engineMode == "local"
             framesSent = 0
             finalsCount = 0
             translationsCount = 0
@@ -140,6 +236,8 @@ class SampleHandler: RPBroadcastSampleHandler {
             fatalErrorReason = ""
             recentLines = []
             broadcastActive = true
+            routingLocal = true
+            localSentenceActive = false
         }
 
         let engine = LocalEngine(
@@ -162,12 +260,14 @@ class SampleHandler: RPBroadcastSampleHandler {
     private func handleLocalFinal(id: Int, text: String) {
         stateQueue.sync {
             finalsCount += 1
+            localSentenceActive = false
             recentLines.append(RecentLine(id: id, src: text, dst: ""))
             if recentLines.count > maxRecentLines {
                 recentLines.removeFirst()
             }
         }
         writeLatestLines()
+        applyAutoDecision(handleAutoEvent(.localSentenceFinalized))
     }
 
     private func handleLocalTranslation(id: Int, text: String) {
@@ -184,9 +284,14 @@ class SampleHandler: RPBroadcastSampleHandler {
         stateQueue.sync { lastStatusCode = status }
         logger.info("Local engine status: \(status)")
         if ["asr_assets_missing", "asr_unsupported", "analyzer_format_failed", "asr_failed", "asr_result_failed"].contains(where: { status.hasPrefix($0) }) {
-            stateQueue.sync {
-                fatalErrorOccurred = true
-                fatalErrorReason = "fatal:\(status)"
+            if engineMode == "auto" {
+                // 本机引擎自己坏了：停掉它、把音频交还给节点重连，别让音频继续喂给死引擎。
+                applyAutoDecision(handleAutoEvent(.localAvailabilityChanged(false)))
+            } else {
+                stateQueue.sync {
+                    fatalErrorOccurred = true
+                    fatalErrorReason = "fatal:\(status)"
+                }
             }
         }
         writeStatus("last=\(status)")
@@ -240,9 +345,10 @@ class SampleHandler: RPBroadcastSampleHandler {
                 (readyReceived, framesSent, finalsCount, translationsCount, lastStatusCode, preReadyDropped, fatalErrorOccurred, fatalErrorReason, reconnectCount)
             }
             let readyStr = state.0 ? "1" : "0"
-            let engineStr = engineMode == "local" ? "local" : "node"
+            let localActive = stateQueue.sync { routingLocal }
+            let engineStr = (engineMode == "local" || localActive) ? "local" : "node"
             var status = "blocks=\(blockCount) rate=\(Int(sampleRate)) ch=\(channelCount) fmt=\(formatString) flags=\(formatFlags) ileave=\(interleavedStr) rms=\(String(format: "%.3f", avgRMS)) mem=\(memMB) engine=\(engineStr)"
-            if engineMode == "node" {
+            if engineMode != "local" && !localActive {
                 status += " node=\(nodeName) ready=\(readyStr) sent=\(state.1) finals=\(state.2) tx=\(state.3) last=\(state.4.isEmpty ? "-" : state.4) drop=\(state.5) reconn=\(state.8)"
             } else {
                 status += " finals=\(state.2) tx=\(state.3) last=\(state.4.isEmpty ? "-" : state.4)"
@@ -254,15 +360,21 @@ class SampleHandler: RPBroadcastSampleHandler {
             lastStatusWriteTime = now
         }
 
-        if engineMode == "local" {
+        let routeLocal = stateQueue.sync { routingLocal }
+        if engineMode == "local" || routeLocal {
             if #available(iOS 26.0, *) {
                 guard let converter = converter, let engine = localEngine as? LocalEngine else { return }
                 let fatal = stateQueue.sync { fatalErrorOccurred }
                 guard !fatal else { return }
 
                 let frames = converter.append(sampleBuffer)
-                for frame in frames {
-                    engine.append(pcm16k: frame)
+                if !frames.isEmpty {
+                    // 节点 ready 时靠这个标记判断“本机还有一句没定稿”，
+                    // 避免切回节点把半句截断。
+                    stateQueue.sync { localSentenceActive = true }
+                    for frame in frames {
+                        engine.append(pcm16k: frame)
+                    }
                 }
             }
             return
@@ -306,6 +418,9 @@ class SampleHandler: RPBroadcastSampleHandler {
                 if shouldReport {
                     self.writeStatus("last=\(status)")
                 }
+                if self.engineMode == "auto" {
+                    self.applyAutoDecision(self.handleAutoEvent(.reconnectAbandoned))
+                }
                 return
             }
 
@@ -335,11 +450,17 @@ class SampleHandler: RPBroadcastSampleHandler {
     private func handleNodeEvent(_ event: NodeEvent) {
         switch event {
         case .ready(let cold):
+            // 自动模式：把“本机是否还有一句没定稿”同步给决策器，再问要不要切回。
+            if stateQueue.sync(execute: { localSentenceActive }) {
+                _ = handleAutoEvent(.localSentenceStarted)
+            }
+            let decision = handleAutoEvent(.nodeReady)
             stateQueue.sync {
                 readyReceived = true
                 reconnectPolicy.reset()
             }
             logger.info("Node ready cold=\(cold)")
+            applyAutoDecision(decision)
         case .final(let id, _, _, let text):
             stateQueue.sync {
                 finalsCount += 1
@@ -361,9 +482,14 @@ class SampleHandler: RPBroadcastSampleHandler {
             stateQueue.sync { lastStatusCode = code }
             logger.info("Node status: \(code) \(text)")
             if NodeEvent.isFatal(code: code) {
-                stateQueue.sync {
-                    fatalErrorOccurred = true
-                    fatalErrorReason = "fatal:\(code)"
+                if engineMode == "auto" {
+                    // 自动模式不把节点致命错误记成全局 fatal——那会连本机一起停掉。
+                    applyAutoDecision(handleAutoEvent(.reconnectAbandoned))
+                } else {
+                    stateQueue.sync {
+                        fatalErrorOccurred = true
+                        fatalErrorReason = "fatal:\(code)"
+                    }
                 }
             }
         case .drained:
@@ -376,8 +502,13 @@ class SampleHandler: RPBroadcastSampleHandler {
         stateQueue.sync { lastStatusCode = "closed=\(displayCode)" }
         logger.info("Node closed: \(code)")
 
-        // 只在 node 模式下尝试重连
-        guard engineMode == "node" else { return }
+        // 显式 node 和自动模式都要重连；显式 local 不碰节点。
+        guard engineMode == "node" || engineMode == "auto" else { return }
+
+        if engineMode == "auto" {
+            stateQueue.sync { readyReceived = false }
+            applyAutoDecision(handleAutoEvent(.nodeFailed))
+        }
 
         // 由 NodeSession 通过 closeReason 还原过 1005→真实码
         let shouldReconnect = stateQueue.sync { () -> (TimeInterval?, NodeConfig?) in
@@ -389,7 +520,12 @@ class SampleHandler: RPBroadcastSampleHandler {
             return (delay, nodeConfig)
         }
 
-        guard let delay = shouldReconnect.0, let config = shouldReconnect.1 else { return }
+        guard let delay = shouldReconnect.0, let config = shouldReconnect.1 else {
+            if engineMode == "auto" {
+                applyAutoDecision(handleAutoEvent(.reconnectAbandoned))
+            }
+            return
+        }
 
         // 重连前把 readyReceived 置 false（ready 之前的帧照旧丢弃计入 drop）
         stateQueue.sync { readyReceived = false }
