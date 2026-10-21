@@ -49,8 +49,9 @@ def test_watchdog_non_ollama_translator_does_nothing():
     assert not spawn_called
 
 
-def test_watchdog_single_failure_does_not_spawn():
+def test_watchdog_single_failure_does_not_spawn(monkeypatch):
     """One probe failure should not trigger spawn (needs 2 consecutive)."""
+    monkeypatch.setattr("realtime_subtitle.node.ollama_watchdog._find_ollama_exe_default", lambda: Path("/fake/ollama"))
     clock = FakeClock()
     failures = 0
 
@@ -73,8 +74,9 @@ def test_watchdog_single_failure_does_not_spawn():
     assert spawn_called
 
 
-def test_watchdog_two_failures_spawns_once():
+def test_watchdog_two_failures_spawns_once(monkeypatch):
     """Two consecutive failures should trigger exactly one spawn."""
+    monkeypatch.setattr("realtime_subtitle.node.ollama_watchdog._find_ollama_exe_default", lambda: Path("/fake/ollama"))
     clock = FakeClock()
     spawn_count = 0
 
@@ -96,8 +98,9 @@ def test_watchdog_two_failures_spawns_once():
     assert spawn_count == 1
 
 
-def test_watchdog_spawn_cooldown_300s():
+def test_watchdog_spawn_cooldown_300s(monkeypatch):
     """Second spawn should be blocked within 300s cooldown."""
+    monkeypatch.setattr("realtime_subtitle.node.ollama_watchdog._find_ollama_exe_default", lambda: Path("/fake/ollama"))
     clock = FakeClock()
     spawn_count = 0
 
@@ -124,8 +127,9 @@ def test_watchdog_spawn_cooldown_300s():
     assert spawn_count == 2
 
 
-def test_watchdog_success_clears_failures():
+def test_watchdog_success_clears_failures(monkeypatch):
     """A successful probe should reset consecutive failure count."""
+    monkeypatch.setattr("realtime_subtitle.node.ollama_watchdog._find_ollama_exe_default", lambda: Path("/fake/ollama"))
     clock = FakeClock()
     probe_results = [False, False, True, False, False]
     probe_idx = 0
