@@ -45,6 +45,9 @@ TEXT_STATUS_CLOUD_KEY_INVALID = '云端 key 无效'
 TEXT_STATUS_CLOUD_COOLDOWN_SUFFIX = ' · 云端限流冷却'
 TEXT_UNTRANSLATED = '未翻译 ⟳'
 TEXT_NODE_UNAVAILABLE_SUFFIX = ' 不可用，已用本机'
+TEXT_NODE_RECOVERED_WAITING_SUFFIX = ' 已恢复，等本句结束后切回'
+TEXT_NODE_RECOVERED_SWITCHED_SUFFIX = ' 已恢复，已切回节点'
+TEXT_NODE_LOADING_SUFFIX = ' 正在加载模型…'
 
 PALETTE_TEXT = (('白', '#F0F0F0'), ('暖黄', '#FFE894'), ('浅青', '#9FE7F5'), ('浅绿', '#B8F2B0'), ('浅粉', '#FFC4D6'),)
 PALETTE_BACKGROUND = (('黑', '#000000'), ('深灰', '#1E1E1E'), ('深蓝', '#0F1B2D'), ('深绿', '#10241A'), ('深紫', '#1F1630'),)
