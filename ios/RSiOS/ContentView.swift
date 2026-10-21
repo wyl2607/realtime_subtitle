@@ -24,6 +24,12 @@ struct ContentView: View {
     @State private var engineMode: String = "auto"
     @State private var prepareStatus = ""
     @State private var isPreparing = false
+    /// Groq key 的输入框内容。只在用户输入时存在，保存后立刻清空。
+    @State private var groqKeyInput: String = ""
+    /// 已保存 key 的掩码（只显示后 4 位）。完整 key 只在 Keychain 里。
+    @State private var groqKeyMasked: String = ""
+    @State private var cloudEnabled: Bool = false
+    @State private var cloudKeyStatus: String = ""
     /// 每次收到新句对就 +1：「今天的字幕」页面靠它触发重新读存档文件。
     @State private var transcriptRefresh = 0
 
@@ -116,6 +122,53 @@ struct ContentView: View {
                             .font(.caption)
                             .foregroundColor(prepareStatus.hasPrefix("错误") || prepareStatus.hasPrefix("需要") ? .red : .green)
                     }
+                }
+
+                Divider()
+
+                VStack(spacing: 12) {
+                    Text("云端识别（Groq）")
+                        .font(.headline)
+
+                    if groqKeyMasked.isEmpty {
+                        SecureField("Groq API key", text: $groqKeyInput)
+                            .textFieldStyle(.roundedBorder)
+                            .autocapitalization(.none)
+                            .disableAutocorrection(true)
+
+                        Button("保存 key") {
+                            saveGroqKey()
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(groqKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    } else {
+                        HStack {
+                            Text("已保存：\(groqKeyMasked)")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            Spacer()
+                            Button("清除 key") {
+                                clearGroqKey()
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+
+                    Toggle("启用云端识别", isOn: $cloudEnabled)
+                        .onChange(of: cloudEnabled) { _, newValue in
+                            SharedKeychain.writeCloudEnabled(newValue)
+                        }
+
+                    if !cloudKeyStatus.isEmpty {
+                        Text(cloudKeyStatus)
+                            .font(.caption)
+                            .foregroundColor(cloudKeyStatus.hasPrefix("已保存") ? .green : .red)
+                    }
+
+                    Text("开着时音频片段会发给 Groq；关掉后只走电脑节点和本机。")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
                 Divider()
@@ -233,6 +286,7 @@ struct ContentView: View {
             .navigationTitle("RSiOS")
             .onAppear {
                 loadPairedConfig()
+                loadCloudSettings()
             }
             .onReceive(linesMonitor.$lines) { lines in
                 transcriptStore.ingest(lines.map {
@@ -272,6 +326,34 @@ struct ContentView: View {
            let config = try? JSONDecoder().decode(NodeConfig.self, from: data) {
             pairedConfigDisplay = config.displayName
         }
+    }
+
+    // MARK: - 云端识别（Groq）
+
+    private func loadCloudSettings() {
+        cloudEnabled = SharedKeychain.readCloudEnabled()
+        groqKeyMasked = SharedKeychain.maskedGroqKey() ?? ""
+    }
+
+    /// key 只进 Keychain：写完立刻把输入框清掉，界面上以后只留后 4 位。
+    private func saveGroqKey() {
+        let key = groqKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return }
+        if SharedKeychain.writeGroqKey(key) {
+            groqKeyInput = ""
+            groqKeyMasked = SharedKeychain.maskedGroqKey() ?? ""
+            cloudKeyStatus = "已保存到钥匙串"
+        } else {
+            cloudKeyStatus = "保存失败"
+        }
+    }
+
+    /// 清掉 key：云端这一档立刻失效（扩展下次读到就没 key 了）。
+    private func clearGroqKey() {
+        _ = SharedKeychain.clearGroqKey()
+        groqKeyInput = ""
+        groqKeyMasked = ""
+        cloudKeyStatus = "已清除"
     }
 
     private func prepareLocalAssets() {
