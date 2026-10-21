@@ -845,6 +845,13 @@ final class CloudUploadController: @unchecked Sendable {
         } else if lastKey != snap.key {
             context.apply(RouteEvent(type: "key_modified", status: nil, retryAfter: nil, usagePercent: nil))
             lastKey = snap.key
+            // 换 client 之前作废旧 key 的在飞请求：推进代次，旧 key 的迟到 401 就过不了
+            // segmentEpoch 检查，不会把新 key 打成无效（之后 key 不变，key_modified 不会再来救）。
+            // 不能交给末尾的 `if cancel`——那时 client 已经换成新的，会取消错对象。
+            epoch += 1
+            probeID = nil
+            segmentBounds.removeAll()
+            client?.cancelInflightRequests()
             client = makeClient(snap.key ?? "")
             clearCooldownIfResumed()
         } else if context.cloudState == .off {
@@ -1104,6 +1111,53 @@ final class CloudUploadController: @unchecked Sendable {
                 node: idle
             )
             check(discarded.discard && discarded.lines.isEmpty, "开关关之后回来的响应应丢弃")
+        }
+
+        // F4：换 key 时旧 key 的在飞请求迟到回 401，不能把新 key 打成「云端 key 无效」。
+        do {
+            let keyA = "gsk_selftest_fake_key_old_abcdefghijklmnopqrstuv"
+            let keyB = "gsk_selftest_fake_key_new_abcdefghijklmnopqrstuv"
+            let oldFake = FakeCloud()
+            let newFake = FakeCloud()
+            let rotBox = SwitchBox(snapshot: CloudSwitchSnapshot(hasKey: true, enabled: true, key: keyA))
+            let rot = CloudUploadController(
+                localeID: "de-DE",
+                ledger: QuotaLedger(url: root.appendingPathComponent("quota-keyrot.json")),
+                readSwitch: { rotBox.snapshot },
+                makeClient: { key in key == keyA ? oldFake : newFake }
+            )
+            var rotClock = 0.0
+            func rotPush(_ amplitude: Float, _ seconds: Double) -> CloudIngestEffect {
+                let count = Int((seconds * 16_000).rounded())
+                let effect = rot.ingest(samples: [Float](repeating: amplitude, count: count), startSeconds: rotClock, now: now, node: idle)
+                rotClock += Double(count) / 16_000
+                return effect
+            }
+            _ = rotPush(0.05, 2.0)
+            let oldSeg = rotPush(0, 0.6).uploads.first
+            if let oldSeg, rot.prepareSend(oldSeg, now: now) === oldFake {
+                rotBox.snapshot.key = keyB
+                let late = rot.resolveFailure(
+                    id: oldSeg.id,
+                    error: CloudClientError.httpStatus(401, retryAfter: nil, xGroqID: nil),
+                    now: now,
+                    node: idle
+                )
+                check(late.mode != .cloudKeyInvalid, "换 key 后旧 key 的迟到 401 不应把状态打成 key 无效，实际 \(late.mode.label)")
+                check(late.discard, "旧 key 的迟到回执应丢弃")
+                check(oldFake.cancelled == 1, "换 key 应取消旧 client 的在飞请求，实际 \(oldFake.cancelled)")
+                check(newFake.cancelled == 0, "换 key 不应取消新 client")
+                _ = rotPush(0.05, 2.0)
+                let fresh = rotPush(0, 0.6)
+                check(fresh.control.mode == .cloud, "新 key 应照常走云端，实际 \(fresh.control.mode.label)")
+                if let next = fresh.uploads.first {
+                    check(rot.prepareSend(next, now: now) === newFake, "新 key 的下一段应走新 client")
+                } else {
+                    check(false, "新 key 的下一段应上传")
+                }
+            } else {
+                check(false, "换 key 用例：旧 key 应先发出一段")
+            }
         }
 
         let rateLedger = QuotaLedger(url: root.appendingPathComponent("quota-rate.json"))
