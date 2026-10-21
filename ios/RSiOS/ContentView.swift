@@ -424,6 +424,11 @@ struct BroadcastPickerView: UIViewRepresentable {
         let picker = RPSystemBroadcastPickerView()
         picker.preferredExtension = "com.yilinwang.realtimesubtitle.broadcast"
         picker.showsMicrophoneButton = false
+        // 系统按钮默认画成黑色，深色界面上看不见（真机上只剩一块空白，用户找不到开播入口）。
+        // 换成 label 色：深色模式白、浅色模式黑。
+        for case let button as UIButton in picker.subviews {
+            button.imageView?.tintColor = .label
+        }
         return picker
     }
 
