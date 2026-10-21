@@ -21,6 +21,7 @@ struct NodeSelftest {
         pcmChecks(sampleRate: 48_000, channels: 2, check: check)
         pcmChecks(sampleRate: 44_100, channels: 1, check: check)
         testCMSampleBufferPaths(check)
+        runPCMConverterSelftest(check)
         runPairingSelftest(check)
         runTailnetPinSelftest(check)
         runReconnectSelftest(check)
