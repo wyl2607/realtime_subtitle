@@ -1,8 +1,12 @@
-"""从 design/tokens.json 生成 Swift 与 Python 常量（spec 006）。
+"""从 design/tokens.json 生成 Swift 与 Python 常量（spec 006 / 010）。
 
 为什么是生成而不是运行期读 JSON：rslite 是单个可执行文件、Windows 版从仓库就地跑，
 两边都不想多一个运行期文件依赖；生成的常量编译进去，tests/test_design_tokens.py
 盯着生成物与 tokens.json 同步，改了 JSON 忘了重新生成会红。
+
+iOS 端（ios/Shared/DesignTokens.swift）与 rslite 共用同一份渲染结果：令牌全是
+String/Double 字面量，不碰 AppKit/NSColor，两个平台的产物逐字节相同才能被
+scripts/design/check_parity.py 直接比对。
 
 用法：python3 scripts/design/gen_tokens.py [--check]
 """
@@ -15,6 +19,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "design" / "tokens.json"
 SWIFT_OUT = ROOT / "macos-native" / "Sources" / "rslite" / "DesignTokens.swift"
+IOS_SWIFT_OUT = ROOT / "ios" / "Shared" / "DesignTokens.swift"
 PY_OUT = ROOT / "realtime_subtitle" / "ui" / "design_tokens.py"
 HEADER = "由 scripts/design/gen_tokens.py 从 design/tokens.json 生成，不要手改。"
 
@@ -81,7 +86,8 @@ def _snake(name: str) -> str:
 
 def main(argv: list[str]) -> int:
     tokens = json.loads(SRC.read_text(encoding="utf-8"))
-    outputs = {SWIFT_OUT: render_swift(tokens), PY_OUT: render_python(tokens)}
+    swift = render_swift(tokens)
+    outputs = {SWIFT_OUT: swift, IOS_SWIFT_OUT: swift, PY_OUT: render_python(tokens)}
     if "--check" in argv:
         stale = [str(p.relative_to(ROOT)) for p, text in outputs.items()
                  if not p.exists() or p.read_text(encoding="utf-8") != text]
