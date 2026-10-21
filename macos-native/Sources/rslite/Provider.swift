@@ -83,7 +83,7 @@ struct CloudRouteContext {
                 quotaUpdate(event.usagePercent ?? 100)
             }
         case "cooldown_expired":
-            if cloudState == .cooldownBackoff || cloudState == .cooldownRateLimited || cloudState == .cooldownQuota {
+            if cloudState == .cooldownBackoff || cloudState == .cooldownRateLimited {
                 cloudState = .probe
                 action = "probe_once"
             }

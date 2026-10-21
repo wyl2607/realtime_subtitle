@@ -770,6 +770,39 @@
           }
         }
       ]
+    },
+    {
+      "name": "quota_cooldown_timer_expiry_requires_evidence_not_generic_probe",
+      "initial": {
+        "has_key": true,
+        "cloud_enabled": true,
+        "node_enabled": true,
+        "node_healthy": true,
+        "node_is_self": false
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "quota_update",
+            "usage_percent": 95
+          },
+          "expect": {
+            "tier": "node",
+            "cloud_state": "cooldown_quota",
+            "action": "quota_cooldown"
+          }
+        },
+        {
+          "event": {
+            "type": "cooldown_expired"
+          },
+          "expect": {
+            "tier": "node",
+            "cloud_state": "cooldown_quota",
+            "action": "none"
+          }
+        }
+      ]
     }
   ]
 }
