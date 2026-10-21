@@ -39,6 +39,20 @@ System audio ──WASAPI loopback──▶ Faster-Whisper (CUDA or CPU)
                          Overlay: source first + draft + final bilingual lines
 ```
 
+## Platform status
+
+As of 2026-10-21. The current release is v3.1.0 for Windows / macOS; v3.2.0 is tagged as beta and the final release is not out yet.
+
+Stage legend: ✅ stable · 🟢 usable · 🧪 experimental · ⬜ not started.
+
+| Platform | Form | Stage | Available now | Still missing |
+|---|---|---|---|---|
+| Windows | Desktop app | ✅ Stable | Local recognition and translation; three-tier automatic routing from cloud (Groq) → computer node → local (v3.2.0 beta); the status line shows the current source. Full pytest on a real Windows machine: 1207 passed, 0 failed | Final v3.2.0 release not out yet |
+| macOS | Desktop app + rslite (native Swift) | 🟢 Usable | Local recognition and translation; three-tier automatic routing from cloud → computer node → local (v3.2.0 beta). rslite cloud acceptance mostly passed, hybrid-mode median refine latency 1.47 s | final v3.2.0 release not out yet |
+| Android | Native app (separate private repo) | 🧪 Experimental | v0.4.0-quality released (old architecture); the rewrite/v1 has on-device recognition, cloud tier, node tier, automatic switching, and Keystore-encrypted key storage, with 395 unit tests passing and 0 failures | Rewrite not yet verified on a real device |
+| iOS | Native app (prototype) | 🧪 Experimental | Screen-recording broadcast extension captures audio from other apps, picture-in-picture display, "Auto" mode (falls back to local when the node fails, switches back at sentence end after recovery), daily subtitle archive, cloud tier logic only | Broadcast extension not yet integrated, not yet run on a real device; display is picture-in-picture only, no desktop-style overlay |
+| Linux | — | ⬜ Not started | — | No plans |
+
 ## Features
 
 - **Source text first** — partial recognition appears immediately (grey = still revisable); translation follows

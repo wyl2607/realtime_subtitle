@@ -40,6 +40,20 @@ Systemton ──WASAPI-Loopback──▶ Faster-Whisper (CUDA oder CPU)
                     Overlay: Quelle zuerst + Entwurf + finale Zweizeiler
 ```
 
+## Plattformstatus
+
+Stand 2026-10-21. Aktuelle Release-Version ist v3.1.0 für Windows / macOS; v3.2.0 ist als Beta getaggt, die finale Version ist noch nicht veröffentlicht.
+
+Legende: ✅ stabil · 🟢 nutzbar · 🧪 experimentell · ⬜ nicht begonnen.
+
+| Plattform | Form | Stufe | Schon nutzbar | Noch offen |
+|---|---|---|---|---|
+| Windows | Desktop-App | ✅ Stabil | Lokale Erkennung und Übersetzung; dreistufiges automatisches Routing Cloud (Groq) → Rechenknoten → lokal (v3.2.0 Beta); die Statuszeile zeigt die aktuelle Quelle. Vollständiges pytest auf echter Windows-Hardware: 1207 bestanden, 0 fehlgeschlagen | Finale v3.2.0 noch nicht veröffentlicht |
+| macOS | Desktop-App + rslite (natives Swift) | 🟢 Nutzbar | Lokale Erkennung und Übersetzung; dreistufiges automatisches Routing Cloud → Rechenknoten → lokal (v3.2.0 Beta). rslite-Cloud-Abnahme größtenteils bestanden, Median-Latenz der Hybrid-Verfeinerung 1,47 s | finale v3.2.0 noch nicht veröffentlicht |
+| Android | Native App (separates privates Repo) | 🧪 Experimentell | v0.4.0-quality veröffentlicht (alte Architektur); die Neuentwicklung rewrite/v1 bietet Erkennung auf dem Gerät, Cloud-Stufe, Knoten-Stufe, automatische Umschaltung und Keystore-verschlüsselte Schlüsselspeicherung, 395 Unit-Tests bestanden, 0 fehlgeschlagen | Neuentwicklung noch nicht auf echter Hardware verifiziert |
+| iOS | Native App (Prototyp) | 🧪 Experimentell | Broadcast-Erweiterung für Bildschirmaufnahme nimmt Ton anderer Apps auf, Bild-in-Bild-Anzeige, „Automatik“-Modus (bei Knotenausfall lokal, nach Erholung am Satzende zurück), Tagesarchiv der Untertitel, Cloud-Stufe nur als reine Logik | Broadcast-Erweiterung noch nicht eingebunden, noch nicht auf echter Hardware; Anzeige nur per Bild-in-Bild, kein Desktop-Overlay |
+| Linux | — | ⬜ Nicht begonnen | — | Keine Pläne |
+
 ## Funktionen
 
 - **Quelltext zuerst** — Teilerkennung erscheint sofort (grau = noch änderbar); Übersetzung folgt
