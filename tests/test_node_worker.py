@@ -185,6 +185,28 @@ def test_utterance_times_are_clamped_into_the_unpadded_speech_span():
     assert 0.0 <= f["a0"] <= f["a1"] <= 1.0 + 0.04
 
 
+def test_identical_utterances_clamped_to_the_same_span_emit_one_final():
+    """Whisper 在非语音上复读（真机上见过两行「Ja.」同一时间）：两句时间都落在语音之外，
+    夹到同一个边界后文本和时间都完全相同。同一行字发两遍没有任何信息，只发一条，也只翻译一次。"""
+    asr = FakeAsr([Utterance(5.0, 6.0, "Ja."), Utterance(6.0, 7.0, " ja. ")])
+    pcm = np.concatenate([tone(1.0), silence(1.0)])
+    _c, ev, _err, _asr, tr = run_worker(hello() + audio_frames(pcm) + ctl(type="drain"), asr=asr)
+    finals = [e for e in ev if e["ev"] == "final"]
+    assert [f["text"] for f in finals] == ["Ja."]
+    assert [e["id"] for e in ev if e["ev"] == "translation"] == [finals[0]["id"]]
+    assert len(tr.calls) == 1
+
+
+def test_repeated_words_at_different_times_are_kept():
+    """真人说「Ja. Ja.」：两句时间不同，都要留着。"""
+    asr = FakeAsr([Utterance(0.1, 0.3, "Ja."), Utterance(0.5, 0.7, "Ja.")])
+    pcm = np.concatenate([tone(1.0), silence(1.0)])
+    _c, ev, *_ = run_worker(hello() + audio_frames(pcm) + ctl(type="drain"), asr=asr)
+    finals = [e for e in ev if e["ev"] == "final"]
+    assert [f["text"] for f in finals] == ["Ja.", "Ja."]
+    assert finals[0]["a1"] <= finals[1]["a0"]
+
+
 class SpanAsr(FakeAsr):
     """每段报一句覆盖整段音频的话（含垫），最糟情况：模型把垫也算进去。"""
 

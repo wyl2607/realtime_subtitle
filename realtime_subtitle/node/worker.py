@@ -719,9 +719,17 @@ class Worker:
             explicit = sess.explicit
             session_sid = sess.sid
             emitted = []
+            prev = None
             for u in utts:
                 a0 = min(max(seg.audio_t0 + u.start, lo), hi)
                 a1 = min(max(seg.audio_t0 + u.end, a0), hi)
+                # Whisper 在非语音上会复读（真机见过两行「Ja.」同一时间）：时间落在语音之外，
+                # 夹到同一边界后文本和时间都相同。同一行发两遍没有信息，只留第一条。
+                # 时间不同的重复（真人说「Ja. Ja.」）不动。
+                same = (" ".join(u.text.split()).casefold(), round(a0, 3), round(a1, 3))
+                if same == prev:
+                    continue
+                prev = same
                 sentence_id = sess.next_id
                 sess.next_id += 1
                 emitted.append((sentence_id, a0, a1, u.text))
