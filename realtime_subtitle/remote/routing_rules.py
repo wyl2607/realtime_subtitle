@@ -73,7 +73,9 @@ class RoutingState:
                 self._quota_update(float(event.get("usage_percent", 100)))
             return
         if event_type == "cooldown_expired":
-            if self.cloud_state.startswith("cooldown_"):
+            # Quota recovery requires fresh usage measurement or verified RPD rollover.
+            # A generic timer must never reopen cloud while daily quota is exhausted.
+            if self.cloud_state in {"cooldown_backoff", "cooldown_rate_limited"}:
                 self.cloud_state = "probe"
                 self.action = "probe_once"
             return
