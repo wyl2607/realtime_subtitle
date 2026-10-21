@@ -73,6 +73,12 @@ struct CloudRouteContext {
             httpStatus(event.status ?? 0, retryAfter: event.retryAfter)
         case "quota_update":
             quotaUpdate(event.usagePercent ?? 0)
+        case "quota_reset_confirmed":
+            // The ledger verifies rollover first; here only quota cooldown may lift.
+            // Missing usage remains fail-closed (100%), and 401/429/off win.
+            if cloudEnabled && hasKey && !keyInvalid && cloudState == .cooldownQuota {
+                quotaUpdate(event.usagePercent ?? 100)
+            }
         case "cooldown_expired":
             if cloudState == .cooldownBackoff || cloudState == .cooldownRateLimited || cloudState == .cooldownQuota {
                 cloudState = .probe
@@ -162,6 +168,7 @@ struct CloudRouteContext {
             return
         }
         if status == 429 {
+            if keyInvalid || cloudState == .disabledInvalidKey { return }
             cloudState = .cooldownRateLimited
             cooldownSeconds = retryAfter ?? 60
             action = "rate_limited"
