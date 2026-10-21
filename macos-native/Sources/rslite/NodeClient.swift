@@ -305,7 +305,10 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
     private static let frameBytes = 3200
     static let preReadyAudioSeconds = 15
     // 冷启动＝拉起 worker + import MLX + 加载权重，mini2 实测 >5s；预算对齐 RFC「冷启动后首条精修 ≤15s」，等待期间本机 B 照常出字
-    private static let readyTimeout: Duration = .seconds(preReadyAudioSeconds)
+    static let readyTimeoutSeconds = Double(preReadyAudioSeconds)
+    // 节点冷加载可能超过 15s（Windows 节点实测 17.4s）。每收到一条 loading 续 15s，
+    // 但从发出 hello 起总共不超过 60s；超过仍按 handshake_timeout 回退。
+    static let readyLoadingMaxSeconds = 60.0
     private static let readyBufferMaxBytes = preReadyAudioSeconds * 16_000 * 2
     private static let closeTimeout: Duration = .seconds(2)
 
@@ -667,25 +670,71 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         finished.open()
     }
 
+    /// 纯函数：loading 到达时把 deadline 推到 now+15s，但不超过 helloAt+60s。
+    static func readyDeadline(
+        helloAt: Double,
+        now: Double,
+        current: Double,
+        receivedLoading: Bool,
+        timeout: Double = readyTimeoutSeconds,
+        maxTotal: Double = readyLoadingMaxSeconds
+    ) -> Double {
+        let cap = helloAt + maxTotal
+        if receivedLoading {
+            return min(cap, now + timeout)
+        }
+        return min(cap, current)
+    }
+
+    static func loadingStatus(nodeID: String) -> String {
+        nodeID + DesignTokens.Text.nodeLoadingSuffix
+    }
+
     private func awaitReady(_ socket: NodeWebSocketTask) async throws {
+        let helloAt = Self.monotonic()
+        let deadline = ReadyDeadlineBox(
+            helloAt: helloAt,
+            current: Self.readyDeadline(
+                helloAt: helloAt, now: helloAt, current: helloAt + Self.readyTimeoutSeconds,
+                receivedLoading: false
+            )
+        )
         try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask {
+            group.addTask { [weak self] in
                 while true {
                     let message = try await socket.receive()
-                    if case .string(let text) = message,
-                       Self.parseEvent(text)?["ev"] as? String == "ready" {
+                    guard case .string(let text) = message,
+                          let event = Self.parseEvent(text) else {
+                        continue
+                    }
+                    if event["ev"] as? String == "ready" {
                         return
+                    }
+                    if event["ev"] as? String == "status", event["code"] as? String == "loading" {
+                        deadline.extend(now: Self.monotonic())
+                        if let self {
+                            self.callbacks.onStatus(Self.loadingStatus(nodeID: self.config.id))
+                        }
                     }
                 }
             }
             group.addTask {
-                do {
-                    try await Task.sleep(for: Self.readyTimeout)
-                } catch {
-                    return
+                while true {
+                    let remaining = deadline.current - Self.monotonic()
+                    if remaining <= 0 {
+                        socket.cancel(with: .goingAway, reason: nil)
+                        throw NodeClientError.timeout
+                    }
+                    do {
+                        try await Task.sleep(for: .seconds(remaining))
+                    } catch {
+                        return
+                    }
+                    if Self.monotonic() >= deadline.current {
+                        socket.cancel(with: .goingAway, reason: nil)
+                        throw NodeClientError.timeout
+                    }
                 }
-                socket.cancel(with: .goingAway, reason: nil)
-                throw NodeClientError.timeout
             }
             do {
                 try await group.next()
@@ -1063,6 +1112,31 @@ final class PongClock: @unchecked Sendable {
 }
 
 @available(macOS 27.0, *)
+/// awaitReady 的跨任务截止时间：收包任务续期，超时任务按当前值重新睡。
+final class ReadyDeadlineBox: @unchecked Sendable {
+    private let helloAt: Double
+    private let lock = NSLock()
+    private var deadline: Double
+
+    init(helloAt: Double, current: Double) {
+        self.helloAt = helloAt
+        self.deadline = current
+    }
+
+    var current: Double {
+        lock.withLockValue { deadline }
+    }
+
+    func extend(now: Double) {
+        lock.withLockVoid {
+            deadline = NodeClient.readyDeadline(
+                helloAt: helloAt, now: now, current: deadline, receivedLoading: true
+            )
+        }
+    }
+}
+
+@available(macOS 27.0, *)
 extension NodeClient {
     static func selfTest() -> [String] {
         var failures: [String] = []
@@ -1078,6 +1152,23 @@ extension NodeClient {
             }
             return false
         }
+        // 冷加载续期：基础 15s；loading 每条续 15s；总上限 hello+60s。
+        check(readyDeadline(helloAt: 0, now: 0, current: 15, receivedLoading: false) == 15,
+              "ready 无 loading 时保持基础 15s")
+        check(readyDeadline(helloAt: 0, now: 10, current: 15, receivedLoading: true) == 25,
+              "ready 收到 loading 后续 15s")
+        check(readyDeadline(helloAt: 0, now: 50, current: 60, receivedLoading: true) == 60,
+              "ready 续期不能超过 hello+60s")
+        check(readyDeadline(helloAt: 0, now: 59, current: 60, receivedLoading: true) == 60,
+              "ready 接近 60s 上限时不再后移")
+        check(readyDeadline(helloAt: 0, now: 14, current: 15, receivedLoading: true) == 29,
+              "ready 持续 loading 时 15s 未到不超时")
+        check(readyDeadline(helloAt: 0, now: 16, current: 15, receivedLoading: false) == 15,
+              "ready loading 停止后 15s 仍按原截止时间超时")
+        check(readyDeadline(helloAt: 0, now: 60, current: 60, receivedLoading: true) == 60,
+              "ready 持续 loading 超过 60s 仍超时")
+        check(loadingStatus(nodeID: "desk") == "desk" + DesignTokens.Text.nodeLoadingSuffix,
+              "节点加载中状态行用节点名 + 设计令牌")
         // 心跳：10s 一发，发出后 10s 无 pong 判死
         check(HeartbeatPolicy.step(now: 5, lastPingSentAt: 0, lastPongAt: 0) == .none, "心跳：未到间隔不发 ping")
         check(HeartbeatPolicy.step(now: 10, lastPingSentAt: 0, lastPongAt: 0) == .sendPing, "心跳：到间隔发 ping")

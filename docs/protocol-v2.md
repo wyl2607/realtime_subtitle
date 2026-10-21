@@ -65,7 +65,7 @@ gateway 不原样转发 hello，而是重建（只放行校验过的 `src`/`dst`
 | `ready` | `{"ev":"ready","cold":bool,"load_s":float,"engine":{...,"translator":str}}` | `worker.py:301-304`；`engine` 来自引擎 `info()`，再加 `translator`（翻译器不可用时为 `"none"`） |
 | `final` | `{"ev":"final","id":int,"a0":float,"a1":float,"text":str}` | `worker.py:468-469`；`id` 每会话从 1 起；`a0`/`a1` 是从 hello 起算的音频秒数（按收到的样本数计，保留 3 位小数），夹在不含垫的段边界内（`worker.py:454-465`） |
 | `translation` | `{"ev":"translation","id":int,"text":str}` | `worker.py:488`；`id` 对应某条 `final`，晚于 `final` 到达 |
-| `status` | `{"ev":"status","code":str,"text":str}`；`translate_failed` 额外带 `id:int` | 见下表 |
+| `status` | `{"ev":"status","code":str,"text":str}`；`translate_failed` 额外带 `id:int`，`loading` 额外带 `elapsed_s:float` | 见下表 |
 | `drained` | `{"ev":"drained"}` | `worker.py:423` |
 
 gateway 只向客户端放行这五种事件（`_CLIENT_EVENTS`，`gateway.py:103`），其它事件丢弃并记日志。节点**不发** volatile/draft；流式模式留作后续扩展。
@@ -74,6 +74,7 @@ gateway 只向客户端放行这五种事件（`_CLIENT_EVENTS`，`gateway.py:10
 
 | code | 来源 | 语义 |
 |---|---|---|
+| `loading` | gateway（`gateway.py` `_loading_heartbeat`） | worker 是**冷拉起**（不是复用保温中的 worker）时，会话 attach 后立即发一条，之后每 5s 一条，直到 worker 发出 `ready` 或会话结束；`elapsed_s` 是从本会话开始加载起的秒数。保温复用不发。客户端语义：基础等 ready 15s；每收到一条 `loading` 把截止时间推到「现在 + 15s」，但从发出 hello 起**总共不超过 60s**（Python `READY_LOADING_MAX_SECONDS` / Swift `readyLoadingMaxSeconds`），超过仍按 `handshake_timeout` 处理。`loading` 是非致命状态，旧客户端不认识时忽略即可；会话不中断 |
 | `audio_dropped` | gateway（`gateway.py:76, 522-523`） | 上行音频积压（队列 `AUDIO_QUEUE_MAX_FRAMES = 200` 帧，约 20s，`gateway.py:69`），最旧的帧被丢弃，**这段时间的识别结果可能缺内容**。被丢的帧原位换成等长的零 PCM（`gap`），所以 worker 的样本时钟不前移、`a0`/`a1` 仍与客户端一致（`gateway.py:196-201, 229, 617-623`）。ready 之前（冷加载期间）的丢帧只记账，ready 送达后合并通知一次；之后按 1s 合并（`gateway.py:663-669, 515-518`）。会话**不中断** |
 | `backlog_dropped` | worker（`worker.py:413`） | worker 内部处理积压：asr 队列按「段」计上限 8（`MAX_ASR_BACKLOG`），tx 队列按「句」计上限 64（`MAX_TX_BACKLOG`），超限丢**最旧**的（`worker.py:74-75, 399-413`）。与 `audio_dropped` 的区别：`audio_dropped` 丢的是还没进 worker 的原始音频（时间轴用静音补齐），`backlog_dropped` 丢的是已分段待识别/待翻译的内容（时间轴上留空）。会话不中断 |
 | `worker_crashed` | gateway（`gateway.py:586, 97-102`） | worker 在会话中退出：退出码非 0 且不是 2/3/4，**或退出码为 0**（会话进行中 worker 不该自己退出），或无法拉起/管道写失败后等不到退出码（记为 -1）。文案「识别进程异常退出」 |
@@ -183,6 +184,7 @@ v1（`realtime_subtitle/remote/server.py`，已在 TK-006 删除）是外包算�
 3. **冷启动与音频缓冲**：
    - 客户端连接 `WS /v2/session` 后 5s 内发送 `hello`（`v: 2`，采样率 16000，`s16le`）。
    - 在收到服务端的 `ready` 事件前（节点 worker 冷启动需要数秒），客户端在上行发送端维护有界音频缓冲区，既不阻塞本地实时音频捕获，又避免丢弃冷启动期间的有效语音片段。
+   - 冷加载期间 gateway 每 5s 发一条 `status/loading`；客户端每收到一条把 ready 截止时间续 15s，总上限 60s（见 status 码值表）。
 
 4. **双路字幕与结果融合**：
    - 本机 Faster-Whisper 先行产生初步字幕供实时显示；

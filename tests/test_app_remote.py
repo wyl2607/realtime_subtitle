@@ -238,6 +238,34 @@ def test_route_label_uses_tokens_for_cooldown_and_invalid_key(tmp_path):
         bridge.close()
 
 
+def test_route_label_shows_node_loading_suffix(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "realtime_subtitle.remote.router.read_self_node_id", lambda: "this-machine")
+    bridge, _ui, _translator = _open(
+        cloud_on=False,
+        node_on=True,
+        cloud_client_factory=_boom,
+        segmenter_factory=_boom,
+        ledger_factory=_boom,
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs),
+        node_client_factory=_boom,
+        node_entries=[{
+            "id": "desk",
+            "node_id": "tk007nodeid0001",
+            "url": "ws://100.64.0.8:8791",
+            "token_file": "unused",
+        }],
+        quota_path=tmp_path / "quota.json",
+    )
+    try:
+        bridge._node_loading_id = "desk"
+        assert bridge.route_label() == "desk" + design_tokens.TEXT_NODE_LOADING_SUFFIX
+        bridge._node_loading_id = None
+        assert bridge.route_label().startswith(design_tokens.TEXT_STATUS_HYBRID_PREFIX)
+    finally:
+        bridge.close()
+
+
 def test_route_label_keeps_cooldown_suffix_on_hybrid(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "realtime_subtitle.remote.router.read_self_node_id", lambda: "this-machine")

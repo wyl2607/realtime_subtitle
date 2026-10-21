@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import socket
+import time
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +26,9 @@ PRE_READY_AUDIO_SECONDS = 15
 READY_BUFFER_MAX_BYTES = PRE_READY_AUDIO_SECONDS * 16000 * 2  # 480000 bytes
 MAX_PAD_GAP_SECONDS = 5.0
 READY_TIMEOUT_SECONDS = 15.0
+# 冷启动可能比 15s 慢（Windows 节点实测 17.4s）。每收到一条 loading 就把 ready
+# 截止时间推到「现在 + 15s」，但从发出 hello 起总共不超过 60s。
+READY_LOADING_MAX_SECONDS = 60.0
 CLOSE_TIMEOUT_SECONDS = 2.0
 
 
@@ -162,6 +166,8 @@ class NodeCallbacks:
     on_translation: Callable[[str, int, int, str], None] = lambda *_: None
     on_status: Callable[[str], None] = lambda *_: None
     on_status_event: Callable[[str, int, dict[str, Any]], None] = lambda *_: None
+    # 冷加载心跳：每收到一条 status/loading 回调一次，UI 用来刷新「节点名 正在加载模型…」。
+    on_loading: Callable[[str, int], None] = lambda *_: None
     on_translate_failed: Callable[[str, int, int], None] = lambda *_: None
     on_closed: Callable[[str, int, Exception | None], None] = lambda *_: None
 
@@ -431,6 +437,22 @@ def bounded_gap_pad_samples(
     return gap_pad_samples(offset, sent_samples, audio_start, tolerance)
 
 
+def extend_ready_deadline(
+    *,
+    now: float,
+    hello_at: float,
+    current_deadline: float,
+    received_loading: bool,
+    timeout: float = READY_TIMEOUT_SECONDS,
+    max_total: float | None = None,
+) -> float:
+    """收到 loading 后续期 ready 截止时间；总时长永远不超过 hello 起 max_total。"""
+    cap = hello_at + (READY_LOADING_MAX_SECONDS if max_total is None else max_total)
+    if not received_loading:
+        return min(cap, current_deadline)
+    return min(cap, now + timeout)
+
+
 def _extract_close_code(e: ConnectionClosed) -> int | None:
     rcvd = getattr(e, "rcvd", None)
     if rcvd is not None and getattr(rcvd, "code", None) is not None:
@@ -613,21 +635,41 @@ class NodeClient:
         self._is_ready = True
 
     async def _await_ready(self, timeout: float) -> None:
-        async def wait_msg() -> None:
-            while True:
-                msg = await self._ws.recv()
-                if isinstance(msg, str):
-                    try:
-                        data = json.loads(msg)
-                        if data.get("ev") == "ready":
-                            return
-                    except Exception:
-                        pass
-
-        try:
-            await asyncio.wait_for(wait_msg(), timeout=timeout)
-        except asyncio.TimeoutError as e:
-            raise HandshakeTimeoutError(f"Ready handshake timed out after {timeout}s") from e
+        hello_at = time.monotonic()
+        deadline = extend_ready_deadline(
+            now=hello_at,
+            hello_at=hello_at,
+            current_deadline=hello_at + timeout,
+            received_loading=False,
+            timeout=timeout,
+        )
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise HandshakeTimeoutError(
+                    f"Ready handshake timed out after {timeout}s (loading cap {READY_LOADING_MAX_SECONDS}s)")
+            try:
+                msg = await asyncio.wait_for(self._ws.recv(), timeout=remaining)
+            except asyncio.TimeoutError as e:
+                raise HandshakeTimeoutError(
+                    f"Ready handshake timed out after {timeout}s (loading cap {READY_LOADING_MAX_SECONDS}s)") from e
+            if not isinstance(msg, str):
+                continue
+            try:
+                data = json.loads(msg)
+            except Exception:
+                continue
+            if data.get("ev") == "ready":
+                return
+            if data.get("ev") == "status" and data.get("code") == "loading":
+                self.callbacks.on_loading(self.config.id, self.session_generation)
+                deadline = extend_ready_deadline(
+                    now=time.monotonic(),
+                    hello_at=hello_at,
+                    current_deadline=deadline,
+                    received_loading=True,
+                    timeout=timeout,
+                )
 
     async def _receive_loop(self) -> None:
         close_error: Exception | None = None

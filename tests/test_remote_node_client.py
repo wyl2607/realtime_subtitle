@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import socket
+import time
 import urllib.parse
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -15,6 +17,7 @@ from websockets.asyncio.server import ServerConnection
 from realtime_subtitle.remote.node_client import (
     AudioGapError,
     BadURLError,
+    HandshakeTimeoutError,
     NodeBusyError,
     NodeCallbacks,
     NodeClient,
@@ -30,6 +33,7 @@ from realtime_subtitle.remote.node_client import (
     WireAudio,
     bounded_gap_pad_samples,
     gap_pad_samples,
+    extend_ready_deadline,
     prepare,
     read_token_file,
     validate_and_resolve_node_host,
@@ -489,6 +493,119 @@ def test_node_client_translate_failed_status_is_structured_and_not_raw_ui_text()
     assert ui_statuses == ["节点 desk：audio_dropped"]
     assert status_events == [("desk", 3, {"ev": "status", "code": "translate_failed", "id": 42, "text": "x"})]
     assert failed == [("desk", 3, 42)]
+
+
+def test_ready_deadline_extends_on_loading_and_caps_at_60s():
+    assert extend_ready_deadline(
+        now=0, hello_at=0, current_deadline=15, received_loading=False,
+        timeout=15, max_total=60) == 15
+    assert extend_ready_deadline(
+        now=10, hello_at=0, current_deadline=15, received_loading=True,
+        timeout=15, max_total=60) == 25
+    assert extend_ready_deadline(
+        now=50, hello_at=0, current_deadline=60, received_loading=True,
+        timeout=15, max_total=60) == 60
+    assert extend_ready_deadline(
+        now=59, hello_at=0, current_deadline=60, received_loading=True,
+        timeout=15, max_total=60) == 60
+
+
+def _loading_server(handler_body, tmp_path: Path, callbacks=None):
+    @contextlib.asynccontextmanager
+    async def run():
+        server = await websockets.serve(handler_body, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        token_file = tmp_path / "token"
+        token_file.write_text("token123\n", encoding="utf-8")
+        if os.name == "posix":
+            token_file.chmod(0o600)
+        config = NodeConfig(
+            id="node1", node_id="n1", url=f"ws://fake-node.ts:{port}/v2/session",
+            token_file=str(token_file),
+        )
+        info = NodeInfo.from_dict(_info_payload(node_id="n1"))
+
+        def mock_addrinfo(host, p, proto=0):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("100.64.0.5", p))]
+
+        client = NodeClient(
+            config=config, token="token123", info=info,
+            callbacks=callbacks, getaddrinfo_fn=mock_addrinfo,
+        )
+        real_ws_connect = websockets.connect
+
+        async def patched_connect(uri, **kwargs):
+            return await real_ws_connect(f"ws://127.0.0.1:{port}/v2/session", **kwargs)
+
+        with patch("websockets.connect", side_effect=patched_connect):
+            yield client
+        server.close()
+        await server.wait_closed()
+
+    return run
+
+
+def test_ready_keeps_waiting_while_loading_arrives(tmp_path: Path):
+    async def handler(websocket: ServerConnection):
+        await websocket.recv()
+        for _ in range(4):
+            await websocket.send(json.dumps({
+                "ev": "status", "code": "loading", "text": "正在加载模型", "elapsed_s": 0.1,
+            }))
+            await asyncio.sleep(0.05)
+        await websocket.send(json.dumps({"ev": "ready", "cold": True, "load_s": 0.3, "engine": {}}))
+        with contextlib.suppress(websockets.exceptions.ConnectionClosed):
+            await websocket.recv()
+
+    loadings: list[tuple[str, int]] = []
+    callbacks = NodeCallbacks(on_loading=lambda node_id, generation: loadings.append((node_id, generation)))
+
+    async def scenario():
+        async with _loading_server(handler, tmp_path, callbacks)() as client:
+            await client.connect(ready_timeout=0.2)
+            assert client._is_ready
+            await client.close()
+
+    asyncio.run(scenario())
+    assert loadings and all(node_id == "node1" for node_id, _ in loadings)
+    assert all(generation == 1 for _, generation in loadings)
+
+
+def test_ready_times_out_when_loading_stops(tmp_path: Path):
+    async def handler(websocket: ServerConnection):
+        await websocket.recv()
+        await websocket.send(json.dumps({"ev": "status", "code": "loading", "text": "正在加载模型"}))
+        await asyncio.sleep(1.0)
+
+    async def scenario():
+        async with _loading_server(handler, tmp_path)() as client:
+            started = time.monotonic()
+            with pytest.raises(HandshakeTimeoutError):
+                await client.connect(ready_timeout=0.2)
+            assert time.monotonic() - started < 0.9
+
+    asyncio.run(scenario())
+
+
+def test_ready_times_out_at_60s_cap_while_loading_keeps_arriving(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("realtime_subtitle.remote.node_client.READY_LOADING_MAX_SECONDS", 0.6)
+
+    async def handler(websocket: ServerConnection):
+        await websocket.recv()
+        with contextlib.suppress(websockets.exceptions.ConnectionClosed):
+            while True:
+                await websocket.send(json.dumps({"ev": "status", "code": "loading", "text": "正在加载模型"}))
+                await asyncio.sleep(0.05)
+
+    async def scenario():
+        async with _loading_server(handler, tmp_path)() as client:
+            started = time.monotonic()
+            with pytest.raises(HandshakeTimeoutError):
+                await client.connect(ready_timeout=0.2)
+            elapsed = time.monotonic() - started
+            assert 0.5 <= elapsed < 1.5
+
+    asyncio.run(scenario())
 
 
 def test_node_client_distinguishes_busy_1013(tmp_path: Path):
