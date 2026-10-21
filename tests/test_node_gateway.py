@@ -1187,6 +1187,32 @@ def test_warm_worker_reuse_sends_no_loading(tmp_path, monkeypatch):
     assert first["ev"] == "ready"
 
 
+def test_reusing_worker_still_loading_sends_loading(tmp_path, monkeypatch):
+    """P1 问题 2：上一个会话在冷加载中途断开，worker 进程还活着但模型没加载完。
+    新会话复用它时也要发 loading，否则客户端只等基础 15s 就放弃（Windows 冷加载实测 17–21s）。"""
+    monkeypatch.setattr(gw_mod, "WORKER_KEEPALIVE_S", 5.0)
+
+    async def scenario():
+        async with running(
+            tmp_path, "slow-ready:0.6", loading_interval_s=0.05
+        ) as (gw, _rec):
+            ws = await uds_connect(gw)
+            await ws.send(json.dumps(HELLO))
+            assert _is_loading(json.loads(await asyncio.wait_for(ws.recv(), 8)))
+            await ws.close()  # 冷加载中途放弃（客户端超时 / 用户停止）
+            await wait_session_freed(gw)
+            assert gw.worker.state == "warm"  # 进程还在，模型还没 ready
+
+            ws = await uds_connect(gw)
+            await ws.send(json.dumps(HELLO))
+            first = json.loads(await asyncio.wait_for(ws.recv(), 8))
+            await ws.close()
+            return first
+
+    first = asyncio.run(scenario())
+    assert _is_loading(first), first
+
+
 def test_loading_stops_when_session_ends_mid_load(tmp_path):
     """会话在冷加载中途断开：loading 心跳任务被取消，不再发。"""
     async def scenario():

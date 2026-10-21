@@ -912,3 +912,37 @@ def test_node_connect_slower_than_5s_is_not_abandoned(tmp_path, monkeypatch):
         assert bridge._node_backoff_until == 0.0
     finally:
         bridge.close()
+
+
+def test_route_status_never_names_the_wrong_node_while_connecting(tmp_path, monkeypatch):
+    """P1 问题 3：打分挑中的是第二个候选时，连接返回那一刻状态行不能先闪一下第一个候选的名字。"""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "realtime_subtitle.remote.router.read_self_node_id", lambda: "this-machine")
+    monkeypatch.setattr(
+        RemoteRouter, "select_best_node", lambda self, cands, now: SimpleNamespace(id="desk2"))
+    statuses: list[str] = []
+    bridge, _ui, _translator = _open(
+        cloud_on=False,
+        node_on=True,
+        cloud_client_factory=_boom,
+        segmenter_factory=_boom,
+        ledger_factory=_boom,
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs),
+        prepare=lambda cfg: ("100.64.0.8", object()),
+        node_client_factory=lambda cfg, info, callbacks: _Node(),
+        node_entries=[
+            NodeConfig(id="desk", node_id="tk007nodeid0001", url="ws://100.64.0.8:8791", token_file="x"),
+            NodeConfig(id="desk2", node_id="tk007nodeid0002", url="ws://100.64.0.9:8791", token_file="x"),
+        ],
+        quota_path=tmp_path / "quota.json",
+        ui_status=statuses.append,
+    )
+    try:
+        bridge.feed_audio(np.zeros(320, dtype=np.float32))
+        assert bridge.router.current_node_id == "desk2"
+        assert "路由：混合·desk" not in statuses, statuses
+        assert statuses[-1] == "路由：混合·desk2", statuses
+    finally:
+        bridge.close()
