@@ -15,6 +15,9 @@ struct NodeSelftest {
         testParse(check)
         testIsFatal(check)
         testCloseReason(check)
+        testReadyDeadline(check)
+        testLoadingEvent(check)
+        testSessionLoadingCallback(check)
         pcmChecks(sampleRate: 48_000, channels: 2, check: check)
         pcmChecks(sampleRate: 44_100, channels: 1, check: check)
         testCMSampleBufferPaths(check)
@@ -113,6 +116,111 @@ struct NodeSelftest {
         check(NodeEvent.closeReason(code: 1000, reasonData: nil) == 1000, "closeReason 1000 → 1000")
         check(NodeEvent.closeReason(code: 1005, reasonData: Data([0x03])) == 1005, "closeReason 载荷 <2 字节 → 原样")
         check(NodeEvent.closeReason(code: 1011, reasonData: busyReason) == 1011, "closeReason 1011 → 原样")
+    }
+
+    static func testReadyDeadline(_ check: (Bool, String) -> Void) {
+        // 常量与 rslite / Python 客户端同值
+        check(NodeSession.readyTimeoutSeconds == 15, "ready 基础超时应为 15s")
+        check(NodeSession.readyLoadingMaxSeconds == 60, "loading 续期总上限应为 60s")
+
+        // 场景 1：无 loading → 基础 15s 到点即超时
+        check(NodeSession.readyDeadline(helloAt: 0, now: 0, current: 15, receivedLoading: false) == 15,
+              "无 loading 时保持基础 15s")
+        check(NodeSession.readyDeadline(helloAt: 0, now: 14.9, current: 15, receivedLoading: false) == 15,
+              "无 loading 时 15s 前截止时间不变")
+
+        // 场景 2：持续 loading（每 5s 一条）→ 截止时间一直被推到 now+15s，不会到点
+        var deadline = NodeSession.readyDeadline(
+            helloAt: 0, now: 0, current: 15, receivedLoading: false
+        )
+        for tick in stride(from: 5.0, through: 45.0, by: 5.0) {
+            deadline = NodeSession.readyDeadline(
+                helloAt: 0, now: tick, current: deadline, receivedLoading: true
+            )
+            check(deadline > tick, "持续 loading 在 \(tick)s 收到心跳时不应到点（截止 \(deadline)）")
+        }
+        check(deadline == 60, "持续 loading 的截止时间被 60s 上限截住（实际 \(deadline)）")
+
+        // 场景 3：loading 停止 → 保持最后一次续期值，15s 后到点
+        let stopped = NodeSession.readyDeadline(
+            helloAt: 0, now: 10, current: 15, receivedLoading: true
+        )
+        check(stopped == 25, "loading 在 10s 到达时续到 25s（实际 \(stopped)）")
+        check(NodeSession.readyDeadline(helloAt: 0, now: 24.9, current: stopped, receivedLoading: false) == 25,
+              "loading 停止后 25s 前不超时")
+        check(NodeSession.readyDeadline(helloAt: 0, now: 25, current: stopped, receivedLoading: false) == 25,
+              "loading 停止 15s 后按 25s 到点")
+
+        // 场景 4：持续 loading 超过 hello+60s → 仍在 60s 到点
+        check(NodeSession.readyDeadline(helloAt: 0, now: 55, current: 60, receivedLoading: true) == 60,
+              "接近 60s 上限时不再后移")
+        check(NodeSession.readyDeadline(helloAt: 0, now: 70, current: 60, receivedLoading: true) == 60,
+              "持续 loading 超过 60s 仍按 60s 到点")
+        check(NodeSession.readyDeadline(helloAt: 100, now: 170, current: 160, receivedLoading: true) == 160,
+              "上限跟着 helloAt 走（hello+60s）")
+
+        // ReadyDeadlineBox 与纯函数同一套语义
+        let box = ReadyDeadlineBox(helloAt: 0, current: 15)
+        box.extend(now: 10)
+        check(box.current == 25, "ReadyDeadlineBox 收到 loading 续到 25s（实际 \(box.current)）")
+        box.extend(now: 50)
+        check(box.current == 60, "ReadyDeadlineBox 续期不超过 60s（实际 \(box.current)）")
+    }
+
+    static func testLoadingEvent(_ check: (Bool, String) -> Void) {
+        check(NodeEvent.loadingElapsed(from: #"{"ev":"status","code":"loading","text":"正在加载模型","elapsed_s":5.25}"#) == 5.25,
+              "loading 帧解析 elapsed_s 浮点")
+        check(NodeEvent.loadingElapsed(from: #"{"ev":"status","code":"loading","text":"x","elapsed_s":3}"#) == 3,
+              "loading 帧解析 elapsed_s 整数")
+        check(NodeEvent.loadingElapsed(from: #"{"ev":"status","code":"loading","text":"x"}"#) == nil,
+              "loading 缺 elapsed_s → nil")
+        check(NodeEvent.loadingElapsed(from: #"{"ev":"status","code":"audio_dropped","text":"x","elapsed_s":3}"#) == nil,
+              "非 loading 状态不取 elapsed_s")
+        check(NodeEvent.loadingElapsed(from: #"{"ev":"status","code":"loading","text":"x","elapsed_s":true}"#) == nil,
+              "elapsed_s 非数字 → nil")
+        check(NodeEvent.loadingElapsed(from: #"{"ev":"ready","cold":true}"#) == nil,
+              "ready 帧不取 elapsed_s")
+        check(NodeEvent.loadingElapsed(from: "not json") == nil, "非 JSON 不取 elapsed_s")
+
+        // 老行为：loading 仍按 status 事件原样上报（SampleHandler 照旧能记录状态码）
+        if case .status(let code, let text, let id)? = NodeEvent.parse(
+            #"{"ev":"status","code":"loading","text":"正在加载模型","elapsed_s":1.5}"#
+        ) {
+            check(code == "loading" && text == "正在加载模型" && id == nil, "loading 仍解析成 status")
+        } else {
+            check(false, "loading 应解析成 status")
+        }
+    }
+
+    static func testSessionLoadingCallback(_ check: (Bool, String) -> Void) {
+        var events: [NodeEvent] = []
+        var loadings: [Double] = []
+        var closes: [Int] = []
+        let session = NodeSession(
+            url: URL(string: "ws://127.0.0.1:1/v2/session")!,
+            token: "gsk_test_fake_key_not_real",
+            src: "de",
+            dst: "zh",
+            onEvent: { events.append($0) },
+            onClose: { closes.append($0) },
+            onLoading: { loadings.append($0) }
+        )
+        check(closes.isEmpty, "未 start 的会话不应触发 onClose")
+
+        // 假帧：和现有 testParse 一样直接喂协议文本，不开真连接
+        session.handle(eventText: #"{"ev":"status","code":"loading","text":"正在加载模型","elapsed_s":0.0}"#)
+        session.handle(eventText: #"{"ev":"status","code":"loading","text":"正在加载模型","elapsed_s":5.25}"#)
+        check(loadings == [0.0, 5.25], "NodeSession 收到 loading 时回调 elapsed_s（实际 \(loadings)）")
+        check(events.count == 2, "loading 同时继续按事件上报（实际 \(events.count)）")
+        check(NodeEvent.loadingElapsed(from: #"{"ev":"status","code":"loading","text":"x","elapsed_s":5.25}"#) == 5.25,
+              "假帧 elapsed_s 可单独读取")
+
+        session.handle(eventText: #"{"ev":"status","code":"audio_dropped","text":"y"}"#)
+        check(loadings.count == 2, "非 loading 状态不触发 onLoading")
+
+        session.handle(eventText: #"{"ev":"ready","cold":true}"#)
+        check(loadings.count == 2, "ready 后不再触发 onLoading")
+        check(events.count == 4, "ready 仍按事件上报（实际 \(events.count)）")
     }
 
     static func pcmChecks(sampleRate: Double, channels: Int, check: (Bool, String) -> Void) {
