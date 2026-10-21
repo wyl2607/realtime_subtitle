@@ -708,14 +708,17 @@ class RemoteBridge:
             self._abandon_client(client)
             self._close_node()
             self._node_backoff_until = time.time() + 30
-            return
-        finally:
             self._node_loading_id = None
             self._announce_route()
+            return
+        # 成功路径先不播报：这时 current_node_id 还是旧值（或为空，退回第一个候选），
+        # 立刻播报会让状态行闪一下别的节点名。等下面换成这次连上的节点再播报。
+        self._node_loading_id = None
         # 连接在音频线程上等待。返回时主线程可能已经 close()，或云端开关把代次加一。
         # 这时不能把新客户端留在桥上。
         if self._closed or self._generation != generation:
             self._abandon_client(client)
+            self._announce_route()
             return
         if hasattr(self.router, "node_states"):
             self.router.node_states[cfg.id] = NodeStateRecord(info=info)

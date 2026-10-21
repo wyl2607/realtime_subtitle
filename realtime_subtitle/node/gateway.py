@@ -526,6 +526,9 @@ class WorkerManager:
         # sid 只增不减：worker 崩了重启也不把旧 ready 发给新会话。
         self._next_sid = 0
         self._ready: set[int] = set()
+        # 进程活着 ≠ 模型加载完：上一个会话冷加载中途断开时进程还在。只有见过 ready 才算加载完，
+        # 复用一个还在加载的 worker 时新会话也得发 loading（P1 问题 2）。
+        self._loaded = False
         # 没有 sid 的旧事件（单测假 worker 历史上不带 sid）仍按 hello/ready 序号过滤。
         # 三个计数都随 worker 进程重置。生产路径的事件都带 sid，不走这里。
         self._hellos_written = 0
@@ -535,6 +538,11 @@ class WorkerManager:
     @property
     def state(self) -> str:
         return "warm" if self._proc is not None and self._proc.returncode is None else "cold"
+
+    @property
+    def loaded(self) -> bool:
+        """当前 worker 是否已经发过 ready（模型加载完）。"""
+        return self.state == "warm" and self._loaded
 
     @property
     def pid(self) -> int | None:
@@ -617,6 +625,7 @@ class WorkerManager:
         self._readies_seen = 0
         self._sink_hello_no = None
         self._ready.clear()
+        self._loaded = False
         self._reader = asyncio.create_task(self._read_events(proc))
         log.info("worker_spawned spawn_s=%.3f", time.monotonic() - t0)
 
@@ -661,6 +670,9 @@ class WorkerManager:
         if not isinstance(ev, dict) or ev.get("ev") not in _CLIENT_EVENTS:
             log.warning("worker_unknown_event bytes=%d", len(line))
             return
+        if ev.get("ev") == "ready":
+            # 不论归属哪个会话（哪怕那个会话已经断开），模型都已经在内存里了
+            self._loaded = True
         sid = ev.get("sid")
         if isinstance(sid, int) and not isinstance(sid, bool):
             # 带 sid 的事件只给这个 sid。ready 之前的（冷加载中断开后迟到的 final）丢掉。
@@ -787,7 +799,8 @@ class _Session:
             try:
                 reused, sid = await self.gw.worker.attach(self)
                 self.sid = sid
-                self._worker_reused = reused
+                # 只有复用到「已加载完」的 worker 才没有冷加载可等
+                self._worker_reused = reused and self.gw.worker.loaded
             except OSError as e:
                 log.error("worker_spawn_failed err=%s", type(e).__name__)
                 await self._fail("worker_crashed")
@@ -827,7 +840,7 @@ class _Session:
         limit = asyncio.create_task(asyncio.sleep(SESSION_MAX_S))
         crashed = asyncio.ensure_future(self.exit_fut)
         tasks = [pump_in, pump_out, feeder, limit, crashed]
-        # 保温复用的 worker 已经在内存里，没有冷加载可等；只有冷拉起才发 loading。
+        # 保温复用且已加载完的 worker 没有冷加载可等；冷拉起、或复用的 worker 还在加载，都发 loading。
         if not self._worker_reused:
             self._loading_task = asyncio.create_task(self._loading_heartbeat())
         crash_rc: int | None = None
