@@ -29,6 +29,12 @@ enum HandoffRules {
         broadcastActive
     }
 
+    /// 节点 ready 之后状态行该显示什么：还停在「<节点> 正在加载模型…」就换成 ready，
+    /// 别的状态码（断开、错误）不动。只有 loading 会被 ready 取代。
+    static func statusAfterReady(_ last: String, loadingSuffix: String) -> String {
+        last.hasSuffix(loadingSuffix) ? "ready" : last
+    }
+
     /// 云端结果是不是作废的旧请求（换 key / 关开关 / 退出云端档都会推进代次）。
     /// 作废的结果不进路由状态机、不记额度、不上屏。
     static func isStaleCloudResponse(requestGeneration: UInt64, currentGeneration: UInt64) -> Bool {

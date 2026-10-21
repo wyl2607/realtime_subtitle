@@ -36,6 +36,11 @@ struct RecentLinesSelftest {
         check(HandoffRules.isStaleCloudResponse(requestGeneration: 4, currentGeneration: 5), "换 key 后旧请求的结果应作废")
         check(!HandoffRules.isStaleCloudResponse(requestGeneration: 5, currentGeneration: 5), "当前代次的结果照常处理")
 
+        // 节点 ready 之后状态行不能停在「正在加载模型…」（iPhone 真机：ready=1 但 last 还是加载中）。
+        check(HandoffRules.statusAfterReady("mini2 正在加载模型…", loadingSuffix: " 正在加载模型…") == "ready", "ready 后加载中状态应清掉")
+        check(HandoffRules.statusAfterReady("closed=1006", loadingSuffix: " 正在加载模型…") == "closed=1006", "ready 不覆盖别的状态码")
+        check(HandoffRules.statusAfterReady("", loadingSuffix: " 正在加载模型…") == "", "空状态保持为空")
+
         if failures.isEmpty {
             print("SELFTEST OK")
         } else {
