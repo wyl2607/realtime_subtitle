@@ -508,6 +508,7 @@
           }
         }
       ]
-    }
+    },
+    {"name": "disabled_invalid_key_ignores_late_rate_limit", "initial": {"has_key": true, "cloud_enabled": true, "node_enabled": false, "node_healthy": false, "node_is_self": false}, "steps": [{"event": {"type": "http_status", "status": 401}, "expect": {"tier": "local", "cloud_state": "disabled_invalid_key", "key_invalid": true, "action": "mark_key_invalid"}}, {"event": {"type": "http_status", "status": 429, "retry_after": 30}, "expect": {"tier": "local", "cloud_state": "disabled_invalid_key", "key_invalid": true, "action": "none"}}, {"event": {"type": "cooldown_expired"}, "expect": {"tier": "local", "cloud_state": "disabled_invalid_key", "key_invalid": true, "action": "none"}}, {"event": {"type": "key_modified"}, "expect": {"tier": "cloud", "cloud_state": "available", "key_invalid": false, "action": "resume_cloud"}}]}
   ]
 }
