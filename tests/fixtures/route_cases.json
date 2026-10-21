@@ -12,7 +12,9 @@
       },
       "steps": [
         {
-          "event": {"type": "segment_failure"},
+          "event": {
+            "type": "segment_failure"
+          },
           "expect": {
             "tier": "cloud",
             "cloud_state": "available",
@@ -21,7 +23,9 @@
           }
         },
         {
-          "event": {"type": "segment_failure"},
+          "event": {
+            "type": "segment_failure"
+          },
           "expect": {
             "tier": "cloud",
             "cloud_state": "available",
@@ -30,7 +34,9 @@
           }
         },
         {
-          "event": {"type": "segment_failure"},
+          "event": {
+            "type": "segment_failure"
+          },
           "expect": {
             "tier": "local",
             "cloud_state": "cooldown_backoff",
@@ -52,7 +58,10 @@
       },
       "steps": [
         {
-          "event": {"type": "http_status", "status": 401},
+          "event": {
+            "type": "http_status",
+            "status": 401
+          },
           "expect": {
             "tier": "node",
             "cloud_state": "disabled_invalid_key",
@@ -60,7 +69,9 @@
           }
         },
         {
-          "event": {"type": "key_modified"},
+          "event": {
+            "type": "key_modified"
+          },
           "expect": {
             "tier": "cloud",
             "cloud_state": "available",
@@ -80,7 +91,10 @@
       },
       "steps": [
         {
-          "event": {"type": "http_status", "status": 403},
+          "event": {
+            "type": "http_status",
+            "status": 403
+          },
           "expect": {
             "tier": "local",
             "cloud_state": "disabled_invalid_key",
@@ -100,7 +114,11 @@
       },
       "steps": [
         {
-          "event": {"type": "http_status", "status": 429, "retry_after": 17},
+          "event": {
+            "type": "http_status",
+            "status": 429,
+            "retry_after": 17
+          },
           "expect": {
             "tier": "node",
             "cloud_state": "cooldown_rate_limited",
@@ -109,7 +127,9 @@
           }
         },
         {
-          "event": {"type": "cooldown_expired"},
+          "event": {
+            "type": "cooldown_expired"
+          },
           "expect": {
             "tier": "cloud",
             "cloud_state": "probe",
@@ -117,7 +137,9 @@
           }
         },
         {
-          "event": {"type": "segment_success"},
+          "event": {
+            "type": "segment_success"
+          },
           "expect": {
             "tier": "cloud",
             "cloud_state": "available",
@@ -137,7 +159,10 @@
       },
       "steps": [
         {
-          "event": {"type": "http_status", "status": 429},
+          "event": {
+            "type": "http_status",
+            "status": 429
+          },
           "expect": {
             "tier": "local",
             "cloud_state": "cooldown_rate_limited",
@@ -158,7 +183,10 @@
       },
       "steps": [
         {
-          "event": {"type": "quota_update", "usage_percent": 90},
+          "event": {
+            "type": "quota_update",
+            "usage_percent": 90
+          },
           "expect": {
             "tier": "node",
             "cloud_state": "cooldown_quota",
@@ -166,7 +194,10 @@
           }
         },
         {
-          "event": {"type": "quota_update", "usage_percent": 85},
+          "event": {
+            "type": "quota_update",
+            "usage_percent": 85
+          },
           "expect": {
             "tier": "node",
             "cloud_state": "cooldown_quota",
@@ -174,7 +205,10 @@
           }
         },
         {
-          "event": {"type": "quota_update", "usage_percent": 79},
+          "event": {
+            "type": "quota_update",
+            "usage_percent": 79
+          },
           "expect": {
             "tier": "cloud",
             "cloud_state": "available",
@@ -196,7 +230,9 @@
       },
       "steps": [
         {
-          "event": {"type": "cooldown_expired"},
+          "event": {
+            "type": "cooldown_expired"
+          },
           "expect": {
             "tier": "cloud",
             "cloud_state": "probe",
@@ -204,7 +240,9 @@
           }
         },
         {
-          "event": {"type": "segment_failure"},
+          "event": {
+            "type": "segment_failure"
+          },
           "expect": {
             "tier": "local",
             "cloud_state": "cooldown_backoff",
@@ -214,7 +252,9 @@
           }
         },
         {
-          "event": {"type": "cooldown_expired"},
+          "event": {
+            "type": "cooldown_expired"
+          },
           "expect": {
             "tier": "cloud",
             "cloud_state": "probe",
@@ -222,7 +262,9 @@
           }
         },
         {
-          "event": {"type": "segment_failure"},
+          "event": {
+            "type": "segment_failure"
+          },
           "expect": {
             "tier": "local",
             "cloud_state": "cooldown_backoff",
@@ -232,7 +274,9 @@
           }
         },
         {
-          "event": {"type": "cooldown_expired"},
+          "event": {
+            "type": "cooldown_expired"
+          },
           "expect": {
             "tier": "cloud",
             "cloud_state": "probe",
@@ -240,7 +284,9 @@
           }
         },
         {
-          "event": {"type": "segment_failure"},
+          "event": {
+            "type": "segment_failure"
+          },
           "expect": {
             "tier": "local",
             "cloud_state": "cooldown_backoff",
@@ -250,7 +296,9 @@
           }
         },
         {
-          "event": {"type": "cooldown_expired"},
+          "event": {
+            "type": "cooldown_expired"
+          },
           "expect": {
             "tier": "cloud",
             "cloud_state": "probe",
@@ -258,7 +306,9 @@
           }
         },
         {
-          "event": {"type": "segment_failure"},
+          "event": {
+            "type": "segment_failure"
+          },
           "expect": {
             "tier": "local",
             "cloud_state": "cooldown_backoff",
@@ -280,7 +330,9 @@
       },
       "steps": [
         {
-          "event": {"type": "switch_off"},
+          "event": {
+            "type": "switch_off"
+          },
           "expect": {
             "tier": "local",
             "cloud_state": "off",
@@ -290,7 +342,9 @@
           }
         },
         {
-          "event": {"type": "switch_on"},
+          "event": {
+            "type": "switch_on"
+          },
           "expect": {
             "tier": "cloud",
             "cloud_state": "available",
@@ -310,7 +364,9 @@
       },
       "steps": [
         {
-          "event": {"type": "key_cleared"},
+          "event": {
+            "type": "key_cleared"
+          },
           "expect": {
             "tier": "node",
             "cloud_state": "off",
@@ -320,7 +376,9 @@
           }
         },
         {
-          "event": {"type": "key_modified"},
+          "event": {
+            "type": "key_modified"
+          },
           "expect": {
             "tier": "cloud",
             "cloud_state": "available",
@@ -340,7 +398,9 @@
       },
       "steps": [
         {
-          "event": {"type": "noop"},
+          "event": {
+            "type": "noop"
+          },
           "expect": {
             "tier": "node",
             "cloud_state": "available",
@@ -360,7 +420,9 @@
       },
       "steps": [
         {
-          "event": {"type": "noop"},
+          "event": {
+            "type": "noop"
+          },
           "expect": {
             "tier": "local",
             "cloud_state": "available",
@@ -380,7 +442,9 @@
       },
       "steps": [
         {
-          "event": {"type": "noop"},
+          "event": {
+            "type": "noop"
+          },
           "expect": {
             "tier": "local",
             "cloud_state": "available",
@@ -400,7 +464,10 @@
       },
       "steps": [
         {
-          "event": {"type": "http_status", "status": 401},
+          "event": {
+            "type": "http_status",
+            "status": 401
+          },
           "expect": {
             "tier": "local",
             "cloud_state": "disabled_invalid_key",
@@ -408,7 +475,10 @@
           }
         },
         {
-          "event": {"type": "quota_update", "usage_percent": 95},
+          "event": {
+            "type": "quota_update",
+            "usage_percent": 95
+          },
           "expect": {
             "tier": "local",
             "cloud_state": "disabled_invalid_key",
@@ -416,7 +486,10 @@
           }
         },
         {
-          "event": {"type": "quota_update", "usage_percent": 50},
+          "event": {
+            "type": "quota_update",
+            "usage_percent": 50
+          },
           "expect": {
             "tier": "local",
             "cloud_state": "disabled_invalid_key",
@@ -436,7 +509,9 @@
       },
       "steps": [
         {
-          "event": {"type": "switch_off"},
+          "event": {
+            "type": "switch_off"
+          },
           "expect": {
             "tier": "local",
             "cloud_state": "off",
@@ -446,7 +521,10 @@
           }
         },
         {
-          "event": {"type": "quota_update", "usage_percent": 95},
+          "event": {
+            "type": "quota_update",
+            "usage_percent": 95
+          },
           "expect": {
             "tier": "local",
             "cloud_state": "off",
@@ -454,7 +532,10 @@
           }
         },
         {
-          "event": {"type": "quota_update", "usage_percent": 50},
+          "event": {
+            "type": "quota_update",
+            "usage_percent": 50
+          },
           "expect": {
             "tier": "local",
             "cloud_state": "off",
@@ -474,7 +555,10 @@
       },
       "steps": [
         {
-          "event": {"type": "http_status", "status": 401},
+          "event": {
+            "type": "http_status",
+            "status": 401
+          },
           "expect": {
             "tier": "local",
             "cloud_state": "disabled_invalid_key",
@@ -482,7 +566,9 @@
           }
         },
         {
-          "event": {"type": "switch_off"},
+          "event": {
+            "type": "switch_off"
+          },
           "expect": {
             "tier": "local",
             "cloud_state": "off",
@@ -492,7 +578,9 @@
           }
         },
         {
-          "event": {"type": "switch_on"},
+          "event": {
+            "type": "switch_on"
+          },
           "expect": {
             "tier": "local",
             "cloud_state": "disabled_invalid_key",
@@ -500,11 +588,184 @@
           }
         },
         {
-          "event": {"type": "key_modified"},
+          "event": {
+            "type": "key_modified"
+          },
           "expect": {
             "tier": "cloud",
             "cloud_state": "available",
             "action": "resume_cloud"
+          }
+        }
+      ]
+    },
+    {
+      "name": "trusted_day_rollover_resumes_only_after_all_windows_drop_below_80",
+      "initial": {
+        "has_key": true,
+        "cloud_enabled": true,
+        "node_enabled": true,
+        "node_healthy": true,
+        "node_is_self": false
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "quota_update",
+            "usage_percent": 95
+          },
+          "expect": {
+            "tier": "node",
+            "cloud_state": "cooldown_quota",
+            "action": "quota_cooldown"
+          }
+        },
+        {
+          "event": {
+            "type": "quota_reset_confirmed",
+            "usage_percent": 79
+          },
+          "expect": {
+            "tier": "cloud",
+            "cloud_state": "available",
+            "action": "resume_cloud"
+          }
+        }
+      ]
+    },
+    {
+      "name": "trusted_day_rollover_does_not_override_other_exhausted_windows",
+      "initial": {
+        "has_key": true,
+        "cloud_enabled": true,
+        "node_enabled": true,
+        "node_healthy": true,
+        "node_is_self": false
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "quota_update",
+            "usage_percent": 95
+          },
+          "expect": {
+            "tier": "node",
+            "cloud_state": "cooldown_quota",
+            "action": "quota_cooldown"
+          }
+        },
+        {
+          "event": {
+            "type": "quota_reset_confirmed",
+            "usage_percent": 95
+          },
+          "expect": {
+            "tier": "node",
+            "cloud_state": "cooldown_quota",
+            "action": "quota_cooldown"
+          }
+        }
+      ]
+    },
+    {
+      "name": "trusted_day_rollover_cannot_reactivate_401_invalid_key",
+      "initial": {
+        "has_key": true,
+        "cloud_enabled": true,
+        "node_enabled": true,
+        "node_healthy": true,
+        "node_is_self": false
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "http_status",
+            "status": 401
+          },
+          "expect": {
+            "tier": "node",
+            "cloud_state": "disabled_invalid_key",
+            "action": "mark_key_invalid"
+          }
+        },
+        {
+          "event": {
+            "type": "quota_reset_confirmed",
+            "usage_percent": 0
+          },
+          "expect": {
+            "tier": "node",
+            "cloud_state": "disabled_invalid_key",
+            "action": "none",
+            "key_invalid": true
+          }
+        }
+      ]
+    },
+    {
+      "name": "trusted_day_rollover_cannot_short_circuit_429_cooldown",
+      "initial": {
+        "has_key": true,
+        "cloud_enabled": true,
+        "node_enabled": true,
+        "node_healthy": true,
+        "node_is_self": false
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "http_status",
+            "status": 429,
+            "retry_after": 120
+          },
+          "expect": {
+            "tier": "node",
+            "cloud_state": "cooldown_rate_limited",
+            "action": "rate_limited"
+          }
+        },
+        {
+          "event": {
+            "type": "quota_reset_confirmed",
+            "usage_percent": 0
+          },
+          "expect": {
+            "tier": "node",
+            "cloud_state": "cooldown_rate_limited",
+            "action": "none"
+          }
+        }
+      ]
+    },
+    {
+      "name": "trusted_day_rollover_cannot_reenable_manual_switch_off",
+      "initial": {
+        "has_key": true,
+        "cloud_enabled": true,
+        "node_enabled": true,
+        "node_healthy": true,
+        "node_is_self": false
+      },
+      "steps": [
+        {
+          "event": {
+            "type": "switch_off"
+          },
+          "expect": {
+            "tier": "node",
+            "cloud_state": "off",
+            "action": "cloud_off"
+          }
+        },
+        {
+          "event": {
+            "type": "quota_reset_confirmed",
+            "usage_percent": 0
+          },
+          "expect": {
+            "tier": "node",
+            "cloud_state": "off",
+            "action": "none"
           }
         }
       ]
