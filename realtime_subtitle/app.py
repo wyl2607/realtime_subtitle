@@ -10,6 +10,12 @@ import platform
 import time
 from realtime_subtitle.paths import SINGLETON_LOCK_FILE, repo_path
 
+# ☠️ 和 realtime_subtitle.capture.audio_capture.STOP_FLAG_FILE 必须是同一个值
+# （.ps1 与 Python 的跨进程约定，见 paths.py）。不直接 import 那个模块，是因为
+# 它会把 sounddevice（~60ms）拉进启动路径；tests/test_startup_imports.py 对账
+# 两者相等，防的是以后有人只改一边。
+STOP_FLAG_FILE = repo_path(".stop")
+
 # 控制台可能默认使用非UTF-8编码（如cp1252），会导致emoji/中文print崩溃
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -88,8 +94,12 @@ _LOG = logging.getLogger(__name__)
 # 不成立——无条件 import 实测白占 ~180MB 常驻内存，而 Mac 上内存正是降档的触发源
 if sys.platform == "win32":
     import torch  # noqa: F401
-from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
-from realtime_subtitle.capture.audio_capture import AudioCapture, PAUSE_FLAG_FILE, STOP_FLAG_FILE
+# ☠️ 识别/翻译和音频采集这两个模块故意**不在这里 import**（2026-10-21 实测）：
+# translator_queue 会拉进 numpy/requests（~97ms），audio_capture 会拉进
+# sounddevice（~62ms）——都不参与窗口构造，却让窗口晚出现约 0.16 秒。
+# 现在它们在 _load_models 的后台线程里导入，窗口构造不再为它们付钱。
+# （2026-10-21 另试过在窗口构造期间预取 MLX 权重：A/B 三轮里就绪时间没有
+#  稳定收益、窗口反而慢 ~70ms——加载和窗口构造抢同一块 CPU/内存，已放弃。）
 from realtime_subtitle.ui.subtitle_window import SubtitleWindow
 from realtime_subtitle.ui.settings_window import MODE_ICONS as _MODE_ICON
 from realtime_subtitle.resources.memory import TierGovernor, read_memory_snapshot
@@ -1112,6 +1122,8 @@ class SubtitleApp:
                 from realtime_subtitle.translate.translator_queue import release_startup_warm
                 release_startup_warm()
                 return
+            # 延迟导入：见模块顶部说明（窗口出现前不付 numpy/requests 的 import）。
+            from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
             # 翻译器（Whisper 模型 + Ollama 预热，启动耗时大头）
             translator = WhisperQueueTranslator()
             if self._closing:
@@ -1148,6 +1160,8 @@ class SubtitleApp:
 
             # 音频捕获（设备名/设备切换提示直接上悬浮窗）。构造要开WASAPI流，
             # 有几百毫秒窗口，之后再查一次 _closing 才真正启动采集/热键
+            from realtime_subtitle.capture.audio_capture import AudioCapture
+
             audio_capture = AudioCapture(
                 callback=self.on_audio_received,
                 on_status=self.subtitle_window.show_status)
@@ -1366,6 +1380,8 @@ class SubtitleApp:
 
     def _toggle_pause(self):
         """暂停/继续（和 暂停继续字幕.bat 完全等价：切换.paused标记文件）"""
+        from realtime_subtitle.capture.audio_capture import PAUSE_FLAG_FILE
+
         try:
             if os.path.exists(PAUSE_FLAG_FILE):
                 os.remove(PAUSE_FLAG_FILE)
