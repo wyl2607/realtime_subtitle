@@ -40,7 +40,9 @@ class RoutingState:
         )
 
     def apply(self, event: dict[str, Any]) -> None:
-        self.cooldown_seconds = None
+        # A confirmed RPD reset cannot shorten an unrelated HTTP 429 cooldown.
+        if not (event["type"] == "quota_reset_confirmed" and self.cloud_state == "cooldown_rate_limited"):
+            self.cooldown_seconds = None
         self.cancel_inflight = False
         self.discard_response = False
         self.action = "none"
