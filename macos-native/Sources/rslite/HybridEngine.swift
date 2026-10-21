@@ -104,6 +104,10 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
     private var cloudTask: Task<Void, Never>?
     private var uploadTasks: [UUID: Task<Void, Never>] = [:]
     private var lastPublishedMode: SubtitleMode?
+    /// 最近一次真正交给 onMode 的模式（带冷却后缀的原样），用于冷却进入/退出的去重。
+    private var lastEmittedMode: SubtitleMode?
+    /// 上一次云端协调看到的是否为 429 冷却态。节点接管状态行时也要靠它捕捉进入/退出。
+    private var lastCloudRateLimited = false
     private var lastNodeTierEnabled = true
     /// 云端或 key 无效占着状态行时，节点路由器的「混合/本机/精修中」不能把它盖掉。
     private var cloudOwnsLabel = false
@@ -141,7 +145,9 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
     }
 
     func start() async throws {
-        onMode(activateCloudController())
+        let mode = activateCloudController()
+        lock.withLockVoid { lastEmittedMode = mode }
+        onMode(mode)
         let wrapped = PipelineCallbacks(
             onVolatile: callbacks.onVolatile,
             onFinal: { [weak self] id, text, t0, t1 in
@@ -557,7 +563,9 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
 
     /// 所有非云端调度发出的模式都过这里：429 冷却期间统一补后缀。
     private func publishMode(_ mode: SubtitleMode) {
-        onMode(cloudRateLimited() ? .rateLimited(mode) : mode)
+        let emitted = cloudRateLimited() ? .rateLimited(mode) : mode
+        lock.withLockVoid { lastEmittedMode = emitted }
+        onMode(emitted)
     }
 
     private static func shouldRunRouter(mode: RSLiteMode, hasFanout: Bool, hasRouter: Bool) -> Bool {
@@ -799,6 +807,90 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
             check(capture.finals.count == 2 && capture.finals[1].0 == "Cloud neu",
                   "语言切换后发出的云端结果应按最新代正常上屏")
         }
+        do {
+            // 节点接管状态行时 429 的进入/退出也必须上屏，这是最容易漏的路径。
+            let capture = NodeCapture()
+            let engine = makeEngine(capture)
+            select(engine, "mini2", 1)
+            engine.publishMode(.hybrid("mini2"))
+
+            final class FakeCloud: CloudTranscribing, @unchecked Sendable {
+                func transcribe(
+                    pcm16Mono16k: Data,
+                    a0: Double,
+                    duration: Double,
+                    language: String,
+                    segmentID: Int?
+                ) async throws -> CloudTranscriptionResult {
+                    CloudTranscriptionResult(text: "", segments: [], statusCode: 200, xGroqID: nil, remainingRequests: nil)
+                }
+                func cancelInflightRequests() {}
+            }
+            final class SwitchBox: @unchecked Sendable {
+                var snapshot = CloudSwitchSnapshot(
+                    hasKey: true,
+                    enabled: true,
+                    key: "gsk_selftest_fake_key_abcdefghijklmnopqrstuvwxyz"
+                )
+            }
+            let box = SwitchBox()
+            let root = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("rslite-hybrid-cooldown-\(UUID().uuidString)")
+            try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let cloud = CloudUploadController(
+                localeID: "de-DE",
+                ledger: QuotaLedger(url: root.appendingPathComponent("quota.json")),
+                readSwitch: { box.snapshot },
+                makeClient: { _ in FakeCloud() }
+            )
+            let active = NodeTierFacts(enabled: true, healthy: true, activeNodeID: "mini2", isSelf: false)
+            let now = Date(timeIntervalSince1970: 1_700_000_000)
+            var clock = 0.0
+            func push(_ amplitude: Float, _ seconds: Double, _ at: Date) -> CloudIngestEffect {
+                let count = Int((seconds * 16_000).rounded())
+                let effect = cloud.ingest(
+                    samples: [Float](repeating: amplitude, count: count),
+                    startSeconds: clock,
+                    now: at,
+                    node: active
+                )
+                clock += Double(count) / 16_000
+                return effect
+            }
+            _ = push(0.05, 2.0, now)
+            let closed = push(0, 0.6, now)
+            if let segment = closed.uploads.first, cloud.prepareSend(segment, now: now) != nil {
+                let limited = cloud.resolveFailure(
+                    id: segment.id,
+                    error: CloudClientError.httpStatus(429, retryAfter: 3, xGroqID: nil),
+                    now: now,
+                    node: active
+                )
+                engine.cloudController = cloud
+                engine.applyCloudEffect(limited)
+                check(limited.yieldStatusToNode, "节点会话在时 429 的状态行应由节点接管")
+                check(capture.modes.last == .rateLimited(.hybrid("mini2")),
+                      "节点接管时进入 429 冷却仍要播报冷却后缀，实际 \(capture.modes.last?.label ?? "nil")")
+                check(capture.modes.last?.label
+                        == DesignTokens.Text.statusHybridPrefix + "mini2" + DesignTokens.Text.statusCloudCooldownSuffix,
+                      "冷却后缀应接在节点模式之后")
+
+                let expired = cloud.ingest(
+                    samples: [Float](repeating: 0, count: 1_600),
+                    startSeconds: clock,
+                    now: now.addingTimeInterval(3),
+                    node: active
+                )
+                clock += 0.1
+                engine.applyCloudEffect(expired.control)
+                check(expired.control.yieldStatusToNode, "冷却到期转 probe 时节点仍接管状态行")
+                check(capture.modes.last == .hybrid("mini2"),
+                      "冷却结束（转 probe）后要播报不带后缀的节点模式，实际 \(capture.modes.last?.label ?? "nil")")
+            } else {
+                check(false, "429 冷却自测应先有一段已接受的上传")
+            }
+        }
         failures.append(contentsOf: CloudSegmenter.selfTest())
         failures.append(contentsOf: CloudUploadController.selfTest())
         return failures
@@ -1011,7 +1103,11 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
         if let generation, isStaleLanguageGeneration(generation, where: "cloud_result") {
             return
         }
-        let decision = lock.withLockValue { () -> (Bool, Bool, NodeRouter?) in
+        let decision = lock.withLockValue { () -> (Bool, Bool, NodeRouter?, SubtitleMode?) in
+            var rateLimited = false
+            if case .rateLimited = effect.mode { rateLimited = true }
+            let cooldownChanged = rateLimited != lastCloudRateLimited
+            lastCloudRateLimited = rateLimited
             if effect.yieldStatusToNode {
                 cloudOwnsLabel = false
                 lastPublishedMode = nil
@@ -1019,6 +1115,7 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
             var publish = false
             if effect.publishStatus && lastPublishedMode != effect.mode {
                 lastPublishedMode = effect.mode
+                lastEmittedMode = effect.mode
                 cloudOwnsLabel = effect.mode.base == .cloud || effect.mode.base == .cloudKeyInvalid
                 selectedNodeSession = Self.selectedSession(
                     after: effect.mode,
@@ -1027,16 +1124,29 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
                 )
                 publish = true
             }
+            // 节点接管状态行时，429 进入/退出冷却不会经过 NodeRouter 的 publishMode，
+            // 得由云端自己按当前节点侧模式补/摘后缀，否则状态行要么不出现、要么滞留。
+            var cooldownPublish: SubtitleMode?
+            if effect.yieldStatusToNode && cooldownChanged {
+                let target = rateLimited ? SubtitleMode.rateLimited(effect.mode.base) : effect.mode.base
+                if lastEmittedMode != target {
+                    lastEmittedMode = target
+                    cooldownPublish = target
+                }
+            }
             let tierChanged = lastNodeTierEnabled != effect.nodeTierEnabled
             if tierChanged {
                 lastNodeTierEnabled = effect.nodeTierEnabled
             }
-            return (publish, tierChanged, router)
+            return (publish, tierChanged, router, cooldownPublish)
         }
         if !effect.discard {
             for line in effect.lines {
                 emitCloudLine(line)
             }
+        }
+        if let cooldownPublish = decision.3 {
+            onMode(cooldownPublish)
         }
         if decision.0 {
             onMode(effect.mode)
