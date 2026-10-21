@@ -21,3 +21,15 @@ def test_python_tokens_import_without_qt():
     assert t.COLOR_SUBTITLE_TRANSLATION.startswith("#")
     assert t.TYPE_SUBTITLE_MIN < t.TYPE_SUBTITLE_DEFAULT < t.TYPE_SUBTITLE_MAX
     assert len(t.PALETTE_TEXT) == 5 and len(t.PALETTE_BACKGROUND) == 5
+
+
+def test_ios_tokens_are_platform_neutral():
+    # iOS 的 Shared/ 同时被 App 与广播扩展编译；生成物只能是 String/Double 常量，
+    # 一旦混进 AppKit/NSColor 就会在 iOS target 上直接编译失败。
+    text = (ROOT / "ios" / "Shared" / "DesignTokens.swift").read_text(encoding="utf-8")
+    assert "enum DesignTokens" in text
+    assert "AppKit" not in text
+    assert "UIKit" not in text
+    assert "NSColor" not in text
+    assert '"#FFE894"' in text
+
