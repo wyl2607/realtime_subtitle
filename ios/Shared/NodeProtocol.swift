@@ -63,6 +63,20 @@ enum NodeEvent {
         }
     }
 
+    /// 从 `status/loading` 帧里取 `elapsed_s`（节点从开始加载本会话起算的秒数）。
+    /// 不把它塞进 `.status` 的关联值：那个 case 的签名被 SampleHandler 的既有
+    /// 模式匹配依赖，而本轮不接 SampleHandler（另一条线在改），多加一个关联值
+    /// 会直接编译失败。其它帧、缺失或类型不对一律返回 nil。
+    static func loadingElapsed(from text: String) -> Double? {
+        guard let data = text.data(using: .utf8),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              object["ev"] as? String == "status",
+              object["code"] as? String == "loading" else {
+            return nil
+        }
+        return doubleValue(object["elapsed_s"])
+    }
+
     /// 这些码通常意味着会话将随 close 1011 结束，客户端应放弃重试。
     static func isFatal(code: String) -> Bool {
         code == "protocol_error" || code == "engine_load_failed" || code == "internal_error"
@@ -109,20 +123,77 @@ enum NodeEvent {
     }
 }
 
+/// ready 截止时间的跨线程容器：收包侧在 loading 时续期，看门狗按当前值重新睡。
+/// 语义与 `macos-native/Sources/rslite/NodeClient.swift` 的 `ReadyDeadlineBox` 一致。
+final class ReadyDeadlineBox: @unchecked Sendable {
+    private let helloAt: Double
+    private let lock = NSLock()
+    private var deadline: Double
+
+    init(helloAt: Double, current: Double) {
+        self.helloAt = helloAt
+        self.deadline = current
+    }
+
+    var current: Double {
+        lock.lock()
+        defer { lock.unlock() }
+        return deadline
+    }
+
+    func extend(now: Double) {
+        lock.lock()
+        deadline = NodeSession.readyDeadline(
+            helloAt: helloAt, now: now, current: deadline, receivedLoading: true
+        )
+        lock.unlock()
+    }
+}
+
 /// v2 节点会话客户端。不自动重连、不做 TailnetPin（以后做）。
 /// 日志/打印绝不输出 token 与字幕正文——本类不做任何日志输出。
 final class NodeSession: NSObject, URLSessionWebSocketDelegate {
+    // 冷启动＝拉起 worker + 加载权重，Windows 节点实测 17–20s。基础等 ready 15s
+    // （与 rslite/Python 客户端同值），每收到一条 loading 续 15s，但从发出 hello
+    // 起总共不超过 60s；超过仍按握手超时收场。
+    static let readyTimeoutSeconds = 15.0
+    static let readyLoadingMaxSeconds = 60.0
+
+    /// 纯函数：loading 到达时把截止时间推到 now+15s，但不超过 helloAt+60s。
+    /// 与 rslite 的 `NodeClient.readyDeadline`、Python 的 `extend_ready_deadline` 同语义。
+    static func readyDeadline(
+        helloAt: Double,
+        now: Double,
+        current: Double,
+        receivedLoading: Bool,
+        timeout: Double = readyTimeoutSeconds,
+        maxTotal: Double = readyLoadingMaxSeconds
+    ) -> Double {
+        let cap = helloAt + maxTotal
+        if receivedLoading {
+            return min(cap, now + timeout)
+        }
+        return min(cap, current)
+    }
+
+    private static func monotonic() -> Double {
+        ProcessInfo.processInfo.systemUptime
+    }
+
     private let url: URL
     private let token: String
     private let src: String
     private let dst: String
     private let onEvent: (NodeEvent) -> Void
     private let onClose: (Int) -> Void
+    private let onLoading: ((Double) -> Void)?
 
     private let lock = NSLock()
     private var session: URLSession?
     private var socket: URLSessionWebSocketTask?
     private var closeNotified = false
+    private var readyBox: ReadyDeadlineBox?
+    private var readyWatchdog: DispatchWorkItem?
 
     init(
         url: URL,
@@ -130,7 +201,8 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
         src: String,
         dst: String,
         onEvent: @escaping (NodeEvent) -> Void,
-        onClose: @escaping (Int) -> Void
+        onClose: @escaping (Int) -> Void,
+        onLoading: ((Double) -> Void)? = nil
     ) {
         self.url = url
         self.token = token
@@ -138,6 +210,7 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
         self.dst = dst
         self.onEvent = onEvent
         self.onClose = onClose
+        self.onLoading = onLoading
     }
 
     func start() {
@@ -153,11 +226,23 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
         let socket = session.webSocketTask(with: request)
         self.socket = socket
         socket.resume()
+        // 截止时间从「发出 hello」起算，和 Python 的 hello_at 语义对齐。
+        let helloAt = Self.monotonic()
+        let box = ReadyDeadlineBox(
+            helloAt: helloAt,
+            current: Self.readyDeadline(
+                helloAt: helloAt,
+                now: helloAt,
+                current: helloAt + Self.readyTimeoutSeconds,
+                receivedLoading: false
+            )
+        )
         socket.send(.string(hello.json())) { [weak self] error in
             if error != nil {
                 self?.notifyClosed(1006)
                 return
             }
+            self?.beginReadyWatch(box)
             self?.receiveLoop()
         }
     }
@@ -175,8 +260,23 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
 
     /// 发 close 1000 并结束会话。
     func close() {
+        cancelReadyWatch()
         socket?.cancel(with: .normalClosure, reason: nil)
         session?.finishTasksAndInvalidate()
+    }
+
+    /// 分发一帧文本事件。receiveLoop 调用；自测也直接喂假帧，不建真连接。
+    func handle(eventText: String) {
+        guard let event = NodeEvent.parse(eventText) else { return }
+        switch event {
+        case .ready:
+            cancelReadyWatch()
+        case .status(let code, _, _) where code == "loading":
+            noteLoading(elapsed: NodeEvent.loadingElapsed(from: eventText) ?? 0)
+        default:
+            break
+        }
+        onEvent(event)
     }
 
     private func receiveLoop() {
@@ -184,8 +284,8 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
         socket.receive { [weak self] result in
             switch result {
             case .success(let message):
-                if case .string(let text) = message, let event = NodeEvent.parse(text) {
-                    self?.onEvent(event)
+                if case .string(let text) = message {
+                    self?.handle(eventText: text)
                 }
                 self?.receiveLoop()
             case .failure:
@@ -198,7 +298,74 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
         }
     }
 
+    /// 收到 loading：续期 ready 截止时间，并把 elapsed_s 交给上层（本轮只回调，不接 UI）。
+    private func noteLoading(elapsed: Double) {
+        lock.lock()
+        let box = readyBox
+        lock.unlock()
+        box?.extend(now: Self.monotonic())
+        onLoading?(elapsed)
+    }
+
+    private func beginReadyWatch(_ box: ReadyDeadlineBox) {
+        lock.lock()
+        readyBox = box
+        lock.unlock()
+        armReadyWatchdog()
+    }
+
+    /// 让看门狗睡到当前截止时间。被续期时旧 work item 会到点先醒，发现截止时间
+    /// 变远就再睡一次——和 rslite 超时任务按 `deadline.current` 循环的语义相同。
+    private func armReadyWatchdog() {
+        lock.lock()
+        guard let box = readyBox else {
+            lock.unlock()
+            return
+        }
+        readyWatchdog?.cancel()
+        let remaining = box.current - Self.monotonic()
+        let work = DispatchWorkItem { [weak self] in
+            self?.readyWatchdogFired()
+        }
+        readyWatchdog = work
+        lock.unlock()
+        DispatchQueue.global(qos: .utility).asyncAfter(
+            deadline: .now() + max(0, remaining), execute: work
+        )
+    }
+
+    private func readyWatchdogFired() {
+        lock.lock()
+        guard let box = readyBox else {
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+        let remaining = box.current - Self.monotonic()
+        if remaining > 0 {
+            armReadyWatchdog()
+            return
+        }
+        // 到点仍未 ready：按握手超时结束会话。rslite 到点用 .goingAway 取消 socket
+        // 再上报 timeout，这里同样以 1001 通知 onClose，让调用方走正常重连退避。
+        lock.lock()
+        readyBox = nil
+        let socket = self.socket
+        lock.unlock()
+        socket?.cancel(with: .goingAway, reason: nil)
+        notifyClosed(1001)
+    }
+
+    private func cancelReadyWatch() {
+        lock.lock()
+        readyBox = nil
+        readyWatchdog?.cancel()
+        readyWatchdog = nil
+        lock.unlock()
+    }
+
     private func notifyClosed(_ code: Int) {
+        cancelReadyWatch()
         lock.lock()
         guard !closeNotified else {
             lock.unlock()
