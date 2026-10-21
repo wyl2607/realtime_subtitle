@@ -3,6 +3,8 @@
   1. 最终文本 WER（对 concat5 对应的前 5 句参考）——并与 C 的基线比，要求 ≤ C + 1pp；
   2. 首次出字时间——与 B 的同类数字比，要求不慢于 B；
   3. 精修延迟中位数（节点 final 到达时刻 - 该句音频结束时刻）——要求 ≤ 4s；
+     两个时钟零点必须对齐：headless 的 t 从进程启动算，t0/t1 从第一块样本算，
+     差值在 clock 事件里（df3bf1d 起）；不减掉它，延迟会平白多出启动的 0.5–1.5s；
   4. 不重复、不丢句。
 
 事件流是 headless 的 JSONL（非 JSON 行，如混进来的 stderr，直接跳过）：
@@ -39,6 +41,9 @@ COVER_RATIO_MIN = 0.5       # 参考句与最相近的一行相似度低于此�
 DEFAULT_REFS = Path.home() / "projects" / "rs-mac-native-data" / "refs.jsonl"
 NODE_PREFIX_RE = re.compile(r"^\[([^\]]+)\]\s*(.*)$")
 REPLACE_RE = re.compile(r"\bnode=([^\s]+).*?\bids=\[([^\]]*)\]")
+# 混合档 stderr 埋点（NodeClient/HybridEngine 写，NodeTiming 与 headless t 同一时钟）
+NODE_LOG_PREFIX = "rslite.node "
+NODE_LOG_FIELD_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=([^\s]+)")
 
 
 def load_jsonl(path):
@@ -182,12 +187,118 @@ def replay_lines(events):
     return lines
 
 
-def refine_latencies(events):
+def sample_clock_offset(events):
+    """样本时钟零点在墙钟上的位置 = clock 事件的 t - t0。
+
+    headless 的 t 从进程启动算，t0/t1 从「第一块样本」算；两者差值就是启动/
+    模型加载耗掉的时间。老事件流没有 clock 事件时返回 None（无法校正）。
+    """
+    for e in events:
+        if e.get("ev") != "clock":
+            continue
+        t, t0 = e.get("t"), e.get("t0")
+        if isinstance(t, (int, float)) and isinstance(t0, (int, float)):
+            return t - t0
+    return None
+
+
+def refine_latencies(events, clock_offset):
     """节点 final 到达时刻 - 其音频结束时刻（t1，客户端样本时钟）。
 
-    file: 源按实时速度回放，样本时钟与 headless 墙钟同起点，所以两者可直接相减。
+    样本时刻 s 对应的墙钟是 s + clock_offset，所以延迟要减掉这个零点差。
+    没有 clock 事件时返回空列表：和 acceptance/run_mac_key.sh 的契约一致——
+    绝不拿 `t - t1` 硬算（那会把启动/加载时间算进延迟，正是本指标失真的来源）。
     """
-    return [e["t"] - e["t1"] for e in events if e["ev"] == "final" and is_node(e) and e.get("t1") is not None]
+    if clock_offset is None:
+        return []
+    return [
+        e["t"] - e["t1"] - clock_offset
+        for e in events
+        if e["ev"] == "final" and is_node(e) and e.get("t1") is not None
+    ]
+
+
+def raw_refine_latencies(events):
+    """老口径（未对齐零点）的原始差值，仅作历史对比，不参与判定。"""
+    return [
+        e["t"] - e["t1"]
+        for e in events
+        if e["ev"] == "final" and is_node(e) and e.get("t1") is not None
+    ]
+
+
+def parse_node_log(text, clock_offset=None):
+    """解析 stderr 里的 rslite.node send/recv/show 行，返回各段耗时中位数。
+
+    只聚合数字：这些行本身只有节点 id、句子 id、音频秒和时刻，不含正文/音频/token。
+    键是 (node, 句子 id)，因为重连后 id 会从 1 重新开始。
+
+    send/recv 的 t 是墙钟、audio_end/a1 是样本时钟，必须减 clock_offset 才能和
+    headless 的 t 对账（没有 clock 事件时这两项给 None）；translation/show 之间
+    是墙钟对墙钟，不需要校正。
+    """
+    sends: list[float] = []
+    finals: dict[tuple[str, int], dict] = {}
+    translations: dict[tuple[str, int], float] = {}
+    shows: dict[tuple[str, int], dict] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line.startswith(NODE_LOG_PREFIX):
+            continue
+        parts = line[len(NODE_LOG_PREFIX):].split()
+        if len(parts) < 2:
+            continue
+        kind, fields = parts[0], dict(NODE_LOG_FIELD_RE.findall(" ".join(parts[1:])))
+        try:
+            t = float(fields["t"])
+        except (KeyError, ValueError):
+            continue
+        if kind == "send":
+            if clock_offset is None:
+                continue
+            try:
+                sends.append(t - float(fields["audio_end"]) - clock_offset)
+            except (KeyError, ValueError):
+                continue
+            continue
+        try:
+            key = (fields.get("node", ""), int(fields["id"]))
+        except (KeyError, ValueError):
+            continue
+        if kind == "recv" and fields.get("ev") == "final":
+            try:
+                finals[key] = {"a1": float(fields["a1"]), "t": t}
+            except (KeyError, ValueError):
+                continue
+        elif kind == "recv" and fields.get("ev") == "translation":
+            translations[key] = t
+        elif kind == "show":
+            shows[key] = {"t": t, "dst": fields.get("dst") == "1"}
+
+    def median(xs):
+        return round(statistics.median(xs), 3) if xs else None
+
+    final_waits = (
+        [r["t"] - r["a1"] - clock_offset for r in finals.values() if r["a1"] >= 0]
+        if clock_offset is not None else []
+    )
+    tx_gaps = [translations[k] - r["t"] for k, r in finals.items() if k in translations]
+    # 上屏合并只算译文到达之后那一段；没有译文时退回「final 到达 → 上屏」。
+    show_gaps = [
+        shows[k]["t"] - translations.get(k, r["t"])
+        for k, r in finals.items() if k in shows
+    ]
+    return {
+        "send_n": len(sends),
+        "send_lag_median_s": median(sends),
+        "final_n": len(finals),
+        "final_wait_median_s": median(final_waits),
+        "translation_n": len(tx_gaps),
+        "translate_gap_median_s": median(tx_gaps),
+        "show_n": len(shows),
+        "show_gap_median_s": median(show_gaps),
+        "show_with_node_translation": sum(1 for r in shows.values() if r["dst"]),
+    }
 
 
 def check_integrity(lines, refs):
@@ -217,12 +328,14 @@ def check_integrity(lines, refs):
     return problems
 
 
-def score(events, refs, b_events=None, c_wer=None):
+def score(events, refs, b_events=None, c_wer=None, node_timings=None):
     lines = replay_lines(events)
     hyp = norm(" ".join(ln["text"] for ln in lines))
     ref = norm(" ".join(refs))
     wer = jiwer.wer(ref, hyp)
-    lats = refine_latencies(events)
+    clock_offset = sample_clock_offset(events)
+    lats = refine_latencies(events, clock_offset)
+    raw = raw_refine_latencies(events)
     first = first_text_time(events)
     b_first = first_text_time(b_events) if b_events is not None else None
     problems = check_integrity(lines, refs)
@@ -234,12 +347,16 @@ def score(events, refs, b_events=None, c_wer=None):
         "b_first_text_s": b_first,
         "refine_n": len(lats),
         "refine_median_s": statistics.median(lats) if lats else None,
+        "clock_offset_s": None if clock_offset is None else round(clock_offset, 3),
+        "refine_median_raw_s": statistics.median(raw) if raw else None,
         "problems": problems,
         "problem_counts": {
             "duplicates": sum(1 for p in problems if p.startswith("重复")),
             "dropped": sum(1 for p in problems if p.startswith("丢句")),
         },
     }
+    if node_timings is not None:
+        result["node_timings"] = node_timings
     checks = {
         "首字不慢于 B": None if first is None or b_first is None else first <= b_first,
         f"最终 WER ≤ C+{WER_MARGIN * 100:.0f}pp": None if c_wer is None else wer <= c_wer + WER_MARGIN,
@@ -259,6 +376,17 @@ def print_score(r, c_wer=None):
     print(f"最终文本 WER      {fmt(r['final_wer'], 4)}   （C 基线 {fmt(c_wer, 4)}）")
     print(f"首字时间          {fmt(r['first_text_s'])} s （B {fmt(r['b_first_text_s'])} s）")
     print(f"精修延迟中位数    {fmt(r['refine_median_s'])} s （{r['refine_n']} 条节点 final）")
+    if r.get("clock_offset_s") is None:
+        print("  ⚠️ 没有 clock 事件（第一样本零点），精修延迟不可判定；"
+              f"未对齐零点的原始中位 {fmt(r.get('refine_median_raw_s'))} s（不建议引用）")
+    else:
+        print(f"  样本时钟零点    {r['clock_offset_s']} s（已从延迟里减掉；"
+              f"未对齐时 {fmt(r.get('refine_median_raw_s'))} s）")
+    nt = r.get("node_timings")
+    if nt:
+        print(f"  拆分（中位）    段尾+识别 {fmt(nt['final_wait_median_s'])} / "
+              f"翻译 {fmt(nt['translate_gap_median_s'])} / 上屏 {fmt(nt['show_gap_median_s'])} s"
+              f"（send lag {fmt(nt['send_lag_median_s'])}）")
     print(f"重复/丢句         {r['problem_counts']['duplicates']} / {r['problem_counts']['dropped']}")
     for p in r["problems"]:
         print("  问题:", p)
@@ -270,8 +398,8 @@ def _load_refs(path, n):
     return [r["ref"] for r in load_jsonl(path)][:n]
 
 
-def _score_path(path, refs, b_events=None, c_wer=None):
-    r = score(load_events(path), refs, b_events=b_events, c_wer=c_wer)
+def _score_path(path, refs, b_events=None, c_wer=None, node_timings=None):
+    r = score(load_events(path), refs, b_events=b_events, c_wer=c_wer, node_timings=node_timings)
     r["events_file"] = str(path)
     r["refs_n"] = len(refs)
     return r
@@ -314,7 +442,14 @@ def offline_summary(out_dir, refs, c_mode_note=""):
     b_events = load_events(b_path)
     b = _score_path(b_path, refs, b_events=b_events)
     c = _score_path(c_path, refs)
-    hybrid = _score_path(h_path, refs, b_events=b_events, c_wer=c["final_wer"])
+    node_log = out_dir / "hybrid.stderr.log"
+    node_timings = None
+    if node_log.exists():
+        node_timings = parse_node_log(
+            node_log.read_text(encoding="utf-8", errors="replace"),
+            sample_clock_offset(load_events(h_path)),
+        )
+    hybrid = _score_path(h_path, refs, b_events=b_events, c_wer=c["final_wer"], node_timings=node_timings)
     hybrid["c_wer"] = c["final_wer"]
     checks = _rfc_checks(hybrid)
     return {
@@ -341,6 +476,7 @@ def main():
     ap.add_argument("--c-events", help="C 档事件流；未显式给 --c-wer 时用它计算 C 基线")
     ap.add_argument("--c-wer", type=float, help="C 档最终 WER（小数，如 0.026）")
     ap.add_argument("--offline-dir", help="包含 B.jsonl、C.jsonl、hybrid.jsonl 的目录，直接离线重算")
+    ap.add_argument("--node-log", help="混合档 stderr 日志（rslite.node 埋点）；默认用 --offline-dir 里的 hybrid.stderr.log")
     ap.add_argument("--c-mode-note", default="", help="写入 --offline-dir JSON 汇总的 C 档取舍说明")
     ap.add_argument("--json", action="store_true", help="输出 JSON，适合脚本汇总")
     a = ap.parse_args()
@@ -372,7 +508,13 @@ def main():
     c_wer = a.c_wer
     if c_wer is None and a.c_events:
         c_wer = score(load_events(a.c_events), refs)["final_wer"]
-    r = score(events, refs, b_events, c_wer)
+    node_timings = None
+    if a.node_log:
+        node_timings = parse_node_log(
+            Path(a.node_log).read_text(encoding="utf-8", errors="replace"),
+            sample_clock_offset(events),
+        )
+    r = score(events, refs, b_events, c_wer, node_timings=node_timings)
     r["refs_n"] = len(refs)
 
     if a.json:

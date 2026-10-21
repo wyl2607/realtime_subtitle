@@ -57,6 +57,7 @@ case "$mode" in
     ;;
   auto|hybrid)
     printf '%s\n' \
+      '{"ev":"clock","t":0.5,"t0":0.0}' \
       '{"ev":"volatile","t":1.0,"text":"Hal"}' \
       '{"ev":"final","id":1,"t":3.0,"t0":0.0,"t1":2.0,"text":"Hallo Welt"}' \
       '{"ev":"final","id":2,"t":6.0,"t0":2.1,"t1":4.0,"text":"Wie geht es dir"}' \

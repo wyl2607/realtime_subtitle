@@ -56,6 +56,10 @@ class Segment:
     a1: float
     audio: np.ndarray  # float32, [-1, 1]
     audio_t0: float
+    # 仅诊断：worker 入队时补上（segmenter 自己不读墙钟，保持纯样本轴）。
+    # close_wait_s = 段尾静音等待；enqueued_at = perf_counter 入队时刻，用来算排队。
+    close_wait_s: float | None = None
+    enqueued_at: float | None = None
 
 
 VadFn = Callable[[np.ndarray], float]

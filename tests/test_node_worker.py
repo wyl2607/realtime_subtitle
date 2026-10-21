@@ -1106,6 +1106,24 @@ def read_state(d):
     return json.loads((d / info_mod.ASR_STATE_FILENAME).read_text(encoding="utf-8"))
 
 
+def test_segment_log_reports_close_wait_and_queue_time():
+    """段尾静音等待和排队时间只记数字，供协调者拆分精修延迟（不打印正文）。"""
+    out, err = io.BytesIO(), io.StringIO()
+    w = Worker(io.BytesIO(speech_session(1, speech_s=3.0)), out, FakeAsr(), EnergyVad(),
+               translator_factory=lambda s, d: FakeTr(), err=err)
+    assert w.run() == EXIT_OK
+    line = next(l for l in err.getvalue().splitlines() if "[node.worker] segment " in l)
+    fields = {}
+    for part in line.split():
+        if "=" in part:
+            key, value = part.split("=", 1)
+            fields[key] = value
+    # 3s 语音 + 1s 静音：wait 是「最后一个语音样本到段收尾」的墙钟差
+    assert 0.1 <= float(fields["wait_s"]) <= 1.5
+    assert float(fields["queue_s"]) >= 0.0
+    assert float(fields["asr_s"]) >= 0.0
+
+
 def test_session_end_creates_state_file_with_session_rtf(tmp_path):
     code, w, _ = run_rtf(speech_session(3), tmp_path, cost=0.5)
     assert code == EXIT_OK
