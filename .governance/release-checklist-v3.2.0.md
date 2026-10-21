@@ -28,7 +28,7 @@
 Mac 自动验收记录：`~/projects/rs-mac-native-data/accept-v320/fallback2/`（仓库外）。跑法：`bash .governance/sprints-002-cloud-asr-first/acceptance/run_mac_auto.sh [--only gates|docs|fallback]`。
 
 附带发现：
-- **精修中位延迟 4.4–5.1s**，超过 Sprint 001 混合档 RFC 的 ≤ 4s（hybrid_score 的 `精修中位延迟 ≤ 4s` = false）。这一条不属于 v3.2.0 的 Done 4，但发布说明里不要再写「≤ 4s」。
+- ~~**精修中位延迟 4.4–5.1s**，超过 Sprint 001 混合档 RFC 的 ≤ 4s~~ **10-21 真节点复测已达标：精修中位 1.47s**（mini2 @ bf860a3，concat5，`RSLITE_CONFIG_DIR` 只放 nodes.json + tokens、不放 Groq key，否则会走云端）。原来的 4.4–5.1s 里有两笔测量误差——评分器直接用 `t - t1`、没按 clock 事件对齐零点（423e4cf 修），以及 FileSource 回放漂移（942d954 修）；节点本身也变快了：词时间戳对齐不再重复编码，每轮识别 -44%（cbaed5a）。拆分：说完 → 节点 final 1.41s、翻译 0.08s、上屏约 0s。同轮 WER 1.75%（C 0.88%，上限 1.88%），不重复不丢句 0/0；「首字不慢于 B」字面差 28ms（5.035 vs 5.007，两边首字都来自本机识别，同 node-acceptance §4 的 12ms 先例，未放宽判据）。混合档路由先选 yzwdmsnlmm（仍在 ad4fe98）时 `handshake_timeout`，退回本机后改用 mini2，原因待查。详见 `docs/node-acceptance.md` §4。
 - **验收隔离 bug 已修（ec5be35）**：`CloudConfigStore` 原来不认 `RSLITE_CONFIG_DIR` / `$HOME`。第一次跑时，假 key 和 `cloud off` 写进了真实的 `~/.config/rslite`，auto 模式也不允许协调者还原。**用户要手动执行**：`macos-native/.build/release/rslite --clear-groq-key && macos-native/.build/release/rslite --cloud on`（`quota-ledger.json` 里只多了一条 10 秒记录，可以删）。
 
 ## 10-19 合并与节点
