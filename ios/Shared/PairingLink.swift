@@ -28,6 +28,16 @@ enum PairingLink {
     static let host = "pair"
     static let requiredVersion = "1"
 
+    /// 扫码或点链接把 App 拉起来时，配对框里预填什么。只认 rsnode://pair，其余返回 nil。
+    /// 只预填、不应用：token 写进钥匙串前要用户自己点「应用配对」（与 Android 一致）。
+    static func prefillText(for url: URL) -> String? {
+        guard url.scheme?.lowercased() == scheme,
+              url.host?.lowercased() == host else {
+            return nil
+        }
+        return url.absoluteString
+    }
+
     static func parse(_ string: String) -> NodeConfig? {
         guard let url = URL(string: string),
               let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {

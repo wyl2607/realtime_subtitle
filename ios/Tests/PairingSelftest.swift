@@ -1,6 +1,14 @@
 import Foundation
 
 func runPairingSelftest(_ check: (Bool, String) -> Void) {
+    // 扫码 / 点链接打开 App：只有 rsnode://pair 链接才预填，别的 URL 一律不碰（不自动应用，用户确认后才写入）。
+    do {
+        let link = "rsnode://pair?v=1&id=node123&host=mini2.tailnet.ts.net&port=8791&name=Mini2&token=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        check(PairingLink.prefillText(for: URL(string: link)!) == link, "rsnode://pair 链接应原样预填")
+        check(PairingLink.prefillText(for: URL(string: "https://example.com/pair?v=1")!) == nil, "非 rsnode 链接不预填")
+        check(PairingLink.prefillText(for: URL(string: "rsnode://other?v=1")!) == nil, "rsnode 非 pair 路径不预填")
+        check(PairingLink.prefillText(for: URL(string: "RSNODE://PAIR?v=1")!) != nil, "scheme/host 大小写不敏感")
+    }
     let validLink = "rsnode://pair?v=1&id=node123&host=mini2.tailnet.ts.net&port=8791&tok=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&name=Mini2"
     let validWithLang = "rsnode://pair?v=1&id=node123&host=mini2.tailnet.ts.net&port=8791&tok=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&name=Mini2&src=de&dst=zh"
 

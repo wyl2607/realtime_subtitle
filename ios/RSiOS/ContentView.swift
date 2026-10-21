@@ -35,258 +35,272 @@ struct ContentView: View {
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 24) {
-                Text("RSiOS Spike")
-                    .font(.largeTitle)
-                    .fontWeight(.bold)
+            // 内容比一屏高：必须能滚动。没有 ScrollView 时 VStack 居中溢出，顶部的 Broadcast 按钮、
+            // 配对输入框被裁到状态栏后面，用户既滑不动也点不到（iPhone 15 Pro 真机复现）。
+            ScrollView {
+                VStack(spacing: 24) {
+                    Text("RSiOS Spike")
+                        .font(.largeTitle)
+                        .fontWeight(.bold)
 
-                VStack(spacing: 12) {
-                    Text("Broadcast Extension Picker")
-                        .font(.headline)
-                    BroadcastPickerView()
-                        .frame(height: 50)
-                }
-
-                Divider()
-
-                VStack(spacing: 12) {
-                    Text("节点配对")
-                        .font(.headline)
-
-                    HStack {
-                        TextField("粘贴 rsnode://pair?... 链接", text: $pairingLinkText)
-                            .textFieldStyle(.roundedBorder)
-                            .autocapitalization(.none)
-                            .disableAutocorrection(true)
-
-                        Button("粘贴配对链接") {
-                            if let pasteboard = UIPasteboard.general.string {
-                                pairingLinkText = pasteboard
-                            }
-                        }
-                        .buttonStyle(.bordered)
+                    VStack(spacing: 12) {
+                        Text("Broadcast Extension Picker")
+                            .font(.headline)
+                        BroadcastPickerView()
+                            .frame(width: 60, height: 60)
+                        Text("点上面的圆形按钮 → 选「实时字幕」→ 开始直播")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
                     }
 
-                    Button("应用配对") {
-                        applyPairingLink()
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(pairingLinkText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Divider()
 
-                    if !pairingStatus.isEmpty {
-                        Text(pairingStatus)
-                            .font(.caption)
-                            .foregroundColor(pairingStatus.hasPrefix("已配对") ? .green : .red)
-                    }
+                    VStack(spacing: 12) {
+                        Text("节点配对")
+                            .font(.headline)
 
-                    if !pairedConfigDisplay.isEmpty {
-                        Text("已配对：\(pairedConfigDisplay)")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                }
-
-                Divider()
-
-                VStack(spacing: 12) {
-                    Text("识别引擎")
-                        .font(.headline)
-
-                    Picker("引擎", selection: $engineMode) {
-                        Text("自动").tag("auto")
-                        Text("电脑节点").tag("node")
-                        Text("本机").tag("local")
-                    }
-                    .pickerStyle(.segmented)
-                    .onChange(of: engineMode) { _, newValue in
-                        SharedKeychain.writeEngineMode(newValue)
-                    }
-                    .onAppear {
-                        engineMode = SharedKeychain.readEngineMode()
-                    }
-
-                    Button(action: prepareLocalAssets) {
                         HStack {
-                            if isPreparing {
-                                ProgressView().scaleEffect(0.8)
-                            }
-                            Text(isPreparing ? "准备中..." : "准备本机识别资源")
-                        }
-                        .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(isPreparing)
+                            TextField("粘贴 rsnode://pair?... 链接", text: $pairingLinkText)
+                                .textFieldStyle(.roundedBorder)
+                                .autocapitalization(.none)
+                                .disableAutocorrection(true)
 
-                    if !prepareStatus.isEmpty {
-                        Text(prepareStatus)
-                            .font(.caption)
-                            .foregroundColor(prepareStatus.hasPrefix("错误") || prepareStatus.hasPrefix("需要") ? .red : .green)
-                    }
-                }
-
-                Divider()
-
-                VStack(spacing: 12) {
-                    Text("云端识别（Groq）")
-                        .font(.headline)
-
-                    if groqKeyMasked.isEmpty {
-                        SecureField("Groq API key", text: $groqKeyInput)
-                            .textFieldStyle(.roundedBorder)
-                            .autocapitalization(.none)
-                            .disableAutocorrection(true)
-
-                        Button("保存 key") {
-                            saveGroqKey()
-                        }
-                        .buttonStyle(.bordered)
-                        .disabled(groqKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    } else {
-                        HStack {
-                            Text("已保存：\(groqKeyMasked)")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                            Spacer()
-                            Button("清除 key") {
-                                clearGroqKey()
+                            Button("粘贴配对链接") {
+                                if let pasteboard = UIPasteboard.general.string {
+                                    pairingLinkText = pasteboard
+                                }
                             }
                             .buttonStyle(.bordered)
                         }
-                    }
 
-                    Toggle("启用云端识别", isOn: $cloudEnabled)
-                        .onChange(of: cloudEnabled) { _, newValue in
-                            SharedKeychain.writeCloudEnabled(newValue)
+                        Button("应用配对") {
+                            applyPairingLink()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(pairingLinkText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                        if !pairingStatus.isEmpty {
+                            Text(pairingStatus)
+                                .font(.caption)
+                                .foregroundColor(pairingStatus.hasPrefix("已配对") ? .green : .red)
                         }
 
-                    if !cloudKeyStatus.isEmpty {
-                        Text(cloudKeyStatus)
-                            .font(.caption)
-                            .foregroundColor(cloudKeyStatus.hasPrefix("已保存") ? .green : .red)
+                        if !pairedConfigDisplay.isEmpty {
+                            Text("已配对：\(pairedConfigDisplay)")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
                     }
 
-                    Text("开着时音频片段会发给 Groq；关掉后只走电脑节点和本机。")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
+                    Divider()
 
-                Divider()
+                    VStack(spacing: 12) {
+                        Text("识别引擎")
+                            .font(.headline)
 
-                VStack(spacing: 12) {
-                    Text("App State: \(appStateMonitor.isInBackground ? "后台" : "前台")")
-                        .font(.headline)
-                        .foregroundColor(appStateMonitor.isInBackground ? .orange : .green)
-
-                    Text("Picture-in-Picture")
-                        .font(.headline)
-
-                    PiPHostView(pipManager: pipManager)
-                        .frame(width: 320, height: 90)
-                        .background(Color(.systemGray6))
-                        .cornerRadius(8)
-
-                    Button(action: {
-                        if pipManager.isPiPActive {
-                            pipManager.stopPiP()
-                        } else {
-                            pipManager.startPiP()
+                        Picker("引擎", selection: $engineMode) {
+                            Text("自动").tag("auto")
+                            Text("电脑节点").tag("node")
+                            Text("本机").tag("local")
                         }
-                    }) {
-                        Text(pipManager.isPiPActive ? "Stop PiP" : "Start PiP")
+                        .pickerStyle(.segmented)
+                        .onChange(of: engineMode) { _, newValue in
+                            SharedKeychain.writeEngineMode(newValue)
+                        }
+                        .onAppear {
+                            engineMode = SharedKeychain.readEngineMode()
+                        }
+
+                        Button(action: prepareLocalAssets) {
+                            HStack {
+                                if isPreparing {
+                                    ProgressView().scaleEffect(0.8)
+                                }
+                                Text(isPreparing ? "准备中..." : "准备本机识别资源")
+                            }
                             .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(pipManager.isStarting)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(isPreparing)
 
-                    HStack {
-                        Text("PiP Possible: \(pipManager.isPictureInPicturePossible ? "Yes" : "No")")
-                            .font(.caption)
-                            .foregroundColor(pipManager.isPictureInPicturePossible ? .green : .red)
-                        Spacer()
-                        Text(pipManager.pipStatusLine)
+                        if !prepareStatus.isEmpty {
+                            Text(prepareStatus)
+                                .font(.caption)
+                                .foregroundColor(prepareStatus.hasPrefix("错误") || prepareStatus.hasPrefix("需要") ? .red : .green)
+                        }
+                    }
+
+                    Divider()
+
+                    VStack(spacing: 12) {
+                        Text("云端识别（Groq）")
+                            .font(.headline)
+
+                        if groqKeyMasked.isEmpty {
+                            SecureField("Groq API key", text: $groqKeyInput)
+                                .textFieldStyle(.roundedBorder)
+                                .autocapitalization(.none)
+                                .disableAutocorrection(true)
+
+                            Button("保存 key") {
+                                saveGroqKey()
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(groqKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        } else {
+                            HStack {
+                                Text("已保存：\(groqKeyMasked)")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Spacer()
+                                Button("清除 key") {
+                                    clearGroqKey()
+                                }
+                                .buttonStyle(.bordered)
+                            }
+                        }
+
+                        Toggle("启用云端识别", isOn: $cloudEnabled)
+                            .onChange(of: cloudEnabled) { _, newValue in
+                                SharedKeychain.writeCloudEnabled(newValue)
+                            }
+
+                        if !cloudKeyStatus.isEmpty {
+                            Text(cloudKeyStatus)
+                                .font(.caption)
+                                .foregroundColor(cloudKeyStatus.hasPrefix("已保存") ? .green : .red)
+                        }
+
+                        Text("开着时音频片段会发给 Groq；关掉后只走电脑节点和本机。")
                             .font(.caption)
                             .foregroundColor(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                     }
 
-                    if let error = pipManager.lastError {
-                        Text("Error: \(error)")
-                            .font(.caption)
-                            .foregroundColor(.red)
+                    Divider()
+
+                    VStack(spacing: 12) {
+                        Text("App State: \(appStateMonitor.isInBackground ? "后台" : "前台")")
+                            .font(.headline)
+                            .foregroundColor(appStateMonitor.isInBackground ? .orange : .green)
+
+                        Text("Picture-in-Picture")
+                            .font(.headline)
+
+                        PiPHostView(pipManager: pipManager)
+                            .frame(width: 320, height: 90)
+                            .background(Color(.systemGray6))
+                            .cornerRadius(8)
+
+                        Button(action: {
+                            if pipManager.isPiPActive {
+                                pipManager.stopPiP()
+                            } else {
+                                pipManager.startPiP()
+                            }
+                        }) {
+                            Text(pipManager.isPiPActive ? "Stop PiP" : "Start PiP")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(pipManager.isStarting)
+
+                        HStack {
+                            Text("PiP Possible: \(pipManager.isPictureInPicturePossible ? "Yes" : "No")")
+                                .font(.caption)
+                                .foregroundColor(pipManager.isPictureInPicturePossible ? .green : .red)
+                            Spacer()
+                            Text(pipManager.pipStatusLine)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+
+                        if let error = pipManager.lastError {
+                            Text("Error: \(error)")
+                                .font(.caption)
+                                .foregroundColor(.red)
+                        }
                     }
-                }
 
-                Divider()
+                    Divider()
 
-                VStack(spacing: 8) {
-                    Text("Extension Status (Keychain)")
-                        .font(.headline)
-                    Text(statusMonitor.keychainStatus)
-                        .font(.system(.body, design: .monospaced))
-                        .foregroundColor(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding()
-                        .background(Color(.systemGray6))
-                        .cornerRadius(8)
-                }
-
-                VStack(spacing: 8) {
-                    Text("最近句对 (来自扩展)")
-                        .font(.headline)
-                    if linesMonitor.lines.isEmpty {
-                        Text("暂无字幕")
+                    VStack(spacing: 8) {
+                        Text("Extension Status (Keychain)")
+                            .font(.headline)
+                        Text(statusMonitor.keychainStatus)
                             .font(.system(.body, design: .monospaced))
                             .foregroundColor(.secondary)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding()
                             .background(Color(.systemGray6))
                             .cornerRadius(8)
-                    } else {
-                        ForEach(linesMonitor.lines.indices, id: \.self) { idx in
-                            let line = linesMonitor.lines[idx]
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("[\(line.id)] \(line.src)")
-                                    .font(.system(.body, design: .monospaced))
-                                    .foregroundColor(.primary)
-                                Text(line.dst.isEmpty ? "…" : line.dst)
-                                    .font(.system(.body, design: .monospaced))
-                                    .foregroundColor(.secondary)
+                    }
+
+                    VStack(spacing: 8) {
+                        Text("最近句对 (来自扩展)")
+                            .font(.headline)
+                        if linesMonitor.lines.isEmpty {
+                            Text("暂无字幕")
+                                .font(.system(.body, design: .monospaced))
+                                .foregroundColor(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding()
+                                .background(Color(.systemGray6))
+                                .cornerRadius(8)
+                        } else {
+                            ForEach(linesMonitor.lines.indices, id: \.self) { idx in
+                                let line = linesMonitor.lines[idx]
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("[\(line.id)] \(line.src)")
+                                        .font(.system(.body, design: .monospaced))
+                                        .foregroundColor(.primary)
+                                    Text(line.dst.isEmpty ? "…" : line.dst)
+                                        .font(.system(.body, design: .monospaced))
+                                        .foregroundColor(.secondary)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding()
+                                .background(Color(.systemGray6))
+                                .cornerRadius(8)
                             }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding()
-                            .background(Color(.systemGray6))
-                            .cornerRadius(8)
                         }
                     }
-                }
 
-                VStack(spacing: 8) {
-                    Text("Darwin Notifications")
-                        .font(.headline)
-                    Text("Tick: \(statusMonitor.darwinNotificationCount)  Lines: \(linesMonitor.darwinNotificationCount)")
-                        .font(.system(.body, design: .monospaced))
-                        .foregroundColor(.secondary)
-                }
-
-                Divider()
-
-                VStack(spacing: 12) {
-                    Text("今天的字幕")
-                        .font(.headline)
-                    NavigationLink {
-                        TranscriptView(store: transcriptStore, refreshToken: transcriptRefresh)
-                    } label: {
-                        Text("查看今天的字幕")
+                    VStack(spacing: 8) {
+                        Text("Darwin Notifications")
+                            .font(.headline)
+                        Text("Tick: \(statusMonitor.darwinNotificationCount)  Lines: \(linesMonitor.darwinNotificationCount)")
+                            .font(.system(.body, design: .monospaced))
+                            .foregroundColor(.secondary)
                     }
-                }
 
-                Spacer()
+                    Divider()
+
+                    VStack(spacing: 12) {
+                        Text("今天的字幕")
+                            .font(.headline)
+                        NavigationLink {
+                            TranscriptView(store: transcriptStore, refreshToken: transcriptRefresh)
+                        } label: {
+                            Text("查看今天的字幕")
+                        }
+                    }
+
+                    Spacer()
+                }
+                .padding()
             }
-            .padding()
+            .scrollDismissesKeyboard(.interactively)
             .navigationTitle("RSiOS")
             .onAppear {
                 loadPairedConfig()
                 loadCloudSettings()
+            }
+            // 相机扫配对码 / 点 rsnode://pair 链接：只把链接填进配对框，用户点「应用配对」才写入钥匙串。
+            .onOpenURL { url in
+                guard let text = PairingLink.prefillText(for: url) else { return }
+                pairingLinkText = text
+                pairingStatus = "已填入配对链接，确认后点「应用配对」"
             }
             .onReceive(linesMonitor.$lines) { lines in
                 transcriptStore.ingest(lines.map {
@@ -410,9 +424,15 @@ struct ContentView: View {
 
 struct BroadcastPickerView: UIViewRepresentable {
     func makeUIView(context: Context) -> RPSystemBroadcastPickerView {
-        let picker = RPSystemBroadcastPickerView()
+        // 必须给非零尺寸：系统在 init 时按这个尺寸建内部按钮，零尺寸建出来的按钮不可见也点不到。
+        let picker = RPSystemBroadcastPickerView(frame: CGRect(x: 0, y: 0, width: 60, height: 60))
         picker.preferredExtension = "com.yilinwang.realtimesubtitle.broadcast"
         picker.showsMicrophoneButton = false
+        // 系统按钮默认画成黑色，深色界面上看不见（真机上只剩一块空白，用户找不到开播入口）。
+        // 换成 label 色：深色模式白、浅色模式黑。
+        for case let button as UIButton in picker.subviews {
+            button.imageView?.tintColor = .label
+        }
         return picker
     }
 
