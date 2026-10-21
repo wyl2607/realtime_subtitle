@@ -1266,7 +1266,9 @@ final class SubtitleEngine {
     }
 
     private func writeStatus(_ text: String) {
-        let success = SharedKeychain.writeExtStatus(text)
+        // start/finish/错误也会写状态；所有行都带来源，主 App 才不会把自己刚写的短状态误判成旧版广播。
+        let sourcedText = text.contains("src=") ? text : "\(text) src=\(source)"
+        let success = SharedKeychain.writeExtStatus(sourcedText)
         if !success {
             logger.error("Failed to write status to keychain")
         }

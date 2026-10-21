@@ -15,6 +15,7 @@ struct ContentView: View {
     @StateObject private var statusMonitor = StatusMonitor()
     @StateObject private var linesMonitor = LinesMonitor()
     @StateObject private var transcriptStore = TranscriptStore()
+    @StateObject private var micCapture = MicCapture()
     @ObservedObject private var appStateMonitor = AppStateMonitor.shared
 
     @State private var pairingLinkText = ""
@@ -32,6 +33,32 @@ struct ContentView: View {
     @State private var cloudKeyStatus: String = ""
     /// 每次收到新句对就 +1：「今天的字幕」页面靠它触发重新读存档文件。
     @State private var transcriptRefresh = 0
+
+    private var micStatusText: String {
+        switch micCapture.state {
+        case .idle:
+            DesignTokens.Text.micStatusIdle
+        case .running:
+            DesignTokens.Text.micStatusRunning
+        case .denied:
+            DesignTokens.Text.micPermissionDenied
+        case .blockedByBroadcast:
+            DesignTokens.Text.micBlockedByBroadcast
+        case .error(let message):
+            message
+        }
+    }
+
+    private var micStatusColor: Color {
+        switch micCapture.state {
+        case .running:
+            .green
+        case .idle:
+            .secondary
+        case .denied, .blockedByBroadcast, .error:
+            .red
+        }
+    }
 
     var body: some View {
         NavigationStack {
@@ -51,6 +78,31 @@ struct ContentView: View {
                         Text("点上面的圆形按钮 → 选「实时字幕」→ 开始直播")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
+                    }
+
+                    VStack(spacing: 12) {
+                        Text(DesignTokens.Text.micSubtitleTitle)
+                            .font(.headline)
+                        HStack {
+                            Button(DesignTokens.Text.micStartButton) {
+                                micCapture.start(
+                                    extensionStatus: statusMonitor.keychainStatus,
+                                    extensionStatusUpdatedAt: statusMonitor.lastStatusUpdate
+                                )
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(micCapture.isRunning)
+
+                            Button(DesignTokens.Text.micStopButton) {
+                                micCapture.stop()
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(!micCapture.isRunning)
+                        }
+                        Text(micStatusText)
+                            .font(.caption)
+                            .foregroundStyle(micStatusColor)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                     }
 
                     Divider()
@@ -308,6 +360,12 @@ struct ContentView: View {
                 })
                 transcriptRefresh += 1
             }
+        }
+        .onReceive(statusMonitor.$lastStatusUpdate) { updatedAt in
+            micCapture.reconcileBroadcast(
+                extensionStatus: statusMonitor.keychainStatus,
+                extensionStatusUpdatedAt: updatedAt
+            )
         }
     }
 
@@ -910,6 +968,8 @@ extension DateFormatter {
 final class StatusMonitor: ObservableObject {
     @Published var keychainStatus: String = "无"
     @Published var darwinNotificationCount: Int = 0
+    /// 只有 Darwin 通知才代表扩展刚写过状态；轮询读到旧 Keychain 值不能延长广播占用时间。
+    @Published private(set) var lastStatusUpdate: Date?
 
     private var timer: Timer?
     private var darwinObserver: UnsafeRawPointer?
@@ -938,9 +998,12 @@ final class StatusMonitor: ObservableObject {
         timer = nil
     }
 
-    private func updateKeychainStatus() {
+    private func updateKeychainStatus(markingFreshUpdate: Bool = false) {
         DispatchQueue.main.async {
             self.keychainStatus = SharedKeychain.readExtStatus() ?? "无"
+            if markingFreshUpdate {
+                self.lastStatusUpdate = Date()
+            }
         }
     }
 
@@ -954,6 +1017,7 @@ final class StatusMonitor: ObservableObject {
             let monitor = Unmanaged<StatusMonitor>.fromOpaque(observer).takeUnretainedValue()
             DispatchQueue.main.async {
                 monitor.darwinNotificationCount += 1
+                monitor.updateKeychainStatus(markingFreshUpdate: true)
             }
         }, name, nil, .deliverImmediately)
 

@@ -21,3 +21,7 @@ xcrun swiftc -O ios/Shared/Routing.swift ios/Shared/CloudClient.swift ios/Shared
 # I5：SampleHandler 抽出来的纯判定（切回时机、按会话回填译文、广播结束闸门、换 key 作废）。
 xcrun swiftc -O ios/Shared/RecentLines.swift ios/Tests/RecentLinesSelftest.swift -o .tmp/handoffselftest
 .tmp/handoffselftest
+# I8-B：广播/麦克风互斥和 PiP 会话回退必须可在命令行稳定复现，
+# 不把 Keychain、音频硬件或 ReplayKit 带进单元自测。
+xcrun swiftc -O ios/Shared/CaptureArbiter.swift ios/Tests/CaptureArbiterSelftest.swift -o .tmp/capturearbiterselftest
+.tmp/capturearbiterselftest
