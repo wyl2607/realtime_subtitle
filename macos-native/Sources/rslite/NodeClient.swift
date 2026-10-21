@@ -203,6 +203,12 @@ private struct ReadyAudioBuffer {
     private var chunks: [WireAudio] = []
     private var byteCount = 0
 
+    // 私有存储属性会让 memberwise init 变成 private，Swift 6.3 里同文件的
+    // NodeClient 就构造不了；显式给出 internal init。
+    init(maxBytes: Int) {
+        self.maxBytes = maxBytes
+    }
+
     var isEmpty: Bool { chunks.isEmpty }
 
     mutating func append(_ audio: WireAudio) {
@@ -635,9 +641,10 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
             readyBuffer.removeAll()
             return (socket, session)
         }
-        guard let (socket, session) = pair else {
+        guard let pair else {
             return
         }
+        let (socket, session): (NodeWebSocketTask?, URLSession?) = pair
         let heartbeat = lock.withLockValue { heartbeatTask }
         heartbeat?.cancel()
         socket?.cancel(with: .normalClosure, reason: nil)

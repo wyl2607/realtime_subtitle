@@ -798,6 +798,7 @@ final class NodeRouter: @unchecked Sendable {
                 break
             }
             let (client, session, connecting, connectingSession, connectingIsReplaying) = lock.withLockValue {
+                () -> (NodeClient?, NodeSessionRef?, NodeClient?, NodeSessionRef?, Bool) in
                 (
                     currentClient,
                     currentSession,
