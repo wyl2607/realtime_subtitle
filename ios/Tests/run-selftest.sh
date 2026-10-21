@@ -18,3 +18,6 @@ xcrun swiftc -O ios/Shared/Routing.swift ios/Shared/LineStore.swift ios/Shared/A
 # 不发网络请求，也不读任何真实 key。
 xcrun swiftc -O ios/Shared/Routing.swift ios/Shared/CloudClient.swift ios/Shared/QuotaLedger.swift ios/Shared/CloudSegmenter.swift ios/Tests/CloudSelftestMain.swift ios/Tests/CloudClientSelftest.swift ios/Tests/QuotaLedgerSelftest.swift ios/Tests/CloudSegmenterSelftest.swift -o .tmp/cloudselftest
 .tmp/cloudselftest
+# I5：SampleHandler 抽出来的纯判定（切回时机、按会话回填译文、广播结束闸门、换 key 作废）。
+xcrun swiftc -O ios/Shared/RecentLines.swift ios/Tests/RecentLinesSelftest.swift -o .tmp/handoffselftest
+.tmp/handoffselftest
