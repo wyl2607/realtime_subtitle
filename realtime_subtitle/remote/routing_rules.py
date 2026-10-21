@@ -64,6 +64,12 @@ class RoutingState:
         if event_type == "quota_update":
             self._quota_update(float(event["usage_percent"]))
             return
+        if event_type == "quota_reset_confirmed":
+            # Caller must verify a server-period rollover and recompute *all*
+            # quota windows before emitting this event.
+            if self.cloud_enabled and self.has_key and not self.key_invalid and self.cloud_state == "cooldown_quota":
+                self._quota_update(float(event.get("usage_percent", 100)))
+            return
         if event_type == "cooldown_expired":
             if self.cloud_state.startswith("cooldown_"):
                 self.cloud_state = "probe"
@@ -142,7 +148,7 @@ class RoutingState:
             self.action = "mark_key_invalid"
             return
         if status == 429:
-            if self.key_invalid:
+            if self.key_invalid or self.cloud_state == "disabled_invalid_key":
                 # 失效 key 只有 key_modified 能解除。401 之后迟到的 429 是并发在飞请求的
                 # 回执，若照常进限流冷却，冷却到期会 probe→tier() 回到 cloud，
                 # 把已经失效的 key 又带回云端发请求，所以这里整条忽略。
