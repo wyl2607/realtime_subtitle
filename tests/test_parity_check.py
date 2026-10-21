@@ -123,3 +123,20 @@ def test_android_missing_tokens(parity, generator, tmp_path, capsys):
 
     assert parity.main(["--android", str(android)], root=repo) == 1
     assert "MISSING" in capsys.readouterr().out
+
+
+def test_crlf_checkout_is_not_drift(tmp_path):
+    """Windows 签出（autocrlf）把副本变成 CRLF，内容没变，不能报 DRIFT。"""
+    from pathlib import Path as _P
+    src = _P(__file__).resolve().parents[1]
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("check_parity_crlf", src / "scripts/design/check_parity.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    a = tmp_path / "a.json"
+    b = tmp_path / "b.json"
+    a.write_bytes(b'{\n  "x": 1\n}\n')
+    b.write_bytes(b'{\r\n  "x": 1\r\n}\r\n')
+    assert mod._compare_file(a, b, tmp_path, allow_missing=False)
+    b.write_bytes(b'{\r\n  "x": 2\r\n}\r\n')
+    assert not mod._compare_file(a, b, tmp_path, allow_missing=False)

@@ -45,6 +45,16 @@ def _first_diff_line(left: bytes, right: bytes) -> int:
     return min(len(a), len(b)) + 1
 
 
+def _read_normalized(path: Path) -> bytes:
+    """读文件并把 CRLF 统一成 LF 再比。
+
+    Windows 上 git 默认 core.autocrlf=true，签出的文本副本是 CRLF；gen_tokens.py --check
+    用 read_text（通用换行）所以不在乎，这里也必须一样，否则 Windows 上永远报 DRIFT。
+    只统一换行，其余仍逐字节比对。
+    """
+    return path.read_bytes().replace(b"\r\n", b"\n")
+
+
 def _compare_file(expected: Path, actual: Path, root: Path, allow_missing: bool) -> bool:
     """返回 True 表示这项算通过（一致，或被 --allow-missing 放过）。"""
     if not expected.exists():
@@ -58,8 +68,8 @@ def _compare_file(expected: Path, actual: Path, root: Path, allow_missing: bool)
             return True
         print(f"MISSING {shown}")
         return False
-    left = expected.read_bytes()
-    right = actual.read_bytes()
+    left = _read_normalized(expected)
+    right = _read_normalized(actual)
     if left == right:
         return True
     print(f"DRIFT {shown} 首处不同在第 {_first_diff_line(left, right)} 行")
@@ -85,11 +95,11 @@ def _check_repo(root: Path, allow_missing: bool) -> bool:
         else:
             print(f"MISSING {_display(actual, root)}")
             ok = False
-    elif actual.read_bytes() != expected:
+    elif _read_normalized(actual) != expected:
         ok = False
         print(
             f"DRIFT {_display(actual, root)} 首处不同在第 "
-            f"{_first_diff_line(expected, actual.read_bytes())} 行"
+            f"{_first_diff_line(expected, _read_normalized(actual))} 行"
         )
     return ok
 
