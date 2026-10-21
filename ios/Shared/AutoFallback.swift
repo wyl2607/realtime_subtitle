@@ -28,30 +28,31 @@ struct AutoFallbackDecision: Equatable {
     let status: String?
 }
 
-/// 状态文案常量。L-D 生成 DesignTokens 后改为取令牌。
+/// 状态文案：全部取自设计令牌（spec 010 C3），代码里不写死中文。
+/// 令牌是「后缀/前缀」形态，节点名拼在前面，这样同一句文案四端一致。
 enum AutoFallbackStatus {
     static func connected(_ nodeName: String) -> String {
-        "\(nodeName) 已连接"
+        nodeName + DesignTokens.Text.nodeConnectedSuffix
     }
 
     static func nodeUnavailableLocal(_ nodeName: String) -> String {
-        "\(nodeName) 不可用，已用本机"
+        nodeName + DesignTokens.Text.nodeUnavailableSuffix
     }
 
     static func nodeUnavailableNoLocal(_ nodeName: String) -> String {
-        "\(nodeName) 不可用，正在重连"
+        nodeName + DesignTokens.Text.nodeUnavailableReconnectingSuffix
     }
 
     static func waitingSentenceEnd(_ nodeName: String) -> String {
-        "\(nodeName) 已恢复，等本句结束后切回"
+        nodeName + DesignTokens.Text.nodeRecoveredWaitingSuffix
     }
 
     static func switchedBack(_ nodeName: String) -> String {
-        "\(nodeName) 已恢复，已切回节点"
+        nodeName + DesignTokens.Text.nodeRecoveredSwitchedSuffix
     }
 
     static func localUnavailable(_ nodeName: String) -> String {
-        "本机识别不可用，正在重连 \(nodeName)"
+        DesignTokens.Text.localUnavailableReconnectingPrefix + nodeName
     }
 }
 
@@ -62,6 +63,7 @@ enum AutoFallbackStatus {
 /// - 节点恢复 ready → 若本机当前句还在进行中则先等它定稿，避免半句被截断；
 ///   没有进行中的句子就立刻切回；
 /// - 本机不可用（iOS < 26）→ 不启本机，只让 ReconnectPolicy 继续重连并显示状态。
+/// - 广播已结束 → 之后的事件一律不动作（迟到的节点事件不能把本机引擎重新拉起来）。
 ///
 /// 它不碰网络、不启动引擎、不读 Keychain，所以能在 macOS 上用 swiftc 跑自测。
 struct AutoFallback {
@@ -70,10 +72,18 @@ struct AutoFallback {
     private(set) var usingLocal = false
     private(set) var sentenceInProgress = false
     private(set) var awaitingSentenceEnd = false
+    /// 广播是否还在进行。广播结束后节点那边还会抛来迟到的 close/ready 事件，
+    /// 那时既不该把本机引擎重新拉起来，也不该改状态行。
+    private(set) var broadcastActive = true
 
     init(nodeName: String, localAvailable: Bool) {
         self.nodeName = nodeName
         self.localAvailable = localAvailable
+    }
+
+    /// 广播结束：之后的事件一律不再产生动作。
+    mutating func broadcastEnded() {
+        broadcastActive = false
     }
 
     private var displayName: String {
@@ -81,6 +91,12 @@ struct AutoFallback {
     }
 
     mutating func handle(_ event: AutoFallbackEvent) -> AutoFallbackDecision {
+        // 广播已经结束：后面来的都是迟到的事件。
+        // 少了这道闸，广播结束瞬间的节点 close 事件会把本机引擎重新拉起来，
+        // 而节点根本连不上，用户看到的是「字幕还在跑但没有节点」。
+        guard broadcastActive else {
+            return AutoFallbackDecision(action: .keep, status: nil)
+        }
         switch event {
         case .nodeReady:
             guard usingLocal else {

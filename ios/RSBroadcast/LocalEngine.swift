@@ -19,6 +19,10 @@ final class LocalEngine {
 
     private let onFinal: (Int, String) -> Void
     private let onTranslation: (Int, String) -> Void
+    /// 这一句已经收尾：译文落地了，或者翻译失败了。
+    /// 切回节点必须等这一刻——早一步切走会把还在路上的译文取消掉，
+    /// 用户看到的就是「最后一句只剩原文」。
+    private let onSentenceSettled: (Int) -> Void
     private let onStatus: (String) -> Void
 
     private let sourceLocale = Locale.Language(identifier: "de")
@@ -36,10 +40,12 @@ final class LocalEngine {
     init(
         onFinal: @escaping (Int, String) -> Void,
         onTranslation: @escaping (Int, String) -> Void,
+        onSentenceSettled: @escaping (Int) -> Void,
         onStatus: @escaping (String) -> Void
     ) {
         self.onFinal = onFinal
         self.onTranslation = onTranslation
+        self.onSentenceSettled = onSentenceSettled
         self.onStatus = onStatus
     }
 
@@ -217,6 +223,10 @@ final class LocalEngine {
                 onStatus("tx_error")
             }
         }
+
+        // 翻译成功、翻译失败、或者压根没有翻译会话，这一句都算收尾了。
+        // 放在最后：调用方据此判断「本机这边可以放手了」，能安全切回节点。
+        onSentenceSettled(id)
     }
 
     private func waitForResults() async {

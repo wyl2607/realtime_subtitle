@@ -56,6 +56,9 @@ enum DesignTokens {
         static let nodeRecoveredWaitingSuffix: String = " 已恢复，等本句结束后切回"
         static let nodeRecoveredSwitchedSuffix: String = " 已恢复，已切回节点"
         static let nodeLoadingSuffix: String = " 正在加载模型…"
+        static let nodeConnectedSuffix: String = " 已连接"
+        static let nodeUnavailableReconnectingSuffix: String = " 不可用，正在重连"
+        static let localUnavailableReconnectingPrefix: String = "本机识别不可用，正在重连 "
     }
     enum Palette {
         static let text: [(name: String, hex: String)] = [(name: "白", hex: "#F0F0F0"), (name: "暖黄", hex: "#FFE894"), (name: "浅青", hex: "#9FE7F5"), (name: "浅绿", hex: "#B8F2B0"), (name: "浅粉", hex: "#FFC4D6")]

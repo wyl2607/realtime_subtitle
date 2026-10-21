@@ -50,10 +50,25 @@ class SampleHandler: RPBroadcastSampleHandler {
     private let connectionQueue = DispatchQueue(label: "com.wyl2607.rsios.spike.connection")
     private var broadcastActive = false
 
+    /// 引擎会话代号：每次开一个新的引擎会话换一个新代号。
+    ///
+    /// 为什么需要：本机引擎的 id 每次启动都从 1 开始，节点会话的 id 也按会话重新计数。
+    /// 主 App 靠 id 去重（同 id 视为同一句、译文后到就改写那一行），
+    /// 只看 id 的话，后一个会话的第 1 句会把前一个会话的第 1 句覆盖掉，
+    /// 用户看到的是字幕被改写而不是追加。带上代号之后主 App 用「代号 + id」当键。
+    private var localSessionCode: String = ""
+    private var nodeSessionCode: String = ""
+
+    /// 本机这边原文已定稿、译文还没收尾的句子。
+    /// 切回节点要等它们收尾，否则最后一句只剩原文。
+    private var pendingLocalSettles: Set<Int> = []
+
     struct RecentLine: Codable {
         let id: Int
         let src: String
         var dst: String
+        /// 产生这一句的引擎会话代号：主 App 用「代号 + id」去重。
+        let session: String
     }
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
@@ -121,6 +136,8 @@ class SampleHandler: RPBroadcastSampleHandler {
 
         let currentSession = stateQueue.sync { () -> NodeSession? in
             broadcastActive = false
+            // 决策器也要知道广播结束了：之后迟到的节点事件不许再拉起本机引擎。
+            self.autoFallback?.broadcastEnded()
             let currentSession = session
             session = nil
             return currentSession
@@ -160,6 +177,7 @@ class SampleHandler: RPBroadcastSampleHandler {
             reconnectCount = 0
             routingLocal = false
             localSentenceActive = false
+            pendingLocalSettles.removeAll()
         }
 
         guard let json = SharedKeychain.readNodeConfig(),
@@ -214,6 +232,24 @@ class SampleHandler: RPBroadcastSampleHandler {
             (localEngine as? LocalEngine)?.stop()
         }
         localEngine = nil
+        stateQueue.sync {
+            // 引擎没了，在途的译文不会再回调：把没收尾的句子清掉，
+            // 否则「本机还忙」的判断会一直挂着。
+            pendingLocalSettles.removeAll()
+            localSentenceActive = false
+        }
+    }
+
+    /// 新会话代号：随机十六进制，不含制表符（它会被写进存档文件的行尾）。
+    private func newSessionCode() -> String {
+        let hex = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        return String(hex.prefix(12))
+    }
+
+    /// 本机是不是还有没收尾的句子（有句子在识别，或者译文还在路上）。
+    /// 必须在 stateQueue 上读。
+    private var localBusy: Bool {
+        localSentenceActive || !pendingLocalSettles.isEmpty
     }
 
     @available(iOS 26.0, *)
@@ -238,6 +274,10 @@ class SampleHandler: RPBroadcastSampleHandler {
             broadcastActive = true
             routingLocal = true
             localSentenceActive = false
+            pendingLocalSettles.removeAll()
+            // 换引擎就是换会话：新的本机引擎的 id 又从 1 开始，
+            // 不换代号的话会和上一个本机会话的同 id 句对上。
+            localSessionCode = newSessionCode()
         }
 
         let engine = LocalEngine(
@@ -246,6 +286,9 @@ class SampleHandler: RPBroadcastSampleHandler {
             },
             onTranslation: { [weak self] id, text in
                 self?.handleLocalTranslation(id: id, text: text)
+            },
+            onSentenceSettled: { [weak self] id in
+                self?.handleLocalSettled(id: id)
             },
             onStatus: { [weak self] status in
                 self?.handleLocalStatus(status)
@@ -261,12 +304,28 @@ class SampleHandler: RPBroadcastSampleHandler {
         stateQueue.sync {
             finalsCount += 1
             localSentenceActive = false
-            recentLines.append(RecentLine(id: id, src: text, dst: ""))
+            pendingLocalSettles.insert(id)
+            recentLines.append(RecentLine(id: id, src: text, dst: "", session: localSessionCode))
             if recentLines.count > maxRecentLines {
                 recentLines.removeFirst()
             }
         }
         writeLatestLines()
+        // 这里不发 .localSentenceFinalized：译文还在路上。
+        // 早一步通知决策器，节点会立刻接手、本机引擎被停掉，
+        // 在途的翻译随之取消，用户看到的就是「最后一句只有原文」。
+        // 等译文落地（或翻译失败）后由 handleLocalSettled 通知。
+    }
+
+    /// 本机这一句收尾了（译文落地或翻译失败）：这时才可以交给节点。
+    private func handleLocalSettled(id: Int) {
+        let shouldReport = stateQueue.sync { () -> Bool in
+            guard broadcastActive else { return false }
+            guard pendingLocalSettles.remove(id) != nil else { return false }
+            // 还有别的句子没收尾就继续等：一次只切一句，切早了会截断后面的半句。
+            return pendingLocalSettles.isEmpty
+        }
+        guard shouldReport else { return }
         applyAutoDecision(handleAutoEvent(.localSentenceFinalized))
     }
 
@@ -415,11 +474,15 @@ class SampleHandler: RPBroadcastSampleHandler {
                     self.lastStatusCode = status
                     return true
                 }
-                if shouldReport {
-                    self.writeStatus("last=\(status)")
-                }
+                guard shouldReport else { return }
+                self.writeStatus("last=\(status)")
+                // 解析失败多半是临时性的（还没连上 Tailscale、DNS 抖动），
+                // 所以照旧按退避策略重连；不然节点这一路就永久断了
+                // （本机还能顶上，但节点再也回不来，用户以为节点坏了）。
+                self.scheduleReconnect(closeCode: 1006)
                 if self.engineMode == "auto" {
-                    self.applyAutoDecision(self.handleAutoEvent(.reconnectAbandoned))
+                    // 节点这一轮没连上：交给决策器决定要不要落到本机。
+                    self.applyAutoDecision(self.handleAutoEvent(.nodeFailed))
                 }
                 return
             }
@@ -439,6 +502,9 @@ class SampleHandler: RPBroadcastSampleHandler {
             let shouldStart = self.stateQueue.sync { () -> Bool in
                 guard self.broadcastActive else { return false }
                 self.session = newSession
+                // 新的节点会话：节点的句子 id 重新从 1 计数，
+                // 换一个新代号，主 App 才不会把它当成旧会话的同一句。
+                self.nodeSessionCode = self.newSessionCode()
                 return true
             }
             if shouldStart {
@@ -447,11 +513,41 @@ class SampleHandler: RPBroadcastSampleHandler {
         }
     }
 
+    /// 按退避策略安排一次重连。节点断开、Tailnet 解析失败都走这里。
+    /// - Returns: 是否真的排上了重连（false = 放弃重连或广播已结束）。
+    @discardableResult
+    private func scheduleReconnect(closeCode: Int) -> Bool {
+        let plan = stateQueue.sync { () -> (TimeInterval?, NodeConfig?) in
+            guard broadcastActive else { return (nil, nil) }
+            guard !fatalErrorOccurred else { return (nil, nil) }
+            guard let delay = reconnectPolicy.next(closeCode: closeCode) else { return (nil, nil) }
+            reconnectCount += 1
+            return (delay, nodeConfig)
+        }
+
+        guard let delay = plan.0, let config = plan.1 else { return false }
+
+        // 重连前把 readyReceived 置 false（ready 之前的帧照旧丢弃计入 drop）
+        stateQueue.sync { readyReceived = false }
+
+        // 延迟后在 connectionQueue 上重新走 startPinnedSession（含 TailnetPin 校验）
+        connectionQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            self.stateQueue.sync {
+                guard self.broadcastActive else { return }
+                self.startPinnedSession(config)
+            }
+        }
+        return true
+    }
+
     private func handleNodeEvent(_ event: NodeEvent) {
         switch event {
         case .ready(let cold):
-            // 自动模式：把“本机是否还有一句没定稿”同步给决策器，再问要不要切回。
-            if stateQueue.sync(execute: { localSentenceActive }) {
+            // 自动模式：把「本机是否还有句子没收尾」同步给决策器，再问要不要切回。
+            // 没收尾包括「正在识别」和「译文还在路上」两种：
+            // 只看正在识别的话，节点恰好在译文飞回来之前就绪，最后一句就只剩原文。
+            if stateQueue.sync(execute: { localBusy }) {
                 _ = handleAutoEvent(.localSentenceStarted)
             }
             let decision = handleAutoEvent(.nodeReady)
@@ -464,7 +560,7 @@ class SampleHandler: RPBroadcastSampleHandler {
         case .final(let id, _, _, let text):
             stateQueue.sync {
                 finalsCount += 1
-                recentLines.append(RecentLine(id: id, src: text, dst: ""))
+                recentLines.append(RecentLine(id: id, src: text, dst: "", session: nodeSessionCode))
                 if recentLines.count > maxRecentLines {
                     recentLines.removeFirst()
                 }
@@ -498,6 +594,14 @@ class SampleHandler: RPBroadcastSampleHandler {
     }
 
     private func handleNodeClose(_ code: Int) {
+        // 广播已经结束就别再管这个 close 了：不发 .nodeFailed（那会把本机引擎重新拉起来）、
+        // 不重连、不改状态。少了这道闸，广播结束瞬间的 close 事件会让本机引擎复活，
+        // 而节点根本不存在——用户看到的是「字幕还在跑，但没有节点」。
+        guard stateQueue.sync(execute: { broadcastActive }) else {
+            logger.info("Node closed after broadcast ended: \(code)")
+            return
+        }
+
         let displayCode = code == 1013 ? "busy" : "\(code)"
         stateQueue.sync { lastStatusCode = "closed=\(displayCode)" }
         logger.info("Node closed: \(code)")
@@ -511,32 +615,9 @@ class SampleHandler: RPBroadcastSampleHandler {
         }
 
         // 由 NodeSession 通过 closeReason 还原过 1005→真实码
-        let shouldReconnect = stateQueue.sync { () -> (TimeInterval?, NodeConfig?) in
-            guard broadcastActive else { return (nil, nil) }
-            guard !fatalErrorOccurred else { return (nil, nil) }
-            let delay = reconnectPolicy.next(closeCode: code)
-            guard let delay else { return (nil, nil) }
-            reconnectCount += 1
-            return (delay, nodeConfig)
-        }
-
-        guard let delay = shouldReconnect.0, let config = shouldReconnect.1 else {
-            if engineMode == "auto" {
-                applyAutoDecision(handleAutoEvent(.reconnectAbandoned))
-            }
-            return
-        }
-
-        // 重连前把 readyReceived 置 false（ready 之前的帧照旧丢弃计入 drop）
-        stateQueue.sync { readyReceived = false }
-
-        // 延迟后在 connectionQueue 上重新走 startPinnedSession（含 TailnetPin 校验）
-        connectionQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self else { return }
-            self.stateQueue.sync {
-                guard self.broadcastActive else { return }
-                self.startPinnedSession(config)
-            }
+        let scheduled = scheduleReconnect(closeCode: code)
+        if !scheduled, engineMode == "auto" {
+            applyAutoDecision(handleAutoEvent(.reconnectAbandoned))
         }
     }
 
