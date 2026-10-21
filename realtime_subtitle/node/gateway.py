@@ -118,6 +118,10 @@ _STATUS_TEXT = {
     "internal_error": "识别进程内部错误",
 }
 _CLIENT_EVENTS = frozenset({"ready", "final", "translation", "status", "drained"})
+# 冷加载可能超过客户端 15s 的握手耐心（Windows 节点实测 17.4s）。冷拉起 worker 后
+# 每 5s 发一条 loading，客户端每收到一条就把 ready 截止时间续 15s，总上限 60s。
+LOADING_STATUS_INTERVAL_S = 5.0
+LOADING_STATUS_TEXT = "正在加载模型"
 
 
 class GatewayStartError(RuntimeError):
@@ -739,6 +743,8 @@ class _Session:
         self._drop_notified_at = float("-inf")
         self._dropped_before_ready = False
         self.sid: int | None = None
+        self._worker_reused = False
+        self._loading_task: asyncio.Task[None] | None = None
 
     # ---- worker 回调（都在事件循环线程里，不需要 threadsafe）----
 
@@ -781,6 +787,7 @@ class _Session:
             try:
                 reused, sid = await self.gw.worker.attach(self)
                 self.sid = sid
+                self._worker_reused = reused
             except OSError as e:
                 log.error("worker_spawn_failed err=%s", type(e).__name__)
                 await self._fail("worker_crashed")
@@ -820,6 +827,9 @@ class _Session:
         limit = asyncio.create_task(asyncio.sleep(SESSION_MAX_S))
         crashed = asyncio.ensure_future(self.exit_fut)
         tasks = [pump_in, pump_out, feeder, limit, crashed]
+        # 保温复用的 worker 已经在内存里，没有冷加载可等；只有冷拉起才发 loading。
+        if not self._worker_reused:
+            self._loading_task = asyncio.create_task(self._loading_heartbeat())
         crash_rc: int | None = None
         try:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -838,11 +848,33 @@ class _Session:
         finally:
             for t in tasks:
                 t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            if self._loading_task is not None:
+                self._loading_task.cancel()
+            await asyncio.gather(
+                *tasks,
+                *([self._loading_task] if self._loading_task is not None else []),
+                return_exceptions=True,
+            )
         if crash_rc is not None:
             code = _EXIT_STATUS.get(crash_rc, "worker_crashed")
             log.error("session_worker_exit rc=%d status=%s", crash_rc, code)
             await self._fail(code, flush_pending=True)
+
+    async def _loading_heartbeat(self) -> None:
+        """冷加载期间向客户端报进度，直到 worker 发出 ready 或会话结束。
+
+        客户端只在收到 loading 时续期（不是无条件等），所以 worker 真的卡死时
+        仍会在 60s 上限内判 handshake_timeout，不会无限挂着。
+        """
+        started = self.gw._clock()
+        while not self.ready:
+            self.out_q.put_nowait({
+                "ev": "status",
+                "code": "loading",
+                "text": LOADING_STATUS_TEXT,
+                "elapsed_s": round(self.gw._clock() - started, 3),
+            })
+            await asyncio.sleep(self.gw._loading_interval_s)
 
     async def _fail(self, code: str, *, flush_pending: bool = False) -> None:
         """告诉客户端出了什么事再关；先把 worker 崩溃前已经产出的事件发完。"""
@@ -966,6 +998,8 @@ class Gateway:
         allow_non_tailscale_for_tests: bool = False,
         token_file: str | Path | None = None,
         max_sessions: int | None = None,
+        loading_interval_s: float = LOADING_STATUS_INTERVAL_S,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._token_file = Path(token_file) if token_file else None
         if self._token_file is not None:
@@ -985,6 +1019,9 @@ class Gateway:
         self._uid = _current_uid() if uid is None else uid
         self._info = info or node_info.NodeInfo(state_dir=self._uds_dir)
         self._sleep = sleep
+        # loading 心跳的间隔与时钟可注入，测试才能把 5s / 17s 这类真时长压到毫秒级。
+        self._loading_interval_s = loading_interval_s
+        self._clock = clock
         # ☠️ 仅测试用：允许监听 127.0.0.1 等非 Tailscale 地址。生产入口（run_gateway）不传。
         self._allow_non_tailscale = allow_non_tailscale_for_tests
         self._uds_enabled = _uds_supported()

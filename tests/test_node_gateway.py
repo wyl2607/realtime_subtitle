@@ -80,6 +80,8 @@ FAKE_WORKER = textwrap.dedent(
             if t == "hello":
                 if mode == "stale":
                     emit({{"ev": "final", "id": 99, "a0": 0.0, "a1": 1.0, "text": "STALE"}}, sid)
+                if mode.startswith("slow-ready:"):
+                    time.sleep(float(mode.partition(":")[2]))
                 emit({{"ev": "ready", "cold": True, "load_s": 0.0, "engine": {{}}}}, sid)
                 if mode == "stall":
                     time.sleep(3600)
@@ -193,9 +195,21 @@ def uds_connect(gw: Gateway):
     return unix_connect(str(gw.uds_path), "ws://localhost/v2/session", logger=_quiet)
 
 
+def _is_loading(ev: dict) -> bool:
+    return ev.get("ev") == "status" and ev.get("code") == "loading"
+
+
+async def recv_non_loading(ws, timeout: float = 8) -> dict:
+    """跳过冷加载心跳；既有用例关心的是业务事件，不是 loading。"""
+    while True:
+        ev = json.loads(await asyncio.wait_for(ws.recv(), timeout))
+        if not _is_loading(ev):
+            return ev
+
+
 async def hello_ready(ws, hello: dict | None = None) -> dict:
     await ws.send(json.dumps(hello or HELLO))
-    return json.loads(await asyncio.wait_for(ws.recv(), 8))
+    return await recv_non_loading(ws)
 
 
 async def http_get(path: str, *, port: int | None = None, uds: Path | None = None,
@@ -1120,6 +1134,79 @@ def test_new_session_during_reap_waits_and_respawns(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_cold_worker_sends_loading_until_ready(tmp_path):
+    """冷拉起 worker 慢就绪：先收到 >=2 条 loading，ready 最后到；字段走 status。"""
+    ticks = [0.0]
+
+    def clock():
+        ticks[0] += 1.0
+        return ticks[0]
+
+    async def scenario():
+        async with running(
+            tmp_path, "slow-ready:0.35", loading_interval_s=0.05, clock=clock
+        ) as (gw, _rec):
+            ws = await uds_connect(gw)
+            await ws.send(json.dumps(HELLO))
+            evs = []
+            while True:
+                ev = json.loads(await asyncio.wait_for(ws.recv(), 8))
+                evs.append(ev)
+                if ev.get("ev") == "ready":
+                    break
+            await ws.close()
+            return evs
+
+    evs = asyncio.run(scenario())
+    loadings = [e for e in evs if _is_loading(e)]
+    assert evs[-1]["ev"] == "ready"
+    assert len(loadings) >= 2
+    assert all(e["text"] == gw_mod.LOADING_STATUS_TEXT for e in loadings)
+    assert loadings[0]["elapsed_s"] == 1.0  # 注入时钟：第一条发在 started 的下一个 tick
+    assert all(b["elapsed_s"] > a["elapsed_s"] for a, b in zip(loadings, loadings[1:]))
+
+
+def test_warm_worker_reuse_sends_no_loading(tmp_path, monkeypatch):
+    """保温复用的 worker 不发 loading：第二条会话第一个事件就是 ready。"""
+    monkeypatch.setattr(gw_mod, "WORKER_KEEPALIVE_S", 5.0)
+
+    async def scenario():
+        async with running(tmp_path, "echo", loading_interval_s=0.05) as (gw, _rec):
+            ws = await uds_connect(gw)
+            assert (await hello_ready(ws))["ev"] == "ready"
+            await ws.close()
+            await until(lambda: not gw._session_active)
+
+            ws = await uds_connect(gw)
+            await ws.send(json.dumps(HELLO))
+            first = json.loads(await asyncio.wait_for(ws.recv(), 8))
+            await ws.close()
+            return first
+
+    first = asyncio.run(scenario())
+    assert first["ev"] == "ready"
+
+
+def test_loading_stops_when_session_ends_mid_load(tmp_path):
+    """会话在冷加载中途断开：loading 心跳任务被取消，不再发。"""
+    async def scenario():
+        async with running(
+            tmp_path, "slow-ready:5", loading_interval_s=0.05
+        ) as (gw, _rec):
+            ws = await uds_connect(gw)
+            await ws.send(json.dumps(HELLO))
+            first = json.loads(await asyncio.wait_for(ws.recv(), 8))
+            assert _is_loading(first)
+            sink = next(iter(gw.worker._sinks.values()))
+            task = sink._loading_task
+            assert task is not None and not task.done()
+            await ws.close()
+            await until(task.done, what="loading task cancelled")
+            assert task.cancelled()
+
+    asyncio.run(scenario())
+
+
 def test_worker_crash_notifies_client(tmp_path, caplog):
     async def scenario():
         async with running(tmp_path, "crash:9") as (gw, rec):
@@ -1172,7 +1259,7 @@ def test_worker_spawn_failure_is_reported(tmp_path):
         try:
             ws = await uds_connect(gw)
             await ws.send(json.dumps(HELLO))
-            ev = json.loads(await asyncio.wait_for(ws.recv(), 5))
+            ev = await recv_non_loading(ws, 5)
             assert ev["code"] == "worker_crashed"
             await asyncio.wait_for(ws.wait_closed(), 5)
         finally:
@@ -1883,6 +1970,8 @@ async def _recv_until(ws, stop, timeout: float = 15.0) -> list[dict]:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         ev = json.loads(await asyncio.wait_for(ws.recv(), max(0.1, deadline - time.monotonic())))
+        if _is_loading(ev):
+            continue
         evs.append(ev)
         if stop(ev):
             return evs

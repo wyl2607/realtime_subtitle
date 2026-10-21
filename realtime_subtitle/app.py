@@ -250,6 +250,8 @@ class RemoteBridge:
         self._saw_cloud = False
         self._announced = None
         self._node_client = None
+        # 正在等节点 ready 的节点 id。只有这段时间状态行显示加载中后缀。
+        self._node_loading_id = None
         self._loop = None
         self._node_thread = None
         self._node_backoff_until = 0.0
@@ -381,7 +383,11 @@ class RemoteBridge:
                     cands = []
                 if cands:
                     name = cands[0].config.id
-            label = design_tokens.TEXT_STATUS_HYBRID_PREFIX + (name or "节点")
+            if self._node_loading_id:
+                # 冷加载期间用「节点名 正在加载模型…」；本机识别照常先上屏。
+                label = f"{self._node_loading_id}{design_tokens.TEXT_NODE_LOADING_SUFFIX}"
+            else:
+                label = design_tokens.TEXT_STATUS_HYBRID_PREFIX + (name or "节点")
         else:
             label = design_tokens.TEXT_STATUS_LOCAL
         if state == "cooldown_rate_limited":
@@ -673,6 +679,7 @@ class RemoteBridge:
             on_translation=self._on_node_translation,
             on_status=self._on_node_status,
             on_status_event=self._on_node_status_event,
+            on_loading=self._on_node_loading,
             on_translate_failed=self._on_node_translate_failed,
             on_closed=self._on_node_closed,
         )
@@ -683,6 +690,8 @@ class RemoteBridge:
             self._node_backoff_until = time.time() + 30
             return
         generation = self._generation
+        self._node_loading_id = cfg.id
+        self._announce_route()
         try:
             self._start_node_loop()
             self._run_on_loop(client.connect())
@@ -692,6 +701,9 @@ class RemoteBridge:
             self._close_node()
             self._node_backoff_until = time.time() + 30
             return
+        finally:
+            self._node_loading_id = None
+            self._announce_route()
         # 连接在音频线程上等待。返回时主线程可能已经 close()，或云端开关把代次加一。
         # 这时不能把新客户端留在桥上。
         if self._closed or self._generation != generation:
@@ -890,6 +902,16 @@ class RemoteBridge:
     def _on_node_status(self, text):
         if self._ui_status is not None and text:
             self._ui_status(text)
+
+    def _on_node_loading(self, node_id, generation):
+        if self._stale_remote_generation(generation, "node_loading"):
+            return
+        from realtime_subtitle.ui import design_tokens
+
+        self._node_loading_id = node_id
+        if self._ui_status is not None:
+            # 每 5s 一条 loading：重新挂状态行，避免 5s 自动清空后在剩下的冷加载里看不见。
+            self._ui_status(f"{node_id}{design_tokens.TEXT_NODE_LOADING_SUFFIX}")
 
     def _on_node_closed(self, node_id, generation, error):
         if self._stale_remote_generation(generation, "node_closed"):
