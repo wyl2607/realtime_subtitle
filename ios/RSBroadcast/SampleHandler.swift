@@ -1051,6 +1051,11 @@ class SampleHandler: RPBroadcastSampleHandler {
             stateQueue.sync {
                 readyReceived = true
                 reconnectPolicy.reset()
+                // 冷启动期间状态行写成了「<节点> 正在加载模型…」；就绪后不清掉会一直显示加载中。
+                lastStatusCode = HandoffRules.statusAfterReady(
+                    lastStatusCode,
+                    loadingSuffix: DesignTokens.Text.nodeLoadingSuffix
+                )
             }
             logger.info("Node ready cold=\(cold)")
             applyAutoDecision(decision)
