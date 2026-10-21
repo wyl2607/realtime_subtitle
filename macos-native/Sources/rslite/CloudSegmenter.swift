@@ -605,6 +605,13 @@ final class CloudUploadController: @unchecked Sendable {
 
     var groqLanguageCode: String { language }
 
+    /// 429 限流冷却中。节点路由在冷却期接手状态行，HybridEngine 靠这个标志补后缀。
+    var isRateLimited: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return context.cloudState == .cooldownRateLimited
+    }
+
     func ingest(samples: [Float], startSeconds: Double, now: Date, node: NodeTierFacts) -> CloudIngestEffect {
         lock.lock()
         defer { lock.unlock() }
@@ -707,8 +714,13 @@ final class CloudUploadController: @unchecked Sendable {
             return reconcileLocked(atSilence: false, node: node, lines: [], discard: true, cancel: cancel)
         }
         if let http = error as? CloudClientError, case .httpStatus(let status, let retryAfter, _) = http {
+            let wasRateLimited = context.cloudState == .cooldownRateLimited
             context.apply(RouteEvent(type: "http_status", status: status, retryAfter: retryAfter, usagePercent: nil))
             noteCooldown(now)
+            if status == 429 && !wasRateLimited {
+                // 只在进入冷却时打一行；key 和正文都不进日志。
+                Self.writeCooldownLog(status: status, retryAfter: context.cooldownSeconds ?? 60)
+            }
             return reconcileLocked(atSilence: false, node: node, lines: [], discard: false, cancel: false)
         }
         context.apply(RouteEvent(type: "segment_failure", status: nil, retryAfter: nil, usagePercent: nil))
@@ -746,6 +758,15 @@ final class CloudUploadController: @unchecked Sendable {
         probeID = nil
         segmentBounds.removeAll()
         client?.cancelInflightRequests()
+    }
+
+    /// 冷却日志的唯一样式，selftest 直接断言这行，避免文案只存在于 write 调用里。
+    static func cooldownLogLine(status: Int, retryAfter: Int) -> String {
+        "rslite.cloud cooldown reason=\(status) retry_after=\(retryAfter)"
+    }
+
+    static func writeCooldownLog(status: Int, retryAfter: Int) {
+        FileHandle.standardError.write(Data((cooldownLogLine(status: status, retryAfter: retryAfter) + "\n").utf8))
     }
 
     static func groqLanguage(localeID: String) -> String {
@@ -906,8 +927,10 @@ final class CloudUploadController: @unchecked Sendable {
             cloudGateOpen = false
         }
         let waitingOnNode = desired == .cloud && node.activeNodeID != nil && !cloudGateOpen
-        let mode = presentationMode(desired: desired, waitingOnNode: waitingOnNode, node: node)
-        let cloudLabel = mode == .cloud || mode == .cloudKeyInvalid
+        let baseMode = presentationMode(desired: desired, waitingOnNode: waitingOnNode, node: node)
+        // 429 冷却期间不换路由语义，只给状态行加冷却后缀。
+        let mode = context.cloudState == .cooldownRateLimited ? .rateLimited(baseMode) : baseMode
+        let cloudLabel = mode.base == .cloud || mode.base == .cloudKeyInvalid
         let nodeOwnsStatus = !cloudLabel && (desired == .node || waitingOnNode)
         let publish = Self.shouldPublishStatus(nodeOwnsStatus: nodeOwnsStatus, mode: mode, last: lastMode)
         if nodeOwnsStatus {
@@ -1024,13 +1047,18 @@ final class CloudUploadController: @unchecked Sendable {
         check(hybrid.control.mode == .hybrid("mini2"), "节点会话建立后状态应为混合·节点名，实际 \(hybrid.control.mode.label)")
         check(hybrid.control.publishStatus == false, "节点连接期间云端不改写混合/本机")
 
-        let limited = controller.resolveFailure(
-            id: -1,
-            error: CloudClientError.httpStatus(429, retryAfter: 3, xGroqID: nil),
-            now: now.addingTimeInterval(3),
-            node: active
-        )
-        check(limited.mode == .hybrid("mini2") || limited.mode == .local, "429 之后不应停在可上传的云端档")
+        if let retryID = third.uploads.first?.id {
+            let limited = controller.resolveFailure(
+                id: retryID,
+                error: CloudClientError.httpStatus(429, retryAfter: 3, xGroqID: nil),
+                now: now.addingTimeInterval(3),
+                node: active
+            )
+            check(limited.mode == .rateLimited(.hybrid("mini2")),
+                  "429 之后不应停在可上传的云端档，实际 \(limited.mode.label)")
+        } else {
+            check(false, "429 用例应先有一段已接受的发送")
+        }
         let tooSoon = controller.ingest(samples: [Float](repeating: 0.05, count: 16_000), startSeconds: clock, now: now.addingTimeInterval(4), node: idle)
         clock += 1
         check(tooSoon.uploads.isEmpty, "retry-after 未到不应上传")
@@ -1102,7 +1130,9 @@ final class CloudUploadController: @unchecked Sendable {
                 now: now,
                 node: idle
             )
-            check(limited.mode == .local, "429 且没有节点会话时应回到本机，实际 \(limited.mode.label)")
+            check(limited.mode.base == .local, "429 且没有节点会话时应回到本机，实际 \(limited.mode.label)")
+            check(limited.mode.label == DesignTokens.Text.statusLocal + DesignTokens.Text.statusCloudCooldownSuffix,
+                  "429 冷却期间状态行应带冷却后缀，实际 \(limited.mode.label)")
             _ = pushRate(0.05, 2, now.addingTimeInterval(2))
             let early = pushRate(0, 0.6, now.addingTimeInterval(2))
             check(early.uploads.isEmpty, "retry-after 整数秒未到不应上传")
@@ -1135,10 +1165,14 @@ final class CloudUploadController: @unchecked Sendable {
         route.nodeIsSelf = true
         check(TieredProviders.select(route) == .local, "不连自己，节点是自己时落到本机")
         check(CloudUploadController.cloudNodeID == "cloud:groq", "云端 P5 来源标识固定，不写入节点清单")
-        check(SubtitleMode.cloud.label == "云端·Groq", "云端状态文案")
-        check(SubtitleMode.hybrid("mini2").label == "混合·mini2", "节点状态文案")
-        check(SubtitleMode.local.label == "本机", "本机状态文案")
-        check(SubtitleMode.cloudKeyInvalid.label == "云端 key 无效", "key 无效文案")
+        check(SubtitleMode.cloud.label == DesignTokens.Text.statusCloud, "云端状态文案")
+        check(SubtitleMode.hybrid("mini2").label == DesignTokens.Text.statusHybridPrefix + "mini2", "节点状态文案")
+        check(SubtitleMode.local.label == DesignTokens.Text.statusLocal, "本机状态文案")
+        check(SubtitleMode.cloudKeyInvalid.label == DesignTokens.Text.statusCloudKeyInvalid, "key 无效文案")
+        check(CloudUploadController.cooldownLogLine(status: 429, retryAfter: 3) == "rslite.cloud cooldown reason=429 retry_after=3",
+              "冷却日志格式")
+        check(SubtitleMode.rateLimited(.local).label == DesignTokens.Text.statusLocal + DesignTokens.Text.statusCloudCooldownSuffix,
+              "冷却后缀接在实际模式之后")
 
         let empty = CloudTranscriptionResult(text: "Nur Text", segments: [], statusCode: 200, xGroqID: nil, remainingRequests: nil)
         let corrected = CloudSpeechBounds(speechA0: 1.2, speechA1: 3.4, audioOrigin: 1.0, pcmCount: 100)

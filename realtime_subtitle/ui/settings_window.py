@@ -246,12 +246,12 @@ def node_active():
 def static_route_label():
     """没有接上路由器时，按落盘的开关给面板一个标签。"""
     if cloud_active():
-        return "云端·Groq"
+        return design_tokens.TEXT_STATUS_CLOUD
     if node_active():
         entries = load_node_entries()
         name = str(entries[0].get("id") or "") if entries else ""
-        return f"混合·{name}" if name else "混合·节点"
-    return "本机"
+        return design_tokens.TEXT_STATUS_HYBRID_PREFIX + (name or "节点")
+    return design_tokens.TEXT_STATUS_LOCAL
 
 
 # 面板可调参数（存 window_state.json 的 "tuning"；FONT_SIZE/BACKGROUND_OPACITY

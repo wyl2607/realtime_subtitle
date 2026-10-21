@@ -27,14 +27,25 @@ enum SubtitleMode: Sendable, Equatable {
     case cloud
     /// 401/403 之后保持到 key 变化，优先于「混合」。
     case cloudKeyInvalid
+    /// 429 限流冷却期间：路由语义与内层一致，只是状态行多一段冷却后缀。
+    indirect case rateLimited(SubtitleMode)
+
+    /// 去掉展示包装后的实际模式，用来比较路由语义。
+    var base: SubtitleMode {
+        if case .rateLimited(let inner) = self {
+            return inner
+        }
+        return self
+    }
 
     var label: String {
         switch self {
-        case .local: return "本机"
-        case .hybrid(let node): return "混合·\(node)"
+        case .local: return DesignTokens.Text.statusLocal
+        case .hybrid(let node): return DesignTokens.Text.statusHybridPrefix + node
         case .refining: return "精修中"
-        case .cloud: return "云端·Groq"
-        case .cloudKeyInvalid: return "云端 key 无效"
+        case .cloud: return DesignTokens.Text.statusCloud
+        case .cloudKeyInvalid: return DesignTokens.Text.statusCloudKeyInvalid
+        case .rateLimited(let inner): return inner.label + DesignTokens.Text.statusCloudCooldownSuffix
         }
     }
 }
@@ -172,7 +183,7 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
             lastPublishedMode = .local
         }
         await stopRouter(clearPending: true, clearFanout: true)
-        onMode(.local)
+        publishMode(.local)
     }
 
     func resume() async {
@@ -258,7 +269,9 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
                     return
                 }
                 self.recordRouterMode(mode)
-                onMode(mode)
+                // 节点只报「混合/本机」，限流冷却期间由这里补上后缀，
+                // 否则 429 后的状态行会被节点路由覆盖成不带冷却说明的原文案。
+                self.publishMode(mode)
             },
             nodeTierEnabled: nodeTierEnabled,
             pinnedNode: pinnedNode
@@ -465,7 +478,7 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
             return
         case .refining:
             if !lock.withLockValue({ cloudOwnsLabel }) {
-                onMode(.refining)
+                publishMode(.refining)
             }
         case .publish(let sentenceID, let action, let isSelected):
             publish(nodeID: nodeID, id: sentenceID, isSelected: isSelected, action: action)
@@ -490,7 +503,7 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
             }
         }
         if isSelected, !lock.withLockValue({ cloudOwnsLabel }) {
-            onMode(.hybrid(nodeID))
+            publishMode(.hybrid(nodeID))
         }
     }
 
@@ -532,8 +545,19 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
         lock.withLockVoid {
             selectedNodeSession = Self.selectedSession(after: mode, activeSessions: activeNodeSessions, previous: selectedNodeSession)
             lastPublishedMode = mode
-            cloudOwnsLabel = mode == .cloud || mode == .cloudKeyInvalid
+            cloudOwnsLabel = mode.base == .cloud || mode.base == .cloudKeyInvalid
         }
+    }
+
+    /// 冷却标志在云控制器里，先取引用再问，避免两把锁嵌套。
+    private func cloudRateLimited() -> Bool {
+        let controller = lock.withLockValue { cloudController }
+        return controller?.isRateLimited ?? false
+    }
+
+    /// 所有非云端调度发出的模式都过这里：429 冷却期间统一补后缀。
+    private func publishMode(_ mode: SubtitleMode) {
+        onMode(cloudRateLimited() ? .rateLimited(mode) : mode)
     }
 
     private static func shouldRunRouter(mode: RSLiteMode, hasFanout: Bool, hasRouter: Bool) -> Bool {
@@ -551,6 +575,8 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
                 return previous
             }
             return NodeSessionKey(nodeID: nodeID, generation: generation)
+        case .rateLimited(let inner):
+            return selectedSession(after: inner, activeSessions: activeSessions, previous: previous)
         case .local, .cloud, .cloudKeyInvalid:
             return nil
         case .refining:
@@ -795,7 +821,7 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
             cloudController = controller
             lastNodeTierEnabled = effect.nodeTierEnabled
             lastPublishedMode = effect.mode
-            cloudOwnsLabel = effect.mode == .cloud || effect.mode == .cloudKeyInvalid
+            cloudOwnsLabel = effect.mode.base == .cloud || effect.mode.base == .cloudKeyInvalid
         }
         return effect.mode
     }
@@ -993,7 +1019,7 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
             var publish = false
             if effect.publishStatus && lastPublishedMode != effect.mode {
                 lastPublishedMode = effect.mode
-                cloudOwnsLabel = effect.mode == .cloud || effect.mode == .cloudKeyInvalid
+                cloudOwnsLabel = effect.mode.base == .cloud || effect.mode.base == .cloudKeyInvalid
                 selectedNodeSession = Self.selectedSession(
                     after: effect.mode,
                     activeSessions: activeNodeSessions,

@@ -11,6 +11,7 @@ from realtime_subtitle.app import open_remote_bridge  # noqa: E402
 from realtime_subtitle.remote.cloud_client import CloudTranscript, MappedSegment  # noqa: E402
 from realtime_subtitle.remote.node_client import NodeConfig, SelfNodeError  # noqa: E402
 from realtime_subtitle.remote.router import RemoteRouter  # noqa: E402
+from realtime_subtitle.ui import design_tokens  # noqa: E402
 
 
 class _UI:
@@ -212,6 +213,84 @@ def test_node_on_does_not_build_cloud(tmp_path, monkeypatch):
         assert bridge.router.node_enabled is True
         assert seen["kwargs"]["node_configs"][0].id == "desk"
         assert bridge.route_label().startswith("混合·")
+    finally:
+        bridge.close()
+
+
+def test_route_label_uses_tokens_for_cooldown_and_invalid_key(tmp_path):
+    bridge, _ui, _translator = _open(
+        cloud_on=True,
+        node_on=False,
+        cloud_client_factory=lambda key_path=None: _Cloud(),
+        segmenter_factory=_Segmenter,
+        ledger_factory=lambda path, routing=None: _Ledger(path, routing),
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs),
+        quota_path=tmp_path / "quota.json",
+    )
+    try:
+        bridge.routing.cloud_state = "cooldown_rate_limited"
+        bridge.routing.cooldown_seconds = 7
+        assert bridge.route_label() == (
+            design_tokens.TEXT_STATUS_LOCAL + design_tokens.TEXT_STATUS_CLOUD_COOLDOWN_SUFFIX)
+        bridge.routing.cloud_state = "disabled_invalid_key"
+        assert bridge.route_label() == design_tokens.TEXT_STATUS_CLOUD_KEY_INVALID
+    finally:
+        bridge.close()
+
+
+def test_route_label_keeps_cooldown_suffix_on_hybrid(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "realtime_subtitle.remote.router.read_self_node_id", lambda: "this-machine")
+    bridge, _ui, _translator = _open(
+        cloud_on=False,
+        node_on=True,
+        cloud_client_factory=_boom,
+        segmenter_factory=_boom,
+        ledger_factory=_boom,
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs),
+        node_client_factory=_boom,
+        node_entries=[{
+            "id": "mini2",
+            "node_id": "tk007nodeid0001",
+            "url": "ws://100.64.0.8:8791",
+            "token_file": "unused",
+        }],
+        quota_path=tmp_path / "quota.json",
+    )
+    try:
+        bridge.routing.has_key = True
+        bridge.routing.cloud_state = "cooldown_rate_limited"
+        bridge.routing.cooldown_seconds = 3
+        assert bridge.route_label() == (
+            design_tokens.TEXT_STATUS_HYBRID_PREFIX + "mini2"
+            + design_tokens.TEXT_STATUS_CLOUD_COOLDOWN_SUFFIX)
+    finally:
+        bridge.close()
+
+
+def test_cloud_429_logs_cooldown_once_without_key(tmp_path, capsys):
+    from realtime_subtitle.remote.cloud_client import CloudError
+
+    bridge, _ui, _translator = _open(
+        cloud_on=True,
+        node_on=False,
+        cloud_client_factory=lambda key_path=None: _Cloud(),
+        segmenter_factory=_Segmenter,
+        ledger_factory=lambda path, routing=None: _Ledger(path, routing),
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs),
+        quota_path=tmp_path / "quota.json",
+    )
+    try:
+        error = CloudError(
+            status=429, reason="rate limited", exc_type="HTTPError",
+            retry_after=7, secret="gsk_test_fake_key_never_logged")
+        bridge._on_cloud_exception(error, 0)
+        out = capsys.readouterr().out
+        assert "rslite.cloud cooldown reason=429 retry_after=7" in out
+        assert "gsk_test_fake_key_never_logged" not in out
+        # 冷却还没结束时再来一次 429 不重复刷日志。
+        bridge._on_cloud_exception(error, 0)
+        assert "rslite.cloud cooldown" not in capsys.readouterr().out
     finally:
         bridge.close()
 
@@ -608,6 +687,9 @@ def test_feed_audio_expires_cooldown_and_recovers_quota(tmp_path, monkeypatch):
     try:
         bridge.routing.apply({"type": "http_status", "status": 429, "retry_after": 5})
         assert bridge.routing.cloud_state == "cooldown_rate_limited"
+        bridge._announce_route()
+        assert bridge._announced == (
+            design_tokens.TEXT_STATUS_LOCAL + design_tokens.TEXT_STATUS_CLOUD_COOLDOWN_SUFFIX)
         bridge.feed_audio(np.zeros(160, dtype=np.float32))
         assert bridge.routing.cloud_state == "cooldown_rate_limited"
         clock["t"] += 0.4
@@ -616,6 +698,8 @@ def test_feed_audio_expires_cooldown_and_recovers_quota(tmp_path, monkeypatch):
         clock["t"] += 5
         bridge.feed_audio(np.zeros(160, dtype=np.float32))
         assert bridge.routing.cloud_state == "probe"
+        # 冷却结束（probe 会立刻按云端档再试）后状态行恢复原文案。
+        assert bridge._announced == design_tokens.TEXT_STATUS_CLOUD
 
         for _ in range(18):
             bridge.ledger.note(1.0, now=clock["t"])

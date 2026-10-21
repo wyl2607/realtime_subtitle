@@ -355,7 +355,14 @@ class RemoteBridge:
         return True
 
     def route_label(self):
+        from realtime_subtitle.ui import design_tokens
+
         self._sync_provider()
+        state = str(getattr(self.routing, "cloud_state", "") or "")
+        # key 无效是按住不放的状态，优先于层选择：这时 tier 已经退回节点/本机，
+        # 光看 tier 会把它显示成普通混合档，用户不知道要换 key。
+        if state == "disabled_invalid_key":
+            return design_tokens.TEXT_STATUS_CLOUD_KEY_INVALID
         tier = "local"
         select = getattr(self.router, "select_tier", None)
         if select is not None:
@@ -364,8 +371,8 @@ class RemoteBridge:
             except Exception:
                 tier = "local"
         if tier == "cloud":
-            return "云端·Groq"
-        if tier == "node":
+            label = design_tokens.TEXT_STATUS_CLOUD
+        elif tier == "node":
             name = getattr(self.router, "current_node_id", None)
             if not name:
                 try:
@@ -374,8 +381,12 @@ class RemoteBridge:
                     cands = []
                 if cands:
                     name = cands[0].config.id
-            return f"混合·{name or '节点'}"
-        return "本机"
+            label = design_tokens.TEXT_STATUS_HYBRID_PREFIX + (name or "节点")
+        else:
+            label = design_tokens.TEXT_STATUS_LOCAL
+        if state == "cooldown_rate_limited":
+            label += design_tokens.TEXT_STATUS_CLOUD_COOLDOWN_SUFFIX
+        return label
 
     def on_local_pair(self, src, tgt, t0, t1, key, revision):
         revision = _coerce_revision(revision)
@@ -471,6 +482,7 @@ class RemoteBridge:
             status = exc.status
             reached = status is not None
             routed = status in (401, 403, 429) or (reached and 500 <= int(status) <= 599)
+            previous_state = str(getattr(self.routing, "cloud_state", "") or "")
             try:
                 if routed:
                     self.routing.apply({
@@ -482,6 +494,10 @@ class RemoteBridge:
                     self.routing.apply({"type": "segment_failure"})
                 if reached and self.ledger is not None:
                     self.ledger.note(exc.duration_s, remaining_requests=exc.remaining_requests)
+                if status == 429 and previous_state != "cooldown_rate_limited":
+                    # 只在进入冷却时打一行；和 rslite 同一格式，不含 key 和正文。
+                    seconds = getattr(self.routing, "cooldown_seconds", None) or 60
+                    print(f"rslite.cloud cooldown reason=429 retry_after={int(seconds)}")
             except Exception as note_exc:
                 print(f"⚠️  云端失败记账出错: {type(note_exc).__name__}")
         else:
@@ -554,6 +570,8 @@ class RemoteBridge:
             routing.apply({"type": "cooldown_expired"})
             self._cooldown_deadline = None
             self._cooldown_sig = None
+            # 冷却结束要把状态行从「… · 云端限流冷却」恢复成原文案。
+            self._announce_route()
         if self.ledger is not None:
             self.ledger.usage()
 
@@ -1337,7 +1355,8 @@ class SubtitleApp:
         try:
             return static_route_label()
         except Exception:
-            return "本机"
+            from realtime_subtitle.ui import design_tokens
+            return design_tokens.TEXT_STATUS_LOCAL
 
     def _ui_show_line(self, src, dst, t0, t1, key, source, revision=0):
         def _go():

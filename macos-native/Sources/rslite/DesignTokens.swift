@@ -49,6 +49,8 @@ enum DesignTokens {
         static let statusLocal: String = "本机"
         static let statusHybridPrefix: String = "混合·"
         static let statusCloud: String = "云端·Groq"
+        static let statusCloudKeyInvalid: String = "云端 key 无效"
+        static let statusCloudCooldownSuffix: String = " · 云端限流冷却"
         static let untranslated: String = "未翻译 ⟳"
         static let nodeUnavailableSuffix: String = " 不可用，已用本机"
     }
