@@ -113,6 +113,8 @@ final class SubtitleEngine {
     /// 用户看到的是字幕被改写而不是追加。带上代号之后主 App 用「代号 + id」当键。
     private var localSessionCode: String = ""
     private var nodeSessionCode: String = ""
+    /// 节点重连不会开启新的引擎轮次：单独记住会话身份，旧连接的迟到回调才不会碰到新连接。
+    private var nodeSessionToken: UUID?
 
     /// 本机这边原文已定稿、译文还没收尾的句子。
     /// 切回节点要等它们收尾，否则最后一句只剩原文。
@@ -141,6 +143,7 @@ final class SubtitleEngine {
                 reconnectCount = 0
                 reconnectPolicy = ReconnectPolicy()
                 session = nil
+                nodeSessionToken = nil
             }
             if #available(iOS 26.0, *) {
                 startLocalEngine()
@@ -180,6 +183,7 @@ final class SubtitleEngine {
             fatalErrorReason = ""
             recentLines = []
             session = nil
+            nodeSessionToken = nil
             broadcastActive = true
             reconnectPolicy = ReconnectPolicy()
             reconnectCount = 0
@@ -209,6 +213,7 @@ final class SubtitleEngine {
             self.autoFallback?.broadcastEnded()
             let currentSession = session
             session = nil
+            nodeSessionToken = nil
             return currentSession
         }
         currentSession?.flush()
@@ -217,11 +222,16 @@ final class SubtitleEngine {
             stopLocalEngine()
             stopCloudTier()
         }
-        if #available(iOS 26.0, *) {
-            (cloudTranslator as? LocalEngine)?.stop()
+        let translator = stateQueue.sync { () -> AnyObject? in
+            let translator = cloudTranslator
+            cloudTranslator = nil
+            cloudTranslatorToken = ""
+            cloudTranslationAvailable = false
+            return translator
         }
-        cloudTranslator = nil
-        stateQueue.sync { cloudTranslationAvailable = false }
+        if #available(iOS 26.0, *) {
+            (translator as? LocalEngine)?.stop()
+        }
         converter = nil
         writeStatus("finished")
     }
@@ -254,6 +264,7 @@ final class SubtitleEngine {
             fatalErrorReason = ""
             recentLines = []
             session = nil
+            nodeSessionToken = nil
             broadcastActive = true
             reconnectPolicy = ReconnectPolicy()
             reconnectCount = 0
@@ -377,17 +388,18 @@ final class SubtitleEngine {
     }
 
     private func stopLocalEngine() {
-        let engine = localEngine
-        if #available(iOS 26.0, *) {
-            (engine as? LocalEngine)?.stop()
-        }
-        stateQueue.sync {
+        let engine = stateQueue.sync { () -> AnyObject? in
             // 在锁内清掉引用：回调的闸门也在锁内核对它，迟到的回调到这里就进不来了。
+            let engine = localEngine
             localEngine = nil
             // 引擎没了，在途的译文不会再回调：把没收尾的句子清掉，
             // 否则「本机还忙」的判断会一直挂着。
             pendingLocalSettles.removeAll()
             localSentenceActive = false
+            return engine
+        }
+        if #available(iOS 26.0, *) {
+            (engine as? LocalEngine)?.stop()
         }
     }
 
@@ -430,21 +442,25 @@ final class SubtitleEngine {
         guard #available(iOS 26.0, *) else { return }
         let availability = readCloudAvailability()
         guard availability.hasKey, availability.enabled else { return }
-        if cloudTranslator == nil {
-            let token = newSessionCode()
-            let engine = LocalEngine(
-                mode: .translateOnly,
-                onFinal: { _, _, _ in },
-                onTranslation: { [weak self] id, text in
-                    self?.handleCloudTranslation(id: id, text: text, token: token)
-                },
-                onSentenceSettled: { _ in },
-                onStatus: { [weak self] status in
-                    self?.handleCloudTranslatorStatus(status, token: token)
-                }
-            )
-            stateQueue.sync { cloudTranslatorToken = token }
+        let token = newSessionCode()
+        let engine = LocalEngine(
+            mode: .translateOnly,
+            onFinal: { _, _, _ in },
+            onTranslation: { [weak self] id, text in
+                self?.handleCloudTranslation(id: id, text: text, token: token)
+            },
+            onSentenceSettled: { _ in },
+            onStatus: { [weak self] status in
+                self?.handleCloudTranslatorStatus(status, token: token)
+            }
+        )
+        let shouldStart = stateQueue.sync { () -> Bool in
+            guard cloudTranslator == nil else { return false }
             cloudTranslator = engine
+            cloudTranslatorToken = token
+            return true
+        }
+        if shouldStart {
             Task {
                 await engine.start()
             }
@@ -453,23 +469,23 @@ final class SubtitleEngine {
 
     /// 只翻译引擎的状态：准备好了才让云端这一档参与路由。
     private func handleCloudTranslatorStatus(_ status: String, token: String) {
-        let accepted = stateQueue.sync { () -> Bool in
+        let availabilityChanged = stateQueue.sync { () -> Bool in
             guard broadcastActive,
                   cloudTranslator != nil,
                   cloudTranslatorToken == token else { return false }
-            return true
+            switch status {
+            case "tx_ready":
+                cloudTranslationAvailable = true
+                return true
+            case "tx_unavailable", "tx_prepare_failed":
+                cloudTranslationAvailable = false
+                return true
+            default:
+                return false
+            }
         }
-        guard accepted else { return }
-        switch status {
-        case "tx_ready":
-            stateQueue.sync { cloudTranslationAvailable = true }
-            updateCloudAvailability(readCloudAvailability())
-        case "tx_unavailable", "tx_prepare_failed":
-            stateQueue.sync { cloudTranslationAvailable = false }
-            updateCloudAvailability(readCloudAvailability())
-        default:
-            break
-        }
+        guard availabilityChanged else { return }
+        updateCloudAvailability(readCloudAvailability())
     }
 
     /// 把云端的事实喂给路由状态机（key/开关变了要在这里反映出来）。
@@ -718,8 +734,9 @@ final class SubtitleEngine {
         }
         writeLatestLines()
         // 译文用本机翻译：云端只给原文。
+        let translator = stateQueue.sync { cloudTranslator }
         if #available(iOS 26.0, *) {
-            (cloudTranslator as? LocalEngine)?.translate(text, id: lineID)
+            (translator as? LocalEngine)?.translate(text, id: lineID)
         }
     }
 
@@ -756,7 +773,24 @@ final class SubtitleEngine {
         if converter == nil {
             converter = PCMConverter()
         }
-        stateQueue.sync {
+        let sessionCode = newSessionCode()
+        let engine = LocalEngine(
+            onFinal: { [weak self] id, text, range in
+                self?.handleLocalFinal(id: id, text: text, range: range, session: sessionCode)
+            },
+            onTranslation: { [weak self] id, text in
+                self?.handleLocalTranslation(id: id, text: text, session: sessionCode)
+            },
+            onSentenceSettled: { [weak self] id in
+                self?.handleLocalSettled(id: id, session: sessionCode)
+            },
+            onStatus: { [weak self] status in
+                self?.handleLocalStatus(status, session: sessionCode)
+            }
+        )
+        let transition = stateQueue.sync { () -> (Bool, AnyObject?) in
+            guard HandoffRules.mayStartLocal(broadcastActive: broadcastActive) else { return (false, nil) }
+            let oldEngine = localEngine
             // 只有显式「本机」模式才把节点就绪视为真；自动模式正在等节点，
             // 这里写 true 会让切回节点之前就把音频发给一个尚未 ready 的会话。
             readyReceived = engineMode == "local"
@@ -773,28 +807,17 @@ final class SubtitleEngine {
             pendingLocalSettles.removeAll()
             // 换引擎就是换会话：新的本机引擎的 id 又从 1 开始，
             // 不换代号的话会和上一个本机会话的同 id 句对上。
-            localSessionCode = newSessionCode()
+            localSessionCode = sessionCode
             // 本机句的时间要跟云端段对齐：记下这一刻的样本时钟。
             localClockOrigin = sampleClock
+            // 引用和路由同时切换，音频线程不会看到本机档却还拿不到本机引擎。
+            localEngine = engine
+            return (true, oldEngine)
         }
-
-        // 四个回调都带本轮代号：上一轮引擎迟到的句子/译文/状态不能写进这一轮。
-        let sessionCode = stateQueue.sync { localSessionCode }
-        let engine = LocalEngine(
-            onFinal: { [weak self] id, text, range in
-                self?.handleLocalFinal(id: id, text: text, range: range, session: sessionCode)
-            },
-            onTranslation: { [weak self] id, text in
-                self?.handleLocalTranslation(id: id, text: text, session: sessionCode)
-            },
-            onSentenceSettled: { [weak self] id in
-                self?.handleLocalSettled(id: id, session: sessionCode)
-            },
-            onStatus: { [weak self] status in
-                self?.handleLocalStatus(status, session: sessionCode)
-            }
-        )
-        localEngine = engine
+        guard transition.0 else { return }
+        if #available(iOS 26.0, *) {
+            (transition.1 as? LocalEngine)?.stop()
+        }
         Task {
             await engine.start()
         }
@@ -1002,10 +1025,10 @@ final class SubtitleEngine {
                 return value
             }
         }
-        let tier = stateQueue.sync { routingTier }
-        if engineMode == "local" || tier == .local {
+        let localRoute = stateQueue.sync { (routingTier, localEngine) }
+        if engineMode == "local" || localRoute.0 == .local {
             if #available(iOS 26.0, *) {
-                guard let engine = localEngine as? LocalEngine else { return }
+                guard let engine = localRoute.1 as? LocalEngine else { return }
                 if !frames.isEmpty {
                     // 节点 ready 时靠这个标记判断“本机还有一句没定稿”，
                     // 避免切回节点把半句截断。
@@ -1019,7 +1042,7 @@ final class SubtitleEngine {
         }
 
         // 云端档：音频喂分段器，段上传 Groq。
-        if engineMode == "auto", tier == .cloud {
+        if engineMode == "auto", localRoute.0 == .cloud {
             for (index, frame) in frames.enumerated() {
                 feedCloudFrame(frame, start: batchStart + Double(index) * Self.frameSeconds)
             }
@@ -1044,10 +1067,12 @@ final class SubtitleEngine {
         }
     }
 
-    /// 在 stateQueue 内核对轮次、活动状态和档位；三个条件缺一不可才可碰节点。
-    private func isCurrentNodeRun(_ generation: Int) -> Bool {
+    /// 在 stateQueue 内核对轮次、活动状态和档位；节点回调还要核对连接身份，重连后旧连接才不会越权。
+    private func isCurrentNodeRun(_ generation: Int, sessionToken: UUID? = nil) -> Bool {
         stateQueue.sync {
-            runGate.isCurrent(generation)
+            let matchesSession = sessionToken.map { nodeSessionToken == $0 } ?? true
+            return matchesSession
+                && runGate.isCurrent(generation)
                 && broadcastActive
                 && EngineRunGate.mayTouchNode(engineMode: engineMode)
         }
@@ -1090,35 +1115,46 @@ final class SubtitleEngine {
                 return
             }
 
+            let sessionToken = UUID()
+            let sessionCode = self.newSessionCode()
             let newSession = NodeSession(
                 url: pinnedURL,
                 token: config.token,
                 src: config.src,
                 dst: config.dst,
                 onEvent: { [weak self] event in
-                    self?.handleNodeEvent(event, generation: generation)
+                    self?.handleNodeEvent(
+                        event,
+                        generation: generation,
+                        sessionToken: sessionToken,
+                        sessionCode: sessionCode
+                    )
                 },
                 onClose: { [weak self] code in
-                    self?.handleNodeClose(code, generation: generation)
+                    self?.handleNodeClose(code, generation: generation, sessionToken: sessionToken)
                 },
                 onLoading: { [weak self] elapsed in
                     // 节点冷启动：状态行显示「<节点> 正在加载模型…」。
-                    self?.handleNodeLoading(generation: generation)
+                    self?.handleNodeLoading(generation: generation, sessionToken: sessionToken)
                 }
             )
-            let shouldStart = self.stateQueue.sync { () -> Bool in
+            let transition = self.stateQueue.sync { () -> (Bool, NodeSession?) in
                 guard self.runGate.isCurrent(generation),
                       self.broadcastActive,
                       EngineRunGate.mayTouchNode(engineMode: self.engineMode) else {
-                    return false
+                    return (false, nil)
                 }
+                let oldSession = self.session
                 self.session = newSession
+                self.nodeSessionToken = sessionToken
                 // 新的节点会话：节点的句子 id 重新从 1 计数，
                 // 换一个新代号，主 App 才不会把它当成旧会话的同一句。
-                self.nodeSessionCode = self.newSessionCode()
-                return true
+                self.nodeSessionCode = sessionCode
+                return (true, oldSession)
             }
-            if shouldStart {
+            if transition.0 {
+                // 先在锁内换掉身份，再在锁外关旧连接：它排队的迟到回调会被新身份拦住。
+                transition.1?.close()
                 newSession.start()
             }
         }
@@ -1127,9 +1163,11 @@ final class SubtitleEngine {
     /// 按退避策略安排一次重连。节点断开、Tailnet 解析失败都走这里。
     /// - Returns: 是否真的排上了重连（false = 放弃重连或广播已结束）。
     @discardableResult
-    private func scheduleReconnect(closeCode: Int, generation: Int) -> Bool {
+    private func scheduleReconnect(closeCode: Int, generation: Int, sessionToken: UUID? = nil) -> Bool {
         let plan = stateQueue.sync { () -> (TimeInterval?, NodeConfig?) in
-            guard runGate.isCurrent(generation),
+            let matchesSession = sessionToken.map { nodeSessionToken == $0 } ?? true
+            guard matchesSession,
+                  runGate.isCurrent(generation),
                   broadcastActive,
                   EngineRunGate.mayTouchNode(engineMode: engineMode) else {
                 return (nil, nil)
@@ -1144,7 +1182,9 @@ final class SubtitleEngine {
 
         // 重连前把 readyReceived 置 false（ready 之前的帧照旧丢弃计入 drop）
         let markedPending = stateQueue.sync { () -> Bool in
-            guard runGate.isCurrent(generation),
+            let matchesSession = sessionToken.map { nodeSessionToken == $0 } ?? true
+            guard matchesSession,
+                  runGate.isCurrent(generation),
                   broadcastActive,
                   EngineRunGate.mayTouchNode(engineMode: engineMode) else {
                 return false
@@ -1157,7 +1197,7 @@ final class SubtitleEngine {
         // 延迟后在 connectionQueue 上重新走 startPinnedSession（含 TailnetPin 校验）
         connectionQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
-            guard self.isCurrentNodeRun(generation) else { return }
+            guard self.isCurrentNodeRun(generation, sessionToken: sessionToken) else { return }
             // startPinnedSession 只会投递到 connectionQueue；不要在 stateQueue 内再同步调用它，
             // 否则后续给回调加状态核对时会形成同队列死锁。
             self.startPinnedSession(config, generation: generation)
@@ -1165,20 +1205,28 @@ final class SubtitleEngine {
         return true
     }
 
-    private func handleNodeEvent(_ event: NodeEvent, generation: Int) {
-        guard isCurrentNodeRun(generation) else { return }
+    private func handleNodeEvent(
+        _ event: NodeEvent,
+        generation: Int,
+        sessionToken: UUID,
+        sessionCode: String
+    ) {
+        guard isCurrentNodeRun(generation, sessionToken: sessionToken) else { return }
         switch event {
         case .ready(let cold):
             // 自动模式：把「本机是否还有句子没收尾」同步给决策器，再问要不要切回。
             // 没收尾包括「正在识别」和「译文还在路上」两种：
             // 只看正在识别的话，节点恰好在译文飞回来之前就绪，最后一句就只剩原文。
-            if stateQueue.sync(execute: { runGate.isCurrent(generation) && localBusy }) {
+            if stateQueue.sync(execute: {
+                runGate.isCurrent(generation) && nodeSessionToken == sessionToken && localBusy
+            }) {
                 _ = handleAutoEvent(.localSentenceStarted)
             }
-            guard isCurrentNodeRun(generation) else { return }
+            guard isCurrentNodeRun(generation, sessionToken: sessionToken) else { return }
             let decision = handleAutoEvent(.nodeReady)
             let accepted = stateQueue.sync { () -> Bool in
                 guard runGate.isCurrent(generation),
+                      nodeSessionToken == sessionToken,
                       broadcastActive,
                       EngineRunGate.mayTouchNode(engineMode: engineMode) else {
                     return false
@@ -1198,12 +1246,13 @@ final class SubtitleEngine {
         case .final(let id, _, _, let text):
             let accepted = stateQueue.sync { () -> Bool in
                 guard runGate.isCurrent(generation),
+                      nodeSessionToken == sessionToken,
                       broadcastActive,
                       EngineRunGate.mayTouchNode(engineMode: engineMode) else {
                     return false
                 }
                 finalsCount += 1
-                recentLines.append(RecentLine(id: id, src: text, dst: "", session: nodeSessionCode))
+                recentLines.append(RecentLine(id: id, src: text, dst: "", session: sessionCode))
                 if recentLines.count > maxRecentLines {
                     recentLines.removeFirst()
                 }
@@ -1214,13 +1263,14 @@ final class SubtitleEngine {
         case .translation(let id, let text):
             let accepted = stateQueue.sync { () -> Bool in
                 guard runGate.isCurrent(generation),
+                      nodeSessionToken == sessionToken,
                       broadcastActive,
                       EngineRunGate.mayTouchNode(engineMode: engineMode) else {
                     return false
                 }
                 translationsCount += 1
                 // 节点前后两个会话的 id 都从 1 计：只比 id 会把译文写到旧会话那一行。
-                if let idx = RecentLineLookup.index(in: recentLines, session: nodeSessionCode, id: id) {
+                if let idx = RecentLineLookup.index(in: recentLines, session: sessionCode, id: id) {
                     recentLines[idx].dst = text
                 }
                 return true
@@ -1230,6 +1280,7 @@ final class SubtitleEngine {
         case .status(let code, let text, _):
             let accepted = stateQueue.sync { () -> Bool in
                 guard runGate.isCurrent(generation),
+                      nodeSessionToken == sessionToken,
                       broadcastActive,
                       EngineRunGate.mayTouchNode(engineMode: engineMode) else {
                     return false
@@ -1246,13 +1297,13 @@ final class SubtitleEngine {
             guard accepted else { return }
             logger.info("Node status: \(code) \(text)")
             if NodeEvent.isFatal(code: code) {
-                guard isCurrentNodeRun(generation) else { return }
+                guard isCurrentNodeRun(generation, sessionToken: sessionToken) else { return }
                 if engineMode == "auto" {
                     // 自动模式不把节点致命错误记成全局 fatal——那会连本机一起停掉。
                     applyAutoDecision(handleAutoEvent(.reconnectAbandoned))
                 } else {
                     stateQueue.sync {
-                        guard runGate.isCurrent(generation), broadcastActive else { return }
+                        guard runGate.isCurrent(generation), nodeSessionToken == sessionToken, broadcastActive else { return }
                         fatalErrorOccurred = true
                         fatalErrorReason = "fatal:\(code)"
                     }
@@ -1264,16 +1315,16 @@ final class SubtitleEngine {
     }
 
     /// 节点冷启动（gateway 正在拉起 worker 加载权重）：状态行显示加载中。
-    private func handleNodeLoading(generation: Int) {
-        guard isCurrentNodeRun(generation) else { return }
+    private func handleNodeLoading(generation: Int, sessionToken: UUID) {
+        guard isCurrentNodeRun(generation, sessionToken: sessionToken) else { return }
         applyAutoDecision(handleAutoEvent(.nodeLoading))
     }
 
-    private func handleNodeClose(_ code: Int, generation: Int) {
+    private func handleNodeClose(_ code: Int, generation: Int, sessionToken: UUID) {
         // 广播已经结束就别再管这个 close 了：不发 .nodeFailed（那会把本机引擎重新拉起来）、
         // 不重连、不改状态。少了这道闸，广播结束瞬间的 close 事件会让本机引擎复活，
         // 而节点根本不存在——用户看到的是「字幕还在跑，但没有节点」。
-        guard isCurrentNodeRun(generation) else {
+        guard isCurrentNodeRun(generation, sessionToken: sessionToken) else {
             logger.info("Node closed after its run ended: \(code)")
             return
         }
@@ -1281,6 +1332,7 @@ final class SubtitleEngine {
         let displayCode = code == 1013 ? "busy" : "\(code)"
         let accepted = stateQueue.sync { () -> Bool in
             guard runGate.isCurrent(generation),
+                  nodeSessionToken == sessionToken,
                   broadcastActive,
                   EngineRunGate.mayTouchNode(engineMode: engineMode) else {
                 return false
@@ -1296,7 +1348,7 @@ final class SubtitleEngine {
 
         if engineMode == "auto" {
             let resetReady = stateQueue.sync { () -> Bool in
-                guard runGate.isCurrent(generation), broadcastActive else { return false }
+                guard runGate.isCurrent(generation), nodeSessionToken == sessionToken, broadcastActive else { return false }
                 readyReceived = false
                 return true
             }
@@ -1305,8 +1357,8 @@ final class SubtitleEngine {
         }
 
         // 由 NodeSession 通过 closeReason 还原过 1005→真实码
-        let scheduled = scheduleReconnect(closeCode: code, generation: generation)
-        if !scheduled, engineMode == "auto", isCurrentNodeRun(generation) {
+        let scheduled = scheduleReconnect(closeCode: code, generation: generation, sessionToken: sessionToken)
+        if !scheduled, engineMode == "auto", isCurrentNodeRun(generation, sessionToken: sessionToken) {
             applyAutoDecision(handleAutoEvent(.reconnectAbandoned))
         }
     }
