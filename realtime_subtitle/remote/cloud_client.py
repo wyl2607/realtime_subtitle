@@ -7,6 +7,7 @@ key 只从配置文件读，不读环境变量。日志只留 x_groq.id、音频
 from __future__ import annotations
 
 import io
+import hashlib
 import logging
 import math
 import os
@@ -70,6 +71,7 @@ class CloudError(Exception):
         groq_id: str | None = None,
         audio_s: float = 0.0,
         duration_s: float | None = None,
+        key_fingerprint: str | None = None,
         secret: str = "",
     ):
         self.status = status
@@ -79,6 +81,7 @@ class CloudError(Exception):
         self.remaining_requests = remaining_requests
         self.groq_id = _public_id(groq_id, secret)
         self.audio_s = audio_s
+        self.key_fingerprint = key_fingerprint if key_fingerprint is not None else _key_fingerprint(secret)
         # 计费时长：有响应 duration 用响应的，否则用送出去的音频长度。max(10, ·) 在 quota。
         self.duration_s = audio_s if duration_s is None else duration_s
         super().__init__(f"status={self.status} reason={self.reason} exc={self.exc_type}")
@@ -90,13 +93,22 @@ class CloudError(Exception):
 class CloudCancelled(CloudError):
     """关开关之后：在飞请求的结果不能再当成识别结果。"""
 
-    def __init__(self, *, audio_s: float = 0.0, groq_id: str | None = None, status: int | None = None, secret: str = ""):
+    def __init__(
+        self,
+        *,
+        audio_s: float = 0.0,
+        groq_id: str | None = None,
+        status: int | None = None,
+        key_fingerprint: str | None = None,
+        secret: str = "",
+    ):
         super().__init__(
             status=status,
             reason="cancelled",
             exc_type="CloudCancelled",
             groq_id=groq_id,
             audio_s=audio_s,
+            key_fingerprint=key_fingerprint,
             secret=secret,
         )
 
@@ -150,6 +162,13 @@ def read_groq_key(path: Path | None = None) -> str | None:
         if key:
             return key
     return None
+
+
+def _key_fingerprint(key: str) -> str | None:
+    """用于关联一次请求和后续换 key，不保留或输出 key 本身。"""
+    if not key:
+        return None
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
 
 
 class CloudClient:
