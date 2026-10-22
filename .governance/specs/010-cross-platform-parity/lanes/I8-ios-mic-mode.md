@@ -31,15 +31,15 @@
 6. **共用设计令牌**：新增的用户可见状态文案进 `design/tokens.json`（`python3 scripts/design/gen_tokens.py` 生成四端），`check_parity.py` 要过。
 
 ## 待办
-- [ ] 1. `SubtitleEngine` 抽取（纯搬家 + 拆 ingest），`SampleHandler` 变适配层；`project.yml` / `run-selftest.sh` 路径更新
+- [x] 1. `SubtitleEngine` 抽取（纯搬家 + 拆 ingest），`SampleHandler` 变适配层；`project.yml` / `run-selftest.sh` 路径更新（406801c）
 - [ ] 2. 广播回归：真机广播模式跑一遍 tagesschau，结果与抽取前一致（node 会话、字幕、状态行）
-- [ ] 3. `PCMConverter.append(pcmBuffer:)` + 自测（48k Float32 单声道 0.25s → 2 帧 3200 字节，余量留在 pending）
-- [ ] 4. `MicCapture`：AVAudioEngine tap → 串行队列 → `SubtitleEngine.ingest(pcmBuffer:)`；音频会话与 PiP 共存；中断处理
-- [ ] 5. 麦克风权限：`NSMicrophoneUsageDescription` + 运行时申请 + 拒绝提示
-- [ ] 6. 主页「麦克风字幕」开始 / 停止 + 状态；广播与麦克风互斥（纯函数 + 自测）
-- [ ] 7. 新文案进设计令牌，`gen_tokens.py --check`、`check_parity.py` 通过
-- [ ] 8. `build-check.sh` 加断言：`Info.plist` 有 `NSMicrophoneUsageDescription`、Engine 目录被两个 target 编进去
-- [ ] 9. 门禁全绿：`bash ios/Tests/run-selftest.sh && bash ios/Tests/build-check.sh && python3 scripts/design/check_parity.py`
+- [x] 3. `PCMConverter.append(pcmBuffer:)` + 自测（48k Float32 单声道 0.25s → 2 帧 3200 字节，余量留在 pending）（406801c）
+- [x] 4. `MicCapture`：AVAudioEngine tap → 串行队列 → `SubtitleEngine.ingest(pcmBuffer:)`；音频会话与 PiP 共存；中断处理（b87878b）
+- [x] 5. 麦克风权限：`NSMicrophoneUsageDescription` + 运行时申请 + 拒绝提示（b87878b、2361019）
+- [x] 6. 主页「麦克风字幕」开始 / 停止 + 状态；广播与麦克风互斥（纯函数 + 自测）（b87878b）
+- [x] 7. 新文案进设计令牌，`gen_tokens.py --check`、`check_parity.py` 通过（b87878b）
+- [x] 8. `build-check.sh` 加断言：`Info.plist` 有 `NSMicrophoneUsageDescription`、Engine 目录被两个 target 编进去（406801c、b87878b）
+- [x] 9. 门禁全绿：`bash ios/Tests/run-selftest.sh && bash ios/Tests/build-check.sh && python3 scripts/design/check_parity.py`（b87878b）
 - [ ] 10. 真机验证（iPhone 15 Pro）：节点模式（Mac `say -v Anna "…"` 放德语，麦克风能听到）→ 字幕 + 翻译；节点日志 `session_start device=iphone-15-pro`；本机模式（iOS 26+ SpeechAnalyzer）；锁屏 / PiP 下继续出字幕；拒绝权限的提示
 - [ ] 11. 合进 `lane/rs010-int3`（先拉 GitHub 上最新的 int3 再合——用户会直接在 GitHub 合 PR 进去），推送
 
@@ -62,3 +62,8 @@ bash ios/Tests/run-selftest.sh && bash ios/Tests/build-check.sh && python3 scrip
 - 注释用中文，写清「为什么」；不加卡片以外的功能。
 - 每条改动先写会失败的自测再修；`SampleHandler` / 音频采集这类写不成自测的部分，在 PR 里写清真机怎么验证的。
 - 广播模式是已经在真机上跑通的功能：抽取引擎后必须先在真机上回归广播，再做麦克风。
+
+## 2026-10-22 通宵修复
+- **dad941d** 节点握手阶段也受 15 秒 ready 截止时间约束：看门狗从 `resume()` 就启动，Tailscale 对端离线时也能以 1001/1006 收尾，自动档因此能收到 `.nodeFailed` 并回退到本机。
+- **20d306f** 新增 `EngineRunGate`：节点建连、重连、事件、close、loading 都核对建会话时的轮次代号，旧回调不能跨轮次复活；本机档不碰节点，启动状态行写实际读到的 `started mode=<档位>`。
+- **2361019** 本机失败码经 `LocalEngineStatus` 映射成主界面红字提示；主 App 在 `local` / `auto` 档开始麦克风或准备本机资源时申请一次语音识别授权，被拒只提示、不阻止麦克风。
