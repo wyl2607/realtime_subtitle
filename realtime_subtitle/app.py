@@ -2,6 +2,7 @@
 主程序入口
 整合所有模块，协调工作流程
 """
+import functools
 import warnings
 import logging
 import sys
@@ -253,6 +254,11 @@ class RemoteBridge:
         self._saw_cloud = False
         self._announced = None
         self._node_client = None
+        # 每建一个节点客户端递增，作为这次连接的序号。节点句 id 是每会话从头
+        # 编号的，四张节点状态表的键必须带上它，否则重连后同号句会串到上一
+        # 会话的行上。不是最新一次发起的连接，它的事件（迟到的 closed/translation）
+        # 一律丢弃；最新这次哪怕还在 connect 里（loading 早于 ready 就会到）也照收。
+        self._node_conn_seq = 0
         # 正在等节点 ready 的节点 id。只有这段时间状态行显示加载中后缀。
         self._node_loading_id = None
         self._loop = None
@@ -773,14 +779,16 @@ class RemoteBridge:
                         chosen = item
                         break
         cfg, info, _rtt = chosen
+        self._node_conn_seq += 1
+        conn = self._node_conn_seq
         callbacks = NodeCallbacks(
-            on_final=self._on_node_final,
-            on_translation=self._on_node_translation,
-            on_status=self._on_node_status,
-            on_status_event=self._on_node_status_event,
-            on_loading=self._on_node_loading,
-            on_translate_failed=self._on_node_translate_failed,
-            on_closed=self._on_node_closed,
+            on_final=functools.partial(self._on_node_final, conn=conn),
+            on_translation=functools.partial(self._on_node_translation, conn=conn),
+            on_status=functools.partial(self._on_node_status, conn=conn),
+            on_status_event=functools.partial(self._on_node_status_event, conn=conn),
+            on_loading=functools.partial(self._on_node_loading, conn=conn),
+            on_translate_failed=functools.partial(self._on_node_translate_failed, conn=conn),
+            on_closed=functools.partial(self._on_node_closed, conn=conn),
         )
         try:
             client = self._build_node_client(cfg, info, callbacks)
@@ -827,6 +835,7 @@ class RemoteBridge:
                 frames = list(buf.frames)
             buf.clear()
         self._node_client = client
+        self._prune_node_state(conn)
         if hasattr(self.router, "current_node_id"):
             self.router.current_node_id = cfg.id
         for frame in frames:
@@ -924,11 +933,23 @@ class RemoteBridge:
                 print(f"⚠️  节点关闭失败: {type(exc).__name__}")
         self._stop_node_loop()
 
-    def _on_node_final(self, node_id, generation, final_id, body, t0, t1):
+    def _node_conn_stale(self, conn):
+        """conn=None 是测试直接调用时的旧签名；真实回调一定带序号。"""
+        return conn is not None and conn != self._node_conn_seq
+
+    def _prune_node_state(self, conn):
+        """新连接挂上桥时清掉上一会话的残留，按键里的连接序号隔离。"""
+        for table in (self._node_src_by_id, self._early_node_dst, self._node_dst_keys):
+            for key in [key for key in list(table) if key[1] != conn]:
+                table.pop(key, None)
+        self._node_translate_failed = {
+            key for key in list(self._node_translate_failed) if key[1] == conn}
+
+    def _on_node_final(self, node_id, generation, final_id, body, t0, t1, conn=None):
         text = (body or "").strip()
-        if not text or self._stale_remote_generation(generation, "node_final"):
+        if not text or self._node_conn_stale(conn) or self._stale_remote_generation(generation, "node_final"):
             return
-        node_key = (node_id, final_id)
+        node_key = (node_id, conn, final_id)
         self._node_src_by_id[node_key] = text
 
         def work():
@@ -945,10 +966,12 @@ class RemoteBridge:
 
         self._pool.submit(work)
 
-    def _on_node_translation(self, node_id, generation, tx_id, body):
+    def _on_node_translation(self, node_id, generation, tx_id, body, conn=None):
+        if self._node_conn_stale(conn):
+            return
         if self._stale_remote_generation(generation, "node_translation"):
             return
-        node_key = (node_id, tx_id)
+        node_key = (node_id, conn, tx_id)
         if node_key in self._node_translate_failed or not (body or ""):
             return
 
@@ -974,18 +997,22 @@ class RemoteBridge:
         if self._ui_status is not None:
             self._ui_status(f"节点 {node_id}：翻译暂不可用，改用本机翻译")
 
-    def _on_node_status_event(self, node_id, generation, event):
+    def _on_node_status_event(self, node_id, generation, event, conn=None):
+        if self._node_conn_stale(conn):
+            return
         if self._stale_remote_generation(generation, "node_status_event"):
             return
         code = event.get("code") if isinstance(event, dict) else None
         if code == "translate_failed":
             self._notify_node_translate_failed_once(node_id, generation)
 
-    def _on_node_translate_failed(self, node_id, generation, tx_id):
+    def _on_node_translate_failed(self, node_id, generation, tx_id, conn=None):
+        if self._node_conn_stale(conn):
+            return
         if self._stale_remote_generation(generation, "node_translate_failed"):
             return
         self._notify_node_translate_failed_once(node_id, generation)
-        node_key = (node_id, tx_id)
+        node_key = (node_id, conn, tx_id)
         self._node_translate_failed.add(node_key)
 
         def work():
@@ -1005,11 +1032,15 @@ class RemoteBridge:
 
         self._pool.submit(work)
 
-    def _on_node_status(self, text):
+    def _on_node_status(self, text, conn=None):
+        if self._node_conn_stale(conn):
+            return
         if self._ui_status is not None and text:
             self._ui_status(text)
 
-    def _on_node_loading(self, node_id, generation):
+    def _on_node_loading(self, node_id, generation, conn=None):
+        if self._node_conn_stale(conn):
+            return
         if self._stale_remote_generation(generation, "node_loading"):
             return
         from realtime_subtitle.ui import design_tokens
@@ -1019,7 +1050,9 @@ class RemoteBridge:
             # 每 5s 一条 loading：重新挂状态行，避免 5s 自动清空后在剩下的冷加载里看不见。
             self._ui_status(f"{node_id}{design_tokens.TEXT_NODE_LOADING_SUFFIX}")
 
-    def _on_node_closed(self, node_id, generation, error):
+    def _on_node_closed(self, node_id, generation, error, conn=None):
+        if self._node_conn_stale(conn):
+            return
         if self._stale_remote_generation(generation, "node_closed"):
             return
         if error is not None:
