@@ -7,14 +7,19 @@ import Foundation
 /// 对用户不可读，而映射规则要能在命令行自测里直接编译验证，不能依赖 SwiftUI。
 enum LocalEngineStatus {
     static func userMessage(forStatusLine line: String) -> String? {
-        for part in line.split(separator: " ") {
-            let fragment = String(part)
+        let parts = line.split(separator: " ").map(String.init)
+        // 只有本机档的行才谈本机失败。自动档回退到节点/云端之后，
+        // 上一轮遗留的 last= 还留在状态行里，照旧解析会让用户看到早已不成立的提示。
+        for part in parts where part.hasPrefix("engine=") {
+            if part != "engine=local" { return nil }
+        }
+        for part in parts {
             // 显式本机档会追加 fatal:<码>，状态行里同时带 last=<码>。
             let code: String
-            if fragment.hasPrefix("fatal:") {
-                code = String(fragment.dropFirst("fatal:".count))
-            } else if fragment.hasPrefix("last=") {
-                code = String(fragment.dropFirst("last=".count))
+            if part.hasPrefix("fatal:") {
+                code = String(part.dropFirst("fatal:".count))
+            } else if part.hasPrefix("last=") {
+                code = String(part.dropFirst("last=".count))
             } else {
                 continue
             }

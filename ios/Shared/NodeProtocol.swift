@@ -264,6 +264,13 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
     /// 发 close 1000 并结束会话。
     func close() {
         cancelReadyWatch()
+        // 显式关闭不是故障：先占住「已通知」位，之后 URLSession 的取消回调
+        // （didCompleteWithError(cancelled)）就不会再把 onClose 报给上层，
+        // 否则上层会把它当成断线去重连。
+        lock.lock()
+        closeNotified = true
+        let socket = self.socket
+        lock.unlock()
         socket?.cancel(with: .normalClosure, reason: nil)
         session?.finishTasksAndInvalidate()
     }

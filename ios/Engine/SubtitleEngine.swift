@@ -67,6 +67,8 @@ final class SubtitleEngine {
     private var cloudLedger: QuotaLedger?
     /// 只做翻译的引擎：云端只给原文，译文要用本机 TranslationSession。
     private var cloudTranslator: AnyObject?
+    /// 只翻译引擎的轮次标识：跟着引擎一起换，迟到的回调据此丢弃。
+    private var cloudTranslatorToken = ""
     /// 本机翻译能不能用（准备成功后为 true）。云端这一档的前提条件之一。
     private var cloudTranslationAvailable = false
     /// 同一时间只保留一段上传音频：广播扩展只有 ~50MB，排队会无界增长。
@@ -266,7 +268,9 @@ final class SubtitleEngine {
             cloudDroppedSegments = 0
             cloudUploadedSegments = 0
             cloudNextLineID = 1
-            cloudGeneration = 0
+            // 代次跨轮单调：上一轮在飞的云端响应回来时必须判过期，
+            // 归零会让它和本轮的请求撞上同一个代次。
+            cloudGeneration &+= 1
             sampleClock = 0
             p5Store = LineStore()
             p5Identity.removeAll()
@@ -318,12 +322,22 @@ final class SubtitleEngine {
             stateQueue.sync {
                 routingTier = .node
                 localSentenceActive = false
+                // 本机档已经离开：上一轮的本机失败码留着会让状态行提示误报。
+                if Self.isLocalFailureCode(lastStatusCode) {
+                    lastStatusCode = ""
+                }
             }
         case .startCloud:
             startCloudTier()
         case .stopCloudAndSwitchToNode:
             stopCloudTier()
-            stateQueue.sync { routingTier = .node }
+            stateQueue.sync {
+                routingTier = .node
+                // 云端档依赖本机翻译，失败码同样可能是本机残留的。
+                if Self.isLocalFailureCode(lastStatusCode) {
+                    lastStatusCode = ""
+                }
+            }
         case .stopCloudAndStartLocal:
             stopCloudTier()
             if #available(iOS 26.0, *) {
@@ -336,6 +350,17 @@ final class SubtitleEngine {
         }
         if let status = decision.status {
             writeStatus("last=\(status)")
+        }
+    }
+
+    /// 本机这一档自己的失败码。清的时候只认这些，节点状态（closed=… / ready 等）不能碰。
+    private static func isLocalFailureCode(_ code: String) -> Bool {
+        if code.hasPrefix("asr_") { return true }
+        switch code {
+        case "analyzer_format_failed", "tx_unavailable", "tx_prepare_failed", "local_needs_ios26":
+            return true
+        default:
+            return false
         }
     }
 
@@ -352,11 +377,13 @@ final class SubtitleEngine {
     }
 
     private func stopLocalEngine() {
+        let engine = localEngine
         if #available(iOS 26.0, *) {
-            (localEngine as? LocalEngine)?.stop()
+            (engine as? LocalEngine)?.stop()
         }
-        localEngine = nil
         stateQueue.sync {
+            // 在锁内清掉引用：回调的闸门也在锁内核对它，迟到的回调到这里就进不来了。
+            localEngine = nil
             // 引擎没了，在途的译文不会再回调：把没收尾的句子清掉，
             // 否则「本机还忙」的判断会一直挂着。
             pendingLocalSettles.removeAll()
@@ -404,17 +431,19 @@ final class SubtitleEngine {
         let availability = readCloudAvailability()
         guard availability.hasKey, availability.enabled else { return }
         if cloudTranslator == nil {
+            let token = newSessionCode()
             let engine = LocalEngine(
                 mode: .translateOnly,
                 onFinal: { _, _, _ in },
                 onTranslation: { [weak self] id, text in
-                    self?.handleCloudTranslation(id: id, text: text)
+                    self?.handleCloudTranslation(id: id, text: text, token: token)
                 },
                 onSentenceSettled: { _ in },
                 onStatus: { [weak self] status in
-                    self?.handleCloudTranslatorStatus(status)
+                    self?.handleCloudTranslatorStatus(status, token: token)
                 }
             )
+            stateQueue.sync { cloudTranslatorToken = token }
             cloudTranslator = engine
             Task {
                 await engine.start()
@@ -423,7 +452,14 @@ final class SubtitleEngine {
     }
 
     /// 只翻译引擎的状态：准备好了才让云端这一档参与路由。
-    private func handleCloudTranslatorStatus(_ status: String) {
+    private func handleCloudTranslatorStatus(_ status: String, token: String) {
+        let accepted = stateQueue.sync { () -> Bool in
+            guard broadcastActive,
+                  cloudTranslator != nil,
+                  cloudTranslatorToken == token else { return false }
+            return true
+        }
+        guard accepted else { return }
         switch status {
         case "tx_ready":
             stateQueue.sync { cloudTranslationAvailable = true }
@@ -688,13 +724,18 @@ final class SubtitleEngine {
     }
 
     /// 云端那句的译文到了。
-    private func handleCloudTranslation(id: Int, text: String) {
-        stateQueue.sync {
+    private func handleCloudTranslation(id: Int, text: String, token: String) {
+        let accepted = stateQueue.sync { () -> Bool in
+            guard broadcastActive,
+                  cloudTranslator != nil,
+                  cloudTranslatorToken == token else { return false }
             translationsCount += 1
             if let index = RecentLineLookup.index(in: recentLines, session: cloudSessionCode, id: id) {
                 recentLines[index].dst = text
             }
+            return true
         }
+        guard accepted else { return }
         writeLatestLines()
     }
 
@@ -737,18 +778,20 @@ final class SubtitleEngine {
             localClockOrigin = sampleClock
         }
 
+        // 四个回调都带本轮代号：上一轮引擎迟到的句子/译文/状态不能写进这一轮。
+        let sessionCode = stateQueue.sync { localSessionCode }
         let engine = LocalEngine(
             onFinal: { [weak self] id, text, range in
-                self?.handleLocalFinal(id: id, text: text, range: range)
+                self?.handleLocalFinal(id: id, text: text, range: range, session: sessionCode)
             },
             onTranslation: { [weak self] id, text in
-                self?.handleLocalTranslation(id: id, text: text)
+                self?.handleLocalTranslation(id: id, text: text, session: sessionCode)
             },
             onSentenceSettled: { [weak self] id in
-                self?.handleLocalSettled(id: id)
+                self?.handleLocalSettled(id: id, session: sessionCode)
             },
             onStatus: { [weak self] status in
-                self?.handleLocalStatus(status)
+                self?.handleLocalStatus(status, session: sessionCode)
             }
         )
         localEngine = engine
@@ -757,9 +800,11 @@ final class SubtitleEngine {
         }
     }
 
-    private func handleLocalFinal(id: Int, text: String, range: LocalSentenceRange?) {
+    /// 迟到的本机回调不能污染新一轮：会话代号变了、引擎没了、或者广播结束了都丢弃。
+    private func handleLocalFinal(id: Int, text: String, range: LocalSentenceRange?, session: String) {
         var display = false
-        stateQueue.sync {
+        let accepted = stateQueue.sync { () -> Bool in
+            guard broadcastActive, localEngine != nil, localSessionCode == session else { return false }
             finalsCount += 1
             localSentenceActive = false
             pendingLocalSettles.insert(id)
@@ -771,20 +816,21 @@ final class SubtitleEngine {
                 let t0 = localClockOrigin + range.start
                 let t1 = localClockOrigin + range.end
                 p5Store.addLocal(key: storeKey, t0: t0, t1: t1, text: text)
-                p5Identity[storeKey] = (session: localSessionCode, id: id)
+                p5Identity[storeKey] = (session: session, id: id)
                 // 已经被远端行盖住的本机句不再上屏（P5）。
                 display = p5Store.lines.contains { $0.key == storeKey }
             } else {
                 display = true
             }
             if display {
-                recentLines.append(RecentLine(id: id, src: text, dst: "", session: localSessionCode))
+                recentLines.append(RecentLine(id: id, src: text, dst: "", session: session))
                 if recentLines.count > maxRecentLines {
                     recentLines.removeFirst()
                 }
             }
+            return true
         }
-        guard display else { return }
+        guard accepted, display else { return }
         writeLatestLines()
         // 这里不发 .localSentenceFinalized：译文还在路上。
         // 早一步通知决策器，节点会立刻接手、本机引擎被停掉，
@@ -793,9 +839,9 @@ final class SubtitleEngine {
     }
 
     /// 本机这一句收尾了（译文落地或翻译失败）：这时才可以交给节点。
-    private func handleLocalSettled(id: Int) {
+    private func handleLocalSettled(id: Int, session: String) {
         let shouldReport = stateQueue.sync { () -> Bool in
-            guard broadcastActive else { return false }
+            guard broadcastActive, localEngine != nil, localSessionCode == session else { return false }
             guard pendingLocalSettles.remove(id) != nil else { return false }
             // 还有别的句子没收尾、或用户已经开始说下一句，就继续等：
             // 切早了下一句已喂进本机 analyzer 的音频会随引擎一起丢掉。下一句收尾时再判断。
@@ -808,29 +854,40 @@ final class SubtitleEngine {
         applyAutoDecision(handleAutoEvent(.localSentenceFinalized))
     }
 
-    private func handleLocalTranslation(id: Int, text: String) {
-        stateQueue.sync {
+    private func handleLocalTranslation(id: Int, text: String, session: String) {
+        let accepted = stateQueue.sync { () -> Bool in
+            guard broadcastActive, localEngine != nil, localSessionCode == session else { return false }
             translationsCount += 1
             // 会话代号一起比：本机句与云端句的 id 是两套号段，只比 id 会串行。
-            if let idx = RecentLineLookup.index(in: recentLines, session: localSessionCode, id: id) {
+            if let idx = RecentLineLookup.index(in: recentLines, session: session, id: id) {
                 recentLines[idx].dst = text
             }
+            return true
         }
+        guard accepted else { return }
         writeLatestLines()
     }
 
-    private func handleLocalStatus(_ status: String) {
-        stateQueue.sync { lastStatusCode = status }
+    private func handleLocalStatus(_ status: String, session: String) {
+        let accepted = stateQueue.sync { () -> Bool in
+            guard broadcastActive, localEngine != nil, localSessionCode == session else { return false }
+            lastStatusCode = status
+            return true
+        }
+        guard accepted else { return }
         logger.info("Local engine status: \(status)")
         if ["asr_assets_missing", "asr_unsupported", "analyzer_format_failed", "asr_failed", "asr_result_failed"].contains(where: { status.hasPrefix($0) }) {
             if engineMode == "auto" {
                 // 本机引擎自己坏了：停掉它、把音频交还给节点重连，别让音频继续喂给死引擎。
                 applyAutoDecision(handleAutoEvent(.localAvailabilityChanged(false)))
             } else {
-                stateQueue.sync {
+                let shouldFatal = stateQueue.sync { () -> Bool in
+                    guard broadcastActive, localEngine != nil, localSessionCode == session else { return false }
                     fatalErrorOccurred = true
                     fatalErrorReason = "fatal:\(status)"
+                    return true
                 }
+                guard shouldFatal else { return }
             }
         }
         writeStatus("last=\(status)")

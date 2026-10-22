@@ -33,6 +33,12 @@ final class LocalEngine {
     private var resultTask: Task<Void, Never>?
     private var nextID = 1
     private var isRunning = false
+    /// stop() 之后一律不再回调。
+    ///
+    /// 不能拿 isRunning 当这个闸门：要到 startRecognition() 末尾才会置真，
+    /// 在那之前发出的 asr_unsupported / asr_assets_missing / analyzer_format_failed /
+    /// tx_unavailable 都是启动期失败，用 isRunning 守会把它们全部吞掉。
+    private var stopped = false
 
     private let mode: Mode
     private let onFinal: (Int, String, LocalSentenceRange?) -> Void
@@ -70,7 +76,7 @@ final class LocalEngine {
     }
 
     func start() async {
-        guard !isRunning else { return }
+        guard !isRunning, !stopped else { return }
         switch mode {
         case .translateOnly:
             await startTranslationOnly()
@@ -79,34 +85,57 @@ final class LocalEngine {
         }
     }
 
+    private func emitStatus(_ status: String) {
+        guard !stopped else { return }
+        onStatus(status)
+    }
+
+    private func emitFinal(_ id: Int, _ text: String, _ range: LocalSentenceRange?) {
+        guard !stopped else { return }
+        onFinal(id, text, range)
+    }
+
+    private func emitTranslation(_ id: Int, _ text: String) {
+        guard !stopped else { return }
+        onTranslation(id, text)
+    }
+
+    private func emitSettled(_ id: Int) {
+        guard !stopped else { return }
+        onSentenceSettled(id)
+    }
+
     /// 只翻译：起一个 TranslationSession 就完事，不碰语音识别资源。
     ///
     /// 云端档必须先确认这条路能用：云端只给原文，出不了译文就等于没字幕。
     /// 翻译不可用时回调 `tx_unavailable`，上层据此把云端这一档关掉。
     private func startTranslationOnly() async {
         let txStatus = await LanguageAvailability().status(from: sourceLocale, to: targetLocale)
+        guard !stopped else { return }
         guard txStatus == .installed else {
-            onStatus("tx_unavailable")
+            emitStatus("tx_unavailable")
             return
         }
         do {
             let session = TranslationSession(installedSource: sourceLocale, target: targetLocale)
             try await session.prepareTranslation()
+            guard !stopped else { return }
             self.translationSession = session
             isRunning = true
-            onStatus("tx_ready")
+            emitStatus("tx_ready")
         } catch {
             logger.error("TranslationSession prepare failed: \(error.localizedDescription)")
-            onStatus("tx_prepare_failed")
+            emitStatus("tx_prepare_failed")
         }
     }
 
     private func startRecognition() async {
         let locale = Locale(identifier: "de-DE")
         guard let supported = await SpeechTranscriber.supportedLocale(equivalentTo: locale) else {
-            onStatus("asr_unsupported")
+            emitStatus("asr_unsupported")
             return
         }
+        guard !stopped else { return }
 
         let transcriber = SpeechTranscriber(
             locale: supported,
@@ -116,14 +145,16 @@ final class LocalEngine {
         )
 
         let assetStatus = await AssetInventory.status(forModules: [transcriber])
+        guard !stopped else { return }
         if assetStatus != .installed {
-            onStatus("asr_assets_missing")
+            emitStatus("asr_assets_missing")
             return
         }
 
         let txStatus = await LanguageAvailability().status(from: sourceLocale, to: targetLocale)
+        guard !stopped else { return }
         if txStatus != .installed {
-            onStatus("tx_unavailable")
+            emitStatus("tx_unavailable")
         }
 
         let inputStream = AsyncStream<AnalyzerInput> { continuation in
@@ -136,9 +167,10 @@ final class LocalEngine {
             compatibleWith: modules,
             considering: sourceFormat
         ) else {
-            onStatus("analyzer_format_failed")
+            emitStatus("analyzer_format_failed")
             return
         }
+        guard !stopped else { return }
         self.analyzerFormat = analyzerFormat
 
         let analyzer = SpeechAnalyzer(modules: modules)
@@ -150,10 +182,11 @@ final class LocalEngine {
             do {
                 let session = TranslationSession(installedSource: sourceLocale, target: targetLocale)
                 try await session.prepareTranslation()
+                guard !stopped else { return }
                 self.translationSession = session
             } catch {
                 logger.error("TranslationSession prepare failed: \(error.localizedDescription)")
-                onStatus("tx_prepare_failed")
+                emitStatus("tx_prepare_failed")
             }
         }
 
@@ -163,8 +196,10 @@ final class LocalEngine {
                 for try await result in transcriber.results {
                     await self.handleResult(result)
                 }
+            } catch is CancellationError {
+                // stop() 取消结果流不是识别失败：显式本机档会把它当成 fatal 直接收场。
             } catch {
-                self.onStatus("asr_result_failed: \(error.localizedDescription)")
+                self.emitStatus("asr_result_failed: \(error.localizedDescription)")
             }
         }
 
@@ -178,7 +213,7 @@ final class LocalEngine {
             } catch is CancellationError {
                 await analyzer.cancelAndFinishNow()
             } catch {
-                self.onStatus("asr_failed: \(error.localizedDescription)")
+                self.emitStatus("asr_failed: \(error.localizedDescription)")
                 await self.finish()
             }
         }
@@ -239,31 +274,36 @@ final class LocalEngine {
     /// 翻译成功、失败、压根没有会话，这一句都算收尾（回调 onSentenceSettled）。
     func translate(_ text: String, id: Int) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty, !stopped else { return }
         guard let session = translationSession else {
-            onStatus("tx_unavailable")
-            onSentenceSettled(id)
+            emitStatus("tx_unavailable")
+            emitSettled(id)
             return
         }
         Task { [weak self] in
             guard let self else { return }
             do {
                 let response = try await session.translate(trimmed)
+                guard !self.stopped else { return }
                 let translated = response.targetText.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !translated.isEmpty {
-                    self.onTranslation(id, translated)
+                    self.emitTranslation(id, translated)
                 } else {
-                    self.onStatus("tx_empty")
+                    self.emitStatus("tx_empty")
                 }
             } catch {
+                guard !self.stopped else { return }
                 self.logger.error("Translation failed: \(error.localizedDescription)")
-                self.onStatus("tx_error")
+                self.emitStatus("tx_error")
             }
-            self.onSentenceSettled(id)
+            self.emitSettled(id)
         }
     }
 
     func stop() {
+        // 必须在 isRunning 那道 guard 之前置真：启动中途被停时 isRunning 还是 false，
+        // 这时候更要挡住启动期回调。
+        stopped = true
         guard isRunning else { return }
         isRunning = false
         inputContinuation?.finish()
@@ -280,6 +320,7 @@ final class LocalEngine {
     }
 
     private func handleResult(_ result: SpeechTranscriber.Result) async {
+        guard !stopped else { return }
         let raw = String(result.text.characters)
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, result.isFinal else { return }
@@ -287,26 +328,29 @@ final class LocalEngine {
         let id = nextID
         nextID += 1
 
-        onFinal(id, text, Self.rangeSeconds(result.range))
+        guard !stopped else { return }
+        emitFinal(id, text, Self.rangeSeconds(result.range))
 
         if let session = translationSession {
             do {
                 let response = try await session.translate(text)
+                guard !stopped else { return }
                 let translated = response.targetText.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !translated.isEmpty {
-                    onTranslation(id, translated)
+                    emitTranslation(id, translated)
                 } else {
-                    onStatus("tx_empty")
+                    emitStatus("tx_empty")
                 }
             } catch {
+                guard !stopped else { return }
                 logger.error("Translation failed: \(error.localizedDescription)")
-                onStatus("tx_error")
+                emitStatus("tx_error")
             }
         }
 
         // 翻译成功、翻译失败、或者压根没有翻译会话，这一句都算收尾了。
         // 放在最后：调用方据此判断「本机这边可以放手了」，能安全切回节点。
-        onSentenceSettled(id)
+        emitSettled(id)
     }
 
     /// CMTimeRange → 秒。整句区间为零/非法时返回 nil：宁可没有时间，

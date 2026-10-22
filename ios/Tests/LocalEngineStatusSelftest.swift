@@ -80,6 +80,24 @@ struct LocalEngineStatusSelftest {
             LocalEngineStatus.userMessage(forStatusLine: "engine=local last=tx_ready") == nil,
             "本机翻译就绪不触发提示"
         )
+        // 自动档回退到节点/云端后，上一轮本机遗留的 last= 不能再冒出来。
+        check(
+            LocalEngineStatus.userMessage(forStatusLine: "engine=node ready=1 sent=5 last=asr_assets_missing") == nil,
+            "engine=node 的旧本机失败码返回 nil"
+        )
+        check(
+            LocalEngineStatus.userMessage(forStatusLine: "engine=local last=asr_assets_missing") == DesignTokens.Text.localAssetsMissing,
+            "engine=local 的资源缺失照旧识别"
+        )
+        check(
+            LocalEngineStatus.userMessage(forStatusLine: "engine=cloud last=tx_unavailable") == nil,
+            "engine=cloud 的本机翻译失败码返回 nil"
+        )
+        // 引擎刚起、还没写 engine= 的短状态行不能被上面那道闸误伤。
+        check(
+            LocalEngineStatus.userMessage(forStatusLine: "last=asr_assets_missing src=mic") == DesignTokens.Text.localAssetsMissing,
+            "不含 engine= 的短状态行照旧识别"
+        )
 
         if failed {
             print("LOCAL ENGINE STATUS SELFTEST FAILED")

@@ -19,6 +19,7 @@ struct NodeSelftest {
         testLoadingEvent(check)
         testSessionLoadingCallback(check)
         testStartReadyWatchdog(check)
+        testExplicitCloseDoesNotNotify(check)
         pcmChecks(sampleRate: 48_000, channels: 2, check: check)
         pcmChecks(sampleRate: 44_100, channels: 1, check: check)
         testCMSampleBufferPaths(check)
@@ -257,6 +258,34 @@ struct NodeSelftest {
         check(codes.first == 1001 || codes.first == 1006,
               "不可达节点应以握手超时或连接失败结束（实际 \(codes)）")
         session.close()
+    }
+
+    static func testExplicitCloseDoesNotNotify(_ check: (Bool, String) -> Void) {
+        let closeLock = NSLock()
+        var closeCount = 0
+        let session = NodeSession(
+            // 不可达地址让建连一直挂着；readyTimeout 拉长，避免看门狗抢先上报。
+            url: URL(string: "ws://100.64.0.1:9/v2/session")!,
+            token: "gsk_test_fake_key_not_real",
+            src: "de",
+            dst: "zh",
+            onEvent: { _ in },
+            onClose: { _ in
+                closeLock.lock()
+                closeCount += 1
+                closeLock.unlock()
+            },
+            readyTimeout: 30
+        )
+
+        session.start()
+        // start 后立刻 close：URLSession 的取消回调不能变成 onClose。
+        session.close()
+        Thread.sleep(forTimeInterval: 0.5)
+        closeLock.lock()
+        let count = closeCount
+        closeLock.unlock()
+        check(count == 0, "显式 close 后 onClose 不应回调（实际 \(count) 次）")
     }
 
     static func pcmChecks(sampleRate: Double, channels: Int, check: (Bool, String) -> Void) {
