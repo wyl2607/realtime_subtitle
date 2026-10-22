@@ -30,10 +30,9 @@ struct ContentView: View {
     @State private var prepareSpeechDeniedHint: String?
     @State private var isPreparing = false
     /// 翻译资源下载只能借 SwiftUI 的 `.translationTask` 拿到 TranslationSession。
-    /// 该类型 iOS 18 起才可用，而工程部署目标是 iOS 17，所以属性单独标可用性，
-    /// 修饰符也在 `wrapped(_:)` 里按可用性包住。
-    @available(iOS 18.0, *)
-    @State private var translationConfig: TranslationSession.Configuration?
+    /// 该类型 iOS 18 起才可用，而工程部署目标是 iOS 17。存储属性不能标 `@available`
+    /// （Xcode 26 直接报错，Xcode 27 才放行），所以用 Any? 存，用的地方都在 iOS 18 分支里再转回。
+    @State private var translationConfig: Any?
     /// Groq key 的输入框内容。只在用户输入时存在，保存后立刻清空。
     @State private var groqKeyInput: String = ""
     /// 已保存 key 的掩码（只显示后 4 位）。完整 key 只在 Keychain 里。
@@ -423,7 +422,7 @@ struct ContentView: View {
     @ViewBuilder
     private func wrapped<V: View>(_ content: V) -> some View {
         if #available(iOS 18.0, *) {
-            content.translationTask(translationConfig) { session in
+            content.translationTask(translationConfig as? TranslationSession.Configuration) { session in
                 _ = try? await session.prepareTranslation()
                 // prepareTranslation 正常返回不代表资源真的装上（用户可能取消系统下载），
                 // 状态必须以再次查询 LanguageAvailability 的结果为准。
