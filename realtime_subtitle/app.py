@@ -942,8 +942,9 @@ class RemoteBridge:
         for table in (self._node_src_by_id, self._early_node_dst, self._node_dst_keys):
             for key in [key for key in list(table) if key[1] != conn]:
                 table.pop(key, None)
-        self._node_translate_failed = {
-            key for key in list(self._node_translate_failed) if key[1] == conn}
+        # 原地删，不整体重新赋值：节点线程可能正往里 add 新连接的标记，换成新集合会把它丢掉。
+        for key in [key for key in list(self._node_translate_failed) if key[1] != conn]:
+            self._node_translate_failed.discard(key)
 
     def _on_node_final(self, node_id, generation, final_id, body, t0, t1, conn=None):
         text = (body or "").strip()
