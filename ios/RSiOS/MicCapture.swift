@@ -16,6 +16,9 @@ final class MicCapture: ObservableObject {
     @Published private(set) var state: MicCaptureState = .idle
     /// 语音识别被拒绝时的提示文案（不改变麦克风采集状态）。
     @Published private(set) var speechDeniedHint: String? = nil
+    /// 点击「开始」那一刻读到的引擎档位。界面靠它判断档位是否真的改过，
+    /// 只有改过才提示「停止后重新开始才生效」。
+    @Published private(set) var startedEngineMode: String? = nil
 
     private let audioEngine = AVAudioEngine()
     private let subtitleEngine = SubtitleEngine(source: "mic")
@@ -71,6 +74,11 @@ final class MicCapture: ObservableObject {
             break
         }
 
+        // 档位在用户点「开始」的这一刻定下：系统权限框停留期间 Picker 值若被改，
+        // 也不能把新一轮启动记成另一个档位。
+        let mode = SharedKeychain.readEngineMode()
+        startedEngineMode = mode
+
         isRequestingPermission = true
         // iOS 17 起由 AVAudioApplication 统一申请录音权限；不把系统权限 API 散在 View 里。
         AVAudioApplication.requestRecordPermission { [weak self] granted in
@@ -81,9 +89,8 @@ final class MicCapture: ObservableObject {
                     self.publish(.denied)
                     return
                 }
-                // 当档位是 local 或 auto 时，麦克风开始前申请语音识别授权（不阻止开始）。
-                self.requestSpeechRecognitionAuthorizationIfNeeded()
-                self.beginCapture()
+                // local/auto 要等语音识别授权结果落地后再开采集（见下方注释）。
+                self.beginCaptureAfterSpeechAuthorization(mode: mode)
             }
         }
     }
@@ -92,6 +99,8 @@ final class MicCapture: ObservableObject {
         shouldResumeAfterInterruption = false
         stopAudioPipeline()
         restorePiPAudioSession()
+        // 用户可能刚从设置里打开权限再回来，提示不能一直挂到杀进程。
+        speechDeniedHint = nil
         publish(.idle)
     }
 
@@ -242,24 +251,44 @@ final class MicCapture: ObservableObject {
         }
     }
 
-    /// 当当前档位是 local 或 auto，且语音识别授权尚未确定时申请一次。
-    /// 被拒绝时通过状态提示 `localSpeechDenied`，但不阻止麦克风开始。
-    private func requestSpeechRecognitionAuthorizationIfNeeded() {
-        let mode = SharedKeychain.readEngineMode()
-        guard mode == "local" || mode == "auto" else { return }
-        guard SFSpeechRecognizer.authorizationStatus() == .notDetermined else { return }
-        SFSpeechRecognizer.requestAuthorization { [weak self] status in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                switch status {
-                case .denied, .restricted:
-                    // 不阻止麦克风开始（节点/云端档不需要语音识别），
-                    // 只在提示里显示拒绝信息，供用户自行到设置打开。
-                    self.speechDeniedHint = DesignTokens.Text.localSpeechDenied
-                default:
-                    break
+    /// local/auto 档先等语音识别授权结果，再启动麦克风采集。
+    /// 以前是「发出授权请求后立刻 beginCapture」：用户还在系统弹框上停留时，
+    /// 本机引擎已经带着未授权状态启动并失败，刚点「允许」就只能看到「请停止后重新开始」。
+    /// 拒绝仍不阻止开始——节点/云端档本来就不需要这项权限，只提示用户去设置打开。
+    private func beginCaptureAfterSpeechAuthorization(mode: String) {
+        guard mode == "local" || mode == "auto" else {
+            beginCapture()
+            return
+        }
+
+        switch SFSpeechRecognizer.authorizationStatus() {
+        case .notDetermined:
+            SFSpeechRecognizer.requestAuthorization { [weak self] status in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.updateSpeechDeniedHint(for: status)
+                    self.beginCapture()
                 }
             }
+        case .denied, .restricted:
+            speechDeniedHint = DesignTokens.Text.localSpeechDenied
+            beginCapture()
+        case .authorized:
+            speechDeniedHint = nil
+            beginCapture()
+        default:
+            beginCapture()
+        }
+    }
+
+    private func updateSpeechDeniedHint(for status: SFSpeechRecognizerAuthorizationStatus) {
+        switch status {
+        case .denied, .restricted:
+            speechDeniedHint = DesignTokens.Text.localSpeechDenied
+        case .authorized:
+            speechDeniedHint = nil
+        default:
+            break
         }
     }
 

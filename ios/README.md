@@ -31,7 +31,7 @@
 - **回退**：云端连续 3 段失败（含 5xx/网络错误）进入退避冷却（5/30/120/300 秒），429 冷却 `retry_after`（缺省 60 秒），额度 ≥90% 冷却、<80% 恢复，401/403 标记 key 失效直到换 key；冷却到期只发一段 probe。云端不在位时，节点失败或 15 秒未 `ready` 转本机并继续重连；节点恢复时若本机还有句子在识别或译文未落地，先等收尾再切回。
 - iOS <26 时自动档没有本机可退：节点不可用只显示「不可用，正在重连」。
 
-本机档和云端档都依赖 iOS 26。开始前点「准备本机识别资源」：代码检查德语 `SpeechTranscriber` 的资源状态和 de→zh-Hans 的 `LanguageAvailability`，并显示结果；当前实现只调用 `AssetInventory.status` 查询，没有主动下载调用，未安装时只提示「再次准备将下载资源」。
+本机档和云端档都依赖 iOS 26。开始前点「准备本机识别资源」：识别资源未装时用 `AssetInventory.assetInstallationRequest(supporting:)` 下载安装，翻译资源未装时经 `.translationTask` 调 `prepareTranslation()` 弹系统下载确认（iOS 18+），完成后重新查询并显示两者状态。
 
 ### 字幕显示
 
