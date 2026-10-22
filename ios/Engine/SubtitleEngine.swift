@@ -1078,6 +1078,17 @@ final class SubtitleEngine {
         }
     }
 
+    /// 令牌留给重连计划核对；事件则还必须有一个活着的会话，不能让已 close 的旧连接借旧令牌复活。
+    private func isCurrentNodeSession(_ generation: Int, sessionToken: UUID) -> Bool {
+        stateQueue.sync {
+            nodeSessionToken == sessionToken
+                && session != nil
+                && runGate.isCurrent(generation)
+                && broadcastActive
+                && EngineRunGate.mayTouchNode(engineMode: engineMode)
+        }
+    }
+
     private func startPinnedSession(_ config: NodeConfig, generation: Int) {
         connectionQueue.async { [weak self] in
             guard let self else { return }
@@ -1155,7 +1166,17 @@ final class SubtitleEngine {
             if transition.0 {
                 // 先在锁内换掉身份，再在锁外关旧连接：它排队的迟到回调会被新身份拦住。
                 transition.1?.close()
-                newSession.start()
+                let shouldStart = self.stateQueue.sync {
+                    self.runGate.isCurrent(generation)
+                        && self.broadcastActive
+                        && self.nodeSessionToken == sessionToken
+                }
+                if shouldStart {
+                    newSession.start()
+                } else {
+                    // finish 可能恰好在换会话后发生；先关掉 B，start 的关闭闸才不会重建连接。
+                    newSession.close()
+                }
             }
         }
     }
@@ -1211,22 +1232,23 @@ final class SubtitleEngine {
         sessionToken: UUID,
         sessionCode: String
     ) {
-        guard isCurrentNodeRun(generation, sessionToken: sessionToken) else { return }
+        guard isCurrentNodeSession(generation, sessionToken: sessionToken) else { return }
         switch event {
         case .ready(let cold):
             // 自动模式：把「本机是否还有句子没收尾」同步给决策器，再问要不要切回。
             // 没收尾包括「正在识别」和「译文还在路上」两种：
             // 只看正在识别的话，节点恰好在译文飞回来之前就绪，最后一句就只剩原文。
             if stateQueue.sync(execute: {
-                runGate.isCurrent(generation) && nodeSessionToken == sessionToken && localBusy
+                runGate.isCurrent(generation) && nodeSessionToken == sessionToken && session != nil && localBusy
             }) {
                 _ = handleAutoEvent(.localSentenceStarted)
             }
-            guard isCurrentNodeRun(generation, sessionToken: sessionToken) else { return }
+            guard isCurrentNodeSession(generation, sessionToken: sessionToken) else { return }
             let decision = handleAutoEvent(.nodeReady)
             let accepted = stateQueue.sync { () -> Bool in
                 guard runGate.isCurrent(generation),
                       nodeSessionToken == sessionToken,
+                      session != nil,
                       broadcastActive,
                       EngineRunGate.mayTouchNode(engineMode: engineMode) else {
                     return false
@@ -1247,6 +1269,7 @@ final class SubtitleEngine {
             let accepted = stateQueue.sync { () -> Bool in
                 guard runGate.isCurrent(generation),
                       nodeSessionToken == sessionToken,
+                      session != nil,
                       broadcastActive,
                       EngineRunGate.mayTouchNode(engineMode: engineMode) else {
                     return false
@@ -1264,6 +1287,7 @@ final class SubtitleEngine {
             let accepted = stateQueue.sync { () -> Bool in
                 guard runGate.isCurrent(generation),
                       nodeSessionToken == sessionToken,
+                      session != nil,
                       broadcastActive,
                       EngineRunGate.mayTouchNode(engineMode: engineMode) else {
                     return false
@@ -1281,6 +1305,7 @@ final class SubtitleEngine {
             let accepted = stateQueue.sync { () -> Bool in
                 guard runGate.isCurrent(generation),
                       nodeSessionToken == sessionToken,
+                      session != nil,
                       broadcastActive,
                       EngineRunGate.mayTouchNode(engineMode: engineMode) else {
                     return false
@@ -1297,13 +1322,13 @@ final class SubtitleEngine {
             guard accepted else { return }
             logger.info("Node status: \(code) \(text)")
             if NodeEvent.isFatal(code: code) {
-                guard isCurrentNodeRun(generation, sessionToken: sessionToken) else { return }
+                guard isCurrentNodeSession(generation, sessionToken: sessionToken) else { return }
                 if engineMode == "auto" {
                     // 自动模式不把节点致命错误记成全局 fatal——那会连本机一起停掉。
                     applyAutoDecision(handleAutoEvent(.reconnectAbandoned))
                 } else {
                     stateQueue.sync {
-                        guard runGate.isCurrent(generation), nodeSessionToken == sessionToken, broadcastActive else { return }
+                        guard runGate.isCurrent(generation), nodeSessionToken == sessionToken, session != nil, broadcastActive else { return }
                         fatalErrorOccurred = true
                         fatalErrorReason = "fatal:\(code)"
                     }
@@ -1316,7 +1341,7 @@ final class SubtitleEngine {
 
     /// 节点冷启动（gateway 正在拉起 worker 加载权重）：状态行显示加载中。
     private func handleNodeLoading(generation: Int, sessionToken: UUID) {
-        guard isCurrentNodeRun(generation, sessionToken: sessionToken) else { return }
+        guard isCurrentNodeSession(generation, sessionToken: sessionToken) else { return }
         applyAutoDecision(handleAutoEvent(.nodeLoading))
     }
 
@@ -1333,11 +1358,14 @@ final class SubtitleEngine {
         let accepted = stateQueue.sync { () -> Bool in
             guard runGate.isCurrent(generation),
                   nodeSessionToken == sessionToken,
+                  session != nil,
                   broadcastActive,
                   EngineRunGate.mayTouchNode(engineMode: engineMode) else {
                 return false
             }
             lastStatusCode = "closed=\(displayCode)"
+            // 令牌仍是这次重连的凭据；只退休可收事件/发帧的会话身份。
+            session = nil
             return true
         }
         guard accepted else { return }

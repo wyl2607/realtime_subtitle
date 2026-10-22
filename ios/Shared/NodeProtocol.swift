@@ -217,17 +217,21 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
     }
 
     func start() {
+        lock.lock()
+        guard !closeNotified else {
+            lock.unlock()
+            return
+        }
+        lock.unlock()
         guard let hello = NodeHello(src: src, dst: dst) else {
-            onClose(1008)
+            notifyClosed(1008)
             return
         }
         var request = URLRequest(url: url)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         let configuration = URLSessionConfiguration.ephemeral
         let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
-        self.session = session
         let socket = session.webSocketTask(with: request)
-        self.socket = socket
         // 截止时间从开始建连起算：握手卡住时 send 回调不会返回，必须先让看门狗接管。
         let helloAt = Self.monotonic()
         let box = ReadyDeadlineBox(
@@ -239,8 +243,18 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
                 receivedLoading: false
             )
         )
+        lock.lock()
+        guard !closeNotified else {
+            lock.unlock()
+            return
+        }
+        self.session = session
+        self.socket = socket
+        self.readyBox = box
+        // start 与 close 在同一把锁内交接：finish 若已先关闭，就不能在它之后再建活连接。
         socket.resume()
-        beginReadyWatch(box)
+        lock.unlock()
+        armReadyWatchdog()
         socket.send(.string(hello.json())) { [weak self] error in
             if error != nil {
                 self?.notifyClosed(1006)
@@ -270,6 +284,7 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
         lock.lock()
         closeNotified = true
         let socket = self.socket
+        let session = self.session
         lock.unlock()
         socket?.cancel(with: .normalClosure, reason: nil)
         session?.finishTasksAndInvalidate()
@@ -286,6 +301,12 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
         default:
             break
         }
+        lock.lock()
+        let closed = closeNotified
+        lock.unlock()
+        // 只查不持锁回调：onEvent 会一路进上层状态队列和自动档决策，持着这把锁回调有死锁风险；
+        // 查完到回调之间的窄窗口由上层「会话仍活着」的闸门兜住。
+        guard !closed else { return }
         onEvent(event)
     }
 
@@ -311,17 +332,14 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
     /// 收到 loading：续期 ready 截止时间，并把 elapsed_s 交给上层（本轮只回调，不接 UI）。
     private func noteLoading(elapsed: Double) {
         lock.lock()
+        guard !closeNotified else {
+            lock.unlock()
+            return
+        }
         let box = readyBox
         lock.unlock()
         box?.extend(now: Self.monotonic())
         onLoading?(elapsed)
-    }
-
-    private func beginReadyWatch(_ box: ReadyDeadlineBox) {
-        lock.lock()
-        readyBox = box
-        lock.unlock()
-        armReadyWatchdog()
     }
 
     /// 让看门狗睡到当前截止时间。被续期时旧 work item 会到点先醒，发现截止时间

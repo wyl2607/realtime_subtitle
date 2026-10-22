@@ -229,6 +229,7 @@ struct NodeSelftest {
     static func testStartReadyWatchdog(_ check: (Bool, String) -> Void) {
         let closeLock = NSLock()
         var closeCodes: [Int] = []
+        var eventCount = 0
         let closed = DispatchSemaphore(value: 0)
         let session = NodeSession(
             // 不可达地址让握手可能一直挂住，验证看门狗不依赖 send 完成回调。
@@ -236,7 +237,11 @@ struct NodeSelftest {
             token: "gsk_test_fake_key_not_real",
             src: "de",
             dst: "zh",
-            onEvent: { _ in },
+            onEvent: { _ in
+                closeLock.lock()
+                eventCount += 1
+                closeLock.unlock()
+            },
             onClose: { code in
                 closeLock.lock()
                 closeCodes.append(code)
@@ -257,6 +262,11 @@ struct NodeSelftest {
         check(codes.count == 1, "不可达节点 onClose 只能回调一次（实际 \(codes)）")
         check(codes.first == 1001 || codes.first == 1006,
               "不可达节点应以握手超时或连接失败结束（实际 \(codes)）")
+        session.handle(eventText: #"{"ev":"ready","cold":true}"#)
+        closeLock.lock()
+        let eventsAfterClose = eventCount
+        closeLock.unlock()
+        check(eventsAfterClose == 0, "notifyClosed 后的 ready 不应再上报事件（实际 \(eventsAfterClose)）")
         session.close()
     }
 
