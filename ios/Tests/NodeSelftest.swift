@@ -18,9 +18,12 @@ struct NodeSelftest {
         testReadyDeadline(check)
         testLoadingEvent(check)
         testSessionLoadingCallback(check)
+        testStartReadyWatchdog(check)
+        testExplicitCloseDoesNotNotify(check)
         pcmChecks(sampleRate: 48_000, channels: 2, check: check)
         pcmChecks(sampleRate: 44_100, channels: 1, check: check)
         testCMSampleBufferPaths(check)
+        runPCMConverterSelftest(check)
         runPairingSelftest(check)
         runTailnetPinSelftest(check)
         runReconnectSelftest(check)
@@ -221,6 +224,78 @@ struct NodeSelftest {
         session.handle(eventText: #"{"ev":"ready","cold":true}"#)
         check(loadings.count == 2, "ready 后不再触发 onLoading")
         check(events.count == 4, "ready 仍按事件上报（实际 \(events.count)）")
+    }
+
+    static func testStartReadyWatchdog(_ check: (Bool, String) -> Void) {
+        let closeLock = NSLock()
+        var closeCodes: [Int] = []
+        var eventCount = 0
+        let closed = DispatchSemaphore(value: 0)
+        let session = NodeSession(
+            // 不可达地址让握手可能一直挂住，验证看门狗不依赖 send 完成回调。
+            url: URL(string: "ws://100.64.0.1:9/v2/session")!,
+            token: "gsk_test_fake_key_not_real",
+            src: "de",
+            dst: "zh",
+            onEvent: { _ in
+                closeLock.lock()
+                eventCount += 1
+                closeLock.unlock()
+            },
+            onClose: { code in
+                closeLock.lock()
+                closeCodes.append(code)
+                closeLock.unlock()
+                closed.signal()
+            },
+            readyTimeout: 0.3
+        )
+
+        session.start()
+        let arrived = closed.wait(timeout: .now() + 2) == .success
+        check(arrived, "不可达节点应在 2s 内结束会话")
+        // 等待 cancel 触发的 delegate 回调，确认它和看门狗竞争时不会重复通知上层。
+        Thread.sleep(forTimeInterval: 0.1)
+        closeLock.lock()
+        let codes = closeCodes
+        closeLock.unlock()
+        check(codes.count == 1, "不可达节点 onClose 只能回调一次（实际 \(codes)）")
+        check(codes.first == 1001 || codes.first == 1006,
+              "不可达节点应以握手超时或连接失败结束（实际 \(codes)）")
+        session.handle(eventText: #"{"ev":"ready","cold":true}"#)
+        closeLock.lock()
+        let eventsAfterClose = eventCount
+        closeLock.unlock()
+        check(eventsAfterClose == 0, "notifyClosed 后的 ready 不应再上报事件（实际 \(eventsAfterClose)）")
+        session.close()
+    }
+
+    static func testExplicitCloseDoesNotNotify(_ check: (Bool, String) -> Void) {
+        let closeLock = NSLock()
+        var closeCount = 0
+        let session = NodeSession(
+            // 不可达地址让建连一直挂着；readyTimeout 拉长，避免看门狗抢先上报。
+            url: URL(string: "ws://100.64.0.1:9/v2/session")!,
+            token: "gsk_test_fake_key_not_real",
+            src: "de",
+            dst: "zh",
+            onEvent: { _ in },
+            onClose: { _ in
+                closeLock.lock()
+                closeCount += 1
+                closeLock.unlock()
+            },
+            readyTimeout: 30
+        )
+
+        session.start()
+        // start 后立刻 close：URLSession 的取消回调不能变成 onClose。
+        session.close()
+        Thread.sleep(forTimeInterval: 0.5)
+        closeLock.lock()
+        let count = closeCount
+        closeLock.unlock()
+        check(count == 0, "显式 close 后 onClose 不应回调（实际 \(count) 次）")
     }
 
     static func pcmChecks(sampleRate: Double, channels: Int, check: (Bool, String) -> Void) {

@@ -46,6 +46,16 @@ enum DesignTokens {
         static let minHoldSec: Double = 3.0
     }
     enum Text {
+        static let micSubtitleTitle: String = "麦克风字幕"
+        static let micStartButton: String = "开始"
+        static let micStopButton: String = "停止"
+        static let micStatusIdle: String = "未启动"
+        static let micStatusRunning: String = "正在采集麦克风音频"
+        static let micPermissionDenied: String = "麦克风权限被拒绝，请到 设置 → 实时字幕 打开"
+        static let micBlockedByBroadcast: String = "请先停止屏幕广播"
+        static let micStoppedByBroadcast: String = "屏幕广播已开始，麦克风已停止"
+        static let micInterrupted: String = "麦克风被系统中断，未自动恢复"
+        static let micError: String = "麦克风无法启动，请稍后重试"
         static let statusLocal: String = "本机"
         static let statusHybridPrefix: String = "混合·"
         static let statusCloud: String = "云端·Groq"
@@ -59,6 +69,13 @@ enum DesignTokens {
         static let nodeConnectedSuffix: String = " 已连接"
         static let nodeUnavailableReconnectingSuffix: String = " 不可用，正在重连"
         static let localUnavailableReconnectingPrefix: String = "本机识别不可用，正在重连 "
+        static let localAsrUnsupported: String = "本机不支持德语识别"
+        static let localAssetsMissing: String = "本机识别资源未下载，请点「准备本机识别资源」"
+        static let localFormatFailed: String = "本机音频格式不支持，请停止后重新开始"
+        static let localAsrFailed: String = "本机识别出错，请停止后重新开始"
+        static let localTxUnavailable: String = "本机翻译资源未下载，只显示原文"
+        static let localNeedsIOS26: String = "本机识别需要 iOS 26 或更新"
+        static let localSpeechDenied: String = "语音识别权限被拒绝，请到 设置 → 实时字幕 打开"
     }
     enum Palette {
         static let text: [(name: String, hex: String)] = [(name: "白", hex: "#F0F0F0"), (name: "暖黄", hex: "#FFE894"), (name: "浅青", hex: "#9FE7F5"), (name: "浅绿", hex: "#B8F2B0"), (name: "浅粉", hex: "#FFC4D6")]
