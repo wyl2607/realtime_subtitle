@@ -104,6 +104,12 @@ struct ContentView: View {
                             .font(.caption)
                             .foregroundStyle(micStatusColor)
                             .frame(maxWidth: .infinity, alignment: .leading)
+                        if let speechDenied = micCapture.speechDeniedHint {
+                            Text(speechDenied)
+                                .font(.caption)
+                                .foregroundColor(.red)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
                     }
 
                     Divider()
@@ -302,6 +308,15 @@ struct ContentView: View {
                             .cornerRadius(8)
                     }
 
+                    // 本机引擎失败时把原始码映射成可读提示（纯逻辑，不删原状态行）。
+                    if let localMsg = LocalEngineStatus.userMessage(forStatusLine: statusMonitor.keychainStatus) {
+                        Text(localMsg)
+                            .font(.caption)
+                            .foregroundColor(.red)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.top, 4)
+                    }
+
                     VStack(spacing: 8) {
                         Text("最近句对 (来自扩展)")
                             .font(.headline)
@@ -450,6 +465,20 @@ struct ContentView: View {
 
         isPreparing = true
         prepareStatus = "检查资源状态..."
+        // 准备本机识别资源时，如果档位允许且授权尚未确定，就申请一次语音识别授权（不阻止流程）。
+        if #available(iOS 26.0, *) {
+            let mode = SharedKeychain.readEngineMode()
+            if (mode == "local" || mode == "auto"), SFSpeechRecognizer.authorizationStatus() == .notDetermined {
+                SFSpeechRecognizer.requestAuthorization { status in
+                    DispatchQueue.main.async {
+                        // 资源检查的结果会写同一行，拒绝提示放在前面，免得被覆盖后看不到。
+                        if status == .denied || status == .restricted {
+                            prepareStatus = DesignTokens.Text.localSpeechDenied + " · " + prepareStatus
+                        }
+                    }
+                }
+            }
+        }
 
         Task {
             do {

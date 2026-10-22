@@ -61,6 +61,13 @@ TEXT_NODE_LOADING_SUFFIX = ' 正在加载模型…'
 TEXT_NODE_CONNECTED_SUFFIX = ' 已连接'
 TEXT_NODE_UNAVAILABLE_RECONNECTING_SUFFIX = ' 不可用，正在重连'
 TEXT_LOCAL_UNAVAILABLE_RECONNECTING_PREFIX = '本机识别不可用，正在重连 '
+TEXT_LOCAL_ASR_UNSUPPORTED = '本机不支持德语识别'
+TEXT_LOCAL_ASSETS_MISSING = '本机识别资源未下载，请点「准备本机识别资源」'
+TEXT_LOCAL_FORMAT_FAILED = '本机音频格式不支持，请停止后重新开始'
+TEXT_LOCAL_ASR_FAILED = '本机识别出错，请停止后重新开始'
+TEXT_LOCAL_TX_UNAVAILABLE = '本机翻译资源未下载，只显示原文'
+TEXT_LOCAL_NEEDS_I_O_S26 = '本机识别需要 iOS 26 或更新'
+TEXT_LOCAL_SPEECH_DENIED = '语音识别权限被拒绝，请到 设置 → 实时字幕 打开'
 
 PALETTE_TEXT = (('白', '#F0F0F0'), ('暖黄', '#FFE894'), ('浅青', '#9FE7F5'), ('浅绿', '#B8F2B0'), ('浅粉', '#FFC4D6'),)
 PALETTE_BACKGROUND = (('黑', '#000000'), ('深灰', '#1E1E1E'), ('深蓝', '#0F1B2D'), ('深绿', '#10241A'), ('深紫', '#1F1630'),)

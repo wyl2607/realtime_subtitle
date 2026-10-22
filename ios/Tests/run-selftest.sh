@@ -29,3 +29,6 @@ xcrun swiftc -O ios/Shared/CaptureArbiter.swift ios/Tests/CaptureArbiterSelftest
 # local 档也绝不能意外建立节点连接。
 xcrun swiftc -O ios/Shared/EngineRunGate.swift ios/Tests/EngineRunGateSelftest.swift -o .tmp/enginerungateselftest
 .tmp/enginerungateselftest
+# 本机引擎状态解析：纯逻辑、无依赖，单独编译验证。
+xcrun swiftc -O ios/Shared/LocalEngineStatus.swift ios/Shared/DesignTokens.swift ios/Tests/LocalEngineStatusSelftest.swift -o .tmp/localenginestatusselftest
+.tmp/localenginestatusselftest

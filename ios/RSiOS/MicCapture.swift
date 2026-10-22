@@ -1,6 +1,7 @@
 import AVFoundation
 import Combine
 import Foundation
+import Speech
 
 /// 主 App 麦克风采集的可观察状态；错误详情只留给诊断，界面只显示设计令牌里的稳定文案。
 enum MicCaptureState: Equatable {
@@ -13,6 +14,8 @@ enum MicCaptureState: Equatable {
 
 final class MicCapture: ObservableObject {
     @Published private(set) var state: MicCaptureState = .idle
+    /// 语音识别被拒绝时的提示文案（不改变麦克风采集状态）。
+    @Published private(set) var speechDeniedHint: String? = nil
 
     private let audioEngine = AVAudioEngine()
     private let subtitleEngine = SubtitleEngine(source: "mic")
@@ -78,6 +81,8 @@ final class MicCapture: ObservableObject {
                     self.publish(.denied)
                     return
                 }
+                // 当档位是 local 或 auto 时，麦克风开始前申请语音识别授权（不阻止开始）。
+                self.requestSpeechRecognitionAuthorizationIfNeeded()
                 self.beginCapture()
             }
         }
@@ -234,6 +239,27 @@ final class MicCapture: ObservableObject {
             self.state = state
         } else {
             DispatchQueue.main.async { self.state = state }
+        }
+    }
+
+    /// 当当前档位是 local 或 auto，且语音识别授权尚未确定时申请一次。
+    /// 被拒绝时通过状态提示 `localSpeechDenied`，但不阻止麦克风开始。
+    private func requestSpeechRecognitionAuthorizationIfNeeded() {
+        let mode = SharedKeychain.readEngineMode()
+        guard mode == "local" || mode == "auto" else { return }
+        guard SFSpeechRecognizer.authorizationStatus() == .notDetermined else { return }
+        SFSpeechRecognizer.requestAuthorization { [weak self] status in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch status {
+                case .denied, .restricted:
+                    // 不阻止麦克风开始（节点/云端档不需要语音识别），
+                    // 只在提示里显示拒绝信息，供用户自行到设置打开。
+                    self.speechDeniedHint = DesignTokens.Text.localSpeechDenied
+                default:
+                    break
+                }
+            }
         }
     }
 

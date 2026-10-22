@@ -69,6 +69,13 @@ enum DesignTokens {
         static let nodeConnectedSuffix: String = " 已连接"
         static let nodeUnavailableReconnectingSuffix: String = " 不可用，正在重连"
         static let localUnavailableReconnectingPrefix: String = "本机识别不可用，正在重连 "
+        static let localAsrUnsupported: String = "本机不支持德语识别"
+        static let localAssetsMissing: String = "本机识别资源未下载，请点「准备本机识别资源」"
+        static let localFormatFailed: String = "本机音频格式不支持，请停止后重新开始"
+        static let localAsrFailed: String = "本机识别出错，请停止后重新开始"
+        static let localTxUnavailable: String = "本机翻译资源未下载，只显示原文"
+        static let localNeedsIOS26: String = "本机识别需要 iOS 26 或更新"
+        static let localSpeechDenied: String = "语音识别权限被拒绝，请到 设置 → 实时字幕 打开"
     }
     enum Palette {
         static let text: [(name: String, hex: String)] = [(name: "白", hex: "#F0F0F0"), (name: "暖黄", hex: "#FFE894"), (name: "浅青", hex: "#9FE7F5"), (name: "浅绿", hex: "#B8F2B0"), (name: "浅粉", hex: "#FFC4D6")]
