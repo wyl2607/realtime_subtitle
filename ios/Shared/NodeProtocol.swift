@@ -154,7 +154,7 @@ final class ReadyDeadlineBox: @unchecked Sendable {
 /// 日志/打印绝不输出 token 与字幕正文——本类不做任何日志输出。
 final class NodeSession: NSObject, URLSessionWebSocketDelegate {
     // 冷启动＝拉起 worker + 加载权重，Windows 节点实测 17–20s。基础等 ready 15s
-    // （与 rslite/Python 客户端同值），每收到一条 loading 续 15s，但从发出 hello
+    // （与 rslite/Python 客户端同值），每收到一条 loading 续 15s，但从开始建连
     // 起总共不超过 60s；超过仍按握手超时收场。
     static let readyTimeoutSeconds = 15.0
     static let readyLoadingMaxSeconds = 60.0
@@ -187,6 +187,7 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
     private let onEvent: (NodeEvent) -> Void
     private let onClose: (Int) -> Void
     private let onLoading: ((Double) -> Void)?
+    private let readyTimeout: Double
 
     private let lock = NSLock()
     private var session: URLSession?
@@ -202,7 +203,8 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
         dst: String,
         onEvent: @escaping (NodeEvent) -> Void,
         onClose: @escaping (Int) -> Void,
-        onLoading: ((Double) -> Void)? = nil
+        onLoading: ((Double) -> Void)? = nil,
+        readyTimeout: Double = readyTimeoutSeconds
     ) {
         self.url = url
         self.token = token
@@ -211,6 +213,7 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
         self.onEvent = onEvent
         self.onClose = onClose
         self.onLoading = onLoading
+        self.readyTimeout = readyTimeout
     }
 
     func start() {
@@ -225,24 +228,24 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
         self.session = session
         let socket = session.webSocketTask(with: request)
         self.socket = socket
-        socket.resume()
-        // 截止时间从「发出 hello」起算，和 Python 的 hello_at 语义对齐。
+        // 截止时间从开始建连起算：握手卡住时 send 回调不会返回，必须先让看门狗接管。
         let helloAt = Self.monotonic()
         let box = ReadyDeadlineBox(
             helloAt: helloAt,
             current: Self.readyDeadline(
                 helloAt: helloAt,
                 now: helloAt,
-                current: helloAt + Self.readyTimeoutSeconds,
+                current: helloAt + readyTimeout,
                 receivedLoading: false
             )
         )
+        socket.resume()
+        beginReadyWatch(box)
         socket.send(.string(hello.json())) { [weak self] error in
             if error != nil {
                 self?.notifyClosed(1006)
                 return
             }
-            self?.beginReadyWatch(box)
             self?.receiveLoop()
         }
     }
