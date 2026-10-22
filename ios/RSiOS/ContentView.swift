@@ -23,6 +23,7 @@ struct ContentView: View {
     @State private var pairedConfigDisplay = ""
 
     @State private var engineMode: String = "auto"
+    @State private var engineModeSaveFailed = false
     @State private var prepareStatus = ""
     @State private var isPreparing = false
     /// Groq key 的输入框内容。只在用户输入时存在，保存后立刻清空。
@@ -157,10 +158,23 @@ struct ContentView: View {
                         }
                         .pickerStyle(.segmented)
                         .onChange(of: engineMode) { _, newValue in
-                            SharedKeychain.writeEngineMode(newValue)
+                            // 档位只进 Keychain；写失败时不能让界面看起来像已经生效。
+                            engineModeSaveFailed = !SharedKeychain.writeEngineMode(newValue)
                         }
                         .onAppear {
                             engineMode = SharedKeychain.readEngineMode()
+                        }
+
+                        if engineModeSaveFailed {
+                            Text("保存引擎档位失败，请重试")
+                                .font(.caption)
+                                .foregroundColor(.red)
+                        }
+
+                        if micCapture.isRunning {
+                            Text("麦克风停止后重新开始才生效")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
                         }
 
                         Button(action: prepareLocalAssets) {

@@ -100,6 +100,8 @@ final class SubtitleEngine {
     private let stateQueue = DispatchQueue(label: "com.wyl2607.rsios.spike.state")
     private let connectionQueue = DispatchQueue(label: "com.wyl2607.rsios.spike.connection")
     private var broadcastActive = false
+    /// 所有节点异步回调都带着创建时的代号；必须在 stateQueue 上核对，不能跨轮次写状态。
+    private var runGate = EngineRunGate()
 
     /// 引擎会话代号：每次开一个新的引擎会话换一个新代号。
     ///
@@ -123,14 +125,21 @@ final class SubtitleEngine {
     }
 
     func start() {
+        let generation = stateQueue.sync { runGate.begin() }
         logger.info("Subtitle engine started source=\(self.source)")
-        writeStatus("started")
-
         engineMode = SharedKeychain.readEngineMode()
+        // 真机状态行必须直接暴露本轮实际读到的档位，才能区分保存失败与路由问题。
+        writeStatus("started mode=\(engineMode)")
 
         if engineMode == "local" {
             // broadcastActive 只在这里（和 auto/node 的启动处）置真：startLocalEngine 会先确认它。
-            stateQueue.sync { broadcastActive = true }
+            stateQueue.sync {
+                broadcastActive = true
+                // 本机档也要清掉上轮节点遗留的退避和会话，状态行才不会显示旧 reconn。
+                reconnectCount = 0
+                reconnectPolicy = ReconnectPolicy()
+                session = nil
+            }
             if #available(iOS 26.0, *) {
                 startLocalEngine()
             } else {
@@ -144,7 +153,7 @@ final class SubtitleEngine {
         }
 
         if engineMode == "auto" {
-            startAutoMode()
+            startAutoMode(generation: generation)
             return
         }
 
@@ -174,14 +183,17 @@ final class SubtitleEngine {
             reconnectCount = 0
         }
 
-        startPinnedSession(config)
+        startPinnedSession(config, generation: generation)
     }
 
     func finish() {
         logger.info("Subtitle engine finished source=\(self.source)")
         
         if engineMode == "local" {
-            stateQueue.sync { broadcastActive = false }
+            stateQueue.sync {
+                broadcastActive = false
+                runGate.end()
+            }
             stopLocalEngine()
             converter = nil
             writeStatus("finished")
@@ -190,6 +202,7 @@ final class SubtitleEngine {
 
         let currentSession = stateQueue.sync { () -> NodeSession? in
             broadcastActive = false
+            runGate.end()
             // 决策器也要知道广播结束了：之后迟到的节点事件不许再拉起本机引擎。
             self.autoFallback?.broadcastEnded()
             let currentSession = session
@@ -218,7 +231,7 @@ final class SubtitleEngine {
         return false
     }
 
-    private func startAutoMode() {
+    private func startAutoMode(generation: Int) {
         converter = PCMConverter()
         // 云端档的事实：key / 开关 / 本机能不能翻译。
         // 翻译能不能用是异步查的（要起 TranslationSession），先按「不能」算，
@@ -275,7 +288,7 @@ final class SubtitleEngine {
         nodeConfig = config
         autoFallback?.nodeName = config.name
         autoFallback?.setNodeEnabled(true)
-        startPinnedSession(config)
+        startPinnedSession(config, generation: generation)
         // 云端档：先确认本机翻译能用，再决定要不要进云端档。
         prepareCloudTier()
     }
@@ -974,9 +987,20 @@ final class SubtitleEngine {
         }
     }
 
-    private func startPinnedSession(_ config: NodeConfig) {
+    /// 在 stateQueue 内核对轮次、活动状态和档位；三个条件缺一不可才可碰节点。
+    private func isCurrentNodeRun(_ generation: Int) -> Bool {
+        stateQueue.sync {
+            runGate.isCurrent(generation)
+                && broadcastActive
+                && EngineRunGate.mayTouchNode(engineMode: engineMode)
+        }
+    }
+
+    private func startPinnedSession(_ config: NodeConfig, generation: Int) {
         connectionQueue.async { [weak self] in
             guard let self else { return }
+            // 解析/建连前先挡掉旧轮次，避免 finish 后排队的重连在下一轮复活。
+            guard self.isCurrentNodeRun(generation) else { return }
             let pinnedURL: URL
             do {
                 pinnedURL = try TailnetPin.pinned(config.sessionURL)
@@ -988,7 +1012,11 @@ final class SubtitleEngine {
                     status = "resolve_failed"
                 }
                 let shouldReport = self.stateQueue.sync { () -> Bool in
-                    guard self.broadcastActive else { return false }
+                    guard self.runGate.isCurrent(generation),
+                          self.broadcastActive,
+                          EngineRunGate.mayTouchNode(engineMode: self.engineMode) else {
+                        return false
+                    }
                     self.lastStatusCode = status
                     return true
                 }
@@ -997,8 +1025,8 @@ final class SubtitleEngine {
                 // 解析失败多半是临时性的（还没连上 Tailscale、DNS 抖动），
                 // 所以照旧按退避策略重连；不然节点这一路就永久断了
                 // （本机还能顶上，但节点再也回不来，用户以为节点坏了）。
-                self.scheduleReconnect(closeCode: 1006)
-                if self.engineMode == "auto" {
+                self.scheduleReconnect(closeCode: 1006, generation: generation)
+                if self.isCurrentNodeRun(generation), self.engineMode == "auto" {
                     // 节点这一轮没连上：交给决策器决定要不要落到本机。
                     self.applyAutoDecision(self.handleAutoEvent(.nodeFailed))
                 }
@@ -1011,18 +1039,22 @@ final class SubtitleEngine {
                 src: config.src,
                 dst: config.dst,
                 onEvent: { [weak self] event in
-                    self?.handleNodeEvent(event)
+                    self?.handleNodeEvent(event, generation: generation)
                 },
                 onClose: { [weak self] code in
-                    self?.handleNodeClose(code)
+                    self?.handleNodeClose(code, generation: generation)
                 },
                 onLoading: { [weak self] elapsed in
                     // 节点冷启动：状态行显示「<节点> 正在加载模型…」。
-                    self?.handleNodeLoading()
+                    self?.handleNodeLoading(generation: generation)
                 }
             )
             let shouldStart = self.stateQueue.sync { () -> Bool in
-                guard self.broadcastActive else { return false }
+                guard self.runGate.isCurrent(generation),
+                      self.broadcastActive,
+                      EngineRunGate.mayTouchNode(engineMode: self.engineMode) else {
+                    return false
+                }
                 self.session = newSession
                 // 新的节点会话：节点的句子 id 重新从 1 计数，
                 // 换一个新代号，主 App 才不会把它当成旧会话的同一句。
@@ -1038,9 +1070,13 @@ final class SubtitleEngine {
     /// 按退避策略安排一次重连。节点断开、Tailnet 解析失败都走这里。
     /// - Returns: 是否真的排上了重连（false = 放弃重连或广播已结束）。
     @discardableResult
-    private func scheduleReconnect(closeCode: Int) -> Bool {
+    private func scheduleReconnect(closeCode: Int, generation: Int) -> Bool {
         let plan = stateQueue.sync { () -> (TimeInterval?, NodeConfig?) in
-            guard broadcastActive else { return (nil, nil) }
+            guard runGate.isCurrent(generation),
+                  broadcastActive,
+                  EngineRunGate.mayTouchNode(engineMode: engineMode) else {
+                return (nil, nil)
+            }
             guard !fatalErrorOccurred else { return (nil, nil) }
             guard let delay = reconnectPolicy.next(closeCode: closeCode) else { return (nil, nil) }
             reconnectCount += 1
@@ -1050,30 +1086,46 @@ final class SubtitleEngine {
         guard let delay = plan.0, let config = plan.1 else { return false }
 
         // 重连前把 readyReceived 置 false（ready 之前的帧照旧丢弃计入 drop）
-        stateQueue.sync { readyReceived = false }
+        let markedPending = stateQueue.sync { () -> Bool in
+            guard runGate.isCurrent(generation),
+                  broadcastActive,
+                  EngineRunGate.mayTouchNode(engineMode: engineMode) else {
+                return false
+            }
+            readyReceived = false
+            return true
+        }
+        guard markedPending else { return false }
 
         // 延迟后在 connectionQueue 上重新走 startPinnedSession（含 TailnetPin 校验）
         connectionQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
-            self.stateQueue.sync {
-                guard self.broadcastActive else { return }
-                self.startPinnedSession(config)
-            }
+            guard self.isCurrentNodeRun(generation) else { return }
+            // startPinnedSession 只会投递到 connectionQueue；不要在 stateQueue 内再同步调用它，
+            // 否则后续给回调加状态核对时会形成同队列死锁。
+            self.startPinnedSession(config, generation: generation)
         }
         return true
     }
 
-    private func handleNodeEvent(_ event: NodeEvent) {
+    private func handleNodeEvent(_ event: NodeEvent, generation: Int) {
+        guard isCurrentNodeRun(generation) else { return }
         switch event {
         case .ready(let cold):
             // 自动模式：把「本机是否还有句子没收尾」同步给决策器，再问要不要切回。
             // 没收尾包括「正在识别」和「译文还在路上」两种：
             // 只看正在识别的话，节点恰好在译文飞回来之前就绪，最后一句就只剩原文。
-            if stateQueue.sync(execute: { localBusy }) {
+            if stateQueue.sync(execute: { runGate.isCurrent(generation) && localBusy }) {
                 _ = handleAutoEvent(.localSentenceStarted)
             }
+            guard isCurrentNodeRun(generation) else { return }
             let decision = handleAutoEvent(.nodeReady)
-            stateQueue.sync {
+            let accepted = stateQueue.sync { () -> Bool in
+                guard runGate.isCurrent(generation),
+                      broadcastActive,
+                      EngineRunGate.mayTouchNode(engineMode: engineMode) else {
+                    return false
+                }
                 readyReceived = true
                 reconnectPolicy.reset()
                 // 冷启动期间状态行写成了「<节点> 正在加载模型…」；就绪后不清掉会一直显示加载中。
@@ -1081,43 +1133,69 @@ final class SubtitleEngine {
                     lastStatusCode,
                     loadingSuffix: DesignTokens.Text.nodeLoadingSuffix
                 )
+                return true
             }
+            guard accepted else { return }
             logger.info("Node ready cold=\(cold)")
             applyAutoDecision(decision)
         case .final(let id, _, _, let text):
-            stateQueue.sync {
+            let accepted = stateQueue.sync { () -> Bool in
+                guard runGate.isCurrent(generation),
+                      broadcastActive,
+                      EngineRunGate.mayTouchNode(engineMode: engineMode) else {
+                    return false
+                }
                 finalsCount += 1
                 recentLines.append(RecentLine(id: id, src: text, dst: "", session: nodeSessionCode))
                 if recentLines.count > maxRecentLines {
                     recentLines.removeFirst()
                 }
+                return true
             }
+            guard accepted else { return }
             writeLatestLines()
         case .translation(let id, let text):
-            stateQueue.sync {
+            let accepted = stateQueue.sync { () -> Bool in
+                guard runGate.isCurrent(generation),
+                      broadcastActive,
+                      EngineRunGate.mayTouchNode(engineMode: engineMode) else {
+                    return false
+                }
                 translationsCount += 1
                 // 节点前后两个会话的 id 都从 1 计：只比 id 会把译文写到旧会话那一行。
                 if let idx = RecentLineLookup.index(in: recentLines, session: nodeSessionCode, id: id) {
                     recentLines[idx].dst = text
                 }
+                return true
             }
+            guard accepted else { return }
             writeLatestLines()
         case .status(let code, let text, _):
-            if code == "loading" {
+            let accepted = stateQueue.sync { () -> Bool in
+                guard runGate.isCurrent(generation),
+                      broadcastActive,
+                      EngineRunGate.mayTouchNode(engineMode: engineMode) else {
+                    return false
+                }
+                if code == "loading" {
                 // 冷启动：状态行显示「<节点> 正在加载模型…」，
                 // 别让原始 code 把它顶掉（每 5 秒一条 loading 帧）。
-                let loading = AutoFallbackStatus.nodeLoading(nodeName.isEmpty ? "电脑节点" : nodeName)
-                stateQueue.sync { lastStatusCode = loading }
-            } else {
-                stateQueue.sync { lastStatusCode = code }
+                    lastStatusCode = AutoFallbackStatus.nodeLoading(nodeName.isEmpty ? "电脑节点" : nodeName)
+                } else {
+                    lastStatusCode = code
+                }
+                return true
             }
+            guard accepted else { return }
             logger.info("Node status: \(code) \(text)")
             if NodeEvent.isFatal(code: code) {
+                guard isCurrentNodeRun(generation) else { return }
                 if engineMode == "auto" {
                     // 自动模式不把节点致命错误记成全局 fatal——那会连本机一起停掉。
                     applyAutoDecision(handleAutoEvent(.reconnectAbandoned))
                 } else {
                     stateQueue.sync {
+                        guard runGate.isCurrent(generation), broadcastActive else { return }
                         fatalErrorOccurred = true
                         fatalErrorReason = "fatal:\(code)"
                     }
@@ -1129,34 +1207,49 @@ final class SubtitleEngine {
     }
 
     /// 节点冷启动（gateway 正在拉起 worker 加载权重）：状态行显示加载中。
-    private func handleNodeLoading() {
+    private func handleNodeLoading(generation: Int) {
+        guard isCurrentNodeRun(generation) else { return }
         applyAutoDecision(handleAutoEvent(.nodeLoading))
     }
 
-    private func handleNodeClose(_ code: Int) {
+    private func handleNodeClose(_ code: Int, generation: Int) {
         // 广播已经结束就别再管这个 close 了：不发 .nodeFailed（那会把本机引擎重新拉起来）、
         // 不重连、不改状态。少了这道闸，广播结束瞬间的 close 事件会让本机引擎复活，
         // 而节点根本不存在——用户看到的是「字幕还在跑，但没有节点」。
-        guard stateQueue.sync(execute: { broadcastActive }) else {
-            logger.info("Node closed after broadcast ended: \(code)")
+        guard isCurrentNodeRun(generation) else {
+            logger.info("Node closed after its run ended: \(code)")
             return
         }
 
         let displayCode = code == 1013 ? "busy" : "\(code)"
-        stateQueue.sync { lastStatusCode = "closed=\(displayCode)" }
+        let accepted = stateQueue.sync { () -> Bool in
+            guard runGate.isCurrent(generation),
+                  broadcastActive,
+                  EngineRunGate.mayTouchNode(engineMode: engineMode) else {
+                return false
+            }
+            lastStatusCode = "closed=\(displayCode)"
+            return true
+        }
+        guard accepted else { return }
         logger.info("Node closed: \(code)")
 
         // 显式 node 和自动模式都要重连；显式 local 不碰节点。
-        guard engineMode == "node" || engineMode == "auto" else { return }
+        guard EngineRunGate.mayTouchNode(engineMode: engineMode) else { return }
 
         if engineMode == "auto" {
-            stateQueue.sync { readyReceived = false }
+            let resetReady = stateQueue.sync { () -> Bool in
+                guard runGate.isCurrent(generation), broadcastActive else { return false }
+                readyReceived = false
+                return true
+            }
+            guard resetReady else { return }
             applyAutoDecision(handleAutoEvent(.nodeFailed))
         }
 
         // 由 NodeSession 通过 closeReason 还原过 1005→真实码
-        let scheduled = scheduleReconnect(closeCode: code)
-        if !scheduled, engineMode == "auto" {
+        let scheduled = scheduleReconnect(closeCode: code, generation: generation)
+        if !scheduled, engineMode == "auto", isCurrentNodeRun(generation) {
             applyAutoDecision(handleAutoEvent(.reconnectAbandoned))
         }
     }

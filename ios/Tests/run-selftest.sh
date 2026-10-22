@@ -25,3 +25,7 @@ xcrun swiftc -O ios/Shared/RecentLines.swift ios/Tests/RecentLinesSelftest.swift
 # 不把 Keychain、音频硬件或 ReplayKit 带进单元自测。
 xcrun swiftc -O ios/Shared/CaptureArbiter.swift ios/Tests/CaptureArbiterSelftest.swift -o .tmp/capturearbiterselftest
 .tmp/capturearbiterselftest
+# 引擎轮次闸门要先在命令行锁住：旧异步回调不能跨 begin/end 进入新一轮，
+# local 档也绝不能意外建立节点连接。
+xcrun swiftc -O ios/Shared/EngineRunGate.swift ios/Tests/EngineRunGateSelftest.swift -o .tmp/enginerungateselftest
+.tmp/enginerungateselftest
