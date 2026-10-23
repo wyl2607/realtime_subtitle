@@ -275,7 +275,9 @@ PR：#62（TK-002）、#63（TK-004）已合并；无其它 open PR。**不向 m
   - 权限：token 0600 / 目录 0700 / node_id 0600 / gw.sock 0600；日志里 token 出现次数 0
   - 客户端 `~/.config/rslite/nodes.json` 写入 `mini2 → ws://yilinmac-mini-2.tail27b5c.ts.net:8791`，客户端 token `~/.config/rslite/tokens/mini2.token`
 
-### 11.2 ☠️ 未解决的 blocker：gateway 的 TCP 监听起不来
+### 11.2 ✅ 已解决（TK-002b，2792120，10-09 20:19 重装验证 TCP 监听 100.105.163.59:8791）：gateway 的 TCP 监听起不来
+
+> **2026-10-21 复核**：根因＝App Store 版 Tailscale 在 launchd 无 `SHLVL` 时进 GUI 模式，stdout 打报错、rc=0 → `validate_host` ValueError；修法＝gateway 调 tailscale 时追加 `TAILSCALE_BE_CLI=1`，日志改记固定原因码（`tcp_bind_failed reason=`），install_node.sh 第 10 步补 TCP 监听自检。本机 `tests/test_node_gateway.py` 131 passed（macOS 需 `--basetemp=/tmp/rs1`，pytest 默认临时路径超 AF_UNIX 104 字节上限会让 66 个用例误红）。以下为当时的排查记录，仅供参考。
 
 mini2 `~/Library/Logs/rs-node/gateway.err.log`：
 
