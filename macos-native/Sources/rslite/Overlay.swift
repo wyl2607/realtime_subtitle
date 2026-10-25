@@ -873,11 +873,13 @@ final class OverlayController: NSObject {
         let duration = animate
             ? OverlayMotion.motionSeconds(milliseconds: DesignTokens.Motion.shiftUpMs, reduceMotion: reduceMotion)
             : 0
+        // 在隐式动画组里移除的行视图会一直留着脏 IOSurface（视图仍在 pairViews 里，最多 60 对），
+        // 长会话多占 ~20MB；移除放在动画外，留下的行照样随动画上移。
+        for view in stack.arrangedSubviews where !desired.contains(where: { $0 === view }) {
+            stack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
         let updates = {
-            for view in self.stack.arrangedSubviews where !desired.contains(where: { $0 === view }) {
-                self.stack.removeArrangedSubview(view)
-                view.removeFromSuperview()
-            }
             for (index, view) in desired.enumerated() {
                 if self.stack.arrangedSubviews.indices.contains(index), self.stack.arrangedSubviews[index] === view {
                     continue
