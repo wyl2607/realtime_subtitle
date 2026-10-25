@@ -86,6 +86,13 @@ def _round(t, capture_time=1.0):
     t._process_items([(np.zeros(1600, dtype=np.float32), capture_time)])
 
 
+def _timed(text, *spans):
+    """造带词时间的提交（Whisper 的词带前导空格，对齐时空白会被忽略）。"""
+    words = [(t0, t1, (" " if i else "") + w)
+             for i, (w, t0, t1) in enumerate(spans)]
+    return TimedText(text, words=words)
+
+
 def test_uppercase_unstable_releases_held_sentence_in_same_asr_round(monkeypatch):
     monkeypatch.setattr(config, "SOURCE_LANGUAGE", "de", raising=False)
     t = _translator([(TimedText("Die Urkunde wurde."), "Es leben noch")])
@@ -165,4 +172,118 @@ def test_chinese_boundary_never_enters_held_lookahead_path(monkeypatch):
     _round(t)
 
     assert [str(s) for s in t._tx_queue] == ["你好。"]
+    assert t._held_since == 0.0
+
+
+def _held_sentence(last_word_end):
+    return _timed("Die Urkunde wurde.",
+                  ("Die", 0.0, 1.2),
+                  ("Urkunde", 1.2, 1.8),
+                  ("wurde.", 1.8, last_word_end))
+
+
+def test_silent_audio_past_hold_window_releases_in_the_same_round(monkeypatch):
+    """句号后已经听到够长的静音，就不该再为墙钟多等一整轮识别。"""
+    monkeypatch.setattr(config, "SOURCE_LANGUAGE", "de", raising=False)
+    now = [100.0]
+    monkeypatch.setattr(translator_queue.time, "time", lambda: now[0])
+    last_end = 2.4
+    t = _translator([
+        (_held_sentence(last_end), ""),
+        (TimedText(""), ""),
+        (TimedText(""), ""),
+    ])
+    t._sample_clock_samples = int(
+        (last_end + config.SENTENCE_HOLD_SEC) * config.SAMPLE_RATE)
+
+    _round(t)
+
+    assert [str(s) for s in t._tx_queue] == ["Die Urkunde wurde."]
+    assert t._held_since == 0.0
+    assert t._stat_held_release == 1
+
+    _round(t, capture_time=2.0)
+
+    assert [str(s) for s in t._tx_queue] == ["Die Urkunde wurde."]
+
+
+def test_short_silent_audio_still_waits_for_the_next_round(monkeypatch):
+    monkeypatch.setattr(config, "SOURCE_LANGUAGE", "de", raising=False)
+    now = [100.0]
+    monkeypatch.setattr(translator_queue.time, "time", lambda: now[0])
+    last_end = 2.4
+    t = _translator([
+        (_held_sentence(last_end), ""),
+        (TimedText(""), ""),
+        (TimedText(""), ""),
+    ])
+    t._sample_clock_samples = int((last_end + 0.2) * config.SAMPLE_RATE)
+
+    _round(t)
+
+    assert t._tx_queue == []
+    assert t._held_since == 100.0
+
+    t._sample_clock_samples = int(
+        (last_end + config.SENTENCE_HOLD_SEC) * config.SAMPLE_RATE)
+    _round(t, capture_time=2.0)
+
+    assert [str(s) for s in t._tx_queue] == ["Die Urkunde wurde."]
+    assert t._held_since == 0.0
+    assert t._stat_held_release == 1
+
+    _round(t, capture_time=3.0)
+
+    assert [str(s) for s in t._tx_queue] == ["Die Urkunde wurde."]
+
+
+def test_long_silence_does_not_bypass_lowercase_unstable_veto(monkeypatch):
+    monkeypatch.setattr(config, "SOURCE_LANGUAGE", "de", raising=False)
+    now = [100.0]
+    monkeypatch.setattr(translator_queue.time, "time", lambda: now[0])
+    last_end = 2.4
+    t = _translator([(_held_sentence(last_end), "fortgesetzt")])
+    t._sample_clock_samples = int(
+        (last_end + config.SENTENCE_HOLD_SEC) * config.SAMPLE_RATE)
+
+    _round(t)
+
+    assert t._tx_queue == []
+    assert t._held_since == 100.0
+
+
+def test_long_silence_does_not_split_an_abbreviation(monkeypatch):
+    monkeypatch.setattr(config, "SOURCE_LANGUAGE", "de", raising=False)
+    now = [100.0]
+    monkeypatch.setattr(translator_queue.time, "time", lambda: now[0])
+    t = _translator([(_timed("Das gilt bzw.",
+                             ("Das", 0.0, 0.4),
+                             ("gilt", 0.4, 0.8),
+                             ("bzw.", 0.8, 1.2)), "")])
+    t._sample_clock_samples = int((1.2 + config.SENTENCE_HOLD_SEC) * config.SAMPLE_RATE)
+
+    _round(t)
+
+    assert t._tx_queue == []
+    assert t.pending_text == "Das gilt bzw."
+
+
+def test_missing_word_times_fall_back_to_the_wall_clock(monkeypatch):
+    monkeypatch.setattr(config, "SOURCE_LANGUAGE", "de", raising=False)
+    now = [100.0]
+    monkeypatch.setattr(translator_queue.time, "time", lambda: now[0])
+    committed = TimedText("Die Urkunde wurde.", words=[
+        (None, None, "Die"), (None, None, " Urkunde"), (None, None, " wurde.")])
+    t = _translator([(committed, ""), (TimedText(""), "")])
+    t._sample_clock_samples = int(60 * config.SAMPLE_RATE)
+
+    _round(t)
+
+    assert t._tx_queue == []
+    assert t._held_since == 100.0
+
+    now[0] += config.SENTENCE_HOLD_SEC + 0.01
+    _round(t, capture_time=2.0)
+
+    assert [str(s) for s in t._tx_queue] == ["Die Urkunde wurde."]
     assert t._held_since == 0.0
