@@ -237,7 +237,10 @@ final class HybridEngine: SubtitleEngine, @unchecked Sendable {
 
     private func ensureRouterRunning() {
         let fanout = lock.withLockValue { () -> AudioFanout? in
-            guard Self.shouldRunRouter(mode: mode, hasFanout: currentFanout != nil, hasRouter: router != nil) else {
+            // self. 不能省：本函数后面有同名局部 `let router`，Swift 6.3 会把这里解析成它
+            // （"closure captures 'router' before it is declared"；batch 模式下更糟，
+            // 不报错而是 ClosureLifetimeFixup 死循环、CI 卡满 6 小时，见 PR #83）。
+            guard Self.shouldRunRouter(mode: mode, hasFanout: currentFanout != nil, hasRouter: self.router != nil) else {
                 return nil
             }
             return currentFanout

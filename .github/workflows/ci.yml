@@ -144,6 +144,9 @@ jobs:
   # 修完后不再容忍失败：这里红就是真回归，本地用新工具链编过不代表 CI 能过。
   rslite-macos:
     runs-on: macos-26
+    # 正常 1 分钟内编完。Swift 6.3 遇到某些闭包写法会在 ClosureLifetimeFixup 里死循环
+    # 而不是报错（PR #83），不设上限就卡满 GitHub 默认的 6 小时。
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - name: Swift version
