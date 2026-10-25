@@ -41,16 +41,16 @@ System audio ──WASAPI loopback──▶ Faster-Whisper (CUDA or CPU)
 
 ## Platform status
 
-As of 2026-10-21. The current release is v3.1.0 for Windows / macOS; v3.2.0 is tagged as beta and the final release is not out yet.
+As of 2026-10-25. The current release for Windows / macOS is v3.2.0 (2026-10-25).
 
 Stage legend: ✅ stable · 🟢 usable · 🧪 experimental · ⬜ not started.
 
 | Platform | Form | Stage | Available now | Still missing |
 |---|---|---|---|---|
-| Windows | Desktop app | ✅ Stable | Local recognition and translation; three-tier automatic routing from cloud (Groq) → computer node → local (v3.2.0 beta); the status line shows the current source. Full pytest on a real Windows machine: 1207 passed, 0 failed | Final v3.2.0 release not out yet |
-| macOS | Desktop app + rslite (native Swift) | 🟢 Usable | Local recognition and translation; three-tier automatic routing from cloud → computer node → local (v3.2.0 beta). rslite cloud acceptance mostly passed, hybrid-mode median refine latency 1.47 s | final v3.2.0 release not out yet |
-| Android | Native app (separate private repo) | 🧪 Experimental | v0.4.0-quality released (old architecture); the rewrite/v1 has on-device recognition, cloud tier, node tier, automatic switching, and Keystore-encrypted key storage, with 395 unit tests passing and 0 failures | Rewrite not yet verified on a real device |
-| iOS | Native app (prototype) | 🧪 Experimental | Screen-recording broadcast extension captures audio from other apps, picture-in-picture display, "Auto" mode (falls back to local when the node fails, switches back at sentence end after recovery), daily subtitle archive, cloud tier logic only | Broadcast extension not yet integrated, not yet run on a real device; display is picture-in-picture only, no desktop-style overlay |
+| Windows | Desktop app | ✅ Stable | Local recognition and translation; three-tier automatic routing from cloud (Groq) → computer node → local; the status line shows the current source. Full pytest on a real Windows machine (RTX 4070): 1269 passed, 0 failed; smoke test and 150% HiDPI check passed | Occasionally splits a sentence early (shown as two lines; translation unaffected) |
+| macOS | Desktop app + rslite (native Swift) | 🟢 Usable | Local recognition and translation; three-tier automatic routing from cloud → computer node → local. Cloud segment end → on screen median ~1.1 s, hybrid-mode median refine latency 1.47 s | Still distributed as source (rslite .app packaging is planned for v3.3); rslite release build with Swift 6.3 hangs on CI, under investigation |
+| Android | Native app (separate private repo) | 🧪 Experimental | v0.4.0-quality released (old architecture); the new architecture is merged into main: on-device recognition with live German drafts, cloud tier, node tier, automatic switching, Keystore-encrypted key storage, all unit tests passing | New architecture not yet verified on a real device; no new release yet |
+| iOS | Native app (prototype) | 🧪 Experimental | Screen-recording broadcast extension captures audio from other apps, or use the microphone directly; three-tier cloud → node → local routing; pairing via QR code / `rsnode://pair`; today's subtitle history | Not yet run on a real device; build and install yourself with Xcode; display is picture-in-picture only, no desktop-style overlay |
 | Linux | — | ⬜ Not started | — | No plans |
 
 ## Features
