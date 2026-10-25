@@ -141,6 +141,81 @@ def test_day_request_header_hysteresis_and_later_local_requests(tmp_path):
     assert state.action == "resume_cloud"
 
 
+def test_reset_header_releases_day_request_cooldown_at_its_deadline(tmp_path):
+    ledger, state = _ledger(tmp_path, now=1000)
+    initial = ledger.note(10, now=1000, remaining_requests=5, reset_requests_s=100)
+    assert initial.usage_percent >= 90
+    assert state.cloud_state == "cooldown_quota"
+    assert ledger.usage(now=1050).usage_percent >= 90
+
+    recovered = ledger.usage(now=1101)
+    assert recovered.day_requests == 0
+    assert recovered.usage_percent < 80
+    assert state.cloud_state == "available"
+
+
+def test_smaller_server_usage_waits_60_seconds_before_it_is_accepted(tmp_path):
+    ledger, _state = _ledger(tmp_path, now=1000)
+    ledger.note(10, now=1000, remaining_requests=5)
+    assert ledger.usage(now=1000).day_requests == 1995
+
+    ledger.note(10, now=1030, remaining_requests=1999)
+    assert ledger.usage(now=1030).day_requests == 1995
+
+    ledger.note(10, now=1061, remaining_requests=1999)
+    assert ledger.usage(now=1061).day_requests == 1
+
+
+def test_remaining_after_reset_is_a_new_server_day_baseline(tmp_path):
+    ledger, _state = _ledger(tmp_path, now=1000)
+    ledger.note(10, now=1000, remaining_requests=5, reset_requests_s=100)
+    ledger.note(10, now=1101, remaining_requests=1900)
+    assert ledger.usage(now=1101).day_requests == 100
+
+
+def test_reset_timestamp_round_trips_and_old_ledger_still_loads(tmp_path):
+    ledger, _state = _ledger(tmp_path, now=2000)
+    ledger.note(10, now=2000, remaining_requests=5, reset_requests_s=100)
+    path = tmp_path / "quota.json"
+    assert json.loads(path.read_text(encoding="utf-8"))["server_reset_at"] == 2100.0
+
+    reloaded, _state = _ledger(tmp_path, now=2050)
+    assert reloaded.usage(now=2050).day_requests == 1995
+
+    path.write_text(
+        json.dumps({
+            "version": 1,
+            "events": [],
+            "server_day_used": 3,
+            "server_day_used_at": 1000,
+        }),
+        encoding="utf-8",
+    )
+    old, _state = _ledger(tmp_path, now=1000)
+    assert old.usage(now=1000).day_requests == 3
+    assert not (tmp_path / "quota.json.corrupt").exists()
+
+
+def test_nonfinite_server_reset_timestamp_quarantines_the_ledger(tmp_path):
+    path = tmp_path / "quota.json"
+    path.write_bytes(
+        b'{"version":1,"events":[],"server_day_used":3,'
+        b'"server_day_used_at":1000,"server_reset_at":Infinity}'
+    )
+    ledger, _state = _ledger(tmp_path, now=1000)
+    assert ledger.usage(now=1000).saturated is True
+    assert (tmp_path / "quota.json.corrupt").exists()
+
+
+@pytest.mark.parametrize("bad", [-1, float("nan"), float("inf"), float("-inf")])
+def test_reset_requests_seconds_must_be_finite_and_nonnegative(tmp_path, bad):
+    ledger, _state = _ledger(tmp_path)
+    with pytest.raises(ValueError, match="reset_requests_s"):
+        ledger.note(1, now=1, reset_requests_s=bad)
+    with pytest.raises(TypeError, match="reset_requests_s"):
+        ledger.note(1, now=1, reset_requests_s=True)
+
+
 def test_low_usage_does_not_clear_a_rate_limit_cooldown(tmp_path):
     state = RoutingState(has_key=True, cloud_enabled=True)
     state.cloud_state = "cooldown_rate_limited"

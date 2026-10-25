@@ -475,6 +475,7 @@ class RemoteBridge:
                 self.ledger.note(
                     transcript.duration_s,
                     remaining_requests=transcript.remaining_requests,
+                    reset_requests_s=transcript.reset_requests_s,
                 )
         except Exception as exc:
             print(f"⚠️  云端记账失败: {type(exc).__name__}")
@@ -544,7 +545,11 @@ class RemoteBridge:
                     else:
                         self.routing.apply({"type": "segment_failure"})
                 if reached and self.ledger is not None:
-                    self.ledger.note(exc.duration_s, remaining_requests=exc.remaining_requests)
+                    self.ledger.note(
+                        exc.duration_s,
+                        remaining_requests=exc.remaining_requests,
+                        reset_requests_s=exc.reset_requests_s,
+                    )
                 if status == 429 and previous_state != "cooldown_rate_limited":
                     # 只在进入冷却时打一行；和 rslite 同一格式，不含 key 和正文。
                     seconds = getattr(self.routing, "cooldown_seconds", None) or 60
