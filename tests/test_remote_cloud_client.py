@@ -86,6 +86,15 @@ def _assert_clean(caplog, exc):
     assert "Bearer" not in blob
 
 
+def test_cloud_error_exposes_only_a_key_fingerprint(tmp_path):
+    key = "gsk_test_fingerprint_only_7d91a4"
+    error = CloudError(status=401, reason="unauthorized", exc_type="HTTPStatus", secret=key)
+    assert error.key_fingerprint is not None
+    assert len(error.key_fingerprint) == 12
+    assert key not in str(error)
+    assert key not in repr(error)
+
+
 def _sent_authorization(kwargs):
     """AuthBase 在 prepare 时写入 Bearer。repr/str 不得含 key。"""
     assert kwargs["allow_redirects"] is False

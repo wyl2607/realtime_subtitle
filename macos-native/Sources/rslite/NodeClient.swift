@@ -312,10 +312,15 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
     private static let readyBufferMaxBytes = preReadyAudioSeconds * 16_000 * 2
     private static let closeTimeout: Duration = .seconds(2)
 
+    /// 自测注入口：生产调用点传 nil，按节点类型建真实 URLSession/UDS 连接。
+    typealias SocketFactory = @Sendable () throws -> NodeWebSocketTask
+
     private let config: NodeConfig
     private let token: String
     private let info: NodeInfo
     private let udsPath: String?
+    private let socketFactory: SocketFactory?
+    private let readyTimeout: Double
     private let sourceLocaleID: String
     private let targetLanguageID: String
     private var offsetSeconds: Double
@@ -351,12 +356,16 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         targetLanguageID: String,
         offsetSeconds: Double,
         sessionGeneration: Int,
-        callbacks: NodeCallbacks
+        callbacks: NodeCallbacks,
+        socketFactory: SocketFactory? = nil,
+        readyTimeoutSeconds: Double = NodeClient.readyTimeoutSeconds
     ) {
         self.config = config
         self.token = token
         self.info = info
         self.udsPath = udsPath
+        self.socketFactory = socketFactory
+        self.readyTimeout = readyTimeoutSeconds
         self.sourceLocaleID = sourceLocaleID
         self.targetLanguageID = targetLanguageID
         self.offsetSeconds = offsetSeconds
@@ -413,37 +422,43 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         }
     }
 
-    func connect() async throws {
-        // P6 的 nodes.json 只记 ws://<名>:8791（install_node.sh 就这么写），会话路径由客户端补；
-        // 不补的话升级请求打到 "/"，gateway 只认 /v2/session，真节点上必然连不上。
+    /// P6 的 nodes.json 只记 ws://<名>:8791（install_node.sh 就这么写），会话路径由客户端补；
+    /// 不补的话升级请求打到 "/"，gateway 只认 /v2/session，真节点上必然连不上。
+    private func makeSocket() throws -> (NodeWebSocketTask, URLSession?) {
+        if let socketFactory {
+            return (try socketFactory(), nil)
+        }
         if config.id == NodeRouter.localUDSID {
             guard let udsPath else {
                 throw NodeClientError.badURL(config.id)
             }
-            let udsTask = try UDSWebSocketTask(path: udsPath)
-            lock.withLockVoid { self.socket = udsTask }
-            udsTask.resume()
-        } else {
-            guard var components = URLComponents(string: config.url) else {
-                throw NodeClientError.badURL(config.url)
-            }
-            if components.path.isEmpty || components.path == "/" {
-                components.path = "/v2/session"
-            }
-            guard let rawURL = components.url else {
-                throw NodeClientError.badURL(config.url)
-            }
-            let url = try TailnetPin.pinned(rawURL)
-            var request = URLRequest(url: url)
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-            let sessionConfiguration = Self.directSessionConfiguration(timeout: 24 * 60 * 60)
-            let session = URLSession(configuration: sessionConfiguration, delegate: self, delegateQueue: nil)
-            let socket = session.webSocketTask(with: request)
-            lock.withLockVoid {
-                self.session = session
-                self.socket = socket
-            }
-            socket.resume()
+            return (try UDSWebSocketTask(path: udsPath), nil)
+        }
+        guard var components = URLComponents(string: config.url) else {
+            throw NodeClientError.badURL(config.url)
+        }
+        if components.path.isEmpty || components.path == "/" {
+            components.path = "/v2/session"
+        }
+        guard let rawURL = components.url else {
+            throw NodeClientError.badURL(config.url)
+        }
+        let url = try TailnetPin.pinned(rawURL)
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let sessionConfiguration = Self.directSessionConfiguration(timeout: 24 * 60 * 60)
+        let session = URLSession(configuration: sessionConfiguration, delegate: self, delegateQueue: nil)
+        return (session.webSocketTask(with: request), session)
+    }
+
+    func connect() async throws {
+        // 建 socket 的同步错误（badURL、Tailnet 校验、UDS 路径）在 do 外直接抛，和改动前一样：
+        // classify 对非 NodeClientError 会空等 1 秒 close 帧，而这时根本还没有连接。
+        let (socket, session) = try makeSocket()
+        // socket 与 session 一起发布：close() 看到 socket 时也一定能拿到 session 去取消。
+        lock.withLockVoid {
+            self.socket = socket
+            self.session = session
         }
         do {
             let hello: [String: Any] = [
@@ -454,11 +469,12 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
                 "sample_rate": 16_000,
                 "format": "s16le",
             ]
-            guard let socket = currentSocket() else {
-                throw NodeClientError.connection("socket closed")
-            }
-            try await socket.send(.string(Self.jsonString(hello)))
-            try await awaitReady(socket)
+            // 截止从 resume 起算：URLSessionWebSocketTask.send 要等升级握手完成才返回，
+            // 远端不可达时一直挂着（2026-10-22 本机实测：连不可路由地址 30s 仍未返回；cancel 后 0.1s 内抛 -999）。若从 send 返回后才起算，
+            // 这段时间路由会一直停在 switching，ready 的 15s/60s 预算完全失效。
+            let helloAt = Self.monotonic()
+            socket.resume()
+            try await awaitReady(socket, helloAt: helloAt, hello: Self.jsonString(hello))
             try await flushReadyBuffer(socket)
             callbacks.onReady(config.id, sessionGeneration, info)
             Task { await receiveLoop(socket) }
@@ -690,17 +706,21 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         nodeID + DesignTokens.Text.nodeLoadingSuffix
     }
 
-    private func awaitReady(_ socket: NodeWebSocketTask) async throws {
-        let helloAt = Self.monotonic()
+    /// helloAt 是 resume 时刻：send(hello) 与等 ready 共用同一个截止。
+    private func awaitReady(_ socket: NodeWebSocketTask, helloAt: Double, hello: String) async throws {
         let deadline = ReadyDeadlineBox(
             helloAt: helloAt,
             current: Self.readyDeadline(
-                helloAt: helloAt, now: helloAt, current: helloAt + Self.readyTimeoutSeconds,
-                receivedLoading: false
-            )
+                helloAt: helloAt, now: helloAt, current: helloAt + readyTimeout,
+                receivedLoading: false, timeout: readyTimeout
+            ),
+            timeout: readyTimeout
         )
         try await withThrowingTaskGroup(of: Void.self) { group in
+            // send 与 receive 必须在同一个子任务里：group.next() 只返回第一个完成的子任务，
+            // send 成功返回不能当成 ready。
             group.addTask { [weak self] in
+                try await socket.send(.string(hello))
                 while true {
                     let message = try await socket.receive()
                     guard case .string(let text) = message,
@@ -1115,11 +1135,13 @@ final class PongClock: @unchecked Sendable {
 /// awaitReady 的跨任务截止时间：收包任务续期，超时任务按当前值重新睡。
 final class ReadyDeadlineBox: @unchecked Sendable {
     private let helloAt: Double
+    private let timeout: Double
     private let lock = NSLock()
     private var deadline: Double
 
-    init(helloAt: Double, current: Double) {
+    init(helloAt: Double, current: Double, timeout: Double = NodeClient.readyTimeoutSeconds) {
         self.helloAt = helloAt
+        self.timeout = timeout
         self.deadline = current
     }
 
@@ -1130,7 +1152,8 @@ final class ReadyDeadlineBox: @unchecked Sendable {
     func extend(now: Double) {
         lock.withLockVoid {
             deadline = NodeClient.readyDeadline(
-                helloAt: helloAt, now: now, current: deadline, receivedLoading: true
+                helloAt: helloAt, now: now, current: deadline,
+                receivedLoading: true, timeout: timeout
             )
         }
     }
@@ -1401,6 +1424,94 @@ extension NodeClient {
             ProbeResult(info: nil, rttMS: nil, availability: .unauthorized),
         ])
         check(denied.availability == .unauthorized && denied.rttMS == nil && denied.info == nil, "都失败时鉴权失败优先于离线")
+        // 握手截止覆盖 send(hello)：远端 URLSession 的请求超时是 24h，send 在升级完成前
+        // 可能一直等系统 TCP 超时。看门狗必须从 resume 起算，而不是 send 返回之后。
+        func connectingClient(_ socket: FakeNodeSocket, readyTimeout: Double) -> NodeClient {
+            NodeClient(
+                config: NodeConfig(id: "fake", nodeID: "n", url: "ws://x", tokenFile: "/tmp/t"),
+                token: "",
+                info: NodeInfo(
+                    v: 2, nodeID: "n", hwHash: "h", asr: .init(),
+                    translator: "apple", busy: false, onAC: true, inUse: false, worker: "warm"
+                ),
+                sourceLocaleID: "de-DE",
+                targetLanguageID: "zh-Hans",
+                offsetSeconds: 0,
+                sessionGeneration: 1,
+                callbacks: NodeCallbacks(),
+                socketFactory: { socket },
+                readyTimeoutSeconds: readyTimeout
+            )
+        }
+        final class AsyncOutcome: @unchecked Sendable {
+            private let lock = NSLock()
+            private var result: Result<Void, Error>?
+            func set(_ value: Result<Void, Error>) { lock.withLockVoid { result = value } }
+            func get() -> Result<Void, Error>? { lock.withLockValue { result } }
+        }
+        // 外层兜底：被测实现若一直挂着，自测不能跟着挂死。
+        func runAsync(
+            timeout: Double,
+            _ body: @escaping @Sendable () async throws -> Void
+        ) -> Result<Void, Error>? {
+            let outcome = AsyncOutcome()
+            let done = DispatchSemaphore(value: 0)
+            Task.detached {
+                do {
+                    try await body()
+                    outcome.set(.success(()))
+                } catch {
+                    outcome.set(.failure(error))
+                }
+                done.signal()
+            }
+            guard done.wait(timeout: .now() + timeout) == .success else {
+                return nil
+            }
+            return outcome.get()
+        }
+        do {
+            let socket = FakeNodeSocket(behavior: .sendNeverReturns)
+            let client = connectingClient(socket, readyTimeout: 0.3)
+            let outcome = runAsync(timeout: 3) {
+                try await client.connect()
+            }
+            var timedOut = false
+            if case .failure(let error)? = outcome, case NodeClientError.timeout = error {
+                timedOut = true
+            }
+            check(outcome != nil, "send 卡住时 connect 不能挂死（外层 3s 兜底）")
+            check(timedOut, "send 卡住时 connect 应在注入的 0.3s 后抛 .timeout")
+            check(socket.isCanceled, "握手超时必须 cancel socket")
+        }
+        do {
+            let socket = FakeNodeSocket(behavior: .readyAfter(0.1))
+            let client = connectingClient(socket, readyTimeout: 1.5)
+            let outcome = runAsync(timeout: 4) {
+                try await client.connect()
+                await client.close()
+            }
+            if case .success? = outcome {
+                check(true, "send 立即返回 + 0.1s ready 应成功，不能把 send 完成当成 ready")
+            } else {
+                check(false, "send 立即返回 + 0.1s ready 应成功，不能把 send 完成当成 ready")
+            }
+        }
+        do {
+            // 初始截止 2.0s；loading 在 1.4s 到达续到 3.4s，ready 在 2.7s——
+            // 总时长超过初始截止，但在续期内（各留 ≥0.6s 余量：今晚三个会话共用 CPU，调度抖动大）。
+            let socket = FakeNodeSocket(behavior: .loadingThenReady(loadingAfter: 1.4, readyAfter: 2.7))
+            let client = connectingClient(socket, readyTimeout: 2.0)
+            let outcome = runAsync(timeout: 6) {
+                try await client.connect()
+                await client.close()
+            }
+            if case .success? = outcome {
+                check(true, "loading 续期应覆盖初始短超时，ready 后连接成功")
+            } else {
+                check(false, "loading 续期应覆盖初始短超时，ready 后连接成功")
+            }
+        }
         return failures
     }
 
@@ -1446,4 +1557,104 @@ protocol NodeWebSocketTask: Sendable {
 extension URLSessionWebSocketTask: NodeWebSocketTask {
     var nodeCloseCode: Int { closeCode.rawValue }
     var completesCloseOnCancel: Bool { false }
+}
+
+/// 握手截止的自测替身：send 可挂在续期里不返回，cancel 时释放，模拟升级握手卡住。
+@available(macOS 27.0, *)
+private final class FakeNodeSocket: NodeWebSocketTask, @unchecked Sendable {
+    enum Behavior {
+        case sendNeverReturns
+        case readyAfter(Double)
+        case loadingThenReady(loadingAfter: Double, readyAfter: Double)
+    }
+
+    private let behavior: Behavior
+    private let lock = NSLock()
+    private var canceled = false
+    private var pendingSend: CheckedContinuation<Void, Error>?
+    private var pendingReceive: CheckedContinuation<URLSessionWebSocketTask.Message, Error>?
+    private var receiveCount = 0
+
+    init(behavior: Behavior) {
+        self.behavior = behavior
+    }
+
+    var nodeCloseCode: Int { 1005 }
+    var completesCloseOnCancel: Bool { true }
+    var isCanceled: Bool { lock.withLockValue { canceled } }
+
+    func resume() {}
+
+    func send(_ message: URLSessionWebSocketTask.Message) async throws {
+        guard case .sendNeverReturns = behavior else {
+            return
+        }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            lock.lock()
+            if canceled {
+                lock.unlock()
+                continuation.resume(throwing: NodeClientError.connection("canceled"))
+                return
+            }
+            pendingSend = continuation
+            lock.unlock()
+        }
+    }
+
+    func receive() async throws -> URLSessionWebSocketTask.Message {
+        switch behavior {
+        case .sendNeverReturns:
+            return try await blockUntilCanceled()
+        case .readyAfter(let delay):
+            let index = lock.withLockValue { receiveCount }
+            lock.withLockVoid { receiveCount += 1 }
+            if index == 0 {
+                try await Task.sleep(for: .seconds(delay))
+                return .string(#"{"ev":"ready"}"#)
+            }
+            return try await blockUntilCanceled()
+        case .loadingThenReady(let loadingAfter, let readyAfter):
+            let index = lock.withLockValue { receiveCount }
+            lock.withLockVoid { receiveCount += 1 }
+            switch index {
+            case 0:
+                try await Task.sleep(for: .seconds(loadingAfter))
+                return .string(#"{"ev":"status","code":"loading"}"#)
+            case 1:
+                try await Task.sleep(for: .seconds(max(0, readyAfter - loadingAfter)))
+                return .string(#"{"ev":"ready"}"#)
+            default:
+                return try await blockUntilCanceled()
+            }
+        }
+    }
+
+    func sendPing(pongReceiveHandler: @escaping @Sendable (Error?) -> Void) {
+        pongReceiveHandler(nil)
+    }
+
+    func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
+        lock.lock()
+        canceled = true
+        let send = pendingSend
+        let receive = pendingReceive
+        pendingSend = nil
+        pendingReceive = nil
+        lock.unlock()
+        send?.resume(throwing: NodeClientError.connection("canceled"))
+        receive?.resume(throwing: NodeClientError.connection("canceled"))
+    }
+
+    private func blockUntilCanceled() async throws -> URLSessionWebSocketTask.Message {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URLSessionWebSocketTask.Message, Error>) in
+            lock.lock()
+            if canceled {
+                lock.unlock()
+                continuation.resume(throwing: NodeClientError.connection("canceled"))
+                return
+            }
+            pendingReceive = continuation
+            lock.unlock()
+        }
+    }
 }

@@ -1,6 +1,7 @@
 """app 把 remote/ 接进主链路。不实例化 SubtitleApp，不连网络。"""
 import os
 import threading
+from pathlib import Path
 
 os.environ["REALTIME_SUBTITLE_NO_SINGLETON"] = "1"
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -121,6 +122,9 @@ def _boom(*_args, **_kwargs):
 def _open(**kwargs):
     ui = kwargs.pop("ui", None) or _UI()
     translator = kwargs.pop("translator", None) or _Translator()
+    # 云端 key 热更测试一律显式给临时路径；其它桥接测试也不能碰用户真实配置。
+    if kwargs.get("cloud_on") and "key_path" not in kwargs:
+        kwargs["key_path"] = Path(__file__).with_name("_test_groq_key_missing")
     bridge = open_remote_bridge(
         translator=translator,
         ui_show=ui.show,
@@ -323,6 +327,296 @@ def test_cloud_429_logs_cooldown_once_without_key(tmp_path, capsys):
         bridge.close()
 
 
+def test_replaced_key_late_401_is_not_marked_invalid_and_cancels_old_cloud(tmp_path, capsys):
+    from realtime_subtitle.remote.cloud_client import CloudError
+
+    old_key = "gsk_test_fake_old_key_4baca9"
+    new_key = "gsk_test_fake_new_key_cde801"
+    key_path = tmp_path / "groq.key"
+    key_path.write_text(old_key + "\n", encoding="utf-8")
+    cloud = _Cloud()
+    bridge, _ui, _translator = _open(
+        cloud_on=True,
+        node_on=False,
+        cloud_client_factory=lambda key_path=None: cloud,
+        segmenter_factory=_Segmenter,
+        ledger_factory=lambda path, routing=None: _Ledger(path, routing),
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs),
+        key_path=key_path,
+        quota_path=tmp_path / "quota.json",
+    )
+    try:
+        key_path.write_text(new_key + "\n", encoding="utf-8")
+        bridge._on_cloud_exception(
+            CloudError(status=401, reason="unauthorized", exc_type="HTTPStatus", secret=old_key),
+            bridge._generation,
+        )
+        assert bridge.route_label() != design_tokens.TEXT_STATUS_CLOUD_KEY_INVALID
+        assert bridge.routing.cloud_state != "disabled_invalid_key"
+        assert cloud.cancelled == 1
+        output = capsys.readouterr()
+        assert old_key not in output.out
+        assert new_key not in output.out
+        assert old_key not in output.err
+        assert new_key not in output.err
+    finally:
+        bridge.close()
+
+
+def test_key_file_change_recovers_an_invalid_cloud_route(tmp_path):
+    from realtime_subtitle.remote.cloud_client import CloudError
+
+    old_key = "gsk_test_fake_invalid_key_49280d"
+    new_key = "gsk_test_fake_replacement_key_0f1b2d"
+    key_path = tmp_path / "groq.key"
+    key_path.write_text(old_key + "\n", encoding="utf-8")
+    cloud = _Cloud()
+    bridge, _ui, _translator = _open(
+        cloud_on=True,
+        node_on=False,
+        cloud_client_factory=lambda key_path=None: cloud,
+        segmenter_factory=_Segmenter,
+        ledger_factory=lambda path, routing=None: _Ledger(path, routing),
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs),
+        key_path=key_path,
+        quota_path=tmp_path / "quota.json",
+    )
+    try:
+        bridge._on_cloud_exception(
+            CloudError(status=401, reason="unauthorized", exc_type="HTTPStatus", secret=old_key),
+            bridge._generation,
+        )
+        assert bridge.routing.cloud_state == "disabled_invalid_key"
+        generation = bridge._generation
+        key_path.write_text(new_key + "\n", encoding="utf-8")
+        bridge._routing_checked_at = None
+        bridge._recover_routing()
+        assert bridge.routing.tier() == "cloud"
+        assert bridge.route_label() == design_tokens.TEXT_STATUS_CLOUD
+        assert bridge._generation == generation
+    finally:
+        bridge.close()
+
+
+def test_unchanged_key_401_still_marks_cloud_key_invalid(tmp_path):
+    from realtime_subtitle.remote.cloud_client import CloudError
+
+    key = "gsk_test_fake_still_invalid_key_8a107c"
+    key_path = tmp_path / "groq.key"
+    key_path.write_text(key + "\n", encoding="utf-8")
+    bridge, _ui, _translator = _open(
+        cloud_on=True,
+        node_on=False,
+        cloud_client_factory=lambda key_path=None: _Cloud(),
+        segmenter_factory=_Segmenter,
+        ledger_factory=lambda path, routing=None: _Ledger(path, routing),
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs),
+        key_path=key_path,
+        quota_path=tmp_path / "quota.json",
+    )
+    try:
+        bridge._on_cloud_exception(
+            CloudError(status=401, reason="unauthorized", exc_type="HTTPStatus", secret=key),
+            bridge._generation,
+        )
+        assert bridge.routing.cloud_state == "disabled_invalid_key"
+        assert bridge.route_label() == design_tokens.TEXT_STATUS_CLOUD_KEY_INVALID
+    finally:
+        bridge.close()
+
+
+def test_touching_unchanged_key_file_does_not_advance_generation(tmp_path):
+    key = "gsk_test_fake_unchanged_key_3779f2"
+    key_path = tmp_path / "groq.key"
+    key_path.write_text(key + "\n", encoding="utf-8")
+    bridge, _ui, _translator = _open(
+        cloud_on=True,
+        node_on=False,
+        cloud_client_factory=lambda key_path=None: _Cloud(),
+        segmenter_factory=_Segmenter,
+        ledger_factory=lambda path, routing=None: _Ledger(path, routing),
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs),
+        key_path=key_path,
+        quota_path=tmp_path / "quota.json",
+    )
+    try:
+        bridge._recover_routing()
+        generation = bridge._generation
+        stat = key_path.stat()
+        os.utime(key_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+        bridge._routing_checked_at = None
+        bridge._recover_routing()
+        assert bridge._generation == generation
+    finally:
+        bridge.close()
+
+
+def test_replaced_key_does_not_advance_node_session_generation(tmp_path, monkeypatch):
+    """换 key 不能推进桥的代次：它同时是 NodeClient 的会话代次。"""
+    monkeypatch.setattr(
+        "realtime_subtitle.remote.router.read_self_node_id", lambda: "this-machine")
+    old_key = "gsk_test_fake_hybrid_old_3f9a1c"
+    new_key = "gsk_test_fake_hybrid_new_7b2d40"
+    key_path = tmp_path / "groq.key"
+    key_path.write_text(old_key + "\n", encoding="utf-8")
+    cloud = _Cloud()
+    bridge, _ui, _translator = _open(
+        cloud_on=True,
+        node_on=True,
+        cloud_client_factory=lambda key_path=None: cloud,
+        segmenter_factory=_Segmenter,
+        ledger_factory=lambda path, routing=None: _Ledger(path, routing),
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs),
+        prepare=lambda cfg: ("100.64.0.8", object()),
+        node_client_factory=lambda cfg, info, callbacks: _Node(),
+        node_entries=[
+            NodeConfig(id="desk", node_id="tk007nodeid0001", url="ws://100.64.0.8:8791", token_file="x"),
+        ],
+        key_path=key_path,
+        quota_path=tmp_path / "quota.json",
+    )
+    closed = []
+    bridge._close_node = lambda: closed.append(True)
+    try:
+        generation = bridge._generation
+        key_path.write_text(new_key + "\n", encoding="utf-8")
+        bridge._routing_checked_at = None
+        bridge._recover_routing()
+        assert bridge._generation == generation
+        assert closed == []
+        assert cloud.cancelled == 1
+    finally:
+        bridge.close()
+
+
+def test_key_change_cancels_cloud_once_and_is_idempotent(tmp_path):
+    old_key = "gsk_test_fake_once_old_5d0e12"
+    new_key = "gsk_test_fake_once_new_9c4b77"
+    key_path = tmp_path / "groq.key"
+    key_path.write_text(old_key + "\n", encoding="utf-8")
+    cloud = _Cloud()
+    bridge, _ui, _translator = _open(
+        cloud_on=True,
+        node_on=False,
+        cloud_client_factory=lambda key_path=None: cloud,
+        segmenter_factory=_Segmenter,
+        ledger_factory=lambda path, routing=None: _Ledger(path, routing),
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs),
+        key_path=key_path,
+        quota_path=tmp_path / "quota.json",
+    )
+    try:
+        bridge._routing_checked_at = None
+        bridge._recover_routing()
+        assert cloud.cancelled == 0
+        key_path.write_text(new_key + "\n", encoding="utf-8")
+        bridge._routing_checked_at = None
+        bridge._recover_routing()
+        assert cloud.cancelled == 1
+        bridge._routing_checked_at = None
+        bridge._recover_routing()
+        assert cloud.cancelled == 1
+        key_path.write_text(new_key + "\n", encoding="utf-8")
+        bridge._routing_checked_at = None
+        bridge._recover_routing()
+        assert cloud.cancelled == 1
+    finally:
+        bridge.close()
+
+
+def test_401_with_new_key_fingerprint_after_recovery_marks_invalid(tmp_path):
+    from realtime_subtitle.remote.cloud_client import CloudError
+
+    old_key = "gsk_test_fake_recovering_old_1e6a90"
+    new_key = "gsk_test_fake_recovering_new_8f3c25"
+    key_path = tmp_path / "groq.key"
+    key_path.write_text(old_key + "\n", encoding="utf-8")
+    bridge, _ui, _translator = _open(
+        cloud_on=True,
+        node_on=False,
+        cloud_client_factory=lambda key_path=None: _Cloud(),
+        segmenter_factory=_Segmenter,
+        ledger_factory=lambda path, routing=None: _Ledger(path, routing),
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs),
+        key_path=key_path,
+        quota_path=tmp_path / "quota.json",
+    )
+    try:
+        bridge._on_cloud_exception(
+            CloudError(status=401, reason="unauthorized", exc_type="HTTPStatus", secret=old_key),
+            bridge._generation,
+        )
+        assert bridge.routing.cloud_state == "disabled_invalid_key"
+        key_path.write_text(new_key + "\n", encoding="utf-8")
+        bridge._routing_checked_at = None
+        bridge._recover_routing()
+        assert bridge.routing.tier() == "cloud"
+        # 恢复后新 key 自己被打回 401，仍必须判成失效。
+        bridge._on_cloud_exception(
+            CloudError(status=401, reason="unauthorized", exc_type="HTTPStatus", secret=new_key),
+            bridge._generation,
+        )
+        assert bridge.routing.cloud_state == "disabled_invalid_key"
+        assert bridge.route_label() == design_tokens.TEXT_STATUS_CLOUD_KEY_INVALID
+    finally:
+        bridge.close()
+
+
+def test_key_change_while_cloud_off_does_not_re_enable_cloud(tmp_path):
+    old_key = "gsk_test_fake_off_old_2a7f41"
+    new_key = "gsk_test_fake_off_new_6e04b8"
+    key_path = tmp_path / "groq.key"
+    key_path.write_text(old_key + "\n", encoding="utf-8")
+    cloud = _Cloud()
+    bridge, _ui, _translator = _open(
+        cloud_on=True,
+        node_on=False,
+        cloud_client_factory=lambda key_path=None: cloud,
+        segmenter_factory=_Segmenter,
+        ledger_factory=lambda path, routing=None: _Ledger(path, routing),
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs),
+        key_path=key_path,
+        quota_path=tmp_path / "quota.json",
+    )
+    try:
+        bridge.set_prefs(False, False)
+        assert bridge.routing.cloud_enabled is False
+        assert cloud.cancelled == 1
+        key_path.write_text(new_key + "\n", encoding="utf-8")
+        bridge._routing_checked_at = None
+        bridge._recover_routing()
+        assert bridge.routing.cloud_enabled is False
+        assert bridge.routing.cloud_state == "off"
+        assert cloud.cancelled == 1
+    finally:
+        bridge.close()
+
+
+def test_bad_utf8_key_file_does_not_break_bridge_or_recover(tmp_path):
+    key_path = tmp_path / "groq.key"
+    key_path.write_bytes(b"\xff\xfe\x00\x80garbage")
+    bridge, _ui, _translator = _open(
+        cloud_on=True,
+        node_on=False,
+        cloud_client_factory=lambda key_path=None: _Cloud(),
+        segmenter_factory=_Segmenter,
+        ledger_factory=lambda path, routing=None: _Ledger(path, routing),
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs),
+        key_path=key_path,
+        quota_path=tmp_path / "quota.json",
+    )
+    try:
+        assert bridge._cloud_key_digest is None
+        bridge._routing_checked_at = None
+        bridge._recover_routing()
+        bridge.feed_audio(np.zeros(160, dtype=np.float32))
+        bridge.flush()
+        assert bridge._cloud_key_digest is None
+        assert bridge.routing.cloud_state == "available"
+    finally:
+        bridge.close()
+
+
 def test_local_pair_reaches_ui_and_remote_replaces_it(tmp_path):
     bridge, ui, _translator = _open(
         cloud_on=True,
@@ -412,6 +706,190 @@ def test_node_feed_connects_once_and_skips_self(tmp_path, monkeypatch):
     finally:
         bridge.close()
     assert nodes[0][1].closed
+
+
+def _open_node_with_callbacks(tmp_path, monkeypatch):
+    """节点桥 + 每次连接留下的 (node, callbacks)，用来模拟会话内的服务端事件。"""
+    monkeypatch.setattr(
+        "realtime_subtitle.remote.router.read_self_node_id", lambda: "this-machine")
+    built = []
+
+    def factory(cfg, info, callbacks):
+        node = _Node()
+        built.append((node, callbacks))
+        return node
+
+    bridge, ui, translator = _open(
+        cloud_on=False,
+        node_on=True,
+        cloud_client_factory=_boom,
+        segmenter_factory=_boom,
+        ledger_factory=_boom,
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs),
+        prepare=lambda cfg: ("100.64.0.8", object()),
+        node_client_factory=factory,
+        node_entries=[
+            NodeConfig(id="desk", node_id="tk007nodeid0001", url="ws://100.64.0.8:8791", token_file="x"),
+        ],
+        quota_path=tmp_path / "quota.json",
+    )
+    return bridge, ui, translator, built
+
+
+def _reconnect_node(bridge):
+    bridge._node_backoff_until = 0
+    bridge.feed_audio(np.zeros(320, dtype=np.float32))
+    bridge.flush()
+
+
+def test_node_reconnect_same_sentence_id_does_not_overwrite_previous_session(tmp_path, monkeypatch):
+    """节点句 id 每会话重编号：重连后 id=0 的译文不能写到上一会话的行上。"""
+    bridge, ui, _translator, built = _open_node_with_callbacks(tmp_path, monkeypatch)
+    try:
+        bridge.feed_audio(np.zeros(320, dtype=np.float32))
+        bridge.flush()
+        assert len(built) == 1
+        generation = bridge._generation
+        _node1, cb1 = built[0]
+        cb1.on_final("desk", generation, 0, "Hallo", 1.0, 2.0)
+        bridge.flush()
+        assert [line["src"] for line in ui.lines] == ["Hallo"]
+
+        cb1.on_closed("desk", generation, ConnectionError("gone"))
+        _reconnect_node(bridge)
+        assert len(built) == 2
+        _node2, cb2 = built[1]
+
+        cb2.on_final("desk", generation, 0, "Tschüss", 3.0, 4.0)
+        bridge.flush()
+        assert [line["src"] for line in ui.lines] == ["Hallo", "Tschüss"]
+
+        cb2.on_translation("desk", generation, 0, "再见")
+        bridge.flush()
+        assert ui.lines[0]["dst"] == "中文译文"
+        assert ui.lines[1]["dst"] == "再见"
+    finally:
+        bridge.close()
+
+
+def test_node_reconnect_does_not_inherit_translate_failed_ids(tmp_path, monkeypatch):
+    """上一会话翻译失败的 id 不能把新会话同号句的节点译文挡掉。"""
+    bridge, ui, _translator, built = _open_node_with_callbacks(tmp_path, monkeypatch)
+    try:
+        bridge.feed_audio(np.zeros(320, dtype=np.float32))
+        bridge.flush()
+        generation = bridge._generation
+        _node1, cb1 = built[0]
+        cb1.on_translate_failed("desk", generation, 1)
+
+        cb1.on_closed("desk", generation, ConnectionError("gone"))
+        _reconnect_node(bridge)
+        assert len(built) == 2
+        _node2, cb2 = built[1]
+
+        cb2.on_final("desk", generation, 1, "Tschüss", 3.0, 4.0)
+        bridge.flush()
+        assert ui.lines[-1]["dst"] == "中文译文"
+
+        cb2.on_translation("desk", generation, 1, "节点译文")
+        bridge.flush()
+        assert ui.lines[-1]["dst"] == "节点译文"
+    finally:
+        bridge.close()
+
+
+def test_node_reconnect_translation_before_final_uses_new_session_row(tmp_path, monkeypatch):
+    """新会话的译文先于 final 到达时，不能落到上一会话同号句的行上。"""
+    bridge, ui, _translator, built = _open_node_with_callbacks(tmp_path, monkeypatch)
+    try:
+        bridge.feed_audio(np.zeros(320, dtype=np.float32))
+        bridge.flush()
+        generation = bridge._generation
+        _node1, cb1 = built[0]
+        cb1.on_final("desk", generation, 0, "Hallo", 1.0, 2.0)
+        bridge.flush()
+
+        cb1.on_closed("desk", generation, ConnectionError("gone"))
+        _reconnect_node(bridge)
+        _node2, cb2 = built[1]
+
+        cb2.on_translation("desk", generation, 0, "再见")
+        bridge.flush()
+        assert ui.lines[0]["dst"] == "中文译文"
+
+        cb2.on_final("desk", generation, 0, "Tschüss", 3.0, 4.0)
+        bridge.flush()
+        assert [line["src"] for line in ui.lines] == ["Hallo", "Tschüss"]
+        assert ui.lines[0]["dst"] == "中文译文"
+        assert ui.lines[1]["dst"] == "再见"
+    finally:
+        bridge.close()
+
+
+def test_late_events_from_previous_node_session_are_ignored(tmp_path, monkeypatch):
+    """旧连接迟到的 closed/translation 不能影响重连后的新连接。"""
+    bridge, ui, _translator, built = _open_node_with_callbacks(tmp_path, monkeypatch)
+    try:
+        bridge.feed_audio(np.zeros(320, dtype=np.float32))
+        bridge.flush()
+        generation = bridge._generation
+        _node1, cb1 = built[0]
+        cb1.on_final("desk", generation, 0, "Hallo", 1.0, 2.0)
+        bridge.flush()
+
+        cb1.on_closed("desk", generation, ConnectionError("gone"))
+        _reconnect_node(bridge)
+        assert len(built) == 2
+        node2, cb2 = built[1]
+        assert bridge._node_client is node2
+
+        cb1.on_closed("desk", generation, ConnectionError("late"))
+        cb1.on_translation("desk", generation, 0, "旧译文")
+        bridge.flush()
+        assert bridge._node_client is node2
+        assert [line["src"] for line in ui.lines] == ["Hallo"]
+        assert ui.lines[0]["dst"] == "中文译文"
+    finally:
+        bridge.close()
+
+
+def test_node_loading_during_connect_reaches_status_line(tmp_path, monkeypatch):
+    """loading 在 connect 还没返回时就到（冷启动续等）：新连接还没挂上桥，也不能当成旧连接丢掉。"""
+    monkeypatch.setattr(
+        "realtime_subtitle.remote.router.read_self_node_id", lambda: "this-machine")
+    statuses: list[str] = []
+    holder = {}
+
+    class _LoadingNode(_Node):
+        async def connect(self):
+            holder["callbacks"].on_loading("desk", holder["bridge"]._generation)
+
+    def factory(cfg, info, callbacks):
+        holder["callbacks"] = callbacks
+        return _LoadingNode()
+
+    bridge, _ui, _translator = _open(
+        cloud_on=False,
+        node_on=True,
+        ui_status=statuses.append,
+        cloud_client_factory=_boom,
+        segmenter_factory=_boom,
+        ledger_factory=_boom,
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs),
+        prepare=lambda cfg: ("100.64.0.8", object()),
+        node_client_factory=factory,
+        node_entries=[
+            NodeConfig(id="desk", node_id="tk007nodeid0001", url="ws://100.64.0.8:8791", token_file="x"),
+        ],
+        quota_path=tmp_path / "quota.json",
+    )
+    holder["bridge"] = bridge
+    try:
+        bridge.feed_audio(np.zeros(320, dtype=np.float32))
+        bridge.flush()
+        assert "desk" + design_tokens.TEXT_NODE_LOADING_SUFFIX in statuses
+    finally:
+        bridge.close()
 
 
 def test_node_translate_failed_with_id_uses_local_fallback_once_and_blocks_late_translation(tmp_path):

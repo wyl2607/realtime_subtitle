@@ -89,8 +89,13 @@ final class CloudSegmenter {
             if gap >= Self.silenceSeconds - eps {
                 silenceRun += gap
                 emitted.append(contentsOf: closeOpenIfSilent())
-                emitted.append(contentsOf: emitHeldIfMergeWindowPassed())
-                emitted.append(contentsOf: flushReady())
+                // 缺口前的语音只能从旧缓冲里切：换缓冲之前全部发出（拿住等合并的短段也一样，
+                // 隔着断流没东西可并）。留到之后再发，切片会落在新时间轴上，切出空 PCM。
+                if let pending = held {
+                    held = nil
+                    queued.append(pending)
+                }
+                emitted.append(contentsOf: flushReady(force: true))
                 samples = incoming
                 origin = startSeconds
                 frameCursor = 0
@@ -353,6 +358,33 @@ final class CloudSegmenter {
             let output = segmenter.append(samples: samples, startSeconds: clock)
             clock += Double(count) / sampleRate
             return output.segments
+        }
+
+        do {
+            let segmenter = CloudSegmenter()
+            var clock = 0.0
+            var got = feed(segmenter, 0.05, 1.0, &clock)
+            got += feed(segmenter, 0, 0.1, &clock)
+            clock += 1.0
+            got += feed(segmenter, 0, 0.6, &clock)
+            got += segmenter.finish()
+            check(got.count == 1, "缺口前的短段应发出一段，实际 \(got.count)")
+            check(got.allSatisfy { !$0.pcm16.isEmpty }, "缺口前的短段不得切出空 PCM")
+        }
+
+        do {
+            let segmenter = CloudSegmenter()
+            var clock = 0.0
+            var got = feed(segmenter, 0.05, 2.0, &clock)
+            got += feed(segmenter, 0, 0.1, &clock)
+            clock += 5.0
+            got += feed(segmenter, 0, 0.6, &clock)
+            got += segmenter.finish()
+            check(got.count == 1, "缺口前的长段应发出一段，实际 \(got.count)")
+            check(got.allSatisfy { !$0.pcm16.isEmpty }, "缺口前的长段不得切出空 PCM")
+            if let segment = got.first {
+                check(segment.pcm16.count >= Int(2.0 * sampleRate) * 2, "缺口前的长段应带上完整语音，字节 \(segment.pcm16.count)")
+            }
         }
 
         do {
