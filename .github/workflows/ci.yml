@@ -137,13 +137,16 @@ jobs:
   # 调整而漂移，写死 macos-26 才能让"编译不过"是真实信号而不是镜像换代。
   # 若将来该标签不存在，回退 macos-latest，并保留这条注释说明本意。
   #
-  # ☠️ continue-on-error 的来由：部分代码是 @available(macOS 27.0, *)，
-  # 当前 runner 的 SDK 尚未包含 macOS 27 API 时连编译都过不去。这是 runner
-  # 侧的滞后、不是本仓库的回归，所以整个 job 先容忍失败。**runner SDK 跟上
-  # macOS 27 后去掉这个 continue-on-error。**
+  # ☠️ 这里曾挂着 continue-on-error，注释归因于「runner 缺 macOS 27 SDK」——
+  # 那是误诊：真实报错全是 Swift 6.3（Xcode 26）比本地 Swift 6.4 严格的编译
+  # 差异（main.swift 里放 @main、私有 memberwise init、可选元组解构推断、
+  # 闭包元组 != 歧义），@available(macOS 27.0, *) 的代码在 26 SDK 上照样能编。
+  # 修完后不再容忍失败：这里红就是真回归，本地用新工具链编过不代表 CI 能过。
   rslite-macos:
     runs-on: macos-26
-    continue-on-error: true
+    # 正常 1 分钟内编完。Swift 6.3 遇到某些闭包写法会在 ClosureLifetimeFixup 里死循环
+    # 而不是报错（PR #83），不设上限就卡满 GitHub 默认的 6 小时。
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - name: Swift version

@@ -1254,7 +1254,7 @@ macOS 避坑（每一条都是这次迁移真实踩过的）：
 16. **rslite 的 `main` 必须是同步函数**（修于 5b1a3c5，2026-10-08 真机）。
     现象：进程活着、CPU 0%、窗口不出现、也不弹权限。根因：async main 里再
     `app.run()`，事件循环跑在一个主队列任务**里面**，该任务永不返回，之后派到
-    MainActor 的任务（窗口显示、启动识别）全排在后面轮不到。做法：`main.swift`
+    MainActor 的任务（窗口显示、启动识别）全排在后面轮不到。做法：`RSLite.swift`
     保持同步入口，同步 main 下 `app.run()`/`dispatchMain()` 自己就在排空主队列。
 17. **URLSession 的 WebSocket 把服务端 close 1013 报成 1005**（v1 客户端
     RemotePipeline 实测，2026-10，经验搬进 TK-005 的节点路由）。现象：节点忙时
