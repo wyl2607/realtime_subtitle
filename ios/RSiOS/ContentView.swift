@@ -15,6 +15,7 @@ struct ContentView: View {
     @StateObject private var statusMonitor = StatusMonitor()
     @StateObject private var linesMonitor = LinesMonitor()
     @StateObject private var transcriptStore = TranscriptStore()
+    @StateObject private var micCapture = MicCapture()
     @ObservedObject private var appStateMonitor = AppStateMonitor.shared
 
     @State private var pairingLinkText = ""
@@ -22,8 +23,16 @@ struct ContentView: View {
     @State private var pairedConfigDisplay = ""
 
     @State private var engineMode: String = "auto"
+    @State private var engineModeSaveFailed = false
     @State private var prepareStatus = ""
+    /// 语音授权被拒的提示单独存一份：prepareStatus 每完成一步都会整段重写，
+    /// 拼进去的拒绝提示会被覆盖，用户就再也看不到。
+    @State private var prepareSpeechDeniedHint: String?
     @State private var isPreparing = false
+    /// 翻译资源下载只能借 SwiftUI 的 `.translationTask` 拿到 TranslationSession。
+    /// 该类型 iOS 18 起才可用，而工程部署目标是 iOS 17。存储属性不能标 `@available`
+    /// （Xcode 26 直接报错，Xcode 27 才放行），所以用 Any? 存，用的地方都在 iOS 18 分支里再转回。
+    @State private var translationConfig: Any?
     /// Groq key 的输入框内容。只在用户输入时存在，保存后立刻清空。
     @State private var groqKeyInput: String = ""
     /// 已保存 key 的掩码（只显示后 4 位）。完整 key 只在 Keychain 里。
@@ -33,7 +42,34 @@ struct ContentView: View {
     /// 每次收到新句对就 +1：「今天的字幕」页面靠它触发重新读存档文件。
     @State private var transcriptRefresh = 0
 
+    private var micStatusText: String {
+        switch micCapture.state {
+        case .idle:
+            DesignTokens.Text.micStatusIdle
+        case .running:
+            DesignTokens.Text.micStatusRunning
+        case .denied:
+            DesignTokens.Text.micPermissionDenied
+        case .blockedByBroadcast:
+            DesignTokens.Text.micBlockedByBroadcast
+        case .error(let message):
+            message
+        }
+    }
+
+    private var micStatusColor: Color {
+        switch micCapture.state {
+        case .running:
+            .green
+        case .idle:
+            .secondary
+        case .denied, .blockedByBroadcast, .error:
+            .red
+        }
+    }
+
     var body: some View {
+        wrapped(
         NavigationStack {
             // 内容比一屏高：必须能滚动。没有 ScrollView 时 VStack 居中溢出，顶部的 Broadcast 按钮、
             // 配对输入框被裁到状态栏后面，用户既滑不动也点不到（iPhone 15 Pro 真机复现）。
@@ -51,6 +87,37 @@ struct ContentView: View {
                         Text("点上面的圆形按钮 → 选「实时字幕」→ 开始直播")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
+                    }
+
+                    VStack(spacing: 12) {
+                        Text(DesignTokens.Text.micSubtitleTitle)
+                            .font(.headline)
+                        HStack {
+                            Button(DesignTokens.Text.micStartButton) {
+                                micCapture.start(
+                                    extensionStatus: statusMonitor.keychainStatus,
+                                    extensionStatusUpdatedAt: statusMonitor.lastStatusUpdate
+                                )
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(micCapture.isRunning)
+
+                            Button(DesignTokens.Text.micStopButton) {
+                                micCapture.stop()
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(!micCapture.isRunning)
+                        }
+                        Text(micStatusText)
+                            .font(.caption)
+                            .foregroundStyle(micStatusColor)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        if let speechDenied = micCapture.speechDeniedHint {
+                            Text(speechDenied)
+                                .font(.caption)
+                                .foregroundColor(.red)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
                     }
 
                     Divider()
@@ -105,10 +172,27 @@ struct ContentView: View {
                         }
                         .pickerStyle(.segmented)
                         .onChange(of: engineMode) { _, newValue in
-                            SharedKeychain.writeEngineMode(newValue)
+                            // 档位只进 Keychain；写失败时不能让界面看起来像已经生效。
+                            engineModeSaveFailed = !SharedKeychain.writeEngineMode(newValue)
                         }
                         .onAppear {
                             engineMode = SharedKeychain.readEngineMode()
+                        }
+
+                        if engineModeSaveFailed {
+                            Text("保存引擎档位失败，请重试")
+                                .font(.caption)
+                                .foregroundColor(.red)
+                        }
+
+                        // 只有启动后真的换过档位才提示：否则麦克风一开就常驻这句话，
+                        // 用户会以为自己刚改了什么。
+                        if micCapture.isRunning,
+                           let startedMode = micCapture.startedEngineMode,
+                           startedMode != engineMode {
+                            Text("麦克风停止后重新开始才生效")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
                         }
 
                         Button(action: prepareLocalAssets) {
@@ -127,6 +211,12 @@ struct ContentView: View {
                             Text(prepareStatus)
                                 .font(.caption)
                                 .foregroundColor(prepareStatus.hasPrefix("错误") || prepareStatus.hasPrefix("需要") ? .red : .green)
+                        }
+
+                        if let speechDenied = prepareSpeechDeniedHint {
+                            Text(speechDenied)
+                                .font(.caption)
+                                .foregroundColor(.red)
                         }
                     }
 
@@ -236,6 +326,15 @@ struct ContentView: View {
                             .cornerRadius(8)
                     }
 
+                    // 本机引擎失败时把原始码映射成可读提示（纯逻辑，不删原状态行）。
+                    if let localMsg = LocalEngineStatus.userMessage(forStatusLine: statusMonitor.keychainStatus) {
+                        Text(localMsg)
+                            .font(.caption)
+                            .foregroundColor(.red)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.top, 4)
+                    }
+
                     VStack(spacing: 8) {
                         Text("最近句对 (来自扩展)")
                             .font(.headline)
@@ -309,6 +408,36 @@ struct ContentView: View {
                 transcriptRefresh += 1
             }
         }
+        .onReceive(statusMonitor.$lastStatusUpdate) { updatedAt in
+            micCapture.reconcileBroadcast(
+                extensionStatus: statusMonitor.keychainStatus,
+                extensionStatusUpdatedAt: updatedAt
+            )
+        }
+        )
+    }
+
+    /// `.translationTask` 是唯一能拿到 TranslationSession 的入口（普通 Task 拿不到），
+    /// 所以翻译资源下载必须挂在这里；可用性判断集中在 View 结构上，body 不整体抬高到 iOS 18。
+    @ViewBuilder
+    private func wrapped<V: View>(_ content: V) -> some View {
+        if #available(iOS 18.0, *) {
+            content.translationTask(translationConfig as? TranslationSession.Configuration) { session in
+                _ = try? await session.prepareTranslation()
+                // prepareTranslation 正常返回不代表资源真的装上（用户可能取消系统下载），
+                // 状态必须以再次查询 LanguageAvailability 的结果为准。
+                let status = await LanguageAvailability().status(
+                    from: Locale.Language(identifier: "de"),
+                    to: Locale.Language(identifier: "zh-Hans")
+                )
+                await MainActor.run {
+                    isPreparing = false
+                    prepareStatus = "翻译 de→zh-Hans: \(status)"
+                }
+            }
+        } else {
+            content
+        }
     }
 
     private func applyPairingLink() {
@@ -378,6 +507,27 @@ struct ContentView: View {
 
         isPreparing = true
         prepareStatus = "检查资源状态..."
+        prepareSpeechDeniedHint = nil
+
+        // 准备本机识别资源时顺带确认语音授权（不阻止流程）；拒绝提示单独存，
+        // 不写进 prepareStatus，否则会被后面每一步的整段赋值覆盖。
+        let mode = SharedKeychain.readEngineMode()
+        if mode == "local" || mode == "auto" {
+            switch SFSpeechRecognizer.authorizationStatus() {
+            case .notDetermined:
+                SFSpeechRecognizer.requestAuthorization { status in
+                    DispatchQueue.main.async {
+                        if status == .denied || status == .restricted {
+                            prepareSpeechDeniedHint = DesignTokens.Text.localSpeechDenied
+                        }
+                    }
+                }
+            case .denied, .restricted:
+                prepareSpeechDeniedHint = DesignTokens.Text.localSpeechDenied
+            default:
+                break
+            }
+        }
 
         Task {
             do {
@@ -397,11 +547,24 @@ struct ContentView: View {
                     attributeOptions: [.audioTimeRange]
                 )
 
-                let assetStatus = await AssetInventory.status(forModules: [transcriber])
-                let txStatus = await LanguageAvailability().status(from: Locale.Language(identifier: "de"), to: Locale.Language(identifier: "zh-Hans"))
+                var assetStatus = await AssetInventory.status(forModules: [transcriber])
+                if assetStatus != .installed {
+                    // 只查状态永远不会把资源装上：本机引擎在资源缺失时直接报 asr_assets_missing，
+                    // 而界面又把用户指回这个按钮，等于死循环。这里必须真的发起安装。
+                    await MainActor.run { prepareStatus = "正在下载识别资源..." }
+                    if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
+                        try await request.downloadAndInstall()
+                    }
+                    // 安装结束后重新查一次：用户可能中途取消，状态以查询结果为准。
+                    assetStatus = await AssetInventory.status(forModules: [transcriber])
+                }
+
+                let txStatus = await LanguageAvailability().status(
+                    from: Locale.Language(identifier: "de"),
+                    to: Locale.Language(identifier: "zh-Hans")
+                )
 
                 await MainActor.run {
-                    isPreparing = false
                     var parts: [String] = ["ASR资源: \(assetStatus)"]
                     parts.append("翻译 de→zh-Hans: \(txStatus)")
                     prepareStatus = parts.joined(separator: " · ")
@@ -409,8 +572,27 @@ struct ContentView: View {
 
                 if assetStatus != .installed {
                     await MainActor.run {
-                        prepareStatus += " · 点击再次准备将下载资源"
+                        prepareStatus += " · 识别资源仍未安装，请重试"
                     }
+                }
+
+                if txStatus != .installed {
+                    // 翻译下载要弹系统确认框，只有 translationTask 能拿到会话：
+                    // 这里只设置配置，真正的 prepareTranslation 在 wrapped(_:) 里执行。
+                    await MainActor.run {
+                        var next = TranslationSession.Configuration(
+                            source: Locale.Language(identifier: "de"),
+                            target: Locale.Language(identifier: "zh-Hans")
+                        )
+                        // 同一对语言连续点按钮时 Configuration 相等，修饰符不会重开会话；
+                        // invalidate 保证这一次点击仍然触发系统下载确认。
+                        next.invalidate()
+                        translationConfig = next
+                        isPreparing = true
+                        prepareStatus += " · 等待系统确认下载翻译资源..."
+                    }
+                } else {
+                    await MainActor.run { isPreparing = false }
                 }
             } catch {
                 await MainActor.run {
@@ -910,6 +1092,8 @@ extension DateFormatter {
 final class StatusMonitor: ObservableObject {
     @Published var keychainStatus: String = "无"
     @Published var darwinNotificationCount: Int = 0
+    /// 只有 Darwin 通知才代表扩展刚写过状态；轮询读到旧 Keychain 值不能延长广播占用时间。
+    @Published private(set) var lastStatusUpdate: Date?
 
     private var timer: Timer?
     private var darwinObserver: UnsafeRawPointer?
@@ -938,9 +1122,12 @@ final class StatusMonitor: ObservableObject {
         timer = nil
     }
 
-    private func updateKeychainStatus() {
+    private func updateKeychainStatus(markingFreshUpdate: Bool = false) {
         DispatchQueue.main.async {
             self.keychainStatus = SharedKeychain.readExtStatus() ?? "无"
+            if markingFreshUpdate {
+                self.lastStatusUpdate = Date()
+            }
         }
     }
 
@@ -954,6 +1141,7 @@ final class StatusMonitor: ObservableObject {
             let monitor = Unmanaged<StatusMonitor>.fromOpaque(observer).takeUnretainedValue()
             DispatchQueue.main.async {
                 monitor.darwinNotificationCount += 1
+                monitor.updateKeychainStatus(markingFreshUpdate: true)
             }
         }, name, nil, .deliverImmediately)
 

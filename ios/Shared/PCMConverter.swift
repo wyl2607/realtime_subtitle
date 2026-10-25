@@ -25,11 +25,22 @@ final class PCMConverter {
         guard let input = extractPCMBuffer(from: sampleBuffer) else {
             return []
         }
-        let converted = convertToWire(input, format: input.format)
+        return append(pcmBuffer: input)
+    }
+
+    /// 转换 AVAudioEngine tap 给出的 PCM，并吐出攒满的 3200 字节帧（0 或多帧）。
+    /// 保留转换后的余量，是为了让任意长度的 tap 都不会丢掉不足 100ms 的尾音。
+    func append(pcmBuffer: AVAudioPCMBuffer) -> [Data] {
+        let converted = convertToWire(pcmBuffer, format: pcmBuffer.format)
         guard !converted.isEmpty else {
             return []
         }
         pending.append(converted)
+        return drainPendingFrames()
+    }
+
+    /// 两个公开入口共享同一份 pending，才能保证广播与麦克风的分帧口径完全一致。
+    private func drainPendingFrames() -> [Data] {
         var frames: [Data] = []
         while pending.count >= Self.frameBytes {
             frames.append(Data(pending.prefix(Self.frameBytes)))

@@ -153,10 +153,19 @@ final class ReadyDeadlineBox: @unchecked Sendable {
 /// v2 节点会话客户端。不自动重连、不做 TailnetPin（以后做）。
 /// 日志/打印绝不输出 token 与字幕正文——本类不做任何日志输出。
 final class NodeSession: NSObject, URLSessionWebSocketDelegate {
+    enum SendResult: Equatable {
+        case sent
+        case buffered
+        case dropped
+    }
+
+    /// gateway 最多积压约 20 秒，客户端只留 15 秒，既能覆盖冷启动又不挤爆广播扩展内存。
+    static let preReadyAudioSeconds = 15
+    private static let preReadyAudioMaxBytes = preReadyAudioSeconds * 16_000 * 2
     // 冷启动＝拉起 worker + 加载权重，Windows 节点实测 17–20s。基础等 ready 15s
-    // （与 rslite/Python 客户端同值），每收到一条 loading 续 15s，但从发出 hello
+    // （与 rslite/Python 客户端同值），每收到一条 loading 续 15s，但从开始建连
     // 起总共不超过 60s；超过仍按握手超时收场。
-    static let readyTimeoutSeconds = 15.0
+    static let readyTimeoutSeconds = Double(preReadyAudioSeconds)
     static let readyLoadingMaxSeconds = 60.0
 
     /// 纯函数：loading 到达时把截止时间推到 now+15s，但不超过 helloAt+60s。
@@ -187,13 +196,32 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
     private let onEvent: (NodeEvent) -> Void
     private let onClose: (Int) -> Void
     private let onLoading: ((Double) -> Void)?
+    private let readyTimeout: Double
 
     private let lock = NSLock()
     private var session: URLSession?
     private var socket: URLSessionWebSocketTask?
     private var closeNotified = false
+    private var readyReceived = false
+    private var preReadyFrames: [Data] = []
+    private var preReadyBytes = 0
+    private var preReadyOverflowDroppedFrames: UInt64 = 0
     private var readyBox: ReadyDeadlineBox?
     private var readyWatchdog: DispatchWorkItem?
+
+    /// 供状态行和自测读取；会话锁保证不会读到半个缓冲状态。
+    var bufferedFrameCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return preReadyFrames.count
+    }
+
+    /// 只统计缓冲到上限后淘汰的旧帧；连接尚未创建不算这里。
+    var overflowDroppedFrameCount: UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return preReadyOverflowDroppedFrames
+    }
 
     init(
         url: URL,
@@ -202,7 +230,8 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
         dst: String,
         onEvent: @escaping (NodeEvent) -> Void,
         onClose: @escaping (Int) -> Void,
-        onLoading: ((Double) -> Void)? = nil
+        onLoading: ((Double) -> Void)? = nil,
+        readyTimeout: Double = readyTimeoutSeconds
     ) {
         self.url = url
         self.token = token
@@ -211,49 +240,88 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
         self.onEvent = onEvent
         self.onClose = onClose
         self.onLoading = onLoading
+        self.readyTimeout = readyTimeout
     }
 
     func start() {
+        lock.lock()
+        guard !closeNotified else {
+            lock.unlock()
+            return
+        }
+        lock.unlock()
         guard let hello = NodeHello(src: src, dst: dst) else {
-            onClose(1008)
+            notifyClosed(1008)
             return
         }
         var request = URLRequest(url: url)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         let configuration = URLSessionConfiguration.ephemeral
         let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
-        self.session = session
         let socket = session.webSocketTask(with: request)
-        self.socket = socket
-        socket.resume()
-        // 截止时间从「发出 hello」起算，和 Python 的 hello_at 语义对齐。
+        // 截止时间从开始建连起算：握手卡住时 send 回调不会返回，必须先让看门狗接管。
         let helloAt = Self.monotonic()
         let box = ReadyDeadlineBox(
             helloAt: helloAt,
             current: Self.readyDeadline(
                 helloAt: helloAt,
                 now: helloAt,
-                current: helloAt + Self.readyTimeoutSeconds,
+                current: helloAt + readyTimeout,
                 receivedLoading: false
             )
         )
+        lock.lock()
+        guard !closeNotified else {
+            lock.unlock()
+            return
+        }
+        self.session = session
+        self.socket = socket
+        self.readyBox = box
+        // start 与 close 在同一把锁内交接：finish 若已先关闭，就不能在它之后再建活连接。
+        socket.resume()
+        lock.unlock()
+        armReadyWatchdog()
         socket.send(.string(hello.json())) { [weak self] error in
             if error != nil {
                 self?.notifyClosed(1006)
                 return
             }
-            self?.beginReadyWatch(box)
             self?.receiveLoop()
         }
     }
 
     /// 发一帧 16kHz 单声道 s16le 音频。调用方保证 ≤ 64KB 且字节数为偶数。
-    func send(pcm16k: Data) {
-        guard let socket else { return }
+    @discardableResult
+    func send(pcm16k: Data) -> SendResult {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !closeNotified else { return .dropped }
+        guard readyReceived else {
+            guard pcm16k.count <= Self.preReadyAudioMaxBytes else {
+                // 调用方本应逐帧传入；超大块不能打破 15 秒上限，只能丢它自己，不能先把已缓冲的淘汰光。
+                preReadyOverflowDroppedFrames &+= 1
+                return .dropped
+            }
+            while preReadyBytes + pcm16k.count > Self.preReadyAudioMaxBytes,
+                  !preReadyFrames.isEmpty {
+                let dropped = preReadyFrames.removeFirst()
+                preReadyBytes -= dropped.count
+                preReadyOverflowDroppedFrames &+= 1
+            }
+            preReadyFrames.append(pcm16k)
+            preReadyBytes += pcm16k.count
+            return .buffered
+        }
+        guard let socket else { return .dropped }
         socket.send(.data(pcm16k)) { _ in }
+        return .sent
     }
 
     func flush() {
+        lock.lock()
+        let socket = self.socket
+        lock.unlock()
         guard let socket else { return }
         socket.send(.string(#"{"type":"flush"}"#)) { _ in }
     }
@@ -261,6 +329,15 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
     /// 发 close 1000 并结束会话。
     func close() {
         cancelReadyWatch()
+        // 显式关闭不是故障：先占住「已通知」位，之后 URLSession 的取消回调
+        // （didCompleteWithError(cancelled)）就不会再把 onClose 报给上层，
+        // 否则上层会把它当成断线去重连。
+        lock.lock()
+        closeNotified = true
+        clearPreReadyBufferLocked()
+        let socket = self.socket
+        let session = self.session
+        lock.unlock()
         socket?.cancel(with: .normalClosure, reason: nil)
         session?.finishTasksAndInvalidate()
     }
@@ -271,15 +348,47 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
         switch event {
         case .ready:
             cancelReadyWatch()
+            lock.lock()
+            guard !closeNotified else {
+                lock.unlock()
+                return
+            }
+            readyReceived = true
+            let bufferedFrames = preReadyFrames
+            clearPreReadyBufferLocked()
+            if let socket {
+                // send 只入 URLSession 的发送队列、完成回调为空，持锁补发不会回调进来死锁；
+                // 同一把锁还保证并发新帧只能排在这些旧帧之后。
+                for frame in bufferedFrames {
+                    socket.send(.data(frame)) { _ in }
+                }
+            }
+            lock.unlock()
+            lock.lock()
+            let closed = closeNotified
+            lock.unlock()
+            // 与其它事件同样在回调前检查关闭闸，关闭后的 ready 不能再分发给上层。
+            guard !closed else { return }
+            onEvent(event)
+            return
         case .status(let code, _, _) where code == "loading":
             noteLoading(elapsed: NodeEvent.loadingElapsed(from: eventText) ?? 0)
         default:
             break
         }
+        lock.lock()
+        let closed = closeNotified
+        lock.unlock()
+        // 只查不持锁回调：onEvent 会一路进上层状态队列和自动档决策，持着这把锁回调有死锁风险；
+        // 查完到回调之间的窄窗口由上层「会话仍活着」的闸门兜住。
+        guard !closed else { return }
         onEvent(event)
     }
 
     private func receiveLoop() {
+        lock.lock()
+        let socket = self.socket
+        lock.unlock()
         guard let socket else { return }
         socket.receive { [weak self] result in
             switch result {
@@ -301,17 +410,14 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
     /// 收到 loading：续期 ready 截止时间，并把 elapsed_s 交给上层（本轮只回调，不接 UI）。
     private func noteLoading(elapsed: Double) {
         lock.lock()
+        guard !closeNotified else {
+            lock.unlock()
+            return
+        }
         let box = readyBox
         lock.unlock()
         box?.extend(now: Self.monotonic())
         onLoading?(elapsed)
-    }
-
-    private func beginReadyWatch(_ box: ReadyDeadlineBox) {
-        lock.lock()
-        readyBox = box
-        lock.unlock()
-        armReadyWatchdog()
     }
 
     /// 让看门狗睡到当前截止时间。被续期时旧 work item 会到点先醒，发现截止时间
@@ -372,8 +478,15 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
             return
         }
         closeNotified = true
+        clearPreReadyBufferLocked()
         lock.unlock()
         onClose(code)
+    }
+
+    /// 调用方必须持有会话锁，避免 close/ready/send 三者交错时留下音频数据。
+    private func clearPreReadyBufferLocked() {
+        preReadyFrames.removeAll(keepingCapacity: false)
+        preReadyBytes = 0
     }
 
     func urlSession(
