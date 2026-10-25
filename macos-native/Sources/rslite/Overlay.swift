@@ -259,6 +259,8 @@ final class OverlayController: NSObject {
     private var isApplyingProgrammaticFrame = false
     /// 用户开始拖边时的尺寸。松手时只把真正拉过的边写进 style，避免拉宽把高度误存成用户高度。
     private var liveResizeStart: NSSize?
+    /// 上一次成功落盘的样式。程序化缩放会反复触发保存，值没变就不写盘。
+    private var lastSavedStyle: OverlayStyle
     private let onPauseChanged: (Bool) -> Void
     private let onQuit: () -> Void
     private let onRetry: (Int) -> Bool
@@ -273,6 +275,7 @@ final class OverlayController: NSObject {
         self.onRetry = onRetry
         let loaded = OverlayStyleStore.load()
         self.style = loaded
+        self.lastSavedStyle = loaded
 
         let frame = Self.initialFrame(for: loaded)
         panel = OverlayPanel(
@@ -1301,7 +1304,7 @@ final class OverlayController: NSObject {
         originSaveTask?.cancel()
         style.originX = Double(panel.frame.origin.x)
         style.originY = Double(panel.frame.origin.y)
-        try? OverlayStyleStore.save(style)
+        saveStyleNow()
     }
 
     private func scheduleStyleSave() {
@@ -1313,8 +1316,19 @@ final class OverlayController: NSObject {
                 return
             }
             guard let self else { return }
-            try? OverlayStyleStore.save(self.style)
+            self.saveStyleIfChanged()
         }
+    }
+
+    private func saveStyleNow() {
+        guard (try? OverlayStyleStore.save(style)) != nil else { return }
+        lastSavedStyle = style
+    }
+
+    /// 磁盘上已经是最新值就不写。动画每帧的中间高度会走到这里，不能每次都落盘。
+    private func saveStyleIfChanged() {
+        guard style != lastSavedStyle else { return }
+        saveStyleNow()
     }
 
     private func rememberOrigin() {
@@ -1492,7 +1506,7 @@ final class OverlayController: NSObject {
         originSaveTask?.cancel()
         originSaveTask = nil
         if pending {
-            try? OverlayStyleStore.save(style)
+            saveStyleNow()
         }
         onQuit()
     }
@@ -1510,6 +1524,9 @@ extension OverlayController: NSWindowDelegate {
 
     func windowWillStartLiveResize(_ notification: Notification) {
         guard (notification.object as? NSWindow) === panel else { return }
+        // 程序化缩放（fitHeight 的 animator）也会走这个回调，它不是用户手势；
+        // 记下来就会被当成用户拖出的高度写进 style。
+        guard !isApplyingProgrammaticFrame else { return }
         liveResizeStart = panel.frame.size
     }
 
