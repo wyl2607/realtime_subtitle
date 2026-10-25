@@ -31,6 +31,10 @@ final class LocalEngine {
     private var inputContinuation: AsyncStream<AnalyzerInput>.Continuation?
     private var analysisTask: Task<Void, Never>?
     private var resultTask: Task<Void, Never>?
+    /// 识别不能等翻译模型准备好；结果到达时再等这个任务，首句既不丢译文也不挡原文。
+    private var translationReady: Task<TranslationSession?, Never>?
+    /// 最近一句的翻译任务；下一句接在它后面，只在结果循环里读写。
+    private var translationTail: Task<Void, Never>?
     private var nextID = 1
     private var isRunning = false
     /// stop() 之后一律不再回调。
@@ -179,16 +183,32 @@ final class LocalEngine {
         isRunning = true
 
         if txStatus == .installed {
-            do {
-                let session = TranslationSession(installedSource: sourceLocale, target: targetLocale)
-                try await session.prepareTranslation()
-                guard !stopped else { return }
-                self.translationSession = session
-            } catch {
-                logger.error("TranslationSession prepare failed: \(error.localizedDescription)")
-                emitStatus("tx_prepare_failed")
+            // 翻译模型首次准备可能很久，独立执行才能让识别任务立即消费已到的音频。
+            // 放在识别器预热和结果任务之前创建：两边的准备并行，最早的结果也一定看得到这个任务。
+            translationReady = Task { [weak self] in
+                guard let self, !self.stopped else { return nil }
+                let session = TranslationSession(installedSource: self.sourceLocale, target: self.targetLocale)
+                do {
+                    try await session.prepareTranslation()
+                    guard !self.stopped else { return nil }
+                    self.translationSession = session
+                    return session
+                } catch {
+                    guard !self.stopped else { return nil }
+                    self.logger.error("TranslationSession prepare failed: \(error.localizedDescription)")
+                    self.emitStatus("tx_prepare_failed")
+                    return nil
+                }
             }
         }
+
+        do {
+            try await analyzer.prepareToAnalyze(in: analyzerFormat)
+        } catch {
+            // 预热失败时后续分析仍会自行加载模型，不能为此放弃已经可用的识别链路。
+            logger.error("SpeechAnalyzer prepare failed: \(error.localizedDescription)")
+        }
+        guard !stopped else { return }
 
         resultTask = Task { [weak self] in
             guard let self else { return }
@@ -304,6 +324,10 @@ final class LocalEngine {
         // 必须在 isRunning 那道 guard 之前置真：启动中途被停时 isRunning 还是 false，
         // 这时候更要挡住启动期回调。
         stopped = true
+        translationReady?.cancel()
+        translationReady = nil
+        translationTail?.cancel()
+        translationTail = nil
         guard isRunning else { return }
         isRunning = false
         inputContinuation?.finish()
@@ -331,7 +355,18 @@ final class LocalEngine {
         guard !stopped else { return }
         emitFinal(id, text, Self.rangeSeconds(result.range))
 
-        if let session = translationSession {
+        // 翻译挂到串行尾链上，不在结果循环里等：否则翻译还在准备（或上一句还在翻）时，
+        // 下一句的原文也得排队等着才能上屏。串行是为了译文和收尾仍按句子顺序到达。
+        let previous = translationTail
+        translationTail = Task { [weak self] in
+            await previous?.value
+            await self?.translateAndSettle(id: id, text: text)
+        }
+    }
+
+    private func translateAndSettle(id: Int, text: String) async {
+        guard !stopped else { return }
+        if let session = await translationReady?.value {
             do {
                 let response = try await session.translate(text)
                 guard !stopped else { return }
@@ -365,6 +400,9 @@ final class LocalEngine {
     private func waitForResults() async {
         await resultTask?.value
         resultTask = nil
+        // 最后一句的译文也要等它落地，finish 才能放掉会话。
+        await translationTail?.value
+        translationTail = nil
     }
 
     private func finish() async {
