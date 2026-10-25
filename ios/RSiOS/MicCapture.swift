@@ -153,7 +153,7 @@ final class MicCapture: ObservableObject {
         audioEngine.reset()
 
         if restartingSubtitleEngine {
-            ingestQueue.sync { subtitleEngine.finish() }
+            ingestQueue.sync { self.subtitleEngine.finish() }
         }
 
         let format = inputNode.outputFormat(forBus: 0)
@@ -181,7 +181,7 @@ final class MicCapture: ObservableObject {
         audioEngine.stop()
         audioEngine.reset()
         // sync 会排在已投递的 buffer 之后：不丢 tap 退出前已经复制的音频，也不会让 finish 与 ingest 并发。
-        ingestQueue.sync { subtitleEngine.finish() }
+        ingestQueue.sync { self.subtitleEngine.finish() }
     }
 
     private func applyAudioSession(_ plan: MicAudioSessionPlan) throws {
