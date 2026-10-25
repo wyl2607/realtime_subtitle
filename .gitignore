@@ -27,6 +27,8 @@ Thumbs.db
 # 运行时状态文件（脚本/热键管理）
 subtitle.pid
 realtime_subtitle.lock
+# uv run/uv lock 顺手生成的空锁：pyproject.toml 故意没有 [project]，依赖唯一真相源是 requirements.txt（CLAUDE.md 第 4 节第 46 条）
+uv.lock
 .paused
 .stop
 transcripts/

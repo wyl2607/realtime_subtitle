@@ -50,6 +50,7 @@ except ImportError:  # pragma: no cover - depends on platform/websockets build
     unix_serve = None
 
 from realtime_subtitle.node import info as node_info
+from realtime_subtitle.node.ollama_watchdog import OllamaWatchdog, create_macos_launchctl_spawn, default_spawn
 
 log = logging.getLogger("realtime_subtitle.node.gateway")
 _ws_log = logging.getLogger("realtime_subtitle.node.gateway.ws")
@@ -81,7 +82,17 @@ CTL_QUEUE_MAX = 64
 _GAP_CHUNK_BYTES = 64 * 1024
 AUDIO_DROPPED_TEXT = "音频积压，部分音频已丢弃"
 MIN_TOKEN_CHARS = 32
+# 同时进行的会话数。缺省 2，配置文件可改，夹到 1–4。满了才 1013。
+MAX_SESSIONS_DEFAULT = 2
+MAX_SESSIONS_MIN = 1
+MAX_SESSIONS_MAX = 4
+NODE_CONFIG_FILENAME = "node_config.json"
+# Windows 没有 SIGHUP，靠轮询 token 目录的 mtime。Mac 只在 SIGHUP 时重载。
+TOKEN_POLL_S = 10.0
+# 会话结束时通知 worker 收口。管道被 stall 住时不能无限等，否则名额放不回来。
+END_SEND_TIMEOUT_S = 0.5
 TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
+_DEVICE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 # --- worker 生命周期（架构选择 1）---
 WORKER_KEEPALIVE_S = 120.0
@@ -107,6 +118,10 @@ _STATUS_TEXT = {
     "internal_error": "识别进程内部错误",
 }
 _CLIENT_EVENTS = frozenset({"ready", "final", "translation", "status", "drained"})
+# 冷加载可能超过客户端 15s 的握手耐心（Windows 节点实测 17.4s）。冷拉起 worker 后
+# 每 5s 发一条 loading，客户端每收到一条就把 ready 截止时间续 15s，总上限 60s。
+LOADING_STATUS_INTERVAL_S = 5.0
+LOADING_STATUS_TEXT = "正在加载模型"
 
 
 class GatewayStartError(RuntimeError):
@@ -191,18 +206,155 @@ def check_token(token: str) -> str:
     return token
 
 
+def _check_token_stat(st: os.stat_result | Any, platform: str | None = None) -> None:
+    """Mac/Linux：0600 且属主是当前用户。Windows 的权限位没有意义，直接返回。
+
+    `platform` 只给测试注入。错误文本里不放路径、不放 token。
+    """
+    plat = sys.platform if platform is None else platform
+    if plat == "win32":
+        return
+    mode = stat.S_IMODE(st.st_mode)
+    if mode & 0o077:
+        raise ValueError(f"token 文件权限过宽（{mode:04o}），需要 0600")
+    uid = getattr(st, "st_uid", None)
+    getuid = getattr(os, "getuid", None)
+    if getuid is not None and uid is not None and int(uid) != int(getuid()):
+        raise ValueError("token 文件属主不是当前用户")
+
+
 def load_token(path: str | Path) -> str:
-    """读 token 文件；权限含 group/other 位就拒绝（S5 要求 0600）。
+    """读 token 文件；权限含 group/other 位就拒绝（S5 要求 0600），属主必须是自己。
 
     Windows 的 st_mode 不反映 ACL（普通文件恒为 0666），由安装脚本用 icacls
-    收紧为仅当前用户可读写，这里不查权限位。
+    收紧为仅当前用户可读写，这里不查权限位、也不查属主。
     """
     with open(path, encoding="utf-8") as f:
         # 用 fstat 而不是先 stat 再 open：检查与读取是同一个文件
-        mode = os.fstat(f.fileno()).st_mode
-        if sys.platform != "win32" and mode & 0o077:
-            raise ValueError(f"token 文件权限过宽（{stat.S_IMODE(mode):04o}），需要 0600")
+        _check_token_stat(os.fstat(f.fileno()))
         return check_token(f.read())
+
+
+class TokenEntry:
+    __slots__ = ("device", "token")
+
+    def __init__(self, device: str, token: str) -> None:
+        self.device = device
+        self.token = token
+
+
+class TokenBook:
+    """一把内存 token，或「旧单文件 default + tokens/*.token」。
+
+    `match` 对每一把都做常量时间比较，全部比完才返回，避免按命中提前返回泄露时序。
+    """
+
+    def __init__(self) -> None:
+        self.entries: list[TokenEntry] = []
+        self._legacy: Path | None = None
+        self._dir_mtime_ns: int | None = None
+
+    @classmethod
+    def from_memory(cls, token: str) -> TokenBook:
+        book = cls()
+        book.entries = [TokenEntry("default", token)]
+        return book
+
+    def load(self, token_file: str | Path, *, strict_legacy: bool) -> None:
+        """用文件内容替换整本账。配了路径就不再保留启动时的内存 token。"""
+        legacy = Path(token_file)
+        directory = legacy.parent / "tokens"
+        entries: list[TokenEntry] = []
+        seen: set[str] = set()
+        if legacy.is_file():
+            try:
+                tok = load_token(legacy)
+            except (OSError, ValueError) as e:
+                if strict_legacy:
+                    raise
+                log.warning("token_load_failed device=default err=%s", type(e).__name__)
+            else:
+                entries.append(TokenEntry("default", tok))
+                seen.add("default")
+        if directory.is_dir():
+            for path in sorted(directory.glob("*.token")):
+                name = path.stem
+                if not _DEVICE_RE.fullmatch(name):
+                    log.warning("token_name_rejected")
+                    continue
+                if name in seen:
+                    continue
+                try:
+                    tok = load_token(path)
+                except (OSError, ValueError) as e:
+                    log.warning("token_load_failed device=%s err=%s", name, type(e).__name__)
+                    continue
+                entries.append(TokenEntry(name, tok))
+                seen.add(name)
+        self.entries = entries
+        self._legacy = legacy
+        self._dir_mtime_ns = _dir_mtime_ns(directory)
+        names = ",".join(e.device for e in entries if _DEVICE_RE.fullmatch(e.device))
+        log.info("tokens_reloaded count=%d devices=%s", len(entries), names or "-")
+
+    def match(self, authorization_value: str) -> str | None:
+        entries = list(self.entries)
+        found: str | None = None
+        try:
+            got = authorization_value.encode("utf-8")
+        except UnicodeError:
+            got = b""
+        for ent in entries:
+            expected = f"Bearer {ent.token}".encode("utf-8")
+            if len(got) != len(expected):
+                hmac.compare_digest(expected, expected)
+                ok = False
+            else:
+                ok = hmac.compare_digest(got, expected)
+            if ok and found is None:
+                found = ent.device
+        return found
+
+    def reload_if_dir_changed(self) -> bool:
+        if self._legacy is None:
+            return False
+        directory = self._legacy.parent / "tokens"
+        mtime = _dir_mtime_ns(directory)
+        if mtime == self._dir_mtime_ns:
+            return False
+        self.load(self._legacy, strict_legacy=False)
+        return True
+
+
+def _dir_mtime_ns(directory: Path) -> int | None:
+    try:
+        if directory.is_dir():
+            return directory.stat().st_mtime_ns
+    except OSError:
+        return None
+    return None
+
+
+def normalize_max_sessions(value: Any) -> int:
+    """缺省 2。整数超出 1–4 就夹住并记日志。布尔/字符串/浮点都当没配（布尔是 int 的子类，单独排除）。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return MAX_SESSIONS_DEFAULT
+    if MAX_SESSIONS_MIN <= value <= MAX_SESSIONS_MAX:
+        return value
+    clamped = min(max(value, MAX_SESSIONS_MIN), MAX_SESSIONS_MAX)
+    log.warning("max_sessions_clamped value=%s clamped=%s", value, clamped)
+    return clamped
+
+
+def read_max_sessions(state_dir: str | Path) -> int:
+    path = Path(state_dir) / NODE_CONFIG_FILENAME
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return MAX_SESSIONS_DEFAULT
+    if not isinstance(raw, dict) or "max_sessions" not in raw:
+        return MAX_SESSIONS_DEFAULT
+    return normalize_max_sessions(raw.get("max_sessions"))
 
 
 # --------------------------------------------------------------------------
@@ -361,15 +513,24 @@ class WorkerManager:
         self._argv = list(argv)
         self._proc: asyncio.subprocess.Process | None = None
         self._reader: asyncio.Task | None = None
-        self._sink: Any = None
+        self._sinks: dict[int, Any] = {}
         self._lock = asyncio.Lock()
+        # 写 stdin 的整帧必须原子，两个会话的 feeder 不能把字节交织在一起。
+        # 只在 send 里拿，不和 _lock 交叉。
+        self._io_lock = asyncio.Lock()
         # 每次 attach/detach 递增。保温到期的回收任务只认自己那一代，
         # 这样新会话来了不必去 cancel 一个可能正在 SIGTERM 中途的任务。
         self._idle_gen = 0
         self._idle_task: asyncio.Task | None = None
         self._reaping: asyncio.subprocess.Process | None = None
-        # 保温 worker 跨会话：按 hello/ready 一一对应的序号过滤事件（见 _deliver）。
-        # 三个计数都随 worker 进程重置。
+        # sid 只增不减：worker 崩了重启也不把旧 ready 发给新会话。
+        self._next_sid = 0
+        self._ready: set[int] = set()
+        # 进程活着 ≠ 模型加载完：上一个会话冷加载中途断开时进程还在。只有见过 ready 才算加载完，
+        # 复用一个还在加载的 worker 时新会话也得发 loading（P1 问题 2）。
+        self._loaded = False
+        # 没有 sid 的旧事件（单测假 worker 历史上不带 sid）仍按 hello/ready 序号过滤。
+        # 三个计数都随 worker 进程重置。生产路径的事件都带 sid，不走这里。
         self._hellos_written = 0
         self._readies_seen = 0
         self._sink_hello_no: int | None = None
@@ -379,25 +540,40 @@ class WorkerManager:
         return "warm" if self._proc is not None and self._proc.returncode is None else "cold"
 
     @property
+    def loaded(self) -> bool:
+        """当前 worker 是否已经发过 ready（模型加载完）。"""
+        return self.state == "warm" and self._loaded
+
+    @property
     def pid(self) -> int | None:
         return self._proc.pid if self._proc is not None and self._proc.returncode is None else None
 
-    async def attach(self, sink: Any) -> bool:
-        """绑定当前会话；必要时 spawn。返回 True 表示复用了保温中的 worker。"""
+    async def attach(self, sink: Any) -> tuple[bool, int]:
+        """绑定一个会话；必要时 spawn。返回 (是否复用了保温中的 worker, sid)。"""
         async with self._lock:
             self._idle_gen += 1
             reused = self.state == "warm"
             if not reused:
                 await self._spawn()
-            self._sink = sink
-            self._sink_hello_no = None  # 本会话的 hello 还没写出，之前的事件都不属于它
-            return reused
+            self._next_sid += 1
+            sid = self._next_sid
+            self._sinks[sid] = sink
+            self._sink_hello_no = None  # 本会话的 hello 还没写出，无 sid 的旧事件先不归它
+            return reused, sid
 
-    def detach(self) -> None:
-        """会话结束：worker 继续保温，到期再回收。"""
-        self._sink = None
+    def detach(self, sid: int | None = None) -> None:
+        """一个会话结束。还有别的会话就继续干；最后一个结束才开始保温计时。"""
+        if sid is None:
+            self._sinks.clear()
+            self._ready.clear()
+        else:
+            self._sinks.pop(sid, None)
+            self._ready.discard(sid)
         self._sink_hello_no = None
         self._idle_gen += 1
+        if self._sinks:
+            self._idle_task = None
+            return
         self._idle_task = asyncio.create_task(self._reap_later(self._idle_gen))
 
     async def shutdown(self) -> None:
@@ -409,21 +585,29 @@ class WorkerManager:
         async with self._lock:
             await self._terminate_locked("shutdown")
 
-    async def send(self, kind: str, payload: Any) -> None:
-        proc = self._proc
-        if proc is None or proc.stdin is None or proc.returncode is not None:
-            raise BrokenPipeError("worker_not_running")
-        if kind == "pcm":
-            data = len(payload).to_bytes(4, "big") + payload
-        else:
-            if payload.get("type") == "hello":
-                # 与 write 之间没有 await：记账与「已写出」同步，取消也不会错位
-                self._hellos_written += 1
-                self._sink_hello_no = self._hellos_written
-            data = (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
-        # 一次 write 把整帧塞进缓冲：drain 中途被取消也不会留下半帧
-        proc.stdin.write(data)
-        await proc.stdin.drain()
+    async def send(self, kind: str, payload: Any, sid: int | None = None) -> None:
+        async with self._io_lock:
+            proc = self._proc
+            if proc is None or proc.stdin is None or proc.returncode is not None:
+                raise BrokenPipeError("worker_not_running")
+            if kind == "pcm":
+                if sid is None:
+                    data = len(payload).to_bytes(4, "big") + payload
+                else:
+                    # 0x01 | sid | length | pcm。长度只含 PCM，假 worker 的字节账才对得上。
+                    data = b"\x01" + int(sid).to_bytes(4, "big") + len(payload).to_bytes(4, "big") + payload
+            else:
+                body = dict(payload)
+                if sid is not None:
+                    body["sid"] = sid
+                if body.get("type") == "hello":
+                    # 与 write 之间没有 await：记账与「已写出」同步，取消也不会错位
+                    self._hellos_written += 1
+                    self._sink_hello_no = self._hellos_written
+                data = (json.dumps(body, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+            # 一次 write 把整帧塞进缓冲：drain 中途被取消也不会留下半帧
+            proc.stdin.write(data)
+            await proc.stdin.drain()
 
     # ---- 内部 ----
 
@@ -440,6 +624,8 @@ class WorkerManager:
         self._hellos_written = 0
         self._readies_seen = 0
         self._sink_hello_no = None
+        self._ready.clear()
+        self._loaded = False
         self._reader = asyncio.create_task(self._read_events(proc))
         log.info("worker_spawned spawn_s=%.3f", time.monotonic() - t0)
 
@@ -469,8 +655,7 @@ class WorkerManager:
             log.error("worker_exit code=%d", rc)
         else:
             log.warning("worker_exit code=0 unexpected=1")
-        sink = self._sink
-        if sink is not None:
+        for sink in list(self._sinks.values()):
             sink.on_worker_exit(rc)
 
     def _deliver(self, proc: asyncio.subprocess.Process, line: bytes) -> None:
@@ -485,22 +670,39 @@ class WorkerManager:
         if not isinstance(ev, dict) or ev.get("ev") not in _CLIENT_EVENTS:
             log.warning("worker_unknown_event bytes=%d", len(line))
             return
-        # worker 对每条 hello 恰好回一个 ready，且按序处理。已写出但尚未收到 ready 的
-        # hello 对应的 ready 及其间事件属于更早的会话（它在冷加载中断开了），丢弃；
-        # 只有本会话那次 hello 的 ready 到达之后的事件才交给本会话。
+        if ev.get("ev") == "ready":
+            # 不论归属哪个会话（哪怕那个会话已经断开），模型都已经在内存里了
+            self._loaded = True
+        sid = ev.get("sid")
+        if isinstance(sid, int) and not isinstance(sid, bool):
+            # 带 sid 的事件只给这个 sid。ready 之前的（冷加载中断开后迟到的 final）丢掉。
+            # 客户端协议没有 sid，这里剥掉。
+            if ev.get("ev") == "ready":
+                self._ready.add(sid)
+            if sid not in self._ready:
+                return
+            sink = self._sinks.get(sid)
+            if sink is None:
+                return
+            out = dict(ev)
+            out.pop("sid", None)
+            sink.on_worker_event(out)
+            return
+        # 没有 sid：旧的单会话序号过滤。多会话时这种事件无法归属，丢掉以免串台。
         if ev.get("ev") == "ready":
             self._readies_seen += 1
         no = self._sink_hello_no
         if no is None or self._readies_seen < no:
             return
-        sink = self._sink
-        if sink is not None:
-            sink.on_worker_event(ev)
+        if len(self._sinks) != 1:
+            return
+        sink = next(iter(self._sinks.values()))
+        sink.on_worker_event(ev)
 
     async def _reap_later(self, gen: int) -> None:
         await asyncio.sleep(WORKER_KEEPALIVE_S)
         async with self._lock:
-            if gen != self._idle_gen or self._sink is not None:
+            if gen != self._idle_gen or self._sinks:
                 return
             await self._terminate_locked("idle")
 
@@ -552,6 +754,9 @@ class _Session:
         self._drop_logged_at = float("-inf")
         self._drop_notified_at = float("-inf")
         self._dropped_before_ready = False
+        self.sid: int | None = None
+        self._worker_reused = False
+        self._loading_task: asyncio.Task[None] | None = None
 
     # ---- worker 回调（都在事件循环线程里，不需要 threadsafe）----
 
@@ -579,12 +784,23 @@ class _Session:
 
     # ---- 主流程 ----
 
+    def _device_for_log(self) -> str:
+        device = getattr(self.ws, "rs_device", None)
+        if isinstance(device, str) and _DEVICE_RE.fullmatch(device):
+            return device
+        if self.transport == "uds":
+            return "local"
+        return "-"
+
     async def run(self) -> None:
         t0 = time.monotonic()
-        log.info("session_start transport=%s", self.transport)
+        log.info("session_start transport=%s device=%s", self.transport, self._device_for_log())
         try:
             try:
-                reused = await self.gw.worker.attach(self)
+                reused, sid = await self.gw.worker.attach(self)
+                self.sid = sid
+                # 只有复用到「已加载完」的 worker 才没有冷加载可等
+                self._worker_reused = reused and self.gw.worker.loaded
             except OSError as e:
                 log.error("worker_spawn_failed err=%s", type(e).__name__)
                 await self._fail("worker_crashed")
@@ -593,7 +809,17 @@ class _Session:
             try:
                 await self._serve()
             finally:
-                self.gw.worker.detach()
+                # end 让 worker 只收口这个 sid。管道满（stall）时不能卡死名额。
+                if self.sid is not None:
+                    try:
+                        await asyncio.wait_for(
+                            self.gw.worker.send("ctl", {"type": "end"}, self.sid),
+                            END_SEND_TIMEOUT_S,
+                        )
+                    except (asyncio.TimeoutError, BrokenPipeError, ConnectionResetError, OSError):
+                        pass
+                    finally:
+                        self.gw.worker.detach(self.sid)
         finally:
             log.info(
                 "session_end transport=%s dur_s=%.1f audio_bytes=%d events_out=%d dropped_frames=%d dropped_bytes=%d",
@@ -614,6 +840,9 @@ class _Session:
         limit = asyncio.create_task(asyncio.sleep(SESSION_MAX_S))
         crashed = asyncio.ensure_future(self.exit_fut)
         tasks = [pump_in, pump_out, feeder, limit, crashed]
+        # 保温复用且已加载完的 worker 没有冷加载可等；冷拉起、或复用的 worker 还在加载，都发 loading。
+        if not self._worker_reused:
+            self._loading_task = asyncio.create_task(self._loading_heartbeat())
         crash_rc: int | None = None
         try:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -632,11 +861,33 @@ class _Session:
         finally:
             for t in tasks:
                 t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            if self._loading_task is not None:
+                self._loading_task.cancel()
+            await asyncio.gather(
+                *tasks,
+                *([self._loading_task] if self._loading_task is not None else []),
+                return_exceptions=True,
+            )
         if crash_rc is not None:
             code = _EXIT_STATUS.get(crash_rc, "worker_crashed")
             log.error("session_worker_exit rc=%d status=%s", crash_rc, code)
             await self._fail(code, flush_pending=True)
+
+    async def _loading_heartbeat(self) -> None:
+        """冷加载期间向客户端报进度，直到 worker 发出 ready 或会话结束。
+
+        客户端只在收到 loading 时续期（不是无条件等），所以 worker 真的卡死时
+        仍会在 60s 上限内判 handshake_timeout，不会无限挂着。
+        """
+        started = self.gw._clock()
+        while not self.ready:
+            self.out_q.put_nowait({
+                "ev": "status",
+                "code": "loading",
+                "text": LOADING_STATUS_TEXT,
+                "elapsed_s": round(self.gw._clock() - started, 3),
+            })
+            await asyncio.sleep(self.gw._loading_interval_s)
 
     async def _fail(self, code: str, *, flush_pending: bool = False) -> None:
         """告诉客户端出了什么事再关；先把 worker 崩溃前已经产出的事件发完。"""
@@ -670,10 +921,10 @@ class _Session:
                     left = payload
                     while left > 0:
                         n = min(left, _GAP_CHUNK_BYTES)
-                        await self.gw.worker.send("pcm", bytes(n))
+                        await self.gw.worker.send("pcm", bytes(n), self.sid)
                         left -= n
                 else:
-                    await self.gw.worker.send(kind, payload)
+                    await self.gw.worker.send(kind, payload, self.sid)
         except (BrokenPipeError, ConnectionResetError, OSError):
             return False
 
@@ -758,10 +1009,22 @@ class Gateway:
         info: node_info.NodeInfo | None = None,
         sleep: Callable[[float], Any] = asyncio.sleep,
         allow_non_tailscale_for_tests: bool = False,
+        token_file: str | Path | None = None,
+        max_sessions: int | None = None,
+        loading_interval_s: float = LOADING_STATUS_INTERVAL_S,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if not token:
-            raise ValueError("token 不能为空")
-        self._token = token
+        self._token_file = Path(token_file) if token_file else None
+        if self._token_file is not None:
+            # 配了文件就以文件为准，调用方传入的内存 token 不留（重载才能真正吊销）。
+            self._tokens = TokenBook()
+            self._tokens.load(self._token_file, strict_legacy=True)
+            if not self._tokens.entries:
+                raise ValueError("token 不能为空")
+        else:
+            if not token:
+                raise ValueError("token 不能为空")
+            self._tokens = TokenBook.from_memory(token)
         self._uds_dir = Path(uds_dir) if uds_dir is not None else node_info.STATE_DIR
         self._port = port
         self._resolve_host = resolve_host or resolve_tailscale_ipv4
@@ -769,11 +1032,19 @@ class Gateway:
         self._uid = _current_uid() if uid is None else uid
         self._info = info or node_info.NodeInfo(state_dir=self._uds_dir)
         self._sleep = sleep
+        # loading 心跳的间隔与时钟可注入，测试才能把 5s / 17s 这类真时长压到毫秒级。
+        self._loading_interval_s = loading_interval_s
+        self._clock = clock
         # ☠️ 仅测试用：允许监听 127.0.0.1 等非 Tailscale 地址。生产入口（run_gateway）不传。
         self._allow_non_tailscale = allow_non_tailscale_for_tests
         self._uds_enabled = _uds_supported()
         self.worker = WorkerManager(worker_argv if worker_argv is not None else WORKER_ARGV)
-        self._session_active = False
+        self._session_count = 0
+        self._capacity = (
+            normalize_max_sessions(max_sessions) if max_sessions is not None else read_max_sessions(self._uds_dir)
+        )
+        self._token_poll: asyncio.Task | None = None
+        self._watchdog_task: asyncio.Task | None = None
         self._uds_server = None
         self._tcp_server = None
         self._tcp_task: asyncio.Task | None = None
@@ -781,9 +1052,31 @@ class Gateway:
         self.tcp_host: str | None = None
         self.tcp_port: int | None = None
 
+        # Ollama watchdog: uses translator from asr_state.json (same source as info)
+        translator = self._info.asr_and_translator()[1]
+        self._watchdog = OllamaWatchdog(
+            translator,
+            probe=lambda: node_info.probe_translator_ok(translator),
+            # macOS 上 brew services 托管的 ollama 要用 launchctl kickstart，直接 serve 会和它抢端口
+            spawn=create_macos_launchctl_spawn() if sys.platform == "darwin" else default_spawn,
+        )
+
     @property
     def uds_path(self) -> Path:
         return self._uds_dir / UDS_FILENAME
+
+    @property
+    def _session_active(self) -> bool:
+        """还有会话占着名额（含还在等 hello 的）。只读：名额用 `_session_count`。"""
+        return self._session_count > 0
+
+    def reload_tokens(self) -> None:
+        if self._token_file is None:
+            return
+        try:
+            self._tokens.load(self._token_file, strict_legacy=False)
+        except Exception as e:  # noqa: BLE001 - 重载失败不能把网关打崩；鉴权维持上一本账
+            log.warning("tokens_reload_failed err=%s", type(e).__name__)
 
     # ---- 启停 ----
 
@@ -806,8 +1099,40 @@ class Gateway:
             # 目录 0700 已经挡住了别人，socket 自身再收紧到 0600 是第二层
             os.chmod(self.uds_path, 0o600)
         self._tcp_task = asyncio.create_task(self._tcp_loop())
+        if sys.platform == "win32" and self._token_file is not None:
+            self._token_poll = asyncio.create_task(self._token_poll_loop())
+
+        # Ollama watchdog: tick every 60s in thread pool (probe does HTTP, spawn does Popen)
+        self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+
+    async def _token_poll_loop(self) -> None:
+        while True:
+            await asyncio.sleep(TOKEN_POLL_S)
+            try:
+                self._tokens.reload_if_dir_changed()
+            except Exception as e:  # noqa: BLE001
+                log.warning("tokens_reload_failed err=%s", type(e).__name__)
+
+    async def _watchdog_loop(self) -> None:
+        while True:
+            await asyncio.sleep(60.0)
+            try:
+                # probe/spawn do blocking I/O; run in thread pool to avoid blocking event loop
+                await asyncio.get_running_loop().run_in_executor(None, self._watchdog.tick)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 - tick 不能把 gateway 打崩
+                log.warning("watchdog_tick_failed err=%s", type(e).__name__)
 
     async def stop(self) -> None:
+        if self._watchdog_task is not None:
+            self._watchdog_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._watchdog_task
+        if self._token_poll is not None:
+            self._token_poll.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._token_poll
         if self._tcp_task is not None:
             self._tcp_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -876,22 +1201,22 @@ class Gateway:
 
     # ---- HTTP 层：鉴权 / 路由 ----
 
-    def _authorized(self, headers: Any) -> bool:
-        # 重复的 Authorization 头一律不认（get() 遇到多个会抛 MultipleValuesError → 500）
+    def _authorized(self, headers: Any) -> str | None:
+        # 重复的 Authorization 头一律不认（结构不对，不必把每把 token 都比一遍）
         values = headers.get_all("Authorization")
         if len(values) != 1:
-            return False
+            return None
         got = values[0] or ""
-        expected = f"Bearer {self._token}"
-        # 常量时间比较；先转 bytes，str 里有非 ASCII 时 compare_digest 会抛 TypeError
-        return hmac.compare_digest(got.encode("utf-8"), expected.encode("utf-8"))
+        return self._tokens.match(got)
 
     async def _process_request_tcp(self, connection: Any, request: Any):
-        if not self._authorized(request.headers):
+        device = self._authorized(request.headers)
+        if device is None:
             log.warning("auth_failed transport=tcp")
             resp = connection.respond(HTTPStatus.UNAUTHORIZED, "unauthorized\n")
             resp.headers["WWW-Authenticate"] = "Bearer"
             return resp
+        connection.rs_device = device
         return await self._route(connection, request)
 
     async def _process_request_uds(self, connection: Any, request: Any):
@@ -905,6 +1230,7 @@ class Gateway:
         if not ok:
             log.warning("peer_uid_rejected transport=uds")
             return connection.respond(HTTPStatus.FORBIDDEN, "forbidden\n")
+        connection.rs_device = "local"
         return await self._route(connection, request)
 
     async def _route(self, connection: Any, request: Any):
@@ -913,8 +1239,15 @@ class Gateway:
             return None  # 交给 websockets 完成升级
         if path == INFO_PATH:
             loop = asyncio.get_running_loop()
+            sessions = self._session_count
+            capacity = self._capacity
+            busy = sessions >= capacity
+            worker_state = self.worker.state
             body = await loop.run_in_executor(
-                None, lambda: self._info.collect(busy=self._session_active, worker=self.worker.state)
+                None,
+                lambda: self._info.collect(
+                    busy=busy, worker=worker_state, sessions=sessions, capacity=capacity,
+                ),
             )
             resp = connection.respond(HTTPStatus.OK, json.dumps(body, separators=(",", ":")) + "\n")
             resp.headers["Content-Type"] = "application/json"
@@ -930,18 +1263,18 @@ class Gateway:
         await self._handle(ws, "uds")
 
     async def _handle(self, ws: Any, transport: str) -> None:
-        # 判断与置位之间没有 await，单线程事件循环下是原子的
-        if self._session_active:
+        # 判断与占名额之间没有 await，单线程事件循环下是原子的。满了才拒，而且在读 hello 之前。
+        if self._session_count >= self._capacity:
             log.info("session_busy transport=%s", transport)
             await ws.close(1013, "busy")
             return
-        self._session_active = True
+        self._session_count += 1
         try:
             hello = await self._read_hello(ws)
             if hello is not None:
                 await _Session(self, ws, hello, transport).run()
         finally:
-            self._session_active = False
+            self._session_count -= 1
 
     async def _read_hello(self, ws: Any) -> dict[str, Any] | None:
         try:
@@ -984,7 +1317,11 @@ class Gateway:
 # 入口
 # --------------------------------------------------------------------------
 
-def _install_signal_handlers(loop: asyncio.AbstractEventLoop, stop_event: asyncio.Event) -> Callable[[], None]:
+def _install_signal_handlers(
+    loop: asyncio.AbstractEventLoop,
+    stop_event: asyncio.Event,
+    on_hup: Callable[[], None] | None = None,
+) -> Callable[[], None]:
     loop_handlers: list[int] = []
     signal_handlers: list[tuple[int, Any]] = []
 
@@ -1002,6 +1339,26 @@ def _install_signal_handlers(loop: asyncio.AbstractEventLoop, stop_event: asynci
                 continue
             signal_handlers.append((sig, old))
 
+    # 只有生产入口传入 on_hup 才登记 SIGHUP。没传时测试看到的仍是 SIGINT/SIGTERM。
+    hup = getattr(signal, "SIGHUP", None)
+    if on_hup is not None and hup is not None:
+        def _reload() -> None:
+            on_hup()
+
+        def _reload_from_signal(_signum, _frame) -> None:
+            loop.call_soon_threadsafe(on_hup)
+
+        try:
+            loop.add_signal_handler(hup, _reload)
+            loop_handlers.append(hup)
+        except (AttributeError, NotImplementedError):
+            try:
+                old = signal.signal(hup, _reload_from_signal)
+            except (OSError, RuntimeError, ValueError):
+                old = None
+            if old is not None:
+                signal_handlers.append((hup, old))
+
     def restore() -> None:
         for sig in loop_handlers:
             with contextlib.suppress(Exception):
@@ -1013,12 +1370,12 @@ def _install_signal_handlers(loop: asyncio.AbstractEventLoop, stop_event: asynci
     return restore
 
 
-async def run_gateway(token: str) -> None:
-    gw = Gateway(token=token)
+async def run_gateway(token: str, token_file: str | Path | None = None) -> None:
+    gw = Gateway(token=token, token_file=token_file)
     await gw.start()
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
-    restore_signals = _install_signal_handlers(loop, stop_event)
+    restore_signals = _install_signal_handlers(loop, stop_event, on_hup=gw.reload_tokens)
     log.info("gateway_started")
     try:
         await stop_event.wait()
@@ -1039,14 +1396,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     try:
-        token = load_token(args.token_file) if args.token_file else check_token(sys.stdin.readline())
+        if args.token_file:
+            token = load_token(args.token_file)
+            token_file: str | None = args.token_file
+        else:
+            token = check_token(sys.stdin.readline())
+            token_file = None
     except (ValueError, OSError) as e:
         # 只报原因，不带 token；OSError 的文本里只有路径
         raise SystemExit(f"token 不可用：{e}") from None
     logging.basicConfig(
         stream=sys.stderr, level=logging.INFO, format="%(asctime)s [node.gateway] %(levelname)s %(message)s"
     )
-    asyncio.run(run_gateway(token))
+    asyncio.run(run_gateway(token, token_file=token_file))
 
 
 if __name__ == "__main__":

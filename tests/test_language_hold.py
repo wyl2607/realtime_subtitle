@@ -36,7 +36,7 @@ class _Proc:
     def buffer_seconds(self):
         return 0.0
 
-    def init(self):
+    def init(self, offset=None):
         self.inits += 1
 
 
@@ -95,6 +95,7 @@ def _bare(script=()):
     t._last_unstable = ""
     t._draft_last_text = ""
     t._draft_last_time = 0.0
+    t._sample_clock_samples = 0
     t.processor = _Proc(script)
     return t
 

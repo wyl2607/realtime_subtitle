@@ -18,8 +18,16 @@ struct Options {
     var src = "de-DE"
     var dst = "zh-Hans"
     var headless = false
-    var mode = RSLiteMode.auto
+    var mode = RSLiteMode.local
+    var pinnedNode: String?
     var selftest = false
+    var cloudCommand: CloudCommand?
+}
+
+enum CloudCommand {
+    case setGroqKey
+    case clearGroqKey
+    case setCloud(Bool)
 }
 
 @main
@@ -38,8 +46,19 @@ struct RSLite {
             exit(1)
         }
         if options.selftest {
-            runSelfTest()
-            return
+            Task {
+                exit(await runSelfTest())
+            }
+            dispatchMain()
+        }
+        if let command = options.cloudCommand {
+            do {
+                try runCloudCommand(command)
+                exit(0)
+            } catch {
+                fputs("error: \(error)\n", stderr)
+                exit(1)
+            }
         }
         do {
             if !(options.headless && options.source.hasPrefix("file:")) {
@@ -76,6 +95,15 @@ struct RSLite {
 
     private static func parse(_ args: [String]) throws -> Options {
         var options = Options()
+        // 未在命令行给出的 source/src/dst/mode 取自 AppSettings；显式参数由下面的 switch 再覆盖。
+        let resolved = AppSettings.resolve(argv: args, settings: AppSettingsStore.load())
+        options.source = resolved.source
+        options.src = resolved.src
+        options.dst = resolved.dst
+        if let mode = RSLiteMode(rawValue: resolved.mode) {
+            options.mode = mode
+        }
+        options.pinnedNode = resolved.pinnedNode
         var i = 0
         while i < args.count {
             let key = args[i]
@@ -86,7 +114,26 @@ struct RSLite {
             case "--selftest":
                 options.selftest = true
                 i += 1
-            case "--source", "--src", "--dst", "--mode":
+            case "--set-groq-key":
+                options.cloudCommand = .setGroqKey
+                i += 1
+            case "--clear-groq-key":
+                options.cloudCommand = .clearGroqKey
+                i += 1
+            case "--cloud":
+                guard i + 1 < args.count else {
+                    throw RSLiteError.usage("missing value for \(key)")
+                }
+                switch args[i + 1] {
+                case "on":
+                    options.cloudCommand = .setCloud(true)
+                case "off":
+                    options.cloudCommand = .setCloud(false)
+                default:
+                    throw RSLiteError.usage("--cloud 只能是 on 或 off")
+                }
+                i += 2
+            case "--source", "--src", "--dst", "--mode", "--node":
                 guard i + 1 < args.count else {
                     throw RSLiteError.usage("missing value for \(key)")
                 }
@@ -98,6 +145,8 @@ struct RSLite {
                     options.src = value
                 case "--dst":
                     options.dst = value
+                case "--node":
+                    options.pinnedNode = AppSettings.normalizedPin(value)
                 default:
                     guard let mode = RSLiteMode(rawValue: value) else {
                         throw RSLiteError.usage("--mode 只能是 auto、local 或 hybrid")
@@ -112,7 +161,21 @@ struct RSLite {
         return options
     }
 
-    private static let usage = "usage: rslite [--source tap|mic|file:PATH] [--src de-DE] [--dst zh-Hans] [--headless] [--mode auto|local|hybrid] [--selftest]"
+    private static let usage = "usage: rslite [--source tap|mic|file:PATH] [--src de-DE] [--dst zh-Hans] [--headless] [--mode auto|local|hybrid] [--node ID] [--selftest] [--set-groq-key|--clear-groq-key|--cloud on|off]"
+
+    private static func runCloudCommand(_ command: CloudCommand) throws {
+        switch command {
+        case .setGroqKey:
+            try CloudConfigStore.readLineFromStdinAndWriteKey()
+            print("Groq key 已写入")
+        case .clearGroqKey:
+            try CloudConfigStore.clearKey()
+            print("Groq key 已清除")
+        case .setCloud(let enabled):
+            try CloudConfigStore.writeEnabled(enabled)
+            print(enabled ? "云端已开启" : "云端已关闭")
+        }
+    }
 
     @available(macOS 27.0, *)
     private static func makeEngine(
@@ -131,7 +194,8 @@ struct RSLite {
             mode: options.mode,
             callbacks: callbacks,
             onMode: onMode,
-            onNodeFinal: onNodeFinal
+            onNodeFinal: onNodeFinal,
+            pinnedNode: options.pinnedNode
         )
     }
 
@@ -139,6 +203,9 @@ struct RSLite {
     private static func runHeadless(_ options: Options) async throws {
         let startedAt = ContinuousClock().now
         let clock = ContinuousClock()
+        CloudTiming.shared.setNowProvider {
+            startedAt.duration(to: clock.now).seconds
+        }
         // 与 Overlay 同一套 P5 逻辑（LineStore），让 headless 也能观察到「节点句替换了几条本机句」
         let store = HeadlessLineStore()
 
@@ -156,8 +223,18 @@ struct RSLite {
                     store.setTranslation(key: id, text: text)
                     writeEvent(clock: clock, startedAt: startedAt, ev: "translation", id: id, text: text)
                 },
+                onTranslationFailed: { id, reason in
+                    writeEvent(clock: clock, startedAt: startedAt, ev: "translate_failed", id: id, text: reason)
+                },
                 onStatus: { text in
                     writeEvent(clock: clock, startedAt: startedAt, ev: "status", id: nil, text: text)
+                },
+                onFanoutReady: { fanout in
+                    // 墙钟与统一样本时钟的共同零点：第一块样本送出时记一次，之后不再记。
+                    // 之后每个句子的 t1 都在这条样本时钟上，延迟 = t_final - (clock.t + (t1 - clock.t0))。
+                    fanout.onFirstSample = { sampleSeconds in
+                        writeClockEvent(clock: clock, startedAt: startedAt, sampleSeconds: sampleSeconds)
+                    }
                 }
             ),
             onMode: { mode in
@@ -182,6 +259,10 @@ struct RSLite {
     @available(macOS 27.0, *)
     @MainActor
     private static func runApp(_ options: Options) {
+        // AppKit 默认吞掉事件循环里的 ObjC 异常继续跑；异常若穿过 MainActor 任务，
+        // Swift 运行时的「当前执行器」会留在已销毁的栈帧上，几分钟后在无关代码里崩
+        // （CLAUDE.md §7 第 26 条）。宁可当场崩。
+        UserDefaults.standard.register(defaults: ["NSApplicationCrashOnExceptions": true])
         NSApplication.shared.setActivationPolicy(.accessory)
 
         var pipeline: SubtitleEngine?
@@ -209,6 +290,12 @@ struct RSLite {
                         app.terminate(nil)
                     }
                 }
+            },
+            onRetry: { id in
+                guard let pipeline else {
+                    return false
+                }
+                return pipeline.retryTranslation(id: id)
             }
         )
 
@@ -223,6 +310,9 @@ struct RSLite {
                 },
                 onTranslation: { id, text in
                     Task { @MainActor in overlay.addTranslation(id: id, text: text) }
+                },
+                onTranslationFailed: { id, reason in
+                    Task { @MainActor in overlay.markUntranslated(id: id, reason: reason) }
                 },
                 onStatus: { text in
                     Task { @MainActor in overlay.setStatus(text) }
@@ -283,25 +373,55 @@ struct RSLite {
         (value * 1000).rounded() / 1000
     }
 
-    private static func runSelfTest() {
+    private static func writeClockEvent(
+        clock: ContinuousClock,
+        startedAt: ContinuousClock.Instant,
+        sampleSeconds: Double
+    ) {
+        let object: [String: Any] = [
+            "t": round3(startedAt.duration(to: clock.now).seconds),
+            "ev": "clock",
+            "t0": round3(sampleSeconds),
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else {
+            return
+        }
+        FileHandle.standardOutput.write(data)
+        FileHandle.standardOutput.write(Data([0x0A]))
+    }
+
+    private static func runSelfTest() async -> Int32 {
         var failures: [String] = []
         failures.append(contentsOf: LineStore.selfTest().map { "LineStore: \($0)" })
+        failures.append(contentsOf: P9FixtureSelfTest.selfTest().map { "P9Fixture: \($0)" })
         failures.append(contentsOf: Capability.selfTest().map { "Capability: \($0)" })
+        failures.append(contentsOf: CloudConfigStore.selfTest().map { "CloudConfig: \($0)" })
+        failures.append(contentsOf: OverlayStyle.selfTest().map { "OverlayStyle: \($0)" })
+        failures.append(contentsOf: OverlayMotion.selfTest().map { "OverlayMotion: \($0)" })
+        failures.append(contentsOf: AppSettings.selfTest().map { "AppSettings: \($0)" })
+        failures.append(contentsOf: NodeCompareBoard.selfTest().map { "NodeCompare: \($0)" })
+        failures.append(contentsOf: TailnetPin.selfTest().map { "TailnetPin: \($0)" })
+        failures.append(contentsOf: QuotaLedger.selfTest().map { "QuotaLedger: \($0)" })
+        failures.append(contentsOf: CloudClient.selfTest().map { "CloudClient: \($0)" })
+        failures.append(contentsOf: FileSource.selfTest().map { "FileSource: \($0)" })
         if #available(macOS 27.0, *) {
             failures.append(contentsOf: NodeRouter.selfTest().map { "NodeRouter: \($0)" })
             failures.append(contentsOf: HybridEngine.selfTest().map { "HybridEngine: \($0)" })
+            let pipelineFailures = await Pipeline.selfTest()
+            failures.append(contentsOf: pipelineFailures.map { "Pipeline: \($0)" })
         } else {
             failures.append("NodeRouter: 需要 macOS 27")
             failures.append("HybridEngine: 需要 macOS 27")
+            failures.append("Pipeline: 需要 macOS 27")
         }
         if failures.isEmpty {
             print("SELFTEST OK")
-            exit(0)
+            return 0
         }
         for failure in failures {
             print("SELFTEST FAIL \(failure)")
         }
-        exit(1)
+        return 1
     }
 }
 

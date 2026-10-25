@@ -3,6 +3,7 @@
 音频按 CHUNK_SUBMIT_SECONDS 一块"实时"到达；识别耗时期间到达的块攒起来，
 下一轮一次性塞进去（等价于 translator_queue._process_inbox 的整批合并）。
 输出：流式 committed 文本对整段参考的 WER、每轮识别耗时、平均刷新间隔。
+加 ``--profile`` 时，MLX 模型额外输出一轮的 p50 分段表；不输出转写正文。
 
 用法（仓库根）：python scripts/bench/stream_smoke.py --parquet <fleurs_de_80.parquet> --n 8
 """
@@ -25,10 +26,17 @@ def norm(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
+def timing_p50(samples):
+    if not samples:
+        return None
+    return {key: float(np.median([sample[key] for sample in samples])) for key in samples[0]}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--parquet", required=True)
     ap.add_argument("--n", type=int, default=8)
+    ap.add_argument("--profile", action="store_true", help="输出 MLX 分阶段 p50 耗时")
     a = ap.parse_args()
 
     import jiwer
@@ -52,11 +60,13 @@ def main():
     print(f"后端: {selected_whisper_backend()}  音频 {total_s:.1f}s")
     t0 = time.time()
     model = create_whisper_model()
+    if a.profile and hasattr(model, "profile_enabled"):
+        model.profile_enabled = True
     proc = OnlineASRProcessor(model)
     chunk = int(16000 * config.CHUNK_SUBMIT_SECONDS)
     blocks = [audio[i:i + chunk] for i in range(0, len(audio), chunk)]
 
-    committed, iters, batch_sizes, sim_clock, next_block = [], [], [], 0.0, 0
+    committed, iters, batch_sizes, timing_samples, sim_clock, next_block = [], [], [], [], 0.0, 0
     while next_block < len(blocks):
         # 模拟时钟：识别期间"实时"到达的块全部进这一批
         arrived = max(next_block + 1, min(len(blocks), int(sim_clock / config.CHUNK_SUBMIT_SECONDS) + 1))
@@ -67,6 +77,9 @@ def main():
         done, _unstable = proc.process_iter()
         dt = time.time() - t
         iters.append(dt)
+        timing = getattr(model, "last_timing", None)
+        if timing is not None:
+            timing_samples.append(timing)
         batch_sizes.append(arrived - prev_block)
         sim_clock = max(sim_clock, next_block * config.CHUNK_SUBMIT_SECONDS) + dt
         if done:
@@ -78,14 +91,20 @@ def main():
     hyp = norm(" ".join(committed))
     ref = norm(" ".join(refs))
     print(f"总耗时 {time.time() - t0:.1f}s（含模型加载）；识别 {len(iters)} 轮，"
-          f"单轮 p50 {np.median(iters):.2f}s / max {max(iters):.2f}s；"
+          f"单轮 p50 {np.median(iters):.2f}s / p90 {np.percentile(iters, 90):.2f}s；"
           f"模拟时钟 {sim_clock:.1f}s 消化 {total_s:.1f}s 音频（落后 {sim_clock - total_s:+.1f}s）")
     worst = int(np.argmax(iters))
     print(f"最慢一轮：第 {worst} 轮 {iters[worst]:.2f}s，该批 {batch_sizes[worst]} 块；"
           f"各轮耗时 {[round(x, 1) for x in iters]}")
     print(f"流式 WER: {jiwer.wer(ref, hyp):.4f}")
-    print("REF:", ref[:300])
-    print("HYP:", hyp[:300])
+    parts = timing_p50(timing_samples)
+    if parts is not None:
+        print("分段 p50（秒）：" + " | ".join(
+            f"{label} {parts[key]:.3f}" for key, label in (
+                ("mel_s", "mel"), ("encoder_s", "encoder"), ("decoder_s", "decoder"),
+                ("alignment_s", "对齐"), ("vad_s", "VAD"), ("python_s", "Python"),
+            )
+        ))
 
 
 if __name__ == "__main__":

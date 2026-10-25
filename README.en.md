@@ -1,8 +1,16 @@
 # Realtime Subtitle
 
-**Offline German (and English) live subtitles for Windows** — capture system audio, recognize speech, translate locally, and show a bilingual always-on-top overlay.
+**Live subtitles for Windows & macOS** — capture system audio, recognize speech, translate, and show a bilingual always-on-top overlay. Default to fully local; audio is only sent to the cloud recognition service when a Groq key is configured in the program settings. Current version **v3.2.0**.
 
-No audio or transcript is sent to the cloud. Recognition and translation run on your machine.
+> **Privacy commitment & off-device paths:**
+>
+> By default, recognition and translation run entirely locally; no audio or transcript is sent to any cloud service. There are only two optional paths where audio leaves your machine, and both require explicit configuration:
+> 1. **Your own compute node:** audio is sent to a machine within your own Tailscale network (`100.64.0.0/10`), never passing through third parties;
+> 2. **Cloud Groq (third-party):** audio is sent to Groq's cloud recognition service only if a Groq key is set in the program settings. Does not read environment variables (preventing unintended uploads from system-wide keys); cloud recognition can be disabled with one click in the settings panel or via CLI.
+>
+> The interface status line clearly indicates the current recognition mode and source: `"云端·Groq"` / `"混合·<node-name>"` / `"本机"`.
+> When using a network proxy, the proxy can see the uploaded **raw audio** fragments (WAV).
+> Regarding third-party data retention: according to the [official Groq data policy](https://console.groq.com/docs/your-data), Groq does not retain recognition requests by default; it may temporarily retain them for up to 30 days solely to investigate reliability issues or abuse. If concerned, enable Zero Data Retention (ZDR) under Data Controls in the Groq console.
 
 > **This is enforced, not just documented.** At startup the app resolves
 > `OLLAMA_BASE_URL` and refuses to run unless every resolved address is a loopback
@@ -30,6 +38,20 @@ System audio ──WASAPI loopback──▶ Faster-Whisper (CUDA or CPU)
                                       ▼
                          Overlay: source first + draft + final bilingual lines
 ```
+
+## Platform status
+
+As of 2026-10-21. The current release is v3.1.0 for Windows / macOS; v3.2.0 is tagged as beta and the final release is not out yet.
+
+Stage legend: ✅ stable · 🟢 usable · 🧪 experimental · ⬜ not started.
+
+| Platform | Form | Stage | Available now | Still missing |
+|---|---|---|---|---|
+| Windows | Desktop app | ✅ Stable | Local recognition and translation; three-tier automatic routing from cloud (Groq) → computer node → local (v3.2.0 beta); the status line shows the current source. Full pytest on a real Windows machine: 1207 passed, 0 failed | Final v3.2.0 release not out yet |
+| macOS | Desktop app + rslite (native Swift) | 🟢 Usable | Local recognition and translation; three-tier automatic routing from cloud → computer node → local (v3.2.0 beta). rslite cloud acceptance mostly passed, hybrid-mode median refine latency 1.47 s | final v3.2.0 release not out yet |
+| Android | Native app (separate private repo) | 🧪 Experimental | v0.4.0-quality released (old architecture); the rewrite/v1 has on-device recognition, cloud tier, node tier, automatic switching, and Keystore-encrypted key storage, with 395 unit tests passing and 0 failures | Rewrite not yet verified on a real device |
+| iOS | Native app (prototype) | 🧪 Experimental | Screen-recording broadcast extension captures audio from other apps, picture-in-picture display, "Auto" mode (falls back to local when the node fails, switches back at sentence end after recovery), daily subtitle archive, cloud tier logic only | Broadcast extension not yet integrated, not yet run on a real device; display is picture-in-picture only, no desktop-style overlay |
+| Linux | — | ⬜ Not started | — | No plans |
 
 ## Features
 
@@ -152,7 +174,21 @@ A native small app using system recognition + system translation; no Python or O
 
 ### Compute node (experimental)
 
-Offload recognition to another Apple Silicon Mac or NVIDIA Windows machine inside the tailnet: this machine shows subtitles first, then the node's refined results replace them; if the node disconnects, subtitles continue and automatically fall back to local processing, reconnecting when the node returns. Install: Mac node `bash scripts/node/install_node.sh <ssh alias>`, Windows node `bash scripts/node/install_node_windows.sh <ssh alias>` (both run on Mac). Privacy boundary: node listens only on Tailscale (`100.64.0.0/10`), token-authenticated (the token is passed only via files), audio stays in memory (no disk), logs contain no transcript content; audio leaves this machine only to your own node. Currently only rslite supports nodes; the Windows desktop subtitle program is planned for v3.2.0. Protocol details: `docs/protocol-v2.md`.
+Offload recognition to another Apple Silicon Mac or NVIDIA Windows machine inside the tailnet: this machine shows subtitles first, then the node's refined results replace them; if the node disconnects, subtitles continue and automatically fall back to local processing, reconnecting when the node returns. Install: Mac node `bash scripts/node/install_node.sh <ssh alias>`, Windows node `bash scripts/node/install_node_windows.sh <ssh alias>` (both run on Mac). Privacy boundary: node listens only on Tailscale (`100.64.0.0/10`), token-authenticated (the token is passed only via files), audio stays in memory (no disk), logs contain no transcript content; audio leaves this machine only to your own node. Both rslite and the Windows desktop subtitle program support compute nodes (see "Windows: Using compute nodes" below). Protocol details: `docs/protocol-v2.md`.
+
+## Cloud recognition (optional)
+
+- **Mac rslite**: read key from standard input via `rslite --set-groq-key`, clear key with `rslite --clear-groq-key`, and toggle cloud mode with `rslite --cloud on|off`.
+- **Windows**: enter the Groq key into the password field under "Cloud Recognition" in the ⚙️ settings panel and toggle the switch to enable/disable.
+- **Free tier limits**: 20 requests per minute, 7,200 seconds of audio per hour, 2,000 requests / 28,800 seconds per day, with each request billed at minimum 10 seconds.
+- **Automatic failover**: when quota approaches limits, the system automatically falls back to your compute node or local recognition; when quota recovers, it switches back at a silence point.
+- **Fallback order**: Cloud → Own compute node → Local.
+
+## Windows: Using compute nodes
+
+- Node switch is off by default.
+- Deploy configuration from a Mac with `bash scripts/node/install_node_windows.sh <node> --client <windows-ssh-alias>` (or `install_node.sh` with the same arguments).
+- If a machine is both a node and a client, it automatically skips itself.
 
 ## Update & uninstall
 

@@ -55,38 +55,59 @@ FAKE_WORKER = textwrap.dedent(
     if mode == "ignore-term":
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
     stdin, out = sys.stdin.buffer, sys.stdout.buffer
-    total = 0  # 收到的 PCM 字节数：worker 按它算样本时钟（F2）
-    def emit(d):
+    total = 0  # 收到的 PCM 字节数：worker 按它算样本时钟（F2）。sid 头不计。
+    def emit(d, sid=None):
+        if sid is not None and "sid" not in d:
+            d = dict(d)
+            d["sid"] = sid
         out.write((json.dumps(d, ensure_ascii=False) + "\\n").encode()); out.flush()
+    def take_pcm(n):
+        global total
+        stdin.read(n)
+        total += n
+        record("pcm %d" % n)
+        if mode.startswith("crash"):
+            sys.exit(int(mode.partition(":")[2] or 3))
     while True:
         b = stdin.read(1)
         if not b:
             record("eof"); sys.exit(0)
         if b == b"{{":
-            t = json.loads(b + stdin.readline())["type"]
-            record(t)
+            msg = json.loads(b + stdin.readline())
+            t = msg.get("type")
+            sid = msg.get("sid")
+            record(t if isinstance(t, str) else "?")
             if t == "hello":
                 if mode == "stale":
-                    emit({{"ev": "final", "id": 99, "a0": 0.0, "a1": 1.0, "text": "STALE"}})
-                emit({{"ev": "ready", "cold": True, "load_s": 0.0, "engine": {{}}}})
+                    emit({{"ev": "final", "id": 99, "a0": 0.0, "a1": 1.0, "text": "STALE"}}, sid)
+                if mode.startswith("slow-ready:"):
+                    time.sleep(float(mode.partition(":")[2]))
+                emit({{"ev": "ready", "cold": True, "load_s": 0.0, "engine": {{}}}}, sid)
                 if mode == "stall":
                     time.sleep(3600)
                 if mode == "gate":  # 慢 worker：门文件出现之前一个字节都不读
                     while not os.path.exists(rec + ".gate"):
                         time.sleep(0.02)
             elif t == "flush":
-                emit({{"ev": "final", "id": 1, "a0": 0.0, "a1": 1.0,
-                       "text": str(total) if mode == "gate" else "{FEATURE}"}})
-                emit({{"ev": "translation", "id": 1, "text": "{FEATURE}-zh"}})
+                if mode == "echo-sid":
+                    text, tr = str(sid), str(sid) + "-zh"
+                elif mode == "gate":
+                    text, tr = str(total), "{FEATURE}-zh"
+                else:
+                    text, tr = "{FEATURE}", "{FEATURE}-zh"
+                emit({{"ev": "final", "id": 1, "a0": 0.0, "a1": 1.0, "text": text}}, sid)
+                emit({{"ev": "translation", "id": 1, "text": tr}}, sid)
             elif t == "drain":
-                emit({{"ev": "drained"}})
+                emit({{"ev": "drained"}}, sid)
+            elif t == "end":
+                pass
+        elif b == b"\\x01":
+            stdin.read(4)  # sid
+            n = int.from_bytes(stdin.read(4), "big")
+            take_pcm(n)
         else:
             n = int.from_bytes(b + stdin.read(3), "big")
-            stdin.read(n)
-            total += n
-            record("pcm %d" % n)
-            if mode.startswith("crash"):
-                sys.exit(int(mode.partition(":")[2] or 3))
+            take_pcm(n)
     '''
 )
 
@@ -174,9 +195,21 @@ def uds_connect(gw: Gateway):
     return unix_connect(str(gw.uds_path), "ws://localhost/v2/session", logger=_quiet)
 
 
+def _is_loading(ev: dict) -> bool:
+    return ev.get("ev") == "status" and ev.get("code") == "loading"
+
+
+async def recv_non_loading(ws, timeout: float = 8) -> dict:
+    """跳过冷加载心跳；既有用例关心的是业务事件，不是 loading。"""
+    while True:
+        ev = json.loads(await asyncio.wait_for(ws.recv(), timeout))
+        if not _is_loading(ev):
+            return ev
+
+
 async def hello_ready(ws, hello: dict | None = None) -> dict:
     await ws.send(json.dumps(hello or HELLO))
-    return json.loads(await asyncio.wait_for(ws.recv(), 8))
+    return await recv_non_loading(ws)
 
 
 async def http_get(path: str, *, port: int | None = None, uds: Path | None = None,
@@ -561,7 +594,8 @@ def test_token_comes_from_file_or_stdin_never_argv(tmp_path):
 
 def test_second_session_gets_1013(tmp_path):
     async def scenario():
-        async with running(tmp_path) as (gw, _rec):
+        # 缺省容量是 2；这条仍钉「满了就 1013、判断在 hello 之前」，所以把容量收成 1。
+        async with running(tmp_path, max_sessions=1) as (gw, _rec):
             first = await tcp_connect(gw)
             assert (await hello_ready(first))["ev"] == "ready"
             status, body = await http_get("/v1/info", port=gw.tcp_port, token=TOKEN)
@@ -1100,6 +1134,105 @@ def test_new_session_during_reap_waits_and_respawns(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_cold_worker_sends_loading_until_ready(tmp_path):
+    """冷拉起 worker 慢就绪：先收到 >=2 条 loading，ready 最后到；字段走 status。"""
+    ticks = [0.0]
+
+    def clock():
+        ticks[0] += 1.0
+        return ticks[0]
+
+    async def scenario():
+        async with running(
+            tmp_path, "slow-ready:0.35", loading_interval_s=0.05, clock=clock
+        ) as (gw, _rec):
+            ws = await uds_connect(gw)
+            await ws.send(json.dumps(HELLO))
+            evs = []
+            while True:
+                ev = json.loads(await asyncio.wait_for(ws.recv(), 8))
+                evs.append(ev)
+                if ev.get("ev") == "ready":
+                    break
+            await ws.close()
+            return evs
+
+    evs = asyncio.run(scenario())
+    loadings = [e for e in evs if _is_loading(e)]
+    assert evs[-1]["ev"] == "ready"
+    assert len(loadings) >= 2
+    assert all(e["text"] == gw_mod.LOADING_STATUS_TEXT for e in loadings)
+    assert loadings[0]["elapsed_s"] == 1.0  # 注入时钟：第一条发在 started 的下一个 tick
+    assert all(b["elapsed_s"] > a["elapsed_s"] for a, b in zip(loadings, loadings[1:]))
+
+
+def test_warm_worker_reuse_sends_no_loading(tmp_path, monkeypatch):
+    """保温复用的 worker 不发 loading：第二条会话第一个事件就是 ready。"""
+    monkeypatch.setattr(gw_mod, "WORKER_KEEPALIVE_S", 5.0)
+
+    async def scenario():
+        async with running(tmp_path, "echo", loading_interval_s=0.05) as (gw, _rec):
+            ws = await uds_connect(gw)
+            assert (await hello_ready(ws))["ev"] == "ready"
+            await ws.close()
+            await until(lambda: not gw._session_active)
+
+            ws = await uds_connect(gw)
+            await ws.send(json.dumps(HELLO))
+            first = json.loads(await asyncio.wait_for(ws.recv(), 8))
+            await ws.close()
+            return first
+
+    first = asyncio.run(scenario())
+    assert first["ev"] == "ready"
+
+
+def test_reusing_worker_still_loading_sends_loading(tmp_path, monkeypatch):
+    """P1 问题 2：上一个会话在冷加载中途断开，worker 进程还活着但模型没加载完。
+    新会话复用它时也要发 loading，否则客户端只等基础 15s 就放弃（Windows 冷加载实测 17–21s）。"""
+    monkeypatch.setattr(gw_mod, "WORKER_KEEPALIVE_S", 5.0)
+
+    async def scenario():
+        async with running(
+            tmp_path, "slow-ready:0.6", loading_interval_s=0.05
+        ) as (gw, _rec):
+            ws = await uds_connect(gw)
+            await ws.send(json.dumps(HELLO))
+            assert _is_loading(json.loads(await asyncio.wait_for(ws.recv(), 8)))
+            await ws.close()  # 冷加载中途放弃（客户端超时 / 用户停止）
+            await wait_session_freed(gw)
+            assert gw.worker.state == "warm"  # 进程还在，模型还没 ready
+
+            ws = await uds_connect(gw)
+            await ws.send(json.dumps(HELLO))
+            first = json.loads(await asyncio.wait_for(ws.recv(), 8))
+            await ws.close()
+            return first
+
+    first = asyncio.run(scenario())
+    assert _is_loading(first), first
+
+
+def test_loading_stops_when_session_ends_mid_load(tmp_path):
+    """会话在冷加载中途断开：loading 心跳任务被取消，不再发。"""
+    async def scenario():
+        async with running(
+            tmp_path, "slow-ready:5", loading_interval_s=0.05
+        ) as (gw, _rec):
+            ws = await uds_connect(gw)
+            await ws.send(json.dumps(HELLO))
+            first = json.loads(await asyncio.wait_for(ws.recv(), 8))
+            assert _is_loading(first)
+            sink = next(iter(gw.worker._sinks.values()))
+            task = sink._loading_task
+            assert task is not None and not task.done()
+            await ws.close()
+            await until(task.done, what="loading task cancelled")
+            assert task.cancelled()
+
+    asyncio.run(scenario())
+
+
 def test_worker_crash_notifies_client(tmp_path, caplog):
     async def scenario():
         async with running(tmp_path, "crash:9") as (gw, rec):
@@ -1152,7 +1285,7 @@ def test_worker_spawn_failure_is_reported(tmp_path):
         try:
             ws = await uds_connect(gw)
             await ws.send(json.dumps(HELLO))
-            ev = json.loads(await asyncio.wait_for(ws.recv(), 5))
+            ev = await recv_non_loading(ws, 5)
             assert ev["code"] == "worker_crashed"
             await asyncio.wait_for(ws.wait_closed(), 5)
         finally:
@@ -1203,8 +1336,9 @@ def mac_probes(monkeypatch):
 class FakeSystem:
     UUID = "11111111-2222-3333-4444-555555555555"
 
-    def __init__(self, idle_ns=5_000_000_000, power="AC Power", fail=()):
+    def __init__(self, idle_ns=5_000_000_000, power="AC Power", swapouts=10_000, fail=()):
         self.idle_ns, self.power, self.fail = idle_ns, power, set(fail)
+        self.swapouts = swapouts
         self.calls: list[list[str]] = []
 
     def __call__(self, argv):
@@ -1217,6 +1351,12 @@ class FakeSystem:
             return f'    "IOPlatformUUID" = "{self.UUID}"\n'
         if argv[0] == "pmset":
             return f"Now drawing from '{self.power}'\n -InternalBattery-0\t100%; charged\n"
+        if argv[:2] == ["sysctl", "-n"] and argv[2] == "kern.memorystatus_vm_pressure_level":
+            return "1\n"
+        if argv[:2] == ["sysctl", "-n"] and argv[2] == "vm.swapusage":
+            return "total = 2048.00M  used = 1536.00M  free = 512.00M  (encrypted)\n"
+        if argv[0] == "vm_stat":
+            return f"Swapouts:                              {self.swapouts}.\n"
         raise AssertionError(argv)
 
 
@@ -1227,30 +1367,97 @@ def test_info_matches_p1_and_leaks_nothing_raw(tmp_path, mac_probes):
         {"model": "whisper-large-v3-turbo", "backend": "mlx", "rtf": 0.08, "translator": "ollama:qwen3.5:4b"}),
         encoding="utf-8")
     system = FakeSystem(idle_ns=7_654_321_000)
+    monkeypatch_probe = pytest.MonkeyPatch()
+    monkeypatch_probe.setattr(info_mod, "probe_translator_ok", lambda translator: False, raising=False)
     info = info_mod.NodeInfo(run=system, state_dir=state)
 
-    async def scenario():
-        async with running(tmp_path, info=info) as (gw, _rec):
-            status, body = await http_get("/v1/info", port=gw.tcp_port, token=TOKEN)
-            raw = await _raw_info(gw)
-            ws = await uds_connect(gw)
-            await hello_ready(ws)
-            _, busy_body = await http_get("/v1/info", port=gw.tcp_port, token=TOKEN)
-            await ws.close()
-            return status, body, raw, busy_body
+    try:
+        async def scenario():
+            async with running(tmp_path, info=info) as (gw, _rec):
+                status, body = await http_get("/v1/info", port=gw.tcp_port, token=TOKEN)
+                raw = await _raw_info(gw)
+                ws = await tcp_connect(gw)
+                await hello_ready(ws)
+                _, busy_body = await http_get("/v1/info", port=gw.tcp_port, token=TOKEN)
+                await ws.close()
+                return status, body, raw, busy_body
 
-    status, body, raw, busy_body = asyncio.run(scenario())
+        status, body, raw, busy_body = asyncio.run(scenario())
+    finally:
+        monkeypatch_probe.undo()
     assert status == 200
-    assert set(body) == {"v", "node_id", "hw_hash", "asr", "translator", "busy", "on_ac", "in_use", "worker"}
+    assert set(body) == {
+        "v", "node_id", "hw_hash", "asr", "translator", "translator_ok",
+        "busy", "sessions", "capacity", "on_ac", "in_use", "worker",
+        "mem_pressure", "swap_used_gb", "swapout_rate",
+    }
+    assert body["mem_pressure"] == "normal" and body["swap_used_gb"] == 1.5 and body["swapout_rate"] is None
     assert body["v"] == 2 and body["node_id"] == "node-abc"
     assert body["hw_hash"] == hashlib.sha256(FakeSystem.UUID.encode()).hexdigest()[:16]
     assert body["asr"] == {"model": "whisper-large-v3-turbo", "backend": "mlx", "rtf": 0.08}
     assert body["translator"] == "ollama:qwen3.5:4b"
+    assert body["translator_ok"] is False
     assert body["busy"] is False and body["on_ac"] is True and body["in_use"] is True
+    assert body["sessions"] == 0 and body["capacity"] == 2
     assert body["worker"] == "cold"
-    assert busy_body["busy"] is True and busy_body["worker"] == "warm"
+    # 缺省容量 2：一个会话还没满，busy 仍是 false，sessions 变成 1。旧客户端只看 busy。
+    assert busy_body["busy"] is False and busy_body["worker"] == "warm"
+    assert busy_body["sessions"] == 1 and busy_body["capacity"] == 2
     # S8：原始空闲时长 / 原始 UUID 不出现在响应里
     assert "7654321" not in raw and "7.65" not in raw and FakeSystem.UUID not in raw
+
+
+def test_info_translator_ok_defaults_true_for_non_ollama(tmp_path, mac_probes, monkeypatch):
+    (tmp_path / "asr_state.json").write_text(json.dumps({"translator": "apple"}), encoding="utf-8")
+    called = False
+
+    def probe(translator):
+        nonlocal called
+        called = True
+        return False
+
+    monkeypatch.setattr(info_mod, "probe_translator_ok", probe, raising=False)
+    body = info_mod.NodeInfo(run=FakeSystem(), state_dir=tmp_path).collect(busy=False, worker="cold")
+    assert body["translator"] == "apple"
+    assert body["translator_ok"] is True
+    assert called is False
+
+
+def test_probe_translator_ok_checks_ollama_version_with_cache(monkeypatch):
+    calls = []
+    clock = {"t": 10.0}
+
+    class _Resp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"version":"0.6.0"}'
+
+    class _Opener:
+        def open(self, request, timeout):
+            calls.append((request.full_url, timeout, request.has_header("Proxy-Authorization")))
+            return _Resp()
+
+    def opener_factory(proxy_handler):
+        assert proxy_handler.proxies == {}
+        return _Opener()
+
+    monkeypatch.setattr(info_mod.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(info_mod.urllib.request, "build_opener", opener_factory)
+    monkeypatch.setattr(info_mod, "_OLLAMA_CHECK_CACHE", None, raising=False)
+
+    assert info_mod.probe_translator_ok("ollama:qwen") is True
+    assert info_mod.probe_translator_ok("ollama:qwen") is True
+    clock["t"] += 11.0
+    assert info_mod.probe_translator_ok("ollama:qwen") is True
+    assert len(calls) == 2
+    assert all(item[0] == "http://127.0.0.1:11434/api/version" and item[1] == 0.5 for item in calls)
 
 
 async def _raw_info(gw) -> str:
@@ -1549,7 +1756,7 @@ def test_short_token_is_refused_and_never_echoed(tmp_path):
 def test_main_refuses_bad_tokens_without_leaking_them(tmp_path, monkeypatch):
     import io
 
-    async def fake_run(token):  # 不真起服务，只看 token 走到了这里
+    async def fake_run(token, token_file=None):  # 不真起服务，只看 token 走到了这里
         seen.append(token)
 
     seen: list[str] = []
@@ -1789,6 +1996,8 @@ async def _recv_until(ws, stop, timeout: float = 15.0) -> list[dict]:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         ev = json.loads(await asyncio.wait_for(ws.recv(), max(0.1, deadline - time.monotonic())))
+        if _is_loading(ev):
+            continue
         evs.append(ev)
         if stop(ev):
             return evs
@@ -2075,3 +2284,287 @@ def test_info_in_use_is_bool_not_seconds(tmp_path, mac_probes):
     assert isinstance(http_val, bool)
     assert type(http_val) is bool
     assert type(http_val) not in (int, float)
+
+
+# ---------------------------------------------------------------- 多会话 + 每设备 token（spec 007 M0）
+
+def _write_secret(path: Path, text: str, mode: int = 0o600) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    path.chmod(mode)
+    return path
+
+
+TOK_DEFAULT = "d" * 32
+TOK_MAC = "m" * 32
+TOK_PHONE = "p" * 32
+
+
+async def _take(ws, pred, timeout: float = 5.0) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        ev = json.loads(await asyncio.wait_for(ws.recv(), timeout))
+        if pred(ev):
+            return ev
+    raise AssertionError("event not seen")
+
+
+def test_two_sessions_keep_their_own_events_and_third_is_busy(tmp_path, monkeypatch):
+    """容量缺省 2：两个会话各拿自己的 final；第三个在 hello 之前就 1013。"""
+    monkeypatch.setattr(gw_mod, "WORKER_KEEPALIVE_S", 0.2)
+
+    async def scenario():
+        async with running(tmp_path, "echo-sid") as (gw, _rec):
+            assert gw._capacity == 2
+            a = await tcp_connect(gw)
+            await until(lambda: gw._session_count >= 1, what="first slot")
+            b = await tcp_connect(gw)
+            await until(lambda: gw._session_count >= 2, what="second slot")
+            status, body = await http_get("/v1/info", port=gw.tcp_port, token=TOKEN)
+            assert status == 200
+            assert body["sessions"] == 2 and body["capacity"] == 2 and body["busy"] is True
+            # 名额在读 hello 之前就占住了：这两个连接都还没发 hello
+            third = await tcp_connect(gw)
+            await asyncio.wait_for(third.wait_closed(), 5)
+            assert third.close_code == 1013
+            assert gw._session_count == 2
+
+            assert (await hello_ready(a))["ev"] == "ready"
+            assert (await hello_ready(b))["ev"] == "ready"
+            await a.send(json.dumps({"type": "flush"}))
+            await b.send(json.dumps({"type": "flush"}))
+            fa = await _take(a, lambda e: e["ev"] == "final")
+            fb = await _take(b, lambda e: e["ev"] == "final")
+            assert fa["text"] == "1" and fb["text"] == "2"
+            assert "sid" not in fa and "sid" not in fb
+            ta = await _take(a, lambda e: e["ev"] == "translation")
+            tb = await _take(b, lambda e: e["ev"] == "translation")
+            assert ta["text"] == "1-zh" and tb["text"] == "2-zh"
+
+            pid = gw.worker.pid
+            await a.close()
+            await until(lambda: gw._session_count == 1, what="one session left")
+            assert gw.worker.state == "warm" and gw.worker.pid == pid
+            assert gw.worker._idle_task is None  # 还有会话，不算保温
+            status, mid = await http_get("/v1/info", port=gw.tcp_port, token=TOKEN)
+            assert status == 200
+            assert mid["sessions"] == 1 and mid["busy"] is False and mid["capacity"] == 2
+            await b.send(json.dumps({"type": "flush"}))
+            again = await _take(b, lambda e: e["ev"] == "final")
+            assert again["text"] == "2"
+
+            await b.close()
+            await until(lambda: gw._session_count == 0, what="no sessions")
+            await until(lambda: gw.worker.state == "cold", timeout=5, what="keepalive after last session")
+
+    asyncio.run(scenario())
+
+
+def test_max_sessions_file_clamps_and_gates_1013(tmp_path, caplog):
+    d = make_dir(tmp_path)
+    assert gw_mod.read_max_sessions(d) == 2
+    cfg = d / gw_mod.NODE_CONFIG_FILENAME
+    for raw, expect in [("[]", 2), ('{"other": 1}', 2), ('{"max_sessions": true}', 2),
+                        ('{"max_sessions": "3"}', 2), ('{"max_sessions": 2.5}', 2),
+                        ('{"max_sessions": 3}', 3), ('{"max_sessions": 0}', 1),
+                        ('{"max_sessions": 9}', 4)]:
+        cfg.write_text(raw, encoding="utf-8")
+        assert gw_mod.read_max_sessions(d) == expect
+    assert "max_sessions_clamped" in caplog.text
+    cfg.write_text('{"max_sessions": 1}', encoding="utf-8")
+
+    async def scenario():
+        async with running(tmp_path) as (gw, _rec):
+            assert gw._capacity == 1
+            first = await tcp_connect(gw)
+            await until(lambda: gw._session_count == 1, what="slot taken before hello")
+            status, body = await http_get("/v1/info", port=gw.tcp_port, token=TOKEN)
+            assert body["busy"] is True and body["sessions"] == 1 and body["capacity"] == 1
+            second = await tcp_connect(gw)
+            await asyncio.wait_for(second.wait_closed(), 5)
+            assert second.close_code == 1013
+            await first.close()
+
+    asyncio.run(scenario())
+
+
+def test_device_tokens_auth_revoke_and_stay_out_of_logs(tmp_path, caplog, capfd, monkeypatch):
+    d = make_dir(tmp_path)
+    legacy = _write_secret(d / "token", TOK_DEFAULT + "\n")
+    _write_secret(d / "tokens" / "mac.token", TOK_MAC)
+    phone = _write_secret(d / "tokens" / "phone.token", TOK_PHONE)
+    _write_secret(d / "tokens" / "bad name.token", "e" * 32)
+    _write_secret(d / "tokens" / "default.token", "z" * 32)  # 不覆盖旧单文件的 default
+
+    compares: list[int] = []
+    real_digest = gw_mod.hmac.compare_digest
+
+    def spy(a, b):
+        compares.append(1)
+        return real_digest(a, b)
+
+    monkeypatch.setattr(gw_mod.hmac, "compare_digest", spy)
+
+    async def scenario():
+        async with running(tmp_path, token_file=legacy) as (gw, _rec):
+            assert [e.device for e in gw._tokens.entries] == ["default", "mac", "phone"]
+            for tok in (TOK_DEFAULT, TOK_MAC, TOK_PHONE):
+                compares.clear()
+                status, _body = await http_get("/v1/info", port=gw.tcp_port, token=tok)
+                assert status == 200
+                assert len(compares) == 3  # 命中第一把也不提前返回
+            compares.clear()
+            status, _body = await http_get("/v1/info", port=gw.tcp_port, token="q" * 32)
+            assert status == 401 and len(compares) == 3
+            compares.clear()
+            status, _body = await http_get("/v1/info", port=gw.tcp_port, token="short")
+            assert status == 401 and len(compares) == 3
+            status, _body = await http_get("/v1/info", port=gw.tcp_port, token="z" * 32)
+            assert status == 401  # 目录里的 default.token 让位给旧单文件
+
+            ws = await tcp_connect(gw, TOK_MAC)
+            assert (await hello_ready(ws))["ev"] == "ready"
+            await ws.close()
+            await until(lambda: not gw._session_active)
+
+            phone.unlink()
+            gw.reload_tokens()
+            status, _body = await http_get("/v1/info", port=gw.tcp_port, token=TOK_PHONE)
+            assert status == 401
+            status, _body = await http_get("/v1/info", port=gw.tcp_port, token=TOK_MAC)
+            assert status == 200
+            status, _body = await http_get("/v1/info", port=gw.tcp_port, token=TOK_DEFAULT)
+            assert status == 200
+            assert legacy.read_text(encoding="utf-8") == TOK_DEFAULT + "\n"  # 不移动原文件
+
+    asyncio.run(scenario())
+    captured = capfd.readouterr()
+    blob = caplog.text + captured.out + captured.err
+    for secret in (TOK_DEFAULT, TOK_MAC, TOK_PHONE, "z" * 32, "e" * 32):
+        assert secret not in blob
+    assert "device=mac" in caplog.text
+    assert "token_name_rejected" in caplog.text
+    assert "bad name" not in caplog.text
+    assert "tokens_reloaded" in caplog.text
+
+
+def test_legacy_single_token_file_still_authenticates(tmp_path, caplog, capfd):
+    d = make_dir(tmp_path)
+    legacy = _write_secret(d / "token", TOK_DEFAULT)
+
+    async def scenario():
+        async with running(tmp_path, token_file=legacy) as (gw, _rec):
+            status, _body = await http_get("/v1/info", port=gw.tcp_port, token=TOK_DEFAULT)
+            assert status == 200
+            ws = await tcp_connect(gw, TOK_DEFAULT)
+            assert (await hello_ready(ws))["ev"] == "ready"
+            await ws.close()
+            assert not (d / "tokens").exists()
+            assert legacy.read_text(encoding="utf-8") == TOK_DEFAULT
+            assert [e.device for e in gw._tokens.entries] == ["default"]
+
+    asyncio.run(scenario())
+    captured = capfd.readouterr()
+    assert TOK_DEFAULT not in caplog.text + captured.out + captured.err
+    assert "device=default" in caplog.text
+
+
+def test_token_book_constant_time_and_dir_mtime_reload(tmp_path, caplog):
+    assert gw_mod.TOKEN_POLL_S == 10.0
+    d = tmp_path / "rs-node"
+    d.mkdir()
+    legacy = _write_secret(d / "token", "a" * 32)
+    book = gw_mod.TokenBook()
+    book.load(legacy, strict_legacy=True)
+    assert book.reload_if_dir_changed() is False  # 目录 mtime 没变就不读
+
+    calls: list[tuple[bytes, bytes]] = []
+    real = gw_mod.hmac.compare_digest
+
+    def spy(a, b):
+        calls.append((a, b))
+        return real(a, b)
+
+    gw_mod.hmac.compare_digest = spy
+    try:
+        assert book.match("Bearer " + "a" * 32) == "default"
+        assert len(calls) == 1
+        phone = _write_secret(d / "tokens" / "phone.token", "b" * 32)
+        _write_secret(d / "tokens" / "mac.token", "c" * 32)
+        assert book.reload_if_dir_changed() is True
+        calls.clear()
+        assert book.match("Bearer " + "b" * 32) == "phone"
+        assert len(calls) == 3
+        calls.clear()
+        assert book.match("Bearer nope") is None
+        assert len(calls) == 3
+        phone.unlink()
+        assert book.reload_if_dir_changed() is True
+        assert book.match("Bearer " + "b" * 32) is None
+        assert book.match("Bearer " + "c" * 32) == "mac"
+        legacy.unlink()
+        book.load(legacy, strict_legacy=False)  # 启动后删掉旧文件不能把进程打崩
+        assert [e.device for e in book.entries] == ["mac"]
+        assert book.match("Bearer " + "a" * 32) is None
+        assert book.match("Bearer " + "c" * 32) == "mac"
+    finally:
+        gw_mod.hmac.compare_digest = real
+    assert "b" * 32 not in caplog.text
+
+
+def test_token_stat_rejects_other_owner_and_loose_mode():
+    gw_mod._check_token_stat(types.SimpleNamespace(st_mode=0o100666, st_uid=0), platform="win32")
+    if IS_WIN:
+        return
+    own = os.getuid()
+    gw_mod._check_token_stat(types.SimpleNamespace(st_mode=0o100600, st_uid=own), platform="darwin")
+    with pytest.raises(ValueError, match="属主"):
+        gw_mod._check_token_stat(types.SimpleNamespace(st_mode=0o100600, st_uid=own + 1), platform="darwin")
+    with pytest.raises(ValueError, match="权限"):
+        gw_mod._check_token_stat(types.SimpleNamespace(st_mode=0o100644, st_uid=own), platform="darwin")
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGHUP"), reason="Windows 没有 SIGHUP")
+def test_sighup_reloads_only_when_handler_is_installed(tmp_path):
+    d = make_dir(tmp_path)
+    legacy = _write_secret(d / "token", TOK_DEFAULT)
+    gw = Gateway(token="ignored-memory-token", uds_dir=d, token_file=legacy, port=0,
+                 resolve_host=lambda: "127.0.0.1", allow_non_tailscale_for_tests=True)
+    assert gw._tokens.match("Bearer " + TOK_DEFAULT) == "default"
+
+    installed: dict[int, object] = {}
+
+    class Loop:
+        def add_signal_handler(self, sig, fn):
+            installed[sig] = fn
+
+        def remove_signal_handler(self, sig):
+            installed.pop(sig, None)
+
+        def call_soon_threadsafe(self, func):
+            func()
+
+    class Stop:
+        def set(self):
+            pass
+
+    restore = gw_mod._install_signal_handlers(Loop(), Stop())
+    assert signal.SIGHUP not in installed
+    restore()
+
+    _write_secret(d / "tokens" / "mac.token", TOK_MAC)
+    restore = gw_mod._install_signal_handlers(Loop(), Stop(), on_hup=gw.reload_tokens)
+    try:
+        assert signal.SIGHUP in installed
+        installed[signal.SIGHUP]()
+    finally:
+        restore()
+    assert gw._tokens.match("Bearer " + TOK_MAC) == "mac"
+    assert gw._tokens.match("Bearer " + TOK_DEFAULT) == "default"
+
+
+def test_empty_token_book_refuses_to_start(tmp_path):
+    d = make_dir(tmp_path)
+    with pytest.raises(ValueError, match="不能为空"):
+        Gateway(token="", uds_dir=d, token_file=d / "missing-token", port=0,
+                resolve_host=lambda: "127.0.0.1", allow_non_tailscale_for_tests=True)

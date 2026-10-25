@@ -9,6 +9,7 @@
 #   <ssh-host>  形如 mini2 / user@mini2；只允许 [A-Za-z0-9._@-]
 #   --local     装到本机（本机节点靠 UDS 被发现，不写 nodes.json）
 #   --dry-run   只打印将执行的动作（token 显示为 <redacted>），不联网、不写文件
+#   --client    可选。把本节点条目再下发到该 Windows 客户端（ssh 别名）
 #
 # 在「控制端」（运行本脚本的机器）上跑；目标机通过 ssh 驱动。目标机必须是
 # Apple Silicon Mac，且已装 brew / ollama / uv / swift / Tailscale
@@ -30,6 +31,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 NODE_PORT=8791
 HAD_PREV=0
 LABEL="com.realtimesubtitle.node"
+TS_LABEL="com.realtimesubtitle.tskeepalive"
 # venv(~3GB) + 依赖缓存 + Whisper 模型(~2.1GB)，且 .new 与 .prev 会同时存在
 MIN_FREE_GB=8
 
@@ -39,6 +41,8 @@ HOST=""
 HOST_SET=0
 NODE_ID=""
 NODE_TOKEN=""
+CLIENT=""
+NODE_DNS=""
 
 info() { printf '%s\n' "$*"; }
 warn() { printf '⚠️  %s\n' "$*" >&2; }
@@ -694,8 +698,76 @@ print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))
 '
 }
 
+# 把本节点的一条配置下发到 Windows 客户端。
+# token 只走 stdin；ssh/scp 的参数里不放 token，也不在 ssh 里内联 powershell 脚本。
+# 先 scp .ps1，再 powershell -File。客户端上的合并和 icacls 都在那个脚本里。
+client_ssh() {
+    ssh -o BatchMode=yes -o ConnectTimeout=10 -- "$1" "$2"
+}
+
+client_scp() {
+    scp -q -o BatchMode=yes -o ConnectTimeout=10 -- "$1" "$2"
+}
+
+# 端口会拼进 ssh 交给 cmd.exe 的那条远端命令。必须是 1–65535 的纯数字，
+# 否则 `& | < >` 会在 powershell 启动之前被执行。
+valid_tcp_port() {
+    local port="$1" value
+    if [[ ! "${port}" =~ ^[0-9]{1,5}$ ]]; then
+        return 1
+    fi
+    value=$((10#${port}))
+    if [[ "${value}" -lt 1 || "${value}" -gt 65535 ]]; then
+        return 1
+    fi
+    return 0
+}
+
+push_windows_client() {
+    local client="$1" id="$2" node_id="$3" url_host="$4" port="$5" token="$6"
+    local ps1_src remote ps
+    [[ "${id}" =~ ^[A-Za-z0-9._@-]+$ ]] || die "节点 id 不合法"
+    [[ "${node_id}" =~ ^[A-Za-z0-9_-]{8,64}$ ]] || die "node_id 格式异常"
+    [[ "${url_host}" =~ ^[A-Za-z0-9.-]+$ ]] || die "MagicDNS 名异常"
+    valid_tcp_port "${port}" || die "端口不合法"
+    [[ "${token}" =~ ^[0-9a-f]{64}$ ]] || die "token 形状不对"
+    valid_host "${client}" || die "客户端别名不合法（只允许 [A-Za-z0-9._@-]，且不能以 - 开头）"
+    ps1_src="${SCRIPT_DIR}/windows/node_setup.ps1"
+    [[ -f "${ps1_src}" ]] || die "找不到 node_setup.ps1"
+    client_ssh "${client}" 'if not exist "%APPDATA%\realtime_subtitle" mkdir "%APPDATA%\realtime_subtitle"' \
+        || die "无法在客户端建立配置目录"
+    client_scp "${ps1_src}" "${client}:AppData/Roaming/realtime_subtitle/push_client.ps1" \
+        || die "上传 push_client.ps1 失败"
+    ps='C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+    remote="${ps} -NoProfile -ExecutionPolicy Bypass -File \"%APPDATA%\\realtime_subtitle\\push_client.ps1\" -Action PushClient -NodeAlias ${id} -NodeId ${node_id} -UrlHost ${url_host} -Port ${port}"
+    printf '%s\n' "${token}" | client_ssh "${client}" "${remote}" \
+        || die "客户端下发失败"
+}
+
+step_push_client() {
+    [[ -n "${CLIENT}" ]] || return 0
+    local id dns token_src token
+    if [[ "${LOCAL}" -eq 1 ]]; then
+        id="local"
+        token_src="${HOME}/.config/rs-node/token"
+    else
+        id="${HOST##*@}"
+        token_src="${HOME}/.config/rslite/tokens/${id}.token"
+    fi
+    dns="${NODE_DNS:-}"
+    if [[ -z "${dns}" ]]; then
+        dns="$(resolve_magicdns)"
+        NODE_DNS="${dns}"
+    fi
+    [[ -f "${token_src}" ]] || die "没有可下发的 token 文件"
+    token="$(cat "${token_src}")"
+    info "下发节点条目到 Windows 客户端 ${CLIENT} ..."
+    push_windows_client "${CLIENT}" "${id}" "${NODE_ID}" "${dns}" "${NODE_PORT}" "${token}"
+    info "  ✅ 已下发到 ${CLIENT}（按 id=${id} 合并，token 不进命令行）"
+}
+
 usage() {
-    sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 parse_args() {
@@ -705,6 +777,13 @@ parse_args() {
             case "$1" in
                 --dry-run) DRY_RUN=1; shift; continue ;;
                 --local) LOCAL=1; shift; continue ;;
+                --client)
+                    [[ $# -ge 2 ]] || die "--client 需要一个 ssh 别名"
+                    CLIENT="$2"
+                    valid_host "${CLIENT}" || die "客户端别名不合法（只允许 [A-Za-z0-9._@-]，且不能以 - 开头）"
+                    shift 2
+                    continue
+                    ;;
                 -h | --help) usage; exit 0 ;;
                 --) only_pos=1; shift; continue ;;
                 -*) die "未知参数：$1" ;;
@@ -739,11 +818,15 @@ print_dry_run() {
     plan "7. 停止 v1 realtime_subtitle.remote.server 进程（精确匹配本人进程；先记录其命令行与 cwd；保留 ~/rs-remote 目录）"
     plan "8. 原子换名：~/rs-node → ~/rs-node.prev，~/rs-node.new → ~/rs-node"
     plan "9. 渲染 plist（不含 IP、不含 token）→ ~/Library/LaunchAgents/${LABEL}.plist；launchctl bootstrap gui/\$UID + kickstart -k"
-    plan "10. 经 UDS 请求 /v1/info，要求 200 且 v=2、node_id 匹配；再有界等待（RS_TCP_WAIT，默认 30 秒）确认 gateway 进程在 <Tailscale IP>:${NODE_PORT} LISTEN 且该端口无 */0.0.0.0 监听；任一失败 → 回滚（有 .prev 则恢复；无则删 plist、失败版留作 ~/rs-node.failed），并按记录重新拉起 v1、告警"
+    plan "10. 渲染 Tailscale 保活 plist（无参数）→ ~/Library/LaunchAgents/${TS_LABEL}.plist；launchctl bootstrap gui/\$UID（幂等：已存在先 bootout 再 bootstrap）"
+    plan "11. 经 UDS 请求 /v1/info，要求 200 且 v=2、node_id 匹配；再有界等待（RS_TCP_WAIT，默认 30 秒）确认 gateway 进程在 <Tailscale IP>:${NODE_PORT} LISTEN 且该端口无 */0.0.0.0 监听；任一失败 → 回滚（有 .prev 则恢复；无则删 plist、失败版留作 ~/rs-node.failed），并按记录重新拉起 v1、告警"
     if [[ "${LOCAL}" -eq 0 ]]; then
-        plan "11. 写 ~/.config/rslite/nodes.json（0600、按 id=${HOST##*@} 去重、原子写）：url=ws://<MagicDNS 名>:${NODE_PORT}"
+        plan "12. 写 ~/.config/rslite/nodes.json（0600、按 id=${HOST##*@} 去重、原子写）：url=ws://<MagicDNS 名>:${NODE_PORT}"
     else
-        plan "11. --local：不写 nodes.json（本机节点靠 UDS 发现）"
+        plan "12. --local：不写 nodes.json（本机节点靠 UDS 发现）"
+    fi
+    if [[ -n "${CLIENT}" ]]; then
+        plan "另：下发到 Windows 客户端 ${CLIENT}：scp push_client.ps1，再 powershell -File PushClient；按 id 合并 %APPDATA%\\realtime_subtitle\\nodes.json；token 经 stdin 写入 tokens\\<id>.token 并 icacls；内容 <redacted>"
     fi
 }
 
@@ -797,10 +880,13 @@ step_token() {
         tgt_run 'chmod 700 "$HOME/.config/rs-node" && chmod 600 "$HOME/.config/rs-node/token"' \
             || die "无法收紧目标机 token 的权限"
     fi
+    # 复制（不移动）为每设备目录里的 default。原文件留在原地，老客户端照常读它。
+    tgt_run 'umask 077; d="$HOME/.config/rs-node"; mkdir -p "$d/tokens"; chmod 700 "$d/tokens"; cp "$d/token" "$d/tokens/default.token"; chmod 600 "$d/tokens/default.token"' \
+        || die "token 目录迁移失败"
     if [[ -n "${client_file}" ]]; then
         write_secret_file "${client_file}" "${NODE_TOKEN}"
     fi
-    info "  ✅ token 就绪（目标机 ~/.config/rs-node/token）"
+    info "  ✅ token 就绪（目标机 ~/.config/rs-node/token，副本 tokens/default.token）"
 }
 
 step_deploy() {
@@ -812,6 +898,11 @@ step_deploy() {
     git -C "${REPO_ROOT}" archive --format=tar HEAD \
         | tgt_run 'rm -rf "$HOME/rs-node.new"; mkdir -p "$HOME/rs-node.new"; tar -x -C "$HOME/rs-node.new"' \
         || die "部署失败"
+    # 写入代码版本（短哈希）到 .rs_commit，供 cluster.py doctor 读取
+    local short_commit
+    short_commit=$(git -C "${REPO_ROOT}" rev-parse --short HEAD)
+    tgt_run "printf '%s\n' '${short_commit}' > \"\$HOME/rs-node.new/.rs_commit\"" \
+        || die "写入 .rs_commit 失败"
     info "[5/9] 安装 Python 环境（可能要几分钟）..."
     tgt_script "${BUILD_SH}" || { cleanup_new; die "目标机安装失败（旧版未受影响）"; }
 }
@@ -842,9 +933,9 @@ step_selfcheck() {
 }
 
 step_swap() {
-    info "[7/9] 停止 v1 远程服务..."
+    info "[7/10] 停止 v1 远程服务..."
     tgt_script "${STOP_V1_SH}" || warn "停止 v1 进程时出现问题，继续安装"
-    info "[8/9] 换名并启动 LaunchAgent..."
+    info "[8/10] 换名并启动 LaunchAgent..."
     local out
     out="$(tgt_script "${SWAP_SH}" "${LABEL}" "${NODE_PORT}")" || {
         printf '%s\n' "${out:-}" >&2
@@ -854,14 +945,40 @@ step_swap() {
     if grep -qx 'prev-kept' <<<"${out}"; then HAD_PREV=1; fi
 }
 
+step_ts_keepalive() {
+    info "[9/10] 安装 Tailscale 保活 LaunchAgent..."
+    local script='
+export PATH=${RS_TOOL_PATH_PREFIX:-/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS}:$PATH
+label="$1"
+plist="$HOME/Library/LaunchAgents/$label.plist"
+template="$HOME/rs-node/scripts/node/com.realtimesubtitle.tskeepalive.plist.template"
+mkdir -p "$HOME/Library/LaunchAgents"
+content=$(cat "$template") || { echo "读不到 tskeepalive plist 模板"; exit 1; }
+content=${content//@HOME@/$HOME}
+tmp="$plist.tmp.$$"
+printf "%s\n" "$content" > "$tmp" || { echo "写 plist 失败"; exit 1; }
+plutil -lint "$tmp" >/dev/null || { rm -f "$tmp"; echo "plist 校验失败"; exit 1; }
+mv "$tmp" "$plist" || { echo "plist 落盘失败"; exit 1; }
+# 幂等：已存在先 bootout 再 bootstrap
+launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+if ! launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null; then
+    echo "launchctl bootstrap 失败（目标机用户是否已登录桌面？LaunchAgent 需要登录会话）"
+    exit 1
+fi
+echo "tskeepalive-ok"
+'
+    tgt_script "$script" "$TS_LABEL" || die "Tailscale 保活 Agent 安装失败"
+}
+
 step_nodes_json() {
     if [[ "${LOCAL}" -eq 1 ]]; then
-        info "[9/9] --local：不写 nodes.json（本机节点靠 UDS 发现）"
+        info "[10/10] --local：不写 nodes.json（本机节点靠 UDS 发现）"
         return 0
     fi
-    info "[9/9] 写客户端 nodes.json..."
+    info "[10/10] 写客户端 nodes.json..."
     local dns id
     dns="$(resolve_magicdns)"
+    NODE_DNS="${dns}"
     [[ "${dns}" =~ ^[A-Za-z0-9.-]+$ ]] || die "MagicDNS 名异常，没有写 nodes.json"
     id="${HOST##*@}"
     merge_nodes_json "${HOME}/.config/rslite/nodes.json" "${id}" "${NODE_ID}" \
@@ -881,7 +998,9 @@ main() {
     step_deploy
     step_selfcheck
     step_swap
+    step_ts_keepalive
     step_nodes_json
+    step_push_client
     info ""
     local prev_note=""
     if [[ "${HAD_PREV}" == "1" ]]; then prev_note="；上一版保留在 ~/rs-node.prev"; fi

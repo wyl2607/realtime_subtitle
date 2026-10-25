@@ -7,19 +7,66 @@ import time
 import uuid
 from PyQt6.QtCore import Qt
 import realtime_subtitle.config as config
+import realtime_subtitle.ui.design_tokens as design_tokens
+
+
+def _hex_to_rgb(color):
+    body = (color or "").strip()
+    if body.startswith("#"):
+        body = body[1:]
+    if len(body) == 3:
+        body = "".join(c * 2 for c in body)
+    if len(body) != 6:
+        return None
+    try:
+        return tuple(int(body[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return None
+
+
+def _dim_color(color, factor=design_tokens.OPACITY_OLDER_PAIR):
+    rgb = _hex_to_rgb(color)
+    if rgb is None:
+        return color
+    return "#" + "".join(f"{round(channel * factor):02x}" for channel in rgb)
+
+
+def _display_mode():
+    mode = str(getattr(config, "DISPLAY_MODE", "") or "").lower()
+    if mode not in {"bilingual", "target", "source"}:
+        return "bilingual" if getattr(config, "SHOW_BILINGUAL", True) else "target"
+    if getattr(config, "SHOW_BILINGUAL", True):
+        return "bilingual"
+    return "target" if mode == "bilingual" else mode
+
+
 class LiveTextRenderMixin:
 
     def update_live(self, committed, unstable):
         """更新live德语行：committed=已提交未翻译（白），unstable=未稳定尾部（灰）"""
         self.signals.live.emit(committed or "", unstable or "")
 
-    def add_pair(self, german, chinese, revision=0):
-        """一段句对翻译完成，加入历史。revision = 发出时的语言代数（见 _add_pair）"""
-        self.signals.pair.emit(german or "", chinese or "", int(revision))
+    def add_pair(self, german, chinese, t0=None, t1=None, key=None, revision=0):
+        """一段句对翻译完成，加入历史。
+
+        兼容旧的 add_pair(german, chinese, revision)；新路径带 t0/t1/key。
+        """
+        if t1 is None and key is None and isinstance(t0, int):
+            revision = t0
+            t0 = None
+        meta = {"revision": int(revision), "t0": t0, "t1": t1,
+                "key": key, "source": "local"}
+        self.signals.pair.emit(german or "", chinese or "", meta)
 
     def update_draft(self, chinese, revision=0):
         """live 行的草稿译文（线程安全）。正式句对完成后自动清掉"""
         self.signals.draft.emit(chinese or "", int(revision))
+
+    def on_translate_failed(self, source_text, t0, t1, key, revision, reason):
+        """翻译失败或被丢弃（线程安全，从后台/worker线程调用）"""
+        self.signals.translate_failed.emit(
+            source_text or "", t0, t1, key or "", int(revision or 0), str(reason or "")
+        )
 
     def show_status(self, text):
         """显示一条状态提示（线程安全）。不进句对历史，下次内容更新时自然消失"""
@@ -48,6 +95,48 @@ class LiveTextRenderMixin:
         self.cinema_bar.update_draft(chinese)
         self._render()
 
+    def _on_translate_failed(self, source_text, t0, t1, key, revision, reason):
+        if self._is_stale_language(revision):
+            return
+        untranslated = design_tokens.TEXT_UNTRANSLATED
+        found = False
+        for index, item in enumerate(self.sentence_pairs):
+            if len(item) >= 7 and item[6] == key:
+                self.sentence_pairs[index] = (
+                    item[0] or source_text, untranslated, item[2], item[3], item[4], item[5], item[6]
+                )
+                found = True
+                break
+        if not found:
+            meta = {"revision": revision, "t0": t0, "t1": t1, "key": key, "source": "local"}
+            self._add_pair(source_text, untranslated, meta)
+        else:
+            self._render()
+            self.history_window.update_dst(key, untranslated, german=source_text)
+            self.tv_window.update_dst(key, untranslated, german=source_text)
+            self.cinema_bar.update_dst(key, untranslated, german=source_text)
+
+    def update_dst(self, key, dst, german=None):
+        """按 key 原地更新译文（主窗、历史窗、电视窗、影院条一致）"""
+        if not key:
+            return
+        changed = False
+        actual_german = german
+        for index, item in enumerate(self.sentence_pairs):
+            if len(item) >= 7 and item[6] == key:
+                if not actual_german:
+                    actual_german = item[0]
+                self.sentence_pairs[index] = (
+                    item[0], dst, item[2], item[3], item[4], item[5], item[6]
+                )
+                changed = True
+                break
+        if changed:
+            self._render()
+            self.history_window.update_dst(key, dst, german=actual_german)
+            self.tv_window.update_dst(key, dst, german=actual_german)
+            self.cinema_bar.update_dst(key, dst, german=actual_german)
+
     def _is_stale_language(self, revision):
         """这条事件是切换语言**之前**发出的吗（审核 O04）。
 
@@ -58,23 +147,38 @@ class LiveTextRenderMixin:
         current = getattr(self, "language_revision", 0)
         return int(revision or 0) < current
 
-    def _add_pair(self, german, chinese, revision=0):
+    @staticmethod
+    def _pair_meta(meta):
+        if isinstance(meta, dict):
+            return (
+                int(meta.get("revision") or 0),
+                meta.get("t0"),
+                meta.get("t1"),
+                meta.get("source") or "local",
+                meta.get("key"),
+            )
+        return int(meta or 0), None, None, "local", None
+
+    def _add_pair(self, german, chinese, meta=0):
+        revision, t0, t1, source, key = self._pair_meta(meta)
         if self._is_stale_language(revision):
             if config.SHOW_PERFORMANCE:
                 print(f"   🌐 丢弃切换语言前的句对（代数 {revision}）")
             return
-        # 第三元是墙钟时间：🤖 按"最近 N 分钟"过滤时用（二元组没法做时间窗）
-        self.sentence_pairs.append((german, chinese, time.time()))
+        if key:
+            for index, item in enumerate(self.sentence_pairs):
+                if len(item) >= 7 and item[6] == key:
+                    self.update_dst(key, chinese, german=german)
+                    return
+        self.sentence_pairs.append((german, chinese, time.time(), t0, t1, source, key))
         while len(self.sentence_pairs) > self.HISTORY_KEEP:
             self.sentence_pairs.pop(0)
         self.live_draft = ""  # 正式翻译到了，草稿退场
         self.status_line = ""
         self._status_clear_timer.stop()
-        self.history_window.append_pair(german, chinese)
-        self.tv_window.append_pair(chinese)
-        # 影院条要德语原文（它自己决定显不显示，见 CINEMA_SHOW_GERMAN），
-        # 所以传两个参数——和 tv_window 只要中文不一样
-        self.cinema_bar.append_pair(german, chinese)
+        self.history_window.append_pair(german, chinese, key=key)
+        self.tv_window.append_pair(chinese, key=key, german=german)
+        self.cinema_bar.append_pair(german, chinese, key=key)
         self._render()
         if config.SHOW_PERFORMANCE:
             print(f"💬 字幕: {chinese[:50]}{'...' if len(chinese) > 50 else ''}")
@@ -113,15 +217,56 @@ class LiveTextRenderMixin:
             return text[:config.MAX_SUBTITLE_LENGTH] + "..."
         return text
 
-    def _pair_html(self, german, chinese):
+    def _pair_html(self, german, chinese, *, dim=False, top_gap=False, key=None):
         """一条已完成句对的富文本块"""
         lines = []
-        if german and getattr(config, "SHOW_BILINGUAL", True):
-            lines.append(html.escape(self._clip(german)))
-        if chinese:
-            color = getattr(config, "CHINESE_TEXT_COLOR", "#c8c8c8")
-            lines.append(f'<span style="color:{color}">{html.escape(self._clip(chinese))}</span>')
-        return "<br>".join(lines)
+        opacity = design_tokens.OPACITY_OLDER_PAIR if dim else 1.0
+        mode = _display_mode()
+        source_size = round(config.FONT_SIZE * design_tokens.TYPE_SOURCE_SCALE)
+        source_color = getattr(config, "SOURCE_TEXT_COLOR",
+                               getattr(config, "TEXT_COLOR", design_tokens.COLOR_SUBTITLE_SOURCE))
+        is_untranslated = (chinese in (design_tokens.TEXT_UNTRANSLATED, "翻译中…"))
+        if is_untranslated:
+            target_color = design_tokens.COLOR_UNTRANSLATED
+        else:
+            target_color = getattr(config, "CHINESE_TEXT_COLOR", design_tokens.COLOR_SUBTITLE_TRANSLATION)
+        if dim:
+            source_color = _dim_color(source_color, opacity)
+            target_color = _dim_color(target_color, opacity)
+        if german and (mode in {"bilingual", "source"} or is_untranslated or not chinese):
+            lines.append(
+                f'<span style="color:{source_color};font-size:{source_size}px">'
+                f'{html.escape(self._clip(german))}</span>'
+            )
+        if chinese and (mode in {"bilingual", "target"} or is_untranslated):
+            if chinese == design_tokens.TEXT_UNTRANSLATED and key:
+                display_zh = (
+                    f'<a href="retry:{html.escape(str(key))}" '
+                    f'style="color:{target_color};text-decoration:none;">'
+                    f'{html.escape(chinese)}</a>'
+                )
+            else:
+                display_zh = html.escape(self._clip(chinese))
+            lines.append(
+                f'<span style="color:{target_color};font-size:{config.FONT_SIZE}px">'
+                f'{display_zh}</span>'
+            )
+        if not lines:
+            return ""
+        gap = "margin-top:0.45em;" if top_gap else ""
+        opacity_style = f"opacity:{opacity:.2f};" if dim else ""
+        return f'<div style="{gap}{opacity_style}">' + "<br>".join(lines) + "</div>"
+
+    @staticmethod
+    def _join_render_blocks(pair_blocks, fixed_blocks):
+        parts = []
+        if pair_blocks:
+            parts.append("".join(pair_blocks))
+        if fixed_blocks:
+            if parts:
+                parts.append("<br>")
+            parts.append("<br>".join(fixed_blocks))
+        return "".join(parts)
 
     def _live_block_html(self):
         """live行的富文本块：德语（白+灰色未稳定尾部）+ 草稿中文。
@@ -130,17 +275,19 @@ class LiveTextRenderMixin:
         句对遵守这个开关，说话过程中德语照样往外冒，和复选框文案直接矛盾。
         藏掉之后这段时间显示的是草稿中文，不会变成空白。
         """
-        bilingual = getattr(config, "SHOW_BILINGUAL", True)
+        mode = _display_mode()
+        show_source = mode in {"bilingual", "source"}
+        show_target = mode in {"bilingual", "target"}
         live_parts = []
-        if bilingual and self.live_committed:
+        if show_source and self.live_committed:
             live_parts.append(html.escape(self._clip(self.live_committed)))
-        if bilingual and self.live_unstable:
+        if show_source and self.live_unstable:
             color = getattr(config, "UNSTABLE_TEXT_COLOR", "#999999")
             live_parts.append(f'<span style="color:{color}"><i>{html.escape(self._clip(self.live_unstable))}</i></span>')
         live_block = " ".join(live_parts)
-        if self.live_draft:
+        if show_target and self.live_draft:
             # 草稿中文：正式翻译还没到之前先给一版（浅蓝斜体和正式中文区分）
-            draft_color = getattr(config, "DRAFT_TEXT_COLOR", "#8fb8e0")
+            draft_color = getattr(config, "DRAFT_TEXT_COLOR", design_tokens.COLOR_SUBTITLE_DRAFT)
             live_block += ('<br>' if live_block else '') + \
                 f'<span style="color:{draft_color}"><i>{html.escape(self._clip(self.live_draft))}</i></span>'
         return live_block
@@ -204,19 +351,33 @@ class LiveTextRenderMixin:
         # 热路径上（on_partial → _update_draft → _render）。
         # 结果与"全构造再取末尾 MAX 条非空"完全等价：这里同样跳过空块继续往回找
         keep = max(1, int(getattr(config, "MAX_SENTENCE_PAIRS", 20)))
-        pair_blocks = []
-        for g, c, _ in reversed(self.sentence_pairs):
-            block = self._pair_html(g, c)
+        pair_items = []
+        for item in reversed(self.sentence_pairs):
+            g, c = item[0], item[1]
+            k = item[6] if len(item) >= 7 else None
+            block = self._pair_html(g, c, key=k)
             if not block:
                 continue
-            pair_blocks.append(block)
-            if len(pair_blocks) >= keep:
+            pair_items.append((g, c, k))
+            if len(pair_items) >= keep:
                 break
-        pair_blocks.reverse()
-        cap = len(pair_blocks)
+        pair_items.reverse()
+        cap = len(pair_items)
+
+        def pair_blocks_for(count):
+            selected = pair_items[len(pair_items) - count:]
+            return [
+                self._pair_html(
+                    g, c,
+                    dim=(idx < len(selected) - 1),
+                    top_gap=(idx > 0),
+                    key=k,
+                )
+                for idx, (g, c, k) in enumerate(selected)
+            ]
 
         def fits(count):
-            doc.setHtml("<br>".join(pair_blocks[len(pair_blocks) - count:] + fixed))
+            doc.setHtml(self._join_render_blocks(pair_blocks_for(count), fixed))
             return doc.size().height() <= avail_h
 
         # 二分找能装下的最多句对数（fits随count单调递减；每次渲染最多
@@ -234,25 +395,40 @@ class LiveTextRenderMixin:
                 else:
                     hi = mid - 1
 
-        blocks = (pair_blocks[len(pair_blocks) - shown:] if shown else []) + fixed
-        if not blocks:
+        pair_blocks = pair_blocks_for(shown) if shown else []
+        if not pair_blocks and not fixed:
             return  # 什么都没有就保持现状（避免闪空白）
 
-        self._last_html = "<br>".join(blocks)
+        self._last_html = self._join_render_blocks(pair_blocks, fixed)
         self.window.setText(self._last_html)
         self.window.show()
 
+    def _handle_retry_click(self, key):
+        """点击「未翻译 ⟳」触发重试"""
+        retry_fn = getattr(self, "on_retry_translation", None)
+        success = False
+        if retry_fn is not None:
+            try:
+                success = bool(retry_fn(key))
+            except Exception as e:
+                print(f"⚠️ retry_translation 出错: {e}")
+                success = False
+        if success:
+            self.update_dst(key, "翻译中…")
+        else:
+            self.show_status("这句已过期，无法重试")
+
     # ------------------------------------------------------------------
-    # 点词查词
+    # 点词查词与未翻译重试
     # ------------------------------------------------------------------
     def _on_label_click(self, pos):
-        """容器上的原地单击：命中字幕文字里的德语词就发起词典查询。
+        """容器上的原地单击：命中未翻译链接触发重试；命中德语词发起词典查询。
 
         QLabel 的富文本没有词级点击API，这里用和渲染完全相同的
         QTextDocument 重建排版，documentLayout().hitTest 找到字符位置，
         再取词。注意 QLabel 是 AlignBottom：文档从内容区底部往上排。
         """
-        if not self.on_lookup or not self._last_html:
+        if not self._last_html:
             return
         lp = pos - self.window.pos()  # 容器坐标 → 字幕标签坐标
         if not self.window.rect().contains(lp):
@@ -265,10 +441,23 @@ class LiveTextRenderMixin:
         content_x0, content_y0 = 22, 17
         content_h = self.window.height() - 34
         doc_y0 = content_y0 + max(0, content_h - doc.size().height())  # AlignBottom
-        hit = doc.documentLayout().hitTest(
-            QPointF(lp.x() - content_x0, lp.y() - doc_y0), Qt.HitTestAccuracy.ExactHit)
+        doc_pt = QPointF(lp.x() - content_x0, lp.y() - doc_y0)
+        hit = doc.documentLayout().hitTest(doc_pt, Qt.HitTestAccuracy.ExactHit)
         if hit < 0:
             return  # 点在空白处
+
+        anchor = doc.documentLayout().anchorAt(doc_pt)
+        if not anchor:
+            cursor = QTextCursor(doc)
+            cursor.setPosition(hit)
+            anchor = cursor.charFormat().anchorHref()
+        if anchor and anchor.startswith("retry:"):
+            key = anchor[len("retry:"):]
+            self._handle_retry_click(key)
+            return
+
+        if not self.on_lookup:
+            return
 
         cursor = QTextCursor(doc)
         cursor.setPosition(hit)

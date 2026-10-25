@@ -31,6 +31,15 @@ struct NodeInfo: Codable, Equatable, Sendable {
     var onAC: Bool
     var inUse: Bool
     var worker: String
+    /// 缺失按 true（旧节点没有这个字段）。false 只表示翻译质量项记 0。
+    var translatorOK: Bool? = nil
+    /// 节点自报的机器状态、已用交换空间 GB 与当前换出速率（页/分）。旧节点没有，nil 不罚分。
+    var memPressure: String? = nil
+    var swapUsedGB: Double? = nil
+    var swapoutRate: Double? = nil
+
+    /// 字段缺失或 true 都算翻译可用；显式 false 才关闭翻译质量分。
+    var translatorQualityEnabled: Bool { translatorOK != false }
 
     enum CodingKeys: String, CodingKey {
         case v
@@ -42,6 +51,76 @@ struct NodeInfo: Codable, Equatable, Sendable {
         case onAC = "on_ac"
         case inUse = "in_use"
         case worker
+        case translatorOK = "translator_ok"
+        case memPressure = "mem_pressure"
+        case swapUsedGB = "swap_used_gb"
+        case swapoutRate = "swapout_rate"
+    }
+}
+
+/// 一次 /v1/info 测速结果。不包含 token。
+struct ProbeResult: Equatable, Sendable {
+    enum Availability: Equatable, Sendable {
+        case idle
+        case busy
+        case inUse
+        case offline
+        case unauthorized
+
+        var title: String {
+            switch self {
+            case .idle: return "空闲"
+            case .busy: return "忙"
+            case .inUse: return "有人在用"
+            case .offline: return "离线"
+            case .unauthorized: return "鉴权失败"
+            }
+        }
+    }
+
+    static let samplesPerNode = 3
+    static let timeout: Duration = .seconds(3)
+
+    var info: NodeInfo?
+    var rttMS: Double?
+    var availability: Availability
+
+    /// 有限样本的中位数。偶数个取中间两数的平均。空样本返回 nil。
+    static func median(_ samples: [Double]) -> Double? {
+        let values = samples.filter(\.isFinite).sorted()
+        guard !values.isEmpty else { return nil }
+        let mid = values.count / 2
+        if values.count % 2 == 1 {
+            return values[mid]
+        }
+        return (values[mid - 1] + values[mid]) / 2
+    }
+
+    static func availability(of info: NodeInfo) -> Availability {
+        if info.inUse { return .inUse }
+        if info.busy { return .busy }
+        return .idle
+    }
+
+    static func availability(of error: NodeClientError) -> Availability {
+        switch error {
+        case .unauthorized, .tokenUnavailable, .tokenPermissions:
+            return .unauthorized
+        default:
+            return .offline
+        }
+    }
+
+    /// 多次探测合成一条：成功样本的 RTT 取中位数；都失败时鉴权失败优先于离线。
+    static func combined(_ results: [ProbeResult]) -> ProbeResult {
+        let rtt = median(results.compactMap(\.rttMS))
+        if let info = results.lazy.compactMap(\.info).last {
+            return ProbeResult(info: info, rttMS: rtt, availability: availability(of: info))
+        }
+        if results.contains(where: { $0.availability == .unauthorized }) {
+            return ProbeResult(info: nil, rttMS: nil, availability: .unauthorized)
+        }
+        return ProbeResult(info: nil, rttMS: nil, availability: .offline)
     }
 }
 
@@ -124,6 +203,12 @@ private struct ReadyAudioBuffer {
     private var chunks: [WireAudio] = []
     private var byteCount = 0
 
+    // 私有存储属性会让 memberwise init 变成 private，Swift 6.3 里同文件的
+    // NodeClient 就构造不了；显式给出 internal init。
+    init(maxBytes: Int) {
+        self.maxBytes = maxBytes
+    }
+
     var isEmpty: Bool { chunks.isEmpty }
 
     mutating func append(_ audio: WireAudio) {
@@ -165,6 +250,15 @@ private struct ReadyAudioBuffer {
     }
 }
 
+/// 混合档的耗时诊断：send / recv / show 三行，时间戳与 headless 的 `t` 共用同一
+/// 个零点（main.swift 注入 CloudTiming），所以可以直接和事件流里的 t/t1 对账。
+/// 只写节点 id、句子 id、音频秒数和时刻——绝不写正文、音频或 token。
+enum NodeTiming {
+    static func write(_ line: @escaping (Double) -> String) {
+        CloudTiming.shared.write(line)
+    }
+}
+
 /// 节点会话的身份：节点 id + 该节点的会话代号。
 struct NodeSessionRef: Hashable, Sendable {
     var nodeID: String
@@ -203,6 +297,8 @@ struct NodeCallbacks: Sendable {
     var onFinal: @Sendable (String, Int, Int, String, Double?, Double?) -> Void = { _, _, _, _, _, _ in }
     var onTranslation: @Sendable (String, Int, Int, String) -> Void = { _, _, _, _ in }
     var onStatus: @Sendable (String) -> Void = { _ in }
+    /// 带 id 的 translate_failed。用户可见文案走 onStatus，这里只交句子 id。
+    var onTranslateFailed: @Sendable (String, Int, Int) -> Void = { _, _, _ in }
     var onClosed: @Sendable (String, Int, Error?) -> Void = { _, _, _ in }
 }
 
@@ -215,14 +311,22 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
     private static let frameBytes = 3200
     static let preReadyAudioSeconds = 15
     // 冷启动＝拉起 worker + import MLX + 加载权重，mini2 实测 >5s；预算对齐 RFC「冷启动后首条精修 ≤15s」，等待期间本机 B 照常出字
-    private static let readyTimeout: Duration = .seconds(preReadyAudioSeconds)
+    static let readyTimeoutSeconds = Double(preReadyAudioSeconds)
+    // 节点冷加载可能超过 15s（Windows 节点实测 17.4s）。每收到一条 loading 续 15s，
+    // 但从发出 hello 起总共不超过 60s；超过仍按 handshake_timeout 回退。
+    static let readyLoadingMaxSeconds = 60.0
     private static let readyBufferMaxBytes = preReadyAudioSeconds * 16_000 * 2
     private static let closeTimeout: Duration = .seconds(2)
+
+    /// 自测注入口：生产调用点传 nil，按节点类型建真实 URLSession/UDS 连接。
+    typealias SocketFactory = @Sendable () throws -> NodeWebSocketTask
 
     private let config: NodeConfig
     private let token: String
     private let info: NodeInfo
     private let udsPath: String?
+    private let socketFactory: SocketFactory?
+    private let readyTimeout: Double
     private let sourceLocaleID: String
     private let targetLanguageID: String
     private var offsetSeconds: Double
@@ -239,9 +343,13 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
     private var remoteCloseCode: Int?
     private var closedNotified = false
     private var heartbeatTask: Task<Void, Never>?
+    /// 同一条 WebSocket 会话里，翻译不可用只对用户说一次。
+    private var translateFailureAnnounced = false
     /// 节点时钟 = 已发给节点的样本数 / 16000；首个音频块到来时把 offset 对齐到它的 startSeconds。
     private var clockStarted = false
     private var sentSamples = 0
+    /// send 埋点按音频秒整数边界节流：一段 run 只留 ~1 行/秒，够看发送是否落后。
+    private var lastSendLogSecond = -1
     private let closeFrameReceived = OneShotGate()
     private let finished = OneShotGate()
 
@@ -254,12 +362,16 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         targetLanguageID: String,
         offsetSeconds: Double,
         sessionGeneration: Int,
-        callbacks: NodeCallbacks
+        callbacks: NodeCallbacks,
+        socketFactory: SocketFactory? = nil,
+        readyTimeoutSeconds: Double = NodeClient.readyTimeoutSeconds
     ) {
         self.config = config
         self.token = token
         self.info = info
         self.udsPath = udsPath
+        self.socketFactory = socketFactory
+        self.readyTimeout = readyTimeoutSeconds
         self.sourceLocaleID = sourceLocaleID
         self.targetLanguageID = targetLanguageID
         self.offsetSeconds = offsetSeconds
@@ -275,9 +387,10 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         guard let token = readTokenFile(config.tokenFile) else {
             throw NodeClientError.tokenUnavailable(config.id)
         }
-        guard let infoURL = infoURL(from: config.url) else {
+        guard let rawInfoURL = infoURL(from: config.url) else {
             throw NodeClientError.badURL(config.url)
         }
+        let infoURL = try TailnetPin.pinned(rawInfoURL)
         var request = URLRequest(url: infoURL)
         request.timeoutInterval = timeout.secondsValue
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -300,36 +413,58 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         return (token, info)
     }
 
-    func connect() async throws {
-        // P6 的 nodes.json 只记 ws://<名>:8791（install_node.sh 就这么写），会话路径由客户端补；
-        // 不补的话升级请求打到 "/"，gateway 只认 /v2/session，真节点上必然连不上。
+    /// 测速用的 /v1/info。走 `prepare`：同一份 token 文件、同一条直连 URLSession（空代理字典，不走代理）。
+    /// 默认超时 3 秒。结果里没有 token。
+    static func probeInfo(config: NodeConfig, timeout: Duration = ProbeResult.timeout) async -> ProbeResult {
+        let started = ContinuousClock().now
+        do {
+            let (_, info) = try await prepare(config: config, timeout: timeout)
+            let rtt = max(0, started.duration(to: ContinuousClock().now).secondsValue * 1000)
+            return ProbeResult(info: info, rttMS: rtt, availability: ProbeResult.availability(of: info))
+        } catch let error as NodeClientError {
+            return ProbeResult(info: nil, rttMS: nil, availability: ProbeResult.availability(of: error))
+        } catch {
+            return ProbeResult(info: nil, rttMS: nil, availability: .offline)
+        }
+    }
+
+    /// P6 的 nodes.json 只记 ws://<名>:8791（install_node.sh 就这么写），会话路径由客户端补；
+    /// 不补的话升级请求打到 "/"，gateway 只认 /v2/session，真节点上必然连不上。
+    private func makeSocket() throws -> (NodeWebSocketTask, URLSession?) {
+        if let socketFactory {
+            return (try socketFactory(), nil)
+        }
         if config.id == NodeRouter.localUDSID {
             guard let udsPath else {
                 throw NodeClientError.badURL(config.id)
             }
-            let udsTask = try UDSWebSocketTask(path: udsPath)
-            lock.withLockVoid { self.socket = udsTask }
-            udsTask.resume()
-        } else {
-            guard var components = URLComponents(string: config.url) else {
-                throw NodeClientError.badURL(config.url)
-            }
-            if components.path.isEmpty || components.path == "/" {
-                components.path = "/v2/session"
-            }
-            guard let url = components.url else {
-                throw NodeClientError.badURL(config.url)
-            }
-            var request = URLRequest(url: url)
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-            let sessionConfiguration = Self.directSessionConfiguration(timeout: 24 * 60 * 60)
-            let session = URLSession(configuration: sessionConfiguration, delegate: self, delegateQueue: nil)
-            let socket = session.webSocketTask(with: request)
-            lock.withLockVoid {
-                self.session = session
-                self.socket = socket
-            }
-            socket.resume()
+            return (try UDSWebSocketTask(path: udsPath), nil)
+        }
+        guard var components = URLComponents(string: config.url) else {
+            throw NodeClientError.badURL(config.url)
+        }
+        if components.path.isEmpty || components.path == "/" {
+            components.path = "/v2/session"
+        }
+        guard let rawURL = components.url else {
+            throw NodeClientError.badURL(config.url)
+        }
+        let url = try TailnetPin.pinned(rawURL)
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let sessionConfiguration = Self.directSessionConfiguration(timeout: 24 * 60 * 60)
+        let session = URLSession(configuration: sessionConfiguration, delegate: self, delegateQueue: nil)
+        return (session.webSocketTask(with: request), session)
+    }
+
+    func connect() async throws {
+        // 建 socket 的同步错误（badURL、Tailnet 校验、UDS 路径）在 do 外直接抛，和改动前一样：
+        // classify 对非 NodeClientError 会空等 1 秒 close 帧，而这时根本还没有连接。
+        let (socket, session) = try makeSocket()
+        // socket 与 session 一起发布：close() 看到 socket 时也一定能拿到 session 去取消。
+        lock.withLockVoid {
+            self.socket = socket
+            self.session = session
         }
         do {
             let hello: [String: Any] = [
@@ -340,11 +475,12 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
                 "sample_rate": 16_000,
                 "format": "s16le",
             ]
-            guard let socket = currentSocket() else {
-                throw NodeClientError.connection("socket closed")
-            }
-            try await socket.send(.string(Self.jsonString(hello)))
-            try await awaitReady(socket)
+            // 截止从 resume 起算：URLSessionWebSocketTask.send 要等升级握手完成才返回，
+            // 远端不可达时一直挂着（2026-10-22 本机实测：连不可路由地址 30s 仍未返回；cancel 后 0.1s 内抛 -999）。若从 send 返回后才起算，
+            // 这段时间路由会一直停在 switching，ready 的 15s/60s 预算完全失效。
+            let helloAt = Self.monotonic()
+            socket.resume()
+            try await awaitReady(socket, helloAt: helloAt, hello: Self.jsonString(hello))
             try await flushReadyBuffer(socket)
             callbacks.onReady(config.id, sessionGeneration, info)
             Task { await receiveLoop(socket) }
@@ -425,6 +561,27 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
             pending.removeFirst(n)
         }
         lock.withLockVoid { sentSamples += audio.samples }
+        logSend(audio)
+    }
+
+    /// 发送是否落后于墙钟：audio_end 是样本时钟，t 是同一个零点上的墙钟。
+    private func logSend(_ audio: WireAudio) {
+        let end = audio.startSeconds + Double(audio.samples) / 16_000
+        let second = Int(end.rounded(.down))
+        let shouldLog = lock.withLockValue { () -> Bool in
+            guard second > lastSendLogSecond else { return false }
+            lastSendLogSecond = second
+            return true
+        }
+        guard shouldLog else { return }
+        let nodeID = config.id
+        NodeTiming.write { now in
+            String(
+                format: "rslite.node send node=%@ audio_end=%.3f t=%.3f\n",
+                locale: Locale(identifier: "en_US_POSIX"),
+                nodeID, end, now
+            )
+        }
     }
 
     private func flushReadyBuffer(_ socket: NodeWebSocketTask) async throws {
@@ -500,9 +657,10 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
             readyBuffer.removeAll()
             return (socket, session)
         }
-        guard let (socket, session) = pair else {
+        guard let pair else {
             return
         }
+        let (socket, session): (NodeWebSocketTask?, URLSession?) = pair
         let heartbeat = lock.withLockValue { heartbeatTask }
         heartbeat?.cancel()
         socket?.cancel(with: .normalClosure, reason: nil)
@@ -535,25 +693,75 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         finished.open()
     }
 
-    private func awaitReady(_ socket: NodeWebSocketTask) async throws {
+    /// 纯函数：loading 到达时把 deadline 推到 now+15s，但不超过 helloAt+60s。
+    static func readyDeadline(
+        helloAt: Double,
+        now: Double,
+        current: Double,
+        receivedLoading: Bool,
+        timeout: Double = readyTimeoutSeconds,
+        maxTotal: Double = readyLoadingMaxSeconds
+    ) -> Double {
+        let cap = helloAt + maxTotal
+        if receivedLoading {
+            return min(cap, now + timeout)
+        }
+        return min(cap, current)
+    }
+
+    static func loadingStatus(nodeID: String) -> String {
+        nodeID + DesignTokens.Text.nodeLoadingSuffix
+    }
+
+    /// helloAt 是 resume 时刻：send(hello) 与等 ready 共用同一个截止。
+    private func awaitReady(_ socket: NodeWebSocketTask, helloAt: Double, hello: String) async throws {
+        let deadline = ReadyDeadlineBox(
+            helloAt: helloAt,
+            current: Self.readyDeadline(
+                helloAt: helloAt, now: helloAt, current: helloAt + readyTimeout,
+                receivedLoading: false, timeout: readyTimeout
+            ),
+            timeout: readyTimeout
+        )
         try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask {
+            // send 与 receive 必须在同一个子任务里：group.next() 只返回第一个完成的子任务，
+            // send 成功返回不能当成 ready。
+            group.addTask { [weak self] in
+                try await socket.send(.string(hello))
                 while true {
                     let message = try await socket.receive()
-                    if case .string(let text) = message,
-                       Self.parseEvent(text)?["ev"] as? String == "ready" {
+                    guard case .string(let text) = message,
+                          let event = Self.parseEvent(text) else {
+                        continue
+                    }
+                    if event["ev"] as? String == "ready" {
                         return
+                    }
+                    if event["ev"] as? String == "status", event["code"] as? String == "loading" {
+                        deadline.extend(now: Self.monotonic())
+                        if let self {
+                            self.callbacks.onStatus(Self.loadingStatus(nodeID: self.config.id))
+                        }
                     }
                 }
             }
             group.addTask {
-                do {
-                    try await Task.sleep(for: Self.readyTimeout)
-                } catch {
-                    return
+                while true {
+                    let remaining = deadline.current - Self.monotonic()
+                    if remaining <= 0 {
+                        socket.cancel(with: .goingAway, reason: nil)
+                        throw NodeClientError.timeout
+                    }
+                    do {
+                        try await Task.sleep(for: .seconds(remaining))
+                    } catch {
+                        return
+                    }
+                    if Self.monotonic() >= deadline.current {
+                        socket.cancel(with: .goingAway, reason: nil)
+                        throw NodeClientError.timeout
+                    }
                 }
-                socket.cancel(with: .goingAway, reason: nil)
-                throw NodeClientError.timeout
             }
             do {
                 try await group.next()
@@ -644,17 +852,48 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         }
         switch ev {
         case "final":
-            guard let id = event["id"] as? Int, let body = event["text"] as? String else { return }
+            guard let id = Self.eventInt(event["id"]), let body = event["text"] as? String else { return }
             let offset = lock.withLockValue { offsetSeconds }
             let t0 = (event["a0"] as? Double).map { $0 + offset }
             let t1 = (event["a1"] as? Double).map { $0 + offset }
+            // final 到达时刻 - a1 = 节点侧「段尾静音等待 + 识别 + 回传」；与 t 同源。
+            let nodeID = config.id
+            NodeTiming.write { now in
+                String(
+                    format: "rslite.node recv node=%@ ev=final id=%d a1=%.3f t=%.3f\n",
+                    locale: Locale(identifier: "en_US_POSIX"),
+                    nodeID, id, t1 ?? -1, now
+                )
+            }
             callbacks.onFinal(config.id, sessionGeneration, id, body, t0, t1)
         case "translation":
-            guard let id = event["id"] as? Int, let body = event["text"] as? String else { return }
+            guard let id = Self.eventInt(event["id"]), let body = event["text"] as? String else { return }
+            let nodeID = config.id
+            NodeTiming.write { now in
+                String(
+                    format: "rslite.node recv node=%@ ev=translation id=%d t=%.3f\n",
+                    locale: Locale(identifier: "en_US_POSIX"),
+                    nodeID, id, now
+                )
+            }
             callbacks.onTranslation(config.id, sessionGeneration, id, body)
         case "status":
-            if let code = event["code"] as? String {
-                callbacks.onStatus("节点 \(config.id)：\(code)")
+            guard let code = event["code"] as? String else { return }
+            let effect = lock.withLockValue { () -> NodeStatusEffect in
+                let effect = Self.presentNodeStatus(
+                    nodeID: config.id,
+                    code: code,
+                    sentenceID: Self.eventInt(event["id"]),
+                    alreadyAnnounced: translateFailureAnnounced
+                )
+                translateFailureAnnounced = effect.announced
+                return effect
+            }
+            if let text = effect.text {
+                callbacks.onStatus(text)
+            }
+            if let id = effect.translateFailedID {
+                callbacks.onTranslateFailed(config.id, sessionGeneration, id)
             }
         case "drained":
             NodeDrainWaiters.shared.open(session: NodeSessionRef(nodeID: config.id, generation: sessionGeneration))
@@ -779,6 +1018,45 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
         return String(data: data ?? Data(), encoding: .utf8) ?? "{}"
     }
 
+    private struct NodeStatusEffect {
+        var text: String?
+        var translateFailedID: Int?
+        var announced: Bool
+    }
+
+    /// 同一会话第一次 translate_failed 给一句人话；之后只回传 id，不再刷原始码。
+    private static func presentNodeStatus(
+        nodeID: String,
+        code: String,
+        sentenceID: Int?,
+        alreadyAnnounced: Bool
+    ) -> NodeStatusEffect {
+        if code == "translate_failed" {
+            let text = alreadyAnnounced ? nil : "节点 \(nodeID)：翻译暂不可用，改用本机翻译"
+            return NodeStatusEffect(text: text, translateFailedID: sentenceID, announced: true)
+        }
+        return NodeStatusEffect(
+            text: "节点 \(nodeID)：\(code)",
+            translateFailedID: nil,
+            announced: alreadyAnnounced
+        )
+    }
+
+    /// JSON 数字在 JSONSerialization 里是 NSNumber。`is Bool` 会把 0 和 1 当成布尔，所以用 CFBoolean 区分。
+    private static func eventInt(_ value: Any?) -> Int? {
+        guard let number = value as? NSNumber else { return nil }
+        if CFGetTypeID(number as CFTypeRef) == CFBooleanGetTypeID() {
+            return nil
+        }
+        let double = number.doubleValue
+        guard double.rounded() == double,
+              double >= Double(Int.min),
+              double <= Double(Int.max) else {
+            return nil
+        }
+        return Int(double)
+    }
+
     private static func parseEvent(_ text: String) -> [String: Any]? {
         guard let data = text.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data),
@@ -861,6 +1139,34 @@ final class PongClock: @unchecked Sendable {
 }
 
 @available(macOS 27.0, *)
+/// awaitReady 的跨任务截止时间：收包任务续期，超时任务按当前值重新睡。
+final class ReadyDeadlineBox: @unchecked Sendable {
+    private let helloAt: Double
+    private let timeout: Double
+    private let lock = NSLock()
+    private var deadline: Double
+
+    init(helloAt: Double, current: Double, timeout: Double = NodeClient.readyTimeoutSeconds) {
+        self.helloAt = helloAt
+        self.timeout = timeout
+        self.deadline = current
+    }
+
+    var current: Double {
+        lock.withLockValue { deadline }
+    }
+
+    func extend(now: Double) {
+        lock.withLockVoid {
+            deadline = NodeClient.readyDeadline(
+                helloAt: helloAt, now: now, current: deadline,
+                receivedLoading: true, timeout: timeout
+            )
+        }
+    }
+}
+
+@available(macOS 27.0, *)
 extension NodeClient {
     static func selfTest() -> [String] {
         var failures: [String] = []
@@ -876,6 +1182,23 @@ extension NodeClient {
             }
             return false
         }
+        // 冷加载续期：基础 15s；loading 每条续 15s；总上限 hello+60s。
+        check(readyDeadline(helloAt: 0, now: 0, current: 15, receivedLoading: false) == 15,
+              "ready 无 loading 时保持基础 15s")
+        check(readyDeadline(helloAt: 0, now: 10, current: 15, receivedLoading: true) == 25,
+              "ready 收到 loading 后续 15s")
+        check(readyDeadline(helloAt: 0, now: 50, current: 60, receivedLoading: true) == 60,
+              "ready 续期不能超过 hello+60s")
+        check(readyDeadline(helloAt: 0, now: 59, current: 60, receivedLoading: true) == 60,
+              "ready 接近 60s 上限时不再后移")
+        check(readyDeadline(helloAt: 0, now: 14, current: 15, receivedLoading: true) == 29,
+              "ready 持续 loading 时 15s 未到不超时")
+        check(readyDeadline(helloAt: 0, now: 16, current: 15, receivedLoading: false) == 15,
+              "ready loading 停止后 15s 仍按原截止时间超时")
+        check(readyDeadline(helloAt: 0, now: 60, current: 60, receivedLoading: true) == 60,
+              "ready 持续 loading 超过 60s 仍超时")
+        check(loadingStatus(nodeID: "desk") == "desk" + DesignTokens.Text.nodeLoadingSuffix,
+              "节点加载中状态行用节点名 + 设计令牌")
         // 心跳：10s 一发，发出后 10s 无 pong 判死
         check(HeartbeatPolicy.step(now: 5, lastPingSentAt: 0, lastPongAt: 0) == .none, "心跳：未到间隔不发 ping")
         check(HeartbeatPolicy.step(now: 10, lastPingSentAt: 0, lastPongAt: 0) == .sendPing, "心跳：到间隔发 ping")
@@ -1003,11 +1326,208 @@ extension NodeClient {
         }
         check(Self.directSessionConfiguration(timeout: 1).connectionProxyDictionary?.isEmpty == true,
               "NodeClient URLSession 应显式直连不走系统代理")
+        do {
+            let down = """
+            {"v":2,"node_id":"yzwdmsnlmm","hw_hash":"h","asr":{"model":"whisper-large-v3-turbo","rtf":0.08},"translator":"ollama:qwen","busy":false,"on_ac":true,"in_use":false,"worker":"warm","translator_ok":false}
+            """
+            let info = try JSONDecoder().decode(NodeInfo.self, from: Data(down.utf8))
+            check(info.translatorOK == false && info.translatorQualityEnabled == false,
+                  "translator_ok=false 应解码且关闭翻译质量")
+            let up = """
+            {"v":2,"node_id":"yzwdmsnlmm","hw_hash":"h","asr":{},"translator":"apple","busy":false,"on_ac":true,"in_use":false,"worker":"warm","translator_ok":true}
+            """
+            let upInfo = try JSONDecoder().decode(NodeInfo.self, from: Data(up.utf8))
+            check(upInfo.translatorOK == true && upInfo.translatorQualityEnabled,
+                  "translator_ok=true 应保持翻译质量")
+            let old = """
+            {"v":2,"node_id":"yzwdmsnlmm","hw_hash":"h","asr":{},"translator":"apple","busy":false,"on_ac":true,"in_use":false,"worker":"warm"}
+            """
+            let oldInfo = try JSONDecoder().decode(NodeInfo.self, from: Data(old.utf8))
+            check(oldInfo.translatorOK == nil && oldInfo.translatorQualityEnabled,
+                  "translator_ok 缺失按 true")
+        } catch {
+            check(false, "NodeInfo translator_ok 解码失败：\(error)")
+        }
+        final class StatusCapture: @unchecked Sendable {
+            var texts: [String] = []
+            var failed: [(String, Int, Int)] = []
+        }
+        let friendly = "节点 yzwdmsnlmm：翻译暂不可用，改用本机翻译"
+        let info = NodeInfo(
+            v: 2, nodeID: "n", hwHash: "h", asr: .init(),
+            translator: "ollama:qwen", busy: false, onAC: true, inUse: false, worker: "warm"
+        )
+        func makeClient(_ capture: StatusCapture, generation: Int) -> NodeClient {
+            NodeClient(
+                config: NodeConfig(id: "yzwdmsnlmm", nodeID: "n", url: "ws://x", tokenFile: "/tmp/t"),
+                token: "",
+                info: info,
+                sourceLocaleID: "de-DE",
+                targetLanguageID: "zh-Hans",
+                offsetSeconds: 0,
+                sessionGeneration: generation,
+                callbacks: NodeCallbacks(
+                    onStatus: { capture.texts.append($0) },
+                    onTranslateFailed: { capture.failed.append(($0, $1, $2)) }
+                )
+            )
+        }
+        let first = StatusCapture()
+        let client = makeClient(first, generation: 3)
+        client.acceptForSelfTest(#"{"ev":"status","code":"translate_failed"}"#)
+        client.acceptForSelfTest(#"{"ev":"status","code":"translate_failed","id":7}"#)
+        client.acceptForSelfTest(#"{"ev":"status","code":"translate_failed","id":8}"#)
+        client.acceptForSelfTest(#"{"ev":"status","code":"audio_dropped"}"#)
+        check(first.texts == [friendly, "节点 yzwdmsnlmm：audio_dropped"],
+              "同一会话只提示一次翻译暂不可用，其它状态码保持原样")
+        check(first.texts.allSatisfy { !$0.contains("translate_failed") },
+              "用户可见文案不得包含 translate_failed")
+        check(first.failed.count == 2
+              && first.failed[0].0 == "yzwdmsnlmm" && first.failed[0].1 == 3 && first.failed[0].2 == 7
+              && first.failed[1].0 == "yzwdmsnlmm" && first.failed[1].1 == 3 && first.failed[1].2 == 8,
+              "同会话后续带 id 的 translate_failed 仍要交回本机翻译")
+        let second = StatusCapture()
+        let client2 = makeClient(second, generation: 4)
+        client2.acceptForSelfTest(#"{"ev":"status","code":"translate_failed","id":1}"#)
+        check(second.texts == [friendly]
+              && second.failed.count == 1
+              && second.failed[0].0 == "yzwdmsnlmm" && second.failed[0].1 == 4 && second.failed[0].2 == 1,
+              "新会话的第一次 translate_failed 应再次提示，id=1 也要交回")
+        check(Self.eventInt(Self.parseEvent(#"{"id":1,"ok":true}"#)?["id"]) == 1,
+              "JSON 整数 1 不得被当成布尔")
+        check(Self.eventInt(Self.parseEvent(#"{"id":true}"#)?["id"]) == nil,
+              "JSON 布尔不是句子 id")
+        check(ProbeResult.median([30, 10, 20]) == 20, "ProbeResult 3 次 RTT 取中位数")
+        check(ProbeResult.median([1, 3]) == 2, "ProbeResult 偶数个样本取中间平均")
+        check(ProbeResult.median([4]) == 4, "ProbeResult 单个样本就是中位数")
+        check(ProbeResult.median([]) == nil, "ProbeResult 空样本没有中位数")
+        check(ProbeResult.median([.nan, 4, .infinity, 8]) == 6, "ProbeResult 中位数忽略非有限值")
+        check(ProbeResult.samplesPerNode == 3, "每个节点测 3 次")
+        check(ProbeResult.timeout == .seconds(3), "测速超时 3 秒")
+        let idleInfo = NodeInfo(
+            v: 2, nodeID: "n", hwHash: "h", asr: .init(model: "whisper-large-v3-turbo", rtf: 0.1),
+            translator: "apple", busy: false, onAC: true, inUse: false, worker: "warm"
+        )
+        var busyInfo = idleInfo
+        busyInfo.busy = true
+        var usedInfo = idleInfo
+        usedInfo.inUse = true
+        usedInfo.busy = true
+        check(ProbeResult.availability(of: idleInfo) == .idle, "未占用且不忙是空闲")
+        check(ProbeResult.availability(of: busyInfo) == .busy, "busy 是忙")
+        check(ProbeResult.availability(of: usedInfo) == .inUse, "有人在用优先于忙")
+        check(ProbeResult.availability(of: NodeClientError.unauthorized) == .unauthorized, "401 是鉴权失败")
+        check(ProbeResult.availability(of: NodeClientError.tokenUnavailable("/tmp/secret-token-value")) == .unauthorized, "token 文件不可用算鉴权失败")
+        check(ProbeResult.availability(of: NodeClientError.timeout) == .offline, "超时算离线")
+        check(ProbeResult.availability(of: NodeClientError.tokenUnavailable("/tmp/secret-token-value")).title == "鉴权失败", "鉴权状态不带 token 路径")
+        let combined = ProbeResult.combined([
+            ProbeResult(info: nil, rttMS: 30, availability: .offline),
+            ProbeResult(info: idleInfo, rttMS: 10, availability: .idle),
+            ProbeResult(info: idleInfo, rttMS: 20, availability: .idle),
+        ])
+        check(combined.rttMS == 20 && combined.availability == .idle && combined.info == idleInfo, "ProbeResult 合并三次取中位数")
+        let denied = ProbeResult.combined([
+            ProbeResult(info: nil, rttMS: nil, availability: .offline),
+            ProbeResult(info: nil, rttMS: nil, availability: .unauthorized),
+        ])
+        check(denied.availability == .unauthorized && denied.rttMS == nil && denied.info == nil, "都失败时鉴权失败优先于离线")
+        // 握手截止覆盖 send(hello)：远端 URLSession 的请求超时是 24h，send 在升级完成前
+        // 可能一直等系统 TCP 超时。看门狗必须从 resume 起算，而不是 send 返回之后。
+        func connectingClient(_ socket: FakeNodeSocket, readyTimeout: Double) -> NodeClient {
+            NodeClient(
+                config: NodeConfig(id: "fake", nodeID: "n", url: "ws://x", tokenFile: "/tmp/t"),
+                token: "",
+                info: NodeInfo(
+                    v: 2, nodeID: "n", hwHash: "h", asr: .init(),
+                    translator: "apple", busy: false, onAC: true, inUse: false, worker: "warm"
+                ),
+                sourceLocaleID: "de-DE",
+                targetLanguageID: "zh-Hans",
+                offsetSeconds: 0,
+                sessionGeneration: 1,
+                callbacks: NodeCallbacks(),
+                socketFactory: { socket },
+                readyTimeoutSeconds: readyTimeout
+            )
+        }
+        final class AsyncOutcome: @unchecked Sendable {
+            private let lock = NSLock()
+            private var result: Result<Void, Error>?
+            func set(_ value: Result<Void, Error>) { lock.withLockVoid { result = value } }
+            func get() -> Result<Void, Error>? { lock.withLockValue { result } }
+        }
+        // 外层兜底：被测实现若一直挂着，自测不能跟着挂死。
+        func runAsync(
+            timeout: Double,
+            _ body: @escaping @Sendable () async throws -> Void
+        ) -> Result<Void, Error>? {
+            let outcome = AsyncOutcome()
+            let done = DispatchSemaphore(value: 0)
+            Task.detached {
+                do {
+                    try await body()
+                    outcome.set(.success(()))
+                } catch {
+                    outcome.set(.failure(error))
+                }
+                done.signal()
+            }
+            guard done.wait(timeout: .now() + timeout) == .success else {
+                return nil
+            }
+            return outcome.get()
+        }
+        do {
+            let socket = FakeNodeSocket(behavior: .sendNeverReturns)
+            let client = connectingClient(socket, readyTimeout: 0.3)
+            let outcome = runAsync(timeout: 3) {
+                try await client.connect()
+            }
+            var timedOut = false
+            if case .failure(let error)? = outcome, case NodeClientError.timeout = error {
+                timedOut = true
+            }
+            check(outcome != nil, "send 卡住时 connect 不能挂死（外层 3s 兜底）")
+            check(timedOut, "send 卡住时 connect 应在注入的 0.3s 后抛 .timeout")
+            check(socket.isCanceled, "握手超时必须 cancel socket")
+        }
+        do {
+            let socket = FakeNodeSocket(behavior: .readyAfter(0.1))
+            let client = connectingClient(socket, readyTimeout: 1.5)
+            let outcome = runAsync(timeout: 4) {
+                try await client.connect()
+                await client.close()
+            }
+            if case .success? = outcome {
+                check(true, "send 立即返回 + 0.1s ready 应成功，不能把 send 完成当成 ready")
+            } else {
+                check(false, "send 立即返回 + 0.1s ready 应成功，不能把 send 完成当成 ready")
+            }
+        }
+        do {
+            // 初始截止 2.0s；loading 在 1.4s 到达续到 3.4s，ready 在 2.7s——
+            // 总时长超过初始截止，但在续期内（各留 ≥0.6s 余量：今晚三个会话共用 CPU，调度抖动大）。
+            let socket = FakeNodeSocket(behavior: .loadingThenReady(loadingAfter: 1.4, readyAfter: 2.7))
+            let client = connectingClient(socket, readyTimeout: 2.0)
+            let outcome = runAsync(timeout: 6) {
+                try await client.connect()
+                await client.close()
+            }
+            if case .success? = outcome {
+                check(true, "loading 续期应覆盖初始短超时，ready 后连接成功")
+            } else {
+                check(false, "loading 续期应覆盖初始短超时，ready 后连接成功")
+            }
+        }
         return failures
     }
 
     func udsPathForSelfTest() -> String? {
         udsPath
+    }
+
+    func acceptForSelfTest(_ text: String) {
+        handle(text)
     }
 }
 
@@ -1044,4 +1564,104 @@ protocol NodeWebSocketTask: Sendable {
 extension URLSessionWebSocketTask: NodeWebSocketTask {
     var nodeCloseCode: Int { closeCode.rawValue }
     var completesCloseOnCancel: Bool { false }
+}
+
+/// 握手截止的自测替身：send 可挂在续期里不返回，cancel 时释放，模拟升级握手卡住。
+@available(macOS 27.0, *)
+private final class FakeNodeSocket: NodeWebSocketTask, @unchecked Sendable {
+    enum Behavior {
+        case sendNeverReturns
+        case readyAfter(Double)
+        case loadingThenReady(loadingAfter: Double, readyAfter: Double)
+    }
+
+    private let behavior: Behavior
+    private let lock = NSLock()
+    private var canceled = false
+    private var pendingSend: CheckedContinuation<Void, Error>?
+    private var pendingReceive: CheckedContinuation<URLSessionWebSocketTask.Message, Error>?
+    private var receiveCount = 0
+
+    init(behavior: Behavior) {
+        self.behavior = behavior
+    }
+
+    var nodeCloseCode: Int { 1005 }
+    var completesCloseOnCancel: Bool { true }
+    var isCanceled: Bool { lock.withLockValue { canceled } }
+
+    func resume() {}
+
+    func send(_ message: URLSessionWebSocketTask.Message) async throws {
+        guard case .sendNeverReturns = behavior else {
+            return
+        }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            lock.lock()
+            if canceled {
+                lock.unlock()
+                continuation.resume(throwing: NodeClientError.connection("canceled"))
+                return
+            }
+            pendingSend = continuation
+            lock.unlock()
+        }
+    }
+
+    func receive() async throws -> URLSessionWebSocketTask.Message {
+        switch behavior {
+        case .sendNeverReturns:
+            return try await blockUntilCanceled()
+        case .readyAfter(let delay):
+            let index = lock.withLockValue { receiveCount }
+            lock.withLockVoid { receiveCount += 1 }
+            if index == 0 {
+                try await Task.sleep(for: .seconds(delay))
+                return .string(#"{"ev":"ready"}"#)
+            }
+            return try await blockUntilCanceled()
+        case .loadingThenReady(let loadingAfter, let readyAfter):
+            let index = lock.withLockValue { receiveCount }
+            lock.withLockVoid { receiveCount += 1 }
+            switch index {
+            case 0:
+                try await Task.sleep(for: .seconds(loadingAfter))
+                return .string(#"{"ev":"status","code":"loading"}"#)
+            case 1:
+                try await Task.sleep(for: .seconds(max(0, readyAfter - loadingAfter)))
+                return .string(#"{"ev":"ready"}"#)
+            default:
+                return try await blockUntilCanceled()
+            }
+        }
+    }
+
+    func sendPing(pongReceiveHandler: @escaping @Sendable (Error?) -> Void) {
+        pongReceiveHandler(nil)
+    }
+
+    func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
+        lock.lock()
+        canceled = true
+        let send = pendingSend
+        let receive = pendingReceive
+        pendingSend = nil
+        pendingReceive = nil
+        lock.unlock()
+        send?.resume(throwing: NodeClientError.connection("canceled"))
+        receive?.resume(throwing: NodeClientError.connection("canceled"))
+    }
+
+    private func blockUntilCanceled() async throws -> URLSessionWebSocketTask.Message {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URLSessionWebSocketTask.Message, Error>) in
+            lock.lock()
+            if canceled {
+                lock.unlock()
+                continuation.resume(throwing: NodeClientError.connection("canceled"))
+                return
+            }
+            pendingReceive = continuation
+            lock.unlock()
+        }
+    }
 }

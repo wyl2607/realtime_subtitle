@@ -27,11 +27,15 @@ POWERSHELL = (os.environ.get("REALTIME_SUBTITLE_TEST_POWERSHELL")
 
 
 def _mini_repo(tmp_path, config_local_text):
-    """tmp_path 里搭最小仓库：config.py 只依赖 paths/version，拷这几个就够。"""
+    """tmp_path 里搭最小仓库：config.py 只依赖 paths/version/tokens，拷这几个就够。"""
     pkg = tmp_path / "realtime_subtitle"
     pkg.mkdir()
     for name in ("__init__.py", "version.py", "paths.py", "config.py"):
         shutil.copyfile(REPO_ROOT / "realtime_subtitle" / name, pkg / name)
+    ui_pkg = pkg / "ui"
+    ui_pkg.mkdir()
+    for name in ("__init__.py", "design_tokens.py"):
+        shutil.copyfile(REPO_ROOT / "realtime_subtitle" / "ui" / name, ui_pkg / name)
     (tmp_path / "config_local.py").write_text(config_local_text, encoding="utf-8")
     return tmp_path
 

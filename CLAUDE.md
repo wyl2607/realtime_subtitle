@@ -6,11 +6,17 @@
 > 目录分级见 [docs/STRUCTURE.md](docs/STRUCTURE.md)；Windows 脚本在 `scripts/windows/`，macOS 脚本在 `scripts/macos/`（见第 7 节）。
  — 给接手这台电脑的 AI 助手（Claude Code 等）
 
-这是一个**完全本地运行**的实时字幕系统：捕获 Windows 正在播放的声音（直播/视频/
+这是一个**默认完全本地运行**的实时字幕系统：捕获 Windows 正在播放的声音（直播/视频/
 语音聊天），Faster-Whisper 实时识别德语，Ollama 本地大模型翻译成中文，PyQt6
-置顶悬浮窗双语显示。不向任何云端发送音频或文本。**支持 Windows**（音频捕获
-用 WASAPI Loopback）**和 Apple Silicon macOS**（识别走 MLX，抓系统声音靠
-BlackHole 虚拟声卡；差异和坑见第 7 节——在 Mac 上干活先读第 7 节）。
+置顶悬浮窗双语显示。默认不向任何云端发送音频或文本；只有在程序配置里填了 Groq key
+才会把音频发送到云端识别服务。音频出本机路径仅两条且须主动配置：一是自己的算力节点
+（自己的机器，Tailscale 内网 100.64.0.0/10，不经第三方），二是云端 Groq（第三方）。
+程序不读环境变量，可在设置面板或命令行一键关掉云端开关。界面状态行显示「云端·Groq」/
+「混合·节点名」/「本机」。经网络代理时代理可见上传的**原始音频**片段（WAV）。
+Groq 数据保留遵循官方数据政策（https://console.groq.com/docs/your-data）：默认不保留
+识别请求；排查故障或滥用时可能临时保存最多 30 天；介意可在 Groq 控制台 Data Controls 打开
+Zero Data Retention（ZDR）。**支持 Windows**（音频捕获用 WASAPI Loopback）**和 Apple Silicon macOS**
+（识别走 MLX，抓系统声音靠 BlackHole 虚拟声卡；差异和坑见第 7 节——在 Mac 上干活先读第 7 节）。
 
 如果用户让你"帮我装上/配好这个字幕"，你的任务是：**按本文件把系统装好、
 按这台电脑的硬件把模型档位配对、验证能跑，并把坑绕开**。本文件就是为此写的，
@@ -1049,6 +1055,22 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     别名，于是从根目录调用时那几个参数直接报"找不到参数"，而且**只在真用到
     那个参数时才暴露**。
 
+47. **云端客户端必须走系统代理（trust_env 默认），而节点客户端必须 trust_env=False 且钉 IP 连接**（2026-10-11，CR-006A/006B 评审发现）。
+    - **现象**：节点客户端若沿用 requests/websockets 默认行为，会读 HTTP(S)_PROXY / ALL_PROXY 把 Tailscale 流量交给代理，并在连接时对主机名再解析一次。
+    - **根因**：先校验 100.64.0.0/10、后按主机名连接，两次解析之间 DNS 可以变（TOCTOU），代理也可以把连接带出 tailnet；云端相反，Groq 在公网，有的用户只能经系统代理访问。
+    - **做法**：云端客户端保持系统代理（trust_env 默认）；节点客户端必须显式设置 `trust_env=False`，且必须在解析并验证目标 IP 属于 `100.64.0.0/10` 后，直接钉住该 IP 发起连接，禁止使用域名进行二次解析。
+    - **Swift 端（rslite）同样适用**：`TailnetPin.swift` 解析→校验全部地址在 100.64.0.0/10→把 URL 主机换成 IP 字面量，/v1/info、测速和 /v2/session 都走它（2026-10-11 补；此前 Swift 只关了代理、没校验网段，陌生 Wi-Fi 的 DNS 应答节点名就会把 token 和音频明文发出去）。
+
+48. **requests 在 trust_env 下会用 `~/.netrc` 的 Basic 覆盖 Bearer**（2026-10-11，CR-006B 评审发现）。
+    - **现象**：只用 `headers={"Authorization": "Bearer …"}` 时，若 `~/.netrc` 里有 api.groq.com 的条目，发出去的是 netrc 的 Basic 认证，Groq 会按 key 无效处理。
+    - **根因**：`requests` 库在 `trust_env=True` 模式下会自动读取用户家目录的 `~/.netrc` 文件；如果里面恰好存在对应域名或默认机器凭据，requests 的默认行为是用 netrc 中的用户名密码生成 Basic Auth 并直接覆盖掉我们在 `headers` 里显式传入的 `Authorization` 请求头。
+    - **做法**：云端 HTTP 请求不能只靠 `headers={"Authorization": f"Bearer {key}"}`，必须自定义 `requests.auth.AuthBase` 子类，在 auth 回调中显式设置 Bearer 头，防止被 requests 内部的 netrc 逻辑覆写。
+
+49. **Groq 的 x-ratelimit-remaining-requests 是每日剩余（令牌桶回补），不能校正分钟窗口；没有音频秒数头**（2026-10-11，TK-001 探针实测响应头）。
+    - **现象**：试图用响应头中的 `x-ratelimit-remaining-requests` 校正分钟限流窗口时，计算出的请求配额产生严重偏差；同时找不到任何返回音频秒数限额的响应头。
+    - **根因**：Groq API 返回的 `x-ratelimit-remaining-requests` 对应的是**每日**（Day）维度的剩余请求数（由令牌桶持续回补），并不是 1 分钟窗口内的剩余请求数；此外 Groq 响应头中完全没有音频时间（audio seconds / duration）相关的限流额度头（例如无 `x-ratelimit-remaining-audio-seconds`）。
+    - **做法**：本地配额记账必须由客户端独立维护本地滑动窗口记录（1 分钟请求数、1 小时音频秒数、24 小时请求数与音频秒数）；`x-ratelimit-remaining-requests` 仅可用于校正 24 小时每日请求数，绝不能用来校正 1 分钟窗口；音频秒数完全依赖客户端上传时长（按每次至少 10 秒下限计费）在本地日志记账。
+
 ## 5. 目录地图
 
 ```
@@ -1122,7 +1144,7 @@ FLEURS 德中平行句 chrF。复测脚本在 `scripts/bench/`）：
 
 | 识别（MLX） | WER | 12 秒缓冲单次 | 内存峰值 | 结论 |
 |---|---|---|---|---|
-| turbo fp16 `mlx-community/whisper-large-v3-turbo` | 4.05% | 2.4s | 2.1GB | 12GB 以上默认 |
+| turbo fp16 `mlx-community/whisper-large-v3-turbo` | 4.05% | 2.4s（复用 encoder 后 1.33s，见下第 1 条） | 2.1GB | 12GB 以上默认 |
 | turbo q8（本地量化） | 3.83% | 3.5s | 1.5GB | 词时间戳在量化模型上慢 1.8s，不做默认 |
 | turbo q4 `mlx-community/whisper-large-v3-turbo-q4` | 4.84% | 3.4s | 1.1GB | <12GB / `--lean` |
 | medium | 5.28% | 2.9s | 2.2GB | 全面劣于 turbo，别用 |
@@ -1138,12 +1160,19 @@ FLEURS 德中平行句 chrF。复测脚本在 `scripts/bench/`）：
 
 macOS 避坑（每一条都是这次迁移真实踩过的）：
 
-1. **Mac 上识别更新一次约 2.4 秒，这是现有架构的下限，不是 bug。**
+1. **Mac 上识别更新一次约 1.4 秒（M2），节奏 = 每轮识别耗时。**
    `CHUNK_SUBMIT_SECONDS=0.5` 在 Mac 上实际不成立：收件箱积压的块会被
    `_process_inbox` 整批合并成一次识别，节奏自动退化成"每轮识别耗时"。
    缩短缓冲**省不了时间**（6 秒缓冲 2.57s vs 12 秒 2.37s）——和第 4 节第 20 条
-   同理，编码器每次都补到 30 秒，M2 上这块固定 ~1.7s；词时间戳再加 ~0.6s。
-   词时间戳是 local agreement 的前提，不能关。
+   同理，编码器每次都补到 30 秒。词时间戳是 local agreement 的前提，不能关。
+   ☠️ ~~"约 2.4 秒是现有架构的下限"~~ **是错的**（2026-10-21 推翻）：mlx-whisper
+   0.4.x 做词时间戳对齐时，`forward_with_cross_qk` 会把同一窗口的 mel **再编码
+   一遍**，原来那 ~0.6s"词时间戳开销"里大半其实是第二次 encoder。
+   `asr/mlx_backend.py` 的 `_MlxAlignmentEncoderCache` 在单次 transcribe 内复用
+   decode 已算出的 features（接口对不上就退回原实现）。M2 串行实测（12 秒缓冲、
+   开 VAD）：fp16 2.40→1.33s、原地 8bit 2.58→1.42s；FLEURS 60 条 WER 不变
+   （4.77%，逐句一致），366 个词的时间戳逐个相等，MLX active/peak 内存不变。
+   升级 mlx-whisper 时先看 `forward_with_cross_qk` 还在不在、是不是仍然自己调 encoder。
 2. **mlx-community 上同名模型有两种格式。** `-8bit`/`-4bit` 后缀的是
    mlx-audio-plus 格式（`model.safetensors`），mlx_whisper 加载直接报
    `[load_npz] Input must be a zip file`；能用的是 `weights.safetensors` /
@@ -1225,7 +1254,7 @@ macOS 避坑（每一条都是这次迁移真实踩过的）：
 16. **rslite 的 `main` 必须是同步函数**（修于 5b1a3c5，2026-10-08 真机）。
     现象：进程活着、CPU 0%、窗口不出现、也不弹权限。根因：async main 里再
     `app.run()`，事件循环跑在一个主队列任务**里面**，该任务永不返回，之后派到
-    MainActor 的任务（窗口显示、启动识别）全排在后面轮不到。做法：`main.swift`
+    MainActor 的任务（窗口显示、启动识别）全排在后面轮不到。做法：`RSLite.swift`
     保持同步入口，同步 main 下 `app.run()`/`dispatchMain()` 自己就在排空主队列。
 17. **URLSession 的 WebSocket 把服务端 close 1013 报成 1005**（v1 客户端
     RemotePipeline 实测，2026-10，经验搬进 TK-005 的节点路由）。现象：节点忙时
@@ -1273,3 +1302,17 @@ macOS 避坑（每一条都是这次迁移真实踩过的）：
     `pgrep -f` 按命令行子串匹配，不分是谁的进程。做法：测试里用桩 pgrep，
     只返回自己起的 PID；涉及真实进程命令行的逻辑，用逐字的真实形状做用例；
     并发跑两份测试是发现这类互杀的便宜办法。
+24. **SpeechTranscriber volatile 结果没有词级时间，rslite 云端分段采用 20ms RMS 0.005 能量 VAD**（2026-10-11，TK-001 探针）。
+    - **现象**：尝试在 rslite 中利用 SpeechTranscriber 的 `audioTimeRange` 进行词级时间驱动分段时，无法获取中间词的时间戳，分段点判定不准或滞后。
+    - **根因**：macOS SpeechTranscriber 的 volatile（未定稿）流式识别结果不提供词级（word-level）时间戳，只有从当前段首到当前位置的宽区间（段首→当前的宽区间），无法直接通过词边界静音（≥0.6s）进行切段。
+    - **做法**：rslite 放弃依赖 SpeechTranscriber 词时间分段，云端切段改用 20ms 帧、RMS 0.005 阈值的本地能量 VAD 算法；静音 ≥0.6s 收段、15s 强切、<1.5s 的段并入相邻段。阈值实测（concat5 建议 0.005、FLEURS 60 建议 0.003，词时间分段两份都不达标）见 `.governance/sprints-002-cloud-asr-first/probes/segmentation.md`；产品用 0.005，直播素材上 0.003/0.005 对比待真机验收。
+25. **rslite 关掉 Swift 6 的运行期 actor 隔离检查**（2026-10-11 19:39 真机崩溃）。
+    - **现象**：rslite 跑了 11 分钟后 SIGSEGV，崩在主线程 `OverlayRootView.hitTest` 的 @objc 入口：`swift_task_isCurrentExecutor → isMainExecutor → swift_getObjectType` 读空指针；调用方是辅助功能命中测试（`accessibilityHitTest`，截图/读屏/窗口管理类工具都会触发）。
+    - **根因**（未完全确认）：Swift 6 语言模式给每个 MainActor 隔离的 @objc 覆写插运行期检查；rslite 是同步 main + `app.run()`（第 16 条），这条 AX 回调路径上拿到的主执行器为空。代码本身确实在主线程。⚠️ 2026-10-12 已查明真正根因见第 26 条：这个 flag 只挡住了 hitTest 这一种崩法，系统 SwiftUI 里的同类检查它管不到。
+    - **做法**：`Package.swift` 里 rslite 目标加 `-Xfrontend -disable-dynamic-actor-isolation`，只关运行期检查、编译期并发检查照旧；二进制里该检查调用点从 112 降到 1。别为了"更安全"把它删掉；要删先复现 AX 命中测试（如 Accessibility Inspector 指向字幕窗）确认不再崩。
+26. **rslite 主线程任务里绝不能有被 AppKit 吞掉的 ObjC 异常**（2026-10-12，三份崩溃报告 + 最小复现）。
+    - **现象**：rslite 跑几分钟到几小时后 SIGSEGV/SIGBUS，崩点各不相同（AX hitTest、NSAnimationContext 里的 SwiftUI 渲染、SwiftUI 手势的 `Task.immediate`），但栈顶一样：`swift_task_isCurrentExecutorWithFlagsImpl +72 → isMainExecutor → swift_getObjectType` 读到垃圾地址（0、0x220、0x1800001120）。日志里什么都没有。
+    - **根因**：反汇编系统 libswift_Concurrency（macOS 27.0.1）可见，该函数 +36 读主线程 TSD `[TPIDRRO_EL0+0x340]`（Swift 的 ExecutorTrackingInfo*，在 `swift_job_run` 的栈帧上），非空就对里面的「当前执行器」调 isMainExecutor，+72 正是这一处。也就是说**坏的是「当前执行器」，不是主执行器没初始化**。它变成悬空指针的原因：`Overlay.render()` 在 `Task { @MainActor }` 里对一个不在 NSStackView 里的视图调 `removeArrangedSubview`，抛 NSInternalInconsistencyException；`-[NSApplication run]` 把异常吞掉继续跑，但异常是直接 unwind 穿过 `swift_job_run` 的，TSD 没被恢复，留在已销毁的栈帧上。之后任何 isCurrentExecutor 检查都读垃圾。AppKit 吞异常只记 os_log FAULT，不进 stderr，所以 rslite.err 里没有任何线索。
+    - **证据**：最小复现（同步 main + `MainActor.assumeIsolated` + `app.run()` + SwiftUI 窗口）：不抛异常时主线程空闲时 TSD 恒为 nil、`Task.immediate` 跑 4 秒无事；在 `Task { @MainActor }` 里 `NSException.raise()` 一次后，TSD 一直指向那个已死的栈地址，下一次 `Task.immediate` 崩在同一个 +72。rslite 本体在 UI 压测（每 200ms 推一对假字幕）+ lldb `breakpoint set -n objc_exception_throw` 下约 12 秒抛出该异常，栈 `NSStackView _removeView ← OverlayController.render (Overlay.swift) ← addFinal`；修后同样压测 100 秒 0 次异常。
+    - **做法**：①移除前先判断视图在不在 `arrangedSubviews` 里（`Overlay.swift` render）；②`runApp` 开头注册 `NSApplicationCrashOnExceptions=YES`，以后再有异常就当场崩（栈停在 `-[NSApplication reportException:]`，一看就知道是被吞的 ObjC 异常），别让带毒的运行时再跑几个小时。再见到「栈顶是 isCurrentExecutor +72」的崩溃，先别查并发：用 lldb 下 `objc_exception_throw` 断点跑一遍找抛出点。同步 main（第 16 条）本身没问题，别为此改成 async main。
+

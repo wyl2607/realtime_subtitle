@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import QLabel, QWidget, QVBoxLayout, QTextEdit, QPushButton
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QTextCursor
 import realtime_subtitle.config as config
+import realtime_subtitle.ui.design_tokens as design_tokens
 from realtime_subtitle.ui.window_geometry import _screen_area_at
 
 
@@ -79,8 +80,19 @@ class HistoryWindow(QWidget):
         hint.setStyleSheet("color: #888; font-size: 12px;")
         layout.addWidget(hint)
         self.setLayout(layout)
+        self._entries = []
 
-    def append_pair(self, german, chinese):
+    def append_pair(self, german, chinese, key=None):
+        if key:
+            for entry in self._entries:
+                if entry.get("key") == key:
+                    self.update_dst(key, chinese, german=german)
+                    return
+        stamp = time.strftime("%H:%M:%S")
+        self._entries.append({"key": key, "stamp": stamp, "german": german, "chinese": chinese})
+        if len(self._entries) > 2000:
+            self._entries.pop(0)
+
         sb = self.text.verticalScrollBar()
         at_bottom = sb.value() >= sb.maximum() - 10  # 用户没往上翻才自动跟进
 
@@ -88,13 +100,71 @@ class HistoryWindow(QWidget):
         # ☠️ 写成 `cursor.End` 会漏过第 1 步那道枚举守卫（它只看 `Q…` 开头的
         # 前缀），Qt6 下这里是当场 AttributeError。见 test_qt_enum_style。
         cursor.movePosition(QTextCursor.MoveOperation.End)
-        stamp = time.strftime("%H:%M:%S")
+        color = (
+            design_tokens.COLOR_UNTRANSLATED
+            if chinese in (design_tokens.TEXT_UNTRANSLATED, "翻译中…")
+            else "#9ad0ff"
+        )
         block = f'<span style="color:#777">[{stamp}]</span> {html.escape(german)}<br>' if german else ""
-        block += f'<span style="color:#9ad0ff">{html.escape(chinese)}</span><br><br>'
+        block += f'<span style="color:{color}">{html.escape(chinese)}</span><br><br>'
         cursor.insertHtml(block)
 
         if at_bottom:
             sb.setValue(sb.maximum())
+
+    def update_dst(self, key, dst, german=None):
+        if not key:
+            return
+        updated = False
+        for entry in self._entries:
+            if entry.get("key") == key:
+                entry["chinese"] = dst
+                if german:
+                    entry["german"] = german
+                updated = True
+                break
+        if not updated:
+            return
+        self._rebuild()
+
+    def drop_keys(self, keys):
+        """按句 id 移除句对（远端句替换本机句时调用）。
+
+        ☠️ 替换=「删掉本机句 + 由远端句重新上屏」，不是就地改文本：远端句在
+        LineStore 里是负数新 key，后面的节点译文更新按那个 key 找，就地改文本会
+        让更新找不到条目。找不到的 key 静默忽略（已滚出/已清空属正常）。
+        """
+        drop = set(keys or [])
+        if not drop:
+            return
+        before = len(self._entries)
+        self._entries = [e for e in self._entries if e.get("key") not in drop]
+        if len(self._entries) != before:
+            self._rebuild()
+
+    def _rebuild(self):
+        sb = self.text.verticalScrollBar()
+        val = sb.value()
+        at_bottom = val >= sb.maximum() - 10
+        self.text.clear()
+        cursor = self.text.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        for entry in self._entries:
+            stamp = entry.get("stamp", "")
+            german = entry.get("german", "")
+            chinese = entry.get("chinese", "")
+            color = (
+                design_tokens.COLOR_UNTRANSLATED
+                if chinese in (design_tokens.TEXT_UNTRANSLATED, "翻译中…")
+                else "#9ad0ff"
+            )
+            block = f'<span style="color:#777">[{stamp}]</span> {html.escape(german)}<br>' if german else ""
+            block += f'<span style="color:{color}">{html.escape(chinese)}</span><br><br>'
+            cursor.insertHtml(block)
+        if at_bottom:
+            sb.setValue(sb.maximum())
+        else:
+            sb.setValue(val)
 
 
 class _AnalysisPopupBase(QWidget):

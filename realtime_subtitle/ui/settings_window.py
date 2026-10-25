@@ -1,14 +1,21 @@
 """
 参数调节面板（⚙️）：tuning 持久化辅助函数 + 场景预设常量 + SettingsWindow。
 """
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 from PyQt6.QtWidgets import (
     QLabel, QWidget, QVBoxLayout, QHBoxLayout, QSlider,
     QPushButton, QGroupBox, QLineEdit, QCheckBox, QColorDialog, QFontComboBox,
-    QScrollArea, QFrame, QApplication,
+    QScrollArea, QFrame, QApplication, QSpinBox, QButtonGroup,
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QFont
 import realtime_subtitle.config as config
+import realtime_subtitle.ui.design_tokens as design_tokens
 from realtime_subtitle import language_policy
 from realtime_subtitle.ui.window_frame import DraggableWidget
 from realtime_subtitle.ui.window_geometry import (
@@ -19,6 +26,20 @@ from realtime_subtitle.ui.window_geometry import (
 # 设置面板自身字号（100% 缩放起点）。字幕正文仍由 config.FONT_SIZE /「字幕字号」控制。
 # 只乘 screen_scale_factor，不开 AA_EnableHighDpiScaling（见 CLAUDE.md 第 24 条）。
 PANEL_FONT_PX_AT_100 = 17
+
+STYLE_TEXT_COLORS = design_tokens.PALETTE_TEXT
+BACKGROUND_COLORS = design_tokens.PALETTE_BACKGROUND
+TEXT_EDGE_OPTIONS = (("none", "无"), ("shadow", "阴影"))
+WINDOW_RADIUS_OPTIONS = (
+    design_tokens.RADIUS_NONE,
+    design_tokens.RADIUS_SMALL,
+    design_tokens.RADIUS_CARD,
+)
+DISPLAY_MODE_OPTIONS = (
+    ("bilingual", "双语"),
+    ("target", "仅译文"),
+    ("source", "仅原文"),
+)
 
 
 def panel_font_px(scale=None):
@@ -57,6 +78,182 @@ def format_slider_value(value, step):
     return f"{value:.{decimals}f}"
 
 
+def config_dir():
+    """云端/节点开关的目录。
+
+    包一层是为了让面板测试替换本模块的 config_dir，而不必去改
+    cloud_client.groq_key_path() 里面那个绑定好的函数。路径规则仍以
+    cloud_client 为准：Windows 用 %APPDATA%，其它系统用 ~/.config。
+    延迟导入：两个开关都关时，import 本模块不应把远端客户端带进来。
+    """
+    from realtime_subtitle.remote.cloud_client import config_dir as cloud_config_dir
+    return cloud_config_dir()
+
+
+def groq_key_file():
+    return Path(config_dir()) / "groq.key"
+
+
+def _pref_path(name):
+    return Path(config_dir()) / name
+
+
+def _atomic_private(path, data):
+    """原子写，并把权限收成只有当前用户能读。
+
+    key 不能先进一个谁都能读的临时文件再改权限：先按 0600 建临时文件，
+    写完再 replace。Windows 上 os.open 的 mode 不起作用，所以在 replace
+    之前对临时文件跑 icacls。NTFS 同卷 rename 会保留 DACL；若先替换再改
+    权限，中间窗口和 icacls 失败都会把目标文件留成继承来的宽松 ACL。
+    icacls 失败就删掉临时文件并抛 OSError，目标文件不会出现。
+    USERNAME 只在这一支用来当 ACL 主体，不是密钥来源。
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        if sys.platform == "win32":
+            _icacls_user_only(tmp)
+        else:
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    if sys.platform != "win32":
+        os.chmod(path, 0o600)
+
+
+def _icacls_user_only(path):
+    """只给当前用户完全控制。命令按参数列表传，不经 shell，避免路径被拼接。"""
+    user = os.environ.get("USERNAME")
+    if not user:
+        raise OSError("icacls failed")
+    try:
+        subprocess.run(
+            ["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
+            check=True,
+            shell=False,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        raise OSError("icacls failed") from None
+
+
+def write_groq_key(text):
+    """写入 groq.key。空串直接拒绝，避免一次空保存把已有 key 抹掉。"""
+    key = (text or "").strip()
+    if not key:
+        raise ValueError("empty groq key")
+    _atomic_private(groq_key_file(), (key + "\n").encode("utf-8"))
+
+
+def clear_groq_key():
+    try:
+        groq_key_file().unlink()
+    except FileNotFoundError:
+        return
+
+
+def groq_key_configured():
+    """只回答「有没有 key」。读失败按没有处理，异常文本可能带路径，不往外抛。"""
+    try:
+        from realtime_subtitle.remote.cloud_client import read_groq_key
+        return bool(read_groq_key(groq_key_file()))
+    except Exception:
+        return False
+
+
+def _read_bool_pref(name, default):
+    try:
+        path = _pref_path(name)
+        if not path.is_file():
+            return default
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+    if isinstance(data, dict) and "enabled" in data:
+        return bool(data["enabled"])
+    return default
+
+
+def _write_bool_pref(name, enabled):
+    payload = (json.dumps({"enabled": bool(enabled)}) + "\n").encode("utf-8")
+    _atomic_private(_pref_path(name), payload)
+
+
+def read_cloud_enabled():
+    """没有 cloud.json 时：已经有 key 就默认开，否则关。老用户两边都没有，等于关。"""
+    return _read_bool_pref("cloud.json", groq_key_configured())
+
+
+def write_cloud_enabled(enabled):
+    _write_bool_pref("cloud.json", enabled)
+
+
+def read_node_enabled():
+    """没有 node.json 就是关。缺文件不能把用户以后下发的偏好提前写成开。"""
+    return _read_bool_pref("node.json", False)
+
+
+def write_node_enabled(enabled):
+    _write_bool_pref("node.json", enabled)
+
+
+def nodes_file():
+    return Path(config_dir()) / "nodes.json"
+
+
+def load_node_entries():
+    """只收有 id 和 url 的条目。文件缺失、不是数组、读坏了都当成没有节点。"""
+    path = nodes_file()
+    try:
+        if not path.is_file():
+            return []
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    usable = []
+    for entry in data:
+        if isinstance(entry, dict) and entry.get("id") and entry.get("url"):
+            usable.append(entry)
+    return usable
+
+
+def nodes_available():
+    return bool(load_node_entries())
+
+
+def cloud_active():
+    """开关文件写着开、但 key 已经没了，就不能再上传。"""
+    return bool(read_cloud_enabled()) and groq_key_configured()
+
+
+def node_active():
+    return bool(read_node_enabled()) and nodes_available()
+
+
+def static_route_label():
+    """没有接上路由器时，按落盘的开关给面板一个标签。"""
+    if cloud_active():
+        return design_tokens.TEXT_STATUS_CLOUD
+    if node_active():
+        entries = load_node_entries()
+        name = str(entries[0].get("id") or "") if entries else ""
+        return design_tokens.TEXT_STATUS_HYBRID_PREFIX + (name or "节点")
+    return design_tokens.TEXT_STATUS_LOCAL
+
+
 # 面板可调参数（存 window_state.json 的 "tuning"；FONT_SIZE/BACKGROUND_OPACITY
 # 维持顶层独立键向后兼容，不进此集合）
 TUNING_KEYS = (
@@ -68,8 +265,13 @@ TUNING_KEYS = (
     "MAX_SENTENCE_PAIRS",
     "LOOPBACK_DEVICE_NAME",
     "SHOW_BILINGUAL",
+    "DISPLAY_MODE",
     "DRAFT_TRANSLATION",
+    "SOURCE_TEXT_COLOR",
     "CHINESE_TEXT_COLOR",
+    "BACKGROUND_COLOR",
+    "TEXT_EDGE",
+    "WINDOW_CORNER_RADIUS",
     "DRAFT_TEXT_COLOR",
     "UNSTABLE_TEXT_COLOR",
     "FONT_FAMILY",
@@ -92,7 +294,40 @@ TUNING_KEYS = (
 
 
 # 会被原样插进富文本/样式表的键，读回时必须过一遍校验（见 apply_tuning）
-_COLOR_KEYS = ("CHINESE_TEXT_COLOR", "DRAFT_TEXT_COLOR", "UNSTABLE_TEXT_COLOR")
+_COLOR_KEYS = (
+    "SOURCE_TEXT_COLOR",
+    "CHINESE_TEXT_COLOR",
+    "BACKGROUND_COLOR",
+    "DRAFT_TEXT_COLOR",
+    "UNSTABLE_TEXT_COLOR",
+)
+
+
+def _display_mode_from_show_bilingual(show_bilingual):
+    return "bilingual" if bool(show_bilingual) else "target"
+
+
+def _normalize_display_mode(value, fallback=None):
+    mode = str(value or "").strip().lower()
+    valid = {mode for mode, _label in DISPLAY_MODE_OPTIONS}
+    if mode in valid:
+        return mode
+    if fallback is not None:
+        return _display_mode_from_show_bilingual(fallback)
+    return "bilingual"
+
+
+def _set_display_mode(mode):
+    normalized = _normalize_display_mode(mode)
+    config.DISPLAY_MODE = normalized
+    config.SHOW_BILINGUAL = normalized == "bilingual"
+    return normalized
+
+
+def sync_display_mode_from_show_bilingual():
+    """旧 SHOW_BILINGUAL 入口改动后，同步到三态 DISPLAY_MODE。"""
+    return _set_display_mode(_display_mode_from_show_bilingual(
+        getattr(config, "SHOW_BILINGUAL", True)))
 
 
 def _sanitize_font_family(value):
@@ -119,6 +354,7 @@ def apply_tuning(tuning):
     """
     if not isinstance(tuning, dict):
         return
+    has_display_mode = "DISPLAY_MODE" in tuning
     for key in TUNING_KEYS:
         if key not in tuning:
             continue
@@ -126,6 +362,22 @@ def apply_tuning(tuning):
             val = tuning[key]
             if key in _COLOR_KEYS:
                 apply_text_color(key, val)  # 自带 #rgb/#rrggbb 校验 + 规范化
+                continue
+            if key == "DISPLAY_MODE":
+                _set_display_mode(val)
+                continue
+            if key == "TEXT_EDGE":
+                edge = str(val).strip().lower()
+                if edge not in {option for option, _label in TEXT_EDGE_OPTIONS}:
+                    continue
+                setattr(config, key, edge)
+                continue
+            if key == "WINDOW_CORNER_RADIUS":
+                radius = int(val)
+                if radius not in WINDOW_RADIUS_OPTIONS:
+                    continue
+                setattr(config, key, radius)
+                setattr(config, "BORDER_RADIUS", radius)
                 continue
             if key == "FONT_FAMILY":
                 setattr(config, key, _sanitize_font_family(val))
@@ -156,6 +408,8 @@ def apply_tuning(tuning):
             elif isinstance(current, str):
                 val = str(val)
             setattr(config, key, val)
+            if key == "SHOW_BILINGUAL" and not has_display_mode:
+                sync_display_mode_from_show_bilingual()
         except (TypeError, ValueError, AttributeError):
             continue
 
@@ -185,6 +439,10 @@ def apply_text_color(config_key, hex_color):
         body = "".join(c * 2 for c in body)
     normalized = "#" + body.lower()
     setattr(config, config_key, normalized)
+    if config_key == "SOURCE_TEXT_COLOR":
+        setattr(config, "TEXT_COLOR", "#" + body.upper())
+    elif config_key == "TEXT_COLOR":
+        setattr(config, "SOURCE_TEXT_COLOR", normalized)
     return normalized
 
 
@@ -239,6 +497,10 @@ class SettingsWindow(DraggableWidget):
         self._lang_pair_buttons = {}  # (source, target) -> QPushButton
         # 🎞 影院条由 SubtitleWindow 建好之后挂进来（它比本面板晚构造）
         self._cinema_bar = None
+        if bool(getattr(config, "SHOW_BILINGUAL", True)):
+            _set_display_mode("bilingual")
+        elif _normalize_display_mode(getattr(config, "DISPLAY_MODE", None)) == "bilingual":
+            _set_display_mode("target")
 
         scale = screen_scale_factor()
         self._panel_font_px = panel_font_px(scale)
@@ -384,8 +646,8 @@ class SettingsWindow(DraggableWidget):
             if self._on_font_change:
                 self._on_font_change()
 
-        self.font_size_slider = self._create_slider(
-            "字幕字号", 14, 72, config.FONT_SIZE, 1, set_font_size
+        self.font_size_slider = self._create_spinbox(
+            "字幕字号", design_tokens.TYPE_SUBTITLE_MIN, design_tokens.TYPE_SUBTITLE_MAX, config.FONT_SIZE, set_font_size
         )
 
         def set_bg_opacity(v):
@@ -397,12 +659,36 @@ class SettingsWindow(DraggableWidget):
             "背景不透明度", 100, 255, config.BACKGROUND_OPACITY, 5, set_bg_opacity
         )
 
-        # 只显中文：勾上 = 隐藏德语原文（SHOW_BILINGUAL=False）
-        self.chinese_only_cb = QCheckBox("只显中文（隐藏德语原文）")
-        self.chinese_only_cb.setFont(self.font())
-        self.chinese_only_cb.setToolTip("勾选后同窗口可多显示约一倍句对")
-        self.chinese_only_cb.setChecked(not getattr(config, "SHOW_BILINGUAL", True))
-        self.chinese_only_cb.toggled.connect(self._on_chinese_only_toggled)
+        style_group = QGroupBox("字幕样式")
+        style_layout = QVBoxLayout()
+
+        self.source_color_palette = self._create_color_palette_row(
+            "原文颜色", "SOURCE_TEXT_COLOR", STYLE_TEXT_COLORS)
+        self.target_color_palette = self._create_color_palette_row(
+            "译文颜色", "CHINESE_TEXT_COLOR", STYLE_TEXT_COLORS)
+        self.background_color_palette = self._create_color_palette_row(
+            "背景颜色", "BACKGROUND_COLOR", BACKGROUND_COLORS, custom_label=None)
+        self.text_edge_row = self._create_button_group_row(
+            "文字边缘", TEXT_EDGE_OPTIONS, getattr(config, "TEXT_EDGE", "none"),
+            self._set_text_edge)
+        self.corner_radius_row = self._create_button_group_row(
+            "窗口圆角", tuple((v, str(v)) for v in WINDOW_RADIUS_OPTIONS),
+            getattr(config, "WINDOW_CORNER_RADIUS", 8), self._set_corner_radius)
+        self.display_mode_row = self._create_button_group_row(
+            "显示模式", DISPLAY_MODE_OPTIONS,
+            _normalize_display_mode(getattr(config, "DISPLAY_MODE", None),
+                                    getattr(config, "SHOW_BILINGUAL", True)),
+            self._set_display_mode_from_ui)
+
+        style_layout.addWidget(self.font_size_slider['widget'])
+        style_layout.addWidget(self.source_color_palette['widget'])
+        style_layout.addWidget(self.target_color_palette['widget'])
+        style_layout.addWidget(self.background_color_palette['widget'])
+        style_layout.addWidget(self.bg_opacity_slider['widget'])
+        style_layout.addWidget(self.text_edge_row['widget'])
+        style_layout.addWidget(self.corner_radius_row['widget'])
+        style_layout.addWidget(self.display_mode_row['widget'])
+        style_group.setLayout(style_layout)
 
         # 草稿中文：游戏模式会禁用此开关
         self.draft_cb = QCheckBox("草稿中文（残句先出浅蓝译文）")
@@ -411,11 +697,7 @@ class SettingsWindow(DraggableWidget):
         self.draft_cb.setChecked(bool(getattr(config, "DRAFT_TRANSLATION", True)))
         self.draft_cb.toggled.connect(self._on_draft_toggled)
 
-        # 三个颜色按钮：正式中文 / 草稿中文 / 未稳定德语
-        self.color_btn_chinese = self._make_color_button(
-            "正式中文", "CHINESE_TEXT_COLOR",
-            getattr(config, "CHINESE_TEXT_COLOR", "#c8c8c8"),
-        )
+        self.color_btn_chinese = self.target_color_palette["custom"]
         self.color_btn_draft = self._make_color_button(
             "草稿中文", "DRAFT_TEXT_COLOR",
             getattr(config, "DRAFT_TEXT_COLOR", "#8fb8e0"),
@@ -427,8 +709,7 @@ class SettingsWindow(DraggableWidget):
         color_row = QWidget()
         color_layout = QHBoxLayout()
         color_layout.setContentsMargins(0, 0, 0, 0)
-        color_layout.addWidget(QLabel("颜色:"))
-        color_layout.addWidget(self.color_btn_chinese)
+        color_layout.addWidget(QLabel("辅助颜色:"))
         color_layout.addWidget(self.color_btn_draft)
         color_layout.addWidget(self.color_btn_unstable)
         color_layout.addStretch()
@@ -451,9 +732,7 @@ class SettingsWindow(DraggableWidget):
 
         display_layout.addWidget(self.max_length_slider['widget'])
         display_layout.addWidget(self.max_pairs_slider['widget'])
-        display_layout.addWidget(self.font_size_slider['widget'])
-        display_layout.addWidget(self.bg_opacity_slider['widget'])
-        display_layout.addWidget(self.chinese_only_cb)
+        display_layout.addWidget(style_group)
         display_layout.addWidget(self.draft_cb)
         display_layout.addWidget(color_row)
         display_layout.addWidget(font_row)
@@ -494,11 +773,61 @@ class SettingsWindow(DraggableWidget):
         cinema_layout.addWidget(self.cinema_german_cb)
         cinema_group.setLayout(cinema_layout)
 
+        # 识别来源和四个场景模式正交：不进 TUNING_KEYS，也不走 _apply_mode。
+        # 控件初值不在这里 setChecked——那会在信号接通后把用户目录写成默认值。
+        # 真正的显示在 _refresh_remote_controls，并且挡住信号。
+        self.on_remote_change = None
+        self.route_status_source = None
+        remote_group = QGroupBox("识别来源")
+        remote_layout = QVBoxLayout()
+
+        self.node_cb = QCheckBox("使用算力节点")
+        self.node_cb.setFont(self.font())
+        self.node_cb.setToolTip("音频会发到你的节点机器")
+        self.node_cb.toggled.connect(self._on_node_toggled)
+        self.node_reason = QLabel("")
+        self.node_reason.setFont(self.font())
+        self.node_reason.setWordWrap(True)
+
+        key_row = QWidget()
+        key_layout = QHBoxLayout()
+        key_layout.setContentsMargins(0, 0, 0, 0)
+        self.groq_key_edit = QLineEdit()
+        self.groq_key_edit.setFont(self.font())
+        self.groq_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.groq_key_edit.setPlaceholderText("粘贴 Groq key")
+        self.groq_key_edit.setToolTip("只写入本机 key 文件，不会回显已保存的 key")
+        self.groq_save_btn = QPushButton("保存 key")
+        self.groq_save_btn.setFont(self.font())
+        self.groq_save_btn.clicked.connect(self._on_save_groq_key)
+        self.groq_clear_btn = QPushButton("清除 key")
+        self.groq_clear_btn.setFont(self.font())
+        self.groq_clear_btn.clicked.connect(self._on_clear_groq_key)
+        key_layout.addWidget(self.groq_key_edit)
+        key_layout.addWidget(self.groq_save_btn)
+        key_layout.addWidget(self.groq_clear_btn)
+        key_row.setLayout(key_layout)
+
+        self.cloud_cb = QCheckBox("云端识别")
+        self.cloud_cb.setFont(self.font())
+        self.cloud_cb.setToolTip("打开后音频会上传到 Groq")
+        self.cloud_cb.toggled.connect(self._on_cloud_toggled)
+        self.route_label = QLabel("当前路由：本机")
+        self.route_label.setFont(self.font())
+
+        remote_layout.addWidget(self.node_cb)
+        remote_layout.addWidget(self.node_reason)
+        remote_layout.addWidget(key_row)
+        remote_layout.addWidget(self.cloud_cb)
+        remote_layout.addWidget(self.route_label)
+        remote_group.setLayout(remote_layout)
+
         # 添加到主布局
         layout.addWidget(duration_group)
         layout.addWidget(energy_group)
         layout.addWidget(display_group)
         layout.addWidget(cinema_group)
+        layout.addWidget(remote_group)
 
         # 重置按钮
         reset_btn = QPushButton("🔄 恢复默认值")
@@ -516,6 +845,8 @@ class SettingsWindow(DraggableWidget):
         outer.setContentsMargins(8, 8, 8, 8)
         outer.addWidget(scroll)
         self.setLayout(outer)
+        # 构造完再读盘。blockSignals 包在刷新里，避免把默认值写进用户目录。
+        self._refresh_remote_controls()
 
     def _apply_panel_chrome(self, scale):
         """面板字体 + 受屏幕约束的初始几何。不开全局 DPI 缩放。"""
@@ -600,6 +931,154 @@ class SettingsWindow(DraggableWidget):
             'title': label_widget, 'step': step,
         }
 
+    def _create_spinbox(self, label, min_val, max_val, current_val, callback,
+                        mark_custom=True):
+        """创建数值框控件；返回结构兼容旧 slider 测试和 Ctrl+滚轮路径。"""
+        widget = QWidget()
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        label_widget = QLabel(f"{label}:")
+        label_widget.setFont(self.font())
+        self._fit_label_width(label_widget)
+
+        spin = QSpinBox()
+        spin.setFont(self.font())
+        spin.setRange(int(min_val), int(max_val))
+        spin.setSingleStep(1)
+        spin.setValue(int(current_val))
+        spin.setMinimumWidth(spin.fontMetrics().horizontalAdvance(str(max_val)) + 48)
+
+        def on_change(value):
+            if mark_custom:
+                self._mark_custom()
+            callback(int(value))
+            print(f"📊 {label}: {int(value)}")
+
+        spin.valueChanged.connect(on_change)
+        layout.addWidget(label_widget)
+        layout.addWidget(spin)
+        layout.addStretch()
+        widget.setLayout(layout)
+        return {
+            "widget": widget, "slider": spin, "label": spin,
+            "title": label_widget, "step": 1,
+        }
+
+    def _make_segment_button(self, text):
+        btn = QPushButton(text)
+        btn.setCheckable(True)
+        btn.setFont(self.font())
+        px = self._panel_font_px
+        btn.setStyleSheet(
+            f"QPushButton {{ padding: 6px 10px; font-size: {px}px; "
+            f"min-height: {px + 8}px; }}"
+            "QPushButton:checked {"
+            "  background-color: #3a6ea5; color: white; font-weight: bold;"
+            "  border: 1px solid #5a8ec5;"
+            "}"
+        )
+        return btn
+
+    def _create_button_group_row(self, label, options, current, callback):
+        row = QWidget()
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        label_widget = QLabel(f"{label}:")
+        label_widget.setFont(self.font())
+        self._fit_label_width(label_widget)
+        layout.addWidget(label_widget)
+        group = QButtonGroup(row)
+        group.setExclusive(True)
+        buttons = {}
+        for value, text in options:
+            btn = self._make_segment_button(text)
+            btn.setChecked(value == current)
+            group.addButton(btn)
+            layout.addWidget(btn)
+            buttons[value] = btn
+        layout.addStretch()
+        row.setLayout(layout)
+
+        def on_clicked(button):
+            for value, btn in buttons.items():
+                if btn is button:
+                    self._mark_custom()
+                    callback(value)
+                    if self._on_font_change:
+                        self._on_font_change()
+                    print(f"📊 {label}: {btn.text()}")
+                    return
+
+        group.buttonClicked.connect(on_clicked)
+        return {"widget": row, "buttons": buttons, "group": group, "title": label_widget}
+
+    def _create_color_palette_row(self, label, config_key, colors, custom_label="自定义…"):
+        row = QWidget()
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        label_widget = QLabel(f"{label}:")
+        label_widget.setFont(self.font())
+        self._fit_label_width(label_widget)
+        layout.addWidget(label_widget)
+        group = QButtonGroup(row)
+        group.setExclusive(True)
+        buttons = {}
+        for name, color in colors:
+            btn = QPushButton()
+            btn.setCheckable(True)
+            btn.setToolTip(f"{name} {color}")
+            btn.setFixedSize(34, 28)
+            btn.setChecked(getattr(config, config_key, "").lower() == color.lower())
+            self._style_swatch_button(btn, color)
+            group.addButton(btn)
+            layout.addWidget(btn)
+            buttons[color.lower()] = btn
+        custom = None
+        if custom_label:
+            custom = self._make_color_button(
+                custom_label, config_key, getattr(config, config_key, "#ffffff"))
+            layout.addWidget(custom)
+        layout.addStretch()
+        row.setLayout(layout)
+
+        def on_clicked(button):
+            for _name, color in colors:
+                if buttons[color.lower()] is button:
+                    self.apply_color(config_key, color)
+                    self._refresh_palette_checks(config_key)
+                    return
+
+        group.buttonClicked.connect(on_clicked)
+        return {
+            "widget": row, "buttons": buttons, "custom": custom,
+            "colors": tuple(color.lower() for _name, color in colors),
+            "title": label_widget,
+        }
+
+    def _style_swatch_button(self, button, hex_color):
+        border = "#ffffff" if button.isChecked() else "#666666"
+        button.setStyleSheet(
+            f"background-color: {hex_color}; border: 2px solid {border}; "
+            "border-radius: 4px;"
+        )
+
+    def _refresh_palette_checks(self, config_key):
+        rows = {
+            "SOURCE_TEXT_COLOR": getattr(self, "source_color_palette", None),
+            "CHINESE_TEXT_COLOR": getattr(self, "target_color_palette", None),
+            "BACKGROUND_COLOR": getattr(self, "background_color_palette", None),
+        }
+        row = rows.get(config_key)
+        if not row:
+            return
+        current = getattr(config, config_key, "").lower()
+        for color, btn in row["buttons"].items():
+            btn.blockSignals(True)
+            btn.setChecked(color == current)
+            btn.blockSignals(False)
+            self._style_swatch_button(btn, color)
+
     def _make_color_button(self, label, config_key, hex_color):
         """颜色选择按钮：底色=当前色，点击弹 QColorDialog。"""
         btn = QPushButton(label)
@@ -626,17 +1105,52 @@ class SettingsWindow(DraggableWidget):
         else:
             # 按 config_key 找对应按钮
             mapping = {
+                "SOURCE_TEXT_COLOR": getattr(getattr(self, "source_color_palette", {}), "get", lambda *_: None)("custom"),
                 "CHINESE_TEXT_COLOR": getattr(self, "color_btn_chinese", None),
+                "BACKGROUND_COLOR": getattr(getattr(self, "background_color_palette", {}), "get", lambda *_: None)("custom"),
                 "DRAFT_TEXT_COLOR": getattr(self, "color_btn_draft", None),
                 "UNSTABLE_TEXT_COLOR": getattr(self, "color_btn_unstable", None),
             }
             btn = mapping.get(config_key)
             if btn is not None:
                 _style_color_button(btn, normalized)
+        self._refresh_palette_checks(config_key)
         if self._on_font_change:
             self._on_font_change()
         print(f"📊 {config_key}: {normalized}")
         return normalized
+
+    def _set_text_edge(self, value):
+        config.TEXT_EDGE = str(value)
+
+    def _set_corner_radius(self, value):
+        radius = int(value)
+        config.WINDOW_CORNER_RADIUS = radius
+        config.BORDER_RADIUS = radius
+
+    def _set_display_mode_from_ui(self, value):
+        mode = _set_display_mode(value)
+        self._sync_display_controls(mode)
+
+    def _sync_display_controls(self, mode=None):
+        mode = mode or _normalize_display_mode(
+            getattr(config, "DISPLAY_MODE", None), getattr(config, "SHOW_BILINGUAL", True))
+        for value, btn in self.display_mode_row["buttons"].items():
+            btn.blockSignals(True)
+            btn.setChecked(value == mode)
+            btn.blockSignals(False)
+
+    def _sync_style_option_buttons(self):
+        edge = getattr(config, "TEXT_EDGE", "none")
+        for value, btn in self.text_edge_row["buttons"].items():
+            btn.blockSignals(True)
+            btn.setChecked(value == edge)
+            btn.blockSignals(False)
+        radius = int(getattr(config, "WINDOW_CORNER_RADIUS", 8))
+        for value, btn in self.corner_radius_row["buttons"].items():
+            btn.blockSignals(True)
+            btn.setChecked(value == radius)
+            btn.blockSignals(False)
 
     def _on_cinema_german_toggled(self, checked):
         """字幕条德语行开关。不 _mark_custom（PRESETS 不定义 CINEMA_* 键）。"""
@@ -659,14 +1173,6 @@ class SettingsWindow(DraggableWidget):
             bar.clear_text()
         bar._apply_font()
         bar._relayout()
-
-    def _on_chinese_only_toggled(self, checked):
-        """勾上=只显中文 → SHOW_BILINGUAL=False。"""
-        self._mark_custom()
-        config.SHOW_BILINGUAL = not bool(checked)
-        print(f"📊 只显中文: {'开' if checked else '关'} (SHOW_BILINGUAL={config.SHOW_BILINGUAL})")
-        if self._on_font_change:
-            self._on_font_change()
 
     def _on_draft_toggled(self, checked):
         self._mark_custom()
@@ -693,6 +1199,91 @@ class SettingsWindow(DraggableWidget):
         name = self.device_name_edit.text().strip()
         config.LOOPBACK_DEVICE_NAME = name
         print(f"📊 捕获设备名包含: {name or '（系统默认）'}")
+
+    def _emit_remote_change(self):
+        callback = self.on_remote_change
+        if callback is not None:
+            callback()
+
+    def _refresh_remote_controls(self):
+        """控件显示只从文件读回。信号先挡住，否则 setChecked 会再写一遍。"""
+        has_nodes = nodes_available()
+        self.node_cb.blockSignals(True)
+        self.node_cb.setEnabled(has_nodes)
+        # 没有 nodes.json 时勾选框显示关，但不改 node.json：文件还没到，偏好先留着。
+        self.node_cb.setChecked(bool(read_node_enabled()) and has_nodes)
+        self.node_cb.blockSignals(False)
+        if has_nodes:
+            self.node_reason.setText("")
+        else:
+            self.node_reason.setText("没有 nodes.json，开关不可用。音频不会发到节点。")
+
+        configured = groq_key_configured()
+        self.cloud_cb.blockSignals(True)
+        self.cloud_cb.setChecked(bool(read_cloud_enabled()) and configured)
+        self.cloud_cb.blockSignals(False)
+
+        # 正在输入时不要把框清掉，否则状态刷新会吞掉还没保存的 key。
+        if not self.groq_key_edit.hasFocus():
+            self.groq_key_edit.clear()
+        if configured:
+            self.groq_key_edit.setPlaceholderText("已保存（不会回显）")
+        else:
+            self.groq_key_edit.setPlaceholderText("粘贴 Groq key")
+
+        label = static_route_label()
+        source = self.route_status_source
+        if source is not None:
+            try:
+                label = source() or label
+            except Exception:
+                label = static_route_label()
+        self.route_label.setText(f"当前路由：{label}")
+
+    def _on_node_toggled(self, checked):
+        if not nodes_available():
+            self._refresh_remote_controls()
+            return
+        try:
+            write_node_enabled(bool(checked))
+        except Exception as exc:
+            print(f"⚠️  保存节点开关失败: {type(exc).__name__}")
+        self._refresh_remote_controls()
+        self._emit_remote_change()
+
+    def _on_cloud_toggled(self, checked):
+        try:
+            write_cloud_enabled(bool(checked))
+        except Exception as exc:
+            print(f"⚠️  保存云端开关失败: {type(exc).__name__}")
+        self._refresh_remote_controls()
+        self._emit_remote_change()
+
+    def _on_save_groq_key(self):
+        text = self.groq_key_edit.text().strip()
+        # 空保存什么都不做：密码框本来就不回显，空串不能当成「删掉 key」。
+        if not text:
+            return
+        try:
+            write_groq_key(text)
+            write_cloud_enabled(True)
+        except Exception as exc:
+            print(f"⚠️  保存 key 失败: {type(exc).__name__}")
+            return
+        self.groq_key_edit.clear()
+        self._refresh_remote_controls()
+        self._emit_remote_change()
+
+    def _on_clear_groq_key(self):
+        try:
+            clear_groq_key()
+            write_cloud_enabled(False)
+        except Exception as exc:
+            print(f"⚠️  清除 key 失败: {type(exc).__name__}")
+            return
+        self.groq_key_edit.clear()
+        self._refresh_remote_controls()
+        self._emit_remote_change()
 
     # ------------------------------------------------------------------
     # 场景预设
@@ -772,7 +1363,11 @@ class SettingsWindow(DraggableWidget):
             self._sync_preset_button_highlight()
 
     def _reset_defaults(self):
-        """恢复到传入的 defaults 快照（config.py + config_local 出厂态）。"""
+        """恢复到传入的 defaults 快照（config.py + config_local 出厂态）。
+
+        不碰 groq.key / cloud.json / node.json：它们不是场景模式的一部分，
+        「恢复默认」不能把已经保存的 key 或节点开关清掉。
+        """
         # 通过滑块 setValue 触发 valueChanged，自动同步 config 和数值标签
         pairs = [
             (self.chunk_submit_slider, 'CHUNK_SUBMIT_SECONDS'),
@@ -794,18 +1389,33 @@ class SettingsWindow(DraggableWidget):
 
         # checkbox / 颜色 / 字体
         show_bi = self._defaults.get('SHOW_BILINGUAL', True)
-        self.chinese_only_cb.setChecked(not bool(show_bi))
+        mode = self._defaults.get("DISPLAY_MODE", _display_mode_from_show_bilingual(show_bi))
+        if bool(show_bi):
+            mode = "bilingual"
+        elif _normalize_display_mode(mode) == "bilingual":
+            mode = "target"
+        _set_display_mode(mode)
+        self._sync_display_controls(config.DISPLAY_MODE)
 
         draft = self._defaults.get('DRAFT_TRANSLATION', True)
         self.draft_cb.setChecked(bool(draft))
 
         for key, btn in (
+            ("SOURCE_TEXT_COLOR", self.source_color_palette["custom"]),
             ("CHINESE_TEXT_COLOR", self.color_btn_chinese),
             ("DRAFT_TEXT_COLOR", self.color_btn_draft),
             ("UNSTABLE_TEXT_COLOR", self.color_btn_unstable),
         ):
             if key in self._defaults:
                 self.apply_color(key, self._defaults[key], btn)
+        if "BACKGROUND_COLOR" in self._defaults:
+            self.apply_color("BACKGROUND_COLOR", self._defaults["BACKGROUND_COLOR"])
+
+        if "TEXT_EDGE" in self._defaults:
+            config.TEXT_EDGE = self._defaults["TEXT_EDGE"]
+        if "WINDOW_CORNER_RADIUS" in self._defaults:
+            self._set_corner_radius(self._defaults["WINDOW_CORNER_RADIUS"])
+        self._sync_style_option_buttons()
 
         if 'TRANSLATION_STYLE' in self._defaults:
             config.TRANSLATION_STYLE = self._defaults['TRANSLATION_STYLE']
@@ -858,16 +1468,22 @@ class SettingsWindow(DraggableWidget):
             step = info['step']
             slider.blockSignals(True)
             slider.setValue(round(val / step))
-            info['label'].setText(format_slider_value(val, step))
+            if info['label'] is not slider:
+                info['label'].setText(format_slider_value(val, step))
             slider.blockSignals(False)
 
         self.device_name_edit.blockSignals(True)
         self.device_name_edit.setText(getattr(config, 'LOOPBACK_DEVICE_NAME', '') or '')
         self.device_name_edit.blockSignals(False)
 
-        self.chinese_only_cb.blockSignals(True)
-        self.chinese_only_cb.setChecked(not bool(getattr(config, "SHOW_BILINGUAL", True)))
-        self.chinese_only_cb.blockSignals(False)
+        mode = _normalize_display_mode(
+            getattr(config, "DISPLAY_MODE", None), getattr(config, "SHOW_BILINGUAL", True))
+        if bool(getattr(config, "SHOW_BILINGUAL", True)):
+            mode = "bilingual"
+        elif mode == "bilingual":
+            mode = "target"
+        _set_display_mode(mode)
+        self._sync_display_controls(mode)
 
         self.draft_cb.blockSignals(True)
         self.draft_cb.setChecked(bool(getattr(config, "DRAFT_TRANSLATION", True)))
@@ -878,11 +1494,16 @@ class SettingsWindow(DraggableWidget):
         self.cinema_german_cb.blockSignals(False)
 
         for key, btn in (
+            ("SOURCE_TEXT_COLOR", self.source_color_palette["custom"]),
             ("CHINESE_TEXT_COLOR", self.color_btn_chinese),
             ("DRAFT_TEXT_COLOR", self.color_btn_draft),
             ("UNSTABLE_TEXT_COLOR", self.color_btn_unstable),
         ):
-            _style_color_button(btn, getattr(config, key, "#ffffff"))
+            if btn is not None:
+                _style_color_button(btn, getattr(config, key, "#ffffff"))
+            self._refresh_palette_checks(key)
+        self._refresh_palette_checks("BACKGROUND_COLOR")
+        self._sync_style_option_buttons()
 
         primary = (getattr(config, "FONT_FAMILY", "Microsoft YaHei") or "Microsoft YaHei").split(",")[0].strip()
         self.font_combo.blockSignals(True)
@@ -893,5 +1514,4 @@ class SettingsWindow(DraggableWidget):
         self.auto_detect_cb.setChecked(bool(getattr(config, "AUTO_DETECT_LANGUAGE", False)))
         self.auto_detect_cb.blockSignals(False)
         self._sync_language_buttons()
-
-
+        self._refresh_remote_controls()

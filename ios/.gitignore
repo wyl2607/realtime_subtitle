@@ -1,0 +1,6 @@
+*.xcodeproj
+*.xcworkspace
+build/
+DerivedData/
+*.xcuserstate
+.xcode.environment

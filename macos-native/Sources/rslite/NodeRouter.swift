@@ -29,6 +29,15 @@ struct RouteWeights: Sendable {
     var batteryPenalty = 10.0
     var rttPenalty = 6.0
     var localUnderP8Penalty = 1_000.0
+    // 机器状态，与 Python router.RouteWeights 同一套（2026-10-12 Acrobat 退出后 swap_used_gb 仍高）
+    var memWarnPenalty = 8.0
+    var memCriticalPenalty = 25.0
+    var swapPenalty = 6.0
+    var swapHeavyPenalty = 15.0
+    // macOS vm_stat 页按 16KB 估算：500 页/分≈8MB/分，5000 页/分≈80MB/分。
+    // 用当前换出速率判定内存压力；累计 swapUsedGB 只展示，不参与罚分。
+    var swapoutRate = 500.0
+    var swapoutHeavyRate = 5_000.0
     var noNetworkBonus = 4.0
     var migrationMargin = 8.0
 
@@ -51,6 +60,29 @@ struct RouteScore: Sendable {
 }
 
 enum RoutingDecider {
+    /// 节点报的模型名 → 打分表的键（与 Python router.canonical_asr_model 同口径）。
+    /// 2026-10-12：Mac 报 `mlx-community/whisper-large-v3-turbo`、Windows 报 `large-v3-turbo`，
+    /// 都查不到表、全落默认 25 分。
+    static func canonicalASRModel(_ model: String) -> String {
+        var name = (model.split(separator: "/").last.map(String.init) ?? "")
+            .trimmingCharacters(in: .whitespaces).lowercased()
+        if !name.isEmpty, !name.hasPrefix("whisper-"), name != "fake" {
+            name = "whisper-" + name
+        }
+        return name
+    }
+
+    /// 先精确匹配；量化/变体后缀（-q4、-8bit）按最长前缀匹配并扣 2 分。
+    static func asrRank(_ model: String, _ ranks: [String: Double], default fallback: Double = 25) -> Double {
+        let name = canonicalASRModel(model)
+        if let exact = ranks[name] { return exact }
+        let prefixes = ranks.keys.filter { name.hasPrefix($0 + "-") }
+        if let best = prefixes.max(by: { $0.count < $1.count }), let rank = ranks[best] {
+            return rank - 2
+        }
+        return fallback
+    }
+
     static func score(
         _ candidate: RouteCandidate,
         now: Double,
@@ -65,19 +97,31 @@ enum RoutingDecider {
         }
         let model = info.asr.model ?? ""
         let translator = info.translator
-        let asr = weights.asrRank[model] ?? 25
-        let tr = weights.translatorRank[translator] ?? (translator.hasPrefix("ollama:") ? 16 : 12)
+        let asr = RoutingDecider.asrRank(model, weights.asrRank)
+        // translator_ok 缺失按 true。false 只把 tr 记 0，节点仍可当识别用，不加额外罚分。
+        let ranked = weights.translatorRank[translator] ?? (translator.hasPrefix("ollama:") ? 16 : 12)
+        let tr = info.translatorQualityEnabled ? ranked : 0
         let rtf = info.asr.rtf ?? candidate.rttMS / 1000.0
         var penalties = 0.0
         if info.inUse { penalties += weights.inUsePenalty }
         if !info.onAC { penalties += weights.batteryPenalty }
         if candidate.rttMS > 100 { penalties += weights.rttPenalty }
         if candidate.isLocal && !localAccurate { penalties += weights.localUnderP8Penalty }
+        if info.memPressure == "warn" { penalties += weights.memWarnPenalty }
+        if info.memPressure == "critical" { penalties += weights.memCriticalPenalty }
+        if let rate = info.swapoutRate {
+            if rate > weights.swapoutHeavyRate {
+                penalties += weights.swapHeavyPenalty
+            } else if rate > weights.swapoutRate {
+                penalties += weights.swapPenalty
+            }
+        }
         let bonus = candidate.isLocal ? weights.noNetworkBonus : 0
         let score = asr + tr - weights.speedK * rtf - penalties + bonus
         let reason = String(
-            format: "quality=%.1f speed=%.1f penalties=%.1f bonus=%.1f rtt_ms=%.0f",
-            asr + tr, -weights.speedK * rtf, penalties, bonus, candidate.rttMS
+            format: "quality=%.1f speed=%.1f penalties=%.1f bonus=%.1f rtt_ms=%.0f mem=%@/%@",
+            asr + tr, -weights.speedK * rtf, penalties, bonus, candidate.rttMS,
+            info.memPressure ?? "-", info.swapoutRate.map { String(format: "%.1f", $0) } ?? "-"
         )
         return RouteScore(id: candidate.id, score: score, reason: reason)
     }
@@ -91,6 +135,14 @@ enum RoutingDecider {
         candidates.compactMap { score($0, now: now, localAccurate: localAccurate, weights: weights) }
             .max { $0.score < $1.score }
     }
+}
+
+/// 云端状态机看节点层的四个事实。云端不是节点，不会出现在这份清单里。
+struct NodeTierFacts: Sendable, Equatable {
+    var enabled: Bool
+    var healthy: Bool
+    var activeNodeID: String?
+    var isSelf: Bool
 }
 
 struct MigrationGate {
@@ -159,8 +211,6 @@ final class NodeRouter: @unchecked Sendable {
     static let localUDSID = "local_uds"
     private static let probeInterval: Duration = .seconds(30)
     private static let offlineDuration = 60.0
-    private static let silenceThreshold = 0.003
-    private static let silenceSecondsForMigration = 0.6
     private static let replayBufferSeconds = Double(NodeClient.preReadyAudioSeconds)
 
     private let sourceLocaleID: String
@@ -200,6 +250,18 @@ final class NodeRouter: @unchecked Sendable {
     private var replayBuffer = TimedAudioReplayBuffer(maxSeconds: replayBufferSeconds)
     private var nodeAudioSentThrough: Double?
     private var connectingAudioSentThrough: Double?
+    /// 云端档为真时不把音频送去节点。默认开，Sprint 001 的连接行为不变。
+    private var nodeTierEnabled: Bool
+    /// 云端要收回节点会话：等到静音点再关，且不记 offline、不上报「本机」。
+    private var releaseNodeAtSilence = false
+    /// select 选出的节点。云端档关掉连接时也保留，降级时不用再等一轮 30s 探测。
+    private var preferredNodeID: String?
+    /// 用户钉住的节点 id。nil 表示不指定，选点与原来一样。
+    private let pinnedNode: String?
+    private var announcedMissingPin = false
+    private var lastPinnedDownNotice: String?
+    private var probeWaiter: CheckedContinuation<Void, Never>?
+    private var probeKick = false
 
     init(
         sourceLocaleID: String,
@@ -208,7 +270,9 @@ final class NodeRouter: @unchecked Sendable {
         onMode: @escaping @Sendable (SubtitleMode) -> Void,
         nodesURL: URL = NodeRouter.defaultNodesURL,
         stateURL: URL = NodeRouter.defaultStateURL,
-        localAccurate: Bool = Capability.supportsAccurateLocal()
+        localAccurate: Bool = Capability.supportsAccurateLocal(),
+        nodeTierEnabled: Bool = true,
+        pinnedNode: String? = nil
     ) {
         self.sourceLocaleID = sourceLocaleID
         self.targetLanguageID = targetLanguageID
@@ -217,6 +281,8 @@ final class NodeRouter: @unchecked Sendable {
         self.nodesURL = nodesURL
         self.stateURL = stateURL
         self.localAccurate = localAccurate
+        self.nodeTierEnabled = nodeTierEnabled
+        self.pinnedNode = AppSettings.normalizedPin(pinnedNode)
     }
 
     // macOS 的 expandingTildeInPath 不认 $HOME，冒烟/测试没法靠改 HOME 隔离；
@@ -252,12 +318,47 @@ final class NodeRouter: @unchecked Sendable {
         audioTask = Task { await self.audioLoop(stream: stream, fanout: fanout) }
     }
 
+    /// 云端档打开时关掉节点连接；降级时再打开。健康节点已经探测过就立刻作为待连接，否则马上再探一次。
+    func setNodeTierEnabled(_ enabled: Bool) {
+        let shouldProbe = lock.withLockValue { () -> Bool in
+            nodeTierEnabled = enabled
+            if enabled {
+                releaseNodeAtSilence = false
+                if currentNode == nil, pendingMigrationID == nil, let preferred = preferredNodeID {
+                    pendingMigrationID = preferred
+                }
+                return preferredNodeID == nil
+            }
+            pendingMigrationID = nil
+            let sessionOpen = currentNode != nil || currentClient != nil || connectingClient != nil
+            releaseNodeAtSilence = sessionOpen
+            return false
+        }
+        if shouldProbe {
+            requestProbeSoon()
+        }
+    }
+
+    /// 给云端状态机。isSelf 恒为 false：打分前已经丢掉指向本机的清单条目。
+    func tierFacts() -> NodeTierFacts {
+        lock.withLockValue {
+            NodeTierFacts(
+                enabled: !nodes.isEmpty || preferredNodeID != nil,
+                healthy: preferredNodeID != nil,
+                activeNodeID: currentNode?.id,
+                isSelf: false
+            )
+        }
+    }
+
     func stop() async {
         lock.withLockVoid {
             stopped = true
             switching = false
             switchGeneration += 1
         }
+        // 先唤醒等待中的探测，再 cancel。只恢复已挂起的 continuation，避免下一轮误踢。
+        resumeProbeWaiter(setKickIfIdle: false)
         probeTask?.cancel()
         audioTask?.cancel()
         lock.withLockValue { switchTask }?.cancel()
@@ -286,6 +387,7 @@ final class NodeRouter: @unchecked Sendable {
     func finish() async {
         await audioTask?.value
         let client = lock.withLockValue { stopped ? nil : currentClient }
+        resumeProbeWaiter(setKickIfIdle: false)
         probeTask?.cancel()
         await client?.drain(timeout: .seconds(5))
         // 迁移中的旧会话也要把尾部句子收回来（各自 drain ≤3s + close ≤2s，有上限）
@@ -298,18 +400,79 @@ final class NodeRouter: @unchecked Sendable {
 
     private func probeLoop() async {
         await probeOnce()
-        while !Task.isCancelled {
-            do {
-                try await Task.sleep(for: Self.probeInterval)
-            } catch {
+        while !Task.isCancelled && !lock.withLockValue({ stopped }) {
+            // 30s 和「马上再探」谁先到听谁的。取消只唤醒已经挂起的等待，不留下 kick。
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { [self] in
+                    do {
+                        try await Task.sleep(for: Self.probeInterval)
+                    } catch {
+                        return
+                    }
+                    if !Task.isCancelled {
+                        self.resumeProbeWaiter(setKickIfIdle: true)
+                    }
+                }
+                group.addTask { [self] in
+                    await withTaskCancellationHandler {
+                        await self.waitForNextProbe()
+                    } onCancel: {
+                        self.resumeProbeWaiter(setKickIfIdle: false)
+                    }
+                }
+                _ = await group.next()
+                group.cancelAll()
+            }
+            if Task.isCancelled || lock.withLockValue({ stopped }) {
                 return
             }
             await probeOnce()
         }
     }
 
+    private func requestProbeSoon() {
+        resumeProbeWaiter(setKickIfIdle: true)
+    }
+
+    private func resumeProbeWaiter(setKickIfIdle: Bool) {
+        lock.lock()
+        let waiter = probeWaiter
+        probeWaiter = nil
+        if waiter == nil && setKickIfIdle {
+            probeKick = true
+        }
+        lock.unlock()
+        waiter?.resume()
+    }
+
+    private func waitForNextProbe() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            self.lock.lock()
+            if self.probeKick || Task.isCancelled {
+                self.probeKick = false
+                self.lock.unlock()
+                continuation.resume()
+                return
+            }
+            self.probeWaiter = continuation
+            self.lock.unlock()
+        }
+    }
+
     private func probeOnce() async {
-        let configs = lock.withLockValue { nodes }
+        let allConfigs = lock.withLockValue { nodes }
+        let decision = Self.pinnedCandidateDecision(nodeIDs: allConfigs.map(\.id), pinnedNode: pinnedNode)
+        if case .missing(let missingID) = decision {
+            let tell = lock.withLockValue { () -> Bool in
+                if announcedMissingPin { return false }
+                announcedMissingPin = true
+                return true
+            }
+            if tell {
+                callbacks.onStatus(Self.pinnedMissingStatus(id: missingID))
+            }
+        }
+        let configs = Self.configsForProbe(allConfigs, pinnedNode: pinnedNode)
         var candidates: [RouteCandidate] = []
         let localHWHash = Capability.hwHash()
         var localInfo: NodeInfo?
@@ -421,12 +584,16 @@ final class NodeRouter: @unchecked Sendable {
 
     private func select(candidates: [RouteCandidate]) async {
         let now = nowSeconds()
-        let best = RoutingDecider.choose(
-            candidates: candidates.map { candidate in
-                var c = candidate
-                c.offlineUntil = lock.withLockValue { states[candidate.id]?.offlineUntil }
-                return c
-            },
+        let manifestIDs = lock.withLockValue { nodes.map(\.id) }
+        let adjusted = candidates.map { candidate in
+            var c = candidate
+            c.offlineUntil = lock.withLockValue { states[candidate.id]?.offlineUntil }
+            return c
+        }
+        let best = Self.routeSelection(
+            candidates: adjusted,
+            nodeIDs: manifestIDs,
+            pinnedNode: pinnedNode,
             now: now,
             localAccurate: localAccurate,
             weights: weights
@@ -449,18 +616,76 @@ final class NodeRouter: @unchecked Sendable {
         }
         // 切换一律由 audioLoop 在下一块音频到达时执行（首次连接立刻，迁移等静音点）：
         // 这里若也直接切，会和 audioLoop 同时对同一节点开两个会话，后者吃 1013。
-        lock.withLockVoid {
-            if currentNode == nil {
-                pendingMigrationID = best?.id
-                return
+        // 云端档关闭时只记住最优节点，不观察迁移门：观察 nil 会把节点之间的两轮计数清掉。
+        let followUp = lock.withLockValue { () -> (notice: String?, drop: NodeSessionRef?) in
+            preferredNodeID = best?.id
+            let scoredGate: Bool
+            if !nodeTierEnabled || releaseNodeAtSilence || currentNode == nil {
+                scoredGate = false
+            } else {
+                var gateCopy = gate
+                scoredGate = gateCopy.observe(best: best, current: currentScore)
+                gate = gateCopy
             }
-            var gateCopy = gate
-            let ok = gateCopy.observe(best: best, current: currentScore)
-            gate = gateCopy
-            if ok, let best, best.id != currentNode?.id {
-                pendingMigrationID = best.id
+            let gateAllows = Self.migrationGateAllows(
+                nodeIDs: manifestIDs,
+                pinnedNode: pinnedNode,
+                bestID: best?.id,
+                currentNodeID: currentNode?.id,
+                scoredGateAllows: scoredGate
+            )
+            switch Self.pendingMigrationUpdate(
+                nodeTierEnabled: nodeTierEnabled,
+                releaseNodeAtSilence: releaseNodeAtSilence,
+                currentNodeID: currentNode?.id,
+                bestID: best?.id,
+                gateAllows: gateAllows
+            ) {
+            case .set(let id):
+                pendingMigrationID = id
+            case .keep:
+                break
             }
+            let notice = Self.pinnedUnavailableNotice(
+                nodeIDs: manifestIDs,
+                pinnedNode: pinnedNode,
+                bestID: best?.id
+            )
+            let emitNotice = notice != lastPinnedDownNotice ? notice : nil
+            lastPinnedDownNotice = notice
+            let drop = Self.shouldDropPinnedSession(
+                nodeIDs: manifestIDs,
+                pinnedNode: pinnedNode,
+                bestID: best?.id,
+                currentNodeID: currentNode?.id
+            ) && !switching ? currentSession : nil
+            return (emitNotice, drop)
         }
+        if let notice = followUp.notice {
+            callbacks.onStatus(notice)
+        }
+        if let session = followUp.drop {
+            await dropPinnedSession(session)
+        }
+    }
+
+    /// 指定节点已经不可用，而且没有本机节点可迁：拆掉当前会话，字幕留在本机流水线。
+    /// 不额外写 offline_until，下一轮探测看到它恢复就按「当前没有会话」接回去。
+    private func dropPinnedSession(_ session: NodeSessionRef) async {
+        let client = lock.withLockValue { () -> NodeClient? in
+            guard currentSession == session, !switching else { return nil }
+            let client = currentClient
+            currentClient = nil
+            currentSession = nil
+            currentNode = nil
+            currentToken = nil
+            currentInfo = nil
+            pendingMigrationID = nil
+            return client
+        }
+        guard let client else { return }
+        await client.close()
+        onMode(.local)
     }
 
     private static func currentRouteScore(
@@ -549,19 +774,31 @@ final class NodeRouter: @unchecked Sendable {
                 latestClock = audio.startSeconds
                 replayBuffer.append(audio)
             }
-            updateSilence(audio)
             // prepare/connect 最长十几秒：放到独立 Task，音频循环不能被它堵住，
             // 否则 AudioFanout 丢旧帧、节点时钟落后（R3-2）。switching 由 switchToPending 内部预约防重入。
-            let trigger = lock.withLockValue { () -> Bool? in
-                guard !stopped, !switching, pendingMigrationID != nil else { return nil }
-                guard currentNode == nil || silenceRun >= Self.silenceSecondsForMigration else { return nil }
-                return currentNode != nil
+            // 云端收回会话优先于连接：同一次静音里不能又连上又拆掉。
+            let action = lock.withLockValue {
+                Self.nodeTierAction(
+                    stopped: stopped,
+                    switching: switching,
+                    nodeTierEnabled: nodeTierEnabled,
+                    releaseNodeAtSilence: releaseNodeAtSilence,
+                    pendingMigrationID: pendingMigrationID,
+                    silenceRun: silenceRun,
+                    hasCurrentNode: currentNode != nil
+                )
             }
-            if let atSilence = trigger {
+            switch action {
+            case .release:
+                await releaseNodeForCloudTier()
+            case .connect(let atSilence):
                 let task = Task { await self.switchToPending(atSilence: atSilence) }
                 lock.withLockVoid { switchTask = task }
+            case nil:
+                break
             }
             let (client, session, connecting, connectingSession, connectingIsReplaying) = lock.withLockValue {
+                () -> (NodeClient?, NodeSessionRef?, NodeClient?, NodeSessionRef?, Bool) in
                 (
                     currentClient,
                     currentSession,
@@ -598,6 +835,100 @@ final class NodeRouter: @unchecked Sendable {
                 }
             }
         }
+    }
+
+    /// 云端档在静音点拆掉节点会话。不写 offline_until，也不上报本机：状态行这时属于云端。
+    private func releaseNodeForCloudTier() async {
+        let (client, connecting) = lock.withLockValue { () -> (NodeClient?, NodeClient?) in
+            let client = currentClient
+            let connecting = connectingClient
+            currentClient = nil
+            currentSession = nil
+            connectingClient = nil
+            connectingSession = nil
+            connectingReplaySession = nil
+            connectingAudioSentThrough = nil
+            currentNode = nil
+            currentToken = nil
+            currentInfo = nil
+            pendingMigrationID = nil
+            releaseNodeAtSilence = false
+            nodeAudioSentThrough = nil
+            return (client, connecting)
+        }
+        if let client {
+            let id = UUID()
+            lock.withLockVoid {
+                drainTasks[id] = Task {
+                    await client.drain(timeout: .seconds(3))
+                    await client.close()
+                    self.lock.withLockVoid { _ = self.drainTasks.removeValue(forKey: id) }
+                }
+            }
+        }
+        if let connecting, !Self.sameClient(connecting, client) {
+            await connecting.close()
+        }
+    }
+
+    enum NodeTierAction: Equatable {
+        case connect(atSilence: Bool)
+        case release
+    }
+
+    enum PendingMigrationUpdate: Equatable {
+        case set(String?)
+        case keep
+    }
+
+    /// 节点层关闭时的音频循环决策。默认参数下和原来的「无会话立刻连、有会话等 0.6s」一致。
+    static func nodeTierAction(
+        stopped: Bool,
+        switching: Bool,
+        nodeTierEnabled: Bool,
+        releaseNodeAtSilence: Bool,
+        pendingMigrationID: String?,
+        silenceRun: Double,
+        hasCurrentNode: Bool
+    ) -> NodeTierAction? {
+        guard !stopped, !switching else { return nil }
+        if releaseNodeAtSilence {
+            guard silenceRun >= CloudSegmenter.silenceSeconds else { return nil }
+            return .release
+        }
+        guard nodeTierEnabled, pendingMigrationID != nil else { return nil }
+        guard !hasCurrentNode || silenceRun >= CloudSegmenter.silenceSeconds else { return nil }
+        return .connect(atSilence: hasCurrentNode)
+    }
+
+    /// 静音只认 CloudSegmenter 的判定（20ms RMS 0.005、静音 ≥0.6s）。这里不再另量一整块 RMS。
+    static func silenceRun(fromCloudAtSilence atSilence: Bool) -> Double {
+        atSilence ? CloudSegmenter.silenceSeconds : 0
+    }
+
+    func noteCloudSilence(_ atSilence: Bool) {
+        let run = Self.silenceRun(fromCloudAtSilence: atSilence)
+        lock.withLockVoid { silenceRun = run }
+    }
+
+    /// 待连接的三态：关闭时清掉；没有当前会话时直接采用最优；门没过就保留已有意图。
+    static func pendingMigrationUpdate(
+        nodeTierEnabled: Bool,
+        releaseNodeAtSilence: Bool,
+        currentNodeID: String?,
+        bestID: String?,
+        gateAllows: Bool
+    ) -> PendingMigrationUpdate {
+        if !nodeTierEnabled || releaseNodeAtSilence {
+            return .set(nil)
+        }
+        if currentNodeID == nil {
+            return .set(bestID)
+        }
+        if gateAllows, let bestID, bestID != currentNodeID {
+            return .set(bestID)
+        }
+        return .keep
     }
 
     private func switchToPending(atSilence: Bool) async {
@@ -940,25 +1271,6 @@ final class NodeRouter: @unchecked Sendable {
         )
     }
 
-    private func updateSilence(_ audio: TimedAudio) {
-        let seconds = audio.duration
-        guard let channel = audio.buffer.floatChannelData?[0] else {
-            lock.withLockVoid { silenceRun = 0 }
-            return
-        }
-        let count = Int(audio.buffer.frameLength)
-        guard count > 0 else { return }
-        var sum = 0.0
-        for i in 0..<count {
-            let v = Double(channel[i])
-            sum += v * v
-        }
-        let rms = sqrt(sum / Double(count))
-        lock.withLockVoid {
-            silenceRun = rms < Self.silenceThreshold ? silenceRun + seconds : 0
-        }
-    }
-
     private func persistState() {
         let snapshot = lock.withLockValue { states }
         do {
@@ -1099,6 +1411,119 @@ final class NodeRouter: @unchecked Sendable {
         ok = true
     }
 
+    enum PinnedCandidateDecision: Equatable {
+        case unrestricted
+        case only(String)
+        case missing(String)
+    }
+
+    /// 不指定：保持全部候选。指定的 id 在清单里：只留它和本机。不在清单里：只留本机。
+    static func pinnedCandidateDecision(nodeIDs: [String], pinnedNode: String?) -> PinnedCandidateDecision {
+        guard let pin = AppSettings.normalizedPin(pinnedNode) else {
+            return .unrestricted
+        }
+        if nodeIDs.contains(pin) {
+            return .only(pin)
+        }
+        return .missing(pin)
+    }
+
+    static func filterRouteCandidates(
+        candidates: [RouteCandidate],
+        nodeIDs: [String],
+        pinnedNode: String?
+    ) -> [RouteCandidate] {
+        switch pinnedCandidateDecision(nodeIDs: nodeIDs, pinnedNode: pinnedNode) {
+        case .unrestricted:
+            return candidates
+        case .only(let id):
+            return candidates.filter { $0.isLocal || $0.id == id }
+        case .missing:
+            return candidates.filter(\.isLocal)
+        }
+    }
+
+    static func configsForProbe(_ nodes: [NodeConfig], pinnedNode: String?) -> [NodeConfig] {
+        switch pinnedCandidateDecision(nodeIDs: nodes.map(\.id), pinnedNode: pinnedNode) {
+        case .unrestricted:
+            return nodes
+        case .only(let id):
+            return nodes.filter { $0.id == id }
+        case .missing:
+            return []
+        }
+    }
+
+    /// 未指定时与 `RoutingDecider.choose` 相同。
+    /// 指定节点能打分时就用它，不因为别的节点分数更高而改选。
+    /// 指定节点不在清单里，或当前打不出分（离线、忙、鉴权失败）：只在本机候选里选。
+    static func routeSelection(
+        candidates: [RouteCandidate],
+        nodeIDs: [String],
+        pinnedNode: String?,
+        now: Double,
+        localAccurate: Bool,
+        weights: RouteWeights = .default
+    ) -> RouteScore? {
+        let decision = pinnedCandidateDecision(nodeIDs: nodeIDs, pinnedNode: pinnedNode)
+        let filtered = filterRouteCandidates(candidates: candidates, nodeIDs: nodeIDs, pinnedNode: pinnedNode)
+        if case .only(let id) = decision,
+           let pinned = filtered.first(where: { !$0.isLocal && $0.id == id }),
+           let score = RoutingDecider.score(pinned, now: now, localAccurate: localAccurate, weights: weights) {
+            return score
+        }
+        return RoutingDecider.choose(
+            candidates: filtered,
+            now: now,
+            localAccurate: localAccurate,
+            weights: weights
+        )
+    }
+
+    /// 未指定时沿用原来的迁移门。指定节点能用就要接回去；它不能用且当前还连着它，就离开。
+    static func migrationGateAllows(
+        nodeIDs: [String],
+        pinnedNode: String?,
+        bestID: String?,
+        currentNodeID: String?,
+        scoredGateAllows: Bool
+    ) -> Bool {
+        guard case .only(let pinned) = pinnedCandidateDecision(nodeIDs: nodeIDs, pinnedNode: pinnedNode) else {
+            return scoredGateAllows
+        }
+        if bestID == pinned && currentNodeID != pinned {
+            return true
+        }
+        if bestID != pinned && currentNodeID == pinned {
+            return true
+        }
+        return scoredGateAllows
+    }
+
+    static func shouldDropPinnedSession(
+        nodeIDs: [String],
+        pinnedNode: String?,
+        bestID: String?,
+        currentNodeID: String?
+    ) -> Bool {
+        guard case .only(let pinned) = pinnedCandidateDecision(nodeIDs: nodeIDs, pinnedNode: pinnedNode) else {
+            return false
+        }
+        return bestID == nil && currentNodeID == pinned
+    }
+
+    static func pinnedUnavailableNotice(nodeIDs: [String], pinnedNode: String?, bestID: String?) -> String? {
+        guard case .only(let id) = pinnedCandidateDecision(nodeIDs: nodeIDs, pinnedNode: pinnedNode) else {
+            return nil
+        }
+        guard bestID != id else { return nil }
+        return id + DesignTokens.Text.nodeUnavailableSuffix
+    }
+
+    static func pinnedMissingStatus(id: String) -> String {
+        "\(id) 不在节点列表，已用本机"
+    }
+
     static func selfTest() -> [String] {
         var failures: [String] = []
         func check(_ ok: Bool, _ name: String) {
@@ -1128,6 +1553,97 @@ final class NodeRouter: @unchecked Sendable {
         let better = RouteCandidate(id: "better", expectedNodeID: "n2", info: betterInfo, rttMS: 20, isLocal: false, offlineUntil: nil)
         check(RoutingDecider.choose(candidates: [base, better], now: 0, localAccurate: true)?.id == "better",
               "更优节点上线应被选中")
+        let ranks = RouteWeights.default.asrRank
+        check(RoutingDecider.asrRank("mlx-community/whisper-large-v3-turbo", ranks) == 40, "Mac 节点模型名带仓库前缀")
+        check(RoutingDecider.asrRank("large-v3-turbo", ranks) == 40, "Windows 节点模型名无 whisper- 前缀")
+        check(RoutingDecider.asrRank("mlx-community/whisper-large-v3-turbo-q4", ranks) == 38, "量化变体按前缀扣 2 分")
+        check(RoutingDecider.asrRank("whisper-small", ranks) == 25, "未知模型默认 25")
+        // 机器状态：更快的节点在内存严重 / 正在大量换页时应让位；字段缺失（旧节点）不罚分
+        var sickInfo = betterInfo
+        sickInfo.memPressure = "critical"
+        let sick = RouteCandidate(id: "sick", expectedNodeID: "n2", info: sickInfo, rttMS: 20, isLocal: false, offlineUntil: nil)
+        check(RoutingDecider.choose(candidates: [base, sick], now: 0, localAccurate: true)?.id == "base",
+              "内存严重的节点应让位")
+        var swappyInfo = betterInfo
+        swappyInfo.swapUsedGB = 35
+        swappyInfo.swapoutRate = 6_000
+        let swappy = RouteCandidate(id: "swappy", expectedNodeID: "n2", info: swappyInfo, rttMS: 20, isLocal: false, offlineUntil: nil)
+        check(RoutingDecider.choose(candidates: [base, swappy], now: 0, localAccurate: true)?.id == "base",
+              "正在大量换页的节点应让位")
+        var accumulatedSwap = betterInfo
+        accumulatedSwap.swapUsedGB = 35
+        accumulatedSwap.swapoutRate = 0
+        let accumulated = RouteCandidate(
+            id: "accumulated", expectedNodeID: "n2", info: accumulatedSwap, rttMS: 20, isLocal: false, offlineUntil: nil
+        )
+        check(RoutingDecider.choose(candidates: [base, accumulated], now: 0, localAccurate: true)?.id == "accumulated",
+              "只有累计 swap 高但换页率为 0 时不罚分")
+        let plainScore = RoutingDecider.score(better, now: 0, localAccurate: true)?.score
+        var lightSwap = betterInfo
+        lightSwap.swapUsedGB = 35
+        lightSwap.swapoutRate = nil
+        lightSwap.memPressure = "normal"
+        let light = RouteCandidate(id: "light", expectedNodeID: "n2", info: lightSwap, rttMS: 20, isLocal: false, offlineUntil: nil)
+        check(RoutingDecider.score(light, now: 0, localAccurate: true)?.score == plainScore,
+              "正常内存与未知换页率不罚分")
+        if let data = #"{"v":2,"node_id":"n","hw_hash":"h","asr":{},"translator":"apple","busy":false,"on_ac":true,"in_use":false,"worker":"warm","mem_pressure":"warn","swap_used_gb":12.5,"swapout_rate":6000}"#.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode(NodeInfo.self, from: data) {
+            check(decoded.memPressure == "warn" && decoded.swapUsedGB == 12.5 && decoded.swapoutRate == 6_000,
+                  "解析 mem_pressure / swap_used_gb / swapout_rate")
+        } else {
+            check(false, "解析 mem_pressure / swap_used_gb / swapout_rate")
+        }
+        let localCandidate = RouteCandidate(
+            id: localUDSID, expectedNodeID: "n1", info: goodInfo, rttMS: 5, isLocal: true, offlineUntil: nil
+        )
+        let manifestIDs = ["base", "better", "win"]
+        let winBusy = RouteCandidate(id: "win", expectedNodeID: "n3", info: busyInfo, rttMS: 10, isLocal: false, offlineUntil: nil)
+        let pool = [localCandidate, base, better, winBusy]
+        check(Self.routeSelection(candidates: pool, nodeIDs: manifestIDs, pinnedNode: nil, now: 0, localAccurate: true)?.id
+              == RoutingDecider.choose(candidates: pool, now: 0, localAccurate: true)?.id,
+              "pinned 为 nil 时选择与原来的 choose 一致")
+        check(Self.filterRouteCandidates(candidates: pool, nodeIDs: manifestIDs, pinnedNode: nil).map(\.id) == ["local_uds", "base", "better", "win"],
+              "pinned 为 nil 时候选不过滤")
+        check(Self.filterRouteCandidates(candidates: pool, nodeIDs: manifestIDs, pinnedNode: "win").map(\.id) == ["local_uds", "win"],
+              "pinned 存在时只留该 id 和本机")
+        check(Self.filterRouteCandidates(candidates: pool, nodeIDs: manifestIDs, pinnedNode: "ghost").map(\.id) == ["local_uds"],
+              "pinned 不存在时只留本机")
+        check(Self.filterRouteCandidates(candidates: pool, nodeIDs: manifestIDs, pinnedNode: "  ").map(\.id) == ["local_uds", "base", "better", "win"],
+              "空白 pinned 视为不指定")
+        check(Self.routeSelection(candidates: pool, nodeIDs: manifestIDs, pinnedNode: "base", now: 0, localAccurate: true)?.id == "base",
+              "指定节点可用时选它，不选更快的其它节点")
+        check(Self.routeSelection(candidates: pool, nodeIDs: manifestIDs, pinnedNode: "win", now: 0, localAccurate: true)?.id == localUDSID,
+              "指定节点不可用时只回本机，不选其它节点")
+        check(Self.routeSelection(candidates: [base, better, winBusy], nodeIDs: manifestIDs, pinnedNode: "win", now: 0, localAccurate: true) == nil,
+              "指定节点不可用且没有本机候选时不改选其它节点")
+        check(Self.routeSelection(candidates: pool, nodeIDs: manifestIDs, pinnedNode: "ghost", now: 0, localAccurate: true)?.id == localUDSID,
+              "pinned 不在清单时当作本机")
+        let winConfig = NodeConfig(id: "win", nodeID: "n3", url: "ws://win:8791", tokenFile: "/tmp/t")
+        let miniConfig = NodeConfig(id: "mini2", nodeID: "n2", url: "ws://mini2:8791", tokenFile: "/tmp/t")
+        check(Self.configsForProbe([winConfig, miniConfig], pinnedNode: nil).map(\.id) == ["win", "mini2"],
+              "未指定时探测全部节点")
+        check(Self.configsForProbe([winConfig, miniConfig], pinnedNode: "mini2").map(\.id) == ["mini2"],
+              "指定节点时只探测该 id")
+        check(Self.configsForProbe([winConfig, miniConfig], pinnedNode: "ghost").isEmpty,
+              "指定节点不在清单时不探测其它节点")
+        check(Self.migrationGateAllows(nodeIDs: manifestIDs, pinnedNode: nil, bestID: "b", currentNodeID: "a", scoredGateAllows: false) == false,
+              "未指定时沿用原来的迁移门")
+        check(Self.migrationGateAllows(nodeIDs: manifestIDs, pinnedNode: "win", bestID: "win", currentNodeID: localUDSID, scoredGateAllows: false),
+              "指定节点恢复后应接回，不等分数差")
+        check(Self.migrationGateAllows(nodeIDs: manifestIDs, pinnedNode: "win", bestID: localUDSID, currentNodeID: "win", scoredGateAllows: false),
+              "指定节点不可用时应离开它")
+        check(Self.shouldDropPinnedSession(nodeIDs: manifestIDs, pinnedNode: "win", bestID: nil, currentNodeID: "win"),
+              "指定节点不可用且没有本机节点会话时应断开")
+        check(!Self.shouldDropPinnedSession(nodeIDs: manifestIDs, pinnedNode: nil, bestID: nil, currentNodeID: "win"),
+              "未指定时不因这条规则断开")
+        check(Self.pinnedUnavailableNotice(nodeIDs: manifestIDs, pinnedNode: "win", bestID: nil) == "win" + DesignTokens.Text.nodeUnavailableSuffix,
+              "指定节点不可用的状态文案")
+        check(Self.pinnedUnavailableNotice(nodeIDs: manifestIDs, pinnedNode: "win", bestID: localUDSID) == "win" + DesignTokens.Text.nodeUnavailableSuffix,
+              "回到本机节点时也提示指定节点不可用")
+        check(Self.pinnedUnavailableNotice(nodeIDs: manifestIDs, pinnedNode: "win", bestID: "win") == nil,
+              "指定节点可用时不报不可用")
+        check(Self.pinnedMissingStatus(id: "ghost") == "ghost 不在节点列表，已用本机",
+              "清单里没有该节点的提示")
         check(RoutingDecider.choose(candidates: [better, RouteCandidate(id: "off", expectedNodeID: "n1", info: goodInfo, rttMS: 10, isLocal: false, offlineUntil: 100)], now: 1, localAccurate: true)?.id == "better",
               "offline_until 内节点应排除")
         check(RoutingDecider.choose(candidates: [RouteCandidate(id: "busy", expectedNodeID: "n3", info: busyInfo, rttMS: 10, isLocal: false, offlineUntil: nil)], now: 0, localAccurate: true) == nil,
@@ -1156,6 +1672,82 @@ final class NodeRouter: @unchecked Sendable {
               "同 rtf 下本机节点应因无网络加分胜出")
         check(RoutingDecider.choose(candidates: [better, localSlowP8], now: 0, localAccurate: true)?.id == "better",
               "远端明显更优时应选远端")
+        let ollamaDown = NodeInfo(
+            v: 2, nodeID: "od", hwHash: "h",
+            asr: .init(model: "whisper-large-v3-turbo", backend: "mlx", rtf: 0.08),
+            translator: "ollama:qwen", busy: false, onAC: true, inUse: false, worker: "warm",
+            translatorOK: false
+        )
+        let ollamaUp = NodeInfo(
+            v: 2, nodeID: "ou", hwHash: "h",
+            asr: .init(model: "whisper-large-v3-turbo", backend: "mlx", rtf: 0.08),
+            translator: "ollama:qwen", busy: false, onAC: true, inUse: false, worker: "warm",
+            translatorOK: true
+        )
+        let ollamaLegacy = NodeInfo(
+            v: 2, nodeID: "ou", hwHash: "h",
+            asr: .init(model: "whisper-large-v3-turbo", backend: "mlx", rtf: 0.08),
+            translator: "ollama:qwen", busy: false, onAC: true, inUse: false, worker: "warm"
+        )
+        let downCandidate = RouteCandidate(id: "down", expectedNodeID: "od", info: ollamaDown, rttMS: 20, isLocal: false, offlineUntil: nil)
+        let upCandidate = RouteCandidate(id: "up", expectedNodeID: "ou", info: ollamaUp, rttMS: 20, isLocal: false, offlineUntil: nil)
+        if let downScore = RoutingDecider.score(downCandidate, now: 0, localAccurate: true),
+           let upScore = RoutingDecider.score(upCandidate, now: 0, localAccurate: true),
+           let legacyScore = RoutingDecider.score(
+            RouteCandidate(id: "up", expectedNodeID: "ou", info: ollamaLegacy, rttMS: 20, isLocal: false, offlineUntil: nil),
+            now: 0, localAccurate: true
+           ) {
+            check(upScore.score - downScore.score == 16,
+                  "translator_ok=false 时 tr 记 0，不加额外罚分")
+            check(downScore.reason.contains("quality=40.0") && upScore.reason.contains("quality=56.0"),
+                  "translator_ok=false 只把质量项里的 tr 清掉")
+            check(legacyScore.score == upScore.score, "translator_ok 缺失按 true，分数与显式 true 相同")
+        } else {
+            check(false, "translator_ok=false 的节点仍可作识别")
+        }
+        check(RoutingDecider.choose(candidates: [downCandidate, upCandidate], now: 0, localAccurate: true)?.id == "up",
+              "翻译不可用时不应再靠 tr 赢过同条件的可用节点")
+        let fastDown = NodeInfo(
+            v: 2, nodeID: "fd", hwHash: "h",
+            asr: .init(model: "whisper-large-v3-turbo", backend: "mlx", rtf: 0.02),
+            translator: "ollama:qwen", busy: false, onAC: true, inUse: false, worker: "warm",
+            translatorOK: false
+        )
+        let slowUp = NodeInfo(
+            v: 2, nodeID: "su", hwHash: "h",
+            asr: .init(model: "whisper-large-v3-turbo", backend: "mlx", rtf: 1),
+            translator: "ollama:qwen", busy: false, onAC: true, inUse: false, worker: "warm",
+            translatorOK: true
+        )
+        check(RoutingDecider.choose(candidates: [
+            RouteCandidate(id: "fast", expectedNodeID: "fd", info: fastDown, rttMS: 20, isLocal: false, offlineUntil: nil),
+            RouteCandidate(id: "slow", expectedNodeID: "su", info: slowUp, rttMS: 20, isLocal: false, offlineUntil: nil),
+        ], now: 0, localAccurate: true)?.id == "fast",
+              "翻译不可用只把 tr 记 0，更快的识别节点仍可胜出")
+        let appleDown = NodeInfo(
+            v: 2, nodeID: "ad", hwHash: "h",
+            asr: .init(model: "whisper-large-v3-turbo", backend: "mlx", rtf: 0.08),
+            translator: "apple", busy: false, onAC: true, inUse: false, worker: "warm",
+            translatorOK: false
+        )
+        let appleUp = NodeInfo(
+            v: 2, nodeID: "au", hwHash: "h",
+            asr: .init(model: "whisper-large-v3-turbo", backend: "mlx", rtf: 0.08),
+            translator: "apple", busy: false, onAC: true, inUse: false, worker: "warm",
+            translatorOK: true
+        )
+        if let appleDownScore = RoutingDecider.score(
+            RouteCandidate(id: "ad", expectedNodeID: "ad", info: appleDown, rttMS: 20, isLocal: false, offlineUntil: nil),
+            now: 0, localAccurate: true
+        ), let appleUpScore = RoutingDecider.score(
+            RouteCandidate(id: "au", expectedNodeID: "au", info: appleUp, rttMS: 20, isLocal: false, offlineUntil: nil),
+            now: 0, localAccurate: true
+        ) {
+            check(appleUpScore.score - appleDownScore.score == 20,
+                  "translator_ok=false 时 apple 的 tr 也记 0，罚分幅度等于原 tr")
+        } else {
+            check(false, "translator_ok=false 的 apple 节点仍可作识别")
+        }
         check(Self.currentRouteScore(
             node: NodeConfig(id: localUDSID, nodeID: "", url: "", tokenFile: ""),
             info: goodInfo,
@@ -1411,6 +2003,62 @@ final class NodeRouter: @unchecked Sendable {
               "R4-2：audioGap 视为非故障")
         check(!shouldFallbackOnClosed(error: NodeClientError.audioGap, closed: a, current: a, routerStopped: false),
               "R4-2：audioGap 不触发故障回退")
+        check(Self.nodeTierAction(
+            stopped: false, switching: false, nodeTierEnabled: true, releaseNodeAtSilence: false,
+            pendingMigrationID: "n1", silenceRun: 0, hasCurrentNode: false
+        ) == .connect(atSilence: false), "无当前节点时首次连接应立即发生")
+        check(Self.nodeTierAction(
+            stopped: false, switching: false, nodeTierEnabled: true, releaseNodeAtSilence: false,
+            pendingMigrationID: "n1", silenceRun: 0.59, hasCurrentNode: true
+        ) == nil, "已有节点时静音不足不应迁移")
+        check(Self.nodeTierAction(
+            stopped: false, switching: false, nodeTierEnabled: true, releaseNodeAtSilence: false,
+            pendingMigrationID: "n1", silenceRun: 0.6, hasCurrentNode: true
+        ) == .connect(atSilence: true), "已有节点且静音达到 0.6s 才迁移")
+        check(Self.nodeTierAction(
+            stopped: false, switching: false, nodeTierEnabled: true, releaseNodeAtSilence: false,
+            pendingMigrationID: nil, silenceRun: 1, hasCurrentNode: false
+        ) == nil, "没有迁移目标时不应连接")
+        check(Self.nodeTierAction(
+            stopped: true, switching: false, nodeTierEnabled: true, releaseNodeAtSilence: false,
+            pendingMigrationID: "n1", silenceRun: 1, hasCurrentNode: false
+        ) == nil, "停止后不应连接")
+        check(Self.nodeTierAction(
+            stopped: false, switching: true, nodeTierEnabled: true, releaseNodeAtSilence: false,
+            pendingMigrationID: "n1", silenceRun: 1, hasCurrentNode: false
+        ) == nil, "切换进行中不应重入")
+        check(Self.nodeTierAction(
+            stopped: false, switching: false, nodeTierEnabled: false, releaseNodeAtSilence: true,
+            pendingMigrationID: "n1", silenceRun: 0.6, hasCurrentNode: true
+        ) == .release, "云端档静音点应释放节点，且优先于连接")
+        check(Self.nodeTierAction(
+            stopped: false, switching: false, nodeTierEnabled: false, releaseNodeAtSilence: true,
+            pendingMigrationID: nil, silenceRun: 0.59, hasCurrentNode: true
+        ) == nil, "释放节点也要等到静音点")
+        check(Self.silenceRun(fromCloudAtSilence: true) == CloudSegmenter.silenceSeconds,
+              "节点静音只消费分段器的静音判定")
+        check(Self.silenceRun(fromCloudAtSilence: false) == 0,
+              "分段器未静音时节点不得自行累计静音")
+        check(Self.nodeTierAction(
+            stopped: false, switching: false, nodeTierEnabled: false, releaseNodeAtSilence: true,
+            pendingMigrationID: nil, silenceRun: Self.silenceRun(fromCloudAtSilence: true), hasCurrentNode: true
+        ) == .release, "分段器判定静音后才释放节点")
+        check(Self.nodeTierAction(
+            stopped: false, switching: false, nodeTierEnabled: false, releaseNodeAtSilence: true,
+            pendingMigrationID: nil, silenceRun: Self.silenceRun(fromCloudAtSilence: false), hasCurrentNode: true
+        ) == nil, "分段器未静音时不释放节点")
+        check(Self.pendingMigrationUpdate(
+            nodeTierEnabled: false, releaseNodeAtSilence: false, currentNodeID: nil, bestID: "n1", gateAllows: true
+        ) == .set(nil), "节点层关闭时应清掉待连接")
+        check(Self.pendingMigrationUpdate(
+            nodeTierEnabled: true, releaseNodeAtSilence: false, currentNodeID: nil, bestID: "n1", gateAllows: false
+        ) == .set("n1"), "无当前节点时待连接应是最优节点")
+        check(Self.pendingMigrationUpdate(
+            nodeTierEnabled: true, releaseNodeAtSilence: false, currentNodeID: "a", bestID: "b", gateAllows: false
+        ) == .keep, "门未通过时不应清掉已有迁移意图")
+        check(Self.pendingMigrationUpdate(
+            nodeTierEnabled: true, releaseNodeAtSilence: false, currentNodeID: "a", bestID: "b", gateAllows: true
+        ) == .set("b"), "门通过时应改写迁移目标")
         failures.append(contentsOf: NodeClient.selfTest().map { "NodeClient: \($0)" })
         return failures
     }

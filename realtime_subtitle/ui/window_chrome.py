@@ -3,8 +3,24 @@
 Ctrl+滚轮调字号、样式表刷新。以mixin形式并入 SubtitleWindow。
 """
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QColor
+from PyQt6.QtWidgets import QGraphicsDropShadowEffect
 import realtime_subtitle.config as config
+import realtime_subtitle.ui.design_tokens as design_tokens
 from realtime_subtitle.ui.window_frame import ResizableFramelessWidget
+
+
+def _hex_to_rgba(color, alpha):
+    body = str(color or "#000000").strip()
+    if body.startswith("#"):
+        body = body[1:]
+    if len(body) == 3:
+        body = "".join(c * 2 for c in body)
+    try:
+        r, g, b = (int(body[i:i + 2], 16) for i in (0, 2, 4))
+    except (TypeError, ValueError):
+        r, g, b = 0, 0, 0
+    return f"rgba({r}, {g}, {b}, {int(alpha)})"
 
 
 class WindowChromeMixin:
@@ -104,7 +120,7 @@ class WindowChromeMixin:
         if not event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             return False
         step = 1 if event.angleDelta().y() > 0 else -1
-        size = max(14, min(72, config.FONT_SIZE + step))
+        size = max(design_tokens.TYPE_SUBTITLE_MIN, min(design_tokens.TYPE_SUBTITLE_MAX, config.FONT_SIZE + step))
         if size != config.FONT_SIZE:
             # 通过设置面板滑块走，数值标签/config/样式一次同步
             s = self.settings_window.font_size_slider
@@ -128,17 +144,32 @@ class WindowChromeMixin:
 
     def _apply_styles(self):
         """按当前config刷新字幕标签/历史窗口的样式（字号滑块实时调用）"""
+        bg = _hex_to_rgba(
+            getattr(config, "BACKGROUND_COLOR", design_tokens.COLOR_BACKGROUND),
+            getattr(config, "BACKGROUND_OPACITY", round(design_tokens.OPACITY_BACKGROUND_DEFAULT * 255)),
+        )
+        source_color = getattr(config, "SOURCE_TEXT_COLOR", getattr(config, "TEXT_COLOR", design_tokens.COLOR_SUBTITLE_SOURCE))
+        radius = int(getattr(config, "WINDOW_CORNER_RADIUS",
+                             getattr(config, "BORDER_RADIUS", design_tokens.RADIUS_SMALL)))
         self.window.setStyleSheet(f"""
             QLabel {{
-                background-color: rgba(0, 0, 0, {int(config.BACKGROUND_OPACITY)});
-                color: {config.TEXT_COLOR};
+                background-color: {bg};
+                color: {source_color};
                 font-size: {config.FONT_SIZE}px;
                 font-family: {config.FONT_FAMILY};
                 padding: {config.PADDING};
-                border-radius: {config.BORDER_RADIUS}px;
+                border-radius: {radius}px;
                 border: 1px solid {config.BORDER_COLOR};
             }}
         """)
+        if getattr(config, "TEXT_EDGE", "none") == "shadow":
+            effect = QGraphicsDropShadowEffect(self.window)
+            effect.setColor(QColor(0, 0, 0, 255))
+            effect.setBlurRadius(4)
+            effect.setOffset(0, 0)
+            self.window.setGraphicsEffect(effect)
+        else:
+            self.window.setGraphicsEffect(None)
         if hasattr(self, "history_window"):
             self.history_window.text.setStyleSheet(f"""
                 QTextEdit {{

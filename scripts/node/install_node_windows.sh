@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 把 Realtime Subtitle 节点（v2 gateway + worker）装到一台 Windows 机器上（在 Mac 控制端运行）。
 #
-# 用法：bash scripts/node/install_node_windows.sh <ssh 别名> [--dry-run]
+# 用法：bash scripts/node/install_node_windows.sh <ssh 别名> [--dry-run] [--client <Windows客户端ssh别名>]
 #
 # 与 install_node.sh（装到 Mac）同一套契约：token 只经 stdin/文件、node_id 沿用、
 # 旧版保留为 %USERPROFILE%\rs-node.prev、自检失败回滚、写本机 ~/.config/rslite/nodes.json。
@@ -18,6 +18,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 source "${SCRIPT_DIR}/install_node.sh"
 
 NODE_PORT="${RS_NODE_PORT:-8791}"
+valid_tcp_port "${NODE_PORT}" || die "端口不合法"
 OLLAMA_MODEL="${RS_OLLAMA_MODEL:-qwen3.5:4b}"
 INFO_WAIT="${RS_INFO_WAIT:-90}"
 SELFCHECK_WAV_SRC="${RS_SELFCHECK_WAV:-${HOME}/projects/rs-mac-native-data/concat5.wav}"
@@ -26,6 +27,7 @@ POWERSHELL='C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
 
 HOST=""
 DRY_RUN=0
+CLIENT=""
 
 win_run() {  # 目标机 cmd.exe 执行；stdin 原样透传
     ssh -o BatchMode=yes -o ConnectTimeout=10 -- "${HOST}" "$1" 2> >(grep -v -E 'post-quantum|store now, decrypt later|openssh.com/pq.html' >&2)
@@ -45,6 +47,13 @@ parse_args_win() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --dry-run) DRY_RUN=1 ;;
+            --client)
+                # 这里只 shift 一次：循环末尾还有一次 shift，两次合起来吃掉别名。
+                [[ $# -ge 2 ]] || die "--client 需要一个 ssh 别名"
+                CLIENT="$2"
+                valid_host "${CLIENT}" || die "客户端别名不合法：${CLIENT}"
+                shift
+                ;;
             -h | --help) usage_win; exit 0 ;;
             -*) die "未知参数：$1" ;;
             *) [[ -z "${HOST}" ]] || die "只能指定一个目标主机"; HOST="$1" ;;
@@ -66,6 +75,9 @@ print_plan() {
     plan "7. 停旧 gateway（按命令行精确匹配）→ rs-node→rs-node.prev、rs-node.new→rs-node → 计划任务 rs-node-gateway（登录时）→ 防火墙 TCP ${NODE_PORT} 仅 100.64.0.0/10 → 启动"
     plan "8. 控制端经 Tailscale 带 token 请求 /v1/info（${INFO_WAIT}s 内 v=2 且 node_id 匹配），失败 → 回滚"
     plan "9. 写 ~/.config/rslite/nodes.json（按 id=${HOST##*@} 去重、原子写）：url=ws://<MagicDNS>:${NODE_PORT}"
+    if [[ -n "${CLIENT}" ]]; then
+        plan "另：下发到 Windows 客户端 ${CLIENT}：scp push_client.ps1，再 powershell -File PushClient；按 id 合并 %APPDATA%\\realtime_subtitle\\nodes.json；token 经 stdin 写入 tokens\\<id>.token 并 icacls；内容 <redacted>"
+    fi
 }
 
 info_ok() {  # $1=url $2=token 文件 $3=node_id；token 只从文件读，不进 argv
@@ -128,6 +140,11 @@ main_win() {
     git -C "${REPO_ROOT}" archive --format=tar HEAD \
         | win_run '(if exist "%USERPROFILE%\rs-node.new" rmdir /s /q "%USERPROFILE%\rs-node.new") & mkdir "%USERPROFILE%\rs-node.new" && tar -xf - -C "%USERPROFILE%\rs-node.new"' \
         || die "部署失败"
+    # 写入代码版本（短哈希）到 .rs_commit，供 cluster.py doctor 读取
+    local short_commit
+    short_commit=$(git -C "${REPO_ROOT}" rev-parse --short HEAD)
+    win_run "cmd /c echo ${short_commit} > \"%USERPROFILE%\\rs-node.new\\.rs_commit\"" \
+        || die "写入 .rs_commit 失败"
     if [[ -f "${SELFCHECK_WAV_SRC}" ]]; then
         local wav_tmp
         wav_tmp="$(mktemp -t rs-selfcheck).wav"
@@ -171,6 +188,8 @@ PY
     merge_nodes_json "${HOME}/.config/rslite/nodes.json" "${HOST##*@}" "${NODE_ID}" \
         "ws://${ts_dns}:${NODE_PORT}" "${client_file}"
     info "  ✅ ${HOST##*@} → ws://${ts_dns}:${NODE_PORT}"
+    NODE_DNS="${ts_dns}"
+    step_push_client
     info ""
     info "✅ Windows 节点安装完成。日志：目标机 %LOCALAPPDATA%\\rs-node\\logs\\gateway.log"
 }

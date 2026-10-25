@@ -1,6 +1,6 @@
 """节点 worker 的 VAD 分段器：把连续 PCM 切成「一段一次识别」的语音段。
 
-为什么单独成文件：分段规则（静音 ≥0.6s 收尾、单段 ≤15s 强制切）决定了字幕的
+为什么单独成文件：分段规则（短段静音 ≥0.6s、长段自适应收尾、单段 ≤15s 强制切）决定了字幕的
 断点和延迟，要能用合成音频、不加载任何模型地测准。本模块只依赖 numpy；Silero
 只在 `SileroVad` 里惰性 import，测试注入假 VAD 即可。
 
@@ -20,8 +20,16 @@ SAMPLE_RATE = 16000
 # Silero 在 16k 下只接受 512 样本的窗口
 WINDOW = 512
 SPEECH_THRESHOLD = 0.5
-# RFC 架构选择第 2 条：静音 ≥0.6s 视为段落结束，单段最长 15s
+# RFC 架构选择第 2 条：短段/回退模式下静音 ≥0.6s 视为段落结束，单段最长 15s
 SILENCE_END_S = 0.6
+# 2026-10-12 真机 101s 德语 TTS：Windows RTX5060 句末到原文 p50/p90=2.68/3.93s，
+# M4 mini=4.08-4.17/5.3s；识别只占 0.2-1.8s，主要卡在连续讲话时 0.3s
+# 句间停顿达不到固定 0.6s，前句会等到 max_s 强切。长段逐步降到 0.25s 可减少出字延迟。
+# 同机同段 2 分钟 tagesschau 直播 A/B（对整段离线转写算 WER）：旧 0.6s p50 4.3s/WER 5.30%；
+# 最低 0.35s p50 3.89s/5.81%；最低 0.25s p50 2.84s/6.31%（偶尔把词切在中间）。用户选 0.25。
+ADAPTIVE_MIN_SILENCE_S = 0.25
+ADAPTIVE_FULL_SILENCE_BEFORE_S = 2.0
+ADAPTIVE_MIN_SILENCE_AFTER_S = 5.0
 MAX_SEGMENT_S = 15.0
 # 强制切只在段尾最后这几秒里找能量最低点：全段搜索可能把一句话切在第 1 秒，
 # 剩下 14 秒又立刻超限；段尾搜索保证切点离 15s 上限不远，下一段有足够余量
@@ -48,6 +56,10 @@ class Segment:
     a1: float
     audio: np.ndarray  # float32, [-1, 1]
     audio_t0: float
+    # 仅诊断：worker 入队时补上（segmenter 自己不读墙钟，保持纯样本轴）。
+    # close_wait_s = 段尾静音等待；enqueued_at = perf_counter 入队时刻，用来算排队。
+    close_wait_s: float | None = None
+    enqueued_at: float | None = None
 
 
 VadFn = Callable[[np.ndarray], float]
@@ -84,10 +96,15 @@ class Segmenter:
     """feed() 喂 s16le PCM，吐出已经收尾的 Segment。"""
 
     def __init__(self, vad: VadFn, sample_rate: int = SAMPLE_RATE,
-                 silence_s: float = SILENCE_END_S, max_s: float = MAX_SEGMENT_S):
+                 silence_s: float = SILENCE_END_S, max_s: float = MAX_SEGMENT_S,
+                 adaptive: bool = True):
         self._vad = vad
         self._sr = sample_rate
         self._silence = int(silence_s * sample_rate)
+        self._adaptive = adaptive
+        self._adaptive_min_silence = int(ADAPTIVE_MIN_SILENCE_S * sample_rate)
+        self._adaptive_full_before = int(ADAPTIVE_FULL_SILENCE_BEFORE_S * sample_rate)
+        self._adaptive_min_after = int(ADAPTIVE_MIN_SILENCE_AFTER_S * sample_rate)
         self._max = int(max_s * sample_rate)
         self._pre = int(PRE_PAD_S * sample_rate)
         self._post = int(POST_PAD_S * sample_rate)
@@ -121,7 +138,7 @@ class Segmenter:
                     self._start = self._pos
                 self._last_speech_end = end
             if self._start is not None:
-                if not speech and end - self._last_speech_end >= self._silence:
+                if not speech and end - self._last_speech_end >= self._silence_for_current_segment():
                     out.extend(self._close())
                 elif end - self._start >= self._max:
                     out.extend(self._force_cut(end))
@@ -135,6 +152,20 @@ class Segmenter:
         out = self._close() if self._start is not None else []
         self._trim(self._pos - self._pre)
         return out
+
+    def _silence_for_current_segment(self) -> int:
+        if not self._adaptive or self._start is None:
+            return self._silence
+        speech_len = self._last_speech_end - self._start
+        if speech_len < self._adaptive_full_before:
+            return self._silence
+        if speech_len >= self._adaptive_min_after:
+            return self._adaptive_min_silence
+        span = self._adaptive_min_after - self._adaptive_full_before
+        progress = (speech_len - self._adaptive_full_before) / span
+        return int(round(
+            self._silence + (self._adaptive_min_silence - self._silence) * progress
+        ))
 
     def _make(self, a0: int, a1: int, *, pre: bool = True, post: bool = True) -> Segment | None:
         """pre/post=False：该侧是强切边界。垫只加在自然静音边界上，强切两侧

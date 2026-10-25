@@ -8,6 +8,10 @@
 - 流式代价：12 秒缓冲单次 transcribe 的 p50 延迟——生产里每 0.5 秒调一次，
   单次必须明显小于 CHUNK_SUBMIT_SECONDS 才跟得上（CUDA 参考机 p50 0.26 秒）。
 
+需要拆分 MLX 一轮时加 ``--profile --vad``：输出 ``timing_p50_s``，含 VAD、
+mel、encoder、decoder、词时间戳对齐（cross-attention + CPU DTW）和 Python 余量。
+它只用于基准，默认路径保持历史 WER/延迟口径不变。
+
 用法：
   python asr_bench.py --parquet fleurs_de_test.parquet --n 60 --out results.jsonl
 """
@@ -19,8 +23,12 @@ import subprocess
 import sys
 import time
 import unicodedata
+from pathlib import Path
 
 import numpy as np
+
+# 从 scripts/bench 直接执行时，Python 不会把仓库根目录加入 sys.path。
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 TIERS = {
     # name: (backend, model)
@@ -71,7 +79,20 @@ def peak_rss_mb():
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
 
 
-def make_transcriber(backend, model, words=True):
+def make_transcriber(backend, model, words=True, vad=False, profile=False):
+    if backend == "mlx" and (vad or profile):
+        from realtime_subtitle.asr.mlx_backend import load_mlx_model
+
+        mlx_model = load_mlx_model(model)
+        mlx_model.profile_enabled = profile
+
+        def run(audio):
+            segments, _info = mlx_model.transcribe(
+                audio, language="de", word_timestamps=words, vad_filter=vad,
+            )
+            return "".join(segment.text for segment in segments), mlx_model.last_timing
+        return run
+
     if backend == "mlx":
         import mlx_whisper
 
@@ -81,7 +102,7 @@ def make_transcriber(backend, model, words=True):
                 word_timestamps=words, condition_on_previous_text=True,
                 verbose=None,
             )
-            return r["text"]
+            return r["text"], None
         return run
 
     from faster_whisper import WhisperModel
@@ -91,7 +112,7 @@ def make_transcriber(backend, model, words=True):
         segs, _ = m.transcribe(audio, language="de", beam_size=3,
                                word_timestamps=words, condition_on_previous_text=True,
                                vad_filter=True)
-        return " ".join(s.text for s in segs)
+        return " ".join(s.text for s in segs), None
     return run
 
 
@@ -104,7 +125,16 @@ def mlx_peak_mb():
         return None
 
 
-def run_one(tier, parquet, n, buf=12.0, words=True):
+def _timing_percentiles(samples):
+    if not samples:
+        return None
+    return {
+        key: round(float(np.median([sample[key] for sample in samples])), 3)
+        for key in samples[0]
+    }
+
+
+def run_one(tier, parquet, n, buf=12.0, words=True, vad=False, profile=False):
     import jiwer
 
     backend, model = TIERS[tier]
@@ -112,14 +142,14 @@ def run_one(tier, parquet, n, buf=12.0, words=True):
     rss0 = peak_rss_mb()
 
     t0 = time.time()
-    run = make_transcriber(backend, model, words)
-    run(np.zeros(16000, dtype=np.float32))  # 首次调用含加载/编译
+    run = make_transcriber(backend, model, words, vad=vad, profile=profile)
+    run(data[0][0])  # 首次调用含加载/编译；开 VAD 时不能用纯静音预热
     load_s = time.time() - t0
 
     refs, hyps, audio_s, proc_s = [], [], 0.0, 0.0
     for audio, ref in data:
         t = time.time()
-        hyp = run(audio)
+        hyp, _timing = run(audio)
         proc_s += time.time() - t
         audio_s += len(audio) / 16000
         refs.append(norm(ref))
@@ -128,18 +158,23 @@ def run_one(tier, parquet, n, buf=12.0, words=True):
 
     # 流式代价：拼出 12 秒缓冲，重复调用量单次延迟
     audio_buf = np.concatenate([a for a, _ in data])[: int(16000 * buf)]
-    lat = []
+    lat, timing_samples = [], []
     for _ in range(8):
         t = time.time()
-        run(audio_buf)
+        _text, timing = run(audio_buf)
         lat.append(time.time() - t)
+        if timing is not None:
+            timing_samples.append(timing)
 
     return {
-        "tier": tier, "buf_s": buf, "words": words, "backend": backend, "model": model, "n": len(data),
+        "tier": tier, "buf_s": buf, "words": words, "vad": vad, "profile": profile,
+        "backend": backend, "model": model, "n": len(data),
         "wer": round(wer, 4), "rtf": round(proc_s / audio_s, 3),
         "audio_s": round(audio_s, 1), "load_s": round(load_s, 1),
         "lat_p50": round(float(np.median(lat)), 3),
+        "lat_p90": round(float(np.percentile(lat, 90)), 3),
         "lat_max": round(max(lat), 3),
+        "timing_p50_s": _timing_percentiles(timing_samples),
         "peak_rss_mb": round(peak_rss_mb() - 0, 0), "rss_before_mb": round(rss0, 0),
         "mlx_peak_mb": mlx_peak_mb(),
         "samples": [{"ref": r, "hyp": h} for r, h in list(zip(refs, hyps))[:5]],
@@ -155,17 +190,21 @@ def main():
     ap.add_argument("--one")
     ap.add_argument("--buf", type=float, default=12.0)
     ap.add_argument("--no-words", action="store_true")
+    ap.add_argument("--vad", action="store_true", help="按生产路径启用 VAD（会改变历史 WER 口径）")
+    ap.add_argument("--profile", action="store_true", help="记录 MLX 分阶段耗时（仅基准模式）")
     a = ap.parse_args()
 
     if a.one:
-        print(json.dumps(run_one(a.one, a.parquet, a.n, a.buf, not a.no_words), ensure_ascii=False))
+        print(json.dumps(run_one(a.one, a.parquet, a.n, a.buf, not a.no_words, a.vad, a.profile), ensure_ascii=False))
         return
 
     for tier in a.tiers.split(","):
         print(f"== {tier}", file=sys.stderr, flush=True)
         p = subprocess.run([sys.executable, __file__, "--one", tier,
                             "--parquet", a.parquet, "--n", str(a.n), "--buf", str(a.buf)]
-                           + (["--no-words"] if a.no_words else []),
+                           + (["--no-words"] if a.no_words else [])
+                           + (["--vad"] if a.vad else [])
+                           + (["--profile"] if a.profile else []),
                            capture_output=True, text=True)
         line = p.stdout.strip().splitlines()[-1] if p.stdout.strip() else ""
         if p.returncode != 0 or not line.startswith("{"):

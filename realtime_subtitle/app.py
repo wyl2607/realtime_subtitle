@@ -2,6 +2,7 @@
 主程序入口
 整合所有模块，协调工作流程
 """
+import functools
 import warnings
 import logging
 import sys
@@ -9,6 +10,12 @@ import os
 import platform
 import time
 from realtime_subtitle.paths import SINGLETON_LOCK_FILE, repo_path
+
+# ☠️ 和 realtime_subtitle.capture.audio_capture.STOP_FLAG_FILE 必须是同一个值
+# （.ps1 与 Python 的跨进程约定，见 paths.py）。不直接 import 那个模块，是因为
+# 它会把 sounddevice（~60ms）拉进启动路径；tests/test_startup_imports.py 对账
+# 两者相等，防的是以后有人只改一边。
+STOP_FLAG_FILE = repo_path(".stop")
 
 # 控制台可能默认使用非UTF-8编码（如cp1252），会导致emoji/中文print崩溃
 if sys.platform == "win32":
@@ -72,6 +79,10 @@ os.environ['PYTHONWARNINGS'] = 'ignore'
 # 压掉三方库的日志噪音，但保留ERROR——之前全禁到CRITICAL，
 # faster-whisper的真实报错也被吞掉了，排障时什么都看不到
 logging.basicConfig(level=logging.ERROR)
+_LOG = logging.getLogger(__name__)
+# 节点 connect 外层兜底超时 = ready 截止上限（loading 续期最长 60s）+ 这点余量。
+# 余量覆盖 websockets 建连（默认 open_timeout 10s）和收尾；外层不能比 connect 自己先到期。
+NODE_CONNECT_MARGIN_SECONDS = 15.0
 
 # ⚠️ torch 必须在任何 Qt 导入【之前】——这条在 PyQt5 时代是硬伤：先 PyQt5
 # 后 torch = `OSError WinError 1114`（c10.dll 初始化例程失败），100% 复现。
@@ -87,12 +98,16 @@ logging.basicConfig(level=logging.ERROR)
 # 不成立——无条件 import 实测白占 ~180MB 常驻内存，而 Mac 上内存正是降档的触发源
 if sys.platform == "win32":
     import torch  # noqa: F401
-from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
-from realtime_subtitle.capture.audio_capture import AudioCapture, PAUSE_FLAG_FILE, STOP_FLAG_FILE
+# ☠️ 识别/翻译和音频采集这两个模块故意**不在这里 import**（2026-10-21 实测）：
+# translator_queue 会拉进 numpy/requests（~97ms），audio_capture 会拉进
+# sounddevice（~62ms）——都不参与窗口构造，却让窗口晚出现约 0.16 秒。
+# 现在它们在 _load_models 的后台线程里导入，窗口构造不再为它们付钱。
+# （2026-10-21 另试过在窗口构造期间预取 MLX 权重：A/B 三轮里就绪时间没有
+#  稳定收益、窗口反而慢 ~70ms——加载和窗口构造抢同一块 CPU/内存，已放弃。）
 from realtime_subtitle.ui.subtitle_window import SubtitleWindow
 from realtime_subtitle.ui.settings_window import MODE_ICONS as _MODE_ICON
 from realtime_subtitle.resources.memory import TierGovernor, read_memory_snapshot
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 import realtime_subtitle.config as config
 # 纯常量模块，没有任何 import，放这里不影响上面那条 torch/PyQt6 的顺序约束
 from realtime_subtitle.version import version_string
@@ -135,6 +150,1015 @@ def _startup_whisper_bits():
     return 16
 
 
+class _GuiCaller(QObject):
+    """把后台线程的 UI 改动排回主线程。
+
+    Qt6 里从工作线程直接改控件，或从工作线程用 QTimer.singleShot，都不安全。
+    信号在主线程创建，emit 会排队到主线程再执行。
+    """
+
+    call = pyqtSignal(object)
+
+    def __init__(self):
+        super().__init__()
+        self.call.connect(self._run)
+
+    def _run(self, fn):
+        fn()
+
+
+def _pcm_int16(audio):
+    """采集回调是 float32。云端分段和节点都要 s16le，这里只做这一次转换。"""
+    import numpy as np
+
+    arr = np.asarray(audio)
+    if arr.size == 0:
+        return np.zeros(0, dtype=np.int16)
+    if arr.dtype == np.int16:
+        return np.ascontiguousarray(arr).reshape(-1)
+    clipped = np.clip(np.asarray(arr, dtype=np.float32), -1.0, 1.0)
+    return np.ascontiguousarray((clipped * 32767.0).astype(np.int16)).reshape(-1)
+
+
+def _coerce_revision(value):
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _reinsert_pair_by_t0(window, key, source):
+    """远端句替换后按 t0 插回 sentence_pairs，保持时间递增。
+
+    add_pair 只会追加。远端结果往往比后出现的本机句更早，留在末尾会把旧句顶到底行。
+    """
+    pairs = window.sentence_pairs
+    found = None
+    for index in range(len(pairs) - 1, -1, -1):
+        item = pairs[index]
+        if len(item) >= 7 and item[6] == key:
+            found = index
+            break
+    if found is None:
+        return
+    item = pairs.pop(found)
+    item = (item[0], item[1], item[2], item[3], item[4], source, item[6])
+    t0 = item[3]
+    insert_at = len(pairs)
+    if t0 is not None:
+        for index, existing in enumerate(pairs):
+            existing_t0 = existing[3] if len(existing) > 3 else None
+            if existing_t0 is None:
+                existing_t0 = float("-inf")
+            try:
+                later = existing_t0 > t0
+            except TypeError:
+                later = False
+            if later:
+                insert_at = index
+                break
+    pairs.insert(insert_at, item)
+    window._render()
+
+
+class RemoteBridge:
+    """本机句和远端句的汇合点。
+
+    两个开关都关时不要构造它。云端对象只在云端开关开着时建；
+    NodeClient 只在真正要连节点时建，避免云端档还去打开节点套接字。
+    """
+
+    def __init__(
+        self, *, translator, router, routing, cloud, segmenter, ledger,
+        cloud_on, node_on, ui_show, ui_drop, ui_update_dst, ui_status,
+        prepare=None, node_client_factory=None, cloud_key_path=None,
+    ):
+        import concurrent.futures
+
+        self.translator = translator
+        self.router = router
+        self.routing = routing
+        self.cloud = cloud
+        self.segmenter = segmenter
+        self.ledger = ledger
+        self.cloud_on = bool(cloud_on)
+        self.node_on = bool(node_on)
+        self._ui_show = ui_show
+        self._ui_drop = ui_drop
+        self._ui_update_dst = ui_update_dst
+        self._ui_status = ui_status
+        self._prepare = prepare
+        self._node_client_factory = node_client_factory
+        self._closed = False
+        self._generation = 0
+        self._saw_cloud = False
+        self._announced = None
+        self._node_client = None
+        # 每建一个节点客户端递增，作为这次连接的序号。节点句 id 是每会话从头
+        # 编号的，四张节点状态表的键必须带上它，否则重连后同号句会串到上一
+        # 会话的行上。不是最新一次发起的连接，它的事件（迟到的 closed/translation）
+        # 一律丢弃；最新这次哪怕还在 connect 里（loading 早于 ready 就会到）也照收。
+        self._node_conn_seq = 0
+        # 正在等节点 ready 的节点 id。只有这段时间状态行显示加载中后缀。
+        self._node_loading_id = None
+        self._loop = None
+        self._node_thread = None
+        self._node_backoff_until = 0.0
+        self._skipped_nodes = set()
+        self._offline_until = {}
+        self._node_dst_keys = {}
+        self._early_node_dst = {}
+        self._node_src_by_id = {}
+        self._node_translate_failed = set()
+        self._node_translate_failed_notified = set()
+        self._fed_samples = 0
+        self._language_revision = 0
+        # 冷却时长只存在 routing_rules.cooldown_seconds，到点与否由桥自己记。
+        self._routing_checked_at = None
+        self._cooldown_deadline = None
+        self._cooldown_sig = None
+        self._cloud_key_path = cloud_key_path
+        # key 判定和路由变更的专用锁。不能复用 _lock：那把锁只护行存储，
+        # 而这里要把「读指纹 → 决定是否 key_modified / http_status」做成原子。
+        self._key_lock = __import__("threading").Lock()
+        self._cloud_key_digest, _ = self._read_cloud_key_digest()
+        # 分段器的 a0 从这次开桥算起。加上开桥时本机识别已经走过的样本，
+        # 远端句才能和本机句用同一套 t0/t1。中途才打开时，收件箱里还没
+        # 识别的音频可能对不齐，这是已知限制。
+        clock = int(getattr(translator, "_sample_clock_samples", 0) or 0)
+        self._origin_seconds = clock / float(config.SAMPLE_RATE)
+        from realtime_subtitle.remote.line_store import LineStore
+        self.line_store = LineStore()
+        self._lock = __import__("threading").Lock()
+        # 单线程：云端转写、额度记账、节点缺译文时的本机翻译串行。
+        # _translate_single_sentence 本来跑在翻译 worker 上，这里再开一条
+        # 线程会和它抢同一个 Ollama session。收成一条，至少云端/节点之间不并发。
+        self._pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="remote-asr")
+        self._announce_route(notify=False)
+
+    def close(self):
+        self._closed = True
+        self._generation += 1
+        if self.cloud is not None:
+            try:
+                self.cloud.cancel()
+            except Exception as exc:
+                print(f"⚠️  取消云端请求失败: {type(exc).__name__}")
+        self._close_node()
+        pool = self._pool
+        self._pool = None
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    def flush(self):
+        """等已经提交的云端/翻译任务跑完。测试用来同步，不关线程池。"""
+        pool = self._pool
+        if pool is not None:
+            pool.submit(lambda: None).result()
+        loop = self._loop
+        if loop is not None:
+            import asyncio
+            asyncio.run_coroutine_threadsafe(asyncio.sleep(0), loop).result(timeout=2)
+
+    def set_prefs(self, cloud_on, node_on):
+        """只改开关。关云端要作废在飞结果；组合变了由 app 拆掉重建。"""
+        cloud_on = bool(cloud_on)
+        node_on = bool(node_on)
+        if self.cloud_on and not cloud_on:
+            self.routing.apply({"type": "switch_off"})
+            self._generation += 1
+            if self.cloud is not None:
+                self.cloud.cancel()
+            self.cloud_on = False
+        elif cloud_on and not self.cloud_on:
+            self.routing.apply({"type": "switch_on"})
+            self.cloud_on = True
+        if self.node_on and not node_on:
+            self._close_node()
+            self.node_on = False
+        elif node_on and not self.node_on:
+            self.node_on = True
+        self._sync_provider()
+        self._announce_route()
+
+    def on_language_applied(self, src=None, tgt=None, revision=0):
+        """语言对真正生效的边界：作废此前发出的远端请求/节点会话。"""
+        del src, tgt
+        self._language_revision = _coerce_revision(revision)
+        self._generation += 1
+        self._early_node_dst.clear()
+        self._node_src_by_id.clear()
+        self._node_dst_keys.clear()
+        self._node_translate_failed.clear()
+        if self.cloud is not None:
+            try:
+                self.cloud.cancel()
+            except Exception as exc:
+                print(f"⚠️  取消云端请求失败: {type(exc).__name__}")
+        self._close_node()
+
+    def _stale_remote_generation(self, generation, where):
+        if generation == self._generation and not self._closed:
+            return False
+        _LOG.debug(
+            "stale remote %s discarded: generation=%s current=%s closed=%s",
+            where,
+            generation,
+            self._generation,
+            self._closed,
+        )
+        return True
+
+    def route_label(self):
+        from realtime_subtitle.ui import design_tokens
+
+        self._sync_provider()
+        state = str(getattr(self.routing, "cloud_state", "") or "")
+        # key 无效是按住不放的状态，优先于层选择：这时 tier 已经退回节点/本机，
+        # 光看 tier 会把它显示成普通混合档，用户不知道要换 key。
+        if state == "disabled_invalid_key":
+            return design_tokens.TEXT_STATUS_CLOUD_KEY_INVALID
+        tier = "local"
+        select = getattr(self.router, "select_tier", None)
+        if select is not None:
+            try:
+                tier = select()
+            except Exception:
+                tier = "local"
+        if tier == "cloud":
+            label = design_tokens.TEXT_STATUS_CLOUD
+        elif tier == "node":
+            name = getattr(self.router, "current_node_id", None)
+            if not name:
+                try:
+                    cands = self.router.filter_candidates()
+                except Exception:
+                    cands = []
+                if cands:
+                    name = cands[0].config.id
+            if self._node_loading_id:
+                # 冷加载期间用「节点名 正在加载模型…」；本机识别照常先上屏。
+                label = f"{self._node_loading_id}{design_tokens.TEXT_NODE_LOADING_SUFFIX}"
+            else:
+                label = design_tokens.TEXT_STATUS_HYBRID_PREFIX + (name or "节点")
+        else:
+            label = design_tokens.TEXT_STATUS_LOCAL
+        if state == "cooldown_rate_limited":
+            label += design_tokens.TEXT_STATUS_CLOUD_COOLDOWN_SUFFIX
+        return label
+
+    def on_local_pair(self, src, tgt, t0, t1, key, revision):
+        revision = _coerce_revision(revision)
+        self._language_revision = revision
+        with self._lock:
+            self.line_store.add_local(key, t0, t1, src or "", tgt)
+            kept = any(line.key == key for line in self.line_store.lines)
+        # 已经被远端盖住的本机句不再上屏。没盖住的仍走原来的本地来源。
+        if kept:
+            self._ui_show(src, tgt, t0, t1, key, "local", revision)
+
+    def feed_audio(self, audio):
+        if self._closed:
+            return
+        pcm = _pcm_int16(audio)
+        if pcm.size == 0:
+            return
+        rate = float(config.SAMPLE_RATE)
+        start = self._origin_seconds + (self._fed_samples / rate)
+        self._fed_samples += int(pcm.shape[0])
+        self._track_silence(pcm, pcm.shape[0] / rate)
+        self._recover_routing()
+        self._sync_provider()
+        tier = "local"
+        select = getattr(self.router, "select_tier", None)
+        if select is not None:
+            tier = select()
+        if tier == "cloud":
+            self._saw_cloud = True
+        # 开关开着就一直喂，分段器的样本钟才不会在降档时空转落后。
+        # 非云端档吐出来的段直接丢掉，不上传。
+        if self.cloud_on and self.segmenter is not None:
+            import numpy as np
+            segments = self.segmenter.feed(pcm)
+            if tier == "cloud" and self._pool is not None:
+                for a0, a1, seg in segments:
+                    copied = np.array(seg, dtype=np.int16, copy=True)
+                    self._pool.submit(self._transcribe_one, float(a0), float(a1), copied, self._generation)
+        if not self.node_on or tier == "cloud":
+            return
+        # 从云端退到节点要等一段静音，免得一句话被切两半。本机识别一直在跑。
+        # 节点本来就是首选时不等待，直接连。
+        if self._node_client is None:
+            self._remember_for_replay(pcm, start)
+            if self._saw_cloud and not self._silence_ready():
+                return
+            self._ensure_node()
+            return
+        self._send_node_bytes(pcm.tobytes(), start)
+
+    def _transcribe_one(self, a0, a1, pcm, generation):
+        if self._stale_remote_generation(generation, "cloud_start"):
+            return
+        try:
+            # 分段器的 a0 从开桥算起，交给客户端时加上原点，返回的 start/end 已是绝对时间。
+            transcript = self.cloud.transcribe(
+                pcm, a0=self._origin_seconds + a0, language=config.SOURCE_LANGUAGE)
+        except Exception as exc:
+            self._on_cloud_exception(exc, generation)
+            return
+        if self._stale_remote_generation(generation, "cloud_result"):
+            return
+        try:
+            self.routing.apply({"type": "segment_success"})
+            if self.ledger is not None:
+                self.ledger.note(
+                    transcript.duration_s,
+                    remaining_requests=transcript.remaining_requests,
+                )
+        except Exception as exc:
+            print(f"⚠️  云端记账失败: {type(exc).__name__}")
+        self._sync_provider()
+        segments = list(getattr(transcript, "segments", ()) or ())
+        if not segments and getattr(transcript, "text", ""):
+            segments = [_LooseSegment(self._origin_seconds + a0, self._origin_seconds + a1, transcript.text)]
+        for seg in segments:
+            if self._stale_remote_generation(generation, "cloud_segment"):
+                return
+            text = (getattr(seg, "text", "") or "").strip()
+            if not text:
+                continue
+            dst = self._translate(text)
+            if self._stale_remote_generation(generation, "cloud_translation"):
+                return
+            self._publish_remote("cloud", getattr(seg, "start", None), getattr(seg, "end", None), text, dst)
+        self._announce_route()
+
+    def _on_cloud_exception(self, exc, generation):
+        from realtime_subtitle.remote.cloud_client import CloudCancelled, CloudError
+        if isinstance(exc, CloudCancelled) or self._stale_remote_generation(generation, "cloud_exception"):
+            return
+        if isinstance(exc, CloudError):
+            status = exc.status
+            reached = status is not None
+            routed = status in (401, 403, 429) or (reached and 500 <= int(status) <= 599)
+            previous_state = str(getattr(self.routing, "cloud_state", "") or "")
+            status_applied = False
+            stale_key = False
+            if status in (401, 403):
+                # 指纹比较和「打无效」必须是同一把锁里的一个决定。否则旧 key 的
+                # 401 可能在音频线程换 key 之后才落盘，把新 key 永久打成
+                # disabled_invalid_key 且之后再也不恢复。
+                with self._key_lock:
+                    if self._stale_remote_generation(generation, "cloud_exception"):
+                        return
+                    digest, fingerprint = self._read_cloud_key_digest()
+                    if (
+                        digest is not None
+                        and getattr(exc, "key_fingerprint", None) is not None
+                        and exc.key_fingerprint != fingerprint
+                    ):
+                        # _recover_routing 尚未到下一秒检查点时，401/403 仍可能先到。
+                        # 它属于旧 key，不能让 routing_rules 锁死新 key。
+                        stale_key = True
+                        self._apply_cloud_key_modified_locked(digest)
+                    else:
+                        self.routing.apply({
+                            "type": "http_status",
+                            "status": int(status),
+                            "retry_after": exc.retry_after,
+                        })
+                        status_applied = True
+            if stale_key:
+                self._sync_provider()
+                self._announce_route()
+                return
+            try:
+                if not status_applied:
+                    if routed:
+                        self.routing.apply({
+                            "type": "http_status",
+                            "status": int(status),
+                            "retry_after": exc.retry_after,
+                        })
+                    else:
+                        self.routing.apply({"type": "segment_failure"})
+                if reached and self.ledger is not None:
+                    self.ledger.note(exc.duration_s, remaining_requests=exc.remaining_requests)
+                if status == 429 and previous_state != "cooldown_rate_limited":
+                    # 只在进入冷却时打一行；和 rslite 同一格式，不含 key 和正文。
+                    seconds = getattr(self.routing, "cooldown_seconds", None) or 60
+                    print(f"rslite.cloud cooldown reason=429 retry_after={int(seconds)}")
+            except Exception as note_exc:
+                print(f"⚠️  云端失败记账出错: {type(note_exc).__name__}")
+        else:
+            # 不打印异常文本：requests 的消息里可能夹着请求头。
+            print(f"⚠️  云端识别失败: {type(exc).__name__}")
+            try:
+                self.routing.apply({"type": "segment_failure"})
+            except Exception:
+                pass
+        self._sync_provider()
+        self._announce_route()
+
+    def _read_cloud_key_digest(self):
+        """返回 key 内容的完整摘要和可公开的短指纹；读不到 key 时不改变路由。"""
+        if not self.cloud_on or self.cloud is None or self._cloud_key_path is None:
+            return None, None
+        from realtime_subtitle.remote.cloud_client import CloudError, read_groq_key
+        try:
+            key = read_groq_key(self._cloud_key_path)
+        except (CloudError, OSError, UnicodeError):
+            # key 文件可能被写到一半或不是 UTF-8。读不出来就不改变路由，
+            # 也不能让 feed_audio / 建桥因此抛异常。
+            return None, None
+        if key is None:
+            return None, None
+        import hashlib
+        digest = hashlib.sha256(key.encode("utf-8")).digest()
+        return digest, digest.hex()[:12]
+
+    def _apply_cloud_key_modified(self, digest):
+        """换 key：只作废云端自己的在飞请求，再让 routing_rules 恢复云端。
+
+        ☠️ 不推进 self._generation：它同时是节点会话的代次（NodeClient 构造时
+        固化 session_generation），推进它会让混合档下节点字幕被整批当成 stale
+        丢掉。云端自己的 generation 由 cloud.cancel() 推进；排队中的段之后执行
+        时会重新读 key 文件，自然用上新 key。
+        """
+        with self._key_lock:
+            changed = self._apply_cloud_key_modified_locked(digest)
+        if not changed:
+            return
+        self._sync_provider()
+        self._announce_route()
+
+    def _apply_cloud_key_modified_locked(self, digest):
+        """换 key 的实际动作。调用方必须已持有 self._key_lock。"""
+        if not self.cloud_on or self.cloud is None:
+            return False
+        if digest == self._cloud_key_digest:
+            return False
+        self._cloud_key_digest = digest
+        try:
+            self.cloud.cancel()
+        except Exception as exc:
+            print(f"⚠️  取消云端请求失败: {type(exc).__name__}")
+        self.routing.apply({"type": "key_modified"})
+        return True
+
+    def _translate(self, text):
+        """云端句、以及节点还没给译文的句子，走本机现有的单句翻译。"""
+        if not text or self.translator is None:
+            return ""
+        try:
+            translated = self.translator._translate_single_sentence(text, "")
+        except Exception as exc:
+            print(f"⚠️  远端句子翻译失败: {type(exc).__name__}")
+            return ""
+        return translated or ""
+
+    def _publish_remote(self, node_id, t0, t1, src, dst):
+        with self._lock:
+            replaced = self.line_store.apply_remote(node_id, t0, t1, src, dst)
+            remote_key = None
+            for line in reversed(self.line_store.lines):
+                if line.source == "remote" and line.src == src and line.t0 == t0:
+                    remote_key = line.key
+                    break
+        if replaced:
+            self._ui_drop(replaced)
+        self._ui_show(src, dst or "", t0, t1, remote_key, "remote", self._language_revision)
+        return remote_key
+
+    def _recover_routing(self):
+        """音频驱动的冷却恢复。至少隔 1 秒看一次，避免每个音频块都打状态机。
+
+        限流和退避的时长在 routing.cooldown_seconds（apply 会把它清掉，所以只在
+        看到新值时记一次 deadline）。额度冷却没有秒数，靠 ledger.usage() 在
+        降到 80% 以下时自己派发 quota_update。
+        """
+        import time
+        now = time.monotonic()
+        last = self._routing_checked_at
+        if last is not None and (now - last) < 1.0:
+            return
+        self._routing_checked_at = now
+        routing = self.routing
+        if routing is None:
+            return
+        if self.cloud_on and self.cloud is not None:
+            digest, _fingerprint = self._read_cloud_key_digest()
+            if digest is not None:
+                with self._key_lock:
+                    if self._cloud_key_digest is None:
+                        # 开桥时没有 key、之后才补上：只记指纹，不算一次换 key。
+                        self._cloud_key_digest = digest
+                        changed = False
+                    else:
+                        changed = self._apply_cloud_key_modified_locked(digest)
+                if changed:
+                    self._sync_provider()
+                    self._announce_route()
+        state = str(getattr(routing, "cloud_state", "") or "")
+        seconds = getattr(routing, "cooldown_seconds", None)
+        if state == "cooldown_quota" or not state.startswith("cooldown_"):
+            self._cooldown_deadline = None
+            self._cooldown_sig = None
+        elif isinstance(seconds, (int, float)) and not isinstance(seconds, bool):
+            signature = (state, int(seconds))
+            if signature != self._cooldown_sig:
+                self._cooldown_sig = signature
+                self._cooldown_deadline = now + float(seconds)
+        deadline = self._cooldown_deadline
+        if (
+            deadline is not None
+            and state.startswith("cooldown_")
+            and state != "cooldown_quota"
+            and now >= deadline
+        ):
+            routing.apply({"type": "cooldown_expired"})
+            self._cooldown_deadline = None
+            self._cooldown_sig = None
+            # 冷却结束要把状态行从「… · 云端限流冷却」恢复成原文案。
+            self._announce_route()
+        if self.ledger is not None:
+            self.ledger.usage()
+
+    def _sync_provider(self):
+        stub = getattr(self.router, "cloud_provider", None)
+        if stub is not None and self.routing is not None:
+            stub.has_key = bool(self.routing.has_key)
+            stub.cloud_enabled = bool(self.routing.cloud_enabled)
+            stub.cloud_state = self.routing.cloud_state
+        if hasattr(self.router, "node_enabled"):
+            self.router.node_enabled = bool(self.node_on)
+
+    def _announce_route(self, notify=True):
+        label = self.route_label()
+        if label == self._announced:
+            return
+        self._announced = label
+        print(f"路由：{label}")
+        if notify and self._ui_status is not None:
+            self._ui_status(f"路由：{label}")
+
+    def _track_silence(self, pcm, duration):
+        if not hasattr(self.router, "silence_run"):
+            return
+        from realtime_subtitle.remote.router import update_silence_run
+        self.router.silence_run = update_silence_run(
+            float(self.router.silence_run or 0.0), pcm.tobytes(), duration)
+
+    def _silence_ready(self):
+        from realtime_subtitle.remote.router import can_migrate_at_silence
+        return can_migrate_at_silence(float(getattr(self.router, "silence_run", 0.0) or 0.0))
+
+    def _remember_for_replay(self, pcm, start):
+        buf = getattr(self.router, "replay_buffer", None)
+        if buf is None:
+            return
+        from realtime_subtitle.remote.router import TimedAudioChunk
+        buf.append(TimedAudioChunk(
+            bytes(pcm.tobytes()), float(start), pcm.shape[0] / float(config.SAMPLE_RATE)))
+
+    def _ensure_node(self):
+        import time
+        if self._closed or not self.node_on or self._node_client is not None:
+            return
+        if time.time() < self._node_backoff_until:
+            return
+        prepare = self._prepare
+        if prepare is None:
+            from realtime_subtitle.remote.node_client import prepare as prepare
+        from realtime_subtitle.remote.node_client import (
+            READY_LOADING_MAX_SECONDS, NodeCallbacks, SelfNodeError)
+        from realtime_subtitle.remote.router import NodeStateRecord, RouteCandidate
+        configs = []
+        try:
+            configs = list(self.router.configs_skipping_self())
+        except Exception:
+            configs = list(getattr(self.router, "node_configs", []) or [])
+        prepared = []
+        now = time.time()
+        for cfg in configs:
+            if cfg.id in self._skipped_nodes or now < self._offline_until.get(cfg.id, 0.0):
+                continue
+            started = time.perf_counter()
+            try:
+                _pinned, info = prepare(cfg)
+            except SelfNodeError:
+                self._skipped_nodes.add(cfg.id)
+                continue
+            except Exception as exc:
+                print(f"⚠️  节点探测失败 {cfg.id}: {type(exc).__name__}")
+                until = time.time() + 30
+                self._offline_until[cfg.id] = until
+                if hasattr(self.router, "node_states"):
+                    self.router.node_states[cfg.id] = NodeStateRecord(offline_until=until)
+                continue
+            prepared.append((cfg, info, (time.perf_counter() - started) * 1000.0))
+        if not prepared:
+            self._node_backoff_until = time.time() + 30
+            return
+        chosen = prepared[0]
+        choose = getattr(self.router, "select_best_node", None)
+        if choose is not None:
+            candidates = [
+                RouteCandidate(
+                    id=cfg.id, expected_node_id=cfg.node_id, info=info, rtt_ms=rtt)
+                for cfg, info, rtt in prepared
+            ]
+            try:
+                best = choose(candidates, time.time())
+            except Exception:
+                best = None
+            if best is not None:
+                for item in prepared:
+                    if item[0].id == best.id:
+                        chosen = item
+                        break
+        cfg, info, _rtt = chosen
+        self._node_conn_seq += 1
+        conn = self._node_conn_seq
+        callbacks = NodeCallbacks(
+            on_final=functools.partial(self._on_node_final, conn=conn),
+            on_translation=functools.partial(self._on_node_translation, conn=conn),
+            on_status=functools.partial(self._on_node_status, conn=conn),
+            on_status_event=functools.partial(self._on_node_status_event, conn=conn),
+            on_loading=functools.partial(self._on_node_loading, conn=conn),
+            on_translate_failed=functools.partial(self._on_node_translate_failed, conn=conn),
+            on_closed=functools.partial(self._on_node_closed, conn=conn),
+        )
+        try:
+            client = self._build_node_client(cfg, info, callbacks)
+        except Exception as exc:
+            print(f"⚠️  节点客户端创建失败 {cfg.id}: {type(exc).__name__}")
+            self._node_backoff_until = time.time() + 30
+            return
+        generation = self._generation
+        self._node_loading_id = cfg.id
+        self._announce_route()
+        try:
+            self._start_node_loop()
+            # 不能用 _run_on_loop 默认的 5s：节点冷启动要 15s 起、收到 loading 最长续到 60s，
+            # 5s 就放弃会让桌面端永远连不上冷启动中的节点。connect 自己的截止才是唯一真相。
+            self._run_on_loop(
+                client.connect(),
+                timeout=READY_LOADING_MAX_SECONDS + NODE_CONNECT_MARGIN_SECONDS)
+        except Exception as exc:
+            print(f"⚠️  节点连接失败 {cfg.id}: {type(exc).__name__}")
+            self._abandon_client(client)
+            self._close_node()
+            self._node_backoff_until = time.time() + 30
+            self._node_loading_id = None
+            self._announce_route()
+            return
+        # 成功路径先不播报：这时 current_node_id 还是旧值（或为空，退回第一个候选），
+        # 立刻播报会让状态行闪一下别的节点名。等下面换成这次连上的节点再播报。
+        self._node_loading_id = None
+        # 连接在音频线程上等待。返回时主线程可能已经 close()，或云端开关把代次加一。
+        # 这时不能把新客户端留在桥上。
+        if self._closed or self._generation != generation:
+            self._abandon_client(client)
+            self._announce_route()
+            return
+        if hasattr(self.router, "node_states"):
+            self.router.node_states[cfg.id] = NodeStateRecord(info=info)
+        frames = []
+        buf = getattr(self.router, "replay_buffer", None)
+        if buf is not None:
+            from realtime_subtitle.remote.router import should_replay_buffered_audio
+            # 这里只在「当前没有客户端」时进来，按首次接入回放缓冲。
+            # 已经连着的时候换节点不走这个函数，所以不会把迁移也回放一遍。
+            if should_replay_buffered_audio(False, False):
+                frames = list(buf.frames)
+            buf.clear()
+        self._node_client = client
+        self._prune_node_state(conn)
+        if hasattr(self.router, "current_node_id"):
+            self.router.current_node_id = cfg.id
+        for frame in frames:
+            self._send_node_bytes(frame.data, frame.start_seconds)
+        self._announce_route()
+
+    def _build_node_client(self, cfg, info, callbacks):
+        if self._node_client_factory is not None:
+            return self._node_client_factory(cfg, info, callbacks)
+        from realtime_subtitle.remote.node_client import NodeClient, read_token_file
+        token = read_token_file(cfg.token_file)
+        return NodeClient(
+            cfg,
+            token,
+            info,
+            source_locale_id=str(getattr(config, "SOURCE_LANGUAGE", "de")),
+            target_language_id=str(getattr(config, "TARGET_LANGUAGE", "zh")),
+            session_generation=self._generation,
+            callbacks=callbacks,
+        )
+
+    def _start_node_loop(self):
+        import asyncio
+        import threading
+        loop = self._loop
+        thread = self._node_thread
+        if loop is not None and thread is not None and thread.is_alive() and not loop.is_closed():
+            return
+        self._stop_node_loop()
+        loop = asyncio.new_event_loop()
+        self._loop = loop
+
+        def _run():
+            asyncio.set_event_loop(loop)
+            loop.run_forever()
+
+        self._node_thread = threading.Thread(target=_run, name="remote-node", daemon=True)
+        self._node_thread.start()
+
+    def _stop_node_loop(self):
+        import threading
+        loop = self._loop
+        thread = self._node_thread
+        self._loop = None
+        self._node_thread = None
+        if loop is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except Exception:
+                pass
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=2)
+        if loop is not None and not loop.is_closed():
+            try:
+                loop.close()
+            except Exception:
+                pass
+
+    def _abandon_client(self, client):
+        """连接还没挂到 self._node_client 上就要作废。优先用现有 loop。"""
+        if client is None:
+            return
+        loop = self._loop
+        try:
+            if loop is not None and not loop.is_closed():
+                self._run_on_loop(client.close(), timeout=2)
+                return
+        except Exception as exc:
+            print(f"⚠️  节点连接作废失败: {type(exc).__name__}")
+        try:
+            import asyncio
+            asyncio.run(client.close())
+        except Exception as exc:
+            print(f"⚠️  节点连接作废失败: {type(exc).__name__}")
+
+    def _run_on_loop(self, coro, timeout=5):
+        import asyncio
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout=timeout)
+
+    def _send_node_bytes(self, data, start):
+        client = self._node_client
+        loop = self._loop
+        if client is None or loop is None or self._closed or not data:
+            return
+        import asyncio
+        asyncio.run_coroutine_threadsafe(client.send(data, start), loop)
+
+    def _close_node(self):
+        client = self._node_client
+        self._node_client = None
+        if client is not None and self._loop is not None and not self._loop.is_closed():
+            try:
+                self._run_on_loop(client.close(), timeout=2)
+            except Exception as exc:
+                print(f"⚠️  节点关闭失败: {type(exc).__name__}")
+        self._stop_node_loop()
+
+    def _node_conn_stale(self, conn):
+        """conn=None 是测试直接调用时的旧签名；真实回调一定带序号。"""
+        return conn is not None and conn != self._node_conn_seq
+
+    def _prune_node_state(self, conn):
+        """新连接挂上桥时清掉上一会话的残留，按键里的连接序号隔离。"""
+        for table in (self._node_src_by_id, self._early_node_dst, self._node_dst_keys):
+            for key in [key for key in list(table) if key[1] != conn]:
+                table.pop(key, None)
+        # 原地删，不整体重新赋值：节点线程可能正往里 add 新连接的标记，换成新集合会把它丢掉。
+        for key in [key for key in list(self._node_translate_failed) if key[1] != conn]:
+            self._node_translate_failed.discard(key)
+
+    def _on_node_final(self, node_id, generation, final_id, body, t0, t1, conn=None):
+        text = (body or "").strip()
+        if not text or self._node_conn_stale(conn) or self._stale_remote_generation(generation, "node_final"):
+            return
+        node_key = (node_id, conn, final_id)
+        self._node_src_by_id[node_key] = text
+
+        def work():
+            if self._stale_remote_generation(generation, "node_final_work"):
+                return
+            # 节点译文通常晚于 final。先用本机翻译顶上，译文到了再覆盖。
+            # 已经先到的译文直接用，不再打一次 Ollama。
+            early = self._early_node_dst.pop(node_key, None)
+            dst = early if early and node_key not in self._node_translate_failed else self._translate(text)
+            if self._stale_remote_generation(generation, "node_final_translate"):
+                return
+            remote_key = self._publish_remote(node_id, t0, t1, text, dst)
+            self._node_dst_keys[node_key] = remote_key
+
+        self._pool.submit(work)
+
+    def _on_node_translation(self, node_id, generation, tx_id, body, conn=None):
+        if self._node_conn_stale(conn):
+            return
+        if self._stale_remote_generation(generation, "node_translation"):
+            return
+        node_key = (node_id, conn, tx_id)
+        if node_key in self._node_translate_failed or not (body or ""):
+            return
+
+        def work():
+            if self._stale_remote_generation(generation, "node_translation_work"):
+                return
+            key = self._node_dst_keys.get(node_key)
+            if key is None:
+                self._early_node_dst[node_key] = body or ""
+                return
+            with self._lock:
+                self.line_store.set_translation(key, body or "")
+            if self._ui_update_dst is not None:
+                self._ui_update_dst(key, body or "")
+
+        self._pool.submit(work)
+
+    def _notify_node_translate_failed_once(self, node_id, generation):
+        marker = (node_id, generation)
+        if marker in self._node_translate_failed_notified:
+            return
+        self._node_translate_failed_notified.add(marker)
+        if self._ui_status is not None:
+            self._ui_status(f"节点 {node_id}：翻译暂不可用，改用本机翻译")
+
+    def _on_node_status_event(self, node_id, generation, event, conn=None):
+        if self._node_conn_stale(conn):
+            return
+        if self._stale_remote_generation(generation, "node_status_event"):
+            return
+        code = event.get("code") if isinstance(event, dict) else None
+        if code == "translate_failed":
+            self._notify_node_translate_failed_once(node_id, generation)
+
+    def _on_node_translate_failed(self, node_id, generation, tx_id, conn=None):
+        if self._node_conn_stale(conn):
+            return
+        if self._stale_remote_generation(generation, "node_translate_failed"):
+            return
+        self._notify_node_translate_failed_once(node_id, generation)
+        node_key = (node_id, conn, tx_id)
+        self._node_translate_failed.add(node_key)
+
+        def work():
+            if self._stale_remote_generation(generation, "node_translate_failed_work"):
+                return
+            src = self._node_src_by_id.get(node_key, "")
+            key = self._node_dst_keys.get(node_key)
+            if not src or key is None:
+                return
+            dst = self._translate(src)
+            if self._stale_remote_generation(generation, "node_translate_failed_retry") or not dst:
+                return
+            with self._lock:
+                self.line_store.set_translation(key, dst)
+            if self._ui_update_dst is not None:
+                self._ui_update_dst(key, dst)
+
+        self._pool.submit(work)
+
+    def _on_node_status(self, text, conn=None):
+        if self._node_conn_stale(conn):
+            return
+        if self._ui_status is not None and text:
+            self._ui_status(text)
+
+    def _on_node_loading(self, node_id, generation, conn=None):
+        if self._node_conn_stale(conn):
+            return
+        if self._stale_remote_generation(generation, "node_loading"):
+            return
+        from realtime_subtitle.ui import design_tokens
+
+        self._node_loading_id = node_id
+        if self._ui_status is not None:
+            # 每 5s 一条 loading：重新挂状态行，避免 5s 自动清空后在剩下的冷加载里看不见。
+            self._ui_status(f"{node_id}{design_tokens.TEXT_NODE_LOADING_SUFFIX}")
+
+    def _on_node_closed(self, node_id, generation, error, conn=None):
+        if self._node_conn_stale(conn):
+            return
+        if self._stale_remote_generation(generation, "node_closed"):
+            return
+        if error is not None:
+            print(f"⚠️  节点断开 {node_id}: {type(error).__name__}")
+        self._node_client = None
+        import time
+        self._node_backoff_until = time.time() + 5
+
+
+class _LooseSegment:
+    def __init__(self, start, end, text):
+        self.start = start
+        self.end = end
+        self.text = text
+
+
+def open_remote_bridge(
+    *, cloud_on, node_on, translator, ui_show, ui_drop, ui_update_dst=None,
+    ui_status=None, cloud_client_factory=None, segmenter_factory=None,
+    ledger_factory=None, router_factory=None, prepare=None,
+    node_client_factory=None, node_entries=None, key_path=None, quota_path=None,
+):
+    """开关都关时直接返回，不 import、不调用任何远端工厂。"""
+    if not cloud_on and not node_on:
+        return None
+    from realtime_subtitle.remote.router import CloudProviderStub, RemoteRouter, read_self_node_id
+    from realtime_subtitle.remote.routing_rules import RoutingState
+    from realtime_subtitle.ui.settings_window import config_dir, groq_key_file, load_node_entries
+
+    if cloud_on:
+        if cloud_client_factory is None:
+            from realtime_subtitle.remote.cloud_client import CloudClient
+            cloud_client_factory = CloudClient
+        if segmenter_factory is None:
+            from realtime_subtitle.remote.cloud_segmenter import CloudSegmenter
+            segmenter_factory = CloudSegmenter
+        if ledger_factory is None:
+            from realtime_subtitle.remote.quota import QuotaLedger
+            ledger_factory = QuotaLedger
+    if router_factory is None:
+        router_factory = RemoteRouter
+
+    routing = RoutingState(
+        has_key=bool(cloud_on),
+        cloud_enabled=bool(cloud_on),
+        cloud_state="available" if cloud_on else "off",
+        node_enabled=bool(node_on),
+    )
+    cloud = None
+    segmenter = None
+    ledger = None
+    cloud_key_path = None
+    if cloud_on:
+        cloud_key_path = key_path or groq_key_file()
+        cloud = cloud_client_factory(key_path=cloud_key_path)
+        segmenter = segmenter_factory()
+        qpath = quota_path or (config_dir() / "quota.json")
+        qpath.parent.mkdir(parents=True, exist_ok=True)
+        ledger = ledger_factory(qpath, routing=routing)
+    entries = []
+    self_node_id = None
+    if node_on:
+        if node_entries is None:
+            entries = load_node_entries()
+        else:
+            entries = list(node_entries)
+        self_node_id = read_self_node_id()
+    from realtime_subtitle.remote.node_client import NodeConfig
+    configs = []
+    for entry in entries:
+        if isinstance(entry, NodeConfig):
+            configs.append(entry)
+        elif isinstance(entry, dict):
+            configs.append(NodeConfig.from_dict(entry))
+    router = router_factory(
+        cloud_provider=CloudProviderStub(
+            has_key=bool(cloud_on),
+            cloud_enabled=bool(cloud_on),
+            cloud_state=routing.cloud_state,
+        ),
+        node_configs=configs,
+        self_node_id=self_node_id,
+    )
+    if hasattr(router, "node_enabled"):
+        # RemoteRouter 默认把节点当成开。产品默认是关，这里按面板覆盖。
+        router.node_enabled = bool(node_on)
+    return RemoteBridge(
+        translator=translator,
+        router=router,
+        routing=routing,
+        cloud=cloud,
+        segmenter=segmenter,
+        ledger=ledger,
+        cloud_on=cloud_on,
+        node_on=node_on,
+        ui_show=ui_show,
+        ui_drop=ui_drop,
+        ui_update_dst=ui_update_dst,
+        ui_status=ui_status,
+        prepare=prepare,
+        node_client_factory=node_client_factory,
+        cloud_key_path=cloud_key_path,
+    )
+
+
 class SubtitleApp:
     """实时字幕应用主类"""
     
@@ -154,6 +1178,7 @@ class SubtitleApp:
         self.running = False
         self.translator = None
         self.audio_capture = None
+        self.remote = None
 
         # 这台机器的"正常档位"翻译模型：必须在任何模式切换之前拍快照
         # （此时 config_local 的显存分档已经生效）。非性能模式统一切回它
@@ -179,6 +1204,12 @@ class SubtitleApp:
         # 面板四个按钮 / 手动拨滑块 → 都回到 _apply_mode 这唯一入口
         self.subtitle_window.settings_window.on_mode_change = self._apply_mode
         self.subtitle_window.settings_window.on_language_change = self._request_language_pair
+        # 远端开关不是模式。显示靠 refresh 读盘；变更只通知这里，不走 _apply_mode。
+        self._gui_caller = _GuiCaller()
+        self.subtitle_window.settings_window.on_remote_change = self._on_remote_prefs_changed
+        self.subtitle_window.settings_window.route_status_source = self._route_status_text
+        self.subtitle_window.signals.status.connect(self._on_status_refresh_panel)
+        self.subtitle_window.settings_window.refresh_from_config()
         if sys.platform == "darwin":
             self._setup_hotkey()
 
@@ -274,6 +1305,8 @@ class SubtitleApp:
                 from realtime_subtitle.translate.translator_queue import release_startup_warm
                 release_startup_warm()
                 return
+            # 延迟导入：见模块顶部说明（窗口出现前不付 numpy/requests 的 import）。
+            from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
             # 翻译器（Whisper 模型 + Ollama 预热，启动耗时大头）
             translator = WhisperQueueTranslator()
             if self._closing:
@@ -286,8 +1319,14 @@ class SubtitleApp:
             translator.on_pair = self.subtitle_window.add_pair
             translator.on_draft = self.subtitle_window.update_draft
             translator.on_status = self.subtitle_window.show_status
-            translator.on_language_applied = self.subtitle_window.notify_language_applied
+            translator.on_language_applied = self._on_language_applied
+            translator.on_translate_failed = self.subtitle_window.on_translate_failed
+            self.subtitle_window.on_retry_translation = (
+                lambda k: self.translator.retry_translation(k) if self.translator else False
+            )
             self.translator = translator  # 此后 stop() 会负责 shutdown 它
+            # 模型还没好时用户拨的开关只落在文件里。这里按文件决定要不要接远端。
+            self._attach_remote()
             # 点词查词：窗口点击→translator查Ollama→回调线程安全地弹结果
             # on_partial：流式生成中整行地先上屏，不用干等整段
             self.subtitle_window.on_lookup = (
@@ -304,6 +1343,8 @@ class SubtitleApp:
 
             # 音频捕获（设备名/设备切换提示直接上悬浮窗）。构造要开WASAPI流，
             # 有几百毫秒窗口，之后再查一次 _closing 才真正启动采集/热键
+            from realtime_subtitle.capture.audio_capture import AudioCapture
+
             audio_capture = AudioCapture(
                 callback=self.on_audio_received,
                 on_status=self.subtitle_window.show_status)
@@ -375,9 +1416,156 @@ class SubtitleApp:
         # 音频进translator收件箱：识别线程忙时块在收件箱里攒着，
         # 醒来一口气全塞进缓冲只识别一遍——GPU被游戏抢走时字幕只滞后不丢词
         self.translator.enqueue_audio(audio_data, capture_time)
+        # 本机识别始终在跑。远端是额外的一路，两个开关都关时 remote 是 None，这里什么都不做。
+        remote = self.remote
+        if remote is not None:
+            try:
+                remote.feed_audio(audio_data)
+            except Exception as exc:
+                print(f"⚠️  远端音频投递失败: {type(exc).__name__}")
+
+    def _on_remote_prefs_changed(self):
+        # 翻译器还没建好时，开关已经写进文件，等 _load_models 再接。
+        if self.translator is None:
+            return
+        self._attach_remote()
+
+    def _attach_remote(self):
+        from realtime_subtitle.ui.settings_window import cloud_active, node_active
+
+        cloud_on = cloud_active()
+        node_on = node_active()
+        if not cloud_on and not node_on:
+            self._close_remote()
+            if self.translator is not None:
+                self.translator.on_pair = self.subtitle_window.add_pair
+            self._refresh_panel()
+            return
+        # 开关组合一变就拆掉重建：关掉的那一路不能把客户端继续留在内存里。
+        self._close_remote()
+        try:
+            self.remote = open_remote_bridge(
+                cloud_on=cloud_on,
+                node_on=node_on,
+                translator=self.translator,
+                ui_show=self._ui_show_line,
+                ui_drop=self._ui_drop_keys,
+                ui_update_dst=self._ui_update_dst,
+                ui_status=self.subtitle_window.show_status,
+            )
+            if self.translator is not None and self.remote is not None:
+                self.translator.on_pair = self._on_local_pair
+        except Exception as exc:
+            # 远端接不上不能把字幕一起拖死：本机识别照常。这里不是路由回退策略。
+            print(f"⚠️  远端识别没有接上，继续只用本机: {type(exc).__name__}")
+            self.remote = None
+            if self.translator is not None:
+                self.translator.on_pair = self.subtitle_window.add_pair
+        self._refresh_panel()
+
+    def _close_remote(self):
+        # __new__ 跳过 __init__ 的测试也会进 stop()，那时还没有 remote。
+        remote = getattr(self, "remote", None)
+        self.remote = None
+        if remote is None:
+            return
+        try:
+            remote.close()
+        except Exception as exc:
+            print(f"⚠️  关闭远端失败: {type(exc).__name__}")
+
+    def _on_local_pair(self, src, tgt, t0, t1, key, revision):
+        remote = self.remote
+        if remote is None:
+            self.subtitle_window.add_pair(src, tgt, t0, t1, key, revision)
+            return
+        remote.on_local_pair(src, tgt, t0, t1, key, revision)
+
+    def _on_language_applied(self, src, tgt, revision=0):
+        self.subtitle_window.notify_language_applied(src, tgt, revision)
+        remote = getattr(self, "remote", None)
+        if remote is not None:
+            try:
+                remote.on_language_applied(src, tgt, revision)
+            except Exception as exc:
+                print(f"⚠️  远端语言代切换失败: {type(exc).__name__}")
+
+    def _ui_invoke(self, fn):
+        caller = getattr(self, "_gui_caller", None)
+        if caller is None:
+            fn()
+            return
+        caller.call.emit(fn)
+
+    def _refresh_panel(self):
+        self._ui_invoke(self.subtitle_window.settings_window.refresh_from_config)
+
+    def _on_status_refresh_panel(self, _text):
+        # 悬浮窗那条状态 5 秒会淡掉。面板上的「当前路由」靠这次刷新留下来。
+        if getattr(self, "_closing", False):
+            return
+        window = getattr(self, "subtitle_window", None)
+        if window is None:
+            return
+        window.settings_window.refresh_from_config()
+
+    def _route_status_text(self):
+        remote = self.remote
+        if remote is not None:
+            try:
+                return remote.route_label()
+            except Exception:
+                pass
+        from realtime_subtitle.ui.settings_window import static_route_label
+        try:
+            return static_route_label()
+        except Exception:
+            from realtime_subtitle.ui import design_tokens
+            return design_tokens.TEXT_STATUS_LOCAL
+
+    def _ui_show_line(self, src, dst, t0, t1, key, source, revision=0):
+        def _go():
+            window = self.subtitle_window
+            rev = _coerce_revision(revision)
+            if source != "local":
+                # 远端句没有自己的代数。用窗口当前代数和桥上见过的最新代数里更大的那个，
+                # 语言切过去之后才不会被 _is_stale_language 当成 0 丢掉。
+                rev = max(rev, _coerce_revision(getattr(window, "language_revision", 0)))
+            window.add_pair(src or "", dst or "", t0, t1, key, rev)
+            if source == "local":
+                return
+            _reinsert_pair_by_t0(window, key, source)
+        self._ui_invoke(_go)
+
+    def _ui_drop_keys(self, keys):
+        drop = set(keys or [])
+        if not drop:
+            return
+
+        def _go():
+            window = self.subtitle_window
+            window.sentence_pairs = [
+                item for item in window.sentence_pairs
+                if not (len(item) >= 7 and item[6] in drop)
+            ]
+            # 远端句替换本机句：历史窗/电视窗/影院条也按同一句 id 去掉最初那条
+            # 本机句，否则它们会保留旧内容、随后又多出一条远端句（同一内容两遍）。
+            # 缺这些属性的测试替身用 getattr 兜底。
+            for name in ("history_window", "tv_window", "cinema_bar"):
+                view = getattr(window, name, None)
+                drop_fn = getattr(view, "drop_keys", None)
+                if drop_fn is not None:
+                    drop_fn(drop)
+            window._render()
+        self._ui_invoke(_go)
+
+    def _ui_update_dst(self, key, dst):
+        self._ui_invoke(lambda: self.subtitle_window.update_dst(key, dst))
 
     def _toggle_pause(self):
         """暂停/继续（和 暂停继续字幕.bat 完全等价：切换.paused标记文件）"""
+        from realtime_subtitle.capture.audio_capture import PAUSE_FLAG_FILE
+
         try:
             if os.path.exists(PAUSE_FLAG_FILE):
                 os.remove(PAUSE_FLAG_FILE)
@@ -737,6 +1925,9 @@ class SubtitleApp:
             except Exception as e:
                 print(f"⚠️  停止音频捕获时出错: {e}")
 
+        # 远端翻译还在用 translator，必须先取消在飞请求再关识别线程。
+        self._close_remote()
+
         # 优雅地关闭识别/翻译线程（translator内部先ASR后翻译）
         if self.translator is not None:
             print("   - 正在关闭识别与翻译线程...")
@@ -789,6 +1980,7 @@ class SubtitleApp:
         print(f"   - 收尾静音: {config.IDLE_FLUSH_SEC}秒")
         print(f"   - 翻译: Qwen + Whisper (Ollama {config.OLLAMA_MODEL})")
         print(f"   - 源语言: {config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)}")
+        print(f"   - 路由: {self._route_status_text()}")
         from realtime_subtitle.translate.translator_queue import log_language_startup
         log_language_startup()
         print(f"   - 翻译语域: {getattr(config, 'TRANSLATION_STYLE', '（默认）')}")

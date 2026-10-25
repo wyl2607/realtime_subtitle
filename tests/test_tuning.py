@@ -262,17 +262,20 @@ def test_state_file_non_dict_json_falls_back_to_bak(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 def test_chinese_only_and_draft_checkboxes_sync_config():
     _app()
-    snap = _snap_keys("SHOW_BILINGUAL", "DRAFT_TRANSLATION")
+    snap = _snap_keys("SHOW_BILINGUAL", "DRAFT_TRANSLATION", "DISPLAY_MODE")
     try:
         config.SHOW_BILINGUAL = True
+        config.DISPLAY_MODE = "bilingual"
         config.DRAFT_TRANSLATION = True
         win = SettingsWindow()
 
-        # 勾「只显中文」→ SHOW_BILINGUAL=False
-        win.chinese_only_cb.setChecked(True)
+        # 点「仅译文」→ SHOW_BILINGUAL=False, DISPLAY_MODE="target"
+        win.display_mode_row["buttons"]["target"].click()
         assert config.SHOW_BILINGUAL is False
-        win.chinese_only_cb.setChecked(False)
+        assert config.DISPLAY_MODE == "target"
+        win.display_mode_row["buttons"]["bilingual"].click()
         assert config.SHOW_BILINGUAL is True
+        assert config.DISPLAY_MODE == "bilingual"
 
         win.draft_cb.setChecked(False)
         assert config.DRAFT_TRANSLATION is False
@@ -281,9 +284,10 @@ def test_chinese_only_and_draft_checkboxes_sync_config():
 
         # refresh 反向同步
         config.SHOW_BILINGUAL = False
+        config.DISPLAY_MODE = "target"
         config.DRAFT_TRANSLATION = False
         win.refresh_from_config()
-        assert win.chinese_only_cb.isChecked() is True
+        assert win.display_mode_row["buttons"]["target"].isChecked() is True
         assert win.draft_cb.isChecked() is False
         # blockSignals：refresh 不该把值写乱
         assert config.SHOW_BILINGUAL is False
@@ -319,7 +323,8 @@ def test_reset_defaults_restores_passed_snapshot():
         assert config.FONT_SIZE == factory["FONT_SIZE"]
         assert config.MAX_SENTENCE_PAIRS == factory["MAX_SENTENCE_PAIRS"]
         # 控件勾选态一致
-        assert win.chinese_only_cb.isChecked() == (not factory["SHOW_BILINGUAL"])
+        expected_mode = "bilingual" if factory.get("SHOW_BILINGUAL", True) else "target"
+        assert win.display_mode_row["buttons"][expected_mode].isChecked() is True
         assert win.draft_cb.isChecked() == bool(factory["DRAFT_TRANSLATION"])
     finally:
         _restore(snap)

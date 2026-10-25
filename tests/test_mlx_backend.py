@@ -79,6 +79,95 @@ def test_beam_size_is_accepted_and_ignored(monkeypatch):
     assert "beam_size" not in calls[0][1]
 
 
+def test_transcribe_collect_timing_is_opt_in_and_keeps_coarse_fallback(monkeypatch):
+    from realtime_subtitle.asr.mlx_backend import MlxWhisperModel
+
+    calls = []
+    _fake_mlx(monkeypatch, calls)
+    model = MlxWhisperModel("repo")
+
+    list(model.transcribe(np.ones(16000, dtype=np.float32), vad_filter=False)[0])
+    assert model.last_timing is None
+
+    list(model.transcribe(
+        np.ones(16000, dtype=np.float32), vad_filter=False, collect_timing=True,
+    )[0])
+
+    assert calls[-1][1]["path_or_hf_repo"] == "repo"
+    assert model.last_timing is not None
+    assert set(model.last_timing) == {
+        "total_s", "vad_s", "mel_s", "encoder_s", "decoder_s", "alignment_s", "python_s",
+    }
+    assert model.last_timing["total_s"] >= model.last_timing["python_s"] >= 0.0
+    # vad_filter=False 时仍有 ndarray 归一化，不能把这项硬编码为 0。
+    assert model.last_timing["vad_s"] < 0.1
+
+
+def test_transcribe_reuses_decoder_encoder_features_for_word_alignment(monkeypatch):
+    """词级对齐不应再次跑完整 encoder。"""
+    from realtime_subtitle.asr.mlx_backend import MlxWhisperModel
+
+    class FakeModel:
+        def __init__(self):
+            self.encoder_calls = 0
+            self.forward_calls = 0
+            self.decoder_features = []
+
+        def encoder(self, mel):
+            self.encoder_calls += 1
+            return f"features:{mel}"
+
+        def decoder(self, tokens, features):
+            self.decoder_features.append(features)
+            return "logits", None, "cross-qk"
+
+        def decode(self, mel):
+            return self.encoder(mel)
+
+        def forward_with_cross_qk(self, mel, tokens):
+            self.forward_calls += 1
+            return self.decoder(tokens, self.encoder(mel))[:1] + ("cross-qk",)
+
+    model = FakeModel()
+    transcribe_module = types.ModuleType("mlx_whisper.transcribe")
+    transcribe_module.ModelHolder = types.SimpleNamespace(
+        get_model=lambda _repo, _dtype: model,
+    )
+    transcribe_module.log_mel_spectrogram = lambda audio, **_kwargs: audio
+
+    def add_word_timestamps(*, model, mel, **_kwargs):
+        model.forward_with_cross_qk(mel, "tokens")
+
+    transcribe_module.add_word_timestamps = add_word_timestamps
+    mlx = types.ModuleType("mlx")
+    mx = types.SimpleNamespace(float16="float16", eval=lambda _value: None)
+    mlx_whisper = types.ModuleType("mlx_whisper")
+    mlx_whisper.__path__ = []
+
+    def transcribe(audio, **_kwargs):
+        mel = transcribe_module.log_mel_spectrogram(audio)
+        model.decode(mel)
+        transcribe_module.add_word_timestamps(model=model, mel=mel)
+        return {"language": "de", "duration": 1.0, "segments": []}
+
+    mlx_whisper.transcribe = transcribe
+    monkeypatch.setitem(sys.modules, "mlx", mlx)
+    monkeypatch.setitem(sys.modules, "mlx.core", mx)
+    monkeypatch.setitem(sys.modules, "mlx_whisper", mlx_whisper)
+    monkeypatch.setitem(sys.modules, "mlx_whisper.transcribe", transcribe_module)
+
+    list(MlxWhisperModel("repo").transcribe(
+        np.ones(16000, dtype=np.float32), vad_filter=False, collect_timing=True,
+    )[0])
+
+    assert model.encoder_calls == 1
+    assert model.forward_calls == 0
+    assert model.decoder_features == ["features:" + str(np.ones(16000, dtype=np.float32))]
+    model.forward_with_cross_qk("next-mel", "tokens")
+    assert model.encoder_calls == 2
+    assert model.forward_calls == 1
+
+
 def test_vad_maps_timestamps_back_to_original_axis(monkeypatch):
     import pytest
     pytest.importorskip("faster_whisper")  # CI 只装轻量依赖；VAD 复用 faster_whisper.vad
@@ -130,7 +219,10 @@ def test_all_silence_returns_empty_segments_without_calling_mlx(monkeypatch):
 
 def test_detect_language_shares_transcribe_model_and_reads_prob_table(monkeypatch):
     import pytest
-    mx = pytest.importorskip("mlx.core")  # Windows CI 没有 mlx
+    try:
+        import mlx.core as mx
+    except ImportError:
+        pytest.skip("MLX requires a Metal device")
     from realtime_subtitle.asr.mlx_backend import MlxWhisperModel
 
     seen = {}

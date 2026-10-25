@@ -185,6 +185,28 @@ def test_utterance_times_are_clamped_into_the_unpadded_speech_span():
     assert 0.0 <= f["a0"] <= f["a1"] <= 1.0 + 0.04
 
 
+def test_identical_utterances_clamped_to_the_same_span_emit_one_final():
+    """Whisper 在非语音上复读（真机上见过两行「Ja.」同一时间）：两句时间都落在语音之外，
+    夹到同一个边界后文本和时间都完全相同。同一行字发两遍没有任何信息，只发一条，也只翻译一次。"""
+    asr = FakeAsr([Utterance(5.0, 6.0, "Ja."), Utterance(6.0, 7.0, " ja. ")])
+    pcm = np.concatenate([tone(1.0), silence(1.0)])
+    _c, ev, _err, _asr, tr = run_worker(hello() + audio_frames(pcm) + ctl(type="drain"), asr=asr)
+    finals = [e for e in ev if e["ev"] == "final"]
+    assert [f["text"] for f in finals] == ["Ja."]
+    assert [e["id"] for e in ev if e["ev"] == "translation"] == [finals[0]["id"]]
+    assert len(tr.calls) == 1
+
+
+def test_repeated_words_at_different_times_are_kept():
+    """真人说「Ja. Ja.」：两句时间不同，都要留着。"""
+    asr = FakeAsr([Utterance(0.1, 0.3, "Ja."), Utterance(0.5, 0.7, "Ja.")])
+    pcm = np.concatenate([tone(1.0), silence(1.0)])
+    _c, ev, *_ = run_worker(hello() + audio_frames(pcm) + ctl(type="drain"), asr=asr)
+    finals = [e for e in ev if e["ev"] == "final"]
+    assert [f["text"] for f in finals] == ["Ja.", "Ja."]
+    assert finals[0]["a1"] <= finals[1]["a0"]
+
+
 class SpanAsr(FakeAsr):
     """每段报一句覆盖整段音频的话（含垫），最糟情况：模型把垫也算进去。"""
 
@@ -194,9 +216,10 @@ class SpanAsr(FakeAsr):
 
 
 def test_force_cut_finals_are_monotonic_non_overlapping_and_within_speech():
-    # 20s 连续说话（13.0s 处有短凹口让强切落在那里），说完 1s 静音
-    dip = int(13.0 * SR)
-    voice = tone(20.0)
+    # 12s 连续说话（6.5s 处有短凹口，落在 8s 上限前 3s 的搜索窗里，强切切在那里），说完 1s 静音
+    assert worker_mod.NODE_MAX_SEGMENT_S == 8.0
+    dip = int(6.5 * SR)
+    voice = tone(12.0)
     voice[dip:dip + SR // 10] //= 20
     pcm = np.concatenate([voice, silence(1.0)])
     _c, ev, *_ = run_worker(hello() + audio_frames(pcm) + ctl(type="drain"), asr=SpanAsr())
@@ -205,7 +228,8 @@ def test_force_cut_finals_are_monotonic_non_overlapping_and_within_speech():
     for a, b in zip(finals, finals[1:]):
         assert a["a0"] <= a["a1"] <= b["a0"] <= b["a1"]  # 单调且不重叠
     assert finals[0]["a0"] >= -0.001
-    assert finals[-1]["a1"] <= 20.0 + 0.04  # 不越过语音终点
+    assert finals[0]["a1"] == pytest.approx(6.5, abs=0.15)  # 切在凹口
+    assert finals[-1]["a1"] <= 12.0 + 0.04  # 不越过语音终点
 
 
 def test_flush_closes_running_segment():
@@ -255,7 +279,9 @@ def test_translator_unavailable_still_delivers_finals():
 def test_translate_failure_reports_status_and_keeps_going():
     stream = hello() + audio_frames(np.concatenate([tone(1.0), silence(1.0)])) + ctl(type="drain")
     _c, ev, *_ = run_worker(stream, translator=FakeTr(result=None))
-    assert len([e for e in ev if e["ev"] == "status" and e["code"] == "translate_failed"]) == 2
+    statuses = [e for e in ev if e["ev"] == "status" and e["code"] == "translate_failed"]
+    assert len(statuses) == 2
+    assert [e["id"] for e in statuses] == [1, 2]
     assert ev[-1] == {"ev": "drained"}
 
 
@@ -348,6 +374,8 @@ def test_log_never_contains_transcript_or_translation_text():
     assert err.strip(), "日志不应为空，否则这条测试什么也没证明"
     for secret in (SECRET_SRC, SECRET_DST, "Zweiter", "Äpfel", "机密", "boom"):
         assert secret not in err
+    statuses = [e for e in ev if e["ev"] == "status" and e["code"] == "translate_failed"]
+    assert [e["id"] for e in statuses] == [1, 2]
     # 事件流里则必须有正文（它们是产品输出，不是日志）
     assert any(SECRET_SRC in json.dumps(e, ensure_ascii=False) for e in ev)
 
@@ -560,7 +588,8 @@ def test_whisper_engine_calls_model_without_second_vad():
     eng._backend, eng._model_name = "mlx", "m"
     out = eng.transcribe(np.zeros(SR, dtype=np.float32), "de")
     assert [u.text for u in out] == ["Hallo."]
-    assert calls["vad_filter"] is False and calls["word_timestamps"] is True
+    # 2026-10-13 起节点默认不要词时间戳（M4 每段 1.78s → 0.98s），句子时间由伪词插值
+    assert calls["vad_filter"] is False and calls["word_timestamps"] is False
     assert calls["language"] == "de" and calls["condition_on_previous_text"] is False
     info = eng.info()
     assert info["backend"] == "mlx" and info["model"] == "m" and info["rtf"] is not None
@@ -1019,6 +1048,9 @@ def test_asr_thread_baseexception_death_makes_worker_exit_internal():
     assert _SECRET not in err and _SECRET not in out
 
 
+@pytest.mark.skipif(sys.platform == "darwin" and os.environ.get("RS_TEST_SEGV") != "1",
+                    reason="故意段错误会让 macOS 每跑一次就弹一份 Python 崩溃报告（2026-10-12 用户误以为是故障）；"
+                           "需要时设 RS_TEST_SEGV=1 再跑，Windows/CI 照常跑")
 def test_faulthandler_dumps_frames_without_locals_on_native_crash():
     p = _spawn_death("segv")
     try:
@@ -1094,6 +1126,24 @@ def run_rtf(stream, state_dir, cost=0.5, utterances=None, tr_name="fake", factor
 
 def read_state(d):
     return json.loads((d / info_mod.ASR_STATE_FILENAME).read_text(encoding="utf-8"))
+
+
+def test_segment_log_reports_close_wait_and_queue_time():
+    """段尾静音等待和排队时间只记数字，供协调者拆分精修延迟（不打印正文）。"""
+    out, err = io.BytesIO(), io.StringIO()
+    w = Worker(io.BytesIO(speech_session(1, speech_s=3.0)), out, FakeAsr(), EnergyVad(),
+               translator_factory=lambda s, d: FakeTr(), err=err)
+    assert w.run() == EXIT_OK
+    line = next(l for l in err.getvalue().splitlines() if "[node.worker] segment " in l)
+    fields = {}
+    for part in line.split():
+        if "=" in part:
+            key, value = part.split("=", 1)
+            fields[key] = value
+    # 3s 语音 + 1s 静音：wait 是「最后一个语音样本到段收尾」的墙钟差
+    assert 0.1 <= float(fields["wait_s"]) <= 1.5
+    assert float(fields["queue_s"]) >= 0.0
+    assert float(fields["asr_s"]) >= 0.0
 
 
 def test_session_end_creates_state_file_with_session_rtf(tmp_path):
@@ -1319,3 +1369,267 @@ def test_subprocess_sigterm_mid_session_still_updates_rtf(tmp_path):
     assert set(data) == {"model", "backend", "rtf", "translator"}
     assert "Hallo Welt" not in f.read_text(encoding="utf-8") + err
     assert "你好世界" not in f.read_text(encoding="utf-8") + err
+
+
+# ---------------------------------------------------------------- 多会话（spec 007 M0）
+
+def sid_frame(sid, pcm):
+    data = pcm.astype("<i2").tobytes()
+    return b"\x01" + int(sid).to_bytes(4, "big") + len(data).to_bytes(4, "big") + data
+
+
+def sid_audio(sid, pcm, chunk=1600):
+    return b"".join(sid_frame(sid, pcm[i:i + chunk]) for i in range(0, len(pcm), chunk))
+
+
+def _utt(pcm):
+    """一段刚好能收口的语音：0.5s 音 + 0.8s 静音。"""
+    return np.concatenate([tone(0.5), silence(0.8)])
+
+
+class LangAsr(FakeAsr):
+    """识别结果就是语言代号，用来看会话有没有串。"""
+
+    def transcribe(self, audio, language):
+        self.calls += 1
+        self.seen_lang.append(language)
+        return [Utterance(0.05, 0.25, language)]
+
+
+def _pair_tr(src, dst):
+    tr = FakeTr(result=f"{src}-{dst}")
+    return tr
+
+
+class GrowingBuffer:
+    """read(n) 凑满 n 字节才返回（EOF 除外）。os.pipe 的短读会被 worker 当成协议错误。"""
+
+    def __init__(self):
+        self._buf = bytearray()
+        self._cv = threading.Condition()
+        self._eof = False
+
+    def write(self, data: bytes) -> None:
+        with self._cv:
+            self._buf += data
+            self._cv.notify_all()
+
+    def close(self) -> None:
+        with self._cv:
+            self._eof = True
+            self._cv.notify_all()
+
+    def read(self, n=-1):
+        with self._cv:
+            if n is None or n < 0:
+                while not self._eof:
+                    self._cv.wait()
+                data = bytes(self._buf)
+                self._buf.clear()
+                return data
+            while len(self._buf) < n and not self._eof:
+                self._cv.wait()
+            take = min(n, len(self._buf))
+            data = bytes(self._buf[:take])
+            del self._buf[:take]
+            return data
+
+    def readline(self, limit=-1):
+        with self._cv:
+            while True:
+                nl = self._buf.find(b"\n")
+                if nl >= 0 and (limit is None or limit < 0 or nl < limit):
+                    take = nl + 1
+                    break
+                if limit is not None and limit > 0 and len(self._buf) >= limit:
+                    take = limit
+                    break
+                if self._eof:
+                    take = len(self._buf) if limit is None or limit < 0 else min(limit, len(self._buf))
+                    break
+                self._cv.wait()
+            data = bytes(self._buf[:take])
+            del self._buf[:take]
+            return data
+
+
+def test_two_sessions_finals_stay_on_their_own_sid():
+    made = []
+
+    def vad_factory():
+        made.append(1)
+        return EnergyVad()
+
+    pcm = _utt(None)
+    stream = (
+        hello(sid=1, src="de", dst="zh") + hello(sid=2, src="en", dst="ja")
+        + sid_audio(1, pcm) + sid_audio(2, pcm)
+        + ctl(type="drain", sid=1) + ctl(type="drain", sid=2)
+    )
+    out, err = io.BytesIO(), io.StringIO()
+    w = Worker(io.BytesIO(stream), out, LangAsr(), vad_factory=vad_factory,
+               translator_factory=_pair_tr, err=err)
+    assert w.run() == EXIT_OK
+    assert len(made) == 2  # 每个会话一份 VAD，分段器不共享
+    ev = [json.loads(line) for line in out.getvalue().decode().splitlines()]
+    finals = [e for e in ev if e["ev"] == "final"]
+    trans = [e for e in ev if e["ev"] == "translation"]
+    assert [(e["sid"], e["id"], e["text"]) for e in finals] == [(1, 1, "de"), (2, 1, "en")]
+    assert [(e["sid"], e["id"], e["text"]) for e in trans] == [(1, 1, "de-zh"), (2, 1, "en-ja")]
+    assert {e["sid"] for e in ev if e["ev"] == "drained"} == {1, 2}
+    assert {e["sid"] for e in ev if e["ev"] == "ready"} == {1, 2}
+    # drain 只等结果，不摘会话；end 才摘
+    assert set(w._sessions) == {1, 2}
+
+
+def test_end_one_session_leaves_the_other_running():
+    pcm = _utt(None)
+    stream = (
+        hello(sid=1, src="de") + sid_audio(1, tone(0.4))  # 还在说话，没有收口
+        + hello(sid=2, src="en") + sid_audio(2, pcm)
+        + ctl(type="end", sid=1)
+        + sid_audio(1, silence(1.0))  # 已经 end 的 sid：丢掉，不能变成协议错误
+        + ctl(type="flush", sid=1)
+        + ctl(type="drain", sid=2)
+    )
+    out, err = io.BytesIO(), io.StringIO()
+    w = Worker(io.BytesIO(stream), out, LangAsr(), vad_factory=EnergyVad,
+               translator_factory=_pair_tr, err=err)
+    assert w.run() == EXIT_OK
+    ev = [json.loads(line) for line in out.getvalue().decode().splitlines()]
+    finals = [e for e in ev if e["ev"] == "final"]
+    assert finals and all(e["sid"] == 2 and e["text"] == "en" and e["id"] == 1 for e in finals)
+    assert any(e["ev"] == "drained" and e["sid"] == 2 for e in ev)
+    assert 1 not in w._sessions and 2 in w._sessions
+    text = err.getvalue()
+    assert "protocol_error" not in text
+    assert "ignored_unknown_sid" in text
+
+
+def test_sid_frame_before_hello_is_protocol_error():
+    code, ev, err, *_ = run_worker(sid_frame(3, tone(0.2)))
+    assert code == EXIT_PROTOCOL
+    assert any(e["ev"] == "status" and e["code"] == "protocol_error" for e in ev)
+    assert "protocol_error" in err
+
+
+def test_end_before_hello_is_ignored():
+    pcm = _utt(None)
+    stream = ctl(type="end", sid=1) + hello(sid=1, src="de") + sid_audio(1, pcm) + ctl(type="drain", sid=1)
+    out, err = io.BytesIO(), io.StringIO()
+    w = Worker(io.BytesIO(stream), out, LangAsr(), vad_factory=EnergyVad,
+               translator_factory=_pair_tr, err=err)
+    assert w.run() == EXIT_OK
+    ev = [json.loads(line) for line in out.getvalue().decode().splitlines()]
+    assert [(e["sid"], e["text"]) for e in ev if e["ev"] == "final"] == [(1, "de")]
+    assert "protocol_error" not in err.getvalue()
+
+
+def test_round_robin_lets_the_other_session_progress():
+    """一个会话把识别队列塞满时，另一个会话的段仍会插进来，而不是排到队尾。"""
+    class GateAsr(FakeAsr):
+        def __init__(self):
+            super().__init__(utterances=[Utterance(0.05, 0.2, "x")])
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def transcribe(self, audio, language):
+            self.calls += 1
+            self.seen_lang.append(language)
+            if self.calls == 1:
+                self.entered.set()
+                if not self.release.wait(8):
+                    raise TimeoutError("gate")
+            return [Utterance(0.05, 0.2, language)]
+
+    asr = GateAsr()
+    buf, out, err = GrowingBuffer(), io.BytesIO(), io.StringIO()
+    w = Worker(buf, out, asr, vad_factory=EnergyVad, translator_factory=_pair_tr, err=err)
+    code = []
+
+    def runner():
+        code.append(w.run())
+
+    th = threading.Thread(target=runner, name="worker-run")
+    th.start()
+    try:
+        utt = _utt(None)
+        buf.write(hello(sid=1, src="de") + b"".join(sid_audio(1, utt) for _ in range(6)))
+        assert _wait(lambda: asr.entered.is_set() and w._asr_q.qsize() >= 5)
+        assert asr.calls == 1
+        buf.write(hello(sid=2, src="en") + sid_audio(2, utt))
+
+        def en_queued():
+            with w._asr_q._cv:
+                q = w._asr_q._qs.get(2)
+                return q is not None and len(q) >= 1
+
+        assert _wait(en_queued)
+        assert asr.calls == 1  # 第一段还堵着，en 只是进了队列
+        asr.release.set()
+        buf.write(ctl(type="drain", sid=1) + ctl(type="drain", sid=2))
+        buf.close()
+        th.join(20)
+    finally:
+        asr.release.set()
+        buf.close()
+        th.join(5)
+    assert not th.is_alive(), f"worker hung seen={asr.seen_lang}"
+    assert code == [EXIT_OK]
+    # 纯 FIFO 会把 6 段 de 全部做完才轮到 en，index("en") == count("de")。
+    assert asr.seen_lang.count("de") == 6
+    assert asr.seen_lang.index("en") < asr.seen_lang.count("de")
+    ev = [json.loads(line) for line in out.getvalue().decode().splitlines()]
+    finals = {(e["sid"], e["text"]) for e in ev if e["ev"] == "final"}
+    assert (1, "de") in finals and (2, "en") in finals
+
+
+# ---------------------------------------------------------------- 无词时间戳（2026-10-13：M4 每段 1.78s → 0.98s）
+
+
+def SNW(text, start, end, no_speech=0.0):
+    return SimpleNamespace(text=text, start=start, end=end, no_speech_prob=no_speech, words=None)
+
+
+def test_no_words_three_sentences_get_cumulative_times():
+    # 每句 10 个字符（含前导空格），3.0s 平均分：0-1、1-2、2-3
+    seg = SNW(" Eins zwei. Drei vier. Fünf sechs.", 0.0, 3.0)
+    got = utterances_from_segments([seg], "de")
+    assert [u.text for u in got] == ["Eins zwei.", "Drei vier.", "Fünf sechs."]
+    starts = [round(u.start, 2) for u in got]
+    ends = [round(u.end, 2) for u in got]
+    assert starts == sorted(starts) and ends == sorted(ends)
+    assert all(u.start <= u.end for u in got)
+    assert got[0].start == pytest.approx(0.03, abs=0.1) and got[-1].end == pytest.approx(3.0, abs=0.01)
+    assert got[1].start == pytest.approx(1.0, abs=0.15) and got[1].end == pytest.approx(2.0, abs=0.15)
+
+
+def test_no_words_sentence_spanning_two_segments_stays_one_utterance():
+    segs = [SNW(" Die Regierung hat heute", 0.0, 2.0), SNW(" neue Maßnahmen beschlossen.", 2.0, 4.0)]
+    got = utterances_from_segments(segs, "de")
+    assert [u.text for u in got] == ["Die Regierung hat heute neue Maßnahmen beschlossen."]
+    assert got[0].start == pytest.approx(0.0, abs=0.1) and got[0].end == pytest.approx(4.0, abs=0.01)
+
+
+def test_no_words_chinese_has_no_spaces_and_splits():
+    got = utterances_from_segments([SNW("你好。再见。", 0.0, 1.2)], "zh")
+    assert [u.text for u in got] == ["你好。", "再见。"]
+    assert got[0].end == pytest.approx(0.6, abs=0.01) and got[1].end == pytest.approx(1.2, abs=0.01)
+
+
+def test_no_words_matches_word_path_sentence_split():
+    with_words = S(" Das ist gut. Wir gehen.", [W(0.0, 0.3, " Das"), W(0.3, 0.5, " ist"), W(0.5, 0.9, " gut."),
+                                                W(1.2, 1.5, " Wir"), W(1.5, 2.0, " gehen.")])
+    a = [u.text for u in utterances_from_segments([with_words], "de")]
+    b = [u.text for u in utterances_from_segments([SNW(" Das ist gut. Wir gehen.", 0.0, 2.0)], "de")]
+    assert a == b == ["Das ist gut.", "Wir gehen."]
+
+
+def test_no_words_drops_no_speech_and_empty():
+    got = utterances_from_segments([SNW(" Hallo.", 0.0, 1.0, no_speech=0.95), SNW("", 1.0, 2.0)], "de")
+    assert got == []
+
+
+def test_engine_requests_no_word_timestamps_by_default():
+    from realtime_subtitle.node import engines
+    assert engines.NODE_WORD_TIMESTAMPS is False
