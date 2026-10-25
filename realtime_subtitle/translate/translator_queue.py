@@ -1806,8 +1806,8 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             self._held_since = 0.0
         return timed
 
-    def _release_held_boundary(self):
-        """扣留的句尾到点放行。
+    def _release_held_boundary(self, force=False):
+        """扣留的句尾到点，或已看见下一个候选词时放行。
 
         ☠️ 只动文字，绝不碰 processor.finish()——那会清掉正在用的音频缓冲，
         而这时候用户很可能只是句子中间换了口气，音频还要接着识别。
@@ -1815,7 +1815,8 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         held = self._held_since
         if not held:
             return
-        if time.time() - held < getattr(config, "SENTENCE_HOLD_SEC", 0.6):
+        if (not force
+                and time.time() - held < getattr(config, "SENTENCE_HOLD_SEC", 0.6)):
             return
         sentences = self._extract_sentences(final=True)
         if sentences:
@@ -2104,6 +2105,10 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             overlapped = bool(self._tx_inflight)
 
         self._asr_busy = True  # 草稿翻译看这个标志让路（识别在GPU上跑的期间）
+        # 本轮识别实际看到的音频末尾（样本钟）。扣留放行要按音频时间量，
+        # 见下面 _held_since 分支——墙钟起点记在提交那轮结束时，而 Mac 一轮
+        # 识别就超过 SENTENCE_HOLD_SEC，按墙钟总要多白等一整轮。
+        seen_audio_sec = self._sample_clock_seconds()
         try:
             committed, unstable = self.processor.process_iter()
         finally:
@@ -2112,6 +2117,22 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
 
         self._append_committed(committed)
         self._enqueue_sentences(self._extract_sentences())
+
+        if self._held_since:
+            word = unstable.lstrip().split(maxsplit=1)
+            if not word:
+                # 句号后的音频已经延续够久，这段等待在音频时间上发生了；
+                # 再等墙钟等于让同一段静音被识别两遍。pending_words 没时间
+                # （或为空）就退回墙钟。
+                held_end = self.pending_words[-1][1] if self.pending_words else None
+                covered = (held_end is not None
+                           and seen_audio_sec - held_end >= config.SENTENCE_HOLD_SEC)
+                self._release_held_boundary(force=covered)
+            elif not word[0][0].islower():
+                # MLX 一轮识别常比 0.5 秒分块久，持续环境声会让收件箱一直非空，
+                # flush_pending 排不上；而下一词通常已在 unstable 里，没必要再等
+                # 下一轮 local agreement。小写仍须扣住，否则会废掉③a 的续行否决。
+                self._release_held_boundary(force=True)
 
         # 聊天/嘈杂语音下Whisper经常整段不打标点，残句永远凑不成句 →
         # 超长就不等标点直接翻（实测聊天时德语堆在live行、中文迟迟不出）。
