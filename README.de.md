@@ -42,16 +42,16 @@ Systemton ──WASAPI-Loopback──▶ Faster-Whisper (CUDA oder CPU)
 
 ## Plattformstatus
 
-Stand 2026-10-21. Aktuelle Release-Version ist v3.1.0 für Windows / macOS; v3.2.0 ist als Beta getaggt, die finale Version ist noch nicht veröffentlicht.
+Stand 2026-10-25. Aktuelle Release-Version für Windows / macOS ist v3.2.0 (2026-10-25).
 
 Legende: ✅ stabil · 🟢 nutzbar · 🧪 experimentell · ⬜ nicht begonnen.
 
 | Plattform | Form | Stufe | Schon nutzbar | Noch offen |
 |---|---|---|---|---|
-| Windows | Desktop-App | ✅ Stabil | Lokale Erkennung und Übersetzung; dreistufiges automatisches Routing Cloud (Groq) → Rechenknoten → lokal (v3.2.0 Beta); die Statuszeile zeigt die aktuelle Quelle. Vollständiges pytest auf echter Windows-Hardware: 1207 bestanden, 0 fehlgeschlagen | Finale v3.2.0 noch nicht veröffentlicht |
-| macOS | Desktop-App + rslite (natives Swift) | 🟢 Nutzbar | Lokale Erkennung und Übersetzung; dreistufiges automatisches Routing Cloud → Rechenknoten → lokal (v3.2.0 Beta). rslite-Cloud-Abnahme größtenteils bestanden, Median-Latenz der Hybrid-Verfeinerung 1,47 s | finale v3.2.0 noch nicht veröffentlicht |
-| Android | Native App (separates privates Repo) | 🧪 Experimentell | v0.4.0-quality veröffentlicht (alte Architektur); die Neuentwicklung rewrite/v1 bietet Erkennung auf dem Gerät, Cloud-Stufe, Knoten-Stufe, automatische Umschaltung und Keystore-verschlüsselte Schlüsselspeicherung, 395 Unit-Tests bestanden, 0 fehlgeschlagen | Neuentwicklung noch nicht auf echter Hardware verifiziert |
-| iOS | Native App (Prototyp) | 🧪 Experimentell | Broadcast-Erweiterung für Bildschirmaufnahme nimmt Ton anderer Apps auf, Bild-in-Bild-Anzeige, „Automatik“-Modus (bei Knotenausfall lokal, nach Erholung am Satzende zurück), Tagesarchiv der Untertitel, Cloud-Stufe nur als reine Logik | Broadcast-Erweiterung noch nicht eingebunden, noch nicht auf echter Hardware; Anzeige nur per Bild-in-Bild, kein Desktop-Overlay |
+| Windows | Desktop-App | ✅ Stabil | Lokale Erkennung und Übersetzung; dreistufiges automatisches Routing Cloud (Groq) → Rechenknoten → lokal; die Statuszeile zeigt die aktuelle Quelle. Vollständiges pytest auf echter Windows-Hardware (RTX 4070): 1269 bestanden, 0 fehlgeschlagen; Smoke-Test und 150-%-HiDPI-Prüfung bestanden | Trennt gelegentlich einen Satz zu früh (zwei Zeilen; Übersetzung nicht betroffen) |
+| macOS | Desktop-App + rslite (natives Swift) | 🟢 Nutzbar | Lokale Erkennung und Übersetzung; dreistufiges automatisches Routing Cloud → Rechenknoten → lokal. Cloud: Segmentende → Anzeige im Median ca. 1,1 s, Median-Latenz der Hybrid-Verfeinerung 1,47 s | Weiterhin nur als Quellcode (rslite-.app-Paket ist für v3.3 geplant); rslite-Release-Build mit Swift 6.3 hängt in der CI, wird untersucht |
+| Android | Native App (separates privates Repo) | 🧪 Experimentell | v0.4.0-quality veröffentlicht (alte Architektur); die neue Architektur ist in main zusammengeführt: Erkennung auf dem Gerät mit Live-Entwurf auf Deutsch, Cloud-Stufe, Knoten-Stufe, automatische Umschaltung, Keystore-verschlüsselte Schlüsselspeicherung, alle Unit-Tests bestanden | Neue Architektur noch nicht auf echter Hardware verifiziert; noch kein neues Release |
+| iOS | Native App (Prototyp) | 🧪 Experimentell | Broadcast-Erweiterung für Bildschirmaufnahme nimmt Ton anderer Apps auf, alternativ direkt das Mikrofon; dreistufiges Routing Cloud → Knoten → lokal; Kopplung per QR-Code / `rsnode://pair`; Untertitel-Rückblick für heute | Noch nicht auf echter Hardware; selbst mit Xcode bauen und installieren; Anzeige nur per Bild-in-Bild, kein Desktop-Overlay |
 | Linux | — | ⬜ Nicht begonnen | — | Keine Pläne |
 
 ## Funktionen
