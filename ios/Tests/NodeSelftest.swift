@@ -18,6 +18,7 @@ struct NodeSelftest {
         testReadyDeadline(check)
         testLoadingEvent(check)
         testSessionLoadingCallback(check)
+        testPreReadyAudioBuffer(check)
         testStartReadyWatchdog(check)
         testExplicitCloseDoesNotNotify(check)
         pcmChecks(sampleRate: 48_000, channels: 2, check: check)
@@ -224,6 +225,39 @@ struct NodeSelftest {
         session.handle(eventText: #"{"ev":"ready","cold":true}"#)
         check(loadings.count == 2, "ready 后不再触发 onLoading")
         check(events.count == 4, "ready 仍按事件上报（实际 \(events.count)）")
+    }
+
+    static func testPreReadyAudioBuffer(_ check: (Bool, String) -> Void) {
+        let session = NodeSession(
+            url: URL(string: "ws://127.0.0.1:1/v2/session")!,
+            token: "gsk_test_fake_key_not_real",
+            src: "de",
+            dst: "zh",
+            onEvent: { _ in },
+            onClose: { _ in }
+        )
+        let frameBytes = PCMConverter.frameBytes
+        let first = Data(repeating: 1, count: frameBytes)
+        check(session.send(pcm16k: first) == .buffered, "ready 前 send 应返回 buffered")
+        check(session.bufferedFrameCount == 1, "ready 前缓冲帧数递增")
+
+        // 每帧用不同内容标识；第 151 帧到来时应淘汰最早的第 1 帧，仍只保留最新 150 帧。
+        for marker in 2...151 {
+            _ = session.send(pcm16k: Data(repeating: UInt8(marker), count: frameBytes))
+        }
+        check(session.bufferedFrameCount == 150, "ready 前缓冲帧数封顶 150")
+        check(session.overflowDroppedFrameCount == 1, "超过 15 秒时只淘汰最旧的一帧")
+
+        // 自测不建真连接；无 socket 时 ready 的补发等价于丢弃，关键是缓冲已清空且后续不再入缓冲。
+        session.handle(eventText: #"{"ev":"ready","cold":false}"#)
+        check(session.bufferedFrameCount == 0, "ready 后应清空缓冲")
+        check(session.send(pcm16k: Data(repeating: 152, count: frameBytes)) == .dropped,
+              "ready 后无 socket 的 send 不应再返回 buffered")
+
+        session.close()
+        check(session.send(pcm16k: Data(repeating: 153, count: frameBytes)) == .dropped,
+              "close 后 send 应返回 dropped")
+        check(session.bufferedFrameCount == 0, "close 后应释放缓冲")
     }
 
     static func testStartReadyWatchdog(_ check: (Bool, String) -> Void) {

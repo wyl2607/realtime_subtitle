@@ -974,8 +974,10 @@ final class SubtitleEngine {
             let memMB = residentMemoryMB()
             let interleavedStr = isNonInterleaved ? "0" : "1"
             let state = stateQueue.sync {
-                (readyReceived, framesSent, finalsCount, translationsCount, lastStatusCode, preReadyDropped, fatalErrorOccurred, fatalErrorReason, reconnectCount)
+                (readyReceived, framesSent, finalsCount, translationsCount, lastStatusCode, preReadyDropped, fatalErrorOccurred, fatalErrorReason, reconnectCount, session)
             }
+            // drop 只报真正丢掉的帧：尚无会话时的帧，加上当前会话缓冲满后淘汰的旧帧。
+            let droppedFrames = state.5 &+ (state.9?.overflowDroppedFrameCount ?? 0)
             let readyStr = state.0 ? "1" : "0"
             let tier = stateQueue.sync { routingTier }
             let localActive = tier == .local
@@ -989,7 +991,7 @@ final class SubtitleEngine {
             }
             var status = "blocks=\(blockCount) src=\(source) rate=\(Int(sampleRate)) ch=\(channelCount) fmt=\(formatString) flags=\(formatFlags) ileave=\(interleavedStr) rms=\(String(format: "%.3f", avgRMS)) mem=\(memMB) engine=\(engineStr)"
             if engineMode != "local" && !localActive {
-                status += " node=\(nodeName) ready=\(readyStr) sent=\(state.1) finals=\(state.2) tx=\(state.3) last=\(state.4.isEmpty ? "-" : state.4) drop=\(state.5) reconn=\(state.8)"
+                status += " node=\(nodeName) ready=\(readyStr) sent=\(state.1) finals=\(state.2) tx=\(state.3) last=\(state.4.isEmpty ? "-" : state.4) drop=\(droppedFrames) reconn=\(state.8)"
             } else {
                 status += " finals=\(state.2) tx=\(state.3) last=\(state.4.isEmpty ? "-" : state.4)"
             }
@@ -1049,6 +1051,8 @@ final class SubtitleEngine {
             return
         }
 
+        // 自动档在本机/云端时已在上面 return，故节点 ready 后的缓冲只含真正走节点的音频，
+        // 不会把本机已经处理过的语音再发一次。
         let currentSession = stateQueue.sync { session }
         guard let session = currentSession else {
             // 还没有会话：这些帧白转了，计入丢弃。
@@ -1057,12 +1061,8 @@ final class SubtitleEngine {
         }
 
         for frame in frames {
-            let ready = stateQueue.sync { readyReceived }
-            if ready {
-                session.send(pcm16k: frame)
+            if session.send(pcm16k: frame) == .sent {
                 stateQueue.sync { framesSent += 1 }
-            } else {
-                stateQueue.sync { preReadyDropped += 1 }
             }
         }
     }
@@ -1201,7 +1201,7 @@ final class SubtitleEngine {
 
         guard let delay = plan.0, let config = plan.1 else { return false }
 
-        // 重连前把 readyReceived 置 false（ready 之前的帧照旧丢弃计入 drop）
+        // 重连期间状态行仍显示未 ready；新会话会在自身 15 秒有界缓冲内保住这段音频。
         let markedPending = stateQueue.sync { () -> Bool in
             let matchesSession = sessionToken.map { nodeSessionToken == $0 } ?? true
             guard matchesSession,
