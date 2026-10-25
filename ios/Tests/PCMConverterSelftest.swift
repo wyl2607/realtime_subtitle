@@ -17,6 +17,28 @@ func runPCMConverterSelftest(_ check: (Bool, String) -> Void) {
     let third = converter.append(pcmBuffer: makeFloat32MonoBuffer(sampleCount: 2_400))
     check(third.count == 1, "第二个 0.05 秒应与 pending 合成第 3 帧（实际 \(third.count)）")
     check(third.first?.count == PCMConverter.frameBytes, "合成的第 3 帧应为 3200 字节")
+
+    // 换耳机/蓝牙后 tap 的格式会变，而麦克风路由变化时不再重建字幕引擎（也就不重建转换器），
+    // 同一个转换器必须能直接吃下新格式：0.2 秒 @ 16kHz Int16 双声道 → 2 帧。
+    let afterRouteChange = converter.append(pcmBuffer: makeInt16StereoBuffer(sampleRate: 16_000, frames: 3_200))
+    check(afterRouteChange.count == 2, "格式中途改变后同一转换器应继续出帧（实际 \(afterRouteChange.count)）")
+    check(afterRouteChange.allSatisfy { $0.count == PCMConverter.frameBytes }, "格式改变后每帧仍为 3200 字节")
+}
+
+private func makeInt16StereoBuffer(sampleRate: Double, frames: Int) -> AVAudioPCMBuffer {
+    let format = AVAudioFormat(
+        commonFormat: .pcmFormatInt16,
+        sampleRate: sampleRate,
+        channels: 2,
+        interleaved: true
+    )!
+    let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frames))!
+    buffer.frameLength = AVAudioFrameCount(frames)
+    let samples = buffer.int16ChannelData![0]
+    for index in 0..<(frames * 2) {
+        samples[index] = Int16(index % 97) * 100
+    }
+    return buffer
 }
 
 private func makeFloat32MonoBuffer(sampleCount: Int) -> AVAudioPCMBuffer {

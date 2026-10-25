@@ -131,7 +131,7 @@ final class MicCapture: ObservableObject {
         }
         do {
             try applyAudioSession(MicAudioSessionPlan.forMic(active: true))
-            try startAudioPipeline(restartingSubtitleEngine: false)
+            try startAudioPipeline(startingSubtitleEngine: true)
             publish(.running)
         } catch {
             stopAudioPipeline()
@@ -146,15 +146,11 @@ final class MicCapture: ObservableObject {
         publish(nextState)
     }
 
-    private func startAudioPipeline(restartingSubtitleEngine: Bool) throws {
+    private func startAudioPipeline(startingSubtitleEngine: Bool) throws {
         let inputNode = audioEngine.inputNode
         inputNode.removeTap(onBus: 0)
         audioEngine.stop()
         audioEngine.reset()
-
-        if restartingSubtitleEngine {
-            ingestQueue.sync { self.subtitleEngine.finish() }
-        }
 
         let format = inputNode.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else {
@@ -171,7 +167,9 @@ final class MicCapture: ObservableObject {
         }
 
         // 先装 tap 再启动路由：audioEngine.start() 之后的第一帧不会落在尚未初始化的引擎前面。
-        ingestQueue.sync { subtitleEngine.start() }
+        if startingSubtitleEngine {
+            ingestQueue.sync { subtitleEngine.start() }
+        }
         audioEngine.prepare()
         try audioEngine.start()
     }
@@ -234,9 +232,12 @@ final class MicCapture: ObservableObject {
             return
         }
         do {
-            // 换耳机/蓝牙时 input format 可能已变；必须把 tap 与转换器一起重建，不能沿用旧格式。
+            // 换耳机/蓝牙时 input format 可能已变，tap 必须按新格式重装。
+            // 字幕引擎不重启：PCMConverter 按每个 buffer 的格式换转换器，节点会话和本机识别照常跑。
+            // 以前这里 finish()+start()，每次路由变化都要重新握手节点 / 重新加载本机识别器，
+            // 期间的话全丢（AirPods 自动切换、别的 App 起播都会触发 routeConfigurationChange）。
             try applyAudioSession(MicAudioSessionPlan.forMic(active: true))
-            try startAudioPipeline(restartingSubtitleEngine: true)
+            try startAudioPipeline(startingSubtitleEngine: false)
             publish(.running)
         } catch {
             stop(with: .error(DesignTokens.Text.micError))
