@@ -33,7 +33,7 @@
 __version__ = "3.2.0"
 
 # 这一版的代号/日期，只用于展示（打 tag 时顺手更新）
-__version_date__ = "2026-10-11"
+__version_date__ = "2026-10-25"
 
 
 def version_string():
