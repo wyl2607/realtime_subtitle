@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mode: [debug, release-wmo, release-nowmo]
+        mode: [debug-perfile]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - run: swift --version
@@ -23,17 +23,20 @@ jobs:
         shell: bash
         run: |
           case "${{ matrix.mode }}" in
-            debug)         args=(-c debug) ;;
-            release-wmo)   args=(-c release) ;;
-            release-nowmo) args=(-c release -Xswiftc -no-whole-module-optimization -j 1) ;;
+            # 一个文件一个 frontend（关 batch mode）+ 串行 + 打印每个 SIL pass 跑在哪个函数上：
+            # 卡住时 build.log 最后几行就是死循环的那个函数
+            debug-perfile) args=(-c debug -j 1 -Xswiftc -disable-batch-mode -Xswiftc -Xllvm -Xswiftc -sil-print-pass-name) ;;
           esac
+          set +e
           start=$(date +%s)
           swift build --package-path macos-native --target rslite -v "${args[@]}" > build.log 2>&1 &
           pid=$!
           while kill -0 $pid 2>/dev/null; do
             sleep 20
-            if (( $(date +%s) - start > 900 )); then
-              echo "::error::still building after 15 min — sampling"
+            if (( $(date +%s) - start > 600 )); then
+              echo "::error::still building after 10 min — sampling"
+              grep -n "closure-lifetime-fixup" build.log | tail -5 | cut -c1-400
+              tail -c 3000 build.log
               pgrep -lf swift-frontend | cut -c1-400 || true
               for p in $(pgrep swift-frontend); do
                 # 主文件（-primary-file）告诉我们卡在哪个源文件；sample 栈告诉我们卡在哪个编译阶段
@@ -44,7 +47,6 @@ jobs:
               done
               pkill -9 swift-frontend || true
               kill $pid 2>/dev/null || true
-              tail -40 build.log | cut -c1-400
               exit 1
             fi
           done
