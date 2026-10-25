@@ -1,207 +1,55 @@
 name: CI
 
+# 临时诊断分支（不合并）：#80 在 Swift 6.3.3 上 release 编译 rslite 时 swift-frontend
+# 卡死 6 小时。本地只有 Swift 6.4 复现不了，这里在 CI 上定位卡在哪个阶段/哪个文件。
 on:
-  push:
-    branches: [master, main]
   pull_request:
 
-# 默认的 GITHUB_TOKEN 权限跟着仓库设置走，可能是可写的。这两个 job 只需要
-# 读代码，显式收到最小权限（供应链硬化的标准做法，不改变任何现有行为）
 permissions:
   contents: read
 
-# Coverage map (see issue #23):
-# - lint:          ruff（E9 + F，规则集为什么这么窄见 pyproject.toml）
-# - deps-resolve:  requirements.txt 在 3.10–3.13 上都解得出来（见第 4 节第 30 条）
-# - ubuntu:        pure pipeline helpers (no torch/PyQt/WASAPI)
-# - windows:       full pytest suite except standalone GUI harness scripts
-#   (those open real windows and sys.exit; still manual / optional)
-# - rslite-macos:  Swift 客户端编译 + 自检 + 设计令牌生成物同步（spec 006 E1）
-# - ios:           iOS 自测入口 + xcodegen 模拟器构建 + 扩展 plist 校验 + 跨端夹具/令牌一致性（spec 010）
-
 jobs:
-  # 静态检查单独一个 job：十几秒出结果，不用等 windows 那边装完 torch 才知道
-  # 有没有把某个名字打错。它盯的是 CLAUDE.md 第 4 节第 26/28 条那一类
-  # "挪模块时的漏改"——那次包化重构漏了 30 多处函数体里的延迟 import，
-  # master 的 CI 连红 6 次，而 F821/F811/F401 本来能在 PR 阶段就拦下来。
-  #
-  # ☠️ 用 pip 装而不是用第三方 action：本 workflow 的 action 全部按 commit SHA
-  # 钉死（供应链硬化），引入一个新 action 就是多一个信任根；ruff 是单文件
-  # 二进制、pip 装一秒装完，按精确版本钉住即可。**版本必须写死**——ruff 每个
-  # 小版本都可能给已有规则加新检查，浮动版本会让 CI 在没人改代码的日子变红。
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
-        with:
-          python-version: "3.12"
-      - name: Install ruff
-        run: pip install ruff==0.17.1
-      - name: ruff check
-        # --output-format github 让告警直接标在 PR 的对应行上
-        run: ruff check --output-format github .
-
-  # requirements.txt 必须在**所有声明支持的 Python** 上解得出来。
-  #
-  # ☠️ 这个 job 是 2026-08-12 那次 numpy 事故的直接产物（第 4 节第 30 条）：
-  # requirements.txt 当时写着 numpy>=2.5.1，而 numpy 2.5 起 requires_python>=3.12、
-  # 没有 cp310 轮子——3.10/3.11 的用户走到"装依赖"那步直接失败。而 CI 全绿。
-  # 原因是另外两个 job 装的都是自己写死的 "numpy>=1.24,<3" 之类，**从来没有
-  # 任何一个 job 装过 requirements.txt 本身**。dependabot 每周都会提抬下限的
-  # PR，没有这道守卫它随时会再来一次。
-  #
-  # --dry-run 只拉 metadata、不下载 wheel（整个 job 十几秒）。用一个 3.13 的
-  # 解释器 + --python-version 逐个目标解析，不用开四份 setup-python。
-  #
-  # ☠️ 必须跑在 windows runner 上，不能用 ubuntu + `--platform win_amd64`。
-  # 第一版就是那么写的，结果 3.13 假失败：
-  #     ERROR: Could not find a version that satisfies the requirement
-  #            nvidia-nccl-cu13==2.29.7; platform_system == "Linux" (from torch)
-  # 因为 `--platform` **只改 wheel 标签匹配，不改环境标记求值**——
-  # `platform_system` 仍按运行中的解释器算。在 ubuntu 上它是 "Linux"，于是
-  # torch 那条 Linux 专属依赖被激活，再被 --only-binary + win_amd64 卡死。
-  # 本项目只支持 Windows（pyaudiowpatch 连 linux 轮子都没有），在目标平台上
-  # 解析本来就是更诚实的测法。
-  deps-resolve:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
-        with:
-          python-version: "3.13"
-      - name: Resolve requirements.txt for every supported Python
-        shell: bash
-        run: |
-          python -m pip install --upgrade pip
-          failed=0
-          for v in 3.10 3.11 3.12 3.13; do
-            echo "::group::python $v"
-            if pip install --dry-run --ignore-installed \
-                 --python-version "$v" --only-binary=:all: \
-                 --target "/tmp/resolve-$v" -r requirements.txt; then
-              echo "OK   python $v"
-            else
-              echo "::error::requirements.txt 在 Python $v 上解析失败（README/CLAUDE.md 声称支持 3.10-3.13）"
-              failed=1
-            fi
-            echo "::endgroup::"
-          done
-          exit $failed
-
-  pipeline-helpers-ubuntu:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
-        with:
-          python-version: "3.12"
-      - name: Install minimal test deps
-        run: |
-          python -m pip install --upgrade pip
-          # translator_queue lazy-loads torch/faster-whisper on construct
-          # opencc：中文目标译文繁转简的出口测试要它（纯 Python，与 requirements.txt 同范围）
-          pip install "numpy>=1.24,<3" "requests>=2.28,<3" "soxr>=0.5,<2" "opencc-python-reimplemented>=0.1.7,<1.0.0" -r requirements-dev.txt
-      - name: Run pure pipeline unit tests
-        # test_runtime_paths 必须在这里跑（不只 windows）：它盯的是运行时文件
-        # 有没有掉出仓库根，纯 pathlib + 静态扫描，不需要 Qt/torch/WASAPI
-        run: python -m pytest tests/test_pipeline_helpers.py tests/test_runtime_paths.py tests/test_migrate_legacy.py -q
-
-  pytest-windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
-        with:
-          python-version: "3.12"
-      - name: Install Windows unit-test deps
-        shell: bash
-        run: |
-          python -m pip install --upgrade pip
-          # CPU torch is enough: tests only need import-before-Qt ordering
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install "PyQt6>=6.6,<7" "numpy>=1.24,<3" "requests>=2.28,<3" "soxr>=0.5,<2" "PyAudioWPatch>=0.2.12" "websockets>=14.0,<18.0" "opencc-python-reimplemented>=0.1.7,<1.0.0" -r requirements-dev.txt
-      - name: Run pytest suite (skip standalone GUI harness scripts)
-        shell: bash
-        run: |
-          # pyproject.toml already ignores test_hittest / resize_freedom / wordclick
-          # Prefer non-interactive Qt
-          export QT_QPA_PLATFORM=offscreen
-          python -m pytest tests -q --tb=line
-
-  # rslite（Swift 客户端，spec 006 E1）：编译 + --selftest + 设计令牌生成物同步。
-  #
-  # 选 macos-26 而不是 macos-latest：Package.swift 声明 platforms macOS 26，
-  # rslite 依赖 macOS 26 的系统 API（SpeechTranscriber / Process Tap 等），
-  # 必须落在带对应 SDK 的镜像上；macos-latest 现在指向哪个大版本会随 GitHub
-  # 调整而漂移，写死 macos-26 才能让"编译不过"是真实信号而不是镜像换代。
-  # 若将来该标签不存在，回退 macos-latest，并保留这条注释说明本意。
-  #
-  # ☠️ 这里曾挂着 continue-on-error，注释归因于「runner 缺 macOS 27 SDK」——
-  # 那是误诊：真实报错全是 Swift 6.3（Xcode 26）比本地 Swift 6.4 严格的编译
-  # 差异（main.swift 里放 @main、私有 memberwise init、可选元组解构推断、
-  # 闭包元组 != 歧义），@available(macOS 27.0, *) 的代码在 26 SDK 上照样能编。
-  # 修完后不再容忍失败：这里红就是真回归，本地用新工具链编过不代表 CI 能过。
-  rslite-macos:
+  probe:
     runs-on: macos-26
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [debug, release-wmo, release-nowmo]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-      - name: Swift version
-        run: swift --version
-      # 缓存 SwiftPM 构建产物。key 里带上 Package.resolved（仓库当前没有依赖，
-      # hashFiles 取不到时返回空串、不会报错）和 Sources 的哈希——源码一改就换
-      # key，避免用旧编译结果糊弄出一份假的绿。
-      - uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57  # v4.2.0
-        with:
-          path: macos-native/.build
-          key: ${{ runner.os }}-swiftpm-${{ hashFiles('macos-native/Package.resolved', 'macos-native/Sources/**/*.swift') }}
-          restore-keys: |
-            ${{ runner.os }}-swiftpm-
-      - name: swift build (release)
-        run: swift build -c release --package-path macos-native
-      - name: rslite selftest
+      - run: swift --version
+      - name: build with watchdog
         shell: bash
         run: |
-          out="$(macos-native/.build/release/rslite --selftest)"
-          printf '%s\n' "$out"
-          case "$out" in
-            *"SELFTEST OK"*) echo "rslite selftest: OK" ;;
-            *) echo "::error::rslite --selftest 未输出 SELFTEST OK"; exit 1 ;;
+          case "${{ matrix.mode }}" in
+            debug)         args=(-c debug) ;;
+            release-wmo)   args=(-c release) ;;
+            release-nowmo) args=(-c release -Xswiftc -no-whole-module-optimization -j 1) ;;
           esac
-      - name: Check design tokens are up to date
-        run: python3 scripts/design/gen_tokens.py --check
-
-  # iOS（spec 010）：四个纯逻辑自测入口 + xcodegen 模拟器构建 + 扩展 plist 键
-  # 校验 + 跨端夹具/设计令牌副本一致性。覆盖的是"能编译、自测过、两端副本没漂"
-  # 这三件不依赖真机/签名的检查。
-  #
-  # ☠️ 不加 continue-on-error（与上面的 rslite-macos 不同）：iOS 代码只用到
-  # iOS 26 API（@available(iOS 26.0, *)），macos-26 runner 自带的 Xcode 26
-  # 就能编过；这里的红是真回归，容忍失败会把信号废掉。
-  #
-  # ☠️ 用 brew 装 xcodegen 而不是第三方 action：本 workflow 的 action 全部按
-  # commit SHA 钉死，引入新 action 就是多一个信任根；xcodegen 只是一次 CLI
-  # 安装，brew 在 macOS runner 上本来就有。
-  ios:
-    runs-on: macos-26
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-      - name: Xcode version
-        run: xcodebuild -version
-      - name: Install xcodegen
-        run: brew install xcodegen
-      - name: iOS selftests
-        run: bash ios/Tests/run-selftest.sh
-      - name: Build for simulator and check extension plist
-        run: bash ios/Tests/build-check.sh
-      # build-check.sh 把 xcodebuild 输出吞进 grep -q，挂了只看得到退出码；
-      # 失败时重新生成并构建一次，把编译错误原样打到日志里。
-      - name: Show simulator build errors
-        if: failure()
-        working-directory: ios
-        run: |
-          xcodegen generate -q
-          xcodebuild -project RSiOS.xcodeproj -scheme RSiOS -sdk iphonesimulator -configuration Debug -derivedDataPath build CODE_SIGNING_ALLOWED=NO -quiet build
-      - name: Check cross-platform fixtures and tokens
-        run: python3 scripts/design/check_parity.py
+          start=$(date +%s)
+          swift build --package-path macos-native --target rslite -v "${args[@]}" > build.log 2>&1 &
+          pid=$!
+          while kill -0 $pid 2>/dev/null; do
+            sleep 20
+            if (( $(date +%s) - start > 900 )); then
+              echo "::error::still building after 15 min — sampling"
+              pgrep -lf swift-frontend | cut -c1-400 || true
+              for p in $(pgrep swift-frontend); do
+                # 主文件（-primary-file）告诉我们卡在哪个源文件；sample 栈告诉我们卡在哪个编译阶段
+                ps -o args= -p $p | tr ' ' '\n' | grep -A1 -- '-primary-file' || true
+                sample $p 5 -file sample-$p.txt >/dev/null 2>&1 || true
+                sed -n '/Call graph:/,/Total number in stack/p' sample-$p.txt | grep -E 'swift::|llvm::' | head -150 | cut -c1-260
+                sed -n '/Sort by top of stack/,$p' sample-$p.txt | head -30 | cut -c1-260
+              done
+              pkill -9 swift-frontend || true
+              kill $pid 2>/dev/null || true
+              tail -40 build.log | cut -c1-400
+              exit 1
+            fi
+          done
+          wait $pid; rc=$?
+          echo "elapsed $(( $(date +%s) - start ))s rc=$rc"
+          grep -E 'error:' build.log | head -40 || true
+          tail -5 build.log | cut -c1-400
+          exit $rc
