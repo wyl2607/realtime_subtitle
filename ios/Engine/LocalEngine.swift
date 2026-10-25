@@ -33,8 +33,12 @@ final class LocalEngine {
     private var resultTask: Task<Void, Never>?
     /// 识别不能等翻译模型准备好；结果到达时再等这个任务，首句既不丢译文也不挡原文。
     private var translationReady: Task<TranslationSession?, Never>?
-    /// 最近一句的翻译任务；下一句接在它后面，只在结果循环里读写。
+    /// 最近一句的翻译任务；下一句接在它后面。
     private var translationTail: Task<Void, Never>?
+    /// 守 translationReady / translationTail 和 stop() 对 stopped 的写入。
+    /// 本类没有任何隔离：stop() 跑在调用方线程，启动和结果循环跑在全局执行器上，
+    /// 不加锁时两边会同时读写同一个 Task 引用。
+    private let taskLock = NSLock()
     private var nextID = 1
     private var isRunning = false
     /// stop() 之后一律不再回调。
@@ -185,7 +189,7 @@ final class LocalEngine {
         if txStatus == .installed {
             // 翻译模型首次准备可能很久，独立执行才能让识别任务立即消费已到的音频。
             // 放在识别器预热和结果任务之前创建：两边的准备并行，最早的结果也一定看得到这个任务。
-            translationReady = Task { [weak self] in
+            let ready = Task { [weak self] () -> TranslationSession? in
                 guard let self, !self.stopped else { return nil }
                 let session = TranslationSession(installedSource: self.sourceLocale, target: self.targetLocale)
                 do {
@@ -200,6 +204,13 @@ final class LocalEngine {
                     return nil
                 }
             }
+            // 和 stop() 在同一把锁里核对 stopped：否则 stop() 刚清完，这里又挂上一个没人取消的任务。
+            let kept = taskLock.withLock { () -> Bool in
+                guard !stopped else { return false }
+                translationReady = ready
+                return true
+            }
+            if !kept { ready.cancel() }
         }
 
         do {
@@ -323,11 +334,16 @@ final class LocalEngine {
     func stop() {
         // 必须在 isRunning 那道 guard 之前置真：启动中途被停时 isRunning 还是 false，
         // 这时候更要挡住启动期回调。
-        stopped = true
-        translationReady?.cancel()
-        translationReady = nil
-        translationTail?.cancel()
-        translationTail = nil
+        let tasks = taskLock.withLock { () -> (Task<TranslationSession?, Never>?, Task<Void, Never>?) in
+            stopped = true
+            defer {
+                translationReady = nil
+                translationTail = nil
+            }
+            return (translationReady, translationTail)
+        }
+        tasks.0?.cancel()
+        tasks.1?.cancel()
         guard isRunning else { return }
         isRunning = false
         inputContinuation?.finish()
@@ -357,16 +373,20 @@ final class LocalEngine {
 
         // 翻译挂到串行尾链上，不在结果循环里等：否则翻译还在准备（或上一句还在翻）时，
         // 下一句的原文也得排队等着才能上屏。串行是为了译文和收尾仍按句子顺序到达。
-        let previous = translationTail
-        translationTail = Task { [weak self] in
-            await previous?.value
-            await self?.translateAndSettle(id: id, text: text)
+        taskLock.withLock {
+            guard !stopped else { return }
+            let previous = translationTail
+            translationTail = Task { [weak self] in
+                await previous?.value
+                await self?.translateAndSettle(id: id, text: text)
+            }
         }
     }
 
     private func translateAndSettle(id: Int, text: String) async {
         guard !stopped else { return }
-        if let session = await translationReady?.value {
+        let ready = taskLock.withLock { translationReady }
+        if let session = await ready?.value {
             do {
                 let response = try await session.translate(text)
                 guard !stopped else { return }
@@ -401,8 +421,10 @@ final class LocalEngine {
         await resultTask?.value
         resultTask = nil
         // 最后一句的译文也要等它落地，finish 才能放掉会话。
-        await translationTail?.value
-        translationTail = nil
+        // 结果流已经结束，不会再有新句子接到尾链上：这里拿到的就是最后一句。
+        let tail = taskLock.withLock { translationTail }
+        await tail?.value
+        taskLock.withLock { translationTail = nil }
     }
 
     private func finish() async {
