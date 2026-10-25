@@ -1806,8 +1806,8 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             self._held_since = 0.0
         return timed
 
-    def _release_held_boundary(self):
-        """扣留的句尾到点放行。
+    def _release_held_boundary(self, force=False):
+        """扣留的句尾到点，或已看见下一个候选词时放行。
 
         ☠️ 只动文字，绝不碰 processor.finish()——那会清掉正在用的音频缓冲，
         而这时候用户很可能只是句子中间换了口气，音频还要接着识别。
@@ -1815,7 +1815,8 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         held = self._held_since
         if not held:
             return
-        if time.time() - held < getattr(config, "SENTENCE_HOLD_SEC", 0.6):
+        if (not force
+                and time.time() - held < getattr(config, "SENTENCE_HOLD_SEC", 0.6)):
             return
         sentences = self._extract_sentences(final=True)
         if sentences:
@@ -2112,6 +2113,16 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
 
         self._append_committed(committed)
         self._enqueue_sentences(self._extract_sentences())
+
+        if self._held_since:
+            word = unstable.lstrip().split(maxsplit=1)
+            if not word:
+                self._release_held_boundary()
+            elif not word[0][0].islower():
+                # MLX 一轮识别常比 0.5 秒分块久，持续环境声会让收件箱一直非空，
+                # flush_pending 排不上；而下一词通常已在 unstable 里，没必要再等
+                # 下一轮 local agreement。小写仍须扣住，否则会废掉③a 的续行否决。
+                self._release_held_boundary(force=True)
 
         # 聊天/嘈杂语音下Whisper经常整段不打标点，残句永远凑不成句 →
         # 超长就不等标点直接翻（实测聊天时德语堆在live行、中文迟迟不出）。
