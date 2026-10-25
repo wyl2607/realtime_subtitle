@@ -133,6 +133,7 @@ final class Pipeline: @unchecked Sendable {
             try await ensureSpeechAssets(transcriber: transcriber)
             didCheckAssets = true
         }
+        translator.warmUpIfIdle()
 
         let stream = fanout.subscribe()
         callbacks.onFanoutReady(fanout)
@@ -239,6 +240,7 @@ final class Pipeline: @unchecked Sendable {
             commit(sentences, text: text, spans: spans)
             callbacks.onVolatile("")
         } else {
+            translator.warmUpIfIdle()
             let (sentences, remainder) = committer.volatile(text)
             commit(sentences, text: text, spans: spans)
             callbacks.onVolatile(remainder)
@@ -391,6 +393,153 @@ final class Pipeline: @unchecked Sendable {
         await manualQueue.waitUntilIdle()
         check(manualProbe.translation(id: 11) == "手动:Text", "手动重试成功走 onTranslation")
         check(manualQueue.retryTranslation(id: 11) == false, "成功后该 id 从失败缓冲移除")
+
+        final class WarmProbe: @unchecked Sendable {
+            private let lock = NSLock()
+            private var attempts: [String] = []
+            private var translations = 0
+            private var failures = 0
+            private var statuses = 0
+
+            func attempt(_ text: String) { lock.withLockVoid { attempts.append(text) } }
+            func translation() { lock.withLockVoid { translations += 1 } }
+            func failure() { lock.withLockVoid { failures += 1 } }
+            func status() { lock.withLockVoid { statuses += 1 } }
+            func attemptedTexts() -> [String] { lock.withLockValue { attempts } }
+            func callbackCounts() -> (translations: Int, failures: Int, statuses: Int) {
+                lock.withLockValue { (translations, failures, statuses) }
+            }
+        }
+
+        final class TestClock: @unchecked Sendable {
+            private let lock = NSLock()
+            private var value: UInt64 = 0
+
+            func now() -> UInt64 { lock.withLockValue { value } }
+            func advance(seconds: UInt64) {
+                lock.withLockVoid { value += seconds * 1_000_000_000 }
+            }
+        }
+
+        final class AsyncGate: @unchecked Sendable {
+            private let lock = NSLock()
+            private var isOpen = false
+            private var waiter: CheckedContinuation<Void, Never>?
+
+            func wait() async {
+                await withCheckedContinuation { continuation in
+                    let resumeNow = lock.withLockValue {
+                        if isOpen { return true }
+                        waiter = continuation
+                        return false
+                    }
+                    if resumeNow { continuation.resume() }
+                }
+            }
+
+            func open() {
+                let continuation = lock.withLockValue {
+                    isOpen = true
+                    defer { waiter = nil }
+                    return waiter
+                }
+                continuation?.resume()
+            }
+        }
+
+        // 预热只为让 translationd 在定稿前装入模型，不能污染任何正式句回调。
+        let warmClock = TestClock()
+        let warmProbe = WarmProbe()
+        let warmQueue = TranslationQueue(
+            sourceID: "de-DE",
+            targetID: "zh-Hans",
+            onStatus: { _ in warmProbe.status() },
+            onTranslation: { _, _ in warmProbe.translation() },
+            onTranslationFailed: { _, _ in warmProbe.failure() },
+            attempt: { text in
+                warmProbe.attempt(text)
+                return "预热:\(text)"
+            },
+            sleep: { _ in },
+            clock: { warmClock.now() }
+        )
+        warmQueue.warmUpIfIdle()
+        await warmQueue.waitUntilIdle()
+        check(warmProbe.attemptedTexts() == ["Hallo."], "从未翻译时应排入一次预热")
+        let warmCallbacks = warmProbe.callbackCounts()
+        check(warmCallbacks.translations == 0 && warmCallbacks.failures == 0 && warmCallbacks.statuses == 0,
+              "预热成功不得触发正式回调或状态行")
+        warmQueue.warmUpIfIdle()
+        await warmQueue.waitUntilIdle()
+        check(warmProbe.attemptedTexts().count == 1, "预热刚完成时不应重复预热")
+        warmClock.advance(seconds: 61)
+        warmQueue.warmUpIfIdle()
+        await warmQueue.waitUntilIdle()
+        check(warmProbe.attemptedTexts().count == 2, "闲置超过 60 秒后应再次预热")
+
+        let warmErrorProbe = WarmProbe()
+        let warmErrorQueue = TranslationQueue(
+            sourceID: "de-DE",
+            targetID: "zh-Hans",
+            onStatus: { _ in warmErrorProbe.status() },
+            onTranslation: { _, _ in warmErrorProbe.translation() },
+            onTranslationFailed: { _, _ in warmErrorProbe.failure() },
+            attempt: { text in
+                warmErrorProbe.attempt(text)
+                throw PipelineError.unsupported("语言包未安装")
+            },
+            sleep: { _ in },
+            clock: { 0 }
+        )
+        warmErrorQueue.warmUpIfIdle()
+        await warmErrorQueue.waitUntilIdle()
+        let warmErrorCallbacks = warmErrorProbe.callbackCounts()
+        check(warmErrorProbe.attemptedTexts() == ["Hallo."], "预热错误仍只尝试一次")
+        check(warmErrorCallbacks.translations == 0 && warmErrorCallbacks.failures == 0 && warmErrorCallbacks.statuses == 0,
+              "预热错误必须静默")
+
+        let pendingGate = AsyncGate()
+        let pendingProbe = WarmProbe()
+        let pendingQueue = TranslationQueue(
+            sourceID: "de-DE",
+            targetID: "zh-Hans",
+            onStatus: { _ in pendingProbe.status() },
+            onTranslation: { _, _ in pendingProbe.translation() },
+            onTranslationFailed: { _, _ in pendingProbe.failure() },
+            attempt: { text in
+                pendingProbe.attempt(text)
+                await pendingGate.wait()
+                return "正式:\(text)"
+            },
+            sleep: { _ in },
+            clock: { 0 }
+        )
+        pendingQueue.enqueue(id: 13, text: "formal")
+        pendingQueue.warmUpIfIdle()
+        pendingGate.open()
+        await pendingQueue.waitUntilIdle()
+        check(pendingProbe.attemptedTexts() == ["formal"], "有 pending 时不得排入预热")
+
+        let formalClock = TestClock()
+        let formalProbe = WarmProbe()
+        let formalQueue = TranslationQueue(
+            sourceID: "de-DE",
+            targetID: "zh-Hans",
+            onStatus: { _ in formalProbe.status() },
+            onTranslation: { _, _ in formalProbe.translation() },
+            onTranslationFailed: { _, _ in formalProbe.failure() },
+            attempt: { text in
+                formalProbe.attempt(text)
+                return "正式:\(text)"
+            },
+            sleep: { _ in },
+            clock: { formalClock.now() }
+        )
+        formalQueue.enqueue(id: 14, text: "formal")
+        await formalQueue.waitUntilIdle()
+        formalQueue.warmUpIfIdle()
+        await formalQueue.waitUntilIdle()
+        check(formalProbe.attemptedTexts() == ["formal"], "正式翻译完成后 60 秒内不得预热")
 
         return failures
     }
@@ -609,6 +758,8 @@ final class TranslationQueue: @unchecked Sendable {
     /// onTranslationFailed 的原因码，与 spec 003 P2 约定一致。
     static let reasonError = "error"
     static let reasonUnavailable = "unavailable"
+    private static let warmIdleSeconds: UInt64 = 60
+    private static let warmIdleNanoseconds = warmIdleSeconds * 1_000_000_000
 
     private let source: Locale.Language
     private let target: Locale.Language
@@ -620,12 +771,14 @@ final class TranslationQueue: @unchecked Sendable {
     private let overrideAttempt: (@Sendable (String) async throws -> String)?
     private let retryDelay: Duration
     private let sleep: @Sendable (Duration) async -> Void
+    private let clock: @Sendable () -> UInt64
     private let failures = FailedSentenceStore()
 
     private var sessions: [String: TranslationSession] = [:]
     private let queue = DispatchQueue(label: "rslite.translation.queue")
     private var chain = Task<Void, Never> {}
     private var pending = 0
+    private var lastCompletion: UInt64?
     private var idleWaiters: [CheckedContinuation<Void, Never>] = []
     private var cancelled = false
     /// 只在串行 chain 里读写；翻译失败对状态行只说一次，失败句结局一律走 onTranslationFailed。
@@ -639,7 +792,8 @@ final class TranslationQueue: @unchecked Sendable {
         onTranslationFailed: @escaping @Sendable (Int, String) -> Void = { _, _ in },
         attempt: (@Sendable (String) async throws -> String)? = nil,
         retryDelay: Duration = .seconds(1),
-        sleep: (@Sendable (Duration) async -> Void)? = nil
+        sleep: (@Sendable (Duration) async -> Void)? = nil,
+        clock: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
     ) {
         source = Locale.Language(identifier: sourceID)
         target = Locale.Language(identifier: targetID)
@@ -650,6 +804,7 @@ final class TranslationQueue: @unchecked Sendable {
         overrideAttempt = attempt
         self.retryDelay = retryDelay
         self.sleep = sleep ?? { try? await Task.sleep(for: $0) }
+        self.clock = clock
     }
 
     func enqueue(id: Int, text: String) {
@@ -659,6 +814,18 @@ final class TranslationQueue: @unchecked Sendable {
             }
             scheduleLocked { [weak self] in
                 await self?.translateOne(id: id, text: text)
+            }
+        }
+    }
+
+    /// 只在闲置时排入串行队列，避免定稿翻译与预热争用同一条链。
+    func warmUpIfIdle() {
+        queue.sync {
+            guard !cancelled, pending == 0, shouldWarmUpLocked() else {
+                return
+            }
+            scheduleLocked { [weak self] in
+                await self?.warmUp()
             }
         }
     }
@@ -722,6 +889,11 @@ final class TranslationQueue: @unchecked Sendable {
             failures.record(id: id, text: text)
             onTranslationFailed(id, reason)
         }
+    }
+
+    /// 预热失败不代表正式句失败；正式翻译仍沿用原有错误处理。
+    private func warmUp() async {
+        _ = try? await perform("Hallo.")
     }
 
     /// 生产走 Apple 翻译；selftest 注入 overrideAttempt 时只做纯编排。
@@ -810,9 +982,17 @@ final class TranslationQueue: @unchecked Sendable {
 
     private func completeOne() {
         queue.sync {
+            lastCompletion = clock()
             pending -= 1
         }
         resumeIdleIfNeeded()
+    }
+
+    private func shouldWarmUpLocked() -> Bool {
+        guard let lastCompletion else {
+            return true
+        }
+        return clock() - lastCompletion > Self.warmIdleNanoseconds
     }
 
     private func resumeIdleIfNeeded(force: Bool = false) {
