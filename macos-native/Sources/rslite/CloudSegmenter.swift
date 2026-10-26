@@ -733,7 +733,12 @@ final class CloudUploadController: @unchecked Sendable {
             quotaHeaders["x-ratelimit-reset-requests"] = "\(resetSeconds)s"
         }
         if !quotaHeaders.isEmpty {
-            try? ledger.correctRemainingRequests(quotaHeaders, at: now)
+            try? ledger.note(
+                quotaHeaders,
+                at: now,
+                keyFingerprint: result.keyFingerprint,
+                sentAt: result.sentAt
+            )
         }
         context.apply(RouteEvent(type: "segment_success", status: nil, retryAfter: nil, usagePercent: nil))
         clearCooldownIfResumed()
@@ -762,7 +767,12 @@ final class CloudUploadController: @unchecked Sendable {
                 quotaHeaders["x-ratelimit-reset-requests"] = "\(resetSeconds)s"
             }
             if !quotaHeaders.isEmpty {
-                try? ledger.correctRemainingRequests(quotaHeaders, at: now)
+                try? ledger.note(
+                    quotaHeaders,
+                    at: now,
+                    keyFingerprint: quota?.keyFingerprint,
+                    sentAt: quota?.sentAt
+                )
             }
             context.apply(RouteEvent(type: "http_status", status: status, retryAfter: retryAfter, usagePercent: nil))
             noteCooldown(now)
