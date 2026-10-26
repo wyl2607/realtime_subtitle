@@ -556,3 +556,77 @@ def test_quota_publishes_routing_events_and_does_not_own_cloud_state():
     assert "quota_update" in source
     assert "cooldown_quota" not in source
     assert "RoutingState" in source
+
+
+def test_remaining_requests_out_of_bounds_does_not_correct_or_create_reset_record(tmp_path):
+    """F1: remaining_requests must be 0..LIMIT_REQUESTS_PER_DAY; 2001 and -1 are rejected."""
+    ledger, state = _ledger(tmp_path, now=100, name="f1.json")
+    # 先建立一个基线
+    ledger.note(10, now=100, remaining_requests=1000)
+    assert ledger.usage(now=100).day_requests == 1000
+
+    # 2001 (超过上限) — 不校正 server_day_used，不建立 reset_record
+    # 新请求仍计入本地计数，但因 valid_remaining=False，in_server_day 不被置 True
+    # day_requests = server_floor(1000) + 1 个新本地请求 = 1001
+    usage = ledger.note(10, now=101, remaining_requests=2001, reset_requests_s=50, key_fp="key-a", sent_at=101)
+    assert usage.day_requests == 1001  # server_floor 1000 + 1 个新本地请求
+    saved = json.loads((tmp_path / "f1.json").read_text(encoding="utf-8"))
+    assert saved["reset_record"] is None
+    assert saved["server_day_used"] == 1000  # server floor 未变
+    # usage_percent = 1001/2000*100 = 50% < 90，所以状态是 available
+    assert state.cloud_state == "available"
+
+    # -1 (负数) — 同上
+    usage = ledger.note(10, now=102, remaining_requests=-1, reset_requests_s=50, key_fp="key-a", sent_at=102)
+    assert usage.day_requests == 1002  # server_floor 1000 + 2 个新本地请求
+    saved = json.loads((tmp_path / "f1.json").read_text(encoding="utf-8"))
+    assert saved["reset_record"] is None
+    assert saved["server_day_used"] == 1000
+
+    # 合法边界 0 和 2000 仍能工作
+    usage = ledger.note(10, now=103, remaining_requests=0, reset_requests_s=50, key_fp="key-a", sent_at=103)
+    assert usage.day_requests == 2000
+    # 60s 宽限期后，remaining=2000 才能把 floor 降到 0
+    usage = ledger.note(10, now=164, remaining_requests=2000, reset_requests_s=50, key_fp="key-a", sent_at=164)
+    assert usage.day_requests == 0  # 2000-2000=0，宽限期过后 floor 可降
+
+
+def test_key_change_before_late_old_cycle_allows_new_reset_record(tmp_path):
+    """F2: key_fp check must run before late_old_cycle judgment.
+    Scenario: old key record has passed reset_at; new key response has both headers
+    and sent_at=None. Before fix, late_old_cycle would be True (using old record)
+    and new reset_record would not be created. After fix, key change drops old
+    record first, so late_old_cycle becomes False and new record is established.
+    Note: server floor lowering is still guarded by 60s grace period (SERVER_DECREASE_GRACE_S),
+    so day_requests stays at old floor until grace period passes or old floor expires.
+    """
+    mono = [0.0]
+    ledger, _state = _ledger(tmp_path, now=100, monotonic=lambda: mono[0])
+    # 建立旧 key 的恢复记录，reset_at = 110
+    ledger.note(10, now=100, remaining_requests=5, reset_requests_s=10, key_fp="key-old", sent_at=100)
+    saved = json.loads((tmp_path / "quota.json").read_text(encoding="utf-8"))
+    assert saved["reset_record"]["key_fp"] == "key-old"
+    assert saved["reset_record"]["reset_at"] == 110.0
+    # 此时 server_day_used = 1995 (2000-5)
+
+    # 时间推到 reset_at 之后 (115)，旧 key 的记录已过期
+    # 新 key 发来带两个头的响应，sent_at=None (不知道何时发出)
+    # 修复前：late_old_cycle 用旧 record 判为 True，新记录不建立
+    # 修复后：先按 key_fp 丢掉旧 record，late_old_cycle 变 False，新记录建立
+    mono[0] = 15.0
+    usage = ledger.note(
+        10, now=115, remaining_requests=1999, reset_requests_s=100, key_fp="key-new", sent_at=None
+    )
+    # 新 reset_record 应建立（关键修复点）
+    saved = json.loads((tmp_path / "quota.json").read_text(encoding="utf-8"))
+    assert saved["reset_record"] is not None
+    assert saved["reset_record"]["key_fp"] == "key-new"
+    assert saved["reset_record"]["reset_at"] == 215.0  # 115 + 100
+    assert saved["reset_record"]["consumed"] is False
+    # 但 server floor 降低仍受 60s 宽限期保护 (115-100=15 < 60)，仍为 1995
+    # 由于 valid_remaining=True，所有事件 in_server_day 被置 True，extra=0
+    # day_requests = server_floor(1995) + 0 = 1995
+    assert usage.day_requests == 1995
+    # 宽限期过后 (>=160)，再次 note() 触发 floor 降到新 remaining 对应的 1
+    usage2 = ledger.note(10, now=161, remaining_requests=1999, key_fp="key-new", sent_at=161)
+    assert usage2.day_requests == 1  # 此时 server_day_used 已更新为 1

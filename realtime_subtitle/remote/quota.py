@@ -128,21 +128,29 @@ class QuotaLedger:
             ts = self._clock(now)
             self._events.append(_Event(ts, billed, False))
             record = self._reset_record
+            if record is not None and key_fp != record.key_fp:
+                # 换 key 不能继承旧 key 的恢复承诺，但高水位继续 fail-closed。
+                # 必须在 late_old_cycle 判定之前，否则旧 key 过期 + 新 key 同时带两头且 sent_at=None
+                # 会被误判为 late_old_cycle 而丢掉新周期的恢复记录。
+                self._reset_record = None
+                record = None
             late_old_cycle = bool(
                 record is not None
                 and ts >= record.reset_at
                 and (sent_at is None or float(sent_at) < record.reset_at)
             )
-            if record is not None and key_fp != record.key_fp:
-                # 换 key 不能继承旧 key 的恢复承诺，但高水位继续 fail-closed。
-                self._reset_record = None
             # 先消耗已可信的旧周期；当前周期的剩余头随后可建立新的日下限。
             reset_confirmed = self._advance_reset(ts)
             valid_reset = (
                 reset_requests_s is not None
                 and float(reset_requests_s) <= MAX_RESET_REQUESTS_S
             )
-            valid_remaining = remaining_requests is not None and remaining_requests >= 0
+            valid_remaining = (
+                remaining_requests is not None
+                and isinstance(remaining_requests, int)
+                and not isinstance(remaining_requests, bool)
+                and 0 <= remaining_requests <= LIMIT_REQUESTS_PER_DAY
+            )
             if not late_old_cycle and valid_remaining:
                 # 响应头是这一次请求之后的每日剩余。只动 24h 请求窗口。
                 used = LIMIT_REQUESTS_PER_DAY - remaining_requests
