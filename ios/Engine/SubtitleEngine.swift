@@ -623,12 +623,12 @@ final class SubtitleEngine {
         // 额度记账：每请求按 max(10, 时长) 计费（规则在 QuotaLedger 里）。
         _ = try? ledger.recordRequest(duration: segment.duration)
         // 额度事件喂给路由状态机（90% 进冷却、80% 以下才恢复的滞回在 Routing.swift 里）。
-        // 可信翻日刚成立且此前进过冷却时，这里拿到的是 quota_reset_confirmed 的等价百分比。
+        // 可信翻日刚成立且此前进过冷却时，routeEvent 返回 quota_reset_confirmed，
+        // 直接原样应用，保留 type 让路由状态机按 <80% 滞回放行。
         let quotaEvent = ledger.routeEvent()
-        let percent = quotaEvent.usagePercent ?? 0
         let quotaDecision = stateQueue.sync { () -> AutoFallbackDecision? in
             guard var fallback = autoFallback else { return nil }
-            let result = fallback.applyQuotaUsage(percent)
+            let result = fallback.applyRouteEvent(quotaEvent)
             autoFallback = fallback
             return result
         }
@@ -738,11 +738,17 @@ final class SubtitleEngine {
     /// 冷却期间轮询账本：可信翻日刚成立时把路由从额度冷却里放出来。
     /// 只有 cooldownQuota 才允许应用（quota_update 会清掉 429 的 retry-after，
     /// 限流冷却必须留给它自己的 tick）。
+    /// G4: 先在 stateQueue 内确认当前是 cooldownQuota，再消费记录并投递 quota_reset_confirmed；
+    /// 非 cooldownQuota 时不得消费记录。
     private func pollLedgerQuotaReset() {
-        guard let ledger = cloudLedger, let percent = ledger.takeConfirmedReset() else { return }
+        guard let ledger = cloudLedger else { return }
         let decision = stateQueue.sync { () -> AutoFallbackDecision? in
             guard var fallback = autoFallback, fallback.cloudState == .cooldownQuota else { return nil }
-            let result = fallback.applyQuotaUsage(percent)
+            // 确认在配额冷却中后，再消费恢复记录（内部会落盘 consumed=true）。
+            guard let percent = ledger.takeConfirmedReset() else { return nil }
+            let result = fallback.applyRouteEvent(
+                RouteEvent(type: "quota_reset_confirmed", status: nil, retryAfter: nil, usagePercent: percent)
+            )
             autoFallback = fallback
             return result
         }

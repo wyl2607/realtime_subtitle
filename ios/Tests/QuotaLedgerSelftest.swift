@@ -618,6 +618,81 @@ func runQuotaLedgerSelftest(_ check: @escaping (Bool, String) -> Void) {
             check(afterRestart.routeEvent(at: reset.addingTimeInterval(2)).type == "quota_update",
                   "consumed 落盘后重启不得再发 quota_reset_confirmed")
         }
+
+        // G2: dayEpoch 在未来（墙钟前跳到 reset 之后），随后墙钟回拨。
+        // usageLocked 与 pruned 中 dayEpoch > now 时不使用该锚点（按 -inf，fail-closed），
+        // 墙钟追上后照常生效。
+        do {
+            let url = root.appendingPathComponent("quota-g2-future-epoch.json")
+            let base = Date(timeIntervalSince1970: 10_000)
+            let reset = base.addingTimeInterval(100)
+            let mono = TestMonotonicClock(0)
+            let ledger = QuotaLedger(url: url, now: base, monotonicNow: { mono.now })
+            // 先建立恢复记录并进入冷却
+            for _ in 0..<18 {
+                try ledger.recordRequest(duration: 10, at: base)
+            }
+            try ledger.correctRemainingRequests([
+                "x-ratelimit-remaining-requests": "5",
+                "x-ratelimit-reset-requests": "100s",
+            ], at: base, keyFingerprint: "key-a")
+            _ = ledger.usage(at: base)
+            // 墙钟前跳到 reset 之后
+            let afterReset = reset.addingTimeInterval(1)
+            mono.now = 101
+            let u1 = ledger.usage(at: afterReset)
+            check(u1.dayRequests == 0, "G2: 翻日后 dayRequests 应清零")
+            check(u1.usagePercent < 80, "G2: 翻日后 usagePercent 应 <80%")
+            // 墙钟回拨到 reset 之前
+            let rolledBack = base.addingTimeInterval(50)
+            mono.now = 50
+            let u2 = ledger.usage(at: rolledBack)
+            check(u2.dayRequests > 0, "G2: 墙钟回拨时 dayEpoch > now，不应用锚点，旧事件应重新计入（fail-closed）")
+            check(u2.usagePercent >= 90, "G2: 墙钟回拨时 usagePercent 应回到冷却阈值")
+            // 墙钟再次追上 reset 之后
+            mono.now = 101
+            let u3 = ledger.usage(at: afterReset)
+            check(u3.dayRequests == 0, "G2: 墙钟再次追上后 dayRequests 再次清零")
+            check(u3.usagePercent < 80, "G2: 墙钟再次追上后 usagePercent 再次 <80%")
+        }
+
+        // G3: 重启漏发 - 冷却中、记录未消费、reset 之后才重启。
+        // init 里先用旧周期完整用量判断 quotaHot（≥90% 置 true），再推进 dayEpoch。
+        do {
+            let url = root.appendingPathComponent("quota-g3-restart-missed.json")
+            let base = Date(timeIntervalSince1970: 10_000)
+            let reset = base.addingTimeInterval(100)
+            let mono = TestMonotonicClock(0)
+            // 使用较小的日限额以便测试：20 次/天，这样 18 次就能达到 90%
+            let testLimits = QuotaLedgerLimits(requestsPerDay: 20)
+            // 第一次运行：建立恢复记录并进入冷却（≥90%），但不调用 routeEvent 消费记录
+            // 模拟：用户在冷却中关闭了程序，记录还没被消费
+            do {
+                let ledger = QuotaLedger(url: url, limits: testLimits, now: base, monotonicNow: { mono.now })
+                for _ in 0..<18 {
+                    try ledger.recordRequest(duration: 10, at: base)
+                }
+                try ledger.correctRemainingRequests([
+                    "x-ratelimit-remaining-requests": "5",
+                    "x-ratelimit-reset-requests": "100s",
+                ], at: base, keyFingerprint: "key-a")
+                // 在 base 时刻检查用量：此时 minuteRequests=18/20=90%，进入冷却，quotaHot=true
+                let usageAtBase = ledger.usage(at: base)
+                check(usageAtBase.usagePercent >= 90, "G3 前置：base 时刻用量应 ≥90%")
+                mono.now = 101
+                // 故意不调用 usage/routeEvent：记录未消费，serverResetConsumed=false，dayEpoch 也不推进
+                // 模拟用户在此刻关闭程序
+            }
+            // 重启：新实例从文件读，无单调钟，墙钟在 reset 之后
+            let restarted = QuotaLedger(url: url, limits: testLimits, now: reset.addingTimeInterval(1))
+            // G3 修复：quotaHot 应为 true（用旧周期用量判断），因此 routeEvent 能发出 reset 事件
+            let restartedEvent = restarted.routeEvent(at: reset.addingTimeInterval(1))
+            check(restartedEvent.type == "quota_reset_confirmed",
+                  "G3: 重启后 quotaHot 由旧周期用量决定，应仍能发出 quota_reset_confirmed")
+            // 第二次调用不再发
+            let secondEvent = restarted.routeEvent(at: reset.addingTimeInterval(2))
+            check(secondEvent.type == "quota_update", "G3: 同一恢复记录只能触发一次 reset 事件")
+        }
     } catch {
         check(false, "QuotaLedger selftest 异常：\(error)")
     }

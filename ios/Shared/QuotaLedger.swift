@@ -228,13 +228,14 @@ final class QuotaLedger: @unchecked Sendable {
         }
         // 墙钟回拨超过 5 秒：恢复记录不可信，丢弃但保留下限（R4a）。
         let ts = now.timeIntervalSince1970
+        // G3: 重启时先用旧周期完整用量判断 quotaHot，再推进 dayEpoch。
+        // 若旧周期已 ≥90%，置 quotaHot=true，确保翻日事件能在路由侧被消费。
+        let usageBeforeAdvance = usageLocked(now: now)
+        if usageBeforeAdvance.usagePercent >= Self.enterPercent {
+            quotaHot = true
+        }
         if discardRecoveryOnClockRollbackLocked(at: ts) || advanceDayEpochIfRolloverConfirmedLocked(at: ts) {
             try? persistLocked()
-        }
-        // 与 rslite 的 `_publish(load 时)` 对齐：载入时已经 ≥90% 就算「此前进过冷却」，
-        // 重启后仍能靠翻日记录解锁。
-        if usageLocked(now: now).usagePercent >= Self.enterPercent {
-            quotaHot = true
         }
     }
 
@@ -415,7 +416,13 @@ final class QuotaLedger: @unchecked Sendable {
         let ts = now.timeIntervalSince1970
         let minuteEvents = current.events.filter { ts - $0.ts < 60 }
         let hourEvents = current.events.filter { ts - $0.ts < 3_600 }
-        let effectiveEpoch = current.dayEpoch ?? -.infinity
+        // G2: dayEpoch 在未来（墙钟回拨）时不作为锚点，视为 -inf（fail-closed）。
+        let effectiveEpoch: Double
+        if let epoch = current.dayEpoch, epoch <= ts {
+            effectiveEpoch = epoch
+        } else {
+            effectiveEpoch = -.infinity
+        }
         // 恢复点只影响日请求数；日音频窗口仍统计 24h 内全部事件（R5）。
         let dayRequestEvents = current.events.filter { $0.ts > effectiveEpoch }
         let dayEvents = current.events
