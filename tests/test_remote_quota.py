@@ -267,7 +267,11 @@ def test_restarted_ledger_trusts_elapsed_reset_without_a_monotonic_observation(t
     assert reloaded.usage(now=110).day_requests == 0
     saved = json.loads((tmp_path / "quota.json").read_text(encoding="utf-8"))
     assert saved["reset_record"]["consumed"] is True
-    assert not any(event["type"] == "quota_reset_confirmed" for event in restarted.events)
+    # 由于 server_day_used=1995 (99.75%) ≥90%，旧周期处于冷却，重启时应发 quota_reset_confirmed
+    assert any(event["type"] == "quota_reset_confirmed" for event in restarted.events)
+    # usage_percent 由 minute 窗口决定（只有 1 个请求在 100 秒），1/20=5%
+    assert restarted.events[-1]["type"] == "quota_reset_confirmed"
+    assert restarted.events[-1]["usage_percent"] == 5.0
 
 
 def test_smaller_server_usage_waits_60_seconds_before_it_is_accepted(tmp_path):
@@ -323,6 +327,85 @@ def test_old_or_nonfinite_reset_fields_do_not_quarantine_the_ledger(tmp_path):
     ledger, _state = _ledger(tmp_path, now=1000)
     assert ledger.usage(now=1000).day_requests == 3
     assert not (tmp_path / "quota.json.corrupt").exists()
+
+
+def test_parse_reset_record_validates_time_bounds(tmp_path):
+    """G1: reset_at - observed_at must be in [0, MAX_RESET_REQUESTS_S]; otherwise record is discarded."""
+    path = tmp_path / "quota.json"
+    # Case 1: reset_at < observed_at (negative diff) -> discard record, keep server_day_used
+    path.write_text(json.dumps({
+        "version": 1,
+        "events": [],
+        "server_day_used": 500,
+        "server_day_used_at": 1000,
+        "reset_record": {"reset_at": 900, "observed_at": 1000, "key_fp": "key-a", "consumed": False},
+    }), encoding="utf-8")
+    ledger, _state = _ledger(tmp_path, now=1000, name="quota.json")
+    assert ledger.usage(now=1000).day_requests == 500  # server_day_used preserved
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["reset_record"] is None  # bad record discarded
+    assert not (tmp_path / "quota.json.corrupt").exists()  # ledger not quarantined
+
+    # Case 2: reset_at - observed_at > MAX_RESET_REQUESTS_S -> discard record
+    path.write_text(json.dumps({
+        "version": 1,
+        "events": [],
+        "server_day_used": 800,
+        "server_day_used_at": 1000,
+        "reset_record": {"reset_at": 100000, "observed_at": 1000, "key_fp": "key-a", "consumed": False},
+    }), encoding="utf-8")
+    ledger2, _state = _ledger(tmp_path, now=1000, name="quota.json")
+    assert ledger2.usage(now=1000).day_requests == 800
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["reset_record"] is None
+    assert not (tmp_path / "quota.json.corrupt").exists()
+
+    # Case 3: valid bounds -> record kept (not consumed yet since now=1000 < reset_at=1100)
+    path.write_text(json.dumps({
+        "version": 1,
+        "events": [],
+        "server_day_used": 300,
+        "server_day_used_at": 1000,
+        "reset_record": {"reset_at": 1100, "observed_at": 1000, "key_fp": "key-a", "consumed": False},
+    }), encoding="utf-8")
+    ledger3, _state = _ledger(tmp_path, now=1000, name="quota.json")
+    assert ledger3.usage(now=1000).day_requests == 300  # server_day_used=300, reset not yet consumed
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["reset_record"] is not None
+    assert saved["reset_record"]["key_fp"] == "key-a"
+
+
+def test_restart_after_reset_emits_quota_reset_confirmed_when_hot(tmp_path):
+    """G3: 重启时在 reset 之后、账本原本在冷却（≥90%）、恢复记录未消费。
+    加载时应先用旧周期用量判断热度，置 _quota_hot=True，再推进消费并发 quota_reset_confirmed。"""
+    mono = [0.0]
+    state = _RecordingRouting()
+    ledger, _state = _ledger(tmp_path, now=100, state=state, monotonic=lambda: mono[0])
+    # 制造 ≥90% 用量（18 请求 = 90%）
+    for i in range(18):
+        ledger.note(1, now=100 + i)
+    # 建立恢复记录：reset_at = 110（10秒后）
+    ledger.note(10, now=100, remaining_requests=5, reset_requests_s=10, key_fp="key-a", sent_at=100)
+    # 此时 day_requests = 1995，usage_percent ≥90，_quota_hot=True
+    assert state.cloud_state == "cooldown_quota"
+    assert ledger._quota_hot is True
+    saved = json.loads((tmp_path / "quota.json").read_text(encoding="utf-8"))
+    assert saved["reset_record"]["consumed"] is False
+    assert saved["reset_record"]["reset_at"] == 110.0
+
+    # 进程在 reset_at 之后重启（now=110）
+    # 修复前：_advance_reset 先消费记录清 floor，_quota_hot 仍为 False，
+    # _publish 里 reset_confirmed=True 但 previously_hot=False，不发 quota_reset_confirmed
+    # 修复后：_load_locked 先用旧周期 _measure 判热度，置 _quota_hot=True，
+    # 再 _advance_reset，_publish 里 previously_hot=True，发 quota_reset_confirmed
+    restarted = _RecordingRouting()
+    reloaded, _state = _ledger(tmp_path, now=lambda: 110, state=restarted, monotonic=lambda: 0)
+    # day_requests 应归零（新周期）
+    assert reloaded.usage(now=110).day_requests == 0
+    # 关键：必须发出 quota_reset_confirmed，路由才能从 cooldown_quota 恢复
+    assert any(event["type"] == "quota_reset_confirmed" for event in restarted.events)
+    # usage_percent 由 minute 窗口决定（12 个请求在 100-110 秒内），12/20=60%
+    assert restarted.events[-1] == {"type": "quota_reset_confirmed", "usage_percent": 60.0}
 
 
 @pytest.mark.parametrize("bad", [-1, float("nan"), float("inf"), float("-inf")])

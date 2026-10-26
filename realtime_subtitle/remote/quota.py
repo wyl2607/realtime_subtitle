@@ -199,23 +199,29 @@ class QuotaLedger:
             return
         try:
             data = json.loads(_normalize_nonfinite(self.path.read_bytes()))
-            legacy_saturated = self._apply_payload(data)
+            legacy_saturated, normalized = self._apply_payload(data)
         except Exception:
             self._quarantine_and_cap()
             return
         now = self._clock(None)
         before = self._markers()
+        # G3: 在推进重置前，用旧周期完整用量判断是否已在冷却（≥ENTER_PERCENT）。
+        # 如果是，先置 _quota_hot=True，这样 _advance_reset 返回 True 时 _publish 才会发 quota_reset_confirmed。
+        old_cycle_usage = self._measure(now)
+        if old_cycle_usage.usage_percent >= ENTER_PERCENT:
+            self._quota_hot = True
         reset_confirmed = self._advance_reset(now)
         self._prune(now)
         if legacy_saturated:
             # 旧文件只有无时间戳的 saturated。迁成从这次读取起算的 24h 封顶，然后把标志抹掉。
             self._raise_day_request_floor(LIMIT_REQUESTS_PER_DAY, now)
         self._publish(self._measure(now), reset_confirmed=reset_confirmed)
-        if legacy_saturated or self._markers() != before:
+        if legacy_saturated or normalized or self._markers() != before:
             self.save()
 
-    def _apply_payload(self, data: Any) -> bool:
-        """应用一份账本。返回 True 表示带了旧的永久 saturated 哨兵，需要迁成带时间戳的封顶。"""
+    def _apply_payload(self, data: Any) -> tuple[bool, bool]:
+        """应用一份账本。返回 (legacy_saturated, normalized)。
+        normalized=True 表示有数据被清理（如丢弃坏事件、坏恢复记录），需要落盘固化。"""
         if not isinstance(data, dict) or data.get("version") != _VERSION:
             raise ValueError("schema")
         events = data.get("events")
@@ -246,11 +252,15 @@ class QuotaLedger:
             if not isinstance(saturated, bool):
                 raise ValueError("saturated")
             legacy_saturated = saturated
+        # 判断是否有恢复记录被丢弃（文件里有但解析为 None）
+        had_reset_record = data.get("reset_record") is not None
+        reset_record_discarded = had_reset_record and reset_record is None
+        normalized = dropped or reset_record_discarded
         self._events = parsed
         self._server_day_used = server_used
         self._server_day_used_at = server_at
         self._reset_record = reset_record
-        return legacy_saturated
+        return legacy_saturated, normalized
 
     def _quarantine_and_cap(self) -> None:
         # 解析不了就不能假设没用过。原文件改名为 .corrupt（已存在则覆盖），
@@ -455,7 +465,8 @@ def _parse_server(used: Any, used_at: Any) -> tuple[int, float]:
 
 
 def _parse_reset_record(value: Any) -> _ResetRecord | None:
-    """恢复记录损坏只丢记录，不把整本 fail-closed 账本误隔离。"""
+    """恢复记录损坏只丢记录，不把整本 fail-closed 账本误隔离。
+    额外校验：0 <= reset_at - observed_at <= MAX_RESET_REQUESTS_S，不满足即丢弃。"""
     if not isinstance(value, dict):
         return None
     reset_at = value.get("reset_at")
@@ -473,6 +484,9 @@ def _parse_reset_record(value: Any) -> _ResetRecord | None:
         or not key_fp
         or not isinstance(consumed, bool)
     ):
+        return None
+    diff = float(reset_at) - float(observed_at)
+    if diff < 0 or diff > MAX_RESET_REQUESTS_S:
         return None
     return _ResetRecord(
         reset_at=float(reset_at),
