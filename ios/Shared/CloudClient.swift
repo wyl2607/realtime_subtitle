@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// Groq 返回的一段。t0/t1 已由解析函数按音频起点映回样本时钟，下一轮接广播扩展时不必再换算。
@@ -15,15 +16,28 @@ struct CloudTranscriptionResult: Equatable {
     var remainingRequests: Int?
     /// `x-ratelimit-reset-requests` 解析后的秒数；默认值兼容既有构造点。
     var resetRequestsS: Double? = nil
+    /// 这次请求实际使用的 key 的指纹（哈希，不是 key）；账本靠它绑定恢复记录。
+    var keyFingerprint: String? = nil
+    /// 请求发出时的墙钟秒；账本靠它识别上个周期在飞的迟到响应。
+    var sentAt: Double? = nil
 }
 
 struct CloudQuotaHeaders: Equatable {
     var remainingRequests: Int?
     var resetRequestsS: Double?
+    var keyFingerprint: String? = nil
+    var sentAt: Double? = nil
 
-    init(remainingRequests: Int? = nil, resetRequestsS: Double? = nil) {
+    init(
+        remainingRequests: Int? = nil,
+        resetRequestsS: Double? = nil,
+        keyFingerprint: String? = nil,
+        sentAt: Double? = nil
+    ) {
         self.remainingRequests = remainingRequests
         self.resetRequestsS = resetRequestsS
+        self.keyFingerprint = keyFingerprint
+        self.sentAt = sentAt
     }
 }
 
@@ -151,16 +165,42 @@ final class CloudClient: @unchecked Sendable {
             language: language,
             endpoint: endpointURL
         )
+        // 请求发出时刻与 key 指纹随结果/错误一起返回；账本用它们做恢复记录的绑定与乱序判定。
+        let sentAt = Date().timeIntervalSince1970
+        let fingerprint = Self.keyFingerprint(key)
         let (data, response) = try await data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw CloudClientError.invalidResponse
         }
-        return try Self.parse(
-            statusCode: http.statusCode,
-            headers: http.allHeaderFields,
-            body: data,
-            a0: a0
-        )
+        do {
+            var result = try Self.parse(
+                statusCode: http.statusCode,
+                headers: http.allHeaderFields,
+                body: data,
+                a0: a0
+            )
+            result.keyFingerprint = fingerprint
+            result.sentAt = sentAt
+            return result
+        } catch let error as CloudClientError {
+            if case .httpStatus(let status, let retryAfter, let groqID, let quota) = error {
+                var stamped = quota ?? CloudQuotaHeaders()
+                stamped.keyFingerprint = fingerprint
+                stamped.sentAt = sentAt
+                throw CloudClientError.httpStatus(
+                    status,
+                    retryAfter: retryAfter,
+                    xGroqID: groqID,
+                    quota: stamped
+                )
+            }
+            throw error
+        }
+    }
+
+    /// key 指纹：只用于账本绑定同一把 key 的恢复记录，不参与鉴权、不进日志。
+    static func keyFingerprint(_ key: String) -> String {
+        SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     /// 构造请求是纯函数：自测可以逐字节比对 multipart，不需要起网络栈。

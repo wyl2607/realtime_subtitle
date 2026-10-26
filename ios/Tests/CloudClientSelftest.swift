@@ -189,6 +189,23 @@ func runCloudClientSelftest(_ check: @escaping (Bool, String) -> Void) {
     }
 
     do {
+        let fingerprint = CloudClient.keyFingerprint(fakeKey)
+        check(fingerprint == "8ab40e0a271191a4833e19e6db160047d0987086ff44df1c8d662eef0c88d586",
+              "key 指纹应是稳定的 SHA-256 十六进制，实际 \(fingerprint)")
+        check(fingerprint != fakeKey && !fingerprint.contains(fakeKey), "key 指纹不得包含 key 本身")
+        check(CloudClient.keyFingerprint(fakeKey) == fingerprint, "同一把 key 的指纹应稳定")
+        check(CloudClient.keyFingerprint(fakeKey + "x") != fingerprint, "不同 key 的指纹应不同")
+        let quota = CloudQuotaHeaders(
+            remainingRequests: 5,
+            resetRequestsS: 100,
+            keyFingerprint: fingerprint,
+            sentAt: 1_000
+        )
+        check(quota.keyFingerprint == fingerprint && quota.sentAt == 1_000,
+              "额度头应能携带 key 指纹与请求发出时刻")
+    }
+
+    do {
         let configuration = CloudClient.defaultSessionConfiguration()
         check(configuration.timeoutIntervalForRequest == CloudClient.connectTimeout,
               "连接超时应为 5 秒，实际 \(configuration.timeoutIntervalForRequest)")

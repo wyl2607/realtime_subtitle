@@ -622,8 +622,10 @@ final class SubtitleEngine {
 
         // 额度记账：每请求按 max(10, 时长) 计费（规则在 QuotaLedger 里）。
         _ = try? ledger.recordRequest(duration: segment.duration)
-        // 额度百分比喂给路由状态机（90% 进冷却、80% 以下才恢复的滞回在 Routing.swift 里）。
-        let percent = ledger.usage().usagePercent
+        // 额度事件喂给路由状态机（90% 进冷却、80% 以下才恢复的滞回在 Routing.swift 里）。
+        // 可信翻日刚成立且此前进过冷却时，这里拿到的是 quota_reset_confirmed 的等价百分比。
+        let quotaEvent = ledger.routeEvent()
+        let percent = quotaEvent.usagePercent ?? 0
         let quotaDecision = stateQueue.sync { () -> AutoFallbackDecision? in
             guard var fallback = autoFallback else { return nil }
             let result = fallback.applyQuotaUsage(percent)
@@ -681,7 +683,11 @@ final class SubtitleEngine {
             quotaHeaders["x-ratelimit-reset-requests"] = "\(resetSeconds)s"
         }
         if !quotaHeaders.isEmpty {
-            try? cloudLedger?.correctRemainingRequests(quotaHeaders)
+            try? cloudLedger?.correctRemainingRequests(
+                quotaHeaders,
+                keyFingerprint: result.keyFingerprint,
+                sentAt: result.sentAt.map { Date(timeIntervalSince1970: $0) }
+            )
         }
         let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else {
@@ -715,13 +721,33 @@ final class SubtitleEngine {
                 quotaHeaders["x-ratelimit-reset-requests"] = "\(resetSeconds)s"
             }
             if !quotaHeaders.isEmpty {
-                try? cloudLedger?.correctRemainingRequests(quotaHeaders)
+                try? cloudLedger?.correctRemainingRequests(
+                    quotaHeaders,
+                    keyFingerprint: quota?.keyFingerprint,
+                    sentAt: quota?.sentAt.map { Date(timeIntervalSince1970: $0) }
+                )
             }
             applyAutoDecision(handleAutoEvent(.cloudHTTPStatus(status, retryAfter: retryAfter)))
         case .cancelled:
             break
         case .network, .invalidResponse, .decodeFailed:
             applyAutoDecision(handleAutoEvent(.cloudSegmentFailed))
+        }
+    }
+
+    /// 冷却期间轮询账本：可信翻日刚成立时把路由从额度冷却里放出来。
+    /// 只有 cooldownQuota 才允许应用（quota_update 会清掉 429 的 retry-after，
+    /// 限流冷却必须留给它自己的 tick）。
+    private func pollLedgerQuotaReset() {
+        guard let ledger = cloudLedger, let percent = ledger.takeConfirmedReset() else { return }
+        let decision = stateQueue.sync { () -> AutoFallbackDecision? in
+            guard var fallback = autoFallback, fallback.cloudState == .cooldownQuota else { return nil }
+            let result = fallback.applyQuotaUsage(percent)
+            autoFallback = fallback
+            return result
+        }
+        if let decision {
+            applyAutoDecision(decision)
         }
     }
 
@@ -1023,6 +1049,7 @@ final class SubtitleEngine {
             if engineMode == "auto" {
                 handleAutoTick()
                 refreshCloudAvailability()
+                pollLedgerQuotaReset()
             }
         }
 
