@@ -233,6 +233,81 @@ func runQuotaLedgerSelftest(_ check: @escaping (Bool, String) -> Void) {
         let baselineReloaded = QuotaLedger(url: baselineURL, now: afterReset.addingTimeInterval(1))
         check(baselineReloaded.usage(at: afterReset.addingTimeInterval(1)).dayRequests == 100, "已消费恢复点应持久化，重载后不得重算旧本地事件")
 
+        // F4：已翻日后收到下一周期的未来 reset，旧周期本地事件不能重新计入 RPD。
+        let futureResetURL = root.appendingPathComponent("quota-f4-future-reset.json")
+        let oldCycleEvents = (0..<1_800).map { _ in
+            QuotaLedgerEvent(ts: at1000.timeIntervalSince1970 - 3_601, billedS: 10)
+        }
+        try JSONEncoder().encode(QuotaLedgerSnapshot(events: oldCycleEvents)).write(to: futureResetURL)
+        let futureResetMono = TestMonotonicClock(0)
+        let futureReset = QuotaLedger(
+            url: futureResetURL,
+            now: at1000,
+            monotonicNow: { futureResetMono.now }
+        )
+        try futureReset.correctRemainingRequests([
+            "x-ratelimit-remaining-requests": "5",
+            "x-ratelimit-reset-requests": "100s",
+        ], at: at1000, keyFingerprint: "key-a")
+        var futureResetContext = routeContext(.available)
+        futureReset.applyQuotaEvent(to: &futureResetContext, at: at1000)
+        check(futureResetContext.cloudState == .cooldownQuota, "F4 前置：旧周期高用量应先进入冷却")
+        let futureResponseAt = afterReset
+        futureResetMono.now = 101
+        try futureReset.correctRemainingRequests([
+            "x-ratelimit-remaining-requests": "1990",
+            "x-ratelimit-reset-requests": "100s",
+        ], at: futureResponseAt, keyFingerprint: "key-a", sentAt: futureResponseAt)
+        let futureResetUsage = futureReset.usage(at: futureResponseAt)
+        check(futureResetUsage.dayRequests == 10,
+              "F4：翻日后只应保留新周期服务端校正，实际 \(futureResetUsage.dayRequests) 次")
+        check(futureResetUsage.usagePercent < 80,
+              "F4：翻日后的未来 reset 不得把旧周期事件算回冷却，实际 \(futureResetUsage.usagePercent)%")
+        let futureResetJSON = try JSONSerialization.jsonObject(with: Data(contentsOf: futureResetURL)) as? [String: Any]
+        check(futureResetJSON?["day_epoch"] as? Double == 1_100,
+              "F4：已成立的恢复点应持久化为 day_epoch")
+        let epochPruneAt = Date(timeIntervalSince1970: 1_100 + 86_401)
+        try futureReset.recordRequest(duration: 10, at: epochPruneAt)
+        let prunedEpochJSON = try JSONSerialization.jsonObject(with: Data(contentsOf: futureResetURL)) as? [String: Any]
+        check(prunedEpochJSON?["day_epoch"] == nil, "F4：day_epoch 超过 24 小时应随 prune 失效")
+
+        // F1：remaining 仅接受 [0, requestsPerDay] 的整数；越界/非整数不能校正或替换记录。
+        let upperRemainingURL = root.appendingPathComponent("quota-f1-upper-remaining.json")
+        let upperRemaining = QuotaLedger(url: upperRemainingURL, now: at1000)
+        try upperRemaining.correctRemainingRequests([
+            "x-ratelimit-remaining-requests": "2000",
+            "x-ratelimit-reset-requests": "100s",
+        ], at: at1000, keyFingerprint: "key-a")
+        check(upperRemaining.usage(at: at1000).dayRequests == 0,
+              "F1：remaining=2000 应是合法上界")
+        let upperRemainingJSON = try JSONSerialization.jsonObject(with: Data(contentsOf: upperRemainingURL)) as? [String: Any]
+        check(upperRemainingJSON?["server_reset_at"] as? Double == 1_100,
+              "F1：合法上界 remaining 应建立恢复记录")
+
+        let invalidRemainingURL = root.appendingPathComponent("quota-f1-invalid-remaining.json")
+        let invalidRemaining = QuotaLedger(url: invalidRemainingURL, now: at1000)
+        try invalidRemaining.correctRemainingRequests([
+            "x-ratelimit-remaining-requests": "0",
+            "x-ratelimit-reset-requests": "100s",
+        ], at: at1000, keyFingerprint: "key-a")
+        try invalidRemaining.correctRemainingRequests([
+            "x-ratelimit-remaining-requests": "2001",
+            "x-ratelimit-reset-requests": "200s",
+        ], at: at1000.addingTimeInterval(1), keyFingerprint: "key-a")
+        try invalidRemaining.correctRemainingRequests([
+            "x-ratelimit-remaining-requests": "-1",
+            "x-ratelimit-reset-requests": "300s",
+        ], at: at1000.addingTimeInterval(2), keyFingerprint: "key-a")
+        try invalidRemaining.correctRemainingRequests([
+            "x-ratelimit-remaining-requests": NSNumber(value: 1.5),
+            "x-ratelimit-reset-requests": "400s",
+        ], at: at1000.addingTimeInterval(3), keyFingerprint: "key-a")
+        let invalidRemainingJSON = try JSONSerialization.jsonObject(with: Data(contentsOf: invalidRemainingURL)) as? [String: Any]
+        check(invalidRemaining.usage(at: at1000.addingTimeInterval(3)).dayRequests == 2_000,
+              "F1：2001、-1 和非整数 remaining 不得校正日用量")
+        check(invalidRemainingJSON?["server_reset_at"] as? Double == 1_100,
+              "F1：2001、-1 和非整数 remaining 不得替换恢复记录")
+
         let at2000 = Date(timeIntervalSince1970: 2_000)
         let persistedURL = root.appendingPathComponent("quota-reset-persisted.json")
         let persisted = QuotaLedger(url: persistedURL, now: at2000)

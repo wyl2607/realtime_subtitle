@@ -20,6 +20,8 @@ struct QuotaUsage: Equatable {
 struct QuotaLedgerSnapshot: Codable, Equatable {
     var events: [QuotaLedgerEvent]
     var requestCorrections: [QuotaRequestCorrection]
+    /// 已确认翻日的日请求锚点；避免新周期的未来恢复记录覆盖旧周期锚点后旧事件重新计入。
+    var dayEpoch: Double?
     /// 可信恢复记录：只有同一条响应同时带合法的 remaining 与 reset 头才写入。
     /// 四个字段一起构成记录；缺任何一个都按「没有恢复记录」处理（旧文件也是这样）。
     var serverResetAt: Double?
@@ -32,6 +34,7 @@ struct QuotaLedgerSnapshot: Codable, Equatable {
     enum CodingKeys: String, CodingKey {
         case events
         case requestCorrections = "request_corrections"
+        case dayEpoch = "day_epoch"
         case serverResetAt = "server_reset_at"
         case serverResetObservedAt = "server_reset_observed_at"
         case serverResetKeyFp = "server_reset_key_fp"
@@ -41,6 +44,7 @@ struct QuotaLedgerSnapshot: Codable, Equatable {
     init(
         events: [QuotaLedgerEvent] = [],
         requestCorrections: [QuotaRequestCorrection] = [],
+        dayEpoch: Double? = nil,
         serverResetAt: Double? = nil,
         serverResetObservedAt: Double? = nil,
         serverResetKeyFp: String? = nil,
@@ -48,6 +52,7 @@ struct QuotaLedgerSnapshot: Codable, Equatable {
     ) {
         self.events = events
         self.requestCorrections = requestCorrections
+        self.dayEpoch = dayEpoch
         self.serverResetAt = serverResetAt
         self.serverResetObservedAt = serverResetObservedAt
         self.serverResetKeyFp = serverResetKeyFp
@@ -59,6 +64,8 @@ struct QuotaLedgerSnapshot: Codable, Equatable {
         // 两个列表仍是必填：缺键说明文件坏了，要走隔离 + 饱和，不能读成空账本。
         events = try container.decode([QuotaLedgerEvent].self, forKey: .events)
         requestCorrections = try container.decode([QuotaRequestCorrection].self, forKey: .requestCorrections)
+        let (decodedDayEpoch, _) = Self.decodeRecoveryField(Double.self, from: container, forKey: .dayEpoch)
+        dayEpoch = decodedDayEpoch?.isFinite == true ? decodedDayEpoch : nil
         // 恢复记录字段类型不对/非有限数只丢弃记录，不隔离整份账本（R7）。
         let (resetAt, badReset) = Self.decodeRecoveryField(Double.self, from: container, forKey: .serverResetAt)
         let (observedAt, badObserved) = Self.decodeRecoveryField(Double.self, from: container, forKey: .serverResetObservedAt)
@@ -90,6 +97,7 @@ struct QuotaLedgerSnapshot: Codable, Equatable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(events, forKey: .events)
         try container.encode(requestCorrections, forKey: .requestCorrections)
+        try container.encodeIfPresent(dayEpoch, forKey: .dayEpoch)
         try container.encodeIfPresent(serverResetAt, forKey: .serverResetAt)
         try container.encodeIfPresent(serverResetObservedAt, forKey: .serverResetObservedAt)
         try container.encodeIfPresent(serverResetKeyFp, forKey: .serverResetKeyFp)
@@ -219,7 +227,8 @@ final class QuotaLedger: @unchecked Sendable {
             }
         }
         // 墙钟回拨超过 5 秒：恢复记录不可信，丢弃但保留下限（R4a）。
-        if discardRecoveryOnClockRollbackLocked(at: now.timeIntervalSince1970) {
+        let ts = now.timeIntervalSince1970
+        if discardRecoveryOnClockRollbackLocked(at: ts) || advanceDayEpochIfRolloverConfirmedLocked(at: ts) {
             try? persistLocked()
         }
         // 与 rslite 的 `_publish(load 时)` 对齐：载入时已经 ≥90% 就算「此前进过冷却」，
@@ -238,6 +247,7 @@ final class QuotaLedger: @unchecked Sendable {
             QuotaLedgerEvent(ts: now.timeIntervalSince1970, billedS: billed, durS: Self.round3(duration))
         )
         snapshot = Self.pruned(snapshot, now: now)
+        _ = advanceDayEpochIfRolloverConfirmedLocked(at: now.timeIntervalSince1970)
         try persistLocked()
         return billed
     }
@@ -256,7 +266,9 @@ final class QuotaLedger: @unchecked Sendable {
         keyFingerprint: String? = nil,
         sentAt: Date? = nil
     ) throws {
-        let remaining = Self.remainingRequests(from: headers)
+        let remaining = Self.remainingRequests(from: headers).flatMap {
+            Self.isValidRemaining($0, limit: limits.requestsPerDay) ? $0 : nil
+        }
         let rawReset = Self.resetRequestsSeconds(from: headers)
         // reset 时长超过 24h+60s 视为非法（R1）。
         let resetSeconds = rawReset.flatMap { value -> Double? in
@@ -267,6 +279,8 @@ final class QuotaLedger: @unchecked Sendable {
         defer { lock.unlock() }
         let ts = now.timeIntervalSince1970
         var changed = discardRecoveryOnClockRollbackLocked(at: ts)
+        // 新响应替换旧恢复记录前，先把已经按 R4 成立的旧周期锚点持久化。
+        changed = advanceDayEpochIfRolloverConfirmedLocked(at: ts) || changed
         // 换 key：旧记录作废，但服务端用量的下限留在 requestCorrections 里（R2）。
         if let existingFp = snapshot.serverResetKeyFp, existingFp != keyFingerprint {
             discardRecoveryLocked()
@@ -309,7 +323,8 @@ final class QuotaLedger: @unchecked Sendable {
     func usage(at now: Date = Date()) -> QuotaUsage {
         lock.lock()
         defer { lock.unlock() }
-        if discardRecoveryOnClockRollbackLocked(at: now.timeIntervalSince1970) {
+        let ts = now.timeIntervalSince1970
+        if discardRecoveryOnClockRollbackLocked(at: ts) || advanceDayEpochIfRolloverConfirmedLocked(at: ts) {
             try? persistLocked()
         }
         let usage = usageLocked(now: now)
@@ -339,6 +354,7 @@ final class QuotaLedger: @unchecked Sendable {
         defer { lock.unlock() }
         let ts = now.timeIntervalSince1970
         var changed = discardRecoveryOnClockRollbackLocked(at: ts)
+        changed = advanceDayEpochIfRolloverConfirmedLocked(at: ts) || changed
         let usage = usageLocked(now: now)
         if quotaHot, !snapshot.serverResetConsumed, rolloverConfirmedLocked(at: ts) {
             snapshot.serverResetConsumed = true
@@ -372,7 +388,7 @@ final class QuotaLedger: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         let ts = now.timeIntervalSince1970
-        if discardRecoveryOnClockRollbackLocked(at: ts) {
+        if discardRecoveryOnClockRollbackLocked(at: ts) || advanceDayEpochIfRolloverConfirmedLocked(at: ts) {
             try? persistLocked()
         }
         let usage = usageLocked(now: now)
@@ -399,7 +415,7 @@ final class QuotaLedger: @unchecked Sendable {
         let ts = now.timeIntervalSince1970
         let minuteEvents = current.events.filter { ts - $0.ts < 60 }
         let hourEvents = current.events.filter { ts - $0.ts < 3_600 }
-        let effectiveEpoch = effectiveEpochLocked(at: ts)
+        let effectiveEpoch = current.dayEpoch ?? -.infinity
         // 恢复点只影响日请求数；日音频窗口仍统计 24h 内全部事件（R5）。
         let dayRequestEvents = current.events.filter { $0.ts > effectiveEpoch }
         let dayEvents = current.events
@@ -456,8 +472,17 @@ final class QuotaLedger: @unchecked Sendable {
         return true
     }
 
-    private func effectiveEpochLocked(at ts: Double) -> Double {
-        rolloverConfirmedLocked(at: ts) ? (snapshot.serverResetAt ?? -.infinity) : -.infinity
+    /// R4 一旦成立，日请求锚点必须独立于当前恢复记录保存：下一周期的未来 reset
+    /// 不能令旧周期本地事件或服务端校正重新进入 24h 统计。
+    @discardableResult
+    private func advanceDayEpochIfRolloverConfirmedLocked(at ts: Double) -> Bool {
+        guard rolloverConfirmedLocked(at: ts), let resetAt = snapshot.serverResetAt else {
+            return false
+        }
+        let nextEpoch = max(snapshot.dayEpoch ?? -.infinity, resetAt)
+        guard snapshot.dayEpoch != nextEpoch else { return false }
+        snapshot.dayEpoch = nextEpoch
+        return true
     }
 
     @discardableResult
@@ -487,6 +512,7 @@ final class QuotaLedger: @unchecked Sendable {
         return QuotaLedgerSnapshot(
             events: snapshot.events.filter { $0.ts >= cutoff && isBillable($0) },
             requestCorrections: snapshot.requestCorrections.filter { $0.ts >= cutoff },
+            dayEpoch: snapshot.dayEpoch.flatMap { $0 < cutoff ? nil : $0 },
             serverResetAt: snapshot.serverResetAt,
             serverResetObservedAt: snapshot.serverResetObservedAt,
             serverResetKeyFp: snapshot.serverResetKeyFp,
@@ -511,6 +537,10 @@ final class QuotaLedger: @unchecked Sendable {
     }
 
     private static let serverDecreaseGraceSeconds = 60.0
+
+    private static func isValidRemaining(_ value: Int, limit: Int) -> Bool {
+        value >= 0 && value <= limit
+    }
 
     private static func isBillable(_ event: QuotaLedgerEvent) -> Bool {
         event.billedS.isFinite && event.billedS >= 0
@@ -611,7 +641,15 @@ final class QuotaLedger: @unchecked Sendable {
                 continue
             }
             if let number = value as? NSNumber {
-                return number.intValue
+                guard CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+                let double = number.doubleValue
+                guard double.isFinite,
+                      double.rounded(.towardZero) == double,
+                      double >= Double(Int.min),
+                      double <= Double(Int.max) else {
+                    return nil
+                }
+                return Int(double)
             }
             return Int(String(describing: value).trimmingCharacters(in: .whitespacesAndNewlines))
         }
