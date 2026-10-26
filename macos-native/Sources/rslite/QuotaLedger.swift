@@ -308,7 +308,9 @@ final class QuotaLedger: @unchecked Sendable {
         let ts = now.timeIntervalSince1970
         let minuteEvents = current.events.filter { ts - $0.ts < 60 }
         let hourEvents = current.events.filter { ts - $0.ts < 3_600 }
-        let effectiveEpoch = max(current.dayEpoch ?? -.infinity, confirmedResetAt ?? -.infinity)
+        // 墙钟回拨到已消费锚点之前时，不能让未来锚点排除当前 24 小时窗口的数据。
+        let persistedEpoch = current.dayEpoch.flatMap { $0 <= ts ? $0 : nil } ?? -.infinity
+        let effectiveEpoch = max(persistedEpoch, confirmedResetAt ?? -.infinity)
         // 恢复点只影响日请求数；日音频窗口仍统计 24h 内全部事件。
         let dayRequestEvents = current.events.filter { $0.ts > effectiveEpoch }
         let dayEvents = current.events
@@ -341,11 +343,19 @@ final class QuotaLedger: @unchecked Sendable {
     }
 
     private static func pruned(_ snapshot: QuotaLedgerSnapshot, now: Date) -> QuotaLedgerSnapshot {
-        let cutoff = now.timeIntervalSince1970 - 86_400
+        let ts = now.timeIntervalSince1970
+        let cutoff = ts - 86_400
+        // 保留未来锚点，供墙钟追上后继续生效；usageLocked 会在此前将它视为 -∞。
+        let retainedDayEpoch: Double?
+        if let dayEpoch = snapshot.dayEpoch, dayEpoch > ts {
+            retainedDayEpoch = dayEpoch
+        } else {
+            retainedDayEpoch = snapshot.dayEpoch.flatMap { $0 < cutoff ? nil : $0 }
+        }
         return QuotaLedgerSnapshot(
             events: snapshot.events.filter { $0.ts >= cutoff && isBillable($0) },
             requestCorrections: snapshot.requestCorrections.filter { $0.ts >= cutoff },
-            dayEpoch: snapshot.dayEpoch.flatMap { $0 < cutoff ? nil : $0 },
+            dayEpoch: retainedDayEpoch,
             resetAt: snapshot.resetAt,
             observedAt: snapshot.observedAt,
             resetKeyFingerprint: snapshot.resetKeyFingerprint,
@@ -839,6 +849,27 @@ final class QuotaLedger: @unchecked Sendable {
             var restartContext = CloudRouteContext(RouteInitial(hasKey: true, cloudEnabled: true, cloudState: .cooldownQuota, nodeEnabled: false, nodeHealthy: false, nodeIsSelf: false, consecutiveFailures: 0, backoffIndex: 0))
             restartedHot.applyQuotaEvent(to: &restartContext, at: afterReset, monotonicNow: 200)
             check(restartContext.cloudState == .available && restartContext.action == "resume_cloud" && resetRecord(in: restartConfirmURL)?["consumed"] as? Bool == true, "重启后的首次路由调用必须消费记录并发 quota_reset_confirmed")
+
+            // G2：重启时墙钟错误前跳会消费恢复点；随后回拨前锚点必须失效，追上后再恢复生效。
+            let futureEpochURL = dir.appendingPathComponent("quota-future-day-epoch.json")
+            let beforeJump = QuotaLedger(url: futureEpochURL, now: at1000)
+            try beforeJump.recordRequest(duration: 10, at: at1000)
+            try beforeJump.note(
+                ["x-ratelimit-remaining-requests": "0", "x-ratelimit-reset-requests": "100s"],
+                at: at1000, keyFingerprint: keyA, sentAt: at1000, monotonicNow: 100
+            )
+            let jumpedAfterRestart = QuotaLedger(url: futureEpochURL, now: afterReset)
+            var jumpedContext = CloudRouteContext(RouteInitial(
+                hasKey: true, cloudEnabled: true, cloudState: .cooldownQuota,
+                nodeEnabled: false, nodeHealthy: false, nodeIsSelf: false,
+                consecutiveFailures: 0, backoffIndex: 0
+            ))
+            jumpedAfterRestart.applyQuotaEvent(to: &jumpedContext, at: afterReset)
+            check(resetRecord(in: futureEpochURL)?["day_epoch"] as? Double == 1_100, "错误前跳后应持久化已消费的 dayEpoch")
+            let rolledBack = QuotaLedger(url: futureEpochURL, now: at1000.addingTimeInterval(50))
+            check(rolledBack.usage(at: at1000.addingTimeInterval(50)).dayRequests == 2_000, "未来 dayEpoch 在墙钟回拨期间必须忽略，保留本地事件和 remaining=0 校正")
+            check(rolledBack.usage(at: afterReset).dayRequests == 0, "墙钟追上 future dayEpoch 后锚点应重新生效")
+
             let oldFormatURL = dir.appendingPathComponent("quota-old-format.json")
             try Data(#"{"events":[{"ts":1000,"billed_s":10}],"request_corrections":[{"ts":1000,"used_requests":3}]}"#.utf8).write(to: oldFormatURL)
             check(QuotaLedger(url: oldFormatURL, now: at1000).usage(at: at1000).dayRequests == 3, "旧格式账本应照常读取")
