@@ -26,6 +26,8 @@ from realtime_subtitle.ui.design_tokens import TEXT_LOCAL_UNAVAILABLE_RECONNECTI
 
 POLL_INTERVAL_SECONDS = 0.15
 FINALIZE_STABLE_SECONDS = 0.8  # 句末仍可能被系统修订；末句等短暂稳定后才交给翻译。
+# 连上时被压着的旧尾巴，补完后最多这么多词才当旧内容整句跳过（见 prime）。
+SKIP_TAIL_MAX_WORDS = 3
 FORCE_FLUSH_CHARS = 240  # 无标点长句也要有延迟上限，避免草稿无限增长。
 FORCE_FLUSH_SECONDS = 12.0  # 持续增长不能重置此计时，否则不停说话永远无法翻译。
 RECONNECT_INITIAL_SECONDS = 0.5
@@ -57,6 +59,7 @@ class CaptionDiffer:
         self.max_seconds = max_seconds
         self._text = ""
         self._consumed = 0
+        self._skip_first = False
         self._candidate = ""
         self._candidate_since = None
         self._pending_since = None
@@ -94,9 +97,14 @@ class CaptionDiffer:
         ☠️ 系统字幕窗会保留上一次的内容（本应用重启、或断线重连时都在）。
         不先记下就会被当成新句子整段送去翻译和存档（2026-10-27 实测重放过）。
         代价：连上时还没成句的尾巴也一起跳过，最多丢半句。
+
+        ☠️ 系统字幕会把最后几个词压着不显示，等下一段语音来了才补上（真机原始
+        快照实测：停在 "…Geld für Bahn"，新语音进来后才补出 "und Bus."）。所以
+        残留文字没以句末标点结尾时，之后补完的第一句也属于旧内容，一并跳过。
         """
         self._text = " ".join((text or "").split())
         self._consumed = len(self._text)
+        self._skip_first = bool(self._text) and not re.search(_SENTENCE_END.pattern + "$", self._text)
         self._candidate = ""
         self._candidate_since = None
         self._pending_since = None
@@ -120,6 +128,7 @@ class CaptionDiffer:
                 self._consumed = 0
         cursor, related = self._map_consumed(text)
         if not related:
+            self._skip_first = False
             self._pending_since = None
             self._candidate = ""
             self._candidate_since = None
@@ -146,7 +155,19 @@ class CaptionDiffer:
             stable = now - self._candidate_since >= self.stable_seconds
             if not follows and not stable:
                 break
-            finalized.append(sentence)
+            if self._skip_first:
+                # prime 时被压着的旧尾巴，见 prime()。☠️ 只在补出来的部分很短时
+                # 才整句跳过：系统也可能把旧尾巴和新语音拼成一句（真机实测
+                # "…Tagesschau Guten Morgen in Berlin beginnt…"，中间没句号），
+                # 整句跳过会吞掉真正的新内容——那比多翻半句旧话糟得多。
+                self._skip_first = False
+                if len(sentence.split()) > SKIP_TAIL_MAX_WORDS:
+                    if cursor and text[cursor - 1].isalnum() and text[cursor].isalnum():
+                        # 旧尾巴停在词中间（"Tages|schau"），新句别以半个词开头
+                        sentence = sentence.split(" ", 1)[-1]
+                    finalized.append(sentence)
+            else:
+                finalized.append(sentence)
             cursor = match.end()
             self._candidate = ""
             self._candidate_since = None

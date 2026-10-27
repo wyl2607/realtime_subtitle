@@ -18,11 +18,37 @@ def test_sentence_waits_for_stability_and_duplicate_snapshots_do_not_reemit():
 
 def test_prime_skips_text_left_in_window_from_previous_run():
     differ = lc.CaptionDiffer(stable_seconds=1)
-    differ.prime("Alter Satz von gestern. Noch ein alter")
-    assert differ.update("Alter Satz von gestern. Noch ein alter", now=5) == lc.CaptionUpdate([], "")
-    result = differ.update("Alter Satz von gestern. Noch ein alter Neuer Satz.", now=6)
+    differ.prime("Alter Satz von gestern. Noch ein alter.")
+    assert differ.update("Alter Satz von gestern. Noch ein alter.", now=5) == lc.CaptionUpdate([], "")
+    result = differ.update("Alter Satz von gestern. Noch ein alter. Neuer Satz.", now=6)
     assert result.finalized == [] and result.draft == "Neuer Satz."
-    assert differ.update("Alter Satz von gestern. Noch ein alter Neuer Satz.", now=7).finalized == ["Neuer Satz."]
+    assert differ.update("Alter Satz von gestern. Noch ein alter. Neuer Satz.", now=7).finalized == ["Neuer Satz."]
+
+
+def test_prime_skips_held_back_tail_completed_by_next_speech():
+    differ = lc.CaptionDiffer(stable_seconds=1)
+    differ.prime("Die Opposition fordert mehr Geld für Bahn")
+    # 新语音进来，系统才把旧尾巴补完——补完的那一句仍是旧内容
+    result = differ.update("Die Opposition fordert mehr Geld für Bahn und Bus. Das Wetter morgen", now=0)
+    assert result.finalized == [] and result.draft == "Das Wetter morgen"
+    snapshot = "Die Opposition fordert mehr Geld für Bahn und Bus. Das Wetter morgen."
+    assert differ.update(snapshot, now=2).finalized == []
+    assert differ.update(snapshot, now=3.5).finalized == ["Das Wetter morgen."]
+
+
+def test_prime_keeps_new_speech_merged_into_held_back_tail():
+    differ = lc.CaptionDiffer(stable_seconds=1)
+    differ.prime("Das Wetter. Das war die Tages")
+    snapshot = "Das Wetter. Das war die Tagesschau Guten Morgen in Berlin beginnt heute ein Streik. Viele"
+    assert differ.update(snapshot, now=0).finalized == [
+        "Guten Morgen in Berlin beginnt heute ein Streik."]
+
+
+def test_prime_on_complete_sentence_does_not_skip_next_one():
+    differ = lc.CaptionDiffer(stable_seconds=1)
+    differ.prime("Das war die Tagesschau.")
+    assert differ.update("Das war die Tagesschau. Guten Morgen.", now=0).finalized == []
+    assert differ.update("Das war die Tagesschau. Guten Morgen.", now=2).finalized == ["Guten Morgen."]
 
 
 def test_late_punctuation_alone_is_not_a_sentence():
