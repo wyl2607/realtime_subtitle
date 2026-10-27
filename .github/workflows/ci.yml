@@ -137,15 +137,15 @@ jobs:
   # 调整而漂移，写死 macos-26 才能让"编译不过"是真实信号而不是镜像换代。
   # 若将来该标签不存在，回退 macos-latest，并保留这条注释说明本意。
   #
-  # ☠️ 这里曾挂着 continue-on-error，注释归因于「runner 缺 macOS 27 SDK」——
-  # 那是误诊：真实报错全是 Swift 6.3（Xcode 26）比本地 Swift 6.4 严格的编译
-  # 差异（main.swift 里放 @main、私有 memberwise init、可选元组解构推断、
-  # 闭包元组 != 歧义），@available(macOS 27.0, *) 的代码在 26 SDK 上照样能编。
-  # 源码兼容已修，但 Swift 6.3 的 release 编译仍会卡死（PR #83 在查），
-  # 所以暂时继续容忍失败；卡死查清后去掉 continue-on-error。
+  # ☠️ 这里曾挂着 continue-on-error，先后两种误诊：「runner 缺 macOS 27 SDK」
+  # （其实是 Swift 6.3 比本地 6.4 严格的编译差异，#80 已修），以及「6.3 release
+  # 编译卡死」（闭包引用后面才声明的同名局部 → ClosureLifetimeFixup 死循环，
+  # #83 定位、#89 修完最后三处）。卡死一去掉，暴露出第三件事：runner 是 macos-26，
+  # 而 selftest 对 macOS 27 才有的三组（NodeRouter/HybridEngine/Pipeline）是
+  # fail-closed 的（故意的：本机跑时不许静默跳过）。CI 侧只放行这三行，见下面
+  # selftest 步骤；其余任何 FAIL 照样红。runner 升到 macOS 27 后这段放行自动不生效。
   rslite-macos:
     runs-on: macos-26
-    continue-on-error: true
     # 正常 1 分钟内编完。Swift 6.3 遇到某些闭包写法会在 ClosureLifetimeFixup 里死循环
     # 而不是报错（PR #83），不设上限就卡满 GitHub 默认的 6 小时。
     timeout-minutes: 30
@@ -164,26 +164,23 @@ jobs:
             ${{ runner.os }}-swiftpm-
       - name: swift build (release)
         run: swift build -c release --package-path macos-native
-      - name: "probe(tmp): selftest 退出码 + 崩溃报告 + debug 构建对照"
-        if: always()
-        shell: bash
-        run: |
-          set +e
-          macos-native/.build/release/rslite --selftest; echo "release rc=$?"
-          ls -t ~/Library/Logs/DiagnosticReports/ 2>/dev/null | head -5
-          f=$(ls -t ~/Library/Logs/DiagnosticReports/rslite* 2>/dev/null | head -1)
-          [ -n "$f" ] && head -c 6000 "$f"
-          swift build -c debug --package-path macos-native --product rslite 2>&1 | tail -3
-          macos-native/.build/debug/rslite --selftest; echo "debug rc=$?"
       - name: rslite selftest
         shell: bash
         run: |
-          out="$(macos-native/.build/release/rslite --selftest)"
+          out="$(macos-native/.build/release/rslite --selftest)" || true
           printf '%s\n' "$out"
           case "$out" in
-            *"SELFTEST OK"*) echo "rslite selftest: OK" ;;
-            *) echo "::error::rslite --selftest 未输出 SELFTEST OK"; exit 1 ;;
+            *"SELFTEST OK"*) echo "rslite selftest: OK"; exit 0 ;;
           esac
+          # 只在 macOS 27 以下放行"需要 macOS 27"这三行；多一条别的 FAIL、或没有任何 FAIL 行都算红
+          major="$(sw_vers -productVersion | cut -d. -f1)"
+          other="$(printf '%s\n' "$out" | grep '^SELFTEST FAIL' | grep -v ': 需要 macOS 27$' || true)"
+          skipped="$(printf '%s\n' "$out" | grep -c ': 需要 macOS 27$' || true)"
+          if [ "$major" -lt 27 ] && [ -z "$other" ] && [ "$skipped" -gt 0 ]; then
+            echo "::warning::runner 是 macOS $major，selftest 跳过了 $skipped 组只能在 macOS 27 上跑的用例（本机/真机覆盖）"
+            exit 0
+          fi
+          echo "::error::rslite --selftest 未通过"; exit 1
       - name: Check design tokens are up to date
         run: python3 scripts/design/gen_tokens.py --check
 
