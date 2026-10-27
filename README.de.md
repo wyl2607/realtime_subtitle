@@ -86,7 +86,7 @@ Legende: ✅ stabil · 🟢 nutzbar · 🧪 experimentell · ⬜ nicht begonnen.
 | | Empfohlen | Minimum |
 |---|---|---|
 | OS | Windows 10/11 64-Bit | Windows 10/11 (**nur Windows** — WASAPI) |
-| GPU | NVIDIA ≥ 8 GB VRAM | CPU möglich (höhere Latenz) |
+| GPU | NVIDIA ≥ 8 GB VRAM | CPU möglich (höhere Latenz) oder Windows-Liveuntertitel (siehe „Optionale Erkennungsquellen“) |
 | RAM | 16 GB | 8 GB |
 | Speicher | ca. 10 GB | ca. 6 GB |
 | Python | 3.10–3.13 | gleich |
@@ -180,6 +180,27 @@ Erkennung an einen anderen Apple-Silicon-Mac oder NVIDIA-Windows-PC im Tailnet a
 - **Kostenloses Kontingent**: 20 Anfragen pro Minute, 7.200 Sekunden Audio pro Stunde, 2.000 Anfragen / 28.800 Sekunden pro Tag, mindestens 10 Sekunden pro Anfrage.
 - **Automatischer Fallback**: Bei fast vollem Kontingent automatischer Wechsel auf eigene Knoten oder lokal; nach Erholung Umschaltung an Sprechpause.
 - **Fallback-Reihenfolge**: Cloud → Eigener Knoten → Lokal.
+
+## Optionale Erkennungsquellen und Untertitel-Export
+
+Alles in `config_local.py` eintragen und die Untertitel danach neu starten.
+
+- **Windows-Liveuntertitel (ohne GPU)**: `ASR_SOURCE = "livecaptions"`, danach
+  `venv\Scripts\python -m pip install uiautomation`. Die Spracherkennung übernimmt die in Windows 11 (22H2+)
+  eingebaute Funktion „Liveuntertitel“; das Programm liest deren Text und übersetzt ihn mit Ollama. Whisper wird
+  nicht geladen, die GPU nicht genutzt – passend für Rechner ohne NVIDIA-Karte. Die Erkennungssprache wählst du unter
+  **Windows-Einstellungen → Barrierefreiheit → Untertitel**; sie muss zur Quellsprache des Programms passen. Das
+  Liveuntertitel-Fenster wird während des Betriebs minimiert (`LIVE_CAPTIONS_HIDE_WINDOW = False` lässt es sichtbar)
+  und beim Beenden wiederhergestellt. Die Liveuntertitel halten die letzten Wörter bis zum nächsten Satz zurück, daher
+  kommt der letzte Satz vor einer Pause verspätet (spätestens nach ca. 12 s). Sind die Voraussetzungen nicht erfüllt
+  (kein Windows 11, uiautomation fehlt, Liveuntertitel nicht gefunden), wird automatisch Whisper verwendet.
+- **SenseVoice (Rechenknoten, optional)**: `ASR_ENGINE = "sensevoice"` und auf dem Knoten `pip install funasr`.
+  Nur Chinesisch / Englisch / Japanisch / Koreanisch / Kantonesisch – **kein Deutsch**; andere Sprachen fallen auf
+  Whisper zurück. Die lokale Streaming-Erkennung bleibt Whisper.
+- **SRT / CSV pro Sitzung**: standardmäßig an. Neben der täglichen txt-Datei schreibt jeder Lauf unter
+  `transcripts\sessions\` eine zweisprachige SRT (direkt in den Videoplayer ziehen) und eine CSV (öffnet in Excel).
+  Abschalten mit `SAVE_SESSION_SRT = False` / `SAVE_SESSION_CSV = False`; `SAVE_TRANSCRIPT = False` schaltet sie mit
+  ab. `TRANSCRIPT_KEEP_DAYS` gilt auch für sie.
 
 ## Windows: Rechenknoten nutzen
 

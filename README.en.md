@@ -89,7 +89,7 @@ Stage legend: ✅ stable · 🟢 usable · 🧪 experimental · ⬜ not started.
 | | Recommended | Minimum |
 |---|---|---|
 | OS | Windows 10/11 64-bit | Windows 10/11 (**Windows only** — WASAPI loopback) |
-| GPU | NVIDIA 8 GB+ VRAM | CPU-only works (higher latency) |
+| GPU | NVIDIA 8 GB+ VRAM | CPU-only works (higher latency), or use Windows Live Captions (see "Optional recognition sources") |
 | RAM | 16 GB | 8 GB |
 | Disk | ~10 GB (deps + models) | ~6 GB |
 | Python | 3.10–3.13 | same |
@@ -183,6 +183,27 @@ Offload recognition to another Apple Silicon Mac or NVIDIA Windows machine insid
 - **Free tier limits**: 20 requests per minute, 7,200 seconds of audio per hour, 2,000 requests / 28,800 seconds per day, with each request billed at minimum 10 seconds.
 - **Automatic failover**: when quota approaches limits, the system automatically falls back to your compute node or local recognition; when quota recovers, it switches back at a silence point.
 - **Fallback order**: Cloud → Own compute node → Local.
+
+## Optional recognition sources and subtitle export
+
+All of these go into `config_local.py`; restart the subtitles afterwards.
+
+- **Windows Live Captions (no GPU needed)**: `ASR_SOURCE = "livecaptions"`, then
+  `venv\Scripts\python -m pip install uiautomation`. Speech recognition is done by the Live Captions feature built
+  into Windows 11 (22H2+); the app reads its text and translates it with Ollama. Whisper is not loaded and the GPU
+  is not used, so this suits machines without an NVIDIA card. Pick the recognition language under
+  **Windows Settings → Accessibility → Captions** and keep it in line with the app's source language. The Live
+  Captions window is minimized while the app runs (`LIVE_CAPTIONS_HIDE_WINDOW = False` keeps it visible) and
+  restored on exit. Live Captions holds back the last few words until the next phrase, so the last sentence before
+  a pause arrives late (a ~12 s fallback flushes it). If the requirements are not met (not Windows 11, uiautomation
+  missing, Live Captions not found) the app falls back to Whisper.
+- **SenseVoice (compute nodes, optional)**: `ASR_ENGINE = "sensevoice"` plus `pip install funasr` on the node.
+  Only Chinese / English / Japanese / Korean / Cantonese — **no German**; other languages fall back to Whisper.
+  Local streaming recognition stays on Whisper.
+- **Per-session SRT / CSV**: on by default. Besides the daily txt, every run also writes a bilingual SRT (drop it
+  into a video player) and a CSV (opens in Excel) under `transcripts\sessions\`. Turn off with
+  `SAVE_SESSION_SRT = False` / `SAVE_SESSION_CSV = False`; `SAVE_TRANSCRIPT = False` disables them too.
+  `TRANSCRIPT_KEEP_DAYS` applies to them as well.
 
 ## Windows: Using compute nodes
 
