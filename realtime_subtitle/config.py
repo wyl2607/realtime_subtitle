@@ -576,6 +576,8 @@ HALLUCINATION_BLACKLIST = [
 
 # ============ 字幕记录 ============
 SAVE_TRANSCRIPT = True  # 把每条字幕（原文+译文+时间）存到文件，方便回看/搜索/学语言
+SAVE_SESSION_SRT = True  # 单次运行单独导出双语 SRT 文件（transcripts/sessions/）
+SAVE_SESSION_CSV = True  # 单次运行单独导出 CSV 表格（utf-8-sig，方便 Excel 查看）
 TRANSCRIPT_DIR = "transcripts"  # 相对仓库目录，每天一个文件 YYYY-MM-DD.txt
 # 启动时清理超过这么多天的存档文件。**默认 0 = 永久保留**，和一直以来的行为
 # 一致——transcripts 是拿来回看和学德语的，自动删掉用户攒的语料不该是默认。

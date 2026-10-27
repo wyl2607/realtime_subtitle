@@ -729,6 +729,14 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
 
             # 字幕记录（原文+译文+时间戳，每天一个文件）
             self._transcript_ok = bool(getattr(config, "SAVE_TRANSCRIPT", False))
+            self._session_export_ok = self._transcript_ok
+            self._session_start_time = time.time()
+            self._session_id = time.strftime("%Y-%m-%d_%H%M%S", time.localtime(self._session_start_time))
+            self._session_prev_end = 0.0
+            self._session_index = 0
+            self._session_srt_file = None
+            self._session_csv_file = None
+            self._session_csv_writer = None
             if self._transcript_ok:
                 # 仓库根下的 transcripts\：README / uninstall.ps1 都按这个位置
                 # 告诉用户，别再用 __file__ 推（会掉进 translate\ 里）
@@ -742,6 +750,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
                 except OSError as e:
                     print(f"⚠️  字幕记录目录创建失败，记录功能关闭: {e}")
                     self._transcript_ok = False
+                    self._session_export_ok = False
 
             if self._translate_backend != "apple":
                 _warn_if_ipv6_first_host(ollama_url())
@@ -1345,9 +1354,13 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             return  # 本轮全是词典感叹词，不用打Ollama
 
         # 合并成一次请求时同样不能给中文插空格（见 _append_committed）
-        german = ("" if _no_space_language() else " ").join(batch)
         batch_t0, batch_t1, batch_key = self._span_for_sentences(batch)
         batch_rev = getattr(batch[0], "revision", getattr(self, "_lang_revision", 0))
+        joined_text = ("" if _no_space_language() else " ").join(batch)
+        german = TimedSentence(
+            joined_text, t0=batch_t0, t1=batch_t1, key=batch_key,
+            source=getattr(batch[0], "source", "local"), revision=batch_rev,
+        )
         translation = None
         self._last_tx_failure_reason = None
         try:
@@ -2298,6 +2311,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             self.ollama_session.close()
             self.lookup_session.close()
             self.analysis_session.close()
+            self._close_session_export()
         except Exception:
             pass
 
@@ -2371,5 +2385,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
                 self.ollama_session.close()
             if hasattr(self, 'apple_translator') and self.apple_translator is not None:
                 self.apple_translator.close()
+            if hasattr(self, '_close_session_export'):
+                self._close_session_export()
         except Exception:
             pass
