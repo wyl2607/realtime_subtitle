@@ -5,6 +5,8 @@
 import realtime_subtitle.ui.design_tokens as design_tokens
 
 # ============ Whisper 模型配置 ============
+# whisper / sensevoice：只用于节点分段识别；本机流式识别仍用 Whisper 词时间戳。
+ASR_ENGINE = "whisper"
 # large-v3-turbo: large-v3的加速蒸馏版，德语准确率明显好于medium，
 # 速度与medium相当，int8下显存占用差不多（~2GB）
 WHISPER_MODEL = "large-v3-turbo"  # tiny, base, small, medium, large-v3, large-v3-turbo

@@ -1327,6 +1327,8 @@ class SubtitleApp:
             self.translator = translator  # 此后 stop() 会负责 shutdown 它
             # 模型还没好时用户拨的开关只落在文件里。这里按文件决定要不要接远端。
             self._attach_remote()
+            if str(config.ASR_ENGINE).strip().lower() == "sensevoice" and self.remote is None:
+                print("ℹ️ SenseVoice 仅用于节点/分段识别；本机流式识别需要词时间戳，继续使用 Whisper。")
             # 点词查词：窗口点击→translator查Ollama→回调线程安全地弹结果
             # on_partial：流式生成中整行地先上屏，不用干等整段
             self.subtitle_window.on_lookup = (
