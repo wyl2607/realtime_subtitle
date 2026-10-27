@@ -164,6 +164,17 @@ jobs:
             ${{ runner.os }}-swiftpm-
       - name: swift build (release)
         run: swift build -c release --package-path macos-native
+      - name: "probe(tmp): selftest 退出码 + 崩溃报告 + debug 构建对照"
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          macos-native/.build/release/rslite --selftest; echo "release rc=$?"
+          ls -t ~/Library/Logs/DiagnosticReports/ 2>/dev/null | head -5
+          f=$(ls -t ~/Library/Logs/DiagnosticReports/rslite* 2>/dev/null | head -1)
+          [ -n "$f" ] && head -c 6000 "$f"
+          swift build -c debug --package-path macos-native --product rslite 2>&1 | tail -3
+          macos-native/.build/debug/rslite --selftest; echo "debug rc=$?"
       - name: rslite selftest
         shell: bash
         run: |
