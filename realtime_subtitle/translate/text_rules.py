@@ -134,6 +134,33 @@ def to_simplified_if_target(text, target_language):
 # 送去翻译前先归一化成 19:10 Uhr——冒号在任何语言里都只可能是时间，
 # 模型没有可误读的余地。只动喂给模型的文本，屏幕上和存档里的德语原文不变。
 _DE_CLOCK = re.compile(r'\b([01]?\d|2[0-3])\s*\.\s*\.?\s*([0-5]\d)(?=\s*Uhr\b)')
+# 常见德语补充缩写表（仅收录无歧义的非普通词缩写，避免句尾正常词被误判否决）
+_GERMAN_EXTRA_ABBREVIATIONS = {
+    # 称谓与人名前缀
+    "hr", "fr", "fa", "str",
+    # 法律、书籍、文献与时间编号
+    "kap", "bd", "jh",
+    # 常见短语缩写
+    "z.bsp", "u.ä", "o.ä", "z.zt", "e.v",
+    # 学位与头衔修饰
+    "med", "jur", "phil", "rer", "theol", "nat",
+}
+
+# 常见德语带空格多词缩写（如 "z. B.", "u. a.", "i. d. R."）
+_SPACED_ABBREVIATIONS = {
+    "z.b", "d.h", "u.a", "z.t", "v.a", "i.d.r", "u.u", "s.o", "s.u", "e.v", "a.d",
+}
+
+# 常见德语省略号前不应断句的不完整词（介词、冠词、连词、不完整助动词/情态词）
+_INCOMPLETE_BEFORE_ELLIPSIS = {
+    "der", "die", "das", "den", "dem", "des", "ein", "eine", "einer", "eines", "einem", "einen",
+    "mein", "meine", "dein", "deine", "sein", "seine", "ihr", "ihre", "unser", "unsere", "euer", "eure",
+    "in", "an", "auf", "für", "mit", "von", "zu", "bei", "nach", "über", "unter", "vor", "durch", "ohne", "um", "aus",
+    "und", "oder", "aber", "dass", "daß", "weil", "wenn", "ob", "als", "wie", "denn", "sowie",
+    "haben", "hat", "hatte", "hatten", "habe", "bin", "ist", "sind", "war", "waren", "wird", "werden", "wurde", "wurden",
+    "brauchen", "braucht", "brauchte",
+}
+
 
 
 def _normalize_clock_times(text):
@@ -164,9 +191,46 @@ def _boundary_is_real(candidate, remainder, final, lang=None):
     if tail.endswith("."):
         words = tail[:-1].split()
         token = words[-1] if words else ""
-        # ① 缩写否决：德语 bzw./z.B./ca. 这类缩写自带句号
-        if token.lower().strip(_QUOTE_CHARS) in config.SENTENCE_ABBREVIATIONS:
+        clean_token = token.lower().strip(_QUOTE_CHARS)
+        abbrevs = getattr(config, "SENTENCE_ABBREVIATIONS", set()) | _GERMAN_EXTRA_ABBREVIATIONS
+
+        # ①a 单词缩写否决（德语 bzw./z.B./ca./hr./fr. 等自带句号，含 Schiller-Str. 这类连字符复合）
+        token_base = clean_token.rsplit("-", 1)[-1]
+        if clean_token in abbrevs or token_base in abbrevs:
             return False
+
+        # ①b 带空格的多词缩写末尾否决（如 "z. B." -> "z.b", "i. d. R." -> "i.d.r"）
+        if len(words) >= 2:
+            w2 = words[-2].strip(_QUOTE_CHARS).rstrip(".")
+            part2 = f"{w2}.{clean_token}".lower()
+            if part2 in _SPACED_ABBREVIATIONS or part2 in abbrevs:
+                return False
+        if len(words) >= 3:
+            w3 = words[-3].strip(_QUOTE_CHARS).rstrip(".")
+            w2 = words[-2].strip(_QUOTE_CHARS).rstrip(".")
+            part3 = f"{w3}.{w2}.{clean_token}".lower()
+            if part3 in _SPACED_ABBREVIATIONS or part3 in abbrevs:
+                return False
+
+        # ①c 单字母缩写前缀否决（仅当与续行形成已知带空格缩写如 "z. B." 时否决；绝不否决句尾孤立大写单字母如 "Plan B.", "Vitamin D."）
+        if len(clean_token) == 1 and remainder:
+            m = re.match(r"^([A-Za-zÄÖÜäöü])\.", remainder)
+            if m:
+                nxt = m.group(1).lower()
+                pair = f"{clean_token}.{nxt}"
+                if pair in _SPACED_ABBREVIATIONS or pair in abbrevs:
+                    return False
+                if len(words) >= 2:
+                    w2 = words[-2].strip(_QUOTE_CHARS).rstrip(".")
+                    triple = f"{w2}.{clean_token}.{nxt}"
+                    if triple in _SPACED_ABBREVIATIONS or triple in abbrevs:
+                        return False
+            m3 = re.match(r"^([A-Za-zÄÖÜäöü])\.\s*([A-Za-zÄÖÜäöü])\.", remainder)
+            if m3:
+                triple = f"{clean_token}.{m3.group(1).lower()}.{m3.group(2).lower()}"
+                if triple in _SPACED_ABBREVIATIONS or triple in abbrevs:
+                    return False
+
         # ② 序数否决："am 3. Mai" 这种日期序数自带句号——注意德语名词首字母
         #    大写，"Mai" 是大写的，规则③抓不到这种，必须单独否决。
         #    ☠️ 只否决 1-2 位数（能当序数/日期的范围）。以前这里是无条件
@@ -177,8 +241,18 @@ def _boundary_is_real(candidate, remainder, final, lang=None):
         #    整整晚一句。新闻直播是主场景，年份/金额结尾极常见。
         #    四位数几乎不可能是序数，两位数（"Es waren genau 20."）仍按老规则
         #    保守合并，代价只是两句合成一次请求。
+        #    注意：三位数（如 100.）不可随意扩充否决，否则 "Das kostet 100." 接新句
+        #    大写名词时会造成切句失败（中文同样整整晚一句），故严格维持 1-2 位数范围。
         if token.isdigit() and len(token) <= 2:
             return False
+
+    # 省略号（"…" 或 "..."）句中停顿否决：若前一词是不完整词（介词/冠词/连词等），且后面仍有内容，不提前切句
+    if remainder and (tail.endswith("…") or tail.endswith("...")):
+        words = tail.rstrip("….").split()
+        prev_word = words[-1].lower().strip(_PUNCT_STRIP) if words else ""
+        if prev_word in _INCOMPLETE_BEFORE_ELLIPSIS:
+            return False
+
     if not remainder:
         # ③b 句尾扣留：后面还没有词，看不出这个句号是真是假。
         # final=True（收尾/有界放行）时不再等，照常成句
