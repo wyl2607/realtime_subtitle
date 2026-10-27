@@ -16,6 +16,24 @@ def test_sentence_waits_for_stability_and_duplicate_snapshots_do_not_reemit():
     assert differ.update("Guten Morgen.", now=20) == lc.CaptionUpdate([], "")
 
 
+def test_prime_skips_text_left_in_window_from_previous_run():
+    differ = lc.CaptionDiffer(stable_seconds=1)
+    differ.prime("Alter Satz von gestern. Noch ein alter")
+    assert differ.update("Alter Satz von gestern. Noch ein alter", now=5) == lc.CaptionUpdate([], "")
+    result = differ.update("Alter Satz von gestern. Noch ein alter Neuer Satz.", now=6)
+    assert result.finalized == [] and result.draft == "Neuer Satz."
+    assert differ.update("Alter Satz von gestern. Noch ein alter Neuer Satz.", now=7).finalized == ["Neuer Satz."]
+
+
+def test_late_punctuation_alone_is_not_a_sentence():
+    differ = lc.CaptionDiffer(stable_seconds=1)
+    differ.prime("Morgen wird es regnen")
+    assert differ.update("Morgen wird es regnen.", now=0).finalized == []
+    assert differ.update("Morgen wird es regnen.", now=2).finalized == []
+    assert differ.update("Morgen wird es regnen. Danke.", now=3).finalized == []
+    assert differ.update("Morgen wird es regnen. Danke.", now=5).finalized == ["Danke."]
+
+
 def test_new_text_finalizes_preceding_sentence_immediately():
     differ = lc.CaptionDiffer()
     result = differ.update("Der Zug kommt. Bitte warten", now=0)
@@ -230,10 +248,26 @@ def _fake_reader_environment(monkeypatch, tmp_path):
     return events
 
 
+class _FreshElement:
+    """连上那一刻窗口是空的（prime 读到 ""），之后才出现 text。"""
+
+    def __init__(self, text):
+        self._reads = 0
+        self._text = text
+
+    def Exists(self, *args):
+        return True
+
+    @property
+    def Name(self):
+        self._reads += 1
+        return "" if self._reads == 1 else self._text
+
+
 def test_reader_callbacks_and_restore_are_on_com_thread(monkeypatch, tmp_path):
     events = _fake_reader_environment(monkeypatch, tmp_path)
     reader = lc.LiveCaptionsReader("LiveCaptions.exe")
-    monkeypatch.setattr(reader, "_find_controls", lambda auto: (object(), SimpleNamespace(Exists=lambda *args: True, Name="Hallo.")))
+    monkeypatch.setattr(reader, "_find_controls", lambda auto: (object(), _FreshElement("Hallo.")))
     monkeypatch.setattr(reader, "_hide_window", lambda window: events.append(("hide", get_ident())))
     monkeypatch.setattr(reader, "_restore_windows", lambda: events.append(("restore", get_ident())))
     updates = []
@@ -310,7 +344,7 @@ def test_paused_reader_consumes_snapshots_without_replay(monkeypatch, tmp_path):
     pause.touch()
     reader = lc.LiveCaptionsReader("LiveCaptions.exe", hide_window=False)
     monkeypatch.setattr(reader, "_find_controls", lambda auto: (
-        object(), SimpleNamespace(Exists=lambda *args: True, Name="已暂停。新的草稿")))
+        object(), _FreshElement("已暂停。新的草稿")))
     updates = []
     completed = Event()
     def update(finalized, draft):
@@ -350,8 +384,26 @@ def test_window_visibility_is_restored_without_terminating_process(monkeypatch):
     reader = lc.LiveCaptionsReader("LiveCaptions.exe")
     reader._hide_window(SimpleNamespace(NativeWindowHandle=42))
     reader._restore_windows()
-    assert actions == [(42, 0), (42, 3)]
+    # 6 = SW_MINIMIZE；绝不能是 0（SW_HIDE 会让字幕元素从 UIA 树里消失）
+    assert actions == [(42, 6), (42, 3)]
     assert reader._hidden_windows == {}
+
+
+def test_already_minimized_window_is_left_alone(monkeypatch):
+    import ctypes
+    actions = []
+    user32 = SimpleNamespace(
+        IsWindowVisible=lambda handle: True,
+        IsIconic=lambda handle: True,
+        IsZoomed=lambda handle: False,
+        IsWindow=lambda handle: True,
+        ShowWindow=lambda handle, state: actions.append((handle, state)),
+    )
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(user32=user32), raising=False)
+    reader = lc.LiveCaptionsReader("LiveCaptions.exe")
+    reader._hide_window(SimpleNamespace(NativeWindowHandle=42))
+    reader._restore_windows()
+    assert actions == []  # 用户自己最小化的，停止时也别替他还原
 
 
 @pytest.fixture

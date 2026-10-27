@@ -88,6 +88,19 @@ class CaptionDiffer:
                 return (b1 if cursor > a0 else b0), True
         return len(text), True
 
+    def prime(self, text):
+        """把连上那一刻窗口里已有的文字记为"已交付"。
+
+        ☠️ 系统字幕窗会保留上一次的内容（本应用重启、或断线重连时都在）。
+        不先记下就会被当成新句子整段送去翻译和存档（2026-10-27 实测重放过）。
+        代价：连上时还没成句的尾巴也一起跳过，最多丢半句。
+        """
+        self._text = " ".join((text or "").split())
+        self._consumed = len(self._text)
+        self._candidate = ""
+        self._candidate_since = None
+        self._pending_since = None
+
     def update(self, text, now=None):
         now = time.monotonic() if now is None else now
         text = " ".join((text or "").split())
@@ -162,6 +175,9 @@ class CaptionDiffer:
         self._consumed = cursor
         if not tail:
             self._pending_since = None
+        # 系统字幕会事后给已交付的句子补标点，补上的那个 "." 会单独成"句"
+        # （真机实测）。一个字母/数字都没有的不送翻译。
+        finalized = [s for s in finalized if any(ch.isalnum() for ch in s)]
         return CaptionUpdate(finalized, tail)
 
 
@@ -228,7 +244,10 @@ def _running_caption_pids():
     # tasklist 是 Windows 自带工具；不经 shell，不解析本地化的提示行。
     result = subprocess.run(
         ["tasklist", "/FI", "IMAGENAME eq LiveCaptions.exe", "/FO", "CSV", "/NH"],
-        capture_output=True, text=True, timeout=3, check=True,
+        # ☠️ tasklist 按 OEM 代码页输出（德语系统表头是 "Abbildname"，cp850），
+        # 按默认 cp1252 解码会在读输出的线程里抛 UnicodeDecodeError。
+        capture_output=True, text=True, encoding="oem", errors="replace",
+        timeout=3, check=True,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     return {int(row[1]) for row in csv.reader(io.StringIO(result.stdout))
@@ -294,12 +313,18 @@ class LiveCaptionsReader:
             return
         user32 = self._user32()
         handle = window.NativeWindowHandle
-        if not handle or handle in self._hidden_windows or not user32.IsWindowVisible(handle):
+        if (not handle or handle in self._hidden_windows
+                or not user32.IsWindowVisible(handle) or user32.IsIconic(handle)):
             return
-        # 记住用户原来的最大化/最小化状态，停止时恢复，绝不终止系统字幕进程。
-        state = 2 if user32.IsIconic(handle) else 3 if user32.IsZoomed(handle) else 8
+        # ☠️ 只能最小化（SW_MINIMIZE=6），不能 SW_HIDE。2026-10-27 真机实测：
+        # SW_HIDE 之后 CaptionsTextBlock 从 UIA 树里消失，Exists() 恒为 False，
+        # 读取线程陷入"连上→隐藏→元素消失→重连"死循环，一个字都读不到；
+        # 最小化后元素仍在、Name 照常随语音刷新。最小化还有个好处：本程序崩了，
+        # 用户从任务栏就能把系统字幕窗点回来，不会"丢窗口"。
+        # 记住用户原来的最大化/普通状态，停止时恢复，绝不终止系统字幕进程。
+        state = 3 if user32.IsZoomed(handle) else 9
         self._hidden_windows[handle] = state
-        user32.ShowWindow(handle, 0)
+        user32.ShowWindow(handle, 6)
 
     def _restore_windows(self):
         if not self._hidden_windows:
@@ -332,8 +357,9 @@ class LiveCaptionsReader:
                         try:
                             self._hide_window(window)
                         except Exception:
-                            # 某些系统布局不允许隐藏；这不能阻止读取字幕。
-                            print("⚠️ 无法隐藏 Windows 实时字幕窗口，将保持可见。")
+                            # 某些系统布局不允许最小化；这不能阻止读取字幕。
+                            print("⚠️ 无法最小化 Windows 实时字幕窗口，将保持可见。")
+                        self._differ.prime(getattr(element, "Name"))
                         if on_status:
                             on_status(STATUS_LOCAL)
                         while not self._stop.is_set() and not os.path.exists(repo_path(".stop")):
@@ -348,7 +374,7 @@ class LiveCaptionsReader:
                             delay = RECONNECT_INITIAL_SECONDS
                             self._stop.wait(POLL_INTERVAL_SECONDS)
                     finally:
-                        # 异常路径也恢复，隐藏的窗口否则可能无法在重连时被 UIA 找到。
+                        # 异常路径也恢复，最小化的窗口否则会一直留在任务栏里。
                         self._restore_windows()
                         window = element = None
             except Exception:

@@ -9,7 +9,7 @@ ASR_SOURCE = "whisper"  # whisper / livecaptions
 # livecaptions 仅 Windows 11 22H2+；识别语言在 Windows 实时字幕设置中选择。
 # Windows 实时字幕在设备上识别，音频和文字默认留在本机；翻译仍走现有本机后端。
 # 源/目标语言对仍由本应用设置（请与 Windows 识别语言对应）。
-LIVE_CAPTIONS_HIDE_WINDOW = True  # 读取期间隐藏系统字幕窗，停止时恢复
+LIVE_CAPTIONS_HIDE_WINDOW = True  # 读取期间把系统字幕窗最小化（不能隐藏，见 live_captions.py），停止时恢复
 
 # ============ Whisper 模型配置 ============
 # whisper / sensevoice：只用于节点分段识别；本机流式识别仍用 Whisper 词时间戳。
