@@ -1,14 +1,12 @@
 """会话级双语 SRT / CSV 导出与保留期清理的单元测试。"""
 import csv
 from datetime import datetime
-import os
 import time
 
 import pytest
 
 import realtime_subtitle.config as config
 from realtime_subtitle.translate.transcript import (
-    TranscriptMixin,
     _srt_time,
     estimate_duration,
 )
