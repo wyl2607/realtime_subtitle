@@ -1178,6 +1178,8 @@ class SubtitleApp:
         self.running = False
         self.translator = None
         self.audio_capture = None
+        self.live_captions_reader = None
+        self._live_captions_status = "本机·Windows实时字幕"
         self.remote = None
 
         # 这台机器的"正常档位"翻译模型：必须在任何模式切换之前拍快照
@@ -1307,15 +1309,23 @@ class SubtitleApp:
                 return
             # 延迟导入：见模块顶部说明（窗口出现前不付 numpy/requests 的 import）。
             from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
-            # 翻译器（Whisper 模型 + Ollama 预热，启动耗时大头）
-            translator = WhisperQueueTranslator()
+            from realtime_subtitle.capture.live_captions import prepare_live_captions_reader
+
+            reader = prepare_live_captions_reader(
+                getattr(config, "ASR_SOURCE", "whisper"),
+                hide_window=getattr(config, "LIVE_CAPTIONS_HIDE_WINDOW", True))
+            # 先检查可选识别源，失败时走完整 Whisper 初始化路径。
+            translator = WhisperQueueTranslator(
+                asr_source="livecaptions" if reader is not None else "whisper")
+            self.live_captions_reader = reader
             if self._closing:
                 translator.shutdown()
                 return
 
             # 接线：识别提交的德语立即上屏（live行），翻译完成变句对
             # 两个回调都走Qt信号，从任何线程调都安全
-            translator.on_display = self.subtitle_window.update_live
+            translator.on_display = (self._display_live_captions if reader is not None
+                                     else self.subtitle_window.update_live)
             translator.on_pair = self.subtitle_window.add_pair
             translator.on_draft = self.subtitle_window.update_draft
             translator.on_status = self.subtitle_window.show_status
@@ -1341,21 +1351,30 @@ class SubtitleApp:
             self.subtitle_window.on_deep_explain = (
                 lambda sentence, cb: self.translator.deep_explain(sentence, cb))
 
-            # 音频捕获（设备名/设备切换提示直接上悬浮窗）。构造要开WASAPI流，
-            # 有几百毫秒窗口，之后再查一次 _closing 才真正启动采集/热键
-            from realtime_subtitle.capture.audio_capture import AudioCapture
+            if reader is not None:
+                if self._closing:
+                    return
+                self.running = True
+                reader.start(translator.enqueue_captions, self._on_live_captions_status)
+                # stop() 与后台加载并发；覆盖检查到 start 之间的退出窗口。
+                if self._closing:
+                    reader.stop()
+                    return
+            else:
+                # 构造会开 WASAPI 流；Live Captions 模式不导入音频驱动。
+                from realtime_subtitle.capture.audio_capture import AudioCapture
 
-            audio_capture = AudioCapture(
-                callback=self.on_audio_received,
-                on_status=self.subtitle_window.show_status)
-            if self._closing:
-                audio_capture.stop()
-                return
-            self.audio_capture = audio_capture
+                audio_capture = AudioCapture(
+                    callback=self.on_audio_received,
+                    on_status=self.subtitle_window.show_status)
+                if self._closing:
+                    audio_capture.stop()
+                    return
+                self.audio_capture = audio_capture
+                self.running = True
+                self.audio_capture.start()
 
             print("✅ 所有组件初始化完成")
-            self.running = True
-            self.audio_capture.start()
             # 模型加载完才开始盯内存：加载 Whisper + 预热翻译模型时压力本来就会
             # 冲高，算进去的话一启动就被降档（M2 e2e 实测：启动即 4b→2b，之后
             # 要 5 分钟以上才升回，这段时间中文明显更差）
@@ -1364,6 +1383,9 @@ class SubtitleApp:
             if sys.platform != "darwin":
                 self._setup_hotkey()
         except Exception as e:
+            reader = getattr(self, "live_captions_reader", None)
+            if reader is not None:
+                reader.stop()
             print(f"❌ 初始化失败: {e}")
             import traceback
             traceback.print_exc()
@@ -1435,7 +1457,9 @@ class SubtitleApp:
 
         cloud_on = cloud_active()
         node_on = node_active()
-        if not cloud_on and not node_on:
+        if (getattr(self.translator, "asr_source", "whisper") == "livecaptions"
+                or (not cloud_on and not node_on)):
+            # 系统字幕是完整的本机识别源，不启动任何远端音频识别客户端。
             self._close_remote()
             if self.translator is not None:
                 self.translator.on_pair = self.subtitle_window.add_pair
@@ -1509,7 +1533,23 @@ class SubtitleApp:
             return
         window.settings_window.refresh_from_config()
 
+    def _display_live_captions(self, committed, unstable):
+        if self._closing:
+            return
+        self.subtitle_window.update_live(committed, unstable)
+        # update_live 会清掉状态行；同一线程按序发 Qt 信号把识别来源补回去。
+        self.subtitle_window.show_status(self._route_status_text())
+
+    def _on_live_captions_status(self, text):
+        if self._closing:
+            return
+        self._live_captions_status = text
+        # show_status 发 Qt 信号；不从 UIA 线程直接触碰 QWidget。
+        self.subtitle_window.show_status(text)
+
     def _route_status_text(self):
+        if getattr(getattr(self, "translator", None), "asr_source", "whisper") == "livecaptions":
+            return getattr(self, "_live_captions_status", "本机·Windows实时字幕")
         remote = self.remote
         if remote is not None:
             try:
@@ -1564,7 +1604,7 @@ class SubtitleApp:
 
     def _toggle_pause(self):
         """暂停/继续（和 暂停继续字幕.bat 完全等价：切换.paused标记文件）"""
-        from realtime_subtitle.capture.audio_capture import PAUSE_FLAG_FILE
+        PAUSE_FLAG_FILE = repo_path(".paused")
 
         try:
             if os.path.exists(PAUSE_FLAG_FILE):
@@ -1918,6 +1958,11 @@ class SubtitleApp:
             from realtime_subtitle.ui import macos_hotkeys
             macos_hotkeys.unregister_all()
 
+        # 先停 UIA 生产者并恢复系统字幕窗，再关闭共享翻译队列。
+        reader = getattr(self, "live_captions_reader", None)
+        if reader is not None:
+            reader.stop()
+
         # 先停止音频捕获，避免向已关闭的线程池提交新任务
         if self.audio_capture is not None:
             try:
@@ -1974,11 +2019,15 @@ class SubtitleApp:
         print("   6. 点击 ❌ 按钮可退出程序")
         print("   7. 或按 Ctrl+C 中断程序")
         print("\n⚙️  当前配置：")
-        from realtime_subtitle.asr.backends import describe_whisper_backend
-        print(f"   - 识别: {describe_whisper_backend()}")
-        print(f"   - 处理模式: local agreement 增量识别 (每{config.CHUNK_SUBMIT_SECONDS}秒一块, 缓冲上限{config.BUFFER_TRIM_SEC:.0f}秒)")
-        print(f"   - 收尾静音: {config.IDLE_FLUSH_SEC}秒")
-        print(f"   - 翻译: Qwen + Whisper (Ollama {config.OLLAMA_MODEL})")
+        if getattr(self.translator, "asr_source", "whisper") == "livecaptions":
+            print("   - 识别: Windows 实时字幕（本机，识别语言在 Windows 设置中选择）")
+            print("   - 处理模式: UI Automation 文本轮询（约150毫秒）")
+        else:
+            from realtime_subtitle.asr.backends import describe_whisper_backend
+            print(f"   - 识别: {describe_whisper_backend()}")
+            print(f"   - 处理模式: local agreement 增量识别 (每{config.CHUNK_SUBMIT_SECONDS}秒一块, 缓冲上限{config.BUFFER_TRIM_SEC:.0f}秒)")
+            print(f"   - 收尾静音: {config.IDLE_FLUSH_SEC}秒")
+        print(f"   - 翻译: Ollama {config.OLLAMA_MODEL}")
         print(f"   - 源语言: {config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)}")
         print(f"   - 路由: {self._route_status_text()}")
         from realtime_subtitle.translate.translator_queue import log_language_startup

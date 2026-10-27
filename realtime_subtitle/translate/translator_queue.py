@@ -538,8 +538,9 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
     _ollama_verify_next = 0.0        # 下次允许重新校验的时刻（节流）
     on_translate_failed = None
 
-    def __init__(self):
-        """初始化翻译器"""
+    def __init__(self, asr_source="whisper"):
+        """初始化翻译器；系统字幕只复用翻译队列，不创建 Whisper。"""
+        self.asr_source = asr_source
         self._translate_backend, self.apple_translator = _select_translate_backend()
         # ☠️ Ollama 后端的第一件事：确认翻译地址在本机。Apple 后端不把句子发给
         # Ollama，启动时也不该因为 Ollama 没开而报"只显示德语"；查词/AI 分析
@@ -547,12 +548,17 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         if self._translate_backend != "apple":
             _assert_local_ollama(config.OLLAMA_BASE_URL)
 
-        from realtime_subtitle.asr.backends import describe_whisper_backend, selected_whisper_backend
-        print("🔄 正在加载 Whisper 模型...")
-        print(f"   {describe_whisper_backend()}")
+        if self.asr_source == "livecaptions":
+            print("🔄 使用 Windows 实时字幕（识别语言请在 Windows 设置中选择）")
+            self._backlog_warn_at = (6, 12)
+        else:
+            from realtime_subtitle.asr.backends import describe_whisper_backend, selected_whisper_backend
+            print("🔄 正在加载 Whisper 模型...")
+            print(f"   {describe_whisper_backend()}")
         # "GPU繁忙"提示阈值（块数）。CUDA 上单次识别 ~0.26s，攒 6 块就是真落后；
         # Mac(MLX) 单次 ~2.4s，每轮本来就攒 ~5 块，6 块是稳态——按 6 报会刷屏
-        self._backlog_warn_at = (12, 24) if selected_whisper_backend() == "mlx" else (6, 12)
+        if self.asr_source != "livecaptions":
+            self._backlog_warn_at = (12, 24) if selected_whisper_backend() == "mlx" else (6, 12)
 
         start_time = time.time()
 
@@ -562,10 +568,11 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             _spawn_startup_warm()
 
         try:
-            from realtime_subtitle.asr.backends import create_whisper_model
+            if self.asr_source != "livecaptions":
+                from realtime_subtitle.asr.backends import create_whisper_model
 
-            self.model = create_whisper_model()
-            self.processor = OnlineASRProcessor(self.model)
+                self.model = create_whisper_model()
+                self.processor = OnlineASRProcessor(self.model)
 
             # committed 但还没凑成完整句子的德语残句
             self.pending_text = ""
@@ -767,8 +774,11 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
                                         new_model=config.OLLAMA_MODEL)
 
             elapsed = time.time() - start_time
-            print(f"✅ Whisper 模型加载完成！({elapsed:.1f}秒)")
-            print(f"✅ local agreement 增量识别已启用（缓冲上限 {config.BUFFER_TRIM_SEC:.0f}秒）")
+            if self.asr_source == "livecaptions":
+                print(f"✅ Windows 实时字幕翻译队列已就绪 ({elapsed:.1f}秒)")
+            else:
+                print(f"✅ Whisper 模型加载完成！({elapsed:.1f}秒)")
+                print(f"✅ local agreement 增量识别已启用（缓冲上限 {config.BUFFER_TRIM_SEC:.0f}秒）")
 
         except Exception as e:
             print(f"❌ 模型加载失败: {e}")
@@ -1346,7 +1356,9 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             translation = self._translate_single_sentence(
                 german, context, on_partial=self._epoch_gated_draft(epoch))
             tx_elapsed = time.time() - t0
-            self._stat_note_tx(tx_elapsed)
+            # 系统字幕不跑 ASR 的分钟统计清空逻辑，不能无限积累翻译耗时样本。
+            if getattr(self, "asr_source", "whisper") != "livecaptions":
+                self._stat_note_tx(tx_elapsed)
             if config.SHOW_PERFORMANCE:
                 print(f"   🔤 翻译{len(batch)}句 {tx_elapsed:.1f}秒: {german[:50]}{'...' if len(german) > 50 else ''}")
         except requests.ReadTimeout:
@@ -1479,7 +1491,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         except RuntimeError:
             pass  # 程序正在退出
 
-    def _epoch_gated_draft(self, epoch):
+    def _epoch_gated_draft(self, epoch, snapshot=None):
         """给流式partial套上代数/退出检查：切语言或退出后不再往屏幕推旧内容"""
         def emit(text):
             if self.closing or not self.on_draft:
@@ -1487,6 +1499,8 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             with self._tx_lock:
                 if epoch != self._tx_epoch:
                     return
+            if snapshot is not None and not self.pending_text.startswith(snapshot):
+                return  # 系统字幕末句可能已修订；旧草稿的流式片段一起作废
             self._emit_draft(text)
         return emit
 
@@ -1505,8 +1519,9 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         # _asr_busy，照这条让路等于草稿永远不出（实测 24 秒 10 轮 = 0 次）。
         if self._asr_busy and getattr(self, "_translate_backend", "ollama") != "apple":
             return
+        live_snapshot = snapshot if getattr(self, "asr_source", "whisper") == "livecaptions" else None
         translation = self._translate_single_sentence(
-            snapshot, context, on_partial=self._epoch_gated_draft(epoch))
+            snapshot, context, on_partial=self._epoch_gated_draft(epoch, live_snapshot))
         with self._tx_lock:
             if epoch != self._tx_epoch:
                 return  # 期间切了语言，草稿作废
@@ -1893,8 +1908,42 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         except RuntimeError:
             pass  # 程序正在退出
 
+    def enqueue_captions(self, finalized, draft):
+        """UIA 线程只投递文本；不在它持有 COM 控件时进入翻译锁。"""
+        if self.closing:
+            return
+        revision = self._lang_revision
+        try:
+            self._asr_executor.submit(
+                self._process_captions, tuple(finalized), draft, revision)
+        except RuntimeError:
+            pass  # 退出时线程池已关闭
+
+    def _process_captions(self, finalized, draft, revision):
+        # ☠️ 与语言切换共用单线程 ASR 池：pending_text/语言扣留状态不能由
+        # UIA 线程直接改。_enqueue_sentences 自己拿 _tx_lock，外层不要嵌套拿锁。
+        if self.closing or revision != self._lang_revision:
+            return
+        previous = self.pending_text
+        self.pending_text = draft
+        if previous and not draft.startswith(previous):
+            self._draft_last_text = ""
+            self._emit_draft("")  # 修订/成句之后撤掉旧尾句的译文，短新尾句也适用
+        sentences = []
+        for text in finalized:
+            if text.strip():
+                sentence = self._make_timed_sentence(text, [])
+                # UIA 没有音频时间戳；保留唯一键供失败重试/存档路径使用。
+                sentence.key = f"livecaptions:{self._sentence_seq}"
+                sentences.append(sentence)
+        self._enqueue_sentences(sentences)
+        self._emit_display()
+        self._maybe_draft()
+
     def request_flush(self):
         """main的定时器调用：空闲收尾。识别忙着就不插队（它自己会消化）"""
+        if getattr(self, "asr_source", "whisper") == "livecaptions":
+            return  # 成句稳定期/无标点兜底由 CaptionDiffer 管，不碰音频 processor
         with self._asr_lock:
             if self._asr_scheduled or self._audio_inbox:
                 return
