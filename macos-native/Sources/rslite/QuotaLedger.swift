@@ -19,28 +19,40 @@ struct QuotaUsage: Equatable {
 struct QuotaLedgerSnapshot: Codable, Equatable {
     var events: [QuotaLedgerEvent]
     var requestCorrections: [QuotaRequestCorrection]
-    /// 最近一条带有效服务端恢复头的响应所给出的恢复时刻。
-    var serverResetAt: Double?
     /// 已消费的恢复时刻；避免旧周期的本地事件在锚点被清除后重新计入日用量。
     var dayEpoch: Double?
+    /// 可信 RPD 恢复记录。四个字段必须同时有效，否则按没有记录处理。
+    var resetAt: Double?
+    var observedAt: Double?
+    var resetKeyFingerprint: String?
+    var resetConsumed: Bool?
 
     enum CodingKeys: String, CodingKey {
         case events
         case requestCorrections = "request_corrections"
-        case serverResetAt = "server_reset_at"
         case dayEpoch = "day_epoch"
+        case resetAt = "reset_at"
+        case observedAt = "observed_at"
+        case resetKeyFingerprint = "key_fp"
+        case resetConsumed = "consumed"
     }
 
     init(
         events: [QuotaLedgerEvent] = [],
         requestCorrections: [QuotaRequestCorrection] = [],
-        serverResetAt: Double? = nil,
-        dayEpoch: Double? = nil
+        dayEpoch: Double? = nil,
+        resetAt: Double? = nil,
+        observedAt: Double? = nil,
+        resetKeyFingerprint: String? = nil,
+        resetConsumed: Bool? = nil
     ) {
         self.events = events
         self.requestCorrections = requestCorrections
-        self.serverResetAt = serverResetAt
         self.dayEpoch = dayEpoch
+        self.resetAt = resetAt
+        self.observedAt = observedAt
+        self.resetKeyFingerprint = resetKeyFingerprint
+        self.resetConsumed = resetConsumed
     }
 
     init(from decoder: Decoder) throws {
@@ -48,16 +60,37 @@ struct QuotaLedgerSnapshot: Codable, Equatable {
         // 两个列表仍是必填：缺键说明文件坏了，要走隔离 + 饱和，不能读成空账本。
         events = try container.decode([QuotaLedgerEvent].self, forKey: .events)
         requestCorrections = try container.decode([QuotaRequestCorrection].self, forKey: .requestCorrections)
-        serverResetAt = try container.decodeIfPresent(Double.self, forKey: .serverResetAt)
         dayEpoch = try container.decodeIfPresent(Double.self, forKey: .dayEpoch)
+        // 恢复记录是可选扩展：任一字段损坏只丢记录，绝不能隔离整份账本。
+        let resetAt = try? container.decodeIfPresent(Double.self, forKey: .resetAt)
+        let observedAt = try? container.decodeIfPresent(Double.self, forKey: .observedAt)
+        let keyFP = try? container.decodeIfPresent(String.self, forKey: .resetKeyFingerprint)
+        let consumed = try? container.decodeIfPresent(Bool.self, forKey: .resetConsumed)
+        if let resetAt, let observedAt, let keyFP, !keyFP.isEmpty, let consumed,
+           resetAt.isFinite, observedAt.isFinite,
+           // 解码也要验证写入时的范围，坏可选证明不能提前确认翻日。
+           resetAt - observedAt >= 0, resetAt - observedAt <= 86_460 {
+            self.resetAt = resetAt
+            self.observedAt = observedAt
+            resetKeyFingerprint = keyFP
+            resetConsumed = consumed
+        } else {
+            self.resetAt = nil
+            self.observedAt = nil
+            resetKeyFingerprint = nil
+            resetConsumed = nil
+        }
     }
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(events, forKey: .events)
         try container.encode(requestCorrections, forKey: .requestCorrections)
-        try container.encodeIfPresent(serverResetAt, forKey: .serverResetAt)
         try container.encodeIfPresent(dayEpoch, forKey: .dayEpoch)
+        try container.encodeIfPresent(resetAt, forKey: .resetAt)
+        try container.encodeIfPresent(observedAt, forKey: .observedAt)
+        try container.encodeIfPresent(resetKeyFingerprint, forKey: .resetKeyFingerprint)
+        try container.encodeIfPresent(resetConsumed, forKey: .resetConsumed)
     }
 }
 
@@ -66,17 +99,25 @@ struct QuotaLedgerEvent: Codable, Equatable {
     var billedS: Double
     /// 实际音频秒（round 3 位）。旧账本没有这个字段，读出时是 nil。
     var durS: Double?
+    /// 同秒请求不能靠时间戳区分是否已被响应确认；nil 仅用于旧账本迁移。
+    var inServerDay: Bool?
+    /// 关联上传和响应；同一墙钟时刻的并发请求也必须分别确认。
+    var requestID: String?
 
     enum CodingKeys: String, CodingKey {
         case ts
         case billedS = "billed_s"
         case durS = "dur_s"
+        case inServerDay = "in_server_day"
+        case requestID = "request_id"
     }
 
-    init(ts: Double, billedS: Double, durS: Double? = nil) {
+    init(ts: Double, billedS: Double, durS: Double? = nil, inServerDay: Bool? = nil, requestID: String? = nil) {
         self.ts = ts
         self.billedS = billedS
         self.durS = durS
+        self.inServerDay = inServerDay
+        self.requestID = requestID
     }
 
     init(from decoder: Decoder) throws {
@@ -90,6 +131,10 @@ struct QuotaLedgerEvent: Codable, Equatable {
         }
         // dur_s 是可选：旧账本没有它，NaN/Infinity 被换成 null 后也按缺失处理。
         durS = try? container.decodeIfPresent(Double.self, forKey: .durS)
+        // 缺字段才按旧格式推断；已有字段损坏时按未确认处理，不能低估用量。
+        inServerDay = container.contains(.inServerDay)
+            ? ((try? container.decode(Bool.self, forKey: .inServerDay)) ?? false) : nil
+        requestID = try? container.decodeIfPresent(String.self, forKey: .requestID)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -97,6 +142,8 @@ struct QuotaLedgerEvent: Codable, Equatable {
         try container.encode(ts, forKey: .ts)
         try container.encode(billedS, forKey: .billedS)
         try container.encodeIfPresent(durS, forKey: .durS)
+        try container.encodeIfPresent(inServerDay, forKey: .inServerDay)
+        try container.encodeIfPresent(requestID, forKey: .requestID)
     }
 }
 
@@ -115,6 +162,12 @@ final class QuotaLedger: @unchecked Sendable {
     private let limits: QuotaLedgerLimits
     private let lock = NSLock()
     private var snapshot: QuotaLedgerSnapshot
+    /// 单调钟只在当前进程有效，故绝不写入账本。
+    private var observedResetMonotonic: Double?
+    private var quotaHot = false
+    private var resetConfirmationPending = false
+    private var activeKeyFingerprint: String?
+    private var hasBoundKey = false
 
     init(
         url: URL = QuotaLedger.defaultURL,
@@ -124,19 +177,23 @@ final class QuotaLedger: @unchecked Sendable {
         self.url = url
         self.limits = limits
         // 文件不存在是空账本。文件在，但读不到或解不开，才隔离并饱和 24 小时。
-        guard FileManager.default.fileExists(atPath: url.path) else {
+        if !FileManager.default.fileExists(atPath: url.path) {
             snapshot = QuotaLedgerSnapshot()
-            return
-        }
-        do {
-            let data = try Data(contentsOf: url)
-            snapshot = Self.pruned(try Self.decodeSnapshot(data), now: now)
-        } catch {
-            let quarantined = Self.quarantine(url)
-            snapshot = Self.saturatedSnapshot(now: now, requestLimit: limits.requestsPerDay)
-            if quarantined {
-                try? persistLocked()
+        } else {
+            do {
+                let data = try Data(contentsOf: url)
+                snapshot = Self.pruned(try Self.decodeSnapshot(data), now: now)
+            } catch {
+                let quarantined = Self.quarantine(url)
+                snapshot = Self.saturatedSnapshot(now: now, requestLimit: limits.requestsPerDay)
+                if quarantined {
+                    try? persistLocked()
+                }
             }
+        }
+        // 重启前已进额度冷却时，恢复记录仍须能在翻日后发出确认事件。
+        if usageLocked(now: now).usagePercent >= 90 {
+            quotaHot = true
         }
     }
 
@@ -145,72 +202,175 @@ final class QuotaLedger: @unchecked Sendable {
     }
 
     @discardableResult
-    func recordRequest(duration: Double, at now: Date = Date()) throws -> Double {
+    func recordRequest(duration: Double, at now: Date = Date(), requestID: String? = nil) throws -> Double {
         lock.lock()
         defer { lock.unlock() }
         let billed = max(10, duration)
-        snapshot.events.append(QuotaLedgerEvent(ts: now.timeIntervalSince1970, billedS: billed, durS: Self.round3(duration)))
+        snapshot.events.append(QuotaLedgerEvent(ts: now.timeIntervalSince1970, billedS: billed, durS: Self.round3(duration), inServerDay: false, requestID: requestID))
         snapshot = Self.pruned(snapshot, now: now)
         try persistLocked()
         return billed
     }
 
-    func correctRemainingRequests(_ headers: [AnyHashable: Any], at now: Date = Date()) throws {
-        let remaining = Self.remainingRequests(from: headers)
-        let resetSeconds = Self.resetRequestsSeconds(from: headers)
-        guard remaining != nil || resetSeconds != nil else {
-            return
-        }
+    /// 非记账的 key 绑定；不能等新响应回来才清掉旧证明，否则发请求前会先确认旧边界。
+    func observeKey(_ keyFingerprint: String?) throws {
         lock.lock()
         defer { lock.unlock() }
-        let ts = now.timeIntervalSince1970
-        if let resetSeconds {
-            if let oldReset = snapshot.serverResetAt, oldReset <= ts {
-                snapshot.dayEpoch = max(snapshot.dayEpoch ?? -.infinity, oldReset)
-            }
-            // 每个带有效恢复头的响应都以自身时刻重新锚定，最新值覆盖旧值。
-            snapshot.serverResetAt = ts + resetSeconds
-        } else if remaining != nil, let oldReset = snapshot.serverResetAt, ts >= oldReset {
-            // 恢复后的首个 remaining 样本是新周期基线；先消费锚点以隔离旧本地事件。
-            snapshot.dayEpoch = max(snapshot.dayEpoch ?? -.infinity, oldReset)
-            snapshot.serverResetAt = nil
+        activeKeyFingerprint = keyFingerprint
+        hasBoundKey = true
+        if let oldFP = snapshot.resetKeyFingerprint, oldFP != keyFingerprint {
+            clearResetRecordLocked()
+            try persistLocked()
         }
+    }
+
+    /// 记录一个带配额头的响应。`keyFingerprint` 永远是不可逆指纹，不能传原始 key。
+    func note(
+        _ headers: [AnyHashable: Any],
+        at now: Date = Date(),
+        keyFingerprint: String? = nil,
+        sentAt: Date? = nil,
+        requestID: String? = nil,
+        monotonicNow: Double = ProcessInfo.processInfo.systemUptime
+    ) throws {
+        let remaining = Self.remainingRequests(from: headers)
+        let resetSeconds = Self.resetRequestsSeconds(from: headers)
+        lock.lock()
+        defer { lock.unlock() }
+        // 显式观察到的当前 key 优先；迟到回调不能把旧 key 重新绑定回来。
+        guard !hasBoundKey || (activeKeyFingerprint != nil && keyFingerprint == activeKeyFingerprint) else { return }
+        let ts = now.timeIntervalSince1970
+        var changed = false
+        // 不同 key 的响应不能延用旧 key 的恢复证明；服务端用量下限故意保留。
+        if let oldFP = snapshot.resetKeyFingerprint, oldFP != keyFingerprint {
+            clearResetRecordLocked()
+            changed = true
+        }
+        // 无头响应也能证明已经换 key，必须先清旧证明并落盘再返回。
+        guard remaining != nil || resetSeconds != nil else {
+            if changed { try persistLocked() }
+            return
+        }
+
+        // 必须在换 key 后判定：新 key 的第一条响应没有 sent_at 也能建立自己的恢复记录。
+        // 已确认边界独立于待恢复记录保留；新记录不能遮住上一周期的截止点。
+        let elapsedResetAt = snapshot.resetAt.flatMap { ts >= $0 ? $0 : nil }
+        let cutoff = max(snapshot.dayEpoch ?? -.infinity, elapsedResetAt ?? -.infinity)
+        let stalePostReset = cutoff.isFinite && (sentAt == nil || sentAt!.timeIntervalSince1970 < cutoff)
+
+        // 翻日后旧请求（或来源未知的请求）返回的头一律不能影响新周期。
+        if stalePostReset {
+            changed = refreshRolloverLocked(now: now, monotonicNow: monotonicNow) || changed
+            if changed { try persistLocked() }
+            return
+        }
+
         // x-ratelimit-remaining-requests 是每日剩余（上限 requestsPerDay），不是每分钟。
-        if let remaining {
+        if let remaining, Self.isValidRemaining(remaining, limit: limits.requestsPerDay) {
             let usedDay = max(0, limits.requestsPerDay - remaining)
             snapshot.requestCorrections.append(QuotaRequestCorrection(ts: ts, usedRequests: usedDay))
+            // 响应只确认自己的请求；其它并发或无头请求不能借此免记。
+            let acknowledgedIndex: Int?
+            if let requestID {
+                acknowledgedIndex = snapshot.events.firstIndex { $0.requestID == requestID }
+            } else {
+                // 旧调用方没有 ID 时，最多确认一个时间吻合的未确认请求。
+                let requestAt = (sentAt ?? now).timeIntervalSince1970
+                let matches = snapshot.events.indices.filter { snapshot.events[$0].ts == requestAt && snapshot.events[$0].inServerDay != true }
+                acknowledgedIndex = matches.count == 1 ? matches.first : nil
+            }
+            if let acknowledgedIndex { snapshot.events[acknowledgedIndex].inServerDay = true }
+            changed = true
+        }
+        // 只有同一响应同时拥有合法的两个头和 key 指纹，才能生成或替换恢复记录。
+        if let remaining,
+           Self.isValidRemaining(remaining, limit: limits.requestsPerDay),
+           let resetSeconds,
+           resetSeconds.isFinite, resetSeconds >= 0, resetSeconds <= Self.maximumResetSeconds,
+           let keyFingerprint, !keyFingerprint.isEmpty {
+            // 旧记录已过恢复点但还没被路由事件消费时，先推进锚点再替换，
+            // 否则上个周期的本地请求会重新计入 24h 请求数。
+            if rolloverConfirmedLocked(now: now, monotonicNow: monotonicNow), let oldResetAt = snapshot.resetAt {
+                snapshot.dayEpoch = max(snapshot.dayEpoch ?? -.infinity, oldResetAt)
+            }
+            snapshot.resetAt = ts + resetSeconds
+            snapshot.observedAt = ts
+            snapshot.resetKeyFingerprint = keyFingerprint
+            snapshot.resetConsumed = false
+            observedResetMonotonic = monotonicNow
+            resetConfirmationPending = false
+            changed = true
         }
         snapshot = Self.pruned(snapshot, now: now)
-        try persistLocked()
+        changed = refreshRolloverLocked(now: now, monotonicNow: monotonicNow) || changed
+        if changed { try persistLocked() }
     }
 
-    func usage(at now: Date = Date()) -> QuotaUsage {
+    /// 兼容 #87 的调用名；新调用方应使用 `note` 传入可信上下文。
+    func correctRemainingRequests(
+        _ headers: [AnyHashable: Any],
+        at now: Date = Date(),
+        keyFingerprint: String? = nil,
+        sentAt: Date? = nil,
+        requestID: String? = nil,
+        monotonicNow: Double = ProcessInfo.processInfo.systemUptime
+    ) throws {
+        try note(headers, at: now, keyFingerprint: keyFingerprint, sentAt: sentAt, requestID: requestID, monotonicNow: monotonicNow)
+    }
+
+    func usage(at now: Date = Date(), monotonicNow: Double = ProcessInfo.processInfo.systemUptime) -> QuotaUsage {
         lock.withLockValue {
-            usageLocked(now: now)
+            _ = refreshRolloverLocked(now: now, monotonicNow: monotonicNow)
+            let confirmedResetAt = rolloverConfirmedLocked(now: now, monotonicNow: monotonicNow)
+                ? snapshot.resetAt
+                : nil
+            return usageLocked(now: now, confirmedResetAt: confirmedResetAt)
         }
     }
 
-    func applyQuotaEvent(to context: inout CloudRouteContext, at now: Date = Date()) {
-        let percent = usage(at: now).usagePercent
-        context.apply(RouteEvent(type: "quota_update", status: nil, retryAfter: nil, usagePercent: percent))
+    func applyQuotaEvent(
+        to context: inout CloudRouteContext,
+        at now: Date = Date(),
+        monotonicNow: Double = ProcessInfo.processInfo.systemUptime
+    ) {
+        lock.withLockVoid {
+            _ = refreshRolloverLocked(now: now, monotonicNow: monotonicNow, consume: true)
+            let percent = usageLocked(now: now).usagePercent
+            if resetConfirmationPending {
+                resetConfirmationPending = false
+                context.apply(RouteEvent(type: "quota_reset_confirmed", status: nil, retryAfter: nil, usagePercent: percent))
+            } else {
+                context.apply(RouteEvent(type: "quota_update", status: nil, retryAfter: nil, usagePercent: percent))
+                if context.cloudState == .cooldownQuota {
+                    quotaHot = true
+                }
+            }
+        }
     }
 
-    private func usageLocked(now: Date) -> QuotaUsage {
+    private func usageLocked(now: Date, confirmedResetAt: Double? = nil) -> QuotaUsage {
         let current = Self.pruned(snapshot, now: now)
         let ts = now.timeIntervalSince1970
         let minuteEvents = current.events.filter { ts - $0.ts < 60 }
         let hourEvents = current.events.filter { ts - $0.ts < 3_600 }
-        let effectiveEpoch = Self.effectiveEpoch(in: current, at: ts)
+        // 墙钟回拨到已消费锚点之前时，不能让未来锚点排除当前 24 小时窗口的数据。
+        let persistedEpoch = current.dayEpoch.flatMap { $0 <= ts ? $0 : nil } ?? -.infinity
+        let effectiveEpoch = max(persistedEpoch, confirmedResetAt ?? -.infinity)
         // 恢复点只影响日请求数；日音频窗口仍统计 24h 内全部事件。
         let dayRequestEvents = current.events.filter { $0.ts > effectiveEpoch }
         let dayEvents = current.events
         // 1 分钟窗口只信本地计数。响应头仅校正 24 小时请求数（校正记录已按 24h prune）。
         let minuteRequests = minuteEvents.count
-        let correctedDay = Self.foldedDayRequests(
-            current.requestCorrections.filter { $0.ts > effectiveEpoch }
-        )
+        let dayCorrections = current.requestCorrections.filter { $0.ts > effectiveEpoch }
+        let correctedDay = Self.foldedDayRequests(dayCorrections, now: ts)
+        // 每次合法响应仅确认自己的请求（包括被宽限期拒绝的低水位）。
+        // 其它未确认的本地请求仍要叠加到服务端下限。
+        let acknowledgedAt = dayCorrections.map(\.ts).max() ?? -.infinity
+        let unacknowledgedRequests = dayRequestEvents.filter {
+            !($0.inServerDay ?? ($0.ts <= acknowledgedAt))
+        }.count
         let hourAudio = hourEvents.reduce(0.0) { $0 + $1.billedS }
-        let dayRequests = max(dayRequestEvents.count, correctedDay)
+        let dayRequests = max(dayRequestEvents.count, correctedDay + (dayCorrections.isEmpty ? 0 : unacknowledgedRequests))
         let dayAudio = dayEvents.reduce(0.0) { $0 + $1.billedS }
         let percentages = [
             Double(minuteRequests) / Double(limits.requestsPerMinute),
@@ -233,25 +393,28 @@ final class QuotaLedger: @unchecked Sendable {
     }
 
     private static func pruned(_ snapshot: QuotaLedgerSnapshot, now: Date) -> QuotaLedgerSnapshot {
-        let cutoff = now.timeIntervalSince1970 - 86_400
+        let ts = now.timeIntervalSince1970
+        let cutoff = ts - 86_400
+        // 保留未来锚点，供墙钟追上后继续生效；usageLocked 会在此前将它视为 -∞。
+        let retainedDayEpoch: Double?
+        if let dayEpoch = snapshot.dayEpoch, dayEpoch > ts {
+            retainedDayEpoch = dayEpoch
+        } else {
+            retainedDayEpoch = snapshot.dayEpoch.flatMap { $0 < cutoff ? nil : $0 }
+        }
         return QuotaLedgerSnapshot(
             events: snapshot.events.filter { $0.ts >= cutoff && isBillable($0) },
             requestCorrections: snapshot.requestCorrections.filter { $0.ts >= cutoff },
-            serverResetAt: snapshot.serverResetAt,
-            dayEpoch: snapshot.dayEpoch.flatMap { $0 < cutoff ? nil : $0 }
+            dayEpoch: retainedDayEpoch,
+            resetAt: snapshot.resetAt,
+            observedAt: snapshot.observedAt,
+            resetKeyFingerprint: snapshot.resetKeyFingerprint,
+            resetConsumed: snapshot.resetConsumed
         )
     }
 
-    private static func effectiveEpoch(in snapshot: QuotaLedgerSnapshot, at ts: Double) -> Double {
-        var epoch = snapshot.dayEpoch ?? -.infinity
-        if let reset = snapshot.serverResetAt, ts >= reset {
-            epoch = max(epoch, reset)
-        }
-        return epoch
-    }
-
     /// 规格 002：按时序折叠服务端样本；减少仅在已采纳样本满 60 秒后生效。
-    private static func foldedDayRequests(_ corrections: [QuotaRequestCorrection]) -> Int {
+    private static func foldedDayRequests(_ corrections: [QuotaRequestCorrection], now: Double) -> Int {
         var accepted: QuotaRequestCorrection?
         for correction in corrections.sorted(by: { $0.ts < $1.ts }) {
             guard let current = accepted else {
@@ -259,7 +422,8 @@ final class QuotaLedger: @unchecked Sendable {
                 continue
             }
             if correction.usedRequests > current.usedRequests ||
-                (correction.usedRequests < current.usedRequests && correction.ts - current.ts >= serverDecreaseGraceSeconds) {
+                // 回拨后未来的低水位不能清掉已保留的旧周期下限；未来高水位仍 fail-closed。
+                (correction.usedRequests < current.usedRequests && correction.ts <= now && correction.ts - current.ts >= serverDecreaseGraceSeconds) {
                 accepted = correction
             }
         }
@@ -267,6 +431,11 @@ final class QuotaLedger: @unchecked Sendable {
     }
 
     private static let serverDecreaseGraceSeconds = 60.0
+    private static let maximumResetSeconds = 86_460.0
+
+    private static func isValidRemaining(_ value: Int, limit: Int) -> Bool {
+        value >= 0 && value <= limit
+    }
 
     private static func isBillable(_ event: QuotaLedgerEvent) -> Bool {
         event.billedS.isFinite && event.billedS >= 0
@@ -278,9 +447,65 @@ final class QuotaLedger: @unchecked Sendable {
             requestCorrections: [
                 QuotaRequestCorrection(ts: now.timeIntervalSince1970, usedRequests: requestLimit),
             ],
-            serverResetAt: nil,
             dayEpoch: nil
         )
+    }
+
+    /// 只有路由事件调用可消费恢复记录，避免状态查询消费记录却不发确认事件。
+    @discardableResult
+    private func refreshRolloverLocked(now: Date, monotonicNow: Double, consume: Bool = false) -> Bool {
+        snapshot = Self.pruned(snapshot, now: now)
+        guard let resetAt = snapshot.resetAt,
+              let observedAt = snapshot.observedAt,
+              let consumed = snapshot.resetConsumed else {
+            return false
+        }
+        let wallNow = now.timeIntervalSince1970
+        // 墙钟显著回拨时，不能继续信任从旧墙钟推导出的恢复点。
+        if wallNow < observedAt - 5 {
+            clearResetRecordLocked()
+            try? persistLocked()
+            return true
+        }
+        guard rolloverConfirmedLocked(now: now, monotonicNow: monotonicNow) else { return false }
+        // 纯查询已可信地展示新周期时，也须独立保存边界；换 key 不能让旧周期复活。
+        // consumed 仍只由路由调用消费，确保确认事件不会被状态查询吞掉。
+        let confirmedEpoch = max(snapshot.dayEpoch ?? -.infinity, resetAt)
+        var changed = snapshot.dayEpoch != confirmedEpoch
+        snapshot.dayEpoch = confirmedEpoch
+        if consume && !consumed {
+            snapshot.resetConsumed = true
+            if quotaHot { resetConfirmationPending = true }
+            changed = true
+        }
+        if changed { try? persistLocked() }
+        return changed
+    }
+
+    /// R4：墙钟和（若本进程有）单调钟均满足，才认定恢复点已到；重启后只看墙钟。
+    private func rolloverConfirmedLocked(now: Date, monotonicNow: Double) -> Bool {
+        guard let resetAt = snapshot.resetAt,
+              let observedAt = snapshot.observedAt,
+              snapshot.resetKeyFingerprint != nil,
+              snapshot.resetConsumed != nil else {
+            return false
+        }
+        let wallNow = now.timeIntervalSince1970
+        guard wallNow >= resetAt, wallNow >= observedAt - 5 else { return false }
+        if let observedResetMonotonic,
+           monotonicNow - observedResetMonotonic < resetAt - observedAt - 1 {
+            return false
+        }
+        return true
+    }
+
+    private func clearResetRecordLocked() {
+        snapshot.resetAt = nil
+        snapshot.observedAt = nil
+        snapshot.resetKeyFingerprint = nil
+        snapshot.resetConsumed = nil
+        observedResetMonotonic = nil
+        resetConfirmationPending = false
     }
 
     private static func decodeSnapshot(_ data: Data) throws -> QuotaLedgerSnapshot {
@@ -555,66 +780,351 @@ final class QuotaLedger: @unchecked Sendable {
                 check(matches, "恢复头解析应符合规格：\(raw ?? "nil")")
             }
 
-            let unlock = QuotaLedger(url: dir.appendingPathComponent("quota-unlock.json"), now: Date(timeIntervalSince1970: 1_000))
+            // R1–R10：可信恢复记录必须同时绑定两个头、key 指纹、发送时刻和单调钟。
             let at1000 = Date(timeIntervalSince1970: 1_000)
+            let keyA = "fp-a"
+            let keyB = "fp-b"
+            let both: [AnyHashable: Any] = [
+                "x-ratelimit-remaining-requests": "5",
+                "x-ratelimit-reset-requests": "100s",
+            ]
+            func resetRecord(in url: URL) -> [String: Any]? {
+                (try? JSONSerialization.jsonObject(with: Data(contentsOf: url))) as? [String: Any]
+            }
+
+            // 1：两个头才建记录；超长 reset 也不能建记录。
+            let r1URL = dir.appendingPathComponent("quota-r1.json")
+            let r1 = QuotaLedger(url: r1URL, now: at1000)
+            try r1.note(["x-ratelimit-reset-requests": "100s"], at: at1000, keyFingerprint: keyA, sentAt: at1000, monotonicNow: 100)
+            try r1.note(["x-ratelimit-remaining-requests": "5"], at: at1000, keyFingerprint: keyA, sentAt: at1000, monotonicNow: 100)
+            check(resetRecord(in: r1URL)?["reset_at"] == nil, "只有一个头不能建立恢复记录")
+            try r1.note(["x-ratelimit-remaining-requests": "5", "x-ratelimit-reset-requests": "25h"], at: at1000, keyFingerprint: keyA, sentAt: at1000, monotonicNow: 100)
+            check(resetRecord(in: r1URL)?["reset_at"] == nil, "超过 24h+60s 的 reset 应忽略")
+            try r1.note(both, at: at1000, keyFingerprint: keyA, sentAt: at1000, monotonicNow: 100)
+            check(resetRecord(in: r1URL)?["reset_at"] as? Double == 1_100, "带两个头的响应应建立恢复记录")
+
+            // 2、3：恢复前的较大 remaining 不是翻日证据；确认翻日后只发一次确认事件。
+            let unlockURL = dir.appendingPathComponent("quota-unlock.json")
+            let unlock = QuotaLedger(url: unlockURL, now: at1000)
             try unlock.recordRequest(duration: 10, at: at1000)
-            try unlock.correctRemainingRequests(["x-ratelimit-remaining-requests": "5", "x-ratelimit-reset-requests": "100s"], at: at1000)
+            try unlock.note(both, at: at1000, keyFingerprint: keyA, sentAt: at1000, monotonicNow: 100)
             var resetContext = CloudRouteContext(RouteInitial(hasKey: true, cloudEnabled: true, cloudState: .available, nodeEnabled: false, nodeHealthy: false, nodeIsSelf: false, consecutiveFailures: 0, backoffIndex: 0))
-            check(unlock.usage(at: at1000).usagePercent >= 90, "恢复前配额应达到冷却阈值")
-            unlock.applyQuotaEvent(to: &resetContext, at: at1000)
+            unlock.applyQuotaEvent(to: &resetContext, at: at1000, monotonicNow: 100)
             check(resetContext.cloudState == .cooldownQuota, "恢复前应进入额度冷却")
-            check(unlock.usage(at: at1000.addingTimeInterval(50)).usagePercent >= 90, "恢复点前不应解锁")
+            try unlock.note(["x-ratelimit-remaining-requests": "1999"], at: at1000.addingTimeInterval(10), keyFingerprint: keyA, sentAt: at1000.addingTimeInterval(5), monotonicNow: 105)
+            check(unlock.usage(at: at1000.addingTimeInterval(10), monotonicNow: 105).dayRequests >= 1_995, "恢复点前更大 remaining 不得触发翻日")
             let afterReset = at1000.addingTimeInterval(101)
-            check(unlock.usage(at: afterReset).dayRequests == 0 && unlock.usage(at: afterReset).usagePercent < 80, "恢复点后旧周期日请求应清零")
-            check(unlock.usage(at: afterReset).dayAudioSeconds == 10, "恢复点不应清掉日音频窗口")
-            unlock.applyQuotaEvent(to: &resetContext, at: afterReset)
-            check(resetContext.cloudState == .available, "恢复点后应通过 90/80 滞回解锁")
+            unlock.applyQuotaEvent(to: &resetContext, at: afterReset, monotonicNow: 200)
+            let unlockedUsage = unlock.usage(at: afterReset, monotonicNow: 200)
+            check(resetContext.cloudState == .available && resetContext.action == "resume_cloud", "可信翻日应以 quota_reset_confirmed 通过滞回解锁")
+            check(unlockedUsage.dayRequests == 0 && unlockedUsage.dayAudioSeconds == 10, "翻日只能清 RPD，音频窗口必须保留")
+            let expectedPercent = max(
+                Double(unlockedUsage.minuteRequests) / 20,
+                unlockedUsage.hourAudioSeconds / 7_200,
+                Double(unlockedUsage.dayRequests) / 2_000,
+                unlockedUsage.dayAudioSeconds / 28_800
+            ) * 100
+            check(abs(unlockedUsage.usagePercent - expectedPercent) < 1e-9, "确认事件的 usage_percent 应是四窗口最大值")
+            unlock.applyQuotaEvent(to: &resetContext, at: afterReset, monotonicNow: 200)
+            check(resetContext.action == "none", "同一恢复记录只能确认一次")
 
-            let decrease = QuotaLedger(url: dir.appendingPathComponent("quota-decrease.json"), now: at1000)
-            try decrease.recordRequest(duration: 10, at: at1000)
-            try decrease.correctRemainingRequests(["x-ratelimit-remaining-requests": "5"], at: at1000)
-            try decrease.recordRequest(duration: 10, at: at1000.addingTimeInterval(30))
-            try decrease.correctRemainingRequests(["x-ratelimit-remaining-requests": "1999"], at: at1000.addingTimeInterval(30))
-            check(decrease.usage(at: at1000.addingTimeInterval(30)).dayRequests == 1_995, "60 秒内更小的服务端用量应被忽略")
-            try decrease.recordRequest(duration: 10, at: at1000.addingTimeInterval(61))
-            try decrease.correctRemainingRequests(["x-ratelimit-remaining-requests": "1999"], at: at1000.addingTimeInterval(61))
-            check(decrease.usage(at: at1000.addingTimeInterval(61)).dayRequests == 3, "60 秒后更小的服务端用量应被接受")
+            // 翻日后、尚未消费前就来了新周期响应：替换记录不能让旧周期请求重新计入。
+            let replaceURL = dir.appendingPathComponent("quota-replace.json")
+            let replace = QuotaLedger(url: replaceURL, now: at1000)
+            for i in 0..<1_900 {
+                try replace.recordRequest(duration: 10, at: at1000.addingTimeInterval(Double(i) * 0.01))
+            }
+            try replace.note(both, at: at1000.addingTimeInterval(20), keyFingerprint: keyA, sentAt: at1000.addingTimeInterval(20), monotonicNow: 120)
+            let nextCycle = at1000.addingTimeInterval(130)
+            try replace.recordRequest(duration: 10, at: nextCycle)
+            try replace.note(["x-ratelimit-remaining-requests": "1999", "x-ratelimit-reset-requests": "86000s"], at: nextCycle, keyFingerprint: keyA, sentAt: nextCycle, monotonicNow: 230)
+            check(replace.usage(at: nextCycle, monotonicNow: 230).dayRequests < 10, "替换已翻日记录后旧周期请求不得重新计入")
 
-            let baselineURL = dir.appendingPathComponent("quota-baseline.json")
-            let baseline = QuotaLedger(url: baselineURL, now: at1000)
-            try baseline.recordRequest(duration: 10, at: at1000)
-            try baseline.correctRemainingRequests(["x-ratelimit-remaining-requests": "5", "x-ratelimit-reset-requests": "100s"], at: at1000)
-            try baseline.recordRequest(duration: 10, at: afterReset)
-            try baseline.correctRemainingRequests(["x-ratelimit-remaining-requests": "1900"], at: afterReset)
-            check(baseline.usage(at: afterReset).dayRequests == 100, "恢复后无恢复头的 remaining 应成为新周期基线")
-            let baselineReloaded = QuotaLedger(url: baselineURL, now: afterReset.addingTimeInterval(1))
-            check(baselineReloaded.usage(at: afterReset.addingTimeInterval(1)).dayRequests == 100, "已消费恢复点应持久化，重载后不得重算旧本地事件")
+            // PR88 R2 #1：新记录不能遮住已确认的旧周期截止点。
+            let retainedCutoffURL = dir.appendingPathComponent("quota-retained-cutoff.json")
+            let retainedCutoff = QuotaLedger(url: retainedCutoffURL, now: at1000)
+            try retainedCutoff.note(both, at: at1000, keyFingerprint: keyA, sentAt: at1000, monotonicNow: 100)
+            _ = retainedCutoff.usage(at: afterReset, monotonicNow: 201)
+            let freshAt = at1000.addingTimeInterval(102)
+            try retainedCutoff.note(["x-ratelimit-remaining-requests": "5", "x-ratelimit-reset-requests": "86000s"], at: freshAt, keyFingerprint: keyA, sentAt: freshAt, monotonicNow: 202)
+            try retainedCutoff.note(["x-ratelimit-remaining-requests": "1999", "x-ratelimit-reset-requests": "1s"], at: freshAt.addingTimeInterval(1), keyFingerprint: keyA, sentAt: at1000, monotonicNow: 203)
+            check(retainedCutoff.usage(at: freshAt.addingTimeInterval(3), monotonicNow: 205).dayRequests == 1_995 && resetRecord(in: retainedCutoffURL)?["reset_at"] as? Double == 87_102, "PR88 R2 #1：迟到旧周期响应不能替换新记录并提前清除下限")
 
+            let restartedCutoff = QuotaLedger(url: retainedCutoffURL, now: freshAt.addingTimeInterval(3))
+            try restartedCutoff.note(["x-ratelimit-remaining-requests": "1999", "x-ratelimit-reset-requests": "1s"], at: freshAt.addingTimeInterval(4), keyFingerprint: keyA, sentAt: nil)
+            check(restartedCutoff.usage(at: freshAt.addingTimeInterval(6)).dayRequests == 1_995 && resetRecord(in: retainedCutoffURL)?["reset_at"] as? Double == 87_102, "PR88 R2 #1：重启后未知发送时刻响应仍须遵守已保存的截止点")
+
+            // PR88 R2 #3：明确绑定 B 后，A 的迟到回调不能重新安装恢复证明。
+            let boundKeyURL = dir.appendingPathComponent("quota-bound-key.json")
+            let boundKey = QuotaLedger(url: boundKeyURL, now: at1000)
+            try boundKey.observeKey(keyA)
+            try boundKey.note(both, at: at1000, keyFingerprint: keyA, sentAt: at1000, monotonicNow: 100)
+            try boundKey.observeKey(keyB)
+            try boundKey.note(both, at: at1000.addingTimeInterval(1), keyFingerprint: keyA, sentAt: at1000, monotonicNow: 101)
+            check(boundKey.usage(at: afterReset.addingTimeInterval(1), monotonicNow: 202).dayRequests == 1_995 && resetRecord(in: boundKeyURL)?["reset_at"] == nil, "PR88 R2 #3：旧 key 回调不能重建已丢弃的恢复证明")
+
+            // 明确清空 key 后，匿名响应也不能在宽限期后降低保留的服务端下限。
+            let clearedKeyURL = dir.appendingPathComponent("quota-cleared-key.json")
+            let clearedKey = QuotaLedger(url: clearedKeyURL, now: at1000)
+            try clearedKey.observeKey(keyA)
+            try clearedKey.note(both, at: at1000, keyFingerprint: keyA, sentAt: at1000, monotonicNow: 100)
+            try clearedKey.observeKey(nil)
+            try clearedKey.note(["x-ratelimit-remaining-requests": "1999"], at: at1000.addingTimeInterval(61), keyFingerprint: nil, sentAt: at1000, monotonicNow: 161)
+            check(clearedKey.usage(at: afterReset, monotonicNow: 201).dayRequests == 1_995 && resetRecord(in: clearedKeyURL)?["reset_at"] == nil, "PR88 R2 #3：清空 key 后匿名回调不能降低保留的 1995 下限")
+
+            // PR88 R2 #5：A 的响应只能确认 A，不能确认稍后发出的 B。
+            let concurrent = QuotaLedger(url: dir.appendingPathComponent("quota-concurrent-ack.json"), now: at1000)
+            try concurrent.note(["x-ratelimit-remaining-requests": "203"], at: at1000)
+            let sentA = at1000.addingTimeInterval(1)
+            let sentB = at1000.addingTimeInterval(2)
+            try concurrent.recordRequest(duration: 10, at: sentA)
+            try concurrent.recordRequest(duration: 10, at: sentB)
+            try concurrent.note(["x-ratelimit-remaining-requests": "202"], at: at1000.addingTimeInterval(3), sentAt: sentA)
+            try concurrent.note([:], at: at1000.addingTimeInterval(4), sentAt: sentB)
+            check(concurrent.usage(at: at1000.addingTimeInterval(4)).dayRequests == 1_799, "PR88 R2 #5：A=1798 加无头 B 必须保留 1799 次请求")
+            try concurrent.recordRequest(duration: 10, at: at1000.addingTimeInterval(5))
+            var concurrentContext = CloudRouteContext(RouteInitial(hasKey: true, cloudEnabled: true, cloudState: .available, nodeEnabled: false, nodeHealthy: false, nodeIsSelf: false, consecutiveFailures: 0, backoffIndex: 0))
+            concurrent.applyQuotaEvent(to: &concurrentContext, at: at1000.addingTimeInterval(5))
+            check(concurrent.usage(at: at1000.addingTimeInterval(5)).dayRequests == 1_800 && concurrentContext.cloudState == .cooldownQuota, "PR88 R2 #5：再一请求必须触发 90% 冷却")
+
+            let simultaneous = QuotaLedger(url: dir.appendingPathComponent("quota-simultaneous-ack.json"), now: at1000)
+            try simultaneous.note(["x-ratelimit-remaining-requests": "203"], at: at1000)
+            try simultaneous.recordRequest(duration: 10, at: sentA)
+            try simultaneous.recordRequest(duration: 10, at: sentA)
+            try simultaneous.note(["x-ratelimit-remaining-requests": "202"], at: sentA.addingTimeInterval(1), sentAt: sentA)
+            check(simultaneous.usage(at: sentA.addingTimeInterval(1)).dayRequests == 1_800, "PR88 R2 #5：同秒并发请求缺少 ID 时不能猜测已确认哪一个")
+
+            let identifiedURL = dir.appendingPathComponent("quota-identified-ack.json")
+            let identified = QuotaLedger(url: identifiedURL, now: at1000)
+            try identified.note(["x-ratelimit-remaining-requests": "203"], at: at1000)
+            try identified.recordRequest(duration: 10, at: sentA, requestID: "request-a")
+            try identified.recordRequest(duration: 10, at: sentA, requestID: "request-b")
+            try identified.note(["x-ratelimit-remaining-requests": "202"], at: sentA.addingTimeInterval(1), sentAt: sentA, requestID: "request-b")
+            let identifiedSnapshot = try JSONDecoder().decode(QuotaLedgerSnapshot.self, from: Data(contentsOf: identifiedURL))
+            check(identifiedSnapshot.events[0].inServerDay == false && identifiedSnapshot.events[1].inServerDay == true, "PR88 R2 #5：请求 ID 必须只确认同秒返回的 B")
+            check(QuotaLedger(url: identifiedURL, now: sentA.addingTimeInterval(1)).usage(at: sentA.addingTimeInterval(1)).dayRequests == 1_799, "PR88 R2 #5：A 无头时的 1799 下限必须跨重启保持")
+
+            // 4、5：墙钟回拨和单调钟不足都 fail-closed。
+            let rollback = QuotaLedger(url: dir.appendingPathComponent("quota-rollback.json"), now: at1000)
+            try rollback.note(both, at: at1000, keyFingerprint: keyA, sentAt: at1000, monotonicNow: 100)
+            let rollbackUsage = rollback.usage(at: at1000.addingTimeInterval(-6), monotonicNow: 94)
+            check(rollbackUsage.dayRequests == 1_995 && resetRecord(in: dir.appendingPathComponent("quota-rollback.json"))?["reset_at"] == nil, "墙钟回拨应丢记录但保留服务端下限")
+            let jump = QuotaLedger(url: dir.appendingPathComponent("quota-jump.json"), now: at1000)
+            try jump.note(both, at: at1000, keyFingerprint: keyA, sentAt: at1000, monotonicNow: 100)
+            check(jump.usage(at: afterReset, monotonicNow: 101).dayRequests == 1_995, "墙钟前跳但单调钟不足不能翻日")
+
+            // 6、7：换 key 仅清恢复证明；翻日后的迟到/未知发送时刻响应不采信。
+            let bindingURL = dir.appendingPathComponent("quota-binding.json")
+            let binding = QuotaLedger(url: bindingURL, now: at1000)
+            try binding.note(both, at: at1000, keyFingerprint: keyA, sentAt: at1000, monotonicNow: 100)
+            try binding.note(["x-ratelimit-remaining-requests": "1999"], at: at1000.addingTimeInterval(1), keyFingerprint: keyB, sentAt: at1000, monotonicNow: 101)
+            check(binding.usage(at: at1000.addingTimeInterval(1), monotonicNow: 101).dayRequests == 1_995 && resetRecord(in: bindingURL)?["reset_at"] == nil, "换 key 应清恢复记录但保留服务端下限")
+            try binding.note(both, at: at1000.addingTimeInterval(2), keyFingerprint: nil, sentAt: at1000.addingTimeInterval(2), monotonicNow: 102)
+            check(resetRecord(in: bindingURL)?["reset_at"] == nil, "key_fp=nil 不能建恢复记录")
+
+            // F2：旧 key 的恢复点已过时，新 key 的双头响应即使没有 sent_at，也必须建立新记录。
+            let rotatedAfterResetURL = dir.appendingPathComponent("quota-rotated-after-reset.json")
+            let rotatedAfterReset = QuotaLedger(url: rotatedAfterResetURL, now: at1000)
+            try rotatedAfterReset.note(both, at: at1000, keyFingerprint: keyA, sentAt: at1000, monotonicNow: 100)
+            try rotatedAfterReset.note(both, at: afterReset, keyFingerprint: keyB, sentAt: nil, monotonicNow: 200)
+            check(
+                resetRecord(in: rotatedAfterResetURL)?["reset_at"] as? Double == 1_201 &&
+                    resetRecord(in: rotatedAfterResetURL)?["key_fp"] as? String == keyB,
+                "换 key 必须先于迟到旧周期判定，以新响应建立恢复记录"
+            )
+
+            let late = QuotaLedger(url: dir.appendingPathComponent("quota-late.json"), now: at1000)
+            try late.note(both, at: at1000, keyFingerprint: keyA, sentAt: at1000, monotonicNow: 100)
+            _ = late.usage(at: afterReset, monotonicNow: 200)
+            try late.note(["x-ratelimit-remaining-requests": "1999", "x-ratelimit-reset-requests": "100s"], at: afterReset, keyFingerprint: keyA, sentAt: at1000, monotonicNow: 200)
+            try late.note(["x-ratelimit-remaining-requests": "1999", "x-ratelimit-reset-requests": "100s"], at: afterReset, keyFingerprint: keyA, sentAt: nil, monotonicNow: 200)
+            check(late.usage(at: afterReset, monotonicNow: 200).dayRequests == 0 && resetRecord(in: dir.appendingPathComponent("quota-late.json"))?["reset_at"] as? Double == 1_100, "迟到或未知发送时刻的头不得改写新周期")
+
+            // 8：其它三个窗口不因 RPD 翻日而重置。
+            let windows = QuotaLedger(url: dir.appendingPathComponent("quota-windows.json"), now: at1000)
+            try windows.recordRequest(duration: 10, at: at1000)
+            try windows.note(["x-ratelimit-remaining-requests": "5", "x-ratelimit-reset-requests": "10s"], at: at1000, keyFingerprint: keyA, sentAt: at1000, monotonicNow: 100)
+            let beforeWindows = windows.usage(at: at1000.addingTimeInterval(9), monotonicNow: 108)
+            let afterWindows = windows.usage(at: at1000.addingTimeInterval(11), monotonicNow: 111)
+            check(beforeWindows.minuteRequests == afterWindows.minuteRequests && beforeWindows.hourAudioSeconds == afterWindows.hourAudioSeconds && beforeWindows.dayAudioSeconds == afterWindows.dayAudioSeconds, "翻日前后三个非 RPD 窗口必须不变")
+
+            // 9、10：落盘往返、旧格式/坏恢复字段和重启后的墙钟确认。
             let persistedURL = dir.appendingPathComponent("quota-reset-persisted.json")
-            let persisted = QuotaLedger(url: persistedURL, now: Date(timeIntervalSince1970: 2_000))
-            let at2000 = Date(timeIntervalSince1970: 2_000)
-            try persisted.recordRequest(duration: 10, at: at2000)
-            try persisted.correctRemainingRequests(["x-ratelimit-remaining-requests": "5", "x-ratelimit-reset-requests": "100s"], at: at2000)
-            let persistedJSON = try JSONSerialization.jsonObject(with: Data(contentsOf: persistedURL)) as? [String: Any]
-            check(persistedJSON?["server_reset_at"] as? Double == 2_100, "恢复时刻应写入 server_reset_at")
-            let persistedReloaded = QuotaLedger(url: persistedURL, now: at2000.addingTimeInterval(50))
-            check(persistedReloaded.usage(at: at2000.addingTimeInterval(50)).dayRequests == 1_995, "恢复前重载应保留校正")
-            check(persistedReloaded.usage(at: at2000.addingTimeInterval(101)).dayRequests == 0, "恢复后重载应清零")
+            let persisted = QuotaLedger(url: persistedURL, now: at1000)
+            try persisted.note(both, at: at1000, keyFingerprint: keyA, sentAt: at1000, monotonicNow: 100)
+            check(resetRecord(in: persistedURL)?["key_fp"] as? String == keyA && resetRecord(in: persistedURL)?["consumed"] as? Bool == false, "恢复记录应原子落盘")
+            let resetRestarted = QuotaLedger(url: persistedURL, now: afterReset)
+            check(resetRestarted.usage(at: afterReset).dayRequests == 0, "重启后无单调钟时墙钟满足即可翻日")
+            check(resetRecord(in: persistedURL)?["consumed"] as? Bool == false, "状态查询不能消费恢复记录")
+            var persistedContext = CloudRouteContext(RouteInitial(hasKey: true, cloudEnabled: true, cloudState: .cooldownQuota, nodeEnabled: false, nodeHealthy: false, nodeIsSelf: false, consecutiveFailures: 0, backoffIndex: 0))
+            resetRestarted.applyQuotaEvent(to: &persistedContext, at: afterReset)
+            check(resetRecord(in: persistedURL)?["consumed"] as? Bool == true && persistedContext.action == "resume_cloud", "确认事件应和 consumed 一起落盘防重复")
+
+            // F3：重启前已进额度冷却；重启后状态查询不能消费记录，首次路由调用必须原子地确认翻日。
+            let restartConfirmURL = dir.appendingPathComponent("quota-restart-confirm.json")
+            let beforeRestart = QuotaLedger(url: restartConfirmURL, now: at1000)
+            try beforeRestart.note(both, at: at1000, keyFingerprint: keyA, sentAt: at1000, monotonicNow: 100)
+            let restartedHot = QuotaLedger(url: restartConfirmURL, now: at1000.addingTimeInterval(50))
+            _ = restartedHot.usage(at: afterReset, monotonicNow: 200)
+            check(resetRecord(in: restartConfirmURL)?["consumed"] as? Bool == false, "状态查询不得在未发确认事件时消费恢复记录")
+            var restartContext = CloudRouteContext(RouteInitial(hasKey: true, cloudEnabled: true, cloudState: .cooldownQuota, nodeEnabled: false, nodeHealthy: false, nodeIsSelf: false, consecutiveFailures: 0, backoffIndex: 0))
+            restartedHot.applyQuotaEvent(to: &restartContext, at: afterReset, monotonicNow: 200)
+            check(restartContext.cloudState == .available && restartContext.action == "resume_cloud" && resetRecord(in: restartConfirmURL)?["consumed"] as? Bool == true, "重启后的首次路由调用必须消费记录并发 quota_reset_confirmed")
+
+            // G2：重启时墙钟错误前跳会消费恢复点；随后回拨前锚点必须失效，追上后再恢复生效。
+            let futureEpochURL = dir.appendingPathComponent("quota-future-day-epoch.json")
+            let beforeJump = QuotaLedger(url: futureEpochURL, now: at1000)
+            try beforeJump.recordRequest(duration: 10, at: at1000)
+            try beforeJump.note(
+                ["x-ratelimit-remaining-requests": "0", "x-ratelimit-reset-requests": "100s"],
+                at: at1000, keyFingerprint: keyA, sentAt: at1000, monotonicNow: 100
+            )
+            let jumpedAfterRestart = QuotaLedger(url: futureEpochURL, now: afterReset)
+            var jumpedContext = CloudRouteContext(RouteInitial(
+                hasKey: true, cloudEnabled: true, cloudState: .cooldownQuota,
+                nodeEnabled: false, nodeHealthy: false, nodeIsSelf: false,
+                consecutiveFailures: 0, backoffIndex: 0
+            ))
+            jumpedAfterRestart.applyQuotaEvent(to: &jumpedContext, at: afterReset)
+            check(resetRecord(in: futureEpochURL)?["day_epoch"] as? Double == 1_100, "错误前跳后应持久化已消费的 dayEpoch")
+            let rolledBack = QuotaLedger(url: futureEpochURL, now: at1000.addingTimeInterval(50))
+            check(rolledBack.usage(at: at1000.addingTimeInterval(50)).dayRequests == 2_000, "未来 dayEpoch 在墙钟回拨期间必须忽略，保留本地事件和 remaining=0 校正")
+            check(rolledBack.usage(at: afterReset).dayRequests == 0, "墙钟追上 future dayEpoch 后锚点应重新生效")
+
+            // Review F1：消费后换 key 写入低水位，再回拨；未来的低水位不能抹掉旧高水位。
+            let correctionRollbackURL = dir.appendingPathComponent("quota-correction-rollback.json")
+            let correctionRollback = QuotaLedger(url: correctionRollbackURL, now: at1000)
+            try correctionRollback.recordRequest(duration: 10, at: at1000)
+            try correctionRollback.note(both, at: at1000, keyFingerprint: keyA, sentAt: at1000, monotonicNow: 100)
+            var correctionContext = CloudRouteContext(RouteInitial(hasKey: true, cloudEnabled: true, cloudState: .available, nodeEnabled: false, nodeHealthy: false, nodeIsSelf: false, consecutiveFailures: 0, backoffIndex: 0))
+            correctionRollback.applyQuotaEvent(to: &correctionContext, at: at1000, monotonicNow: 100)
+            correctionRollback.applyQuotaEvent(to: &correctionContext, at: at1000.addingTimeInterval(200), monotonicNow: 300)
+            try correctionRollback.recordRequest(duration: 10, at: at1000.addingTimeInterval(200))
+            try correctionRollback.note(["x-ratelimit-remaining-requests": "1999", "x-ratelimit-reset-requests": "100s"], at: at1000.addingTimeInterval(200), keyFingerprint: keyB, sentAt: at1000.addingTimeInterval(200), monotonicNow: 300)
+            correctionRollback.applyQuotaEvent(to: &correctionContext, at: at1000.addingTimeInterval(50), monotonicNow: 301)
+            check(correctionRollback.usage(at: at1000.addingTimeInterval(50), monotonicNow: 301).dayRequests >= 1_995 && correctionContext.cloudState == .cooldownQuota, "F1：未来低水位不能在回拨时冲掉已保留的 1995 下限")
+            let correctionRestart = QuotaLedger(url: correctionRollbackURL, now: at1000.addingTimeInterval(50))
+            check(correctionRestart.usage(at: at1000.addingTimeInterval(50)).dayRequests >= 1_995, "F1：带未来低水位的回拨下限必须跨重启保持")
+
+            // Review F3：B 不能确认 A 的未确认边界；A 已确认的边界则独立于记录保留。
+            let idleKeyURL = dir.appendingPathComponent("quota-idle-key.json")
+            let idleKey = QuotaLedger(url: idleKeyURL, now: at1000)
+            try idleKey.note(both, at: at1000, keyFingerprint: keyA, sentAt: at1000, monotonicNow: 100)
+            try idleKey.note(["x-ratelimit-remaining-requests": "1999", "x-ratelimit-reset-requests": "100s"], at: afterReset, keyFingerprint: keyB, sentAt: afterReset, monotonicNow: 201)
+            check(resetRecord(in: idleKeyURL)?["day_epoch"] == nil, "F3：先换 key 就不能借旧 key 首次确认边界")
+            let confirmedKeyURL = dir.appendingPathComponent("quota-confirmed-key.json")
+            let confirmedKey = QuotaLedger(url: confirmedKeyURL, now: at1000)
+            try confirmedKey.recordRequest(duration: 10, at: at1000)
+            try confirmedKey.note(both, at: at1000, keyFingerprint: keyA, sentAt: at1000, monotonicNow: 100)
+            var confirmedContext = CloudRouteContext(RouteInitial(hasKey: true, cloudEnabled: true, cloudState: .cooldownQuota, nodeEnabled: false, nodeHealthy: false, nodeIsSelf: false, consecutiveFailures: 0, backoffIndex: 0))
+            confirmedKey.applyQuotaEvent(to: &confirmedContext, at: afterReset, monotonicNow: 201)
+            try confirmedKey.recordRequest(duration: 10, at: afterReset.addingTimeInterval(1))
+            try confirmedKey.note([:], at: afterReset.addingTimeInterval(1), keyFingerprint: keyB, sentAt: afterReset, monotonicNow: 202)
+            check(confirmedKey.usage(at: afterReset.addingTimeInterval(1), monotonicNow: 202).dayRequests == 1, "F3：已确认边界在 B 无头响应后仍应排除旧请求")
+            check(QuotaLedger(url: confirmedKeyURL, now: afterReset.addingTimeInterval(1)).usage(at: afterReset.addingTimeInterval(1)).dayRequests == 1, "F3：独立周期边界必须跨重启保留")
+
+            let idleLocalURL = dir.appendingPathComponent("quota-idle-local-key.json")
+            let idleLocalSnapshot = QuotaLedgerSnapshot(events: (0..<1_900).map { QuotaLedgerEvent(ts: -10_000 + Double($0), billedS: 10) }, requestCorrections: [QuotaRequestCorrection(ts: 1_000, usedRequests: 1_995)], resetAt: 1_100, observedAt: 1_000, resetKeyFingerprint: keyA, resetConsumed: false)
+            try JSONEncoder().encode(idleLocalSnapshot).write(to: idleLocalURL)
+            let idleLocal = QuotaLedger(url: idleLocalURL, now: at1000)
+            try idleLocal.recordRequest(duration: 10, at: afterReset)
+            try idleLocal.note(["x-ratelimit-remaining-requests": "1999", "x-ratelimit-reset-requests": "100s"], at: afterReset, keyFingerprint: keyB, sentAt: afterReset, monotonicNow: 201)
+            var idleLocalContext = CloudRouteContext(RouteInitial(hasKey: true, cloudEnabled: true, cloudState: .cooldownQuota, nodeEnabled: false, nodeHealthy: false, nodeIsSelf: false, consecutiveFailures: 0, backoffIndex: 0))
+            idleLocal.applyQuotaEvent(to: &idleLocalContext, at: afterReset, monotonicNow: 201)
+            check(idleLocal.usage(at: afterReset, monotonicNow: 201).dayRequests == 1_901 && idleLocalContext.cloudState == .cooldownQuota && resetRecord(in: idleLocalURL)?["day_epoch"] == nil, "F3：未确认的 A 边界不能抹掉 1900 次本地请求")
+
+            // F3：A 的纯查询已确认边界，也必须独立落盘；路由确认仍保留未消费状态。
+            let queriedKeyURL = dir.appendingPathComponent("quota-queried-key.json")
+            let queriedKey = QuotaLedger(url: queriedKeyURL, now: at1000)
+            try queriedKey.recordRequest(duration: 10, at: at1000)
+            try queriedKey.note(both, at: at1000, keyFingerprint: keyA, sentAt: at1000, monotonicNow: 100)
+            check(queriedKey.usage(at: afterReset, monotonicNow: 201).dayRequests == 0 && resetRecord(in: queriedKeyURL)?["consumed"] as? Bool == false, "F3：A 的纯查询确认新周期，但不能消费路由确认标记")
+            try queriedKey.recordRequest(duration: 10, at: afterReset.addingTimeInterval(1))
+            try queriedKey.note([:], at: afterReset.addingTimeInterval(1), keyFingerprint: keyB, sentAt: afterReset, monotonicNow: 202)
+            check(queriedKey.usage(at: afterReset.addingTimeInterval(1), monotonicNow: 202).dayRequests == 1, "F3：查询已确认的边界不能因 B 无头响应丢失")
+            check(QuotaLedger(url: queriedKeyURL, now: afterReset.addingTimeInterval(1)).usage(at: afterReset.addingTimeInterval(1)).dayRequests == 1, "F3：纯查询确认后的独立边界必须跨重启保留")
+
+            // Review F4：只丢越界恢复证明，保留账本下限并维持额度冷却。
+            for (label, resetAt, observedAt, wallNow) in [("negative", 900.0, 1_000.0, 1_000.0), ("oversized", 90_000.0, 1_000.0, 90_001.0)] {
+                let boundsURL = dir.appendingPathComponent("quota-bounds-\(label).json")
+                let payload = QuotaLedgerSnapshot(requestCorrections: [QuotaRequestCorrection(ts: min(resetAt, wallNow), usedRequests: 2_000)], resetAt: resetAt, observedAt: observedAt, resetKeyFingerprint: keyA, resetConsumed: false)
+                try JSONEncoder().encode(payload).write(to: boundsURL)
+                let bounded = QuotaLedger(url: boundsURL, now: Date(timeIntervalSince1970: wallNow))
+                var boundsContext = CloudRouteContext(RouteInitial(hasKey: true, cloudEnabled: true, cloudState: .cooldownQuota, nodeEnabled: false, nodeHealthy: false, nodeIsSelf: false, consecutiveFailures: 0, backoffIndex: 0))
+                bounded.applyQuotaEvent(to: &boundsContext, at: Date(timeIntervalSince1970: wallNow))
+                check(bounded.usage(at: Date(timeIntervalSince1970: wallNow)).dayRequests == 2_000 && boundsContext.cloudState == .cooldownQuota && boundsContext.action != "resume_cloud", "F4：\(label) 恢复时长必须丢弃且保持冷却")
+                let decoded = try JSONDecoder().decode(QuotaLedgerSnapshot.self, from: Data(contentsOf: boundsURL))
+                check(decoded.resetAt == nil && decoded.dayEpoch == nil, "F4：\(label) 非法可选记录应被丢弃")
+                check(!FileManager.default.fileExists(atPath: boundsURL.appendingPathExtension("corrupt").path), "F4：坏恢复字段不能隔离整份账本")
+            }
+
+            // Review F5：B 即使没有配额头，也必须先清掉 A 的恢复承诺。
+            let headerlessURL = dir.appendingPathComponent("quota-headerless-key.json")
+            let headerless = QuotaLedger(url: headerlessURL, now: at1000)
+            try headerless.note(both, at: at1000, keyFingerprint: keyA, sentAt: at1000, monotonicNow: 100)
+            try headerless.recordRequest(duration: 10, at: afterReset)
+            try headerless.note([:], at: afterReset, keyFingerprint: keyB, sentAt: afterReset, monotonicNow: 201)
+            var headerlessContext = CloudRouteContext(RouteInitial(hasKey: true, cloudEnabled: true, cloudState: .cooldownQuota, nodeEnabled: false, nodeHealthy: false, nodeIsSelf: false, consecutiveFailures: 0, backoffIndex: 0))
+            headerless.applyQuotaEvent(to: &headerlessContext, at: afterReset, monotonicNow: 201)
+            check(headerless.usage(at: afterReset, monotonicNow: 201).dayRequests == 1_996 && headerlessContext.cloudState == .cooldownQuota && headerlessContext.action != "resume_cloud", "F5：无头 B 响应不能借 A 的边界解除冷却")
+            check(resetRecord(in: headerlessURL)?["reset_at"] == nil, "F5：无头 B 响应应持久化清除 A 恢复记录")
+
+            // 同一 F5 序列的边界前 B 请求，以及拒绝低水位时的本地请求确认。
+            let beforeBoundary = QuotaLedger(url: dir.appendingPathComponent("quota-headerless-before-boundary.json"), now: at1000)
+            try beforeBoundary.recordRequest(duration: 10, at: at1000)
+            try beforeBoundary.note(both, at: at1000, keyFingerprint: keyA, sentAt: at1000, monotonicNow: 100)
+            let beforeBoundaryResponse = at1000.addingTimeInterval(50)
+            try beforeBoundary.recordRequest(duration: 10, at: beforeBoundaryResponse)
+            try beforeBoundary.note([:], at: beforeBoundaryResponse, keyFingerprint: keyB, sentAt: beforeBoundaryResponse, monotonicNow: 150)
+            var beforeBoundaryContext = CloudRouteContext(RouteInitial(hasKey: true, cloudEnabled: true, cloudState: .cooldownQuota, nodeEnabled: false, nodeHealthy: false, nodeIsSelf: false, consecutiveFailures: 0, backoffIndex: 0))
+            beforeBoundary.applyQuotaEvent(to: &beforeBoundaryContext, at: afterReset, monotonicNow: 201)
+            check(beforeBoundary.usage(at: afterReset, monotonicNow: 201).dayRequests == 1_996 && beforeBoundaryContext.cloudState == .cooldownQuota, "F5：边界前无头 B 请求应在边界后保留 1996 下限")
+            let acknowledged = QuotaLedger(url: dir.appendingPathComponent("quota-rejected-lower-ack.json"), now: at1000)
+            try acknowledged.recordRequest(duration: 10, at: at1000)
+            try acknowledged.note(["x-ratelimit-remaining-requests": "5"], at: at1000)
+            try acknowledged.recordRequest(duration: 10, at: at1000.addingTimeInterval(30))
+            try acknowledged.note(["x-ratelimit-remaining-requests": "1999"], at: at1000.addingTimeInterval(30))
+            check(acknowledged.usage(at: at1000.addingTimeInterval(30)).dayRequests == 1_995, "被拒绝的低水位仍确认此前本地请求已包含在服务端下限内")
+            try acknowledged.recordRequest(duration: 10, at: at1000.addingTimeInterval(31))
+            check(acknowledged.usage(at: at1000.addingTimeInterval(31)).dayRequests == 1_996, "无头请求才叠加到最后服务端确认的下限")
+
+            // F5 同秒响应不能靠时间戳猜已确认请求，否则 1799 + 1 不会触发 90% 冷却。
+            let sameSecond = QuotaLedger(url: dir.appendingPathComponent("quota-same-second.json"), now: at1000)
+            try sameSecond.recordRequest(duration: 10, at: at1000)
+            try sameSecond.note(["x-ratelimit-remaining-requests": "201", "x-ratelimit-reset-requests": "100s"], at: at1000, keyFingerprint: keyA, sentAt: at1000, monotonicNow: 100)
+            try sameSecond.recordRequest(duration: 10, at: at1000)
+            try sameSecond.note([:], at: at1000, keyFingerprint: keyB, sentAt: at1000, monotonicNow: 100)
+            var sameSecondContext = CloudRouteContext(RouteInitial(hasKey: true, cloudEnabled: true, cloudState: .available, nodeEnabled: false, nodeHealthy: false, nodeIsSelf: false, consecutiveFailures: 0, backoffIndex: 0))
+            sameSecond.applyQuotaEvent(to: &sameSecondContext, at: at1000, monotonicNow: 100)
+            check(sameSecond.usage(at: at1000, monotonicNow: 100).dayRequests == 1_800 && sameSecondContext.cloudState == .cooldownQuota, "F5：同秒新增无头请求必须从 1799 抬到 1800 并进入额度冷却")
+            check(QuotaLedger(url: dir.appendingPathComponent("quota-same-second.json"), now: at1000).usage(at: at1000).dayRequests == 1_800, "F5：同秒未确认请求标记必须跨重启保持")
+
+            let malformedAckURL = dir.appendingPathComponent("quota-malformed-ack.json")
+            try Data(#"{"events":[{"ts":1000,"billed_s":10,"in_server_day":"bad"}],"request_corrections":[{"ts":1000,"used_requests":1799}]}"#.utf8).write(to: malformedAckURL)
+            let malformedAck = QuotaLedger(url: malformedAckURL, now: at1000)
+            check(malformedAck.usage(at: at1000).dayRequests == 1_800, "F5：已有确认标记损坏时应按未确认处理，不能回退旧格式推断而漏记请求")
 
             let oldFormatURL = dir.appendingPathComponent("quota-old-format.json")
             try Data(#"{"events":[{"ts":1000,"billed_s":10}],"request_corrections":[{"ts":1000,"used_requests":3}]}"#.utf8).write(to: oldFormatURL)
-            let oldFormat = QuotaLedger(url: oldFormatURL, now: at1000)
-            check(oldFormat.usage(at: at1000).dayRequests == 3, "没有新字段的旧账本应照常读取")
-            check(!FileManager.default.fileExists(atPath: oldFormatURL.appendingPathExtension("corrupt").path), "旧账本不应生成 corrupt")
-            let missingKeysURL = dir.appendingPathComponent("quota-missing-keys.json")
-            try Data("{}".utf8).write(to: missingKeysURL)
-            check(QuotaLedger(url: missingKeysURL, now: at1000).usage(at: at1000).usagePercent == 100, "缺 events 键的账本应隔离并饱和")
+            check(QuotaLedger(url: oldFormatURL, now: at1000).usage(at: at1000).dayRequests == 3, "旧格式账本应照常读取")
+            // PR88 R2 #6：consumed 缺失或 null 只丢恢复证明，保留 1995 下限。
+            for (label, consumedField) in [("missing", ""), ("null", ",\"consumed\":null")] {
+                let incompleteURL = dir.appendingPathComponent("quota-incomplete-consumed-\(label).json")
+                let incompleteJSON = "{\"events\":[],\"request_corrections\":[{\"ts\":1000,\"used_requests\":1995}],\"reset_at\":1100,\"observed_at\":1000,\"key_fp\":\"fp-a\"\(consumedField)}"
+                try Data(incompleteJSON.utf8).write(to: incompleteURL)
+                let incomplete = QuotaLedger(url: incompleteURL, now: afterReset)
+                var incompleteContext = CloudRouteContext(RouteInitial(hasKey: true, cloudEnabled: true, cloudState: .cooldownQuota, nodeEnabled: false, nodeHealthy: false, nodeIsSelf: false, consecutiveFailures: 0, backoffIndex: 0))
+                incomplete.applyQuotaEvent(to: &incompleteContext, at: afterReset)
+                let decodedIncomplete = try JSONDecoder().decode(QuotaLedgerSnapshot.self, from: Data(contentsOf: incompleteURL))
+                check(incomplete.usage(at: afterReset).dayRequests == 1_995 && incompleteContext.cloudState == .cooldownQuota && decodedIncomplete.resetAt == nil, "PR88 R2 #6：\(label) consumed 必须丢记录并保留额度冷却")
+                check(!FileManager.default.fileExists(atPath: incompleteURL.appendingPathExtension("corrupt").path), "PR88 R2 #6：\(label) consumed 不应隔离整份账本")
+            }
 
-            let override = QuotaLedger(url: dir.appendingPathComponent("quota-reset-override.json"), now: at1000)
-            try override.correctRemainingRequests(["x-ratelimit-remaining-requests": "5", "x-ratelimit-reset-requests": "100s"], at: at1000)
-            try override.correctRemainingRequests(["x-ratelimit-remaining-requests": "5", "x-ratelimit-reset-requests": "200s"], at: at1000.addingTimeInterval(10))
-            check(override.usage(at: at1000.addingTimeInterval(101)).usagePercent >= 90, "最新恢复头应覆盖旧恢复点")
-            check(override.usage(at: at1000.addingTimeInterval(211)).dayRequests == 0, "最新恢复点后应清零")
+            let malformedURL = dir.appendingPathComponent("quota-malformed-reset.json")
+            try Data(#"{"events":[],"request_corrections":[],"reset_at":"bad","observed_at":1000,"key_fp":"fp","consumed":false}"#.utf8).write(to: malformedURL)
+            _ = QuotaLedger(url: malformedURL, now: at1000)
+            check(FileManager.default.fileExists(atPath: malformedURL.path) && !FileManager.default.fileExists(atPath: malformedURL.appendingPathExtension("corrupt").path), "恢复字段非法只丢记录，不隔离整份账本")
+
         } catch {
             failures.append("QuotaLedger selftest 异常：\(error)")
         }

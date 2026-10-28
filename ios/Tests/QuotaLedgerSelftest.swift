@@ -1,5 +1,14 @@
 import Foundation
 
+/// 可控单调钟：R4 的 (b) 条件只能靠时间流逝满足，测试必须能手动推进它。
+private final class TestMonotonicClock {
+    var now: Double
+
+    init(_ now: Double) {
+        self.now = now
+    }
+}
+
 /// QuotaLedger 自测：计费下限、90/80 滞回、原子落盘往返、损坏账本隔离。
 /// 临时文件只落在工作目录的 .tmp/ 下，由本函数自己清理（run-selftest.sh 也会兜底删 .tmp）。
 func runQuotaLedgerSelftest(_ check: @escaping (Bool, String) -> Void) {
@@ -172,18 +181,25 @@ func runQuotaLedgerSelftest(_ check: @escaping (Bool, String) -> Void) {
         }
 
         let at1000 = Date(timeIntervalSince1970: 1_000)
-        let unlock = QuotaLedger(url: root.appendingPathComponent("quota-unlock.json"), now: at1000)
+        let unlockMono = TestMonotonicClock(1_000)
+        let unlock = QuotaLedger(
+            url: root.appendingPathComponent("quota-unlock.json"),
+            now: at1000,
+            monotonicNow: { unlockMono.now }
+        )
         try unlock.recordRequest(duration: 10, at: at1000)
         try unlock.correctRemainingRequests([
             "x-ratelimit-remaining-requests": "5",
             "x-ratelimit-reset-requests": "100s",
-        ], at: at1000)
+        ], at: at1000, keyFingerprint: "key-a")
         var resetContext = routeContext(.available)
         check(unlock.usage(at: at1000).usagePercent >= 90, "恢复前配额应达到冷却阈值")
         unlock.applyQuotaEvent(to: &resetContext, at: at1000)
         check(resetContext.cloudState == .cooldownQuota, "恢复前应进入额度冷却")
+        unlockMono.now = 1_050
         check(unlock.usage(at: at1000.addingTimeInterval(50)).usagePercent >= 90, "恢复点前不应解锁")
         let afterReset = at1000.addingTimeInterval(101)
+        unlockMono.now = 1_101
         let afterResetUsage = unlock.usage(at: afterReset)
         check(afterResetUsage.dayRequests == 0 && afterResetUsage.usagePercent < 80, "恢复点后旧周期日请求应清零")
         check(afterResetUsage.dayAudioSeconds == 10, "恢复点不应清掉日音频窗口")
@@ -201,17 +217,96 @@ func runQuotaLedgerSelftest(_ check: @escaping (Bool, String) -> Void) {
         check(decrease.usage(at: at1000.addingTimeInterval(61)).dayRequests == 3, "60 秒后更小的服务端用量应被接受")
 
         let baselineURL = root.appendingPathComponent("quota-baseline.json")
-        let baseline = QuotaLedger(url: baselineURL, now: at1000)
+        let baselineMono = TestMonotonicClock(1_000)
+        let baseline = QuotaLedger(url: baselineURL, now: at1000, monotonicNow: { baselineMono.now })
         try baseline.recordRequest(duration: 10, at: at1000)
         try baseline.correctRemainingRequests([
             "x-ratelimit-remaining-requests": "5",
             "x-ratelimit-reset-requests": "100s",
-        ], at: at1000)
+        ], at: at1000, keyFingerprint: "key-a")
         try baseline.recordRequest(duration: 10, at: afterReset)
-        try baseline.correctRemainingRequests(["x-ratelimit-remaining-requests": "1900"], at: afterReset)
+        baselineMono.now = 1_101
+        try baseline.correctRemainingRequests([
+            "x-ratelimit-remaining-requests": "1900",
+        ], at: afterReset, keyFingerprint: "key-a", sentAt: afterReset)
         check(baseline.usage(at: afterReset).dayRequests == 100, "恢复后无恢复头的 remaining 应成为新周期基线")
         let baselineReloaded = QuotaLedger(url: baselineURL, now: afterReset.addingTimeInterval(1))
         check(baselineReloaded.usage(at: afterReset.addingTimeInterval(1)).dayRequests == 100, "已消费恢复点应持久化，重载后不得重算旧本地事件")
+
+        // F4：已翻日后收到下一周期的未来 reset，旧周期本地事件不能重新计入 RPD。
+        let futureResetURL = root.appendingPathComponent("quota-f4-future-reset.json")
+        let oldCycleEvents = (0..<1_800).map { _ in
+            QuotaLedgerEvent(ts: at1000.timeIntervalSince1970 - 3_601, billedS: 10)
+        }
+        try JSONEncoder().encode(QuotaLedgerSnapshot(events: oldCycleEvents)).write(to: futureResetURL)
+        let futureResetMono = TestMonotonicClock(0)
+        let futureReset = QuotaLedger(
+            url: futureResetURL,
+            now: at1000,
+            monotonicNow: { futureResetMono.now }
+        )
+        try futureReset.correctRemainingRequests([
+            "x-ratelimit-remaining-requests": "5",
+            "x-ratelimit-reset-requests": "100s",
+        ], at: at1000, keyFingerprint: "key-a")
+        var futureResetContext = routeContext(.available)
+        futureReset.applyQuotaEvent(to: &futureResetContext, at: at1000)
+        check(futureResetContext.cloudState == .cooldownQuota, "F4 前置：旧周期高用量应先进入冷却")
+        let futureResponseAt = afterReset
+        futureResetMono.now = 101
+        try futureReset.correctRemainingRequests([
+            "x-ratelimit-remaining-requests": "1990",
+            "x-ratelimit-reset-requests": "100s",
+        ], at: futureResponseAt, keyFingerprint: "key-a", sentAt: futureResponseAt)
+        let futureResetUsage = futureReset.usage(at: futureResponseAt)
+        check(futureResetUsage.dayRequests == 10,
+              "F4：翻日后只应保留新周期服务端校正，实际 \(futureResetUsage.dayRequests) 次")
+        check(futureResetUsage.usagePercent < 80,
+              "F4：翻日后的未来 reset 不得把旧周期事件算回冷却，实际 \(futureResetUsage.usagePercent)%")
+        let futureResetJSON = try JSONSerialization.jsonObject(with: Data(contentsOf: futureResetURL)) as? [String: Any]
+        check(futureResetJSON?["day_epoch"] as? Double == 1_100,
+              "F4：已成立的恢复点应持久化为 day_epoch")
+        let epochPruneAt = Date(timeIntervalSince1970: 1_100 + 86_401)
+        try futureReset.recordRequest(duration: 10, at: epochPruneAt)
+        let prunedEpochJSON = try JSONSerialization.jsonObject(with: Data(contentsOf: futureResetURL)) as? [String: Any]
+        check(prunedEpochJSON?["day_epoch"] == nil, "F4：day_epoch 超过 24 小时应随 prune 失效")
+
+        // F1：remaining 仅接受 [0, requestsPerDay] 的整数；越界/非整数不能校正或替换记录。
+        let upperRemainingURL = root.appendingPathComponent("quota-f1-upper-remaining.json")
+        let upperRemaining = QuotaLedger(url: upperRemainingURL, now: at1000)
+        try upperRemaining.correctRemainingRequests([
+            "x-ratelimit-remaining-requests": "2000",
+            "x-ratelimit-reset-requests": "100s",
+        ], at: at1000, keyFingerprint: "key-a")
+        check(upperRemaining.usage(at: at1000).dayRequests == 0,
+              "F1：remaining=2000 应是合法上界")
+        let upperRemainingJSON = try JSONSerialization.jsonObject(with: Data(contentsOf: upperRemainingURL)) as? [String: Any]
+        check(upperRemainingJSON?["server_reset_at"] as? Double == 1_100,
+              "F1：合法上界 remaining 应建立恢复记录")
+
+        let invalidRemainingURL = root.appendingPathComponent("quota-f1-invalid-remaining.json")
+        let invalidRemaining = QuotaLedger(url: invalidRemainingURL, now: at1000)
+        try invalidRemaining.correctRemainingRequests([
+            "x-ratelimit-remaining-requests": "0",
+            "x-ratelimit-reset-requests": "100s",
+        ], at: at1000, keyFingerprint: "key-a")
+        try invalidRemaining.correctRemainingRequests([
+            "x-ratelimit-remaining-requests": "2001",
+            "x-ratelimit-reset-requests": "200s",
+        ], at: at1000.addingTimeInterval(1), keyFingerprint: "key-a")
+        try invalidRemaining.correctRemainingRequests([
+            "x-ratelimit-remaining-requests": "-1",
+            "x-ratelimit-reset-requests": "300s",
+        ], at: at1000.addingTimeInterval(2), keyFingerprint: "key-a")
+        try invalidRemaining.correctRemainingRequests([
+            "x-ratelimit-remaining-requests": NSNumber(value: 1.5),
+            "x-ratelimit-reset-requests": "400s",
+        ], at: at1000.addingTimeInterval(3), keyFingerprint: "key-a")
+        let invalidRemainingJSON = try JSONSerialization.jsonObject(with: Data(contentsOf: invalidRemainingURL)) as? [String: Any]
+        check(invalidRemaining.usage(at: at1000.addingTimeInterval(3)).dayRequests == 2_000,
+              "F1：2001、-1 和非整数 remaining 不得校正日用量")
+        check(invalidRemainingJSON?["server_reset_at"] as? Double == 1_100,
+              "F1：2001、-1 和非整数 remaining 不得替换恢复记录")
 
         let at2000 = Date(timeIntervalSince1970: 2_000)
         let persistedURL = root.appendingPathComponent("quota-reset-persisted.json")
@@ -220,7 +315,7 @@ func runQuotaLedgerSelftest(_ check: @escaping (Bool, String) -> Void) {
         try persisted.correctRemainingRequests([
             "x-ratelimit-remaining-requests": "5",
             "x-ratelimit-reset-requests": "100s",
-        ], at: at2000)
+        ], at: at2000, keyFingerprint: "key-a")
         let persistedJSON = try JSONSerialization.jsonObject(with: Data(contentsOf: persistedURL)) as? [String: Any]
         check(persistedJSON?["server_reset_at"] as? Double == 2_100, "恢复时刻应写入 server_reset_at")
         let persistedReloaded = QuotaLedger(url: persistedURL, now: at2000.addingTimeInterval(50))
@@ -236,17 +331,723 @@ func runQuotaLedgerSelftest(_ check: @escaping (Bool, String) -> Void) {
         try Data("{}".utf8).write(to: missingKeysURL)
         check(QuotaLedger(url: missingKeysURL, now: at1000).usage(at: at1000).usagePercent == 100, "缺 events 键的账本应隔离并饱和")
 
-        let override = QuotaLedger(url: root.appendingPathComponent("quota-reset-override.json"), now: at1000)
+        let overrideMono = TestMonotonicClock(1_000)
+        let override = QuotaLedger(
+            url: root.appendingPathComponent("quota-reset-override.json"),
+            now: at1000,
+            monotonicNow: { overrideMono.now }
+        )
         try override.correctRemainingRequests([
             "x-ratelimit-remaining-requests": "5",
             "x-ratelimit-reset-requests": "100s",
-        ], at: at1000)
+        ], at: at1000, keyFingerprint: "key-a")
+        overrideMono.now = 1_010
         try override.correctRemainingRequests([
             "x-ratelimit-remaining-requests": "5",
             "x-ratelimit-reset-requests": "200s",
-        ], at: at1000.addingTimeInterval(10))
+        ], at: at1000.addingTimeInterval(10), keyFingerprint: "key-a")
+        overrideMono.now = 1_101
         check(override.usage(at: at1000.addingTimeInterval(101)).usagePercent >= 90, "最新恢复头应覆盖旧恢复点")
+        overrideMono.now = 1_211
         check(override.usage(at: at1000.addingTimeInterval(211)).dayRequests == 0, "最新恢复点后应清零")
+
+        // MARK: 可信 RPD 翻日信任门（R1–R7）
+
+        let base = Date(timeIntervalSince1970: 10_000)
+        let reset = base.addingTimeInterval(100)
+
+        func storedRecord(_ url: URL) -> [String: Any]? {
+            guard let data = try? Data(contentsOf: url),
+                  let object = try? JSONSerialization.jsonObject(with: data),
+                  let dictionary = object as? [String: Any] else { return nil }
+            return dictionary
+        }
+
+        // 1. 两个头同一条响应才建记录；只带其一不建。
+        do {
+            let bothURL = root.appendingPathComponent("quota-trust-both.json")
+            let mono = TestMonotonicClock(0)
+            let both = QuotaLedger(url: bothURL, now: base, monotonicNow: { mono.now })
+            try both.correctRemainingRequests([
+                "x-ratelimit-remaining-requests": "5",
+                "x-ratelimit-reset-requests": "100s",
+            ], at: base, keyFingerprint: "key-a")
+            let json = storedRecord(bothURL)
+            check(json?["server_reset_at"] as? Double == 10_100, "两个头同响应应写入 reset_at")
+            check(json?["server_reset_observed_at"] as? Double == 10_000, "两个头同响应应写入 observed_at")
+            check(json?["server_reset_key_fp"] as? String == "key-a", "恢复记录应绑定 key 指纹")
+            check(json?["server_reset_consumed"] as? Bool == false, "新恢复记录 consumed 应为 false")
+
+            let onlyResetURL = root.appendingPathComponent("quota-trust-only-reset.json")
+            let onlyReset = QuotaLedger(url: onlyResetURL, now: base)
+            try onlyReset.correctRemainingRequests([
+                "x-ratelimit-reset-requests": "100s",
+            ], at: base, keyFingerprint: "key-a")
+            check(storedRecord(onlyResetURL)?["server_reset_at"] == nil, "只有 reset 头不应建恢复记录")
+
+            let onlyRemainingURL = root.appendingPathComponent("quota-trust-only-remaining.json")
+            let onlyRemaining = QuotaLedger(url: onlyRemainingURL, now: base)
+            try onlyRemaining.correctRemainingRequests([
+                "x-ratelimit-remaining-requests": "5",
+            ], at: base, keyFingerprint: "key-a")
+            check(storedRecord(onlyRemainingURL)?["server_reset_at"] == nil, "只有 remaining 头不应建恢复记录")
+            check(onlyRemaining.usage(at: base).dayRequests == 1_995, "只剩 remaining 时仍应校正日请求数")
+
+            let tooLongURL = root.appendingPathComponent("quota-trust-too-long.json")
+            let tooLong = QuotaLedger(url: tooLongURL, now: base)
+            try tooLong.correctRemainingRequests([
+                "x-ratelimit-remaining-requests": "5",
+                "x-ratelimit-reset-requests": "25h",
+            ], at: base, keyFingerprint: "key-a")
+            check(storedRecord(tooLongURL)?["server_reset_at"] == nil, "超过 24h+60s 的 reset 应视为非法")
+        }
+
+        // 2. 恢复点前更大的 remaining（用量变小）不触发翻日，也不发 reset 事件。
+        do {
+            let url = root.appendingPathComponent("quota-trust-before.json")
+            let mono = TestMonotonicClock(0)
+            let ledger = QuotaLedger(url: url, now: base, monotonicNow: { mono.now })
+            try ledger.correctRemainingRequests([
+                "x-ratelimit-remaining-requests": "5",
+                "x-ratelimit-reset-requests": "100s",
+            ], at: base, keyFingerprint: "key-a")
+            _ = ledger.usage(at: base)
+            mono.now = 10
+            try ledger.correctRemainingRequests([
+                "x-ratelimit-remaining-requests": "1999",
+            ], at: base.addingTimeInterval(10), keyFingerprint: "key-a", sentAt: base.addingTimeInterval(10))
+            let event = ledger.routeEvent(at: base.addingTimeInterval(10))
+            check(event.type == "quota_update", "恢复点前更大的 remaining 不应发 quota_reset_confirmed")
+            check(ledger.usage(at: base.addingTimeInterval(10)).dayRequests == 1_995, "恢复点前仍应保留下限")
+        }
+
+        // 3. 过恢复点（墙钟+单调钟）且此前进过冷却：恰好一次 reset 事件，百分比取四窗口最大。
+        do {
+            let url = root.appendingPathComponent("quota-trust-confirm.json")
+            let mono = TestMonotonicClock(0)
+            let ledger = QuotaLedger(url: url, now: base, monotonicNow: { mono.now })
+            for _ in 0..<18 {
+                try ledger.recordRequest(duration: 10, at: base)
+            }
+            try ledger.correctRemainingRequests([
+                "x-ratelimit-remaining-requests": "5",
+                "x-ratelimit-reset-requests": "100s",
+            ], at: base, keyFingerprint: "key-a")
+            let hotEvent = ledger.routeEvent(at: base)
+            check(hotEvent.type == "quota_update" && (hotEvent.usagePercent ?? 0) >= 90, "恢复前应先把额度打进冷却")
+
+            mono.now = 101
+            let confirmed = ledger.routeEvent(at: reset.addingTimeInterval(1))
+            check(confirmed.type == "quota_reset_confirmed", "过恢复点后应发 quota_reset_confirmed")
+            check(confirmed.usagePercent == ledger.usage(at: reset.addingTimeInterval(1)).usagePercent,
+                  "reset 事件的 usage_percent 应是四窗口最大值")
+            let second = ledger.routeEvent(at: reset.addingTimeInterval(2))
+            check(second.type == "quota_update", "同一恢复记录只能触发一次 reset 事件")
+
+            var context = routeContext(.cooldownQuota)
+            context.apply(confirmed)
+            check(context.cloudState == .available, "reset 事件在冷却中且 <80% 时应放行云端")
+        }
+
+        // 4. 墙钟回拨 → 丢记录、不发事件，日请求仍含服务端下限。
+        do {
+            let url = root.appendingPathComponent("quota-trust-rollback.json")
+            let mono = TestMonotonicClock(10_000)
+            let ledger = QuotaLedger(url: url, now: base, monotonicNow: { mono.now })
+            try ledger.correctRemainingRequests([
+                "x-ratelimit-remaining-requests": "5",
+                "x-ratelimit-reset-requests": "100s",
+            ], at: base, keyFingerprint: "key-a")
+            _ = ledger.usage(at: base)
+            let rolledBack = base.addingTimeInterval(-10)
+            check(ledger.takeConfirmedReset(at: rolledBack) == nil, "墙钟回拨不应触发翻日")
+            check(ledger.usage(at: rolledBack).dayRequests == 1_995, "墙钟回拨后仍应保留下限")
+            check(storedRecord(url)?["server_reset_at"] == nil, "墙钟回拨应丢弃恢复记录")
+        }
+
+        // 5. 墙钟前跳但单调钟没走够 → 不算翻日。
+        do {
+            let url = root.appendingPathComponent("quota-trust-mono.json")
+            let mono = TestMonotonicClock(0)
+            let ledger = QuotaLedger(url: url, now: base, monotonicNow: { mono.now })
+            try ledger.correctRemainingRequests([
+                "x-ratelimit-remaining-requests": "5",
+                "x-ratelimit-reset-requests": "100s",
+            ], at: base, keyFingerprint: "key-a")
+            _ = ledger.usage(at: base)
+            mono.now = 5
+            check(ledger.takeConfirmedReset(at: reset.addingTimeInterval(1)) == nil,
+                  "单调钟未流逝足够时不算翻日")
+            check(ledger.usage(at: reset.addingTimeInterval(1)).dayRequests == 1_995, "未翻日时仍应含下限")
+            check(storedRecord(url)?["server_reset_at"] as? Double == 10_100, "未翻日不应丢弃记录")
+        }
+
+        // 6. key_fp 变化 → 旧记录丢弃、下限保留；key_fp=None 不建记录。
+        do {
+            let url = root.appendingPathComponent("quota-trust-key.json")
+            let mono = TestMonotonicClock(0)
+            let ledger = QuotaLedger(url: url, now: base, monotonicNow: { mono.now })
+            try ledger.correctRemainingRequests([
+                "x-ratelimit-remaining-requests": "5",
+                "x-ratelimit-reset-requests": "100s",
+            ], at: base, keyFingerprint: "key-a")
+            mono.now = 1
+            try ledger.correctRemainingRequests([
+                "x-ratelimit-remaining-requests": "10",
+                "x-ratelimit-reset-requests": "100s",
+            ], at: base.addingTimeInterval(1), keyFingerprint: "key-b")
+            check(storedRecord(url)?["server_reset_key_fp"] as? String == "key-b", "换 key 应重建恢复记录")
+            check(ledger.usage(at: base.addingTimeInterval(1)).dayRequests == 1_995, "换 key 应保留服务端用量下限")
+
+            let nilURL = root.appendingPathComponent("quota-trust-key-nil.json")
+            let nilLedger = QuotaLedger(url: nilURL, now: base)
+            try nilLedger.correctRemainingRequests([
+                "x-ratelimit-remaining-requests": "7",
+                "x-ratelimit-reset-requests": "100s",
+            ], at: base, keyFingerprint: nil)
+            check(storedRecord(nilURL)?["server_reset_at"] == nil, "key_fp=None 不应建立恢复记录")
+            check(nilLedger.usage(at: base).dayRequests == 1_993, "key_fp=None 仍应校正日请求数")
+        }
+
+        // 7. 翻日后 sent_at 早于恢复点 / 未知的迟到响应头不采信。
+        do {
+            let url = root.appendingPathComponent("quota-trust-late.json")
+            let mono = TestMonotonicClock(0)
+            let ledger = QuotaLedger(url: url, now: base, monotonicNow: { mono.now })
+            try ledger.correctRemainingRequests([
+                "x-ratelimit-remaining-requests": "5",
+                "x-ratelimit-reset-requests": "100s",
+            ], at: base, keyFingerprint: "key-a")
+            mono.now = 101
+            let after = reset.addingTimeInterval(1)
+            try ledger.correctRemainingRequests([
+                "x-ratelimit-remaining-requests": "0",
+                "x-ratelimit-reset-requests": "500s",
+            ], at: after, keyFingerprint: "key-a", sentAt: base.addingTimeInterval(50))
+            check(storedRecord(url)?["server_reset_at"] as? Double == 10_100, "sent_at<reset_at 的迟到头不得改锚点")
+            check(ledger.usage(at: after).dayRequests == 0, "sent_at 早于恢复点的 remaining 不得采信")
+
+            try ledger.correctRemainingRequests([
+                "x-ratelimit-remaining-requests": "0",
+                "x-ratelimit-reset-requests": "300s",
+            ], at: after, keyFingerprint: "key-a", sentAt: nil)
+            check(storedRecord(url)?["server_reset_at"] as? Double == 10_100, "sent_at=None 的迟到头不得改锚点")
+            check(ledger.usage(at: after).dayRequests == 0, "sent_at=None 的 remaining 不得采信")
+        }
+
+        // 8. 翻日只清 RPD 服务端分量，1 分钟/1 小时/24h 音频窗口不动。
+        do {
+            let url = root.appendingPathComponent("quota-trust-windows.json")
+            let mono = TestMonotonicClock(0)
+            let ledger = QuotaLedger(url: url, now: base, monotonicNow: { mono.now })
+            try ledger.recordRequest(duration: 12, at: base)
+            try ledger.correctRemainingRequests([
+                "x-ratelimit-remaining-requests": "5",
+                "x-ratelimit-reset-requests": "4s",
+            ], at: base, keyFingerprint: "key-a")
+            mono.now = 3
+            let before = ledger.usage(at: base.addingTimeInterval(3))
+            mono.now = 5
+            let after = ledger.usage(at: base.addingTimeInterval(4))
+            check(before.minuteRequests == after.minuteRequests, "翻日不应改 1 分钟请求窗口")
+            check(before.hourAudioSeconds == after.hourAudioSeconds, "翻日不应改 1 小时音频窗口")
+            check(before.dayAudioSeconds == after.dayAudioSeconds, "翻日不应改 24 小时音频窗口")
+            check(after.dayRequests == 0, "翻日应清掉 RPD 服务端分量")
+        }
+
+        // 9. 落盘往返 + 旧格式可读 + 记录字段非法只丢记录不隔离。
+        do {
+            let url = root.appendingPathComponent("quota-trust-persist.json")
+            let mono = TestMonotonicClock(0)
+            let ledger = QuotaLedger(url: url, now: base, monotonicNow: { mono.now })
+            try ledger.correctRemainingRequests([
+                "x-ratelimit-remaining-requests": "5",
+                "x-ratelimit-reset-requests": "100s",
+            ], at: base, keyFingerprint: "key-a")
+            _ = ledger.usage(at: base)
+            mono.now = 101
+            check(ledger.routeEvent(at: reset.addingTimeInterval(1)).type == "quota_reset_confirmed",
+                  "落盘用例应先发一次 reset 事件")
+            let json = storedRecord(url)
+            check(json?["server_reset_consumed"] as? Bool == true, "consumed 应落盘")
+            check(json?["server_reset_key_fp"] as? String == "key-a", "key_fp 应落盘")
+            check(json?["server_reset_observed_at"] as? Double == 10_000, "observed_at 应落盘")
+            let reloaded = QuotaLedger(url: url, now: reset.addingTimeInterval(2))
+            check(reloaded.takeConfirmedReset(at: reset.addingTimeInterval(2)) == nil,
+                  "已消费的恢复记录重启后不得重复发 reset 事件")
+            check(reloaded.usage(at: reset.addingTimeInterval(2)).dayRequests == 0, "重启后仍按恢复点算 RPD")
+
+            let invalidURL = root.appendingPathComponent("quota-trust-invalid-record.json")
+            let invalidJSON = #"{"events":[{"ts":10000,"billed_s":10}],"request_corrections":[],"server_reset_at":"bad","server_reset_observed_at":10000,"server_reset_key_fp":"key-a","server_reset_consumed":true}"#
+            try Data(invalidJSON.utf8).write(to: invalidURL)
+            let invalid = QuotaLedger(url: invalidURL, now: base)
+            check(invalid.usage(at: base).dayRequests == 1, "非法恢复记录不应影响事件解码")
+            check(storedRecord(invalidURL)?["server_reset_at"] == nil, "非法恢复记录应被丢弃")
+            check(!FileManager.default.fileExists(atPath: root.appendingPathComponent("quota-trust-invalid-record.json.corrupt").path),
+                  "非法恢复记录不应隔离整份账本")
+        }
+
+        // 10. 重启后没有单调钟 → 只看 R4a；consumed 防重复发。
+        do {
+            let url = root.appendingPathComponent("quota-trust-restart.json")
+            let mono = TestMonotonicClock(0)
+            let ledger = QuotaLedger(url: url, now: base, monotonicNow: { mono.now })
+            try ledger.correctRemainingRequests([
+                "x-ratelimit-remaining-requests": "5",
+                "x-ratelimit-reset-requests": "100s",
+            ], at: base, keyFingerprint: "key-a")
+            let restarted = QuotaLedger(url: url, now: reset.addingTimeInterval(1))
+            check(restarted.rolloverConfirmed(at: reset.addingTimeInterval(1)), "重启后应按 R4a 判定翻日")
+            check(restarted.usage(at: reset.addingTimeInterval(1)).dayRequests == 0, "重启后过恢复点应清 RPD")
+
+            let consumedURL = root.appendingPathComponent("quota-trust-restart-consumed.json")
+            let mono2 = TestMonotonicClock(0)
+            let first = QuotaLedger(url: consumedURL, now: base, monotonicNow: { mono2.now })
+            for _ in 0..<18 {
+                try first.recordRequest(duration: 10, at: base)
+            }
+            try first.correctRemainingRequests([
+                "x-ratelimit-remaining-requests": "5",
+                "x-ratelimit-reset-requests": "100s",
+            ], at: base, keyFingerprint: "key-a")
+            _ = first.usage(at: base)
+            mono2.now = 101
+            check(first.routeEvent(at: reset.addingTimeInterval(1)).type == "quota_reset_confirmed",
+                  "重启用例应先发一次 reset 事件")
+            let afterRestart = QuotaLedger(url: consumedURL, now: reset.addingTimeInterval(2))
+            check(afterRestart.routeEvent(at: reset.addingTimeInterval(2)).type == "quota_update",
+                  "consumed 落盘后重启不得再发 quota_reset_confirmed")
+        }
+
+        // PR88 F5：墙钟时间戳相同也有先后顺序，响应后的无头请求仍必须跨过 90% 门槛。
+        do {
+            let url = root.appendingPathComponent("quota-pr88-equal-timestamp.json")
+            let ledger = QuotaLedger(url: url, now: base)
+            try ledger.recordRequest(duration: 10, at: base)
+            try ledger.observeResponse(remainingRequests: 201, resetRequestsSeconds: 100,
+                                       keyFingerprint: "key-a", sentAt: base, at: base)
+            check(ledger.usage(at: base).dayRequests == 1_799,
+                  "PR88 F5 equal-ts: 第一条响应已确认本地请求，基线为 1799")
+            try ledger.recordRequest(duration: 10, at: base)
+            try ledger.observeResponse(remainingRequests: nil, resetRequestsSeconds: nil,
+                                       keyFingerprint: "key-b", sentAt: base, at: base)
+            check(ledger.usage(at: base).dayRequests == 1_800,
+                  "PR88 F5 equal-ts: 同时间戳的后发无头请求必须计为 1800")
+            var route = routeContext(.available)
+            ledger.applyQuotaEvent(to: &route, at: base)
+            check(route.cloudState == .cooldownQuota,
+                  "PR88 F5 equal-ts: 1800 请求必须触发 90% 额度冷却")
+            let restarted = QuotaLedger(url: url, now: base, activeKeyFingerprint: "key-b")
+            check(restarted.usage(at: base).dayRequests == 1_800,
+                  "PR88 F5 equal-ts: 重启仍保留未确认请求身份")
+            // 非法 remaining 不能把未确认请求误标为服务端已确认。
+            try ledger.observeResponse(remainingRequests: -1, resetRequestsSeconds: nil,
+                                       keyFingerprint: "key-b", sentAt: base, at: base)
+            check(ledger.usage(at: base).dayRequests == 1_800,
+                  "PR88 F5 equal-ts: 非法 remaining 不得确认本地请求")
+            // 合法但未采纳的降低仍确认响应前的事件；同时间戳的下一次无头请求仍需另加一。
+            try ledger.observeResponse(remainingRequests: 1_999, resetRequestsSeconds: nil,
+                                       keyFingerprint: "key-b", sentAt: base, at: base)
+            check(ledger.usage(at: base).dayRequests == 1_799,
+                  "PR88 F5 equal-ts: 未采纳的降低仍确认响应前事件，避免重复加算")
+            try ledger.recordRequest(duration: 10, at: base)
+            check(ledger.usage(at: base).dayRequests == 1_800,
+                  "PR88 F5 equal-ts: 未采纳降低之后的同时间戳请求仍加一")
+        }
+        // 缺少确认字段的旧账本按最近校正时间推断，兼容原有时间戳语义。
+        do {
+            let url = root.appendingPathComponent("quota-pr88-legacy-ack.json")
+            let old = QuotaLedgerSnapshot(
+                events: [
+                    QuotaLedgerEvent(ts: base.timeIntervalSince1970, billedS: 10),
+                    QuotaLedgerEvent(ts: base.timeIntervalSince1970 + 1, billedS: 10),
+                ],
+                requestCorrections: [QuotaRequestCorrection(ts: base.timeIntervalSince1970, usedRequests: 1_799)]
+            )
+            try JSONEncoder().encode(old).write(to: url)
+            let ledger = QuotaLedger(url: url, now: base.addingTimeInterval(1))
+            check(ledger.usage(at: base.addingTimeInterval(1)).dayRequests == 1_800,
+                  "PR88 F5 equal-ts: 旧账本只把校正之前的事件推断为已确认")
+        }
+
+        // PR88 F5：新 key 已知时先绑定，再记账/轮询；不能先替旧 key 自动确认翻日。
+        for restarting in [false, true] {
+            let url = root.appendingPathComponent("quota-pr88-key-before-send-\(restarting).json")
+            let mono = TestMonotonicClock(0)
+            let first = QuotaLedger(url: url, now: base, monotonicNow: { mono.now })
+            try first.recordRequest(duration: 10, at: base)
+            try first.observeResponse(remainingRequests: 5, resetRequestsSeconds: 100,
+                                      keyFingerprint: "key-a", sentAt: base, at: base)
+            let bAt = reset.addingTimeInterval(1)
+            mono.now = 101
+            let ledger: QuotaLedger
+            if restarting {
+                ledger = QuotaLedger(url: url, now: bAt, activeKeyFingerprint: "key-b")
+            } else {
+                ledger = first
+                try ledger.bindKeyFingerprint("key-b")
+            }
+            try ledger.recordRequest(duration: 10, at: bAt)
+            try ledger.observeResponse(remainingRequests: nil, resetRequestsSeconds: nil,
+                                       keyFingerprint: "key-b", sentAt: bAt, at: bAt)
+            check(storedRecord(url)?["day_epoch"] == nil,
+                  "PR88 F5: 发送前绑定 B，不能替 A 确认过期证明 restarting=\(restarting)")
+            check(ledger.usage(at: bAt).dayRequests >= 1_995,
+                  "PR88 F5: 发送前绑定 B 后仍保留 A 的旧用量下限 restarting=\(restarting)")
+        }
+
+        // PR88 F5：服务端下限之外，还要加上最后一条有 remaining 的响应尚未确认的本地请求。
+        do {
+            let url = root.appendingPathComponent("quota-pr88-headerless-additive.json")
+            let mono = TestMonotonicClock(0)
+            let ledger = QuotaLedger(url: url, now: base, monotonicNow: { mono.now })
+            try ledger.recordRequest(duration: 10, at: base)
+            try ledger.observeResponse(remainingRequests: 5, resetRequestsSeconds: 100,
+                                       keyFingerprint: "key-a", sentAt: base, at: base)
+            let bResponseAt = base.addingTimeInterval(50)
+            mono.now = 50
+            try ledger.recordRequest(duration: 10, at: bResponseAt)
+            try ledger.observeResponse(remainingRequests: nil, resetRequestsSeconds: nil,
+                                       keyFingerprint: "key-b", sentAt: bResponseAt, at: bResponseAt)
+            check(ledger.usage(at: bResponseAt).dayRequests == 1_996,
+                  "PR88 F5: 无头 B 请求应在旧服务端下限 1995 之上加一")
+            mono.now = 101
+            let afterReset = reset.addingTimeInterval(1)
+            check(ledger.usage(at: afterReset).dayRequests == 1_996,
+                  "PR88 F5: A 恢复点之后仍保留 1996 个请求")
+            let restarted = QuotaLedger(url: url, now: afterReset)
+            check(restarted.usage(at: afterReset).dayRequests == 1_996,
+                  "PR88 F5: 无头 B 请求重启后仍计为 1996")
+        }
+        do {
+            let url = root.appendingPathComponent("quota-pr88-correction-ack.json")
+            let ledger = QuotaLedger(url: url, now: base)
+            try ledger.recordRequest(duration: 10, at: base)
+            try ledger.correctRemainingRequests(["x-ratelimit-remaining-requests": "5"], at: base)
+            let lowAt = base.addingTimeInterval(30)
+            try ledger.recordRequest(duration: 10, at: lowAt)
+            try ledger.correctRemainingRequests(["x-ratelimit-remaining-requests": "1999"], at: lowAt)
+            check(ledger.usage(at: lowAt).dayRequests == 1_995,
+                  "PR88 F5: 未采纳的低用量响应仍确认此前本地请求，不重复加一")
+            try ledger.recordRequest(duration: 10, at: lowAt.addingTimeInterval(1))
+            check(ledger.usage(at: lowAt.addingTimeInterval(1)).dayRequests == 1_996,
+                  "PR88 F5: 最后一次校正之后的无头请求仍应加一")
+        }
+
+        // PR88 F5：无配额头的真实 B 响应也要先使 A 的恢复证明失效。
+        for afterBoundary in [false, true] {
+            let url = root.appendingPathComponent("quota-pr88-headerless-\(afterBoundary).json")
+            let mono = TestMonotonicClock(0)
+            let ledger = QuotaLedger(url: url, now: base, monotonicNow: { mono.now })
+            try ledger.observeResponse(remainingRequests: 5, resetRequestsSeconds: 100,
+                                       keyFingerprint: "key-a", sentAt: base, at: base)
+            _ = ledger.routeEvent(at: base)
+            let responseAt = base.addingTimeInterval(afterBoundary ? 101 : 50)
+            mono.now = afterBoundary ? 101 : 50
+            try ledger.observeResponse(remainingRequests: nil, resetRequestsSeconds: nil,
+                                       keyFingerprint: "key-b", sentAt: responseAt, at: responseAt)
+            mono.now = 102
+            let event = ledger.routeEvent(at: reset.addingTimeInterval(2))
+            check(event.type == "quota_update" && (event.usagePercent ?? 0) >= 99.75,
+                  "PR88 F5: 无头 B 响应后 A 不能解锁额度冷却 afterBoundary=\(afterBoundary)")
+            check(storedRecord(url)?["server_reset_at"] == nil && storedRecord(url)?["day_epoch"] == nil,
+                  "PR88 F5: 无头 B 响应应持久化丢弃 A 的恢复证明")
+            let restarted = QuotaLedger(url: url, now: reset.addingTimeInterval(3))
+            check(restarted.usage(at: reset.addingTimeInterval(3)).dayRequests >= 1_995,
+                  "PR88 F5: 无头 B 响应后重启仍保留旧用量下限")
+        }
+
+        // PR88 F1/F3：跨 key 不应把未确认的旧恢复点追认为可信；已确认锚点独立保留。
+        do {
+            let url = root.appendingPathComponent("quota-pr88-key-boundary.json")
+            let oldEvents = (0..<1_900).map {
+                QuotaLedgerEvent(ts: base.timeIntervalSince1970 - 4_000 - Double($0), billedS: 10, durS: 10)
+            }
+            try JSONEncoder().encode(QuotaLedgerSnapshot(events: oldEvents)).write(to: url)
+            let mono = TestMonotonicClock(0)
+            let ledger = QuotaLedger(url: url, now: base, monotonicNow: { mono.now })
+            try ledger.correctRemainingRequests([
+                "x-ratelimit-remaining-requests": "5", "x-ratelimit-reset-requests": "100s",
+            ], at: base, keyFingerprint: "key-a")
+            _ = ledger.usage(at: base)
+            mono.now = 101
+            // 空闲跨过恢复点，第一条新响应已属于 B：A 从未在有效 key 下被确认。
+            try ledger.correctRemainingRequests([
+                "x-ratelimit-remaining-requests": "1999", "x-ratelimit-reset-requests": "100s",
+            ], at: reset.addingTimeInterval(1), keyFingerprint: "key-b", sentAt: reset.addingTimeInterval(1))
+            check(ledger.usage(at: reset.addingTimeInterval(1)).dayRequests >= 1_900,
+                  "PR88 F3: 换 key 必须先废弃未确认的 A 恢复记录，保留旧事件")
+            check(storedRecord(url)?["day_epoch"] == nil,
+                  "PR88 F3: B 响应不能替 A 确认旧恢复点")
+        }
+        do {
+            let url = root.appendingPathComponent("quota-pr88-confirmed-epoch.json")
+            let mono = TestMonotonicClock(0)
+            let ledger = QuotaLedger(url: url, now: base, monotonicNow: { mono.now })
+            try ledger.correctRemainingRequests([
+                "x-ratelimit-remaining-requests": "5", "x-ratelimit-reset-requests": "100s",
+            ], at: base, keyFingerprint: "key-a")
+            _ = ledger.routeEvent(at: base)
+            mono.now = 101
+            check(ledger.routeEvent(at: reset.addingTimeInterval(1)).type == "quota_reset_confirmed",
+                  "PR88 F3: A 在换 key 之前先独立确认翻日")
+            try ledger.correctRemainingRequests([
+                "x-ratelimit-remaining-requests": "1999", "x-ratelimit-reset-requests": "100s",
+            ], at: reset.addingTimeInterval(2), keyFingerprint: "key-b", sentAt: reset.addingTimeInterval(2))
+            check(storedRecord(url)?["day_epoch"] as? Double == reset.timeIntervalSince1970,
+                  "PR88 F3: 已确认的 day_epoch 跨 key 保留")
+            let restarted = QuotaLedger(url: url, now: reset.addingTimeInterval(3), activeKeyFingerprint: "key-c")
+            check(restarted.usage(at: reset.addingTimeInterval(3)).dayRequests == 1,
+                  "PR88 F3: 换 key 后重启仍只统计已确认边界之后的新周期")
+        }
+        for restartBeforeConsume in [false, true] {
+            let url = root.appendingPathComponent("quota-pr88-consume-rollback-\(restartBeforeConsume).json")
+            let mono = TestMonotonicClock(0)
+            let first = QuotaLedger(url: url, now: base, monotonicNow: { mono.now })
+            try first.correctRemainingRequests([
+                "x-ratelimit-remaining-requests": "5", "x-ratelimit-reset-requests": "100s",
+            ], at: base, keyFingerprint: "key-a")
+            _ = first.routeEvent(at: base)
+            mono.now = 101
+            let ledger = restartBeforeConsume ? QuotaLedger(url: url, now: reset.addingTimeInterval(1)) : first
+            check(ledger.routeEvent(at: reset.addingTimeInterval(1)).type == "quota_reset_confirmed",
+                  "PR88 F1: 测试先消费恢复记录 restart=\(restartBeforeConsume)")
+            let rollback = base.addingTimeInterval(50)
+            check(ledger.usage(at: rollback).dayRequests >= 1_995,
+                  "PR88 F1: 消费后回拨仍保留旧下限 restart=\(restartBeforeConsume)")
+            let restarted = QuotaLedger(url: url, now: rollback)
+            check(restarted.usage(at: rollback).dayRequests >= 1_995,
+                  "PR88 F1: 消费后回拨重启仍保留旧下限")
+            // 恢复后观测到更低的 B 用量；回拨不能用未来的降低来抹掉旧下限。
+            mono.now = 200
+            try ledger.correctRemainingRequests([
+                "x-ratelimit-remaining-requests": "1999", "x-ratelimit-reset-requests": "100s",
+            ], at: base.addingTimeInterval(200), keyFingerprint: "key-b", sentAt: base.addingTimeInterval(200))
+            check(ledger.usage(at: rollback).dayRequests >= 1_995,
+                  "PR88 F1: 未来低用量校正不得在墙钟回拨后降低旧下限")
+            let afterLowRestart = QuotaLedger(url: url, now: rollback)
+            check(afterLowRestart.usage(at: rollback).dayRequests >= 1_995,
+                  "PR88 F1: 未来低用量校正回拨并重启后仍 fail-closed")
+        }
+
+        // G2: dayEpoch 在未来（墙钟前跳到 reset 之后），随后墙钟回拨。
+        // usageLocked 与 pruned 中 dayEpoch > now 时不使用该锚点（按 -inf，fail-closed），
+        // 墙钟追上后照常生效。
+        do {
+            let url = root.appendingPathComponent("quota-g2-future-epoch.json")
+            let base = Date(timeIntervalSince1970: 10_000)
+            let reset = base.addingTimeInterval(100)
+            let mono = TestMonotonicClock(0)
+            let ledger = QuotaLedger(url: url, now: base, monotonicNow: { mono.now })
+            // 先建立恢复记录并进入冷却
+            for _ in 0..<18 {
+                try ledger.recordRequest(duration: 10, at: base)
+            }
+            try ledger.correctRemainingRequests([
+                "x-ratelimit-remaining-requests": "5",
+                "x-ratelimit-reset-requests": "100s",
+            ], at: base, keyFingerprint: "key-a")
+            _ = ledger.usage(at: base)
+            // 墙钟前跳到 reset 之后
+            let afterReset = reset.addingTimeInterval(1)
+            mono.now = 101
+            let u1 = ledger.usage(at: afterReset)
+            check(u1.dayRequests == 0, "G2: 翻日后 dayRequests 应清零")
+            check(u1.usagePercent < 80, "G2: 翻日后 usagePercent 应 <80%")
+            // 墙钟回拨到 reset 之前
+            let rolledBack = base.addingTimeInterval(50)
+            mono.now = 50
+            let u2 = ledger.usage(at: rolledBack)
+            check(u2.dayRequests > 0, "G2: 墙钟回拨时 dayEpoch > now，不应用锚点，旧事件应重新计入（fail-closed）")
+            check(u2.usagePercent >= 90, "G2: 墙钟回拨时 usagePercent 应回到冷却阈值")
+            // 墙钟再次追上 reset 之后
+            mono.now = 101
+            let u3 = ledger.usage(at: afterReset)
+            check(u3.dayRequests == 0, "G2: 墙钟再次追上后 dayRequests 再次清零")
+            check(u3.usagePercent < 80, "G2: 墙钟再次追上后 usagePercent 再次 <80%")
+        }
+
+        // PR88 R2 #1：新记录不能覆盖已经确认的旧周期响应截止点。
+        for restarting in [false, true] {
+            let url = root.appendingPathComponent("quota-r2-retained-cutoff-\(restarting).json")
+            let mono = TestMonotonicClock(0)
+            let first = QuotaLedger(url: url, now: base, monotonicNow: { mono.now })
+            try first.observeResponse(remainingRequests: 5, resetRequestsSeconds: 100,
+                                       keyFingerprint: "key-a", sentAt: base, at: base)
+            _ = first.routeEvent(at: base)
+            mono.now = 101
+            _ = first.routeEvent(at: reset.addingTimeInterval(1))
+            try first.observeResponse(remainingRequests: 5, resetRequestsSeconds: 1_000,
+                                       keyFingerprint: "key-a", sentAt: reset.addingTimeInterval(1),
+                                       at: reset.addingTimeInterval(1))
+            let ledger = restarting
+                ? QuotaLedger(url: url, now: reset.addingTimeInterval(2), activeKeyFingerprint: "key-a") : first
+            for sentAt in [base.addingTimeInterval(50), nil] as [Date?] {
+                mono.now = 102
+                try ledger.observeResponse(remainingRequests: 1_999, resetRequestsSeconds: 1,
+                                           keyFingerprint: "key-a", sentAt: sentAt,
+                                           at: reset.addingTimeInterval(2))
+                check(storedRecord(url)?["server_reset_at"] as? Double == 11_101,
+                      "PR88 R2 #1: 新记录仍须拒绝旧周期/未知发送时间的短 reset")
+            }
+            mono.now = 104
+            check(ledger.usage(at: reset.addingTimeInterval(4)).dayRequests == 1_995,
+                  "PR88 R2 #1: 迟到短 reset 不得清掉新周期的 1995 下限")
+        }
+
+        // PR88 R2 #3：A 通过代次检查后暂停，绑定 B，再恢复 A 的记账也必须拒绝。
+        do {
+            let url = root.appendingPathComponent("quota-r2-stale-bound-key.json")
+            let mono = TestMonotonicClock(0)
+            let ledger = QuotaLedger(url: url, now: base, monotonicNow: { mono.now })
+            try ledger.bindKeyFingerprint("key-a")
+            try ledger.observeResponse(remainingRequests: 5, resetRequestsSeconds: 100,
+                                       keyFingerprint: "key-a", sentAt: base, at: base)
+            try ledger.bindKeyFingerprint("key-b")
+            try ledger.observeResponse(remainingRequests: 5, resetRequestsSeconds: 100,
+                                       keyFingerprint: "key-a", sentAt: base,
+                                       at: base.addingTimeInterval(1))
+            mono.now = 102
+            check(storedRecord(url)?["server_reset_at"] == nil,
+                  "PR88 R2 #3: 已绑定 B 后旧 A 回调不得重装恢复证明")
+            check(ledger.usage(at: reset.addingTimeInterval(2)).dayRequests == 1_995,
+                  "PR88 R2 #3: 旧 A 回调不得清掉 B 保护的服务端下限")
+        }
+
+        // PR88 R2 #5：A 的响应不能替尚未响应、最终无头失败的 B 确认请求。
+        do {
+            let url = root.appendingPathComponent("quota-r2-concurrent-ack.json")
+            let ledger = QuotaLedger(url: url, now: base)
+            try ledger.observeResponse(remainingRequests: 203, resetRequestsSeconds: nil,
+                                       keyFingerprint: "key-a", sentAt: base, at: base)
+            let sentA = base.addingTimeInterval(1)
+            let sentB = base.addingTimeInterval(2)
+            try ledger.recordRequest(duration: 10, at: sentA)
+            try ledger.recordRequest(duration: 10, at: sentB)
+            try ledger.observeResponse(remainingRequests: 202, resetRequestsSeconds: nil,
+                                       keyFingerprint: "key-a", sentAt: sentA,
+                                       at: base.addingTimeInterval(3))
+            try ledger.observeResponse(remainingRequests: nil, resetRequestsSeconds: nil,
+                                       keyFingerprint: "key-a", sentAt: sentB,
+                                       at: base.addingTimeInterval(4))
+            check(ledger.usage(at: base.addingTimeInterval(4)).dayRequests == 1_799,
+                  "PR88 R2 #5: A 只确认自己，B 仍应加在 1798 服务端下限之上")
+            try ledger.recordRequest(duration: 10, at: base.addingTimeInterval(5))
+            var context = routeContext(.available)
+            ledger.applyQuotaEvent(to: &context, at: base.addingTimeInterval(5))
+            check(context.cloudState == .cooldownQuota,
+                  "PR88 R2 #5: 下一次请求达到 1800 必须进入额度冷却")
+        }
+
+        // PR88 R2 #5：时间戳相同也必须按请求身份确认。
+        do {
+            let url = root.appendingPathComponent("quota-r2-concurrent-equal-timestamp.json")
+            let ledger = QuotaLedger(url: url, now: base)
+            try ledger.observeResponse(remainingRequests: 203, resetRequestsSeconds: nil,
+                                       keyFingerprint: "key-a", sentAt: base, at: base)
+            try ledger.recordRequest(duration: 10, at: base, requestID: "request-a")
+            try ledger.recordRequest(duration: 10, at: base, requestID: "request-b")
+            try ledger.observeResponse(remainingRequests: 202, resetRequestsSeconds: nil,
+                                       keyFingerprint: "key-a", sentAt: base, at: base,
+                                       requestID: "request-b")
+            check(ledger.usage(at: base).dayRequests == 1_799,
+                  "PR88 R2 #5: 同时间戳并发时 B 的 ID 只能确认 B")
+            let events = storedRecord(url)?["events"] as? [[String: Any]]
+            check(events?.first?["in_server_day"] as? Bool == false
+                    && events?.last?["in_server_day"] as? Bool == true,
+                  "PR88 R2 #5: B 先响应时 A 仍未确认，B 已确认")
+            let restarted = QuotaLedger(url: url, now: base)
+            check(restarted.usage(at: base).dayRequests == 1_799,
+                  "PR88 R2 #5: 请求确认身份应落盘，重启保留 A 的未确认计数")
+        }
+
+        // 无请求身份且发送时间相同的并发响应不能猜测确认哪一条。
+        do {
+            let url = root.appendingPathComponent("quota-r2-ambiguous-ack.json")
+            let ledger = QuotaLedger(url: url, now: base)
+            try ledger.observeResponse(remainingRequests: 203, resetRequestsSeconds: nil,
+                                       keyFingerprint: "key-a", sentAt: base, at: base)
+            try ledger.recordRequest(duration: 10, at: base)
+            try ledger.recordRequest(duration: 10, at: base)
+            try ledger.observeResponse(remainingRequests: 202, resetRequestsSeconds: nil,
+                                       keyFingerprint: "key-a", sentAt: base, at: base)
+            check(ledger.usage(at: base).dayRequests == 1_800,
+                  "PR88 R2 #5: 无 ID 且同时间戳时必须保留两条未确认请求")
+        }
+
+        // 清空 key 后即使云端关闭，旧证明和迟到 A 的响应也不能恢复它。
+        do {
+            let url = root.appendingPathComponent("quota-r2-cleared-key.json")
+            let mono = TestMonotonicClock(0)
+            let ledger = QuotaLedger(url: url, now: base, monotonicNow: { mono.now })
+            try ledger.bindKeyFingerprint("key-a")
+            try ledger.observeResponse(remainingRequests: 5, resetRequestsSeconds: 100,
+                                       keyFingerprint: "key-a", sentAt: base, at: base)
+            try ledger.bindKeyFingerprint(nil)
+            try ledger.observeResponse(remainingRequests: 5, resetRequestsSeconds: 100,
+                                       keyFingerprint: "key-a", sentAt: base, at: base)
+            try ledger.observeResponse(remainingRequests: 1_999, resetRequestsSeconds: nil,
+                                       keyFingerprint: nil, sentAt: base,
+                                       at: base.addingTimeInterval(70))
+            mono.now = 101
+            check(ledger.usage(at: reset.addingTimeInterval(1)).dayRequests == 1_995,
+                  "PR88 R2 #4: 关闭期间清空 key，轮询仍须保留旧下限")
+            try ledger.bindKeyFingerprint("key-b")
+            check(ledger.usage(at: reset.addingTimeInterval(1)).dayRequests == 1_995,
+                  "PR88 R2 #4: 随后启用 B 也不能继承已经清空的 A 恢复证明")
+        }
+
+        // PR88 R2 #6：缺失/null consumed 只丢恢复记录，保留 1995 下限和事件。
+        for consumedField in ["", ",\"server_reset_consumed\":null"] {
+            let url = root.appendingPathComponent("quota-r2-incomplete-consumed-\(consumedField.isEmpty).json")
+            let json = "{\"events\":[{\"ts\":10000,\"billed_s\":10}],\"request_corrections\":[{\"ts\":10000,\"used_requests\":1995}],\"server_reset_at\":10100,\"server_reset_observed_at\":10000,\"server_reset_key_fp\":\"key-a\"\(consumedField)}"
+            try Data(json.utf8).write(to: url)
+            let ledger = QuotaLedger(url: url, now: reset.addingTimeInterval(1))
+            check(ledger.usage(at: reset.addingTimeInterval(1)).dayRequests == 1_995,
+                  "PR88 R2 #6: 不完整 consumed 不得让 1995 下限翻日清零")
+            check(ledger.usage(at: reset.addingTimeInterval(1)).dayAudioSeconds == 10,
+                  "PR88 R2 #6: 不完整恢复记录不应丢弃本地事件")
+            check(storedRecord(url)?["server_reset_at"] == nil,
+                  "PR88 R2 #6: 不完整恢复记录应清理落盘")
+        }
+
+        // G3: 重启漏发 - 冷却中、记录未消费、reset 之后才重启。
+        // init 里先用旧周期完整用量判断 quotaHot（≥90% 置 true），再推进 dayEpoch。
+        do {
+            let url = root.appendingPathComponent("quota-g3-restart-missed.json")
+            let base = Date(timeIntervalSince1970: 10_000)
+            let reset = base.addingTimeInterval(100)
+            let mono = TestMonotonicClock(0)
+            // 使用较小的日限额以便测试：20 次/天，这样 18 次就能达到 90%
+            let testLimits = QuotaLedgerLimits(requestsPerDay: 20)
+            // 第一次运行：建立恢复记录并进入冷却（≥90%），但不调用 routeEvent 消费记录
+            // 模拟：用户在冷却中关闭了程序，记录还没被消费
+            do {
+                let ledger = QuotaLedger(url: url, limits: testLimits, now: base, monotonicNow: { mono.now })
+                for _ in 0..<18 {
+                    try ledger.recordRequest(duration: 10, at: base)
+                }
+                try ledger.correctRemainingRequests([
+                    "x-ratelimit-remaining-requests": "5",
+                    "x-ratelimit-reset-requests": "100s",
+                ], at: base, keyFingerprint: "key-a")
+                // 在 base 时刻检查用量：此时 minuteRequests=18/20=90%，进入冷却，quotaHot=true
+                let usageAtBase = ledger.usage(at: base)
+                check(usageAtBase.usagePercent >= 90, "G3 前置：base 时刻用量应 ≥90%")
+                mono.now = 101
+                // 故意不调用 usage/routeEvent：记录未消费，serverResetConsumed=false，dayEpoch 也不推进
+                // 模拟用户在此刻关闭程序
+            }
+            // 重启：新实例从文件读，无单调钟，墙钟在 reset 之后
+            let restarted = QuotaLedger(url: url, limits: testLimits, now: reset.addingTimeInterval(1))
+            // G3 修复：quotaHot 应为 true（用旧周期用量判断），因此 routeEvent 能发出 reset 事件
+            let restartedEvent = restarted.routeEvent(at: reset.addingTimeInterval(1))
+            check(restartedEvent.type == "quota_reset_confirmed",
+                  "G3: 重启后 quotaHot 由旧周期用量决定，应仍能发出 quota_reset_confirmed")
+            // 第二次调用不再发
+            let secondEvent = restarted.routeEvent(at: reset.addingTimeInterval(2))
+            check(secondEvent.type == "quota_update", "G3: 同一恢复记录只能触发一次 reset 事件")
+        }
     } catch {
         check(false, "QuotaLedger selftest 异常：\(error)")
     }

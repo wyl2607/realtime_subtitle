@@ -1,4 +1,5 @@
 import AVFoundation
+import CryptoKit
 import Foundation
 
 /// TK-001 实测：SpeechTranscriber 的 volatile 结果没有词级时间，用它判段尾会把延迟做成 final 的 ~2s。
@@ -595,6 +596,7 @@ final class CloudUploadController: @unchecked Sendable {
     private var lastKey: String?
     private var epoch = 0
     private var segmentEpoch: [Int: Int] = [:]
+    private var segmentRequestID: [Int: String] = [:]
     private var accepted = Set<Int>()
     private var probeID: Int?
     private var cooldownDeadline: Date?
@@ -619,6 +621,8 @@ final class CloudUploadController: @unchecked Sendable {
         language = Self.groqLanguage(localeID: localeID)
         let initial = readSwitch()
         lastKey = initial.key
+        // 构造时已有 key 也要先比对证明，初次额度查询不能确认另一个 key 的旧边界。
+        try? ledger.observeKey(initial.key.map(Self.quotaKeyFingerprint))
         let cloudOn = initial.hasKey && initial.enabled
         context = CloudRouteContext(RouteInitial(
             hasKey: initial.hasKey,
@@ -695,8 +699,9 @@ final class CloudUploadController: @unchecked Sendable {
         let allowed = shouldUploadLocked(segment, consumeProbe: false)
             || (probeID == segment.id && context.tier() == .cloud)
         guard allowed, context.tier() == .cloud else { return nil }
+        let requestID = UUID().uuidString
         do {
-            _ = try ledger.recordRequest(duration: segment.duration, at: now)
+            _ = try ledger.recordRequest(duration: segment.duration, at: now, requestID: requestID)
         } catch {
             accepted.insert(segment.id)
             return nil
@@ -708,6 +713,7 @@ final class CloudUploadController: @unchecked Sendable {
         }
         accepted.insert(segment.id)
         segmentEpoch[segment.id] = epoch
+        segmentRequestID[segment.id] = requestID
         if context.cloudState == .probe {
             probeID = segment.id
         }
@@ -722,6 +728,7 @@ final class CloudUploadController: @unchecked Sendable {
         applyNodeFacts(node)
         if id == probeID { probeID = nil }
         let bounds = segmentBounds.removeValue(forKey: id)
+        let requestID = segmentRequestID.removeValue(forKey: id)
         if dropResolvedResultLocked(cancel: cancel) || segmentEpoch[id] != epoch {
             return reconcileLocked(atSilence: false, node: node, lines: [], discard: true, cancel: cancel)
         }
@@ -733,7 +740,13 @@ final class CloudUploadController: @unchecked Sendable {
             quotaHeaders["x-ratelimit-reset-requests"] = "\(resetSeconds)s"
         }
         if !quotaHeaders.isEmpty {
-            try? ledger.correctRemainingRequests(quotaHeaders, at: now)
+            try? ledger.note(
+                quotaHeaders,
+                at: now,
+                keyFingerprint: result.keyFingerprint,
+                sentAt: result.sentAt,
+                requestID: requestID
+            )
         }
         context.apply(RouteEvent(type: "segment_success", status: nil, retryAfter: nil, usagePercent: nil))
         clearCooldownIfResumed()
@@ -749,6 +762,7 @@ final class CloudUploadController: @unchecked Sendable {
         applyNodeFacts(node)
         if id == probeID { probeID = nil }
         segmentBounds.removeValue(forKey: id)
+        let requestID = segmentRequestID.removeValue(forKey: id)
         if dropResolvedResultLocked(cancel: cancel) || segmentEpoch[id] != epoch || Self.isCancellation(error) {
             return reconcileLocked(atSilence: false, node: node, lines: [], discard: true, cancel: cancel)
         }
@@ -762,7 +776,13 @@ final class CloudUploadController: @unchecked Sendable {
                 quotaHeaders["x-ratelimit-reset-requests"] = "\(resetSeconds)s"
             }
             if !quotaHeaders.isEmpty {
-                try? ledger.correctRemainingRequests(quotaHeaders, at: now)
+                try? ledger.note(
+                    quotaHeaders,
+                    at: now,
+                    keyFingerprint: quota?.keyFingerprint,
+                    sentAt: quota?.sentAt,
+                    requestID: requestID
+                )
             }
             context.apply(RouteEvent(type: "http_status", status: status, retryAfter: retryAfter, usagePercent: nil))
             noteCooldown(now)
@@ -806,6 +826,7 @@ final class CloudUploadController: @unchecked Sendable {
         epoch += 1
         probeID = nil
         segmentBounds.removeAll()
+        segmentRequestID.removeAll()
         client?.cancelInflightRequests()
     }
 
@@ -876,8 +897,14 @@ final class CloudUploadController: @unchecked Sendable {
         return context.cloudState == .available
     }
 
+    private static func quotaKeyFingerprint(_ key: String) -> String {
+        SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
     private func refreshSwitchLocked() -> Bool {
         let snap = readSwitch()
+        // 关闭和清空 key 时也须先失效证明；随后额度轮询不能确认旧 key 的边界。
+        try? ledger.observeKey(snap.key.map(Self.quotaKeyFingerprint))
         var cancel = false
         let clearingKey = !snap.hasKey
         if clearingKey {
@@ -900,6 +927,7 @@ final class CloudUploadController: @unchecked Sendable {
             epoch += 1
             probeID = nil
             segmentBounds.removeAll()
+            segmentRequestID.removeAll()
             client?.cancelInflightRequests()
             client = makeClient(snap.key ?? "")
             clearCooldownIfResumed()
@@ -915,6 +943,7 @@ final class CloudUploadController: @unchecked Sendable {
             epoch += 1
             probeID = nil
             segmentBounds.removeAll()
+            segmentRequestID.removeAll()
             client?.cancelInflightRequests()
         }
         if clearingKey {
@@ -1127,13 +1156,13 @@ final class CloudUploadController: @unchecked Sendable {
             _ = controller.prepareSend(probe, now: now.addingTimeInterval(7))
             let back = controller.resolveSuccess(
                 id: probe.id,
-                result: CloudTranscriptionResult(text: "Hallo", segments: [CloudSegment(t0: probe.audioOrigin, t1: probe.audioOrigin + 1, text: "Hallo")], statusCode: 200, xGroqID: "req", remainingRequests: 1990),
+                result: CloudTranscriptionResult(text: "Hallo", segments: [CloudSegment(t0: probe.audioOrigin, t1: probe.audioOrigin + 1, text: "Hallo")], statusCode: 200, xGroqID: "req", remainingRequests: 1990, keyFingerprint: box.snapshot.key.map(Self.quotaKeyFingerprint), sentAt: now.addingTimeInterval(7)),
                 now: now.addingTimeInterval(7),
                 node: active
             )
             check(back.lines.count == 1 && back.lines[0].text == "Hallo", "成功结果应进 P5")
             check(back.mode == .hybrid("mini2"), "试探成功后要等静音点才离开节点，实际 \(back.mode.label)")
-            check(ledger.usage(at: now.addingTimeInterval(7)).dayRequests == 10, "remaining-requests 应校正每日请求数")
+            check(ledger.usage(at: now.addingTimeInterval(7)).dayRequests == 13, "remaining-requests 校正 10 次后，3 次无头失败仍须另计")
             check(ledger.usage(at: now.addingTimeInterval(7)).minuteRequests > 0, "每日剩余不应改写 1 分钟窗口")
             let firstSilence = controller.ingest(samples: [Float](repeating: 0, count: 16_000), startSeconds: clock, now: now.addingTimeInterval(8), node: active)
             clock += 1
@@ -1209,6 +1238,47 @@ final class CloudUploadController: @unchecked Sendable {
             }
         }
 
+        // Review F5：真正的换 key 必须先丢旧恢复证明，再做发请求前的额度检查。
+        do {
+            let keyA = "gsk_selftest_quota_key_old_abcdefghijklmnopqrstuv"
+            let keyB = "gsk_selftest_quota_key_new_abcdefghijklmnopqrstuv"
+            let rotatedLedger = QuotaLedger(url: root.appendingPathComponent("quota-key-before-send.json"), now: now)
+            let rotatedSwitch = SwitchBox(snapshot: CloudSwitchSnapshot(hasKey: true, enabled: true, key: keyA))
+            let rotated = CloudUploadController(localeID: "de-DE", ledger: rotatedLedger, readSwitch: { rotatedSwitch.snapshot }, makeClient: { _ in FakeCloud() })
+            try rotatedLedger.note(["x-ratelimit-remaining-requests": "5", "x-ratelimit-reset-requests": "100s"], at: now, keyFingerprint: quotaKeyFingerprint(keyA), sentAt: now, monotonicNow: 0)
+            _ = rotated.ingest(samples: [], startSeconds: 0, now: now, node: idle)
+            rotatedSwitch.snapshot.key = keyB
+            let unsent = EmittedCloudSegment(id: 987, speechA0: 0, speechA1: 2, audioOrigin: 0, pcm16: Data(repeating: 0, count: 64_000), reason: "selftest")
+            check(rotated.prepareSend(unsent, now: now.addingTimeInterval(101)) == nil, "F5：换 key 后发请求前不能确认旧 key 边界并上传")
+            check(rotatedLedger.usage(at: now.addingTimeInterval(101)).dayRequests == 1_995, "F5：发请求前换 key 观察不能伪造本地请求或丢高水位")
+        } catch {
+            failures.append("F5 换 key 发请求前检查异常：\(error)")
+        }
+
+        // PR88 R2 #4：关闭状态也必须在额度轮询前观察清空和替换 key。
+        do {
+            let keyA = "gsk_selftest_disabled_key_old_abcdefghijklmnopqrstuv"
+            let keyB = "gsk_selftest_disabled_key_new_abcdefghijklmnopqrstuv"
+            for replacement in [nil, keyB] as [String?] {
+                let disabledLedger = QuotaLedger(url: root.appendingPathComponent("quota-disabled-\(replacement == nil ? "clear" : "replace").json"), now: now)
+                let disabledSwitch = SwitchBox(snapshot: CloudSwitchSnapshot(hasKey: true, enabled: true, key: keyA))
+                let disabled = CloudUploadController(localeID: "de-DE", ledger: disabledLedger, readSwitch: { disabledSwitch.snapshot }, makeClient: { _ in FakeCloud() })
+                try disabledLedger.note(["x-ratelimit-remaining-requests": "5", "x-ratelimit-reset-requests": "100s"], at: now, keyFingerprint: quotaKeyFingerprint(keyA), sentAt: now, monotonicNow: 0)
+                disabledSwitch.snapshot.enabled = false
+                _ = disabled.ingest(samples: [], startSeconds: 0, now: now.addingTimeInterval(1), node: idle)
+                disabledSwitch.snapshot.key = replacement
+                disabledSwitch.snapshot.hasKey = replacement != nil
+                _ = disabled.ingest(samples: [], startSeconds: 0, now: now.addingTimeInterval(101), node: idle)
+                disabledSwitch.snapshot.key = keyB
+                disabledSwitch.snapshot.hasKey = true
+                disabledSwitch.snapshot.enabled = true
+                let resumed = disabled.ingest(samples: [], startSeconds: 0, now: now.addingTimeInterval(102), node: idle)
+                check(disabledLedger.usage(at: now.addingTimeInterval(102)).dayRequests == 1_995 && resumed.control.mode != .cloud, "PR88 R2 #4：关闭时清空或替换 key 不能借 A 边界释放 B 的额度冷却")
+            }
+        } catch {
+            failures.append("PR88 R2 #4 关闭时 key 检查异常：\(error)")
+        }
+
         let rateLedger = QuotaLedger(url: root.appendingPathComponent("quota-rate.json"))
         let rateBox = SwitchBox(snapshot: CloudSwitchSnapshot(hasKey: true, enabled: true, key: "gsk_selftest_fake_key_abcdefghijklmnopqrstuvwxyz"))
         let rate = CloudUploadController(
@@ -1258,7 +1328,7 @@ final class CloudUploadController: @unchecked Sendable {
         if let segment = httpClosed.uploads.first, httpQuota.prepareSend(segment, now: now) != nil {
             _ = httpQuota.resolveFailure(
                 id: segment.id,
-                error: CloudClientError.httpStatus(429, retryAfter: 3, xGroqID: nil, quota: CloudQuotaHeaders(remainingRequests: 0, resetRequestsS: 100)),
+                error: CloudClientError.httpStatus(429, retryAfter: 3, xGroqID: nil, quota: CloudQuotaHeaders(remainingRequests: 0, resetRequestsS: 100, keyFingerprint: rateBox.snapshot.key.map(Self.quotaKeyFingerprint), sentAt: now)),
                 now: now,
                 node: idle
             )

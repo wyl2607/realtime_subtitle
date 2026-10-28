@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// 仅供云端延迟诊断使用的单调时钟。headless 运行时由 main.swift 注入与 events.jsonl
 /// 相同的起点；非 headless 运行没有 events.jsonl，则退回到进程 uptime。
@@ -33,15 +34,27 @@ struct CloudTranscriptionResult: Equatable {
     var remainingRequests: Int?
     /// `x-ratelimit-reset-requests` 解析后的秒数；保持默认值以兼容既有 selftest 构造点。
     var resetRequestsS: Double? = nil
+    /// 仅用于账本信任门的 key 指纹和实际请求发出时刻；两者都不含敏感正文或 key。
+    var keyFingerprint: String? = nil
+    var sentAt: Date? = nil
 }
 
 struct CloudQuotaHeaders: Equatable {
     var remainingRequests: Int?
     var resetRequestsS: Double?
+    var keyFingerprint: String?
+    var sentAt: Date?
 
-    init(remainingRequests: Int? = nil, resetRequestsS: Double? = nil) {
+    init(
+        remainingRequests: Int? = nil,
+        resetRequestsS: Double? = nil,
+        keyFingerprint: String? = nil,
+        sentAt: Date? = nil
+    ) {
         self.remainingRequests = remainingRequests
         self.resetRequestsS = resetRequestsS
+        self.keyFingerprint = keyFingerprint
+        self.sentAt = sentAt
     }
 }
 
@@ -85,6 +98,7 @@ final class CloudClient: @unchecked Sendable {
     static let totalTimeout: TimeInterval = 10
 
     private let key: String
+    private let keyFingerprint: String
     private let endpointURL: URL
     private let session: URLSession
     private let logger: @Sendable (CloudLogEntry) -> Void
@@ -109,6 +123,7 @@ final class CloudClient: @unchecked Sendable {
         logger: @escaping @Sendable (CloudLogEntry) -> Void = { _ in }
     ) {
         self.key = key
+        keyFingerprint = Self.fingerprint(for: key)
         self.endpointURL = endpoint
         self.session = URLSession(configuration: sessionConfiguration)
         self.logger = logger
@@ -184,6 +199,7 @@ final class CloudClient: @unchecked Sendable {
             fileData: wav
         )
 
+        let sentAt = Date()
         let generation = lock.withLockValue { cancelGeneration }
         let (data, response) = try await data(for: request, duration: duration, generation: generation, segmentID: segmentID)
         guard let http = response as? HTTPURLResponse else {
@@ -204,7 +220,9 @@ final class CloudClient: @unchecked Sendable {
         let groqID = Self.groqID(from: http)
         let quota = CloudQuotaHeaders(
             remainingRequests: QuotaLedger.remainingRequests(from: http.allHeaderFields),
-            resetRequestsS: QuotaLedger.resetRequestsSeconds(from: http.allHeaderFields)
+            resetRequestsS: QuotaLedger.resetRequestsSeconds(from: http.allHeaderFields),
+            keyFingerprint: keyFingerprint,
+            sentAt: sentAt
         )
         guard (200..<300).contains(http.statusCode) else {
             let retryAfter = Self.retryAfter(from: http)
@@ -227,12 +245,18 @@ final class CloudClient: @unchecked Sendable {
                 statusCode: http.statusCode,
                 xGroqID: groqID,
                 remainingRequests: remaining,
-                resetRequestsS: quota.resetRequestsS
+                resetRequestsS: quota.resetRequestsS,
+                keyFingerprint: keyFingerprint,
+                sentAt: sentAt
             )
         } catch {
             logger(CloudLogEntry(xGroqID: groqID, duration: duration, statusCode: http.statusCode, reason: "decode_failed", errorType: "decode"))
             throw CloudClientError.decodeFailed
         }
+    }
+
+    private static func fingerprint(for key: String) -> String {
+        SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     private func data(
