@@ -224,12 +224,12 @@ def test_reset_record_binds_key_and_rejects_late_old_cycle_headers(tmp_path):
     ledger.note(10, now=112, remaining_requests=1999, reset_requests_s=50, key_fp="key-b", sent_at=112)
     saved = json.loads((tmp_path / "quota.json").read_text(encoding="utf-8"))
     assert saved["reset_record"]["key_fp"] == "key-b"
-    assert ledger.usage(now=112).day_requests == 1995
+    assert ledger.usage(now=112).day_requests == 1997  # 两个未确认请求仍须另计。
 
     ledger.note(10, now=113, remaining_requests=1999, reset_requests_s=50, key_fp=None, sent_at=113)
     saved = json.loads((tmp_path / "quota.json").read_text(encoding="utf-8"))
     assert saved["reset_record"] is None
-    assert ledger.usage(now=113).day_requests == 1995
+    assert ledger.usage(now=113).day_requests == 1997
 
 
 def test_reset_record_persists_consumption_and_bad_record_is_not_quarantined(tmp_path):
@@ -669,7 +669,7 @@ def test_remaining_requests_out_of_bounds_does_not_correct_or_create_reset_recor
 
     # 合法边界 0 和 2000 仍能工作
     usage = ledger.note(10, now=103, remaining_requests=0, reset_requests_s=50, key_fp="key-a", sent_at=103)
-    assert usage.day_requests == 2000
+    assert usage.day_requests == 2002  # 两次非法 remaining 的请求未被当前响应确认。
     # 60s 宽限期后，remaining=2000 才能把 floor 降到 0
     usage = ledger.note(10, now=164, remaining_requests=2000, reset_requests_s=50, key_fp="key-a", sent_at=164)
     assert usage.day_requests == 5  # 服务端下限降到 0，本地 5 次仍须保留
@@ -854,3 +854,70 @@ def test_same_timestamp_headerless_key_request_crosses_quota_threshold(tmp_path)
     restarted, restarted_state = _ledger(tmp_path, now=1000)
     assert restarted.usage(now=1000).day_requests == 1800
     assert restarted_state.cloud_state == "cooldown_quota"
+
+
+@pytest.mark.parametrize("sent_at", [1099, None])
+@pytest.mark.parametrize("restart", [False, True])
+def test_rollover_cutoff_survives_replacement_record(tmp_path, sent_at, restart):
+    mono = [100.0]
+    ledger, _ = _ledger(tmp_path, now=1000, monotonic=lambda: mono[0])
+    ledger.note(10, now=1000, remaining_requests=5, reset_requests_s=100, key_fp="key-a", sent_at=1000)
+    mono[0] = 202
+    ledger.usage(now=1101)
+    ledger.note(10, now=1102, remaining_requests=5, reset_requests_s=1000, key_fp="key-a", sent_at=1102)
+    if restart:
+        ledger, _ = _ledger(tmp_path, now=1102, monotonic=lambda: mono[0])
+    ledger.note(10, now=1103, remaining_requests=1999, reset_requests_s=1, key_fp="key-a", sent_at=sent_at)
+    assert json.loads(ledger.path.read_text())["reset_record"]["reset_at"] == 2102
+    mono[0] = 205
+    assert ledger.usage(now=1105).day_requests >= 1995
+
+
+@pytest.mark.parametrize("old_fp", ["key-a", None])
+def test_bound_key_rejects_old_callback_recovery_evidence(tmp_path, old_fp):
+    mono = [100.0]
+    ledger, _ = _ledger(tmp_path, now=1000, monotonic=lambda: mono[0])
+    ledger.observe_key("key-a")
+    ledger.note(10, now=1000, remaining_requests=5, reset_requests_s=100, key_fp="key-a", sent_at=1000)
+    ledger.observe_key("key-b")
+    ledger.note(10, now=1001, remaining_requests=5, reset_requests_s=1000, key_fp="key-b", sent_at=1001)
+    ledger.note(10, now=1002, remaining_requests=1999, reset_requests_s=1, key_fp=old_fp, sent_at=1000)
+    saved = json.loads(ledger.path.read_text())
+    assert saved["reset_record"]["key_fp"] == "key-b"
+    mono[0] = 105
+    assert ledger.usage(now=1005).day_requests >= 1995
+
+
+def test_response_does_not_acknowledge_overlapping_completed_request(tmp_path):
+    ledger, _ = _ledger(tmp_path, now=1000)
+    ledger.note(10, now=1000, remaining_requests=203)
+    # A starts at 1020; B completes without headers before A's older snapshot arrives.
+    ledger.note(10, now=1030, sent_at=1021)
+    usage = ledger.note(10, now=1040, remaining_requests=202, sent_at=1020)
+    assert usage.day_requests == 1799
+    assert ledger.note(10, now=1041).day_requests == 1800
+
+
+@pytest.mark.parametrize("consumed", ["missing", None])
+def test_incomplete_consumed_record_keeps_floor(tmp_path, consumed):
+    record = {"reset_at": 1100, "observed_at": 1000, "key_fp": "key-a"}
+    if consumed != "missing":
+        record["consumed"] = consumed
+    path = tmp_path / "quota.json"
+    path.write_text(json.dumps({
+        "version": 1, "events": [], "server_day_used": 1995,
+        "server_day_used_at": 1000, "reset_record": record,
+    }))
+    ledger, _ = _ledger(tmp_path, now=1101)
+    assert ledger.usage().day_requests == 1995
+    assert json.loads(path.read_text())["reset_record"] is None
+    assert not path.with_name("quota.json.corrupt").exists()
+
+
+def test_cleared_key_rejects_anonymous_lower_remaining(tmp_path):
+    ledger, _ = _ledger(tmp_path, now=1000)
+    ledger.observe_key("key-a")
+    ledger.note(10, now=1000, remaining_requests=5, key_fp="key-a", sent_at=1000)
+    ledger.observe_key(None)
+    ledger.note(10, now=1061, remaining_requests=1999, key_fp=None, sent_at=1061)
+    assert ledger.usage(now=1061).day_requests == 1995

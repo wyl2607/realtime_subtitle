@@ -80,7 +80,7 @@ struct QuotaLedgerSnapshot: Codable, Equatable {
             || keyFp != nil
             || container.contains(.serverResetConsumed)
             || badReset || badObserved || badKey || badConsumed
-        if badReset || badObserved || badKey || badConsumed || !Self.isCompleteRecovery(
+        if badReset || badObserved || badKey || badConsumed || (hasRecoveryFields && consumed == nil) || !Self.isCompleteRecovery(
             resetAt: serverResetAt,
             observedAt: serverResetObservedAt,
             keyFp: serverResetKeyFp
@@ -138,19 +138,23 @@ struct QuotaLedgerEvent: Codable, Equatable {
     var durS: Double?
     /// 已被合法 remaining 响应确认；nil 表示旧格式，由校正时间推断。
     var inServerDay: Bool?
+    /// 请求身份：同时间戳并发上传也只能确认响应对应的那一条。
+    var requestID: String?
 
     enum CodingKeys: String, CodingKey {
         case ts
         case billedS = "billed_s"
         case durS = "dur_s"
         case inServerDay = "in_server_day"
+        case requestID = "request_id"
     }
 
-    init(ts: Double, billedS: Double, durS: Double? = nil, inServerDay: Bool? = nil) {
+    init(ts: Double, billedS: Double, durS: Double? = nil, inServerDay: Bool? = nil, requestID: String? = nil) {
         self.ts = ts
         self.billedS = billedS
         self.durS = durS
         self.inServerDay = inServerDay
+        self.requestID = requestID
     }
 
     init(from decoder: Decoder) throws {
@@ -167,6 +171,7 @@ struct QuotaLedgerEvent: Codable, Equatable {
         // 缺字段才按旧格式推断；已有字段但损坏时按未确认处理，不能低估用量。
         inServerDay = container.contains(.inServerDay)
             ? ((try? container.decode(Bool.self, forKey: .inServerDay)) ?? false) : nil
+        requestID = try? container.decodeIfPresent(String.self, forKey: .requestID)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -175,6 +180,7 @@ struct QuotaLedgerEvent: Codable, Equatable {
         try container.encode(billedS, forKey: .billedS)
         try container.encodeIfPresent(durS, forKey: .durS)
         try container.encodeIfPresent(inServerDay, forKey: .inServerDay)
+        try container.encodeIfPresent(requestID, forKey: .requestID)
     }
 }
 
@@ -198,6 +204,8 @@ final class QuotaLedger: @unchecked Sendable {
     private var snapshot: QuotaLedgerSnapshot
     /// 恢复记录的单调钟观测点。只活在进程内，绝不落盘（R7）。
     private var recoveryObservedMono: Double?
+    private var activeKeyFingerprint: String?
+    private var hasBoundKey = false
     /// 本账本此前把额度打进过冷却。跟 rslite 的 `_quota_hot` 同义，但不落盘。
     private var quotaHot = false
 
@@ -215,6 +223,8 @@ final class QuotaLedger: @unchecked Sendable {
         self.url = url
         self.limits = limits
         self.monotonicNow = monotonicNow
+        self.activeKeyFingerprint = activeKeyFingerprint
+        hasBoundKey = activeKeyFingerprint != nil
         // 文件不存在是空账本；文件在但读不到或解不开，才隔离并饱和 24 小时。
         guard FileManager.default.fileExists(atPath: url.path) else {
             snapshot = QuotaLedgerSnapshot()
@@ -251,13 +261,14 @@ final class QuotaLedger: @unchecked Sendable {
     }
 
     @discardableResult
-    func recordRequest(duration: Double, at now: Date = Date()) throws -> Double {
+    func recordRequest(duration: Double, at now: Date = Date(), requestID: String? = nil) throws -> Double {
         lock.lock()
         defer { lock.unlock() }
         let billed = max(10, duration)
         snapshot.events.append(
             QuotaLedgerEvent(
-                ts: now.timeIntervalSince1970, billedS: billed, durS: Self.round3(duration), inServerDay: false
+                ts: now.timeIntervalSince1970, billedS: billed, durS: Self.round3(duration),
+                inServerDay: false, requestID: requestID
             )
         )
         snapshot = Self.pruned(snapshot, now: now)
@@ -267,9 +278,11 @@ final class QuotaLedger: @unchecked Sendable {
     }
 
     /// 发送新 key 请求之前绑定身份；不产生计费事件。
-    func bindKeyFingerprint(_ fingerprint: String) throws {
+    func bindKeyFingerprint(_ fingerprint: String?) throws {
         lock.lock()
         defer { lock.unlock() }
+        activeKeyFingerprint = fingerprint
+        hasBoundKey = true
         guard let existing = snapshot.serverResetKeyFp, existing != fingerprint else { return }
         // 身份变化只废弃恢复证明，已确认的 dayEpoch 与用量历史独立保留。
         discardRecoveryLocked()
@@ -279,7 +292,7 @@ final class QuotaLedger: @unchecked Sendable {
     /// 接收云端客户端已解析的响应事实，成功与 HTTP 错误共用同一个记账入口。
     func observeResponse(
         remainingRequests: Int?, resetRequestsSeconds: Double?,
-        keyFingerprint: String?, sentAt: Date?, at now: Date = Date()
+        keyFingerprint: String?, sentAt: Date?, at now: Date = Date(), requestID: String? = nil
     ) throws {
         var headers: [AnyHashable: Any] = [:]
         if let remainingRequests {
@@ -289,7 +302,7 @@ final class QuotaLedger: @unchecked Sendable {
             headers["x-ratelimit-reset-requests"] = "\(resetRequestsSeconds)s"
         }
         // 即使没有配额头也必须观察实际 key：换 key 要先废弃旧证明，不能等下个有头响应（R2）。
-        try correctRemainingRequests(headers, at: now, keyFingerprint: keyFingerprint, sentAt: sentAt)
+        try correctRemainingRequests(headers, at: now, keyFingerprint: keyFingerprint, sentAt: sentAt, requestID: requestID)
     }
 
     /// 记账接口：把响应头里的服务端事实并进账本。
@@ -304,7 +317,8 @@ final class QuotaLedger: @unchecked Sendable {
         _ headers: [AnyHashable: Any],
         at now: Date = Date(),
         keyFingerprint: String? = nil,
-        sentAt: Date? = nil
+        sentAt: Date? = nil,
+        requestID: String? = nil
     ) throws {
         let remaining = Self.remainingRequests(from: headers).flatMap {
             Self.isValidRemaining($0, limit: limits.requestsPerDay) ? $0 : nil
@@ -317,6 +331,8 @@ final class QuotaLedger: @unchecked Sendable {
         }
         lock.lock()
         defer { lock.unlock() }
+        // 绑定当前身份后，旧 key 的迟到回调不能再重装刚被废弃的证明或修改下限。
+        guard !hasBoundKey || (activeKeyFingerprint != nil && keyFingerprint == activeKeyFingerprint) else { return }
         let ts = now.timeIntervalSince1970
         var changed = discardRecoveryOnClockRollbackLocked(at: ts)
         // 换 key 必须先作废旧恢复证明：B 的响应不能替尚未确认的 A 记录追认翻日（R2）。
@@ -336,8 +352,10 @@ final class QuotaLedger: @unchecked Sendable {
         }
         // R3：恢复点已经过去，这时回来的旧周期响应（sent_at 未知或早于恢复点）
         // 一律不采信它的 remaining/reset 头，免得把新周期的账改回去。
-        if let resetAt = snapshot.serverResetAt, ts >= resetAt,
-           sentAt.map({ $0.timeIntervalSince1970 < resetAt }) ?? true {
+        let pendingCutoff = snapshot.serverResetAt.flatMap { ts >= $0 ? $0 : nil }
+        let rolloverCutoff = max(snapshot.dayEpoch ?? -.infinity, pendingCutoff ?? -.infinity)
+        if rolloverCutoff.isFinite,
+           sentAt.map({ $0.timeIntervalSince1970 < rolloverCutoff }) ?? true {
             if changed {
                 snapshot = Self.pruned(snapshot, now: now)
                 try persistLocked()
@@ -356,9 +374,19 @@ final class QuotaLedger: @unchecked Sendable {
         if let remaining {
             let usedDay = max(0, limits.requestsPerDay - remaining)
             snapshot.requestCorrections.append(QuotaRequestCorrection(ts: ts, usedRequests: usedDay))
-            // 按发生顺序确认现有请求：同一时间戳的新请求也能与响应前的请求区分。
-            // 合法降低即使被高水位保护拒绝，响应仍已包含此前请求（与 Python 一致）。
-            for index in snapshot.events.indices { snapshot.events[index].inServerDay = true }
+            // 只确认这个响应对应的请求；其它在飞请求可能最终无头失败，仍须另加一。
+            // 合法降低即使被高水位保护拒绝，也确认它自己的请求。
+            let acknowledgedIndex: Int?
+            if let requestID {
+                acknowledgedIndex = snapshot.events.firstIndex { $0.requestID == requestID }
+            } else {
+                let requestAt = (sentAt ?? now).timeIntervalSince1970
+                let matchingIndices = snapshot.events.indices.filter {
+                    snapshot.events[$0].ts == requestAt && snapshot.events[$0].inServerDay != true
+                }
+                acknowledgedIndex = matchingIndices.count == 1 ? matchingIndices.first : nil
+            }
+            if let acknowledgedIndex { snapshot.events[acknowledgedIndex].inServerDay = true }
         }
         snapshot = Self.pruned(snapshot, now: now)
         try persistLocked()

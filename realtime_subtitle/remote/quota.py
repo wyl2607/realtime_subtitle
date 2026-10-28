@@ -93,6 +93,7 @@ class QuotaLedger:
         self._server_day_used_at: float | None = None
         self._reset_record: _ResetRecord | None = None
         self._active_key_fp = active_key_fp
+        self._key_bound = active_key_fp is not None
         self._day_epoch: float | None = None
         self._request_corrections: list[tuple[int, float]] = []
         # 自己记得「已经把额度打进冷却」，恢复事件才发得出去。
@@ -100,12 +101,13 @@ class QuotaLedger:
         self._quota_hot = False
         self.load()
 
-    def observe_key(self, key_fp: str) -> None:
+    def observe_key(self, key_fp: str | None) -> None:
         """非记账的 key 观察；检测到换 key 后必须先调用，再轮询恢复点。"""
-        if not isinstance(key_fp, str) or not key_fp:
+        if key_fp is not None and (not isinstance(key_fp, str) or not key_fp):
             raise TypeError("key_fp")
         with self._lock:
             self._active_key_fp = key_fp
+            self._key_bound = True
             if self._reset_record is not None and self._reset_record.key_fp != key_fp:
                 # 不能等新响应回来才失效，否则发请求前的轮询会先信任旧 key 的边界。
                 self._reset_record = None
@@ -141,7 +143,11 @@ class QuotaLedger:
                 raise ValueError("sent_at")
         with self._lock:
             ts = self._clock(now)
-            self._events.append(_Event(ts, billed, False))
+            if self._key_bound and (self._active_key_fp is None or key_fp != self._active_key_fp):
+                # 已绑定的当前 key 只能由 observe_key 改变，迟到回调不能反向绑定。
+                return self._measure(ts)
+            current_event = _Event(ts, billed, False)
+            self._events.append(current_event)
             record = self._reset_record
             if record is not None and key_fp != record.key_fp:
                 # 换 key 不能继承旧 key 的恢复承诺，但高水位继续 fail-closed。
@@ -149,11 +155,10 @@ class QuotaLedger:
                 # 会被误判为 late_old_cycle 而丢掉新周期的恢复记录。
                 self._reset_record = None
                 record = None
-            late_old_cycle = bool(
-                record is not None
-                and ts >= record.reset_at
-                and (sent_at is None or float(sent_at) < record.reset_at)
-            )
+            cutoff = self._day_epoch
+            if record is not None and ts >= record.reset_at:
+                cutoff = max(cutoff if cutoff is not None else -math.inf, record.reset_at)
+            late_old_cycle = cutoff is not None and (sent_at is None or float(sent_at) < cutoff)
             # 先消耗已可信的旧周期；当前周期的剩余头随后可建立新的日下限。
             reset_confirmed = self._advance_reset(ts)
             valid_reset = (
@@ -172,8 +177,8 @@ class QuotaLedger:
                 if used < 0:
                     used = 0
                 self._raise_day_request_floor(used, ts)
-                for event in self._events:
-                    event.in_server_day = True
+                # 与 Swift 一致，只确认当前请求，其它无头请求继续保守叠加。
+                current_event.in_server_day = True
             if not late_old_cycle and valid_remaining and valid_reset and key_fp is not None:
                 self._reset_record = _ResetRecord(
                     reset_at=ts + float(reset_requests_s),
