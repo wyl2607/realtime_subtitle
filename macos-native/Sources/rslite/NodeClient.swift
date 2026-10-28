@@ -655,7 +655,7 @@ final class NodeClient: NSObject, URLSessionWebSocketDelegate, URLSessionTaskDel
             }
             isClosed = true
             readyBuffer.removeAll()
-            return (socket, session)
+            return (self.socket, self.session)
         }
         guard let pair else {
             return
