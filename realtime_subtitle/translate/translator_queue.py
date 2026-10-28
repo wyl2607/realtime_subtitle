@@ -727,6 +727,9 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             self._session_id = time.strftime("%Y-%m-%d_%H%M%S", time.localtime(self._session_start_time))
             self._session_prev_end = 0.0
             self._session_index = 0
+            # 会话行按句子 key 存（重试替换同一行），每次保存整份重排重写
+            self._session_entries = {}
+            self._session_seq = 0
             self._session_srt_file = None
             self._session_csv_file = None
             self._session_csv_writer = None
