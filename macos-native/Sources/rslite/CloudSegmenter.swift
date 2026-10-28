@@ -1,4 +1,5 @@
 import AVFoundation
+import CryptoKit
 import Foundation
 
 /// TK-001 实测：SpeechTranscriber 的 volatile 结果没有词级时间，用它判段尾会把延迟做成 final 的 ~2s。
@@ -619,6 +620,8 @@ final class CloudUploadController: @unchecked Sendable {
         language = Self.groqLanguage(localeID: localeID)
         let initial = readSwitch()
         lastKey = initial.key
+        // 构造时已有 key 也要先比对证明，初次额度查询不能确认另一个 key 的旧边界。
+        try? ledger.observeKey(initial.key.map(Self.quotaKeyFingerprint))
         let cloudOn = initial.hasKey && initial.enabled
         context = CloudRouteContext(RouteInitial(
             hasKey: initial.hasKey,
@@ -886,6 +889,10 @@ final class CloudUploadController: @unchecked Sendable {
         return context.cloudState == .available
     }
 
+    private static func quotaKeyFingerprint(_ key: String) -> String {
+        SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
     private func refreshSwitchLocked() -> Bool {
         let snap = readSwitch()
         var cancel = false
@@ -902,6 +909,8 @@ final class CloudUploadController: @unchecked Sendable {
                 cancel = context.cancelInflight
             }
         } else if lastKey != snap.key {
+            // 必须早于调用方随后执行的额度轮询，不记请求、不推进墙钟也不剪历史。
+            try? ledger.observeKey(snap.key.map(Self.quotaKeyFingerprint))
             context.apply(RouteEvent(type: "key_modified", status: nil, retryAfter: nil, usagePercent: nil))
             lastKey = snap.key
             // 换 client 之前作废旧 key 的在飞请求：推进代次，旧 key 的迟到 401 就过不了
@@ -1217,6 +1226,23 @@ final class CloudUploadController: @unchecked Sendable {
             } else {
                 check(false, "换 key 用例：旧 key 应先发出一段")
             }
+        }
+
+        // Review F5：真正的换 key 必须先丢旧恢复证明，再做发请求前的额度检查。
+        do {
+            let keyA = "gsk_selftest_quota_key_old_abcdefghijklmnopqrstuv"
+            let keyB = "gsk_selftest_quota_key_new_abcdefghijklmnopqrstuv"
+            let rotatedLedger = QuotaLedger(url: root.appendingPathComponent("quota-key-before-send.json"), now: now)
+            let rotatedSwitch = SwitchBox(snapshot: CloudSwitchSnapshot(hasKey: true, enabled: true, key: keyA))
+            let rotated = CloudUploadController(localeID: "de-DE", ledger: rotatedLedger, readSwitch: { rotatedSwitch.snapshot }, makeClient: { _ in FakeCloud() })
+            try rotatedLedger.note(["x-ratelimit-remaining-requests": "5", "x-ratelimit-reset-requests": "100s"], at: now, keyFingerprint: "old-fingerprint", sentAt: now, monotonicNow: 0)
+            _ = rotated.ingest(samples: [], startSeconds: 0, now: now, node: idle)
+            rotatedSwitch.snapshot.key = keyB
+            let unsent = EmittedCloudSegment(id: 987, speechA0: 0, speechA1: 2, audioOrigin: 0, pcm16: Data(repeating: 0, count: 64_000), reason: "selftest")
+            check(rotated.prepareSend(unsent, now: now.addingTimeInterval(101)) == nil, "F5：换 key 后发请求前不能确认旧 key 边界并上传")
+            check(rotatedLedger.usage(at: now.addingTimeInterval(101)).dayRequests == 1_995, "F5：发请求前换 key 观察不能伪造本地请求或丢高水位")
+        } catch {
+            failures.append("F5 换 key 发请求前检查异常：\(error)")
         }
 
         let rateLedger = QuotaLedger(url: root.appendingPathComponent("quota-rate.json"))

@@ -1,7 +1,7 @@
 """Groq 免费档本地记账。
 
 四个窗口：1 分钟请求数、1 小时音频秒、24 小时音频秒，全是本地滚动；
-24 小时请求数只在拿到 x-ratelimit-remaining-requests 时改写成
+24 小时请求数在拿到 x-ratelimit-remaining-requests 时建立下限
 2000 - remaining（这是每日令牌桶，不能拿去改 1 分钟窗口）。
 任一窗口 ≥90% 就向 routing_rules 发 quota_update，<80% 由那台状态机恢复。
 这里不自己记云端状态。
@@ -81,6 +81,7 @@ class QuotaLedger:
         routing: RoutingState | None = None,
         now: Callable[[], float] | None = None,
         monotonic: Callable[[], float] | None = None,
+        active_key_fp: str | None = None,
     ):
         self.path = Path(path)
         self.routing = routing if routing is not None else RoutingState()
@@ -91,10 +92,24 @@ class QuotaLedger:
         self._server_day_used: int | None = None
         self._server_day_used_at: float | None = None
         self._reset_record: _ResetRecord | None = None
+        self._active_key_fp = active_key_fp
+        self._day_epoch: float | None = None
+        self._request_corrections: list[tuple[int, float]] = []
         # 自己记得「已经把额度打进冷却」，恢复事件才发得出去。
         # 不读状态机的状态名：那串字只活在 routing_rules。
         self._quota_hot = False
         self.load()
+
+    def observe_key(self, key_fp: str) -> None:
+        """非记账的 key 观察；检测到换 key 后必须先调用，再轮询恢复点。"""
+        if not isinstance(key_fp, str) or not key_fp:
+            raise TypeError("key_fp")
+        with self._lock:
+            self._active_key_fp = key_fp
+            if self._reset_record is not None and self._reset_record.key_fp != key_fp:
+                # 不能等新响应回来才失效，否则发请求前的轮询会先信任旧 key 的边界。
+                self._reset_record = None
+                self.save()
 
     def note(
         self,
@@ -245,7 +260,26 @@ class QuotaLedger:
             server_at = None
         else:
             server_used, server_at = _parse_server(used, used_at)
+        legacy_corrections = "request_corrections" not in data
+        corrections = data.get("request_corrections")
+        if corrections is None:
+            corrections = [] if server_used is None else [{"used_requests": server_used, "ts": server_at}]
+        if not isinstance(corrections, list):
+            raise ValueError("request_corrections")
+        parsed_corrections = [_parse_server(item["used_requests"], item["ts"]) for item in corrections]
+        day_epoch = data.get("day_epoch")
+        if day_epoch is not None and (
+            isinstance(day_epoch, bool) or not isinstance(day_epoch, (int, float))
+            or not math.isfinite(float(day_epoch))
+        ):
+            raise ValueError("day_epoch")
         reset_record = _parse_reset_record(data.get("reset_record"))
+        # 旧格式已消费记录也保存过可信边界；迁移时把它独立出来，不能随换 key 消失。
+        if day_epoch is None and reset_record is not None and reset_record.consumed:
+            day_epoch = reset_record.reset_at
+        if legacy_corrections and reset_record is not None and reset_record.consumed and server_used is None:
+            # 旧写入器消费时删掉了下限；只能保守补一条封顶，正常周期由 epoch 排除。
+            parsed_corrections.append((LIMIT_REQUESTS_PER_DAY, reset_record.observed_at))
         legacy_saturated = False
         if "saturated" in data:
             saturated = data["saturated"]
@@ -254,12 +288,17 @@ class QuotaLedger:
             legacy_saturated = saturated
         # 判断是否有恢复记录被丢弃（文件里有但解析为 None）
         had_reset_record = data.get("reset_record") is not None
+        if reset_record is not None and self._active_key_fp is not None and reset_record.key_fp != self._active_key_fp:
+            # 已知当前 key 时，加载必须先丢旧证明，不能让自动推进先确认旧 key 的边界。
+            reset_record = None
         reset_record_discarded = had_reset_record and reset_record is None
-        normalized = dropped or reset_record_discarded
+        normalized = dropped or reset_record_discarded or legacy_corrections
         self._events = parsed
         self._server_day_used = server_used
         self._server_day_used_at = server_at
         self._reset_record = reset_record
+        self._day_epoch = day_epoch
+        self._request_corrections = parsed_corrections
         return legacy_saturated, normalized
 
     def _quarantine_and_cap(self) -> None:
@@ -271,20 +310,24 @@ class QuotaLedger:
         self._server_day_used = LIMIT_REQUESTS_PER_DAY
         self._server_day_used_at = now
         self._reset_record = None
+        self._day_epoch = None
+        self._request_corrections = [(LIMIT_REQUESTS_PER_DAY, now)]
         self._publish(self._measure(now))
         if moved:
             self.save()
 
     def _raise_day_request_floor(self, used: int, ts: float) -> None:
-        current = self._server_day_used
-        if self._server_active(ts) and current is not None:
-            if used == current:
+        current = self._server_floor(ts)
+        if current is not None:
+            current_used, current_at = current
+            if used == current_used:
                 return
             # 较小值须等 60 秒：迟到乱序响应不该把冷却提前洗掉。
-            if used < current and ts - (self._server_day_used_at or ts) < SERVER_DECREASE_GRACE_S:
+            if used < current_used and ts - current_at < SERVER_DECREASE_GRACE_S:
                 return
         self._server_day_used = used
         self._server_day_used_at = ts
+        self._request_corrections.append((used, ts))
 
     def _publish(self, usage: QuotaUsage, *, reset_confirmed: bool = False) -> None:
         # 没到阈值就别发事件：apply() 每次都会清掉 cooldown_seconds，
@@ -310,7 +353,8 @@ class QuotaLedger:
         percent = max(percent, _percent(hour_audio, LIMIT_AUDIO_PER_HOUR_S))
         percent = max(percent, _percent(day_audio, LIMIT_AUDIO_PER_DAY_S))
         percent = max(percent, _percent(day_requests, LIMIT_REQUESTS_PER_DAY))
-        capped = self._server_active(now) and (self._server_day_used or 0) >= LIMIT_REQUESTS_PER_DAY
+        floor = self._server_floor(now)
+        capped = floor is not None and floor[0] >= LIMIT_REQUESTS_PER_DAY
         return QuotaUsage(
             minute_requests=minute,
             hour_audio_s=hour_audio,
@@ -321,25 +365,34 @@ class QuotaLedger:
         )
 
     def _day_requests(self, now: float) -> int:
-        record = self._reset_record
-        if (
-            record is not None
-            and record.consumed
-            and (self._server_day_used_at is None or self._server_day_used_at <= record.reset_at)
-        ):
-            return sum(
-                1
-                for event in self._events
-                if event.ts > record.reset_at and self._in_window(event.ts, now, WINDOW_DAY_S)
-            )
-        local = self._count(now, WINDOW_DAY_S)
-        if not self._server_active(now):
+        epoch = self._effective_day_epoch(now)
+        local = sum(1 for event in self._events
+                    if event.ts > epoch and self._in_window(event.ts, now, WINDOW_DAY_S))
+        floor = self._server_floor(now)
+        if floor is None:
             return local
-        extra = 0
-        for event in self._events:
-            if self._in_window(event.ts, now, WINDOW_DAY_S) and not event.in_server_day:
-                extra += 1
-        return int(self._server_day_used or 0) + extra
+        extra = sum(1 for event in self._events
+                    if event.ts > epoch and self._in_window(event.ts, now, WINDOW_DAY_S)
+                    and not event.in_server_day)
+        # 本地已发请求也是独立下限，低 remaining 校正不能把它抹掉。
+        return max(local, floor[0] + extra)
+
+    def _effective_day_epoch(self, now: float) -> float:
+        # 未来锚点只暂时失效，不能删历史；墙钟追上后继续排除旧周期。
+        return self._day_epoch if self._day_epoch is not None and self._day_epoch <= now else -math.inf
+
+    def _server_floor(self, now: float) -> tuple[int, float] | None:
+        epoch = self._effective_day_epoch(now)
+        accepted = None
+        for used, ts in sorted(self._request_corrections, key=lambda item: item[1]):
+            if ts <= epoch or now - ts > WINDOW_DAY_S:
+                continue
+            if accepted is None or used > accepted[0] or (
+                used < accepted[0] and ts <= now and ts - accepted[1] >= SERVER_DECREASE_GRACE_S
+            ):
+                # 回拨时未来样本可以抬高下限，但不能借宽限期把历史高水位洗掉。
+                accepted = (used, ts)
+        return accepted
 
     def _count(self, now: float, window: float) -> int:
         return sum(1 for event in self._events if self._in_window(event.ts, now, window))
@@ -351,19 +404,12 @@ class QuotaLedger:
                 total += event.billed_s
         return total
 
-    def _server_active(self, now: float) -> bool:
-        if self._server_day_used is None or self._server_day_used_at is None:
-            return False
-        record = self._reset_record
-        if record is not None and record.consumed and self._server_day_used_at <= record.reset_at:
-            return False
-        # 墙钟回拨时不能把已经观测到的服务端下限当成过期；等墙钟追上再按窗口老化。
-        if now < self._server_day_used_at:
-            return True
-        return self._in_window(self._server_day_used_at, now, WINDOW_DAY_S)
-
     def _prune(self, now: float) -> None:
         self._events = [event for event in self._events if now - event.ts <= WINDOW_DAY_S]
+        self._request_corrections = [(used, ts) for used, ts in self._request_corrections
+                                     if now - ts <= WINDOW_DAY_S]
+        if self._day_epoch is not None and now - self._day_epoch > WINDOW_DAY_S:
+            self._day_epoch = None
         if self._server_day_used_at is not None and now - self._server_day_used_at > WINDOW_DAY_S:
             self._server_day_used = None
             self._server_day_used_at = None
@@ -381,13 +427,17 @@ class QuotaLedger:
             "server_day_used": self._server_day_used,
             "server_day_used_at": self._server_day_used_at,
             "reset_record": _encode_reset_record(self._reset_record),
+            "day_epoch": self._day_epoch,
+            "request_corrections": [{"used_requests": used, "ts": ts}
+                                    for used, ts in self._request_corrections],
         }
 
-    def _markers(self) -> tuple[int, int | None, float | None, tuple[float, float, str, bool] | None]:
+    def _markers(self) -> tuple[Any, ...]:
         record = self._reset_record
         record_marker = None if record is None else (
             record.reset_at, record.observed_at, record.key_fp, record.consumed)
-        return (len(self._events), self._server_day_used, self._server_day_used_at, record_marker)
+        return (len(self._events), self._server_day_used, self._server_day_used_at, record_marker,
+                self._day_epoch, tuple(self._request_corrections))
 
     def _clock(self, now: float | None) -> float:
         if now is not None:
@@ -403,7 +453,7 @@ class QuotaLedger:
         return float(value)
 
     def _advance_reset(self, now: float) -> bool:
-        """在双时钟均可信时消耗恢复记录，并仅清服务端的日请求下限。"""
+        """在双时钟均可信时推进日请求边界，历史样本仍保留以防墙钟回拨。"""
         record = self._reset_record
         if record is None:
             return False
@@ -417,8 +467,8 @@ class QuotaLedger:
             if elapsed < record.reset_at - record.observed_at - 1.0:
                 return False
         record.consumed = True
-        self._server_day_used = None
-        self._server_day_used_at = None
+        # 边界独立持久化，替换/丢弃恢复证明不能复活旧周期，回拨也不能丢下限。
+        self._day_epoch = max(self._day_epoch if self._day_epoch is not None else -math.inf, record.reset_at)
         return True
 
 

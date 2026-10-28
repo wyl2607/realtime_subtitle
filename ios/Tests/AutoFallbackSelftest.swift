@@ -351,4 +351,81 @@ func runAutoFallbackSelftest(_ check: @escaping (Bool, String) -> Void) {
         check(resetDecision2 == nil, "G4: 非 cooldownQuota 时 quota_reset_confirmed 不应产生决策")
         check(fallback.cloudState == .available, "G4: 非冷却时状态不应改变")
     }
+    // PR88 F2：使用与生产上传相同的闭包闸门，停云端的副作用之后不能再发请求。
+    do {
+        var fallback = AutoFallback(
+            nodeName: "mini2", localAvailable: true,
+            cloud: CloudAvailability(hasKey: true, enabled: true, translationAvailable: true, keyRevision: 1)
+        )
+        _ = fallback.startDecision()
+        var requestInvocations = 0
+        var stopInvocations = 0
+        let decision = fallback.applyQuotaUsage(100)
+        CloudUploadGate.submit(
+            applyDecision: { if decision != nil { stopInvocations += 1 } },
+            cloudIsActive: { fallback.usingCloud },
+            send: { requestInvocations += 1 }
+        )
+        check(stopInvocations == 1, "PR88 F2: 测试必须执行配额停云端的副作用")
+        check(requestInvocations == 0, "PR88 F2: 配额决策停云端后请求调用必须为零")
+        _ = fallback.applyRouteEvent(RouteEvent(type: "quota_reset_confirmed", status: nil, retryAfter: nil, usagePercent: 0))
+        CloudUploadGate.submit(applyDecision: {}, cloudIsActive: { fallback.usingCloud }, send: { requestInvocations += 1 })
+        check(requestInvocations == 1, "PR88 F2: 真正恢复后允许正常请求")
+    }
+    do {
+        let base = Date(timeIntervalSince1970: 10_000)
+        var fallback = AutoFallback(
+            nodeName: "mini2", localAvailable: true,
+            cloud: CloudAvailability(hasKey: true, enabled: true, translationAvailable: true, keyRevision: 1),
+            now: { base }
+        )
+        _ = fallback.startDecision()
+        _ = fallback.handle(.cloudHTTPStatus(429, retryAfter: 60))
+        var resetConsumptions = 0
+        _ = fallback.pollQuota(usage: { 100 }, confirmedReset: { resetConsumptions += 1; return 0 })
+        check(resetConsumptions == 0, "PR88 F2: 限流等待中不得提前消费恢复证明")
+        check(fallback.cloudState == .cooldownQuota, "PR88 F2: remaining=0 应在 retry-after 到期前锁住额度冷却")
+        let tickDecision = fallback.tick(now: base.addingTimeInterval(61))
+        var requestInvocations = 0
+        CloudUploadGate.submit(
+            applyDecision: { _ = tickDecision }, cloudIsActive: { fallback.usingCloud },
+            send: { requestInvocations += 1 }
+        )
+        check(requestInvocations == 0 && fallback.cloudState == .cooldownQuota,
+              "PR88 F2: 429 remaining=0 后 retry-after 到期仍不得上传")
+    }
+    do {
+        let base = Date(timeIntervalSince1970: 10_000)
+        var fallback = AutoFallback(
+            nodeName: "mini2", localAvailable: true,
+            cloud: CloudAvailability(hasKey: true, enabled: true, translationAvailable: true, keyRevision: 1),
+            now: { base }
+        )
+        _ = fallback.startDecision()
+        _ = fallback.handle(.cloudHTTPStatus(429, retryAfter: 60))
+        _ = fallback.pollQuota(usage: { 50 }, confirmedReset: { 0 })
+        check(fallback.cloudState == .cooldownRateLimited && fallback.cooldownSecondsRemaining == 60,
+              "PR88 F2: 低用量轮询必须保留 429 retry-after")
+        check(fallback.tick(now: base.addingTimeInterval(59)) == nil,
+              "PR88 F2: 低用量不能提前试探")
+        check(fallback.tick(now: base.addingTimeInterval(61))?.action == .startCloud,
+              "PR88 F2: 非额度耗尽的 429 到期应正常试探")
+    }
+
+    // PR88 F5：旧证明失效后，24 小时自然老化也必须通过正常用量事件恢复。
+    do {
+        var fallback = AutoFallback(
+            nodeName: "mini2", localAvailable: true,
+            cloud: CloudAvailability(hasKey: true, enabled: true, translationAvailable: true, keyRevision: 1)
+        )
+        _ = fallback.startDecision()
+        _ = fallback.applyQuotaUsage(100)
+        _ = fallback.pollQuota(usage: { 85 }, confirmedReset: { nil })
+        check(fallback.cloudState == .cooldownQuota,
+              "PR88 F5: 没有恢复证明时 85% 仍应保持额度冷却")
+        let decision = fallback.pollQuota(usage: { 79 }, confirmedReset: { nil })
+        check(fallback.cloudState == .available && decision?.action == .startCloud,
+              "PR88 F5: 旧下限自然老化到 80% 以下，轮询应解除额度冷却")
+    }
+
 }

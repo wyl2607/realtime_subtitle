@@ -136,17 +136,21 @@ struct QuotaLedgerEvent: Codable, Equatable {
     var billedS: Double
     /// 实际音频秒（round 3 位）。旧账本没有这个字段，读出时是 nil。
     var durS: Double?
+    /// 已被合法 remaining 响应确认；nil 表示旧格式，由校正时间推断。
+    var inServerDay: Bool?
 
     enum CodingKeys: String, CodingKey {
         case ts
         case billedS = "billed_s"
         case durS = "dur_s"
+        case inServerDay = "in_server_day"
     }
 
-    init(ts: Double, billedS: Double, durS: Double? = nil) {
+    init(ts: Double, billedS: Double, durS: Double? = nil, inServerDay: Bool? = nil) {
         self.ts = ts
         self.billedS = billedS
         self.durS = durS
+        self.inServerDay = inServerDay
     }
 
     init(from decoder: Decoder) throws {
@@ -160,6 +164,9 @@ struct QuotaLedgerEvent: Codable, Equatable {
         }
         // dur_s 是可选：旧账本没有它；NaN/Infinity 被换成 null 后也按缺失处理。
         durS = try? container.decodeIfPresent(Double.self, forKey: .durS)
+        // 缺字段才按旧格式推断；已有字段但损坏时按未确认处理，不能低估用量。
+        inServerDay = container.contains(.inServerDay)
+            ? ((try? container.decode(Bool.self, forKey: .inServerDay)) ?? false) : nil
     }
 
     func encode(to encoder: Encoder) throws {
@@ -167,6 +174,7 @@ struct QuotaLedgerEvent: Codable, Equatable {
         try container.encode(ts, forKey: .ts)
         try container.encode(billedS, forKey: .billedS)
         try container.encodeIfPresent(durS, forKey: .durS)
+        try container.encodeIfPresent(inServerDay, forKey: .inServerDay)
     }
 }
 
@@ -201,6 +209,7 @@ final class QuotaLedger: @unchecked Sendable {
         url: URL,
         limits: QuotaLedgerLimits = QuotaLedgerLimits(),
         now: Date = Date(),
+        activeKeyFingerprint: String? = nil,
         monotonicNow: @escaping () -> Double = { ProcessInfo.processInfo.systemUptime }
     ) {
         self.url = url
@@ -226,6 +235,8 @@ final class QuotaLedger: @unchecked Sendable {
                 try? persistLocked()
             }
         }
+        // 重启已知当前 key 时，先废弃别的 key 的证明，再进行任何自动翻日判断（R2）。
+        if let activeKeyFingerprint { try? bindKeyFingerprint(activeKeyFingerprint) }
         // 墙钟回拨超过 5 秒：恢复记录不可信，丢弃但保留下限（R4a）。
         let ts = now.timeIntervalSince1970
         // G3: 重启时先用旧周期完整用量判断 quotaHot，再推进 dayEpoch。
@@ -245,12 +256,40 @@ final class QuotaLedger: @unchecked Sendable {
         defer { lock.unlock() }
         let billed = max(10, duration)
         snapshot.events.append(
-            QuotaLedgerEvent(ts: now.timeIntervalSince1970, billedS: billed, durS: Self.round3(duration))
+            QuotaLedgerEvent(
+                ts: now.timeIntervalSince1970, billedS: billed, durS: Self.round3(duration), inServerDay: false
+            )
         )
         snapshot = Self.pruned(snapshot, now: now)
         _ = advanceDayEpochIfRolloverConfirmedLocked(at: now.timeIntervalSince1970)
         try persistLocked()
         return billed
+    }
+
+    /// 发送新 key 请求之前绑定身份；不产生计费事件。
+    func bindKeyFingerprint(_ fingerprint: String) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let existing = snapshot.serverResetKeyFp, existing != fingerprint else { return }
+        // 身份变化只废弃恢复证明，已确认的 dayEpoch 与用量历史独立保留。
+        discardRecoveryLocked()
+        try persistLocked()
+    }
+
+    /// 接收云端客户端已解析的响应事实，成功与 HTTP 错误共用同一个记账入口。
+    func observeResponse(
+        remainingRequests: Int?, resetRequestsSeconds: Double?,
+        keyFingerprint: String?, sentAt: Date?, at now: Date = Date()
+    ) throws {
+        var headers: [AnyHashable: Any] = [:]
+        if let remainingRequests {
+            headers["x-ratelimit-remaining-requests"] = NSNumber(value: remainingRequests)
+        }
+        if let resetRequestsSeconds {
+            headers["x-ratelimit-reset-requests"] = "\(resetRequestsSeconds)s"
+        }
+        // 即使没有配额头也必须观察实际 key：换 key 要先废弃旧证明，不能等下个有头响应（R2）。
+        try correctRemainingRequests(headers, at: now, keyFingerprint: keyFingerprint, sentAt: sentAt)
     }
 
     /// 记账接口：把响应头里的服务端事实并进账本。
@@ -280,13 +319,14 @@ final class QuotaLedger: @unchecked Sendable {
         defer { lock.unlock() }
         let ts = now.timeIntervalSince1970
         var changed = discardRecoveryOnClockRollbackLocked(at: ts)
-        // 新响应替换旧恢复记录前，先把已经按 R4 成立的旧周期锚点持久化。
-        changed = advanceDayEpochIfRolloverConfirmedLocked(at: ts) || changed
-        // 换 key：旧记录作废，但服务端用量的下限留在 requestCorrections 里（R2）。
+        // 换 key 必须先作废旧恢复证明：B 的响应不能替尚未确认的 A 记录追认翻日（R2）。
+        // 已经确认的 dayEpoch 独立保存；服务端用量下限仍留在 requestCorrections 里。
         if let existingFp = snapshot.serverResetKeyFp, existingFp != keyFingerprint {
             discardRecoveryLocked()
             changed = true
         }
+        // 同 key 替换前才推进旧恢复点，保留已经独立确认的周期边界。
+        changed = advanceDayEpochIfRolloverConfirmedLocked(at: ts) || changed
         guard remaining != nil || resetSeconds != nil else {
             if changed {
                 snapshot = Self.pruned(snapshot, now: now)
@@ -316,6 +356,9 @@ final class QuotaLedger: @unchecked Sendable {
         if let remaining {
             let usedDay = max(0, limits.requestsPerDay - remaining)
             snapshot.requestCorrections.append(QuotaRequestCorrection(ts: ts, usedRequests: usedDay))
+            // 按发生顺序确认现有请求：同一时间戳的新请求也能与响应前的请求区分。
+            // 合法降低即使被高水位保护拒绝，响应仍已包含此前请求（与 Python 一致）。
+            for index in snapshot.events.indices { snapshot.events[index].inServerDay = true }
         }
         snapshot = Self.pruned(snapshot, now: now)
         try persistLocked()
@@ -428,11 +471,16 @@ final class QuotaLedger: @unchecked Sendable {
         let dayEvents = current.events
         // 1 分钟窗口只信本地计数，响应头仅校正 24 小时请求数（校正记录已按 24h prune）。
         let minuteRequests = minuteEvents.count
-        let correctedDay = Self.foldedDayRequests(
-            current.requestCorrections.filter { $0.ts > effectiveEpoch }
-        )
+        let cycleCorrections = current.requestCorrections.filter { $0.ts > effectiveEpoch }
+        let correctedDay = Self.foldedDayRequests(cycleCorrections, now: ts)
+        // 新事件显式记录是否已被响应确认，避免同时间戳的后发请求被误认为已包含在服务端下限内。
+        // 旧账本缺确认字段时沿用时间戳推断，保持无需迁移即可读取。
+        let lastCorrectionAt = cycleCorrections.map(\.ts).max() ?? -.infinity
+        let unacknowledged = dayRequestEvents.filter {
+            !($0.inServerDay ?? ($0.ts <= lastCorrectionAt))
+        }.count
         let hourAudio = hourEvents.reduce(0.0) { $0 + $1.billedS }
-        let dayRequests = max(dayRequestEvents.count, correctedDay)
+        let dayRequests = max(dayRequestEvents.count, correctedDay + unacknowledged)
         let dayAudio = dayEvents.reduce(0.0) { $0 + $1.billedS }
         let percentages = [
             Double(minuteRequests) / Double(limits.requestsPerMinute),
@@ -528,7 +576,7 @@ final class QuotaLedger: @unchecked Sendable {
     }
 
     /// 规格 002：按时序折叠服务端样本；减少仅在已采纳样本满 60 秒后生效。
-    private static func foldedDayRequests(_ corrections: [QuotaRequestCorrection]) -> Int {
+    private static func foldedDayRequests(_ corrections: [QuotaRequestCorrection], now: Double) -> Int {
         var accepted: QuotaRequestCorrection?
         for correction in corrections.sorted(by: { $0.ts < $1.ts }) {
             guard let current = accepted else {
@@ -536,7 +584,9 @@ final class QuotaLedger: @unchecked Sendable {
                 continue
             }
             if correction.usedRequests > current.usedRequests ||
-                (correction.usedRequests < current.usedRequests && correction.ts - current.ts >= serverDecreaseGraceSeconds) {
+                // 墙钟回拨后，未来的低用量不能抹掉过去的高水位；未来的增加仍按 fail-closed 采纳。
+                (correction.usedRequests < current.usedRequests && correction.ts <= now &&
+                 correction.ts - current.ts >= serverDecreaseGraceSeconds) {
                 accepted = correction
             }
         }

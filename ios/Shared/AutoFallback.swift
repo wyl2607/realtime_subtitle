@@ -317,6 +317,25 @@ struct AutoFallback {
         return reconcileTier()
     }
 
+    /// 周期轮询账本的共享入口：恢复证明只允许在额度冷却中消费（G4）。
+    mutating func pollQuota(
+        usage: () -> Double, confirmedReset: () -> Double?
+    ) -> AutoFallbackDecision? {
+        if cloudState != .cooldownQuota {
+            // 耗尽额度必须先锁住路由，再让 tick 处理 429 到期；低用量不发 quota_update，避免清掉 retry-after。
+            let percent = usage()
+            guard percent >= 90 else { return nil }
+            return applyQuotaUsage(percent)
+        }
+        guard let percent = confirmedReset() else {
+            // 换 key 丢弃证明后仍能靠完整 24h 用量自然老化恢复，保留 90/80 滞回。
+            return applyQuotaUsage(usage())
+        }
+        return applyRouteEvent(RouteEvent(
+            type: "quota_reset_confirmed", status: nil, retryAfter: nil, usagePercent: percent
+        ))
+    }
+
     /// 原样应用路由事件（保留 type，如 quota_reset_confirmed）。
     /// 由 QuotaLedger.routeEvent() 产生，SubtitleEngine 在 stateQueue 内调用。
     mutating func applyRouteEvent(_ event: RouteEvent) -> AutoFallbackDecision? {
@@ -539,5 +558,17 @@ struct AutoFallback {
         } else {
             cooldownDeadline = nil
         }
+    }
+}
+
+/// 上传决策与请求提交共用的闸门；引擎在 applyDecision 内执行停云端等副作用。
+enum CloudUploadGate {
+    static func submit(
+        applyDecision: () -> Void, cloudIsActive: () -> Bool, send: () -> Void
+    ) {
+        applyDecision()
+        // 停云端会推进 generation；必须在副作用执行之后重查，才能阻止被错误标成新代次的请求。
+        guard cloudIsActive() else { return }
+        send()
     }
 }

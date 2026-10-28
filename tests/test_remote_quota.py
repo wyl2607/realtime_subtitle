@@ -103,12 +103,12 @@ def test_remaining_requests_corrects_only_the_day_request_window(tmp_path):
     assert usage.usage_percent == 90
     assert state.cloud_state == "cooldown_quota"
 
-    # 头里的剩余把每日请求改成 1，但不能把这一分钟已经发出的 18 次抹掉。
+    # 日请求下限可以降到 1，但本地已经发出的 18 次仍是独立下限。
     ledger, state = _ledger(tmp_path, name="minute.json")
     for i in range(18):
         usage = ledger.note(1, now=100 + i, remaining_requests=1999)
     assert usage.minute_requests == 18
-    assert usage.day_requests == 1
+    assert usage.day_requests == 18
     assert usage.usage_percent == 90
     assert state.cloud_state == "cooldown_quota"
 
@@ -283,7 +283,8 @@ def test_smaller_server_usage_waits_60_seconds_before_it_is_accepted(tmp_path):
     assert ledger.usage(now=1030).day_requests == 1995
 
     ledger.note(10, now=1061, remaining_requests=1999)
-    assert ledger.usage(now=1061).day_requests == 1
+    assert ledger.usage(now=1061).day_requests == 3
+    assert ledger._server_day_used == 1
 
 
 def test_remaining_after_reset_is_a_new_server_day_baseline(tmp_path):
@@ -671,7 +672,8 @@ def test_remaining_requests_out_of_bounds_does_not_correct_or_create_reset_recor
     assert usage.day_requests == 2000
     # 60s 宽限期后，remaining=2000 才能把 floor 降到 0
     usage = ledger.note(10, now=164, remaining_requests=2000, reset_requests_s=50, key_fp="key-a", sent_at=164)
-    assert usage.day_requests == 0  # 2000-2000=0，宽限期过后 floor 可降
+    assert usage.day_requests == 5  # 服务端下限降到 0，本地 5 次仍须保留
+    assert ledger._server_day_used == 0
 
 
 def test_key_change_before_late_old_cycle_allows_new_reset_record(tmp_path):
@@ -712,4 +714,143 @@ def test_key_change_before_late_old_cycle_allows_new_reset_record(tmp_path):
     assert usage.day_requests == 1995
     # 宽限期过后 (>=160)，再次 note() 触发 floor 降到新 remaining 对应的 1
     usage2 = ledger.note(10, now=161, remaining_requests=1999, key_fp="key-new", sent_at=161)
-    assert usage2.day_requests == 1  # 此时 server_day_used 已更新为 1
+    assert usage2.day_requests == 3  # 服务端下限为 1，本地 3 次仍须保留
+    assert ledger._server_day_used == 1
+
+
+@pytest.mark.parametrize("restart_consumes", [False, True])
+@pytest.mark.parametrize("replace_record", [False, True])
+def test_consumed_reset_rollback_restores_retained_server_floor(tmp_path, restart_consumes, replace_record):
+    """F1：消费恢复点不能删历史；回拨和重启都必须重新计入旧周期下限。"""
+    mono = [100.0]
+    ledger, state = _ledger(tmp_path, now=1000, monotonic=lambda: mono[0])
+    ledger.note(10, now=1000, remaining_requests=5, reset_requests_s=100, key_fp="key-a", sent_at=1000)
+    mono[0] = 300
+    if restart_consumes:
+        ledger, state = _ledger(tmp_path, now=1200, monotonic=lambda: mono[0])
+    assert ledger.usage(now=1200).day_requests == 0
+    if replace_record:
+        ledger.note(10, now=1200, remaining_requests=1999, reset_requests_s=100, key_fp="key-b", sent_at=1200)
+    rolled = ledger.usage(now=1050)
+    assert rolled.day_requests >= 1995
+    assert rolled.usage_percent >= 99.75
+    assert state.cloud_state == "cooldown_quota"
+    restarted, restarted_state = _ledger(tmp_path, now=1050)
+    assert restarted.usage(now=1050).day_requests >= 1995
+    assert restarted_state.cloud_state == "cooldown_quota"
+
+
+@pytest.mark.parametrize("new_headers", [False, True])
+def test_confirmed_day_epoch_survives_key_record_discard_and_restart(tmp_path, new_headers):
+    """F3：已由 A 确认的周期边界独立于恢复证明，换 key 不能让旧请求复活。"""
+    mono = [100.0]
+    ledger, _ = _ledger(tmp_path, now=1000, monotonic=lambda: mono[0])
+    ledger.note(10, now=1000, remaining_requests=5, reset_requests_s=100, key_fp="key-a", sent_at=1000)
+    mono[0] = 201
+    assert ledger.usage(now=1101).day_requests == 0
+    headers = dict(remaining_requests=1999, reset_requests_s=100) if new_headers else {}
+    assert ledger.note(10, now=1102, key_fp="key-b", sent_at=1102, **headers).day_requests == 1
+    restarted, _ = _ledger(tmp_path, now=1102)
+    assert restarted.usage(now=1102).day_requests == 1
+    assert json.loads((tmp_path / "quota.json").read_text())["day_epoch"] == 1100
+
+
+def test_headerless_key_change_discards_unconfirmed_old_reset(tmp_path):
+    """F5/R2：B 无配额头也必须清 A 证明，不能在 A 边界后自行解锁。"""
+    mono = [100.0]
+    state = _RecordingRouting()
+    ledger, _ = _ledger(tmp_path, now=1000, state=state, monotonic=lambda: mono[0])
+    ledger.note(10, now=1000, remaining_requests=5, reset_requests_s=100, key_fp="key-a", sent_at=1000)
+    mono[0] = 201
+    ledger.note(10, now=1101, key_fp="key-b", sent_at=1101)
+    assert ledger.usage(now=1101).day_requests >= 1995
+    assert state.cloud_state == "cooldown_quota"
+    assert not any(event["type"] == "quota_reset_confirmed" for event in state.events)
+    assert json.loads((tmp_path / "quota.json").read_text())["reset_record"] is None
+
+
+def test_unconfirmed_old_key_boundary_cannot_erase_local_high_water(tmp_path):
+    """F3/R2：第一条 B 响应不能确认 A，也不能把本地 1900 次降成一次。"""
+    path = tmp_path / "quota.json"
+    path.write_text(json.dumps({
+        "version": 1,
+        "events": [{"ts": -10000 + i, "billed_s": 10} for i in range(1900)],
+        "server_day_used": 1995, "server_day_used_at": 1000,
+        "reset_record": {"reset_at": 1100, "observed_at": 1000, "key_fp": "key-a", "consumed": False},
+    }))
+    state = _RecordingRouting()
+    ledger, _ = _ledger(tmp_path, now=1000, state=state, monotonic=lambda: 100)
+    usage = ledger.note(10, now=1101, remaining_requests=1999, reset_requests_s=100, key_fp="key-b", sent_at=1101)
+    assert usage.day_requests == 1901
+    assert state.cloud_state == "cooldown_quota"
+    assert not any(event["type"] == "quota_reset_confirmed" for event in state.events)
+    assert json.loads(path.read_text())["day_epoch"] is None
+
+
+def test_legacy_consumed_record_restores_conservative_floor_on_rollback(tmp_path):
+    """F1：旧版本消费时已删下限，只能在回拨时保守封顶，正常周期仍归零。"""
+    path = tmp_path / "quota.json"
+    path.write_text(json.dumps({
+        "version": 1, "events": [{"ts": 1000, "billed_s": 10, "in_server_day": True}],
+        "server_day_used": None, "server_day_used_at": None,
+        "reset_record": {"reset_at": 1100, "observed_at": 1000, "key_fp": "key-a", "consumed": True},
+    }))
+    ledger, _ = _ledger(tmp_path, now=1200)
+    assert ledger.usage(now=1200).day_requests == 0
+    assert ledger.usage(now=1050).day_requests == 2000
+    restarted, state = _ledger(tmp_path, now=1050)
+    assert restarted.usage(now=1050).day_requests == 2000
+    assert state.cloud_state == "cooldown_quota"
+
+
+def test_headerless_key_change_before_boundary_retains_additive_local_floor(tmp_path):
+    """F5：与 Swift 相同序列，B 无头请求在边界前到达，边界后仍为 1996。"""
+    mono = [100.0]
+    state = _RecordingRouting()
+    ledger, _ = _ledger(tmp_path, now=1000, state=state, monotonic=lambda: mono[0])
+    ledger.note(10, now=1000, remaining_requests=5, reset_requests_s=100, key_fp="key-a", sent_at=1000)
+    mono[0] = 150
+    assert ledger.note(10, now=1050, key_fp="key-b", sent_at=1050).day_requests == 1996
+    mono[0] = 201
+    assert ledger.usage(now=1101).day_requests == 1996
+    assert state.cloud_state == "cooldown_quota"
+    assert not any(event["type"] == "quota_reset_confirmed" for event in state.events)
+
+
+def test_rejected_lower_correction_acknowledges_local_requests(tmp_path):
+    ledger, _ = _ledger(tmp_path, now=1000)
+    ledger.note(10, now=1000, remaining_requests=5)
+    assert ledger.note(10, now=1030, remaining_requests=1999).day_requests == 1995
+    assert ledger.note(10, now=1031).day_requests == 1996
+
+
+def test_startup_current_key_invalidates_old_reset_before_load_advance(tmp_path):
+    """F5：重启直接使用 B 时，加载也不能先确认 A 的恢复点。"""
+    path = tmp_path / "quota.json"
+    path.write_text(json.dumps({
+        "version": 1, "events": [{"ts": 1000, "billed_s": 10, "in_server_day": True}],
+        "server_day_used": 1995, "server_day_used_at": 1000,
+        "reset_record": {"reset_at": 1100, "observed_at": 1000, "key_fp": "key-a", "consumed": False},
+    }))
+    state = _RecordingRouting()
+    ledger = QuotaLedger(path, routing=state, now=lambda: 1101, active_key_fp="key-b")
+    assert ledger.usage().day_requests == 1995
+    assert state.cloud_state == "cooldown_quota"
+    assert not any(event["type"] == "quota_reset_confirmed" for event in state.events)
+    saved = json.loads(path.read_text())
+    assert saved["reset_record"] is None
+    assert saved["day_epoch"] is None
+
+
+def test_same_timestamp_headerless_key_request_crosses_quota_threshold(tmp_path):
+    """F5：同秒的 B 无头请求也独立记账，1799 + 1 必须触发额度冷却。"""
+    ledger, state = _ledger(tmp_path, now=1000, monotonic=lambda: 100)
+    first = ledger.note(10, now=1000, remaining_requests=201, reset_requests_s=100, key_fp="key-a", sent_at=1000)
+    assert first.day_requests == 1799
+    assert state.cloud_state == "available"
+    second = ledger.note(10, now=1000, key_fp="key-b", sent_at=1000)
+    assert second.day_requests == 1800
+    assert state.cloud_state == "cooldown_quota"
+    restarted, restarted_state = _ledger(tmp_path, now=1000)
+    assert restarted.usage(now=1000).day_requests == 1800
+    assert restarted_state.cloud_state == "cooldown_quota"

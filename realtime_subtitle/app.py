@@ -609,6 +609,9 @@ class RemoteBridge:
         if digest == self._cloud_key_digest:
             return False
         self._cloud_key_digest = digest
+        if self.ledger is not None:
+            # 换 key 先作废旧恢复证明，随后 usage() 不能借旧边界重新开放云端。
+            self.ledger.observe_key(digest.hex()[:12])
         try:
             self.cloud.cancel()
         except Exception as exc:
@@ -1092,6 +1095,7 @@ def open_remote_bridge(
     from realtime_subtitle.remote.routing_rules import RoutingState
     from realtime_subtitle.ui.settings_window import config_dir, groq_key_file, load_node_entries
 
+    use_default_ledger = ledger_factory is None
     if cloud_on:
         if cloud_client_factory is None:
             from realtime_subtitle.remote.cloud_client import CloudClient
@@ -1121,7 +1125,18 @@ def open_remote_bridge(
         segmenter = segmenter_factory()
         qpath = quota_path or (config_dir() / "quota.json")
         qpath.parent.mkdir(parents=True, exist_ok=True)
-        ledger = ledger_factory(qpath, routing=routing)
+        if use_default_ledger:
+            from realtime_subtitle.remote.cloud_client import CloudError, read_groq_key
+            import hashlib
+            try:
+                active_key = read_groq_key(cloud_key_path)
+            except (CloudError, OSError, UnicodeError):
+                active_key = None
+            active_fp = hashlib.sha256(active_key.encode("utf-8")).hexdigest()[:12] if active_key else None
+            # 默认真实账本在 load 自动推进前绑定当前 key；测试工厂保持原来的注入接口。
+            ledger = ledger_factory(qpath, routing=routing, active_key_fp=active_fp)
+        else:
+            ledger = ledger_factory(qpath, routing=routing)
     entries = []
     self_node_id = None
     if node_on:

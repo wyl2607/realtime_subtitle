@@ -108,6 +108,9 @@ class _Ledger:
     ):
         self.notes.append((duration_s, remaining_requests, reset_requests_s, key_fp, sent_at))
 
+    def observe_key(self, key_fp):
+        pass
+
     def usage(self, now=None):
         return None
 
@@ -1040,22 +1043,28 @@ def test_cloud_defaults_use_the_remote_classes(monkeypatch, tmp_path):
             created["cancel"] = True
 
     class _Led:
-        def __init__(self, path, *, routing=None, now=None):
+        def __init__(self, path, *, routing=None, now=None, active_key_fp=None):
             created["led"] = path
+            created["active_fp"] = active_key_fp
 
     monkeypatch.setattr(cloud_segmenter, "CloudSegmenter", _Seg)
     monkeypatch.setattr(cloud_client, "CloudClient", _Cli)
     monkeypatch.setattr(quota, "QuotaLedger", _Led)
+    key_path = tmp_path / "groq.key"
+    key_path.write_text("gsk_test_default_startup_key_abcdef")
     bridge, _ui, _translator = _open(
         cloud_on=True,
         node_on=False,
         quota_path=tmp_path / "quota.json",
+        key_path=key_path,
         node_client_factory=_boom,
     )
     try:
         assert created["seg"] is True
         assert created["cli"] is not None
         assert created["led"] == tmp_path / "quota.json"
+        import hashlib
+        assert created["active_fp"] == hashlib.sha256(key_path.read_bytes()).hexdigest()[:12]
         assert type(bridge.router) is RemoteRouter
     finally:
         bridge.close()
@@ -1435,5 +1444,41 @@ def test_route_status_never_names_the_wrong_node_while_connecting(tmp_path, monk
         assert bridge.router.current_node_id == "desk2"
         assert "路由：混合·desk" not in statuses, statuses
         assert statuses[-1] == "路由：混合·desk2", statuses
+    finally:
+        bridge.close()
+
+
+def test_key_rotation_invalidates_old_reset_before_quota_poll(tmp_path):
+    """F5：检测到实际换 key 后，第一次轮询不能借旧 key 已过期的记录恢复云端。"""
+    import hashlib
+    import json
+    from realtime_subtitle.remote.quota import QuotaLedger
+
+    key_a = "gsk_test_fake_quota_old_abcdef"
+    key_b = "gsk_test_fake_quota_new_abcdef"
+    key_path = tmp_path / "groq.key"
+    key_path.write_text(key_a)
+    clock = [1000.0]
+    mono = [100.0]
+    bridge, _, _ = _open(
+        cloud_on=True, node_on=False, key_path=key_path,
+        cloud_client_factory=lambda key_path=None: _Cloud(), segmenter_factory=_Segmenter,
+        ledger_factory=lambda path, routing=None: QuotaLedger(path, routing=routing, now=lambda: clock[0], monotonic=lambda: mono[0]),
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs), quota_path=tmp_path / "quota.json",
+    )
+    try:
+        bridge.ledger.note(10, remaining_requests=5, reset_requests_s=100,
+                           key_fp=hashlib.sha256(key_a.encode()).hexdigest()[:12], sent_at=1000)
+        assert bridge.routing.cloud_state == "cooldown_quota"
+        clock[0], mono[0] = 1101, 201
+        key_path.write_text(key_b)
+        bridge._routing_checked_at = None
+        bridge._recover_routing()
+        assert bridge.routing.cloud_state == "cooldown_quota"
+        assert bridge.ledger.usage().day_requests == 1995
+        saved = json.loads((tmp_path / "quota.json").read_text())
+        assert saved["reset_record"] is None
+        assert saved["day_epoch"] is None
+        assert len(saved["events"]) == 1  # 观察 key 不能伪造一次已发送请求。
     finally:
         bridge.close()
