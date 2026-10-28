@@ -25,6 +25,8 @@ def _create_test_translator(tmp_path, session_start_time=None, session_id=None):
     t._session_id = session_id
     t._session_prev_end = 0.0
     t._session_index = 0
+    t._session_entries = {}
+    t._session_seq = 0
     t._session_srt_file = None
     t._session_csv_file = None
     t._session_csv_writer = None
@@ -267,16 +269,20 @@ def test_timed_sentence_attributes_detected_automatically(tmp_path):
     assert "00:00:05,000 --> 00:00:08,200" in content
 
 
-def test_robustness_write_error_disables_export_once_with_warning(tmp_path, capsys):
+def test_robustness_write_error_disables_export_once_with_warning(tmp_path, monkeypatch, capsys):
     """写入失败时打印一次警告并关闭导出，不崩溃且后续不再尝试。"""
+    from realtime_subtitle.translate import transcript as transcript_module
+
     t = _create_test_translator(tmp_path, session_start_time=1000.0, session_id="robustness_test")
 
     # 首次写入正常
     t._save_transcript("Satz 1", "句子1")
 
-    # 人为使文件写入引发 OSError（例如将文件句柄关闭或模拟磁盘故障）
-    if t._session_srt_file:
-        t._session_srt_file.close()
+    # 人为使整份重写失败（模拟磁盘故障：换文件那一步抛 OSError）
+    def broken_replace(*_a, **_k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(transcript_module.os, "replace", broken_replace)
 
     # 第二次写入触发异常捕获
     t._save_transcript("Satz 2", "句子2")
@@ -288,6 +294,36 @@ def test_robustness_write_error_disables_export_once_with_warning(tmp_path, caps
     t._save_transcript("Satz 3", "句子3")
     captured_again = capsys.readouterr()
     assert "会话导出写入失败" not in captured_again.out
+
+
+def test_locked_csv_skips_once_and_catches_up_without_disabling(tmp_path, monkeypatch, capsys):
+    """CSV 被 Excel 占着（replace 抛 PermissionError）：SRT 照写、导出不关，解锁后补齐。"""
+    from realtime_subtitle.translate import transcript as transcript_module
+
+    t = _create_test_translator(tmp_path, session_start_time=1000.0, session_id="locked")
+    real_replace = transcript_module.os.replace
+
+    def locked_csv(src, dst):
+        if dst.endswith(".csv"):
+            raise PermissionError(13, "Permission denied", dst)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(transcript_module.os, "replace", locked_csv)
+    t._save_transcript(TimedSentence("Satz 1", t0=1.0, t1=2.0, key="k1"), "句子1")
+    t._save_transcript(TimedSentence("Satz 2", t0=3.0, t1=4.0, key="k2"), "句子2")
+    out = capsys.readouterr().out
+    assert out.count("会话导出文件被占用") == 1
+    assert t._session_export_ok is True
+    sessions = tmp_path / "sessions"
+    assert "Satz 2" in (sessions / "locked.srt").read_text(encoding="utf-8")
+    assert not (sessions / "locked.csv").exists()
+    assert not list(sessions.glob("*.tmp"))
+
+    monkeypatch.setattr(transcript_module.os, "replace", real_replace)
+    t._save_transcript(TimedSentence("Satz 3", t0=5.0, t1=6.0, key="k3"), "句子3")
+    with open(sessions / "locked.csv", encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.reader(f))
+    assert [r[5] for r in rows[1:]] == ["Satz 1", "Satz 2", "Satz 3"]
 
 
 def test_prune_old_transcripts_prunes_session_files(tmp_path, monkeypatch):
@@ -344,3 +380,126 @@ def test_prune_old_transcripts_prunes_session_files(tmp_path, monkeypatch):
     another_old.write_text("test", encoding="utf-8")
     t._prune_old_transcripts()
     assert another_old.exists(), "KEEP_DAYS=0 时不应清理任何存档"
+
+
+def _srt_blocks(path):
+    """把 SRT 拆成 [(序号, 起止行, 正文), ...]，方便断言顺序。"""
+    blocks = []
+    for block in path.read_text(encoding="utf-8").strip().split("\n\n"):
+        lines = block.splitlines()
+        blocks.append((int(lines[0]), lines[1], "\n".join(lines[2:])))
+    return blocks
+
+
+def test_retried_sentence_keeps_original_time_order(tmp_path):
+    """先失败、重试成功后才回来的句子回到自己的时间位置，而不是被顶到队尾。
+
+    回归：以前重试成功同样走 _save_transcript，start = max(prev_end, t0)，
+    而 prev_end 已经被后来那几句推得很高——重试句于是带着伪造过的时间戳
+    排到了它们后面。
+    """
+    t = _create_test_translator(tmp_path, session_start_time=1000.0,
+                                session_id="retry_order")
+
+    # 第二、三句先成功写入（第一句还在重试队列里）
+    t._save_transcript(TimedSentence("Zweiter Satz.", t0=4.0, t1=6.0, key="k2"),
+                       "第二句。")
+    t._save_transcript(TimedSentence("Dritter Satz.", t0=6.5, t1=8.0, key="k3"),
+                       "第三句。")
+    # 重试成功的第一句带着自己的原始音频时间回来
+    t._save_transcript(TimedSentence("Erster Satz.", t0=1.0, t1=3.0, key="k1"),
+                       "第一句。")
+
+    srt_path = tmp_path / "sessions" / "retry_order.srt"
+    blocks = _srt_blocks(srt_path)
+    assert [b[2].splitlines()[0] for b in blocks] == [
+        "Erster Satz.", "Zweiter Satz.", "Dritter Satz."
+    ], "应按句子自身的音频起点排序，而不是按保存到达顺序"
+    assert [b[1] for b in blocks] == [
+        "00:00:01,000 --> 00:00:03,000",
+        "00:00:04,000 --> 00:00:06,000",
+        "00:00:06,500 --> 00:00:08,000",
+    ], "重试句必须保留原始时间戳，不被钳制到后面几句之后"
+
+    with open(tmp_path / "sessions" / "retry_order.csv", "r",
+              encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert [r["source"] for r in rows] == [
+        "Erster Satz.", "Zweiter Satz.", "Dritter Satz."
+    ]
+    assert [float(r["start"]) for r in rows] == [1.0, 4.0, 6.5]
+
+
+def test_manual_retry_replaces_instead_of_duplicating(tmp_path):
+    """用户手动重试终态失败句：同一个 key 覆盖原来那行空译文，不新增第二行。"""
+    t = _create_test_translator(tmp_path, session_start_time=1000.0,
+                                session_id="manual_retry")
+    sentence = TimedSentence("Der Satz.", t0=1.0, t1=2.5, key="k1")
+
+    # 终态失败：已经按"只有原文"存过一行
+    t._save_transcript(sentence, "")
+    # 用户点「未翻译 ⟳」后重试成功
+    t._save_transcript(sentence, "这句话。")
+
+    srt_path = tmp_path / "sessions" / "manual_retry.srt"
+    blocks = _srt_blocks(srt_path)
+    assert len(blocks) == 1, "重试同一句不应在 SRT 里留下两行"
+    assert blocks[0][2] == "Der Satz.\n这句话。", "译文应替换进原来那一行"
+
+    with open(tmp_path / "sessions" / "manual_retry.csv", "r",
+              encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 1, "重试同一句不应在 CSV 里留下两行"
+    assert rows[0]["translation"] == "这句话。"
+
+
+def test_prune_keeps_active_session_files(tmp_path, monkeypatch):
+    """保留期清理不能删掉本次运行正在写的会话文件。
+
+    回归：程序连续跑超过 TRANSCRIPT_KEEP_DAYS 天后，启动/跨天那次清理会把
+    当前会话已经写好的 srt/csv 删掉（Windows 上句柄还能继续写，用户最后
+    拿到的是缺开头的文件）。
+    """
+    day_sec = 86400
+    now = time.time()
+    old_date = time.strftime("%Y-%m-%d", time.localtime(now - 45 * day_sec))
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    active_id = f"{old_date}_100000"
+    active_srt = sessions_dir / f"{active_id}.srt"
+    active_csv = sessions_dir / f"{active_id}.csv"
+    stale_srt = sessions_dir / f"{old_date}_110000.srt"
+    for p in (active_srt, active_csv, stale_srt):
+        p.write_text("content", encoding="utf-8")
+
+    t = _create_test_translator(tmp_path, session_id=active_id)
+    monkeypatch.setattr(config, "TRANSCRIPT_KEEP_DAYS", 30, raising=False)
+    t._prune_old_transcripts()
+
+    assert active_srt.exists(), "当前会话的 srt 不能被清理"
+    assert active_csv.exists(), "当前会话的 csv 不能被清理"
+    assert not stale_srt.exists(), "同一批里非当前会话的旧文件仍应删除"
+
+
+def test_prune_ignores_plain_date_stem_in_sessions(tmp_path, monkeypatch):
+    """sessions/ 下只认 %Y-%m-%d_%H%M%S，纯日期 stem 不当作会话文件删除。"""
+    day_sec = 86400
+    now = time.time()
+    old_date = time.strftime("%Y-%m-%d", time.localtime(now - 45 * day_sec))
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    plain_srt = sessions_dir / f"{old_date}.srt"
+    plain_csv = sessions_dir / f"{old_date}.csv"
+    exact_srt = sessions_dir / f"{old_date}_100000.srt"
+    for p in (plain_srt, plain_csv, exact_srt):
+        p.write_text("content", encoding="utf-8")
+
+    t = _create_test_translator(tmp_path, session_id="2026-01-01_000000")
+    monkeypatch.setattr(config, "TRANSCRIPT_KEEP_DAYS", 30, raising=False)
+    t._prune_old_transcripts()
+
+    assert plain_srt.exists(), "纯日期 stem 不在会话命名规则里，不能删"
+    assert plain_csv.exists(), "纯日期 stem 不在会话命名规则里，不能删"
+    assert not exact_srt.exists(), "确切的会话命名仍应被正常清理"
