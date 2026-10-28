@@ -164,6 +164,20 @@ class CaptionDiffer:
             self._pending_since = None
         return CaptionUpdate(finalized, tail)
 
+    def consume_all(self, text):
+        """丢弃暂停期间的所有字幕（含未定稿尾巴），保留滚动基准供恢复后对齐。"""
+        text = " ".join((text or "").split())
+        # 清空候选句与无标点计时器，防止暂停期间的部分语句在恢复后超时被动定稿。
+        self._candidate = ""
+        self._candidate_since = None
+        self._pending_since = None
+        if not text:
+            # 临时空文本时将当前快照全部标记为已消费，避免旧文本在恢复后重放。
+            self._consumed = len(self._text)
+            return
+        self._text = text
+        self._consumed = len(text)
+
 
 def _windows_supported():
     if sys.platform != "win32":
@@ -322,6 +336,7 @@ class LiveCaptionsReader:
 
     def _run(self, on_update, on_status):
         delay = RECONNECT_INITIAL_SECONDS
+        seen_errors = set()
         while not self._stop.is_set() and not os.path.exists(repo_path(".stop")):
             try:
                 # UIA 官方要求 COM 初始化、控件创建、使用和释放在同一线程。
@@ -336,14 +351,18 @@ class LiveCaptionsReader:
                             print("⚠️ 无法隐藏 Windows 实时字幕窗口，将保持可见。")
                         if on_status:
                             on_status(STATUS_LOCAL)
+                        seen_errors.clear()
                         while not self._stop.is_set() and not os.path.exists(repo_path(".stop")):
                             if not element.Exists(0, 0):
                                 raise LookupError("Windows 实时字幕元素已消失")
                             # UIA 的 Name 属性不是 Qt 枚举，避免仓库的 Qt 短名扫描误报。
-                            result = self._differ.update(getattr(element, "Name"))
+                            name = getattr(element, "Name")
                             if os.path.exists(repo_path(".paused")):
+                                # 暂停期间丢弃所有语音（含未完成草稿），避免恢复后重放。
+                                self._differ.consume_all(name)
                                 on_update([], "")
                             else:
+                                result = self._differ.update(name)
                                 on_update(result.finalized, result.draft)
                             delay = RECONNECT_INITIAL_SECONDS
                             self._stop.wait(POLL_INTERVAL_SECONDS)
@@ -351,9 +370,16 @@ class LiveCaptionsReader:
                         # 异常路径也恢复，隐藏的窗口否则可能无法在重连时被 UIA 找到。
                         self._restore_windows()
                         window = element = None
-            except Exception:
-                if self._stop.is_set():
+            except Exception as exc:
+                if self._stop.is_set() or os.path.exists(repo_path(".stop")):
                     break
+                err_key = (type(exc), str(exc))
+                if err_key not in seen_errors:
+                    seen_errors.add(err_key)
+                    # 重连失败按 (异常类型, 消息) 去重打印，便于排查循环重连根因且避免日志刷屏；
+                    # 严禁打印字幕文本内容（隐私要求：CLAUDE.md §4 #34）。
+                    msg = f": {exc}" if str(exc) else ""
+                    print(f"⚠️ Windows 实时字幕异常（{type(exc).__name__}{msg}）。")
                 if on_status:
                     on_status(f"{TEXT_LOCAL_UNAVAILABLE_RECONNECTING_PREFIX}Windows实时字幕（{delay:g}秒）")
                 self._wait_retry(delay, on_update)

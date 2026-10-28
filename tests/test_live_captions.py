@@ -135,6 +135,42 @@ def test_invalid_differ_limits(kwargs):
         lc.CaptionDiffer(**kwargs)
 
 
+def test_differ_consume_all_drops_pending_tail_and_prevents_replay():
+    differ = lc.CaptionDiffer()
+    result = differ.update("已有第一句。未完成草稿", now=0)
+    assert result.finalized == ["已有第一句。"]
+    assert result.draft == "未完成草稿"
+
+    # 暂停期间收到快照，全额消费并清理计时器
+    differ.consume_all("已有第一句。未完成草稿在暂停中延伸")
+    # 恢复后相同文本不再产生草稿
+    assert differ.update("已有第一句。未完成草稿在暂停中延伸", now=1) == lc.CaptionUpdate([], "")
+    # 恢复后追加新内容，正常交付草稿
+    assert differ.update("已有第一句。未完成草稿在暂停中延伸 恢复后草稿", now=2) == lc.CaptionUpdate([], "恢复后草稿")
+    # 恢复后追加新完整句子，正常定稿交付
+    assert differ.update("已有第一句。未完成草稿在暂停中延伸 恢复后草稿。后续", now=3) == lc.CaptionUpdate(
+        ["恢复后草稿。"], "后续"
+    )
+
+
+def test_differ_consume_all_preserves_scroll_baseline():
+    differ = lc.CaptionDiffer()
+    differ.consume_all("这是很长的一段前缀句子。暂停期间的尾巴文本")
+    # 恢复后发生滚屏，旧前缀消失，但基准对齐后只交付新追加的内容
+    result = differ.update("暂停期间的尾巴文本 恢复后的句子。后面", now=1)
+    assert result == lc.CaptionUpdate(["恢复后的句子。"], "后面")
+
+
+def test_differ_consume_all_empty_snapshot_clears_timers_and_consumes_prior_text():
+    differ = lc.CaptionDiffer()
+    differ.update("未完成草稿", now=0)
+    differ.consume_all("")
+    assert differ._candidate == ""
+    assert differ._candidate_since is None
+    assert differ._pending_since is None
+    assert differ.update("未完成草稿", now=1) == lc.CaptionUpdate([], "")
+
+
 def test_source_selection_on_non_windows_falls_back_without_optional_import(monkeypatch, capsys):
     monkeypatch.setattr(lc.sys, "platform", "linux")
     monkeypatch.setattr(lc.importlib.util, "find_spec", lambda name: pytest.fail("must not probe Windows deps"))
@@ -309,21 +345,60 @@ def test_paused_reader_consumes_snapshots_without_replay(monkeypatch, tmp_path):
     pause = tmp_path / ".paused"
     pause.touch()
     reader = lc.LiveCaptionsReader("LiveCaptions.exe", hide_window=False)
-    monkeypatch.setattr(reader, "_find_controls", lambda auto: (
-        object(), SimpleNamespace(Exists=lambda *args: True, Name="已暂停。新的草稿")))
+    element = SimpleNamespace(Exists=lambda *args: True, Name="已暂停。新的草稿")
+    monkeypatch.setattr(reader, "_find_controls", lambda auto: (object(), element))
     updates = []
     completed = Event()
     def update(finalized, draft):
         updates.append((finalized, draft))
         if len(updates) == 1:
+            # 暂停期间已全额消费当前快照；解除暂停后相同文本不得重放为草稿
             pause.unlink()
+        elif len(updates) == 2:
+            # 恢复后追加的新文本能够正常作为草稿交付；用 setattr 避免 Qt 短名枚举扫描误报。
+            setattr(element, "Name", "已暂停。新的草稿 恢复后新词")
+        elif len(updates) == 3:
+            # 恢复后成句的新文本能够正常定稿交付
+            setattr(element, "Name", "已暂停。新的草稿 恢复后新词。后续")
         else:
             reader.stop()
             completed.set()
     reader.start(update)
     assert completed.wait(2)
     reader.stop()
-    assert updates == [([], ""), ([], "新的草稿")]
+    assert updates == [
+        ([], ""),
+        ([], ""),
+        ([], "恢复后新词"),
+        (["恢复后新词。"], "后续"),
+    ]
+
+
+def test_reader_reconnect_logs_distinct_exceptions_once(monkeypatch, tmp_path, capsys):
+    _fake_reader_environment(monkeypatch, tmp_path)
+    reader = lc.LiveCaptionsReader("LiveCaptions.exe", hide_window=False)
+    attempts = []
+    def find(auto):
+        attempts.append(True)
+        if len(attempts) <= 2:
+            raise LookupError("窗口不可用")
+        if len(attempts) <= 4:
+            raise RuntimeError("COM连接失败")
+        return object(), SimpleNamespace(Exists=lambda *args: True, Name="")
+    monkeypatch.setattr(reader, "_find_controls", find)
+    completed = Event()
+    def update(finalized, draft):
+        if len(attempts) > 4:
+            reader.stop()
+            completed.set()
+    reader.start(update)
+    assert completed.wait(2)
+    reader.stop()
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if "⚠️ Windows 实时字幕异常" in ln]
+    # 同一异常连续重试不刷屏，仅在出现不同 (异常类型, 消息) 时打印一次
+    assert len(lines) == 2
+    assert "LookupError: 窗口不可用" in lines[0]
+    assert "RuntimeError: COM连接失败" in lines[1]
 
 
 def test_stop_flag_prevents_uia_import(monkeypatch, tmp_path):
