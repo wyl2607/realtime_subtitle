@@ -282,6 +282,7 @@ class RemoteBridge:
         # 而这里要把「读指纹 → 决定是否 key_modified / http_status」做成原子。
         self._key_lock = __import__("threading").Lock()
         self._cloud_key_digest, _ = self._read_cloud_key_digest()
+        self._cloud_key_seen = self._cloud_key_digest is not None
         # 分段器的 a0 从这次开桥算起。加上开桥时本机识别已经走过的样本，
         # 远端句才能和本机句用同一套 t0/t1。中途才打开时，收件箱里还没
         # 识别的音频可能对不齐，这是已知限制。
@@ -470,12 +471,18 @@ class RemoteBridge:
         if self._stale_remote_generation(generation, "cloud_result"):
             return
         try:
-            self.routing.apply({"type": "segment_success"})
-            if self.ledger is not None:
-                self.ledger.note(
-                    transcript.duration_s,
-                    remaining_requests=transcript.remaining_requests,
-                )
+            with self._key_lock:
+                if not self._cloud_callback_current_locked(generation, transcript.key_fingerprint):
+                    return
+                self.routing.apply({"type": "segment_success"})
+                if self.ledger is not None:
+                    self.ledger.note(
+                        transcript.duration_s,
+                        remaining_requests=transcript.remaining_requests,
+                        reset_requests_s=transcript.reset_requests_s,
+                        key_fp=transcript.key_fingerprint,
+                        sent_at=transcript.sent_at,
+                    )
         except Exception as exc:
             print(f"⚠️  云端记账失败: {type(exc).__name__}")
         self._sync_provider()
@@ -502,39 +509,12 @@ class RemoteBridge:
             status = exc.status
             reached = status is not None
             routed = status in (401, 403, 429) or (reached and 500 <= int(status) <= 599)
-            previous_state = str(getattr(self.routing, "cloud_state", "") or "")
-            status_applied = False
-            stale_key = False
-            if status in (401, 403):
-                # 指纹比较和「打无效」必须是同一把锁里的一个决定。否则旧 key 的
-                # 401 可能在音频线程换 key 之后才落盘，把新 key 永久打成
-                # disabled_invalid_key 且之后再也不恢复。
-                with self._key_lock:
-                    if self._stale_remote_generation(generation, "cloud_exception"):
-                        return
-                    digest, fingerprint = self._read_cloud_key_digest()
-                    if (
-                        digest is not None
-                        and getattr(exc, "key_fingerprint", None) is not None
-                        and exc.key_fingerprint != fingerprint
-                    ):
-                        # _recover_routing 尚未到下一秒检查点时，401/403 仍可能先到。
-                        # 它属于旧 key，不能让 routing_rules 锁死新 key。
-                        stale_key = True
-                        self._apply_cloud_key_modified_locked(digest)
-                    else:
-                        self.routing.apply({
-                            "type": "http_status",
-                            "status": int(status),
-                            "retry_after": exc.retry_after,
-                        })
-                        status_applied = True
-            if stale_key:
-                self._sync_provider()
-                self._announce_route()
-                return
             try:
-                if not status_applied:
+                # 校验、路由和记账与换 key 共用一把锁，所有响应状态都不能重装旧证明。
+                with self._key_lock:
+                    if not self._cloud_callback_current_locked(generation, exc.key_fingerprint):
+                        return
+                    previous_state = str(getattr(self.routing, "cloud_state", "") or "")
                     if routed:
                         self.routing.apply({
                             "type": "http_status",
@@ -543,12 +523,18 @@ class RemoteBridge:
                         })
                     else:
                         self.routing.apply({"type": "segment_failure"})
-                if reached and self.ledger is not None:
-                    self.ledger.note(exc.duration_s, remaining_requests=exc.remaining_requests)
-                if status == 429 and previous_state != "cooldown_rate_limited":
-                    # 只在进入冷却时打一行；和 rslite 同一格式，不含 key 和正文。
-                    seconds = getattr(self.routing, "cooldown_seconds", None) or 60
-                    print(f"rslite.cloud cooldown reason=429 retry_after={int(seconds)}")
+                    if reached and self.ledger is not None:
+                        self.ledger.note(
+                            exc.duration_s,
+                            remaining_requests=exc.remaining_requests,
+                            reset_requests_s=exc.reset_requests_s,
+                            key_fp=exc.key_fingerprint,
+                            sent_at=exc.sent_at,
+                        )
+                    if status == 429 and previous_state != "cooldown_rate_limited":
+                        # 只在进入冷却时打一行；和 rslite 同一格式，不含 key 和正文。
+                        seconds = getattr(self.routing, "cooldown_seconds", None) or 60
+                        print(f"rslite.cloud cooldown reason=429 retry_after={int(seconds)}")
             except Exception as note_exc:
                 print(f"⚠️  云端失败记账出错: {type(note_exc).__name__}")
         else:
@@ -563,7 +549,7 @@ class RemoteBridge:
 
     def _read_cloud_key_digest(self):
         """返回 key 内容的完整摘要和可公开的短指纹；读不到 key 时不改变路由。"""
-        if not self.cloud_on or self.cloud is None or self._cloud_key_path is None:
+        if self.cloud is None or self._cloud_key_path is None:
             return None, None
         from realtime_subtitle.remote.cloud_client import CloudError, read_groq_key
         try:
@@ -577,6 +563,18 @@ class RemoteBridge:
         import hashlib
         digest = hashlib.sha256(key.encode("utf-8")).digest()
         return digest, digest.hex()[:12]
+
+    def _cloud_callback_current_locked(self, generation, fingerprint):
+        """调用方持有 _key_lock，校验后直到记账完成都不能插入一次换 key。"""
+        if self._stale_remote_generation(generation, "cloud_accounting"):
+            return False
+        digest, current_fp = self._read_cloud_key_digest()
+        self._apply_cloud_key_modified_locked(digest)
+        if self._cloud_key_seen and fingerprint != current_fp:
+            self._sync_provider()
+            self._announce_route()
+            return False
+        return True
 
     def _apply_cloud_key_modified(self, digest):
         """换 key：只作废云端自己的在飞请求，再让 routing_rules 恢复云端。
@@ -595,11 +593,15 @@ class RemoteBridge:
 
     def _apply_cloud_key_modified_locked(self, digest):
         """换 key 的实际动作。调用方必须已持有 self._key_lock。"""
-        if not self.cloud_on or self.cloud is None:
-            return False
         if digest == self._cloud_key_digest:
             return False
         self._cloud_key_digest = digest
+        self._cloud_key_seen = self._cloud_key_seen or digest is not None
+        if self.ledger is not None:
+            # 换 key 先作废旧恢复证明，随后 usage() 不能借旧边界重新开放云端。
+            self.ledger.observe_key(digest.hex()[:12] if digest is not None else None)
+        if not self.cloud_on or self.cloud is None or digest is None:
+            return False
         try:
             self.cloud.cancel()
         except Exception as exc:
@@ -647,19 +649,19 @@ class RemoteBridge:
         routing = self.routing
         if routing is None:
             return
-        if self.cloud_on and self.cloud is not None:
-            digest, _fingerprint = self._read_cloud_key_digest()
-            if digest is not None:
-                with self._key_lock:
-                    if self._cloud_key_digest is None:
-                        # 开桥时没有 key、之后才补上：只记指纹，不算一次换 key。
-                        self._cloud_key_digest = digest
-                        changed = False
-                    else:
-                        changed = self._apply_cloud_key_modified_locked(digest)
-                if changed:
-                    self._sync_provider()
-                    self._announce_route()
+        if self.cloud is not None:
+            with self._key_lock:
+                digest, _fingerprint = self._read_cloud_key_digest()
+                if digest is not None and not self._cloud_key_seen:
+                    # 开桥时没有 key、之后才补上：只记指纹，不算一次换 key。
+                    self._cloud_key_digest = digest
+                    self._cloud_key_seen = True
+                    changed = False
+                else:
+                    changed = self._apply_cloud_key_modified_locked(digest)
+            if changed:
+                self._sync_provider()
+                self._announce_route()
         state = str(getattr(routing, "cloud_state", "") or "")
         seconds = getattr(routing, "cooldown_seconds", None)
         if state == "cooldown_quota" or not state.startswith("cooldown_"):
@@ -683,7 +685,11 @@ class RemoteBridge:
             # 冷却结束要把状态行从「… · 云端限流冷却」恢复成原文案。
             self._announce_route()
         if self.ledger is not None:
-            self.ledger.usage()
+            with self._key_lock:
+                # 与观察串行；不能在旧 key 观察和轮询之间插入一次新 key 记账。
+                _digest, fingerprint = self._read_cloud_key_digest()
+                self.ledger.observe_key(fingerprint)
+                self.ledger.usage()
 
     def _sync_provider(self):
         stub = getattr(self.router, "cloud_provider", None)
@@ -1083,6 +1089,7 @@ def open_remote_bridge(
     from realtime_subtitle.remote.routing_rules import RoutingState
     from realtime_subtitle.ui.settings_window import config_dir, groq_key_file, load_node_entries
 
+    use_default_ledger = ledger_factory is None
     if cloud_on:
         if cloud_client_factory is None:
             from realtime_subtitle.remote.cloud_client import CloudClient
@@ -1112,7 +1119,18 @@ def open_remote_bridge(
         segmenter = segmenter_factory()
         qpath = quota_path or (config_dir() / "quota.json")
         qpath.parent.mkdir(parents=True, exist_ok=True)
-        ledger = ledger_factory(qpath, routing=routing)
+        if use_default_ledger:
+            from realtime_subtitle.remote.cloud_client import CloudError, read_groq_key
+            import hashlib
+            try:
+                active_key = read_groq_key(cloud_key_path)
+            except (CloudError, OSError, UnicodeError):
+                active_key = None
+            active_fp = hashlib.sha256(active_key.encode("utf-8")).hexdigest()[:12] if active_key else None
+            # 默认真实账本在 load 自动推进前绑定当前 key；测试工厂保持原来的注入接口。
+            ledger = ledger_factory(qpath, routing=routing, active_key_fp=active_fp)
+        else:
+            ledger = ledger_factory(qpath, routing=routing)
     entries = []
     self_node_id = None
     if node_on:

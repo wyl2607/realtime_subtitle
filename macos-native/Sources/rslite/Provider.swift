@@ -52,7 +52,10 @@ struct CloudRouteContext {
     }
 
     mutating func apply(_ event: RouteEvent) {
-        cooldownSeconds = nil
+        // Confirming RPD rollover cannot erase an unrelated HTTP 429 retry-after.
+        if !(event.type == "quota_reset_confirmed" && cloudState == .cooldownRateLimited) {
+            cooldownSeconds = nil
+        }
         cancelInflight = false
         discardResponse = false
         action = "none"
@@ -73,8 +76,14 @@ struct CloudRouteContext {
             httpStatus(event.status ?? 0, retryAfter: event.retryAfter)
         case "quota_update":
             quotaUpdate(event.usagePercent ?? 0)
+        case "quota_reset_confirmed":
+            // The ledger verifies rollover first; here only quota cooldown may lift.
+            // Missing usage remains fail-closed (100%), and 401/429/off win.
+            if cloudEnabled && hasKey && !keyInvalid && cloudState == .cooldownQuota {
+                quotaUpdate(event.usagePercent ?? 100)
+            }
         case "cooldown_expired":
-            if cloudState == .cooldownBackoff || cloudState == .cooldownRateLimited || cloudState == .cooldownQuota {
+            if cloudState == .cooldownBackoff || cloudState == .cooldownRateLimited {
                 cloudState = .probe
                 action = "probe_once"
             }
@@ -162,7 +171,7 @@ struct CloudRouteContext {
             return
         }
         if status == 429 {
-            if keyInvalid {
+            if keyInvalid || cloudState == .disabledInvalidKey {
                 // 失效 key 只有 key_modified 能解除。401 之后迟到的 429 是并发在飞请求的
                 // 回执，若照常进限流冷却，冷却到期会 probe→tier() 回到 cloud，
                 // 把已经失效的 key 又带回云端发请求，所以这里整条忽略。

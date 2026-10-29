@@ -7,6 +7,7 @@ os.environ["REALTIME_SUBTITLE_NO_SINGLETON"] = "1"
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np  # noqa: E402
+import pytest  # noqa: E402
 
 from realtime_subtitle.app import open_remote_bridge  # noqa: E402
 from realtime_subtitle.remote.cloud_client import CloudTranscript, MappedSegment  # noqa: E402
@@ -60,6 +61,9 @@ class _Cloud:
             duration_s=1.0,
             status=200,
             remaining_requests=9,
+            reset_requests_s=12.5,
+            key_fingerprint="cloud-key-fp",
+            sent_at=1234.5,
         )
 
     def cancel(self):
@@ -93,8 +97,20 @@ class _Ledger:
         self.routing = routing
         self.notes = []
 
-    def note(self, duration_s, *, now=None, remaining_requests=None):
-        self.notes.append((duration_s, remaining_requests))
+    def note(
+        self,
+        duration_s,
+        *,
+        now=None,
+        remaining_requests=None,
+        reset_requests_s=None,
+        key_fp=None,
+        sent_at=None,
+    ):
+        self.notes.append((duration_s, remaining_requests, reset_requests_s, key_fp, sent_at))
+
+    def observe_key(self, key_fp):
+        pass
 
     def usage(self, now=None):
         return None
@@ -177,7 +193,7 @@ def test_cloud_on_builds_cloud_stack_not_node_client(tmp_path):
         assert segmenter.fed == 1
         assert cloud.calls and cloud.calls[0][1]
         assert translator.calls == [("Hallo", "")]
-        assert ledgers[0].notes
+        assert ledgers[0].notes == [(1.0, 9, 12.5, "cloud-key-fp", 1234.5)]
         assert any(line["dst"] == "中文译文" and line["source"] == "remote" for line in ui.lines)
         assert node_calls == []
     finally:
@@ -315,8 +331,9 @@ def test_cloud_429_logs_cooldown_once_without_key(tmp_path, capsys):
     try:
         error = CloudError(
             status=429, reason="rate limited", exc_type="HTTPError",
-            retry_after=7, secret="gsk_test_fake_key_never_logged")
+            retry_after=7, reset_requests_s=0.12, secret="gsk_test_fake_key_never_logged")
         bridge._on_cloud_exception(error, 0)
+        assert bridge.ledger.notes == [(0.0, None, 0.12, error.key_fingerprint, error.sent_at)]
         out = capsys.readouterr().out
         assert "rslite.cloud cooldown reason=429 retry_after=7" in out
         assert "gsk_test_fake_key_never_logged" not in out
@@ -1027,22 +1044,28 @@ def test_cloud_defaults_use_the_remote_classes(monkeypatch, tmp_path):
             created["cancel"] = True
 
     class _Led:
-        def __init__(self, path, *, routing=None, now=None):
+        def __init__(self, path, *, routing=None, now=None, active_key_fp=None):
             created["led"] = path
+            created["active_fp"] = active_key_fp
 
     monkeypatch.setattr(cloud_segmenter, "CloudSegmenter", _Seg)
     monkeypatch.setattr(cloud_client, "CloudClient", _Cli)
     monkeypatch.setattr(quota, "QuotaLedger", _Led)
+    key_path = tmp_path / "groq.key"
+    key_path.write_text("gsk_test_default_startup_key_abcdef")
     bridge, _ui, _translator = _open(
         cloud_on=True,
         node_on=False,
         quota_path=tmp_path / "quota.json",
+        key_path=key_path,
         node_client_factory=_boom,
     )
     try:
         assert created["seg"] is True
         assert created["cli"] is not None
         assert created["led"] == tmp_path / "quota.json"
+        import hashlib
+        assert created["active_fp"] == hashlib.sha256(key_path.read_bytes()).hexdigest()[:12]
         assert type(bridge.router) is RemoteRouter
     finally:
         bridge.close()
@@ -1162,6 +1185,12 @@ def test_feed_audio_expires_cooldown_and_recovers_quota(tmp_path, monkeypatch):
     import time
 
     from realtime_subtitle.remote.quota import QuotaLedger
+    import hashlib
+
+    key = "gsk_test_quota_recovery_abcdef"
+    key_path = tmp_path / "groq.key"
+    key_path.write_text(key)
+    fingerprint = hashlib.sha256(key.encode()).hexdigest()[:12]
 
     clock = {"t": 1_700_000_000.0}
     monkeypatch.setattr(time, "time", lambda: clock["t"])
@@ -1189,6 +1218,7 @@ def test_feed_audio_expires_cooldown_and_recovers_quota(tmp_path, monkeypatch):
         ledger_factory=ledger_factory,
         router_factory=lambda **kwargs: RemoteRouter(**kwargs),
         quota_path=tmp_path / "quota.json",
+        key_path=key_path,
     )
     try:
         bridge.routing.apply({"type": "http_status", "status": 429, "retry_after": 5})
@@ -1208,7 +1238,7 @@ def test_feed_audio_expires_cooldown_and_recovers_quota(tmp_path, monkeypatch):
         assert bridge._announced == design_tokens.TEXT_STATUS_CLOUD
 
         for _ in range(18):
-            bridge.ledger.note(1.0, now=clock["t"])
+            bridge.ledger.note(1.0, now=clock["t"], key_fp=fingerprint)
         assert bridge.routing.cloud_state == "cooldown_quota"
         bridge.feed_audio(np.zeros(160, dtype=np.float32))
         assert bridge.routing.cloud_state == "cooldown_quota"
@@ -1422,5 +1452,129 @@ def test_route_status_never_names_the_wrong_node_while_connecting(tmp_path, monk
         assert bridge.router.current_node_id == "desk2"
         assert "路由：混合·desk" not in statuses, statuses
         assert statuses[-1] == "路由：混合·desk2", statuses
+    finally:
+        bridge.close()
+
+
+def test_key_rotation_invalidates_old_reset_before_quota_poll(tmp_path):
+    """F5：检测到实际换 key 后，第一次轮询不能借旧 key 已过期的记录恢复云端。"""
+    import hashlib
+    import json
+    from realtime_subtitle.remote.quota import QuotaLedger
+
+    key_a = "gsk_test_fake_quota_old_abcdef"
+    key_b = "gsk_test_fake_quota_new_abcdef"
+    key_path = tmp_path / "groq.key"
+    key_path.write_text(key_a)
+    clock = [1000.0]
+    mono = [100.0]
+    bridge, _, _ = _open(
+        cloud_on=True, node_on=False, key_path=key_path,
+        cloud_client_factory=lambda key_path=None: _Cloud(), segmenter_factory=_Segmenter,
+        ledger_factory=lambda path, routing=None: QuotaLedger(path, routing=routing, now=lambda: clock[0], monotonic=lambda: mono[0]),
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs), quota_path=tmp_path / "quota.json",
+    )
+    try:
+        bridge.ledger.note(10, remaining_requests=5, reset_requests_s=100,
+                           key_fp=hashlib.sha256(key_a.encode()).hexdigest()[:12], sent_at=1000)
+        assert bridge.routing.cloud_state == "cooldown_quota"
+        clock[0], mono[0] = 1101, 201
+        key_path.write_text(key_b)
+        bridge._routing_checked_at = None
+        bridge._recover_routing()
+        assert bridge.routing.cloud_state == "cooldown_quota"
+        assert bridge.ledger.usage().day_requests == 1995
+        saved = json.loads((tmp_path / "quota.json").read_text())
+        assert saved["reset_record"] is None
+        assert saved["day_epoch"] is None
+        assert len(saved["events"]) == 1  # 观察 key 不能伪造一次已发送请求。
+    finally:
+        bridge.close()
+
+
+@pytest.mark.parametrize("status", [200, 429, 500])
+def test_old_key_callback_after_generation_check_cannot_reinstall_reset(tmp_path, status):
+    import hashlib
+    import json
+    from dataclasses import replace
+    from realtime_subtitle.remote.cloud_client import CloudError
+    from realtime_subtitle.remote.quota import QuotaLedger
+
+    key_a, key_b = "gsk_test_callback_old_abcdef", "gsk_test_callback_new_abcdef"
+    fp_a = hashlib.sha256(key_a.encode()).hexdigest()[:12]
+    fp_b = hashlib.sha256(key_b.encode()).hexdigest()[:12]
+    key_path = tmp_path / "groq.key"
+    key_path.write_text(key_a)
+
+    class Cloud(_Cloud):
+        def transcribe(self, pcm, *, a0, language):
+            if status != 200:
+                raise CloudError(status=status, reason="test", exc_type="HTTPStatus", secret=key_a,
+                                 duration_s=10, remaining_requests=1999, reset_requests_s=1, sent_at=1000)
+            return replace(super().transcribe(pcm, a0=a0, language=language),
+                           key_fingerprint=fp_a, sent_at=1000, reset_requests_s=1)
+
+    bridge, _, _ = _open(
+        cloud_on=True, node_on=False, key_path=key_path,
+        cloud_client_factory=lambda key_path=None: Cloud(), segmenter_factory=_Segmenter,
+        ledger_factory=lambda path, routing=None: QuotaLedger(path, routing=routing, now=lambda: 1002, monotonic=lambda: 100),
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs), quota_path=tmp_path / "quota.json",
+    )
+    original = bridge._stale_remote_generation
+    rotated = []
+
+    def rotate_after_check(generation, where):
+        stale = original(generation, where)
+        if where == ("cloud_result" if status == 200 else "cloud_exception") and not rotated:
+            rotated.append(True)
+            key_path.write_text(key_b)
+            bridge._apply_cloud_key_modified(hashlib.sha256(key_b.encode()).digest())
+            bridge.ledger.note(10, remaining_requests=5, reset_requests_s=1000, key_fp=fp_b, sent_at=1002)
+        return stale
+
+    bridge._stale_remote_generation = rotate_after_check
+    try:
+        bridge._transcribe_one(0, 1, np.zeros(1600, dtype=np.int16), bridge._generation)
+        assert rotated
+        record = json.loads(bridge.ledger.path.read_text())["reset_record"]
+        assert record["key_fp"] == fp_b
+        assert record["reset_at"] == 2002
+        assert bridge.ledger.usage(now=1005).day_requests >= 1995
+    finally:
+        bridge.close()
+
+
+@pytest.mark.parametrize("clear", [False, True])
+def test_disabled_key_change_invalidates_reset_before_poll(tmp_path, clear):
+    import hashlib
+    import json
+    from realtime_subtitle.remote.quota import QuotaLedger
+
+    key_a = "gsk_test_disabled_old_abcdef"
+    key_path = tmp_path / "groq.key"
+    key_path.write_text(key_a)
+    clock = [1000.0]
+    bridge, _, _ = _open(
+        cloud_on=True, node_on=False, key_path=key_path,
+        cloud_client_factory=lambda key_path=None: _Cloud(), segmenter_factory=_Segmenter,
+        ledger_factory=lambda path, routing=None: QuotaLedger(path, routing=routing, now=lambda: clock[0], monotonic=lambda: clock[0]),
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs), quota_path=tmp_path / "quota.json",
+    )
+    try:
+        bridge.ledger.note(10, remaining_requests=5, reset_requests_s=100,
+                           key_fp=hashlib.sha256(key_a.encode()).hexdigest()[:12], sent_at=1000)
+        bridge.set_prefs(False, False)
+        if clear:
+            key_path.unlink()
+        else:
+            key_path.write_text("gsk_test_disabled_new_abcdef")
+        clock[0] = 1101
+        bridge._routing_checked_at = None
+        bridge._recover_routing()
+        assert bridge.ledger.usage().day_requests == 1995
+        saved = json.loads(bridge.ledger.path.read_text())
+        assert saved["reset_record"] is None
+        assert saved["day_epoch"] is None
+        assert bridge.routing.cloud_state == "off"
     finally:
         bridge.close()

@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// 仅供云端延迟诊断使用的单调时钟。headless 运行时由 main.swift 注入与 events.jsonl
 /// 相同的起点；非 headless 运行没有 events.jsonl，则退回到进程 uptime。
@@ -31,6 +32,30 @@ struct CloudTranscriptionResult: Equatable {
     var statusCode: Int
     var xGroqID: String?
     var remainingRequests: Int?
+    /// `x-ratelimit-reset-requests` 解析后的秒数；保持默认值以兼容既有 selftest 构造点。
+    var resetRequestsS: Double? = nil
+    /// 仅用于账本信任门的 key 指纹和实际请求发出时刻；两者都不含敏感正文或 key。
+    var keyFingerprint: String? = nil
+    var sentAt: Date? = nil
+}
+
+struct CloudQuotaHeaders: Equatable {
+    var remainingRequests: Int?
+    var resetRequestsS: Double?
+    var keyFingerprint: String?
+    var sentAt: Date?
+
+    init(
+        remainingRequests: Int? = nil,
+        resetRequestsS: Double? = nil,
+        keyFingerprint: String? = nil,
+        sentAt: Date? = nil
+    ) {
+        self.remainingRequests = remainingRequests
+        self.resetRequestsS = resetRequestsS
+        self.keyFingerprint = keyFingerprint
+        self.sentAt = sentAt
+    }
 }
 
 struct CloudLogEntry: Equatable {
@@ -42,7 +67,7 @@ struct CloudLogEntry: Equatable {
 }
 
 enum CloudClientError: Error, CustomStringConvertible {
-    case httpStatus(Int, retryAfter: Int?, xGroqID: String?)
+    case httpStatus(Int, retryAfter: Int?, xGroqID: String?, quota: CloudQuotaHeaders? = nil)
     case network(String)
     case invalidResponse
     case decodeFailed
@@ -50,7 +75,7 @@ enum CloudClientError: Error, CustomStringConvertible {
 
     var description: String {
         switch self {
-        case .httpStatus(let status, let retryAfter, _):
+        case .httpStatus(let status, let retryAfter, _, _):
             if let retryAfter {
                 return "Groq HTTP \(status), retry_after=\(retryAfter)"
             }
@@ -73,6 +98,7 @@ final class CloudClient: @unchecked Sendable {
     static let totalTimeout: TimeInterval = 10
 
     private let key: String
+    private let keyFingerprint: String
     private let endpointURL: URL
     private let session: URLSession
     private let logger: @Sendable (CloudLogEntry) -> Void
@@ -97,6 +123,7 @@ final class CloudClient: @unchecked Sendable {
         logger: @escaping @Sendable (CloudLogEntry) -> Void = { _ in }
     ) {
         self.key = key
+        keyFingerprint = Self.fingerprint(for: key)
         self.endpointURL = endpoint
         self.session = URLSession(configuration: sessionConfiguration)
         self.logger = logger
@@ -172,6 +199,7 @@ final class CloudClient: @unchecked Sendable {
             fileData: wav
         )
 
+        let sentAt = Date()
         let generation = lock.withLockValue { cancelGeneration }
         let (data, response) = try await data(for: request, duration: duration, generation: generation, segmentID: segmentID)
         guard let http = response as? HTTPURLResponse else {
@@ -190,15 +218,21 @@ final class CloudClient: @unchecked Sendable {
             }
         }
         let groqID = Self.groqID(from: http)
+        let quota = CloudQuotaHeaders(
+            remainingRequests: QuotaLedger.remainingRequests(from: http.allHeaderFields),
+            resetRequestsS: QuotaLedger.resetRequestsSeconds(from: http.allHeaderFields),
+            keyFingerprint: keyFingerprint,
+            sentAt: sentAt
+        )
         guard (200..<300).contains(http.statusCode) else {
             let retryAfter = Self.retryAfter(from: http)
             logger(CloudLogEntry(xGroqID: groqID, duration: duration, statusCode: http.statusCode, reason: Self.reason(for: http.statusCode), errorType: nil))
-            throw CloudClientError.httpStatus(http.statusCode, retryAfter: retryAfter, xGroqID: groqID)
+            throw CloudClientError.httpStatus(http.statusCode, retryAfter: retryAfter, xGroqID: groqID, quota: quota)
         }
         do {
             let decoded = try JSONDecoder().decode(GroqVerboseResponse.self, from: data)
             logger(CloudLogEntry(xGroqID: groqID, duration: duration, statusCode: http.statusCode, reason: "ok", errorType: nil))
-            let remaining = QuotaLedger.remainingRequests(from: http.allHeaderFields)
+            let remaining = quota.remainingRequests
             if let remaining {
                 // 只写这个整数，不写 key / URL / 正文 / 其它响应头。风格照抄 rslite.route。
                 FileHandle.standardError.write(Data("rslite.cloud remaining_requests=\(remaining)\n".utf8))
@@ -210,12 +244,19 @@ final class CloudClient: @unchecked Sendable {
                 },
                 statusCode: http.statusCode,
                 xGroqID: groqID,
-                remainingRequests: remaining
+                remainingRequests: remaining,
+                resetRequestsS: quota.resetRequestsS,
+                keyFingerprint: keyFingerprint,
+                sentAt: sentAt
             )
         } catch {
             logger(CloudLogEntry(xGroqID: groqID, duration: duration, statusCode: http.statusCode, reason: "decode_failed", errorType: "decode"))
             throw CloudClientError.decodeFailed
         }
+    }
+
+    private static func fingerprint(for key: String) -> String {
+        SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     private func data(
@@ -455,6 +496,7 @@ final class CloudClient: @unchecked Sendable {
                     headers: [
                         "x_groq.id": "groq-ok",
                         "x-ratelimit-remaining-requests": "1980",
+                        "x-ratelimit-reset-requests": "2m59.56s",
                     ],
                     body: Data(#"{"text":"Hallo","segments":[{"start":0.1,"end":0.4,"text":"Hallo"}]}"#.utf8)
                 )
@@ -467,6 +509,25 @@ final class CloudClient: @unchecked Sendable {
             )
             check(result.segments == [CloudSegment(t0: 12.1, t1: 12.4, text: "Hallo")], "segments 应映射到 a0 时间轴")
             check(result.remainingRequests == 1980, "成功响应应带上 remainingRequests")
+            check(abs((result.resetRequestsS ?? 0) - 179.56) < 1e-9, "成功响应应带上 resetRequestsS")
+        }
+
+        run {
+            CloudURLProtocolStub.handler = { _ in
+                .success(status: 429, headers: [
+                    "x-ratelimit-remaining-requests": "0",
+                    "x-ratelimit-reset-requests": "120ms",
+                ], body: Data())
+            }
+            do {
+                _ = try await client.transcribe(pcm16Mono16k: Data([0, 0]), a0: 0, duration: 1, language: "de")
+                check(false, "429 应抛出带配额头的错误")
+            } catch let CloudClientError.httpStatus(_, _, _, quota) {
+                check(quota?.remainingRequests == 0, "429 错误应带 remaining=0")
+                check(abs((quota?.resetRequestsS ?? 0) - 0.12) < 1e-9, "429 错误应带 resetRequestsS=0.12")
+            } catch {
+                check(false, "429 应保留为 CloudClientError.httpStatus")
+            }
         }
 
         for status in [401, 429, 500] {
