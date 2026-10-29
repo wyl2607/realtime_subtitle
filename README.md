@@ -84,7 +84,7 @@
 | | 推荐 | 最低 |
 |---|---|---|
 | 系统 | Windows 10/11 64 位 | 同左（**仅 Windows**，WASAPI） |
-| 显卡 | NVIDIA 8GB+ 显存 | 无独显可 CPU（延迟更大） |
+| 显卡 | NVIDIA 8GB+ 显存 | 无独显可 CPU（延迟更大），或改用 Windows 实时字幕识别（见下文「可选识别来源」） |
 | 内存 | 16GB | 8GB |
 | 硬盘 | 约 10GB | 约 6GB |
 | Python | 3.10–3.13 | 同左 |
@@ -181,6 +181,23 @@ bash scripts/macos/stop.sh
 - **免费额度**：每分钟 20 次、每小时 7200 秒音频、每天 2000 次 / 28800 秒，每次最少按 10 秒计。
 - **自动切换**：额度快满自动切到自己的节点/本机、恢复后静音点切回。
 - **回退顺序**：云端 → 自己的节点 → 本机。
+
+## 可选识别来源与字幕导出
+
+都写在 `config_local.py` 里，改完重启字幕生效。
+
+- **Windows 实时字幕（免显卡）**：`ASR_SOURCE = "livecaptions"`，再装一次
+  `venv\Scripts\python -m pip install uiautomation`。识别交给 Windows 11（22H2 及以上）自带的
+  「实时辅助字幕」，本程序读它的文字再用 Ollama 翻译，不加载 Whisper、不占显卡，适合没有 N 卡的电脑。
+  识别语言要在 **Windows 设置 → 辅助功能 → 字幕** 里选，并和程序里的源语言一致。运行期间系统字幕窗会被
+  最小化（`LIVE_CAPTIONS_HIDE_WINDOW = False` 可保持可见），退出时恢复。系统字幕本身会把最后几个词压着，
+  等下一句话才补上，所以说话人停下来后最后一句会晚到（最多约 12 秒兜底）。
+  条件不满足（不是 Win11 / 没装 uiautomation / 找不到系统字幕）时自动回退 Whisper。
+- **SenseVoice（算力节点用，可选）**：`ASR_ENGINE = "sensevoice"`，节点上 `pip install funasr`。
+  只支持中/英/日/韩/粤语，**不支持德语**，其它语言自动回退 Whisper；本机流式识别仍是 Whisper。
+- **每次运行的 SRT / CSV**：默认开。除了每天一个 txt，每次运行还会在 `transcripts\sessions\` 存一份
+  双语 SRT（可直接拖进播放器）和 CSV（Excel 可直接打开）。关掉：`SAVE_SESSION_SRT = False` /
+  `SAVE_SESSION_CSV = False`；`SAVE_TRANSCRIPT = False` 时一起关。保留期同样受 `TRANSCRIPT_KEEP_DAYS` 管。
 
 ## Windows：使用算力节点
 

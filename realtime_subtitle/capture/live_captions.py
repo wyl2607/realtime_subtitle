@@ -26,6 +26,8 @@ from realtime_subtitle.ui.design_tokens import TEXT_LOCAL_UNAVAILABLE_RECONNECTI
 
 POLL_INTERVAL_SECONDS = 0.15
 FINALIZE_STABLE_SECONDS = 0.8  # 句末仍可能被系统修订；末句等短暂稳定后才交给翻译。
+# 连上时被压着的旧尾巴，补完后最多这么多词才当旧内容整句跳过（见 prime）。
+SKIP_TAIL_MAX_WORDS = 3
 FORCE_FLUSH_CHARS = 240  # 无标点长句也要有延迟上限，避免草稿无限增长。
 FORCE_FLUSH_SECONDS = 12.0  # 持续增长不能重置此计时，否则不停说话永远无法翻译。
 RECONNECT_INITIAL_SECONDS = 0.5
@@ -57,6 +59,7 @@ class CaptionDiffer:
         self.max_seconds = max_seconds
         self._text = ""
         self._consumed = 0
+        self._skip_first = False
         self._candidate = ""
         self._candidate_since = None
         self._pending_since = None
@@ -88,6 +91,24 @@ class CaptionDiffer:
                 return (b1 if cursor > a0 else b0), True
         return len(text), True
 
+    def prime(self, text):
+        """把连上那一刻窗口里已有的文字记为"已交付"。
+
+        ☠️ 系统字幕窗会保留上一次的内容（本应用重启、或断线重连时都在）。
+        不先记下就会被当成新句子整段送去翻译和存档（2026-10-27 实测重放过）。
+        代价：连上时还没成句的尾巴也一起跳过，最多丢半句。
+
+        ☠️ 系统字幕会把最后几个词压着不显示，等下一段语音来了才补上（真机原始
+        快照实测：停在 "…Geld für Bahn"，新语音进来后才补出 "und Bus."）。所以
+        残留文字没以句末标点结尾时，之后补完的第一句也属于旧内容，一并跳过。
+        """
+        self._text = " ".join((text or "").split())
+        self._consumed = len(self._text)
+        self._skip_first = bool(self._text) and not re.search(_SENTENCE_END.pattern + "$", self._text)
+        self._candidate = ""
+        self._candidate_since = None
+        self._pending_since = None
+
     def update(self, text, now=None):
         now = time.monotonic() if now is None else now
         text = " ".join((text or "").split())
@@ -107,6 +128,7 @@ class CaptionDiffer:
                 self._consumed = 0
         cursor, related = self._map_consumed(text)
         if not related:
+            self._skip_first = False
             self._pending_since = None
             self._candidate = ""
             self._candidate_since = None
@@ -133,7 +155,19 @@ class CaptionDiffer:
             stable = now - self._candidate_since >= self.stable_seconds
             if not follows and not stable:
                 break
-            finalized.append(sentence)
+            if self._skip_first:
+                # prime 时被压着的旧尾巴，见 prime()。☠️ 只在补出来的部分很短时
+                # 才整句跳过：系统也可能把旧尾巴和新语音拼成一句（真机实测
+                # "…Tagesschau Guten Morgen in Berlin beginnt…"，中间没句号），
+                # 整句跳过会吞掉真正的新内容——那比多翻半句旧话糟得多。
+                self._skip_first = False
+                if len(sentence.split()) > SKIP_TAIL_MAX_WORDS:
+                    if cursor and text[cursor - 1].isalnum() and text[cursor].isalnum():
+                        # 旧尾巴停在词中间（"Tages|schau"），新句别以半个词开头
+                        sentence = sentence.split(" ", 1)[-1]
+                    finalized.append(sentence)
+            else:
+                finalized.append(sentence)
             cursor = match.end()
             self._candidate = ""
             self._candidate_since = None
@@ -162,6 +196,9 @@ class CaptionDiffer:
         self._consumed = cursor
         if not tail:
             self._pending_since = None
+        # 系统字幕会事后给已交付的句子补标点，补上的那个 "." 会单独成"句"
+        # （真机实测）。一个字母/数字都没有的不送翻译。
+        finalized = [s for s in finalized if any(ch.isalnum() for ch in s)]
         return CaptionUpdate(finalized, tail)
 
     def consume_all(self, text):
@@ -171,10 +208,14 @@ class CaptionDiffer:
         self._candidate = ""
         self._candidate_since = None
         self._pending_since = None
+        # prime 留下的"跳过下一句"指的是连上时那段残留；它在暂停中已整屏消费掉了
+        self._skip_first = False
         if not text:
             # 临时空文本时将当前快照全部标记为已消费，避免旧文本在恢复后重放。
             self._consumed = len(self._text)
             return
+        # 不复用 prime 的"跳过补完的那半句"：那条规则针对连上时的陈旧快照；暂停期间
+        # 一直在轮询，压着的词通常在暂停中就补出来了，套用它会把恢复后第一句真话吞掉
         self._text = text
         self._consumed = len(text)
 
@@ -242,7 +283,10 @@ def _running_caption_pids():
     # tasklist 是 Windows 自带工具；不经 shell，不解析本地化的提示行。
     result = subprocess.run(
         ["tasklist", "/FI", "IMAGENAME eq LiveCaptions.exe", "/FO", "CSV", "/NH"],
-        capture_output=True, text=True, timeout=3, check=True,
+        # ☠️ tasklist 按 OEM 代码页输出（德语系统表头是 "Abbildname"，cp850），
+        # 按默认 cp1252 解码会在读输出的线程里抛 UnicodeDecodeError。
+        capture_output=True, text=True, encoding="oem", errors="replace",
+        timeout=3, check=True,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     return {int(row[1]) for row in csv.reader(io.StringIO(result.stdout))
@@ -308,12 +352,18 @@ class LiveCaptionsReader:
             return
         user32 = self._user32()
         handle = window.NativeWindowHandle
-        if not handle or handle in self._hidden_windows or not user32.IsWindowVisible(handle):
+        if (not handle or handle in self._hidden_windows
+                or not user32.IsWindowVisible(handle) or user32.IsIconic(handle)):
             return
-        # 记住用户原来的最大化/最小化状态，停止时恢复，绝不终止系统字幕进程。
-        state = 2 if user32.IsIconic(handle) else 3 if user32.IsZoomed(handle) else 8
+        # ☠️ 只能最小化（SW_MINIMIZE=6），不能 SW_HIDE。2026-10-27 真机实测：
+        # SW_HIDE 之后 CaptionsTextBlock 从 UIA 树里消失，Exists() 恒为 False，
+        # 读取线程陷入"连上→隐藏→元素消失→重连"死循环，一个字都读不到；
+        # 最小化后元素仍在、Name 照常随语音刷新。最小化还有个好处：本程序崩了，
+        # 用户从任务栏就能把系统字幕窗点回来，不会"丢窗口"。
+        # 记住用户原来的最大化/普通状态，停止时恢复，绝不终止系统字幕进程。
+        state = 3 if user32.IsZoomed(handle) else 9
         self._hidden_windows[handle] = state
-        user32.ShowWindow(handle, 0)
+        user32.ShowWindow(handle, 6)
 
     def _restore_windows(self):
         if not self._hidden_windows:
@@ -347,8 +397,9 @@ class LiveCaptionsReader:
                         try:
                             self._hide_window(window)
                         except Exception:
-                            # 某些系统布局不允许隐藏；这不能阻止读取字幕。
-                            print("⚠️ 无法隐藏 Windows 实时字幕窗口，将保持可见。")
+                            # 某些系统布局不允许最小化；这不能阻止读取字幕。
+                            print("⚠️ 无法最小化 Windows 实时字幕窗口，将保持可见。")
+                        self._differ.prime(getattr(element, "Name"))
                         if on_status:
                             on_status(STATUS_LOCAL)
                         seen_errors.clear()
@@ -367,7 +418,7 @@ class LiveCaptionsReader:
                             delay = RECONNECT_INITIAL_SECONDS
                             self._stop.wait(POLL_INTERVAL_SECONDS)
                     finally:
-                        # 异常路径也恢复，隐藏的窗口否则可能无法在重连时被 UIA 找到。
+                        # 异常路径也恢复，最小化的窗口否则会一直留在任务栏里。
                         self._restore_windows()
                         window = element = None
             except Exception as exc:
