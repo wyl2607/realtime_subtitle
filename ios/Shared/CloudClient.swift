@@ -13,10 +13,22 @@ struct CloudTranscriptionResult: Equatable {
     var statusCode: Int
     var xGroqID: String?
     var remainingRequests: Int?
+    /// `x-ratelimit-reset-requests` 解析后的秒数；默认值兼容既有构造点。
+    var resetRequestsS: Double? = nil
+}
+
+struct CloudQuotaHeaders: Equatable {
+    var remainingRequests: Int?
+    var resetRequestsS: Double?
+
+    init(remainingRequests: Int? = nil, resetRequestsS: Double? = nil) {
+        self.remainingRequests = remainingRequests
+        self.resetRequestsS = resetRequestsS
+    }
 }
 
 enum CloudClientError: Error, CustomStringConvertible {
-    case httpStatus(Int, retryAfter: Int?, xGroqID: String?)
+    case httpStatus(Int, retryAfter: Int?, xGroqID: String?, quota: CloudQuotaHeaders? = nil)
     case network(String)
     case invalidResponse
     case decodeFailed
@@ -24,7 +36,7 @@ enum CloudClientError: Error, CustomStringConvertible {
 
     var description: String {
         switch self {
-        case .httpStatus(let status, let retryAfter, _):
+        case .httpStatus(let status, let retryAfter, _, _):
             if let retryAfter {
                 return "Groq HTTP \(status), retry_after=\(retryAfter)"
             }
@@ -185,11 +197,16 @@ final class CloudClient: @unchecked Sendable {
         let groqID = headerValue("x_groq.id", in: headers)
             ?? headerValue("x-groq-id", in: headers)
             ?? headerValue("x-request-id", in: headers)
+        let quota = CloudQuotaHeaders(
+            remainingRequests: QuotaLedger.remainingRequests(from: headers),
+            resetRequestsS: QuotaLedger.resetRequestsSeconds(from: headers)
+        )
         guard (200..<300).contains(statusCode) else {
             throw CloudClientError.httpStatus(
                 statusCode,
                 retryAfter: headerValue("retry-after", in: headers).flatMap(Int.init),
-                xGroqID: groqID
+                xGroqID: groqID,
+                quota: quota
             )
         }
         do {
@@ -201,7 +218,8 @@ final class CloudClient: @unchecked Sendable {
                 },
                 statusCode: statusCode,
                 xGroqID: groqID,
-                remainingRequests: QuotaLedger.remainingRequests(from: headers)
+                remainingRequests: quota.remainingRequests,
+                resetRequestsS: quota.resetRequestsS
             )
         } catch {
             throw CloudClientError.decodeFailed

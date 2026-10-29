@@ -17,12 +17,47 @@ struct QuotaUsage: Equatable {
 }
 
 struct QuotaLedgerSnapshot: Codable, Equatable {
-    var events: [QuotaLedgerEvent] = []
-    var requestCorrections: [QuotaRequestCorrection] = []
+    var events: [QuotaLedgerEvent]
+    var requestCorrections: [QuotaRequestCorrection]
+    /// 最近一条带有效服务端恢复头的响应所给出的恢复时刻。
+    var serverResetAt: Double?
+    /// 已消费的恢复时刻；避免旧周期的本地事件在锚点被清除后重新计入日用量。
+    var dayEpoch: Double?
 
     enum CodingKeys: String, CodingKey {
         case events
         case requestCorrections = "request_corrections"
+        case serverResetAt = "server_reset_at"
+        case dayEpoch = "day_epoch"
+    }
+
+    init(
+        events: [QuotaLedgerEvent] = [],
+        requestCorrections: [QuotaRequestCorrection] = [],
+        serverResetAt: Double? = nil,
+        dayEpoch: Double? = nil
+    ) {
+        self.events = events
+        self.requestCorrections = requestCorrections
+        self.serverResetAt = serverResetAt
+        self.dayEpoch = dayEpoch
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        // 两个列表仍是必填：缺键说明文件坏了，要走隔离 + 饱和，不能读成空账本。
+        events = try container.decode([QuotaLedgerEvent].self, forKey: .events)
+        requestCorrections = try container.decode([QuotaRequestCorrection].self, forKey: .requestCorrections)
+        serverResetAt = try container.decodeIfPresent(Double.self, forKey: .serverResetAt)
+        dayEpoch = try container.decodeIfPresent(Double.self, forKey: .dayEpoch)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(events, forKey: .events)
+        try container.encode(requestCorrections, forKey: .requestCorrections)
+        try container.encodeIfPresent(serverResetAt, forKey: .serverResetAt)
+        try container.encodeIfPresent(dayEpoch, forKey: .dayEpoch)
     }
 }
 
@@ -121,16 +156,30 @@ final class QuotaLedger: @unchecked Sendable {
     }
 
     func correctRemainingRequests(_ headers: [AnyHashable: Any], at now: Date = Date()) throws {
-        guard let remaining = Self.remainingRequests(from: headers) else {
+        let remaining = Self.remainingRequests(from: headers)
+        let resetSeconds = Self.resetRequestsSeconds(from: headers)
+        guard remaining != nil || resetSeconds != nil else {
             return
         }
         lock.lock()
         defer { lock.unlock() }
+        let ts = now.timeIntervalSince1970
+        if let resetSeconds {
+            if let oldReset = snapshot.serverResetAt, oldReset <= ts {
+                snapshot.dayEpoch = max(snapshot.dayEpoch ?? -.infinity, oldReset)
+            }
+            // 每个带有效恢复头的响应都以自身时刻重新锚定，最新值覆盖旧值。
+            snapshot.serverResetAt = ts + resetSeconds
+        } else if remaining != nil, let oldReset = snapshot.serverResetAt, ts >= oldReset {
+            // 恢复后的首个 remaining 样本是新周期基线；先消费锚点以隔离旧本地事件。
+            snapshot.dayEpoch = max(snapshot.dayEpoch ?? -.infinity, oldReset)
+            snapshot.serverResetAt = nil
+        }
         // x-ratelimit-remaining-requests 是每日剩余（上限 requestsPerDay），不是每分钟。
-        let usedDay = max(0, limits.requestsPerDay - remaining)
-        snapshot.requestCorrections.append(
-            QuotaRequestCorrection(ts: now.timeIntervalSince1970, usedRequests: usedDay)
-        )
+        if let remaining {
+            let usedDay = max(0, limits.requestsPerDay - remaining)
+            snapshot.requestCorrections.append(QuotaRequestCorrection(ts: ts, usedRequests: usedDay))
+        }
         snapshot = Self.pruned(snapshot, now: now)
         try persistLocked()
     }
@@ -151,12 +200,17 @@ final class QuotaLedger: @unchecked Sendable {
         let ts = now.timeIntervalSince1970
         let minuteEvents = current.events.filter { ts - $0.ts < 60 }
         let hourEvents = current.events.filter { ts - $0.ts < 3_600 }
+        let effectiveEpoch = Self.effectiveEpoch(in: current, at: ts)
+        // 恢复点只影响日请求数；日音频窗口仍统计 24h 内全部事件。
+        let dayRequestEvents = current.events.filter { $0.ts > effectiveEpoch }
         let dayEvents = current.events
-        // 1 分钟窗口只信本地计数。响应头校正只抬高 24 小时请求数（校正记录已按 24h prune）。
+        // 1 分钟窗口只信本地计数。响应头仅校正 24 小时请求数（校正记录已按 24h prune）。
         let minuteRequests = minuteEvents.count
-        let correctedDay = current.requestCorrections.map(\.usedRequests).max() ?? 0
+        let correctedDay = Self.foldedDayRequests(
+            current.requestCorrections.filter { $0.ts > effectiveEpoch }
+        )
         let hourAudio = hourEvents.reduce(0.0) { $0 + $1.billedS }
-        let dayRequests = max(dayEvents.count, correctedDay)
+        let dayRequests = max(dayRequestEvents.count, correctedDay)
         let dayAudio = dayEvents.reduce(0.0) { $0 + $1.billedS }
         let percentages = [
             Double(minuteRequests) / Double(limits.requestsPerMinute),
@@ -182,9 +236,37 @@ final class QuotaLedger: @unchecked Sendable {
         let cutoff = now.timeIntervalSince1970 - 86_400
         return QuotaLedgerSnapshot(
             events: snapshot.events.filter { $0.ts >= cutoff && isBillable($0) },
-            requestCorrections: snapshot.requestCorrections.filter { $0.ts >= cutoff }
+            requestCorrections: snapshot.requestCorrections.filter { $0.ts >= cutoff },
+            serverResetAt: snapshot.serverResetAt,
+            dayEpoch: snapshot.dayEpoch.flatMap { $0 < cutoff ? nil : $0 }
         )
     }
+
+    private static func effectiveEpoch(in snapshot: QuotaLedgerSnapshot, at ts: Double) -> Double {
+        var epoch = snapshot.dayEpoch ?? -.infinity
+        if let reset = snapshot.serverResetAt, ts >= reset {
+            epoch = max(epoch, reset)
+        }
+        return epoch
+    }
+
+    /// 规格 002：按时序折叠服务端样本；减少仅在已采纳样本满 60 秒后生效。
+    private static func foldedDayRequests(_ corrections: [QuotaRequestCorrection]) -> Int {
+        var accepted: QuotaRequestCorrection?
+        for correction in corrections.sorted(by: { $0.ts < $1.ts }) {
+            guard let current = accepted else {
+                accepted = correction
+                continue
+            }
+            if correction.usedRequests > current.usedRequests ||
+                (correction.usedRequests < current.usedRequests && correction.ts - current.ts >= serverDecreaseGraceSeconds) {
+                accepted = correction
+            }
+        }
+        return accepted?.usedRequests ?? 0
+    }
+
+    private static let serverDecreaseGraceSeconds = 60.0
 
     private static func isBillable(_ event: QuotaLedgerEvent) -> Bool {
         event.billedS.isFinite && event.billedS >= 0
@@ -195,7 +277,9 @@ final class QuotaLedger: @unchecked Sendable {
             events: [],
             requestCorrections: [
                 QuotaRequestCorrection(ts: now.timeIntervalSince1970, usedRequests: requestLimit),
-            ]
+            ],
+            serverResetAt: nil,
+            dayEpoch: nil
         )
     }
 
@@ -289,6 +373,43 @@ final class QuotaLedger: @unchecked Sendable {
             return Int(String(describing: value).trimmingCharacters(in: .whitespacesAndNewlines))
         }
         return nil
+    }
+
+    static func resetRequestsSeconds(from headers: [AnyHashable: Any]) -> Double? {
+        for (key, value) in headers where String(describing: key).lowercased() == "x-ratelimit-reset-requests" {
+            return parseResetRequestsSeconds(String(describing: value))
+        }
+        return nil
+    }
+
+    /// 只接受完整、无空格的连续单位串，例如 `2m59.56s` 或 `120ms`。
+    static func parseResetRequestsSeconds(_ raw: String?) -> Double? {
+        let text = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !text.isEmpty else { return nil }
+        let regex = try! NSRegularExpression(pattern: "(\\d+(?:\\.\\d+)?)(ms|h|m|s)")
+        var index = text.startIndex
+        var seconds = 0.0
+        while index < text.endIndex {
+            let range = NSRange(index..<text.endIndex, in: text)
+            guard let match = regex.firstMatch(in: text, options: [.anchored], range: range),
+                  let numberRange = Range(match.range(at: 1), in: text),
+                  let unitRange = Range(match.range(at: 2), in: text),
+                  let value = Double(text[numberRange]), value.isFinite else {
+                return nil
+            }
+            let multiplier: Double
+            switch text[unitRange] {
+            case "h": multiplier = 3_600
+            case "m": multiplier = 60
+            case "s": multiplier = 1
+            case "ms": multiplier = 0.001
+            default: return nil
+            }
+            seconds += value * multiplier
+            guard seconds.isFinite, let next = Range(match.range, in: text)?.upperBound else { return nil }
+            index = next
+        }
+        return seconds
     }
 
     private static func round3(_ value: Double) -> Double {
@@ -417,6 +538,83 @@ final class QuotaLedger: @unchecked Sendable {
             } else {
                 check(false, "旧账本兼容用例应能解码")
             }
+
+            let resetCases: [(String?, Double?)] = [
+                ("2m59.56s", 179.56), ("7.66s", 7.66), ("1h2m3s", 3723),
+                ("0.5s", 0.5), ("120ms", 0.12), ("abc", nil), ("", nil),
+                (nil, nil), ("1h 2m", nil), ("5x", nil),
+            ]
+            for (raw, expected) in resetCases {
+                let actual = QuotaLedger.parseResetRequestsSeconds(raw)
+                let matches: Bool
+                if let expected {
+                    matches = actual.map { abs($0 - expected) < 1e-9 } ?? false
+                } else {
+                    matches = actual == nil
+                }
+                check(matches, "恢复头解析应符合规格：\(raw ?? "nil")")
+            }
+
+            let unlock = QuotaLedger(url: dir.appendingPathComponent("quota-unlock.json"), now: Date(timeIntervalSince1970: 1_000))
+            let at1000 = Date(timeIntervalSince1970: 1_000)
+            try unlock.recordRequest(duration: 10, at: at1000)
+            try unlock.correctRemainingRequests(["x-ratelimit-remaining-requests": "5", "x-ratelimit-reset-requests": "100s"], at: at1000)
+            var resetContext = CloudRouteContext(RouteInitial(hasKey: true, cloudEnabled: true, cloudState: .available, nodeEnabled: false, nodeHealthy: false, nodeIsSelf: false, consecutiveFailures: 0, backoffIndex: 0))
+            check(unlock.usage(at: at1000).usagePercent >= 90, "恢复前配额应达到冷却阈值")
+            unlock.applyQuotaEvent(to: &resetContext, at: at1000)
+            check(resetContext.cloudState == .cooldownQuota, "恢复前应进入额度冷却")
+            check(unlock.usage(at: at1000.addingTimeInterval(50)).usagePercent >= 90, "恢复点前不应解锁")
+            let afterReset = at1000.addingTimeInterval(101)
+            check(unlock.usage(at: afterReset).dayRequests == 0 && unlock.usage(at: afterReset).usagePercent < 80, "恢复点后旧周期日请求应清零")
+            check(unlock.usage(at: afterReset).dayAudioSeconds == 10, "恢复点不应清掉日音频窗口")
+            unlock.applyQuotaEvent(to: &resetContext, at: afterReset)
+            check(resetContext.cloudState == .available, "恢复点后应通过 90/80 滞回解锁")
+
+            let decrease = QuotaLedger(url: dir.appendingPathComponent("quota-decrease.json"), now: at1000)
+            try decrease.recordRequest(duration: 10, at: at1000)
+            try decrease.correctRemainingRequests(["x-ratelimit-remaining-requests": "5"], at: at1000)
+            try decrease.recordRequest(duration: 10, at: at1000.addingTimeInterval(30))
+            try decrease.correctRemainingRequests(["x-ratelimit-remaining-requests": "1999"], at: at1000.addingTimeInterval(30))
+            check(decrease.usage(at: at1000.addingTimeInterval(30)).dayRequests == 1_995, "60 秒内更小的服务端用量应被忽略")
+            try decrease.recordRequest(duration: 10, at: at1000.addingTimeInterval(61))
+            try decrease.correctRemainingRequests(["x-ratelimit-remaining-requests": "1999"], at: at1000.addingTimeInterval(61))
+            check(decrease.usage(at: at1000.addingTimeInterval(61)).dayRequests == 3, "60 秒后更小的服务端用量应被接受")
+
+            let baselineURL = dir.appendingPathComponent("quota-baseline.json")
+            let baseline = QuotaLedger(url: baselineURL, now: at1000)
+            try baseline.recordRequest(duration: 10, at: at1000)
+            try baseline.correctRemainingRequests(["x-ratelimit-remaining-requests": "5", "x-ratelimit-reset-requests": "100s"], at: at1000)
+            try baseline.recordRequest(duration: 10, at: afterReset)
+            try baseline.correctRemainingRequests(["x-ratelimit-remaining-requests": "1900"], at: afterReset)
+            check(baseline.usage(at: afterReset).dayRequests == 100, "恢复后无恢复头的 remaining 应成为新周期基线")
+            let baselineReloaded = QuotaLedger(url: baselineURL, now: afterReset.addingTimeInterval(1))
+            check(baselineReloaded.usage(at: afterReset.addingTimeInterval(1)).dayRequests == 100, "已消费恢复点应持久化，重载后不得重算旧本地事件")
+
+            let persistedURL = dir.appendingPathComponent("quota-reset-persisted.json")
+            let persisted = QuotaLedger(url: persistedURL, now: Date(timeIntervalSince1970: 2_000))
+            let at2000 = Date(timeIntervalSince1970: 2_000)
+            try persisted.recordRequest(duration: 10, at: at2000)
+            try persisted.correctRemainingRequests(["x-ratelimit-remaining-requests": "5", "x-ratelimit-reset-requests": "100s"], at: at2000)
+            let persistedJSON = try JSONSerialization.jsonObject(with: Data(contentsOf: persistedURL)) as? [String: Any]
+            check(persistedJSON?["server_reset_at"] as? Double == 2_100, "恢复时刻应写入 server_reset_at")
+            let persistedReloaded = QuotaLedger(url: persistedURL, now: at2000.addingTimeInterval(50))
+            check(persistedReloaded.usage(at: at2000.addingTimeInterval(50)).dayRequests == 1_995, "恢复前重载应保留校正")
+            check(persistedReloaded.usage(at: at2000.addingTimeInterval(101)).dayRequests == 0, "恢复后重载应清零")
+
+            let oldFormatURL = dir.appendingPathComponent("quota-old-format.json")
+            try Data(#"{"events":[{"ts":1000,"billed_s":10}],"request_corrections":[{"ts":1000,"used_requests":3}]}"#.utf8).write(to: oldFormatURL)
+            let oldFormat = QuotaLedger(url: oldFormatURL, now: at1000)
+            check(oldFormat.usage(at: at1000).dayRequests == 3, "没有新字段的旧账本应照常读取")
+            check(!FileManager.default.fileExists(atPath: oldFormatURL.appendingPathExtension("corrupt").path), "旧账本不应生成 corrupt")
+            let missingKeysURL = dir.appendingPathComponent("quota-missing-keys.json")
+            try Data("{}".utf8).write(to: missingKeysURL)
+            check(QuotaLedger(url: missingKeysURL, now: at1000).usage(at: at1000).usagePercent == 100, "缺 events 键的账本应隔离并饱和")
+
+            let override = QuotaLedger(url: dir.appendingPathComponent("quota-reset-override.json"), now: at1000)
+            try override.correctRemainingRequests(["x-ratelimit-remaining-requests": "5", "x-ratelimit-reset-requests": "100s"], at: at1000)
+            try override.correctRemainingRequests(["x-ratelimit-remaining-requests": "5", "x-ratelimit-reset-requests": "200s"], at: at1000.addingTimeInterval(10))
+            check(override.usage(at: at1000.addingTimeInterval(101)).usagePercent >= 90, "最新恢复头应覆盖旧恢复点")
+            check(override.usage(at: at1000.addingTimeInterval(211)).dayRequests == 0, "最新恢复点后应清零")
         } catch {
             failures.append("QuotaLedger selftest 异常：\(error)")
         }

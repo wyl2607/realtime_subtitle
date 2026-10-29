@@ -60,6 +60,7 @@ class _Cloud:
             duration_s=1.0,
             status=200,
             remaining_requests=9,
+            reset_requests_s=12.5,
         )
 
     def cancel(self):
@@ -93,8 +94,8 @@ class _Ledger:
         self.routing = routing
         self.notes = []
 
-    def note(self, duration_s, *, now=None, remaining_requests=None):
-        self.notes.append((duration_s, remaining_requests))
+    def note(self, duration_s, *, now=None, remaining_requests=None, reset_requests_s=None):
+        self.notes.append((duration_s, remaining_requests, reset_requests_s))
 
     def usage(self, now=None):
         return None
@@ -177,7 +178,7 @@ def test_cloud_on_builds_cloud_stack_not_node_client(tmp_path):
         assert segmenter.fed == 1
         assert cloud.calls and cloud.calls[0][1]
         assert translator.calls == [("Hallo", "")]
-        assert ledgers[0].notes
+        assert ledgers[0].notes == [(1.0, 9, 12.5)]
         assert any(line["dst"] == "中文译文" and line["source"] == "remote" for line in ui.lines)
         assert node_calls == []
     finally:
@@ -315,8 +316,9 @@ def test_cloud_429_logs_cooldown_once_without_key(tmp_path, capsys):
     try:
         error = CloudError(
             status=429, reason="rate limited", exc_type="HTTPError",
-            retry_after=7, secret="gsk_test_fake_key_never_logged")
+            retry_after=7, reset_requests_s=0.12, secret="gsk_test_fake_key_never_logged")
         bridge._on_cloud_exception(error, 0)
+        assert bridge.ledger.notes == [(0.0, None, 0.12)]
         out = capsys.readouterr().out
         assert "rslite.cloud cooldown reason=429 retry_after=7" in out
         assert "gsk_test_fake_key_never_logged" not in out

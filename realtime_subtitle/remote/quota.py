@@ -30,6 +30,7 @@ WINDOW_HOUR_S = 3600.0
 WINDOW_DAY_S = 86400.0
 MIN_BILLED_S = 10.0
 ENTER_PERCENT = 90.0
+SERVER_DECREASE_GRACE_S = 60.0
 _VERSION = 1
 
 
@@ -57,7 +58,8 @@ class QuotaLedger:
 
     损坏的文件隔离成 `<name>.corrupt`，并写一条带时间戳的日请求封顶（2000）。
     这等价于 24h 窗口里已经用满，usage=100%。满 24h 后随 prune 失效，用量回到真实事件。
-    没有无时间戳的永久饱和标志。窗口里的 remaining 头只能抬高日请求水位，不能降低。
+    没有无时间戳的永久饱和标志。服务端用量立即上抬；较小值等旧样本过宽限期，
+    以免迟到响应过早解除冷却。
     """
 
     def __init__(
@@ -74,6 +76,7 @@ class QuotaLedger:
         self._events: list[_Event] = []
         self._server_day_used: int | None = None
         self._server_day_used_at: float | None = None
+        self._server_reset_at: float | None = None
         # 自己记得「已经把额度打进冷却」，恢复事件才发得出去。
         # 不读状态机的状态名：那串字只活在 routing_rules。
         self._quota_hot = False
@@ -85,6 +88,7 @@ class QuotaLedger:
         *,
         now: float | None = None,
         remaining_requests: int | None = None,
+        reset_requests_s: float | None = None,
     ) -> QuotaUsage:
         """记一次已发出的请求。duration_s 是响应里的 duration，没有响应就用送出的音频秒。"""
         billed = _billed(duration_s)
@@ -92,11 +96,24 @@ class QuotaLedger:
             isinstance(remaining_requests, bool) or not isinstance(remaining_requests, int)
         ):
             raise TypeError("remaining_requests")
+        if reset_requests_s is not None:
+            if isinstance(reset_requests_s, bool) or not isinstance(reset_requests_s, (int, float)):
+                raise TypeError("reset_requests_s")
+            if not math.isfinite(float(reset_requests_s)) or float(reset_requests_s) < 0:
+                raise ValueError("reset_requests_s")
         with self._lock:
             ts = self._clock(now)
             self._events.append(_Event(ts, billed, False))
+            # 最新带恢复头的响应为准；缺头不能推翻已确认的恢复时刻。
+            if reset_requests_s is not None:
+                self._server_reset_at = ts + float(reset_requests_s)
+            elif remaining_requests is not None and self._server_reset_at is not None and ts >= self._server_reset_at:
+                # 过恢复点的 remaining 已属于新周期，旧样本也不能触发其乱序宽限。
+                self._server_reset_at = None
+                self._server_day_used = None
+                self._server_day_used_at = None
             if remaining_requests is not None and remaining_requests >= 0:
-                # 响应头是这一次请求之后的每日剩余。只动 24h 请求窗口，而且只升不降。
+                # 响应头是这一次请求之后的每日剩余。只动 24h 请求窗口。
                 used = LIMIT_REQUESTS_PER_DAY - remaining_requests
                 if used < 0:
                     used = 0
@@ -113,11 +130,11 @@ class QuotaLedger:
         """按给定时刻重算窗口。冷却期间靠它发现用量已经降到 80% 以下，不必再打一次请求。"""
         with self._lock:
             ts = self._clock(now)
-            before = (len(self._events), self._server_day_used_at)
+            before = self._markers()
             self._prune(ts)
             usage = self._measure(ts)
             self._publish(usage)
-            if (len(self._events), self._server_day_used_at) != before:
+            if self._markers() != before:
                 self.save()
             return usage
 
@@ -140,13 +157,13 @@ class QuotaLedger:
             self._quarantine_and_cap()
             return
         now = self._clock(None)
-        before = (len(self._events), self._server_day_used, self._server_day_used_at)
+        before = self._markers()
         self._prune(now)
         if legacy_saturated:
             # 旧文件只有无时间戳的 saturated。迁成从这次读取起算的 24h 封顶，然后把标志抹掉。
             self._raise_day_request_floor(LIMIT_REQUESTS_PER_DAY, now)
         self._publish(self._measure(now))
-        if legacy_saturated or (len(self._events), self._server_day_used, self._server_day_used_at) != before:
+        if legacy_saturated or self._markers() != before:
             self.save()
 
     def _apply_payload(self, data: Any) -> bool:
@@ -174,6 +191,7 @@ class QuotaLedger:
             server_at = None
         else:
             server_used, server_at = _parse_server(used, used_at)
+        reset_at = _parse_optional_timestamp(data.get("server_reset_at", None))
         legacy_saturated = False
         if "saturated" in data:
             saturated = data["saturated"]
@@ -183,6 +201,7 @@ class QuotaLedger:
         self._events = parsed
         self._server_day_used = server_used
         self._server_day_used_at = server_at
+        self._server_reset_at = reset_at
         return legacy_saturated
 
     def _quarantine_and_cap(self) -> None:
@@ -193,14 +212,19 @@ class QuotaLedger:
         self._events = []
         self._server_day_used = LIMIT_REQUESTS_PER_DAY
         self._server_day_used_at = now
+        self._server_reset_at = None
         self._publish(self._measure(now))
         if moved:
             self.save()
 
     def _raise_day_request_floor(self, used: int, ts: float) -> None:
-        # 当前 24h 窗口里已经见过的日请求数只升不降。更宽裕的 remaining 不能把封顶洗掉。
-        if self._server_active(ts) and self._server_day_used is not None and used <= self._server_day_used:
-            return
+        current = self._server_day_used
+        if self._server_active(ts) and current is not None:
+            if used == current:
+                return
+            # 较小值须等 60 秒：迟到乱序响应不该把冷却提前洗掉。
+            if used < current and ts - (self._server_day_used_at or ts) < SERVER_DECREASE_GRACE_S:
+                return
         self._server_day_used = used
         self._server_day_used_at = ts
 
@@ -236,6 +260,12 @@ class QuotaLedger:
         )
 
     def _day_requests(self, now: float) -> int:
+        if self._server_reset_at is not None and now >= self._server_reset_at:
+            return sum(
+                1
+                for event in self._events
+                if event.ts > self._server_reset_at and self._in_window(event.ts, now, WINDOW_DAY_S)
+            )
         local = self._count(now, WINDOW_DAY_S)
         if not self._server_active(now):
             return local
@@ -258,10 +288,16 @@ class QuotaLedger:
     def _server_active(self, now: float) -> bool:
         if self._server_day_used is None or self._server_day_used_at is None:
             return False
+        if self._server_reset_at is not None and now >= self._server_reset_at:
+            return False
         return self._in_window(self._server_day_used_at, now, WINDOW_DAY_S)
 
     def _prune(self, now: float) -> None:
         self._events = [event for event in self._events if now - event.ts <= WINDOW_DAY_S]
+        if self._server_reset_at is not None and now >= self._server_reset_at:
+            self._server_day_used = None
+            self._server_day_used_at = None
+            return
         if self._server_day_used_at is not None and now - self._server_day_used_at > WINDOW_DAY_S:
             self._server_day_used = None
             self._server_day_used_at = None
@@ -278,7 +314,11 @@ class QuotaLedger:
             ],
             "server_day_used": self._server_day_used,
             "server_day_used_at": self._server_day_used_at,
+            "server_reset_at": self._server_reset_at,
         }
+
+    def _markers(self) -> tuple[int, int | None, float | None, float | None]:
+        return (len(self._events), self._server_day_used, self._server_day_used_at, self._server_reset_at)
 
     def _clock(self, now: float | None) -> float:
         if now is not None:
@@ -330,11 +370,19 @@ def _parse_server(used: Any, used_at: Any) -> tuple[int, float]:
     return used, float(used_at)
 
 
+def _parse_optional_timestamp(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        raise ValueError("server_reset_at")
+    return float(value)
+
+
 _NONFINITE_TOKENS = (b"-Infinity", b"+Infinity", b"Infinity", b"NaN")
 
 
 def _normalize_nonfinite(payload: bytes) -> bytes:
-    """JSON 不接受 NaN / Infinity。字符串外面的这些记号换成 null，旁边的好事件还能留。"""
+    """JSON 不接受 NaN / Infinity。换成会解码为 inf 的合法数字，由字段解析决定丢弃或隔离。"""
     out = bytearray()
     in_string = False
     escaped = False
@@ -363,7 +411,7 @@ def _normalize_nonfinite(payload: bytes) -> bytes:
             for token in _NONFINITE_TOKENS:
                 end = index + len(token)
                 if payload.startswith(token, index) and (end == limit or _is_json_boundary(payload[end])):
-                    out.extend(b"null")
+                    out.extend(b"1e9999")
                     index = end
                     replaced = True
                     break
