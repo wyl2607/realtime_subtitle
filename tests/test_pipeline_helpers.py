@@ -447,7 +447,10 @@ def test_save_transcript_omits_empty_translation_line(tmp_path):
     t._save_transcript("Hallo Welt.", "你好世界")
     t._save_transcript("Nur Deutsch.", "")
 
-    written = next(tmp_path.iterdir()).read_text(encoding="utf-8")
+    # 只取每日 .txt：会话导出还会建 sessions/ 子目录，iterdir 顺序在 Linux 上不固定，
+    # 取"第一个"会偶发拿到目录（CI 上 IsADirectoryError）
+    (daily,) = tmp_path.glob("*.txt")
+    written = daily.read_text(encoding="utf-8")
     assert "你好世界" in written
     assert "Nur Deutsch." in written
     # 空译文不该留下只有空格的一行
