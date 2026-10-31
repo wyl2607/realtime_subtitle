@@ -32,3 +32,7 @@ xcrun swiftc -O ios/Shared/EngineRunGate.swift ios/Tests/EngineRunGateSelftest.s
 # 本机引擎状态解析：纯逻辑、无依赖，单独编译验证。
 xcrun swiftc -O ios/Shared/LocalEngineStatus.swift ios/Shared/DesignTokens.swift ios/Tests/LocalEngineStatusSelftest.swift -o .tmp/localenginestatusselftest
 .tmp/localenginestatusselftest
+# 界面状态词和字幕样式模型：只依赖 Foundation + DesignTokens，
+# 单独编一组验证解析规则和持久化夹值，不把 SwiftUI 带进自测。
+xcrun swiftc -O ios/Shared/StatusSummary.swift ios/Shared/SubtitleStyle.swift ios/Shared/LocalEngineStatus.swift ios/Shared/DesignTokens.swift ios/Tests/StatusSummarySelftest.swift ios/Tests/SubtitleStyleSelftest.swift ios/Tests/UISelftestMain.swift -o .tmp/uiselftest
+.tmp/uiselftest
