@@ -42,16 +42,16 @@ Systemton ──WASAPI-Loopback──▶ Faster-Whisper (CUDA oder CPU)
 
 ## Plattformstatus
 
-Stand 2026-10-21. Aktuelle Release-Version ist v3.1.0 für Windows / macOS; v3.2.0 ist als Beta getaggt, die finale Version ist noch nicht veröffentlicht.
+Stand 2026-10-25. Aktuelle Release-Version für Windows / macOS ist v3.2.0 (2026-10-25).
 
 Legende: ✅ stabil · 🟢 nutzbar · 🧪 experimentell · ⬜ nicht begonnen.
 
 | Plattform | Form | Stufe | Schon nutzbar | Noch offen |
 |---|---|---|---|---|
-| Windows | Desktop-App | ✅ Stabil | Lokale Erkennung und Übersetzung; dreistufiges automatisches Routing Cloud (Groq) → Rechenknoten → lokal (v3.2.0 Beta); die Statuszeile zeigt die aktuelle Quelle. Vollständiges pytest auf echter Windows-Hardware: 1207 bestanden, 0 fehlgeschlagen | Finale v3.2.0 noch nicht veröffentlicht |
-| macOS | Desktop-App + rslite (natives Swift) | 🟢 Nutzbar | Lokale Erkennung und Übersetzung; dreistufiges automatisches Routing Cloud → Rechenknoten → lokal (v3.2.0 Beta). rslite-Cloud-Abnahme größtenteils bestanden, Median-Latenz der Hybrid-Verfeinerung 1,47 s | finale v3.2.0 noch nicht veröffentlicht |
-| Android | Native App (separates privates Repo) | 🧪 Experimentell | v0.4.0-quality veröffentlicht (alte Architektur); die Neuentwicklung rewrite/v1 bietet Erkennung auf dem Gerät, Cloud-Stufe, Knoten-Stufe, automatische Umschaltung und Keystore-verschlüsselte Schlüsselspeicherung, 395 Unit-Tests bestanden, 0 fehlgeschlagen | Neuentwicklung noch nicht auf echter Hardware verifiziert |
-| iOS | Native App (Prototyp) | 🧪 Experimentell | Broadcast-Erweiterung für Bildschirmaufnahme nimmt Ton anderer Apps auf, Bild-in-Bild-Anzeige, „Automatik“-Modus (bei Knotenausfall lokal, nach Erholung am Satzende zurück), Tagesarchiv der Untertitel, Cloud-Stufe nur als reine Logik | Broadcast-Erweiterung noch nicht eingebunden, noch nicht auf echter Hardware; Anzeige nur per Bild-in-Bild, kein Desktop-Overlay |
+| Windows | Desktop-App | ✅ Stabil | Lokale Erkennung und Übersetzung; dreistufiges automatisches Routing Cloud (Groq) → Rechenknoten → lokal; die Statuszeile zeigt die aktuelle Quelle. Vollständiges pytest auf echter Windows-Hardware (RTX 4070): 1269 bestanden, 0 fehlgeschlagen; Smoke-Test und 150-%-HiDPI-Prüfung bestanden | Trennt gelegentlich einen Satz zu früh (zwei Zeilen; Übersetzung nicht betroffen) |
+| macOS | Desktop-App + rslite (natives Swift) | 🟢 Nutzbar | Lokale Erkennung und Übersetzung; dreistufiges automatisches Routing Cloud → Rechenknoten → lokal. Cloud: Segmentende → Anzeige im Median ca. 1,1 s, Median-Latenz der Hybrid-Verfeinerung 1,47 s | Weiterhin nur als Quellcode (rslite-.app-Paket ist für v3.3 geplant); rslite-Release-Build mit Swift 6.3 hängt in der CI, wird untersucht |
+| Android | Native App (separates privates Repo) | 🧪 Experimentell | v0.4.0-quality veröffentlicht (alte Architektur); die neue Architektur ist in main zusammengeführt: Erkennung auf dem Gerät mit Live-Entwurf auf Deutsch, Cloud-Stufe, Knoten-Stufe, automatische Umschaltung, Keystore-verschlüsselte Schlüsselspeicherung, alle Unit-Tests bestanden | Neue Architektur noch nicht auf echter Hardware verifiziert; noch kein neues Release |
+| iOS | Native App (Prototyp) | 🧪 Experimentell | Broadcast-Erweiterung für Bildschirmaufnahme nimmt Ton anderer Apps auf, alternativ direkt das Mikrofon; dreistufiges Routing Cloud → Knoten → lokal; Kopplung per QR-Code / `rsnode://pair`; Untertitel-Rückblick für heute | Noch nicht auf echter Hardware; selbst mit Xcode bauen und installieren; Anzeige nur per Bild-in-Bild, kein Desktop-Overlay |
 | Linux | — | ⬜ Nicht begonnen | — | Keine Pläne |
 
 ## Funktionen
@@ -86,7 +86,7 @@ Legende: ✅ stabil · 🟢 nutzbar · 🧪 experimentell · ⬜ nicht begonnen.
 | | Empfohlen | Minimum |
 |---|---|---|
 | OS | Windows 10/11 64-Bit | Windows 10/11 (**nur Windows** — WASAPI) |
-| GPU | NVIDIA ≥ 8 GB VRAM | CPU möglich (höhere Latenz) |
+| GPU | NVIDIA ≥ 8 GB VRAM | CPU möglich (höhere Latenz) oder Windows-Liveuntertitel (siehe „Optionale Erkennungsquellen“) |
 | RAM | 16 GB | 8 GB |
 | Speicher | ca. 10 GB | ca. 6 GB |
 | Python | 3.10–3.13 | gleich |
@@ -180,6 +180,27 @@ Erkennung an einen anderen Apple-Silicon-Mac oder NVIDIA-Windows-PC im Tailnet a
 - **Kostenloses Kontingent**: 20 Anfragen pro Minute, 7.200 Sekunden Audio pro Stunde, 2.000 Anfragen / 28.800 Sekunden pro Tag, mindestens 10 Sekunden pro Anfrage.
 - **Automatischer Fallback**: Bei fast vollem Kontingent automatischer Wechsel auf eigene Knoten oder lokal; nach Erholung Umschaltung an Sprechpause.
 - **Fallback-Reihenfolge**: Cloud → Eigener Knoten → Lokal.
+
+## Optionale Erkennungsquellen und Untertitel-Export
+
+Alles in `config_local.py` eintragen und die Untertitel danach neu starten.
+
+- **Windows-Liveuntertitel (ohne GPU)**: `ASR_SOURCE = "livecaptions"`, danach
+  `venv\Scripts\python -m pip install uiautomation`. Die Spracherkennung übernimmt die in Windows 11 (22H2+)
+  eingebaute Funktion „Liveuntertitel“; das Programm liest deren Text und übersetzt ihn mit Ollama. Whisper wird
+  nicht geladen, die GPU nicht genutzt – passend für Rechner ohne NVIDIA-Karte. Die Erkennungssprache wählst du unter
+  **Windows-Einstellungen → Barrierefreiheit → Untertitel**; sie muss zur Quellsprache des Programms passen. Das
+  Liveuntertitel-Fenster wird während des Betriebs minimiert (`LIVE_CAPTIONS_HIDE_WINDOW = False` lässt es sichtbar)
+  und beim Beenden wiederhergestellt. Die Liveuntertitel halten die letzten Wörter bis zum nächsten Satz zurück, daher
+  kommt der letzte Satz vor einer Pause verspätet (spätestens nach ca. 12 s). Sind die Voraussetzungen nicht erfüllt
+  (kein Windows 11, uiautomation fehlt, Liveuntertitel nicht gefunden), wird automatisch Whisper verwendet.
+- **SenseVoice (Rechenknoten, optional)**: `ASR_ENGINE = "sensevoice"` und auf dem Knoten `pip install funasr`.
+  Nur Chinesisch / Englisch / Japanisch / Koreanisch / Kantonesisch – **kein Deutsch**; andere Sprachen fallen auf
+  Whisper zurück. Die lokale Streaming-Erkennung bleibt Whisper.
+- **SRT / CSV pro Sitzung**: standardmäßig an. Neben der täglichen txt-Datei schreibt jeder Lauf unter
+  `transcripts\sessions\` eine zweisprachige SRT (direkt in den Videoplayer ziehen) und eine CSV (öffnet in Excel).
+  Abschalten mit `SAVE_SESSION_SRT = False` / `SAVE_SESSION_CSV = False`; `SAVE_TRANSCRIPT = False` schaltet sie mit
+  ab. `TRANSCRIPT_KEEP_DAYS` gilt auch für sie.
 
 ## Windows: Rechenknoten nutzen
 

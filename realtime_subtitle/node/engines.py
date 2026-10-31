@@ -9,12 +9,17 @@
 `asr/mlx_backend.py` 的 `_on_mlx_thread`），翻译只走 Apple / Ollama 适配器。
 
 日志规则（S7）：本模块不写任何日志；失败一律用异常类名向上报，异常消息可能
-夹带原文，不进日志。
+夹带原文，不进日志。引擎选择器仅输出固定的缺依赖警告（节点交给安全日志通道）。
+
+可选 SenseVoice：`pip install funasr`，不加入默认依赖；仅显式选择时导入和加载。
+首次加载可能下载模型权重，音频/文本始终在本机推理。
 """
 from __future__ import annotations
 
 import logging
+import math
 import re
+import sys
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -228,6 +233,115 @@ class WhisperEngine(AsrEngine):
             "backend": self._backend,
             "rtf": None if self._rtf is None else round(self._rtf, 3),
         }
+
+
+# ---------------------------------------------------------------- SenseVoice（可选）
+
+
+class SenseVoiceEngine(AsrEngine):
+    """FunASR 本机分段识别；不支持的源语言逐次回退 Whisper。
+
+    ☠️ 没有可靠的词时间戳，不能接入 streaming_asr 的 local agreement。
+    这里只返回句级时间：优先用 FunASR 的毫秒时间，否则按字符位置插值。
+    """
+
+    LANGUAGES = frozenset({"zh", "en", "ja", "ko", "yue"})
+    MODEL = "iic/SenseVoiceSmall"
+
+    def __init__(self):
+        self._model = None
+        self._whisper = None
+        self._rtf: float | None = None
+
+    def load(self) -> None:
+        if self._model is not None:
+            return
+        from funasr import AutoModel
+        import torch
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        # 已经由节点 Silero 分段，不再下载/加载第二份 VAD，也不执行远端模型代码。
+        self._model = AutoModel(model=self.MODEL, device=device, trust_remote_code=False,
+                                disable_update=True)
+
+    @staticmethod
+    def _bounds(row: dict, duration: float) -> tuple[float, float]:
+        stamps = row.get("timestamp")
+        start, end = row.get("start"), row.get("end")
+        if start is None and stamps:
+            start, end = stamps[0][0], stamps[-1][1]
+        try:
+            start, end = float(start) / 1000, float(end) / 1000
+        except (TypeError, ValueError):
+            return 0.0, duration
+        if not math.isfinite(start) or not math.isfinite(end) or end < start:
+            return 0.0, duration
+        start = min(max(start, 0.0), duration)
+        return start, min(max(end, start), duration)
+
+    def transcribe(self, audio: np.ndarray, language: str) -> list[Utterance]:
+        if language not in self.LANGUAGES:
+            if self._whisper is None:
+                whisper = WhisperEngine()
+                whisper.load()
+                self._whisper = whisper
+            return self._whisper.transcribe(audio, language)
+
+        duration = len(audio) / SAMPLE_RATE
+        if duration <= 0:
+            return []
+        self.load()
+        t0 = time.perf_counter()
+        results = self._model.generate(input=audio, cache={}, language=language, use_itn=True)
+        out: list[Utterance] = []
+        previous_end = 0.0
+        for result in results:
+            for row in result.get("sentence_info") or [result]:
+                # rich_transcription_postprocess 会把情绪/事件标签变成 emoji；字幕只要正文。
+                text = re.sub(r"<\|[^|]*\|>", "", row.get("text", "")).strip()
+                if not text or _is_hallucination(text):
+                    continue
+                start, end = self._bounds(row, duration)
+                start, end = max(start, previous_end), max(end, previous_end)
+                # 粤语同样用汉字标点；共用现有中文断句规则，不改全局语言配置。
+                text_language = "zh" if language == "yue" else language
+                sentences, rest = _split_sentences(text, final=True, lang=text_language)
+                if rest:
+                    sentences.append(rest)
+                cursor = 0
+                for sentence in sentences:
+                    at = text.find(sentence, cursor)
+                    if at < 0:
+                        continue
+                    cursor = at + len(sentence)
+                    a0 = start + (end - start) * at / len(text)
+                    a1 = start + (end - start) * cursor / len(text)
+                    sentence = to_simplified_if_target(sentence, text_language)
+                    out.append(Utterance(a0, a1, sentence))
+                previous_end = end
+        cur = (time.perf_counter() - t0) / duration
+        self._rtf = cur if self._rtf is None else 0.7 * self._rtf + 0.3 * cur
+        return out
+
+    def info(self) -> dict:
+        return {"model": self.MODEL, "backend": "funasr",
+                "rtf": None if self._rtf is None else round(self._rtf, 3)}
+
+
+def select_asr_engine(warn=None) -> AsrEngine:
+    """只在节点构造时检查可选依赖；缺包只输出一行固定警告，不带异常正文。"""
+    if str(config.ASR_ENGINE).strip().lower() == "sensevoice":
+        try:
+            from funasr import AutoModel  # noqa: F401 - 检查依赖，不加载模型
+        except ImportError:
+            message = "⚠️ SenseVoice 不可用（缺少 funasr），回退 Whisper。"
+            if warn is None:
+                print(message, file=sys.stderr)
+            else:
+                warn(message)
+        else:
+            return SenseVoiceEngine()
+    return WhisperEngine()
 
 
 # ---------------------------------------------------------------- 翻译

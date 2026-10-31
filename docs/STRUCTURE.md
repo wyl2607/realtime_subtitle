@@ -25,6 +25,7 @@ realtime_subtitle/                  # clone root
 │   ├── instance_identity.py        # single-instance mutex identity
 │   ├── migrate_legacy.py           # moves runtime files left by pre-package versions
 │   ├── capture/audio_capture.py    # WASAPI loopback + device hot-swap
+│   ├── capture/live_captions.py    # ASR_SOURCE="livecaptions": read Windows Live Captions via UIA
 │   ├── asr/streaming_asr.py        # local-agreement streaming ASR (word-level commits)
 │   ├── translate/
 │   │   ├── translator_queue.py     # Whisper/Ollama owner: ASR loop, queue, drafts
