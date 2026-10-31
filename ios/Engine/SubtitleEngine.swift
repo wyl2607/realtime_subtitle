@@ -726,6 +726,15 @@ final class SubtitleEngine {
                         requestID: requestID
                     )
                 }
+                if case .decodeFailed(let quota) = error {
+                    try? cloudLedger?.observeResponse(
+                        remainingRequests: quota?.remainingRequests,
+                        resetRequestsSeconds: quota?.resetRequestsS,
+                        keyFingerprint: quota?.keyFingerprint,
+                        sentAt: quota?.sentAt.map { Date(timeIntervalSince1970: $0) },
+                        requestID: requestID
+                    )
+                }
             }
             return stale
         }

@@ -70,7 +70,7 @@ enum CloudClientError: Error, CustomStringConvertible {
     case httpStatus(Int, retryAfter: Int?, xGroqID: String?, quota: CloudQuotaHeaders? = nil)
     case network(String)
     case invalidResponse
-    case decodeFailed
+    case decodeFailed(quota: CloudQuotaHeaders? = nil)
     case cancelled
 
     var description: String {
@@ -251,7 +251,7 @@ final class CloudClient: @unchecked Sendable {
             )
         } catch {
             logger(CloudLogEntry(xGroqID: groqID, duration: duration, statusCode: http.statusCode, reason: "decode_failed", errorType: "decode"))
-            throw CloudClientError.decodeFailed
+            throw CloudClientError.decodeFailed(quota: quota)
         }
     }
 
@@ -527,6 +527,31 @@ final class CloudClient: @unchecked Sendable {
                 check(abs((quota?.resetRequestsS ?? 0) - 0.12) < 1e-9, "429 错误应带 resetRequestsS=0.12")
             } catch {
                 check(false, "429 应保留为 CloudClientError.httpStatus")
+            }
+        }
+
+        run {
+            CloudURLProtocolStub.handler = { _ in
+                .success(
+                    status: 200,
+                    headers: [
+                        "x_groq.id": "groq-decode",
+                        "x-ratelimit-remaining-requests": "5",
+                        "x-ratelimit-reset-requests": "100s",
+                    ],
+                    body: Data("not json".utf8)
+                )
+            }
+            do {
+                _ = try await client.transcribe(pcm16Mono16k: Data([0, 0]), a0: 0, duration: 1, language: "de")
+                check(false, "200 非法 JSON 应抛 decodeFailed")
+            } catch let CloudClientError.decodeFailed(quota) {
+                check(quota?.remainingRequests == 5, "decodeFailed 应保留 remaining=5")
+                check(abs((quota?.resetRequestsS ?? 0) - 100) < 1e-9, "decodeFailed 应保留 resetRequestsS=100")
+                check(quota?.keyFingerprint != nil, "decodeFailed 应保留 key 指纹")
+                check(quota?.sentAt != nil, "decodeFailed 应保留请求发出时刻")
+            } catch {
+                check(false, "200 非法 JSON 应保留为 CloudClientError.decodeFailed")
             }
         }
 

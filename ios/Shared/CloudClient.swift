@@ -45,7 +45,7 @@ enum CloudClientError: Error, CustomStringConvertible {
     case httpStatus(Int, retryAfter: Int?, xGroqID: String?, quota: CloudQuotaHeaders? = nil)
     case network(String)
     case invalidResponse
-    case decodeFailed
+    case decodeFailed(quota: CloudQuotaHeaders? = nil)
     case cancelled
 
     var description: String {
@@ -194,6 +194,12 @@ final class CloudClient: @unchecked Sendable {
                     quota: stamped
                 )
             }
+            if case .decodeFailed(let quota) = error {
+                var stamped = quota ?? CloudQuotaHeaders()
+                stamped.keyFingerprint = fingerprint
+                stamped.sentAt = sentAt
+                throw CloudClientError.decodeFailed(quota: stamped)
+            }
             throw error
         }
     }
@@ -262,7 +268,7 @@ final class CloudClient: @unchecked Sendable {
                 resetRequestsS: quota.resetRequestsS
             )
         } catch {
-            throw CloudClientError.decodeFailed
+            throw CloudClientError.decodeFailed(quota: quota)
         }
     }
 
