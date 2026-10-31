@@ -135,7 +135,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         for path in sorted(_source_files(root, args.android)):
             files += 1
-            display = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
+            # 豁免键和输出一律用正斜杠，Windows 上 str(Path) 是反斜杠，ALLOW 会全部对不上
+            display = path.relative_to(root).as_posix() if path.is_relative_to(root) else path.as_posix()
             for line, literal in _literals(path):
                 for key, token, exact in tokens:
                     if not _matches(literal, token, exact):
