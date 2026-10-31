@@ -167,20 +167,40 @@ jobs:
       - name: rslite selftest
         shell: bash
         run: |
-          out="$(macos-native/.build/release/rslite --selftest)" || true
+          # 保留退出码：旧脚本的 `|| true` 把 rc 吞了，只剩文本匹配，等于对失败敞开
+          rc=0
+          out="$(macos-native/.build/release/rslite --selftest)" || rc=$?
+          out="$(printf '%s\n' "$out" | tr -d '\r')"
           printf '%s\n' "$out"
-          case "$out" in
-            *"SELFTEST OK"*) echo "rslite selftest: OK"; exit 0 ;;
-          esac
-          # 只在 macOS 27 以下放行"需要 macOS 27"这三行；多一条别的 FAIL、或没有任何 FAIL 行都算红
+          echo "rslite selftest 退出码: $rc"
+          # 只看 SELFTEST 行；先分类再逐条核对，避免"含 OK 就绿"和"有一条跳过就绿"的松判
+          lines="$(printf '%s\n' "$out" | grep '^SELFTEST ' || true)"
+          oks="$(printf '%s\n' "$lines" | grep -c '^SELFTEST OK$' || true)"
+          fails="$(printf '%s\n' "$lines" | grep '^SELFTEST FAIL' | LC_ALL=C sort || true)"
+          unknown="$(printf '%s\n' "$lines" | grep -v -e '^SELFTEST OK$' -e '^SELFTEST FAIL' || true)"
+          # rc=0 也只认干净的成功输出：至少一行 SELFTEST OK，且没有任何 FAIL 或别的 SELFTEST 行
+          if [ "$rc" -eq 0 ]; then
+            if [ "$oks" -ge 1 ] && [ -z "$fails" ] && [ -z "$unknown" ]; then
+              echo "rslite selftest: OK"; exit 0
+            fi
+            echo "::error::rslite --selftest 退出码 0，但输出不是干净的 SELFTEST OK"; exit 1
+          fi
+          # 唯一放行口：macOS < 27 且失败项恰好是这三组「需要 macOS 27」——多一条、少一条、
+          # 重复、或只是别的理由以它结尾都不放行；runner 升到 macOS 27 后这段自动失效
           major="$(sw_vers -productVersion | cut -d. -f1)"
-          other="$(printf '%s\n' "$out" | grep '^SELFTEST FAIL' | grep -v ': 需要 macOS 27$' || true)"
-          skipped="$(printf '%s\n' "$out" | grep -c ': 需要 macOS 27$' || true)"
-          if [ "$major" -lt 27 ] && [ -z "$other" ] && [ "$skipped" -gt 0 ]; then
-            echo "::warning::runner 是 macOS $major，selftest 跳过了 $skipped 组只能在 macOS 27 上跑的用例（本机/真机覆盖）"
+          case "$major" in
+            ''|*[!0-9]*) major_ok=0 ;;
+            *) major_ok=1 ;;
+          esac
+          expected="SELFTEST FAIL HybridEngine: 需要 macOS 27
+          SELFTEST FAIL NodeRouter: 需要 macOS 27
+          SELFTEST FAIL Pipeline: 需要 macOS 27"
+          if [ "$rc" -eq 1 ] && [ "$major_ok" -eq 1 ] && [ "$major" -lt 27 ] \
+             && [ "$oks" -eq 0 ] && [ -z "$unknown" ] && [ "$fails" = "$expected" ]; then
+            echo "::warning::runner 是 macOS $major，selftest 跳过了 3 组只能在 macOS 27 上跑的用例（本机/真机覆盖）"
             exit 0
           fi
-          echo "::error::rslite --selftest 未通过"; exit 1
+          echo "::error::rslite --selftest 未通过（exit=$rc, macOS $major）"; exit 1
       - name: Check design tokens are up to date
         run: python3 scripts/design/gen_tokens.py --check
 
