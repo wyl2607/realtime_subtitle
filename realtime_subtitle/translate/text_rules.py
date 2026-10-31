@@ -143,7 +143,7 @@ _GERMAN_EXTRA_ABBREVIATIONS = {
     # 常见短语缩写
     "z.bsp", "u.ä", "o.ä", "z.zt", "e.v",
     # 学位与头衔修饰
-    "med", "jur", "phil", "rer", "theol", "nat",
+    "med", "jur", "rer", "theol", "nat",
 }
 
 # 常见德语带空格多词缩写（如 "z. B.", "u. a.", "i. d. R."）
@@ -159,6 +159,11 @@ _INCOMPLETE_BEFORE_ELLIPSIS = {
     "und", "oder", "aber", "dass", "daß", "weil", "wenn", "ob", "als", "wie", "denn", "sowie",
     "haben", "hat", "hatte", "hatten", "habe", "bin", "ist", "sind", "war", "waren", "wird", "werden", "wurde", "wurden",
     "brauchen", "braucht", "brauchte",
+    # 情态动词：句尾停在它们后面几乎一定没说完（"Wir müssen … Geduld haben."）。
+    # ☠️ 不要加人称代词（es/ich/er/sie/wir…）："Das war es … Morgen geht es
+    # weiter." 里 "es" 就是真句尾，加了会把两句并成一句。
+    "kann", "können", "muss", "müssen", "will", "wollen", "soll", "sollen",
+    "darf", "dürfen", "mag", "mögen", "werde",
 }
 
 
@@ -192,7 +197,7 @@ def _boundary_is_real(candidate, remainder, final, lang=None):
         words = tail[:-1].split()
         token = words[-1] if words else ""
         clean_token = token.lower().strip(_QUOTE_CHARS)
-        abbrevs = getattr(config, "SENTENCE_ABBREVIATIONS", set()) | _GERMAN_EXTRA_ABBREVIATIONS
+        abbrevs = config.SENTENCE_ABBREVIATIONS | _GERMAN_EXTRA_ABBREVIATIONS
 
         # ①a 单词缩写否决（德语 bzw./z.B./ca./hr./fr. 等自带句号，含 Schiller-Str. 这类连字符复合）
         token_base = clean_token.rsplit("-", 1)[-1]
@@ -261,12 +266,19 @@ def _boundary_is_real(candidate, remainder, final, lang=None):
     return not remainder[0].islower()
 
 
-def _split_sentences(text, final=False, lang=None):
+def _split_sentences(text, final=False, lang=None, lookahead=""):
     """切出完整句子 + 剩余残句。返回 (sentences, rest)。
 
     模块级纯函数：单测直接测它，不用在测试里复制一份切分逻辑（复制必然漂移）。
     lang 缺省读 config.SOURCE_LANGUAGE；中文/日文走另一套终止符，见
     _SENTENCE_TERMINATOR_CJK 的注释。
+
+    lookahead 是"文本之后已经看见、但还没提交"的下文（识别线程的 unstable
+    尾部）。它**只用于边界判定**：候选句的 remainder 正好为空（句尾落在文本
+    末尾）时，拿它代替空 remainder 去问 `_boundary_is_real`。这样 D1 放行
+    （force=True）时省略号/单字母缩写这类依赖下文的否决仍然生效，不会因为
+    当下 remainder 为空就误切。它绝不拼进句子或 rest——被否决的候选句原样
+    留在 rest 里，等下一轮新词提交后自然合并。
     """
     sentences = []
     start = 0
@@ -276,7 +288,8 @@ def _split_sentences(text, final=False, lang=None):
         if not candidate:
             continue
         remainder = text[end:].lstrip()
-        if not _boundary_is_real(candidate, remainder, final, lang):
+        effective_remainder = remainder or lookahead.lstrip()
+        if not _boundary_is_real(candidate, effective_remainder, final, lang):
             continue  # 不是真句尾：跳过这个终止符，接着往后找
         sentences.append(candidate)
         start = end
