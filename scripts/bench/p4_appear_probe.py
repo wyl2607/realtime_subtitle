@@ -90,14 +90,41 @@ def _r(value, digits=3):
     return None if value is None else round(value, digits)
 
 
+class _VirtualTimer:
+    """替换真 QTimer：探针用虚拟时钟手动检查 _hold_deadline。
+
+    否则真定时器会在虚拟时间还没到、但墙钟已经过去若干毫秒时提前触发，
+    把 minHold 的数字污染成「取决于探针跑多快」。
+    """
+
+    def __init__(self):
+        self._active = False
+
+    def start(self, _ms):
+        self._active = True
+
+    def stop(self):
+        self._active = False
+
+    def isActive(self):
+        return self._active
+
+
+def _item_key(win, item):
+    fn = getattr(win, "_pair_key", None)
+    if fn is not None:
+        return fn(item)
+    return item[6] if len(item) >= 7 else None
+
+
 def _visible_pair_items(win):
-    """按 _render 的同一套规则，返回当前真正会显示的 [(key, german, chinese)]。"""
+    """按 _render 的同一套规则，返回候选句对 [(key, german, chinese)]。"""
     import realtime_subtitle.config as config
     keep = max(1, int(getattr(config, "MAX_SENTENCE_PAIRS", 20)))
     items = []
     for item in reversed(win.sentence_pairs):
         g, c = item[0], item[1]
-        k = item[6] if len(item) >= 7 else None
+        k = _item_key(win, item)
         if not win._pair_html(g, c, key=k):
             continue
         items.append((k, g, c))
@@ -124,42 +151,54 @@ def _layout_snapshot(win):
     y_from_bottom = 文档总高 - 该句块之前所有句块的高度，即 QLabel 底对齐时
     该句块顶部离窗口底边的距离。live/status 在句对下方，它们变高会把旧句顶
     上去——这正是要量到的「整窗重排」。
+
+    可见集合优先直接读 win._visible_pair_keys（改后产品代码的唯一真相源）；
+    没有这个属性时（改前基线代码）才按 _render 的二分复刻一遍。
     """
     items = _visible_pair_items(win)
     fixed = _fixed_blocks(win)
     if not items and not fixed:
         return [], {}, 0.0
 
-    # 复刻 _render 的二分，得到实际 shown。
     doc = win._doc_for_render()
     avail_h = win.window.height() - 40
-    cap = len(items)
 
-    def blocks_for(count):
-        selected = items[len(items) - count:]
-        return [
-            win._pair_html(g, c, dim=(idx < len(selected) - 1), top_gap=(idx > 0), key=k)
-            for idx, (k, g, c) in enumerate(selected)
-        ]
+    sticky_keys = getattr(win, "_visible_pair_keys", None)
+    if sticky_keys is not None:
+        item_map = {k: (k, g, c) for k, g, c in items}
+        selected = [item_map[k] for k in sticky_keys if k in item_map]
+    else:
+        cap = len(items)
 
-    def fits(count):
-        doc.setHtml(win._join_render_blocks(blocks_for(count), fixed))
-        return doc.size().height() <= avail_h
+        def blocks_for(count):
+            chosen = items[len(items) - count:]
+            return [
+                win._pair_html(g, c, dim=(idx < len(chosen) - 1), top_gap=(idx > 0), key=k)
+                for idx, (k, g, c) in enumerate(chosen)
+            ]
 
-    shown = 0
-    if cap:
-        shown = 1
-        lo, hi = 2, cap
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            if fits(mid):
-                shown = mid
-                lo = mid + 1
-            else:
-                hi = mid - 1
+        def fits(count):
+            doc.setHtml(win._join_render_blocks(blocks_for(count), fixed))
+            return doc.size().height() <= avail_h
 
-    selected = items[len(items) - shown:] if shown else []
-    blocks = blocks_for(shown) if shown else []
+        shown = 0
+        if cap:
+            shown = 1
+            lo, hi = 2, cap
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                if fits(mid):
+                    shown = mid
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+        selected = items[len(items) - shown:] if shown else []
+
+    blocks = [
+        win._pair_html(g, c, dim=(idx < len(selected) - 1),
+                       top_gap=(idx > 0), key=k)
+        for idx, (k, g, c) in enumerate(selected)
+    ]
 
     heights = [0.0]
     for count in range(1, len(blocks) + 1):
@@ -274,6 +313,36 @@ def run(pairs_fit):
     events, end_t = _make_timeline()
     min_hold = float(design_tokens.MOTION_MIN_HOLD_SEC)
 
+    # 改后代码有 _now：换成虚拟时钟，并用手动 tick 检查 _hold_deadline。
+    # 改前基线没有这些接缝，保持原样跑（同一脚本两种代码都能跑）。
+    virtual = {"t": 0.0}
+    has_virtual_clock = hasattr(win, "_now")
+    if has_virtual_clock:
+        win._hold_timer.stop()
+        win._hold_timer = _VirtualTimer()
+        win._now = lambda: virtual["t"]
+        win._visible_pair_keys = []
+        win._shown_at.clear()
+        if hasattr(win, "_ever_shown"):
+            win._ever_shown.clear()
+        win._hold_deadline = None
+        if hasattr(win, "_stop_fade"):
+            win._stop_fade()
+        win._render_layout_sig = None
+        win._render_lang_revision = None
+        win._render()
+        _app().processEvents()
+
+    def release_if_due():
+        deadline = getattr(win, "_hold_deadline", None)
+        if deadline is not None and virtual["t"] + 1e-9 >= deadline:
+            win._on_hold_release()
+
+    def tick_to(target):
+        while virtual["t"] + 1e-9 < target:
+            virtual["t"] = round(min(target, virtual["t"] + 0.1), 6)
+            release_if_due()
+
     first_seen = {}
     residence = {}
     visible_hist = {}
@@ -288,6 +357,9 @@ def run(pairs_fit):
     ever_visible = set()
     reentries = 0
     reentry_keys = set()
+    fade_events = 0
+    old_key_refades = 0
+    fade_prev = getattr(win, "_fade_key", None)
 
     def kind_stats(kind):
         return by_kind.setdefault(kind, {"events": 0, "settext_changes": 0,
@@ -295,6 +367,8 @@ def run(pairs_fit):
                                          "old_pair_y_jumps": 0, "max_old_pair_shift_px": 0.0})
 
     for at, _order, kind, payload in events:
+        if has_virtual_clock:
+            tick_to(at)
         stats = kind_stats(kind)
         stats["events"] += 1
         before_keys, before_y, _ = _layout_snapshot(win)
@@ -318,6 +392,8 @@ def run(pairs_fit):
             target_key = key
             win.update_dst(key, dst)
         wall_ms = (time.perf_counter() - wall0) * 1000.0
+        if has_virtual_clock:
+            release_if_due()
 
         after_text = win.window.text()
         if after_text != before_text:
@@ -329,6 +405,23 @@ def run(pairs_fit):
 
         after_keys, after_y, _ = _layout_snapshot(win)
         visible_hist[len(after_keys)] = visible_hist.get(len(after_keys), 0) + 1
+
+        # 淡入：记录 None → key 的转变；旧 key 曾经上过屏就不该再淡。
+        # 探针不等 150ms 动画，直接推到终值（改前代码没有这些接缝）。
+        cur_fade = getattr(win, "_fade_key", None)
+        if cur_fade is not None and fade_prev is None:
+            fade_events += 1
+            if cur_fade in ever_visible:
+                old_key_refades += 1
+        if cur_fade is not None:
+            finish_fade = getattr(win, "_finish_fade", None)
+            if finish_fade is not None:
+                finish_fade()
+            else:
+                anim = getattr(win, "_fade_anim", None)
+                if anim is not None:
+                    anim.setCurrentTime(anim.duration())
+        fade_prev = getattr(win, "_fade_key", None)
 
         if after_keys != before_keys:
             visibility_changes += 1
@@ -419,6 +512,10 @@ def run(pairs_fit):
                         for k, v in latency_by_kind.items()},
             "note": "槽函数同步调用到 QLabel.setText 完成的墙钟耗时；离屏无 paint，作为 UI 侧对照",
         },
+        "appear": {
+            "fade_events": fade_events,
+            "old_key_refades": old_key_refades,
+        },
     }
     _suppress_construct(lambda: win.container.hide())
     return result
@@ -449,6 +546,8 @@ def _summary(result):
             f"vis={s['visibility_changes']} old_y_jumps={s['old_pair_y_jumps']}"
             for k, s in sorted(f["by_kind"].items())
         ),
+        f"淡入：次数={result['appear']['fade_events']}  "
+        f"淡入了已上屏过的旧 key 的次数={result['appear']['old_key_refades']}",
     ]
     return "\n".join(lines)
 

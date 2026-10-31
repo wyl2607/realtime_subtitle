@@ -3,8 +3,6 @@ import Foundation
 
 /// 字幕动效、最短停留、瀑布流和回看的纯逻辑。不建窗口，`--selftest` 直接调用。
 enum OverlayMotion {
-    /// 瀑布流里最旧一对的透明度。最新一对为 1，次新从 `olderPair` 起，再往上淡到这个值。
-    static let waterfallOldestOpacity = 0.35
     static let waterfallMenuHint = "拉高窗口可显示更多（瀑布流）"
     static let newCaptionBadgeTitle = "↓ 新字幕"
     /// 比「行数」所需高度再高出这么多，才算用户拉高了窗口，避免 1pt 测量误差来回切换。
@@ -38,6 +36,24 @@ enum OverlayMotion {
         let stillHolding = now - outside.shownAt < hold
         let count = stillHolding ? preferred + 1 : preferred
         return shown.suffix(count).map(\.key)
+    }
+
+    /// 瀑布流 fit 之后的最短停留：紧挨可见段上方的那一对若上屏未满 `minHoldSec`，
+    /// 就再多留它一对，并靠顶部渐隐裁切。回看时不保最短停留。
+    /// `shown` 与 `pool` 同序（从旧到新），`fit` 是本轮按高度算出的结果。
+    static func waterfallHoldCount(
+        shown: [ShownLine],
+        now: Double,
+        fit: WaterfallFit,
+        reviewing: Bool,
+        minHoldSec: Double = DesignTokens.Motion.minHoldSec
+    ) -> WaterfallFit {
+        guard !reviewing, !shown.isEmpty else { return fit }
+        let base = min(max(0, fit.pairCount), shown.count)
+        guard base > 0, base < shown.count else { return fit }
+        let outside = shown[shown.count - base - 1]
+        guard now - outside.shownAt < max(0, minHoldSec) else { return fit }
+        return WaterfallFit(pairCount: base + 1, clipsTop: true)
     }
 
     /// 窗口里能放下几对。放不下的最上一对也算进去，调用方用顶部渐隐裁它。
@@ -127,7 +143,7 @@ enum OverlayMotion {
         return userHeight <= linesHeight + slack
     }
 
-    /// 非最新一对变暗。瀑布流里越旧越淡，最旧约 `waterfallOldestOpacity`。
+    /// 非最新一对变暗。瀑布流里越旧越淡，最旧约 `DesignTokens.Opacity.waterfallOldest`。
     static func pairOpacity(indexFromNewest: Int, visibleCount: Int, waterfall: Bool) -> Double {
         if indexFromNewest <= 0 || visibleCount <= 1 {
             return 1
@@ -141,7 +157,7 @@ enum OverlayMotion {
         let span = Double(visibleCount - 2)
         let t = span <= 0 ? 0 : Double(indexFromNewest - 1) / span
         let clamped = min(1, max(0, t))
-        return DesignTokens.Opacity.olderPair + (waterfallOldestOpacity - DesignTokens.Opacity.olderPair) * clamped
+        return DesignTokens.Opacity.olderPair + (DesignTokens.Opacity.waterfallOldest - DesignTokens.Opacity.olderPair) * clamped
     }
 
     /// 系统「减少动态效果」开启时时长为 0。否则把毫秒令牌换成秒。
@@ -341,6 +357,56 @@ enum OverlayMotion {
         ]
         check(visibleLineKeys(shown: boundary, now: 3, lines: 2, minHoldSec: 3) == [1, 2, 3], "最短停留：差一点点仍未满")
 
+        let waterfallShown = (1...4).map { ShownLine(key: $0, shownAt: 0) }
+        let waterfallBaseFit = WaterfallFit(pairCount: 2, clipsTop: false)
+        let waterfallHolding = waterfallHoldCount(
+            shown: waterfallShown,
+            now: 1,
+            fit: waterfallBaseFit,
+            reviewing: false,
+            minHoldSec: hold
+        )
+        check(waterfallHolding == WaterfallFit(pairCount: 3, clipsTop: true), "瀑布流最短停留：未满多留一对并裁顶")
+        let waterfallAged = waterfallHoldCount(
+            shown: waterfallShown,
+            now: hold,
+            fit: waterfallBaseFit,
+            reviewing: false,
+            minHoldSec: hold
+        )
+        check(waterfallAged == waterfallBaseFit, "瀑布流最短停留：满了不再多留")
+        let waterfallCrowded = (1...6).map { ShownLine(key: $0, shownAt: 9) }
+        check(
+            waterfallHoldCount(
+                shown: waterfallCrowded,
+                now: 10,
+                fit: WaterfallFit(pairCount: 2, clipsTop: false),
+                reviewing: false,
+                minHoldSec: hold
+            ) == WaterfallFit(pairCount: 3, clipsTop: true),
+            "瀑布流最短停留：最多只多留一对"
+        )
+        check(
+            waterfallHoldCount(
+                shown: [],
+                now: 10,
+                fit: WaterfallFit(pairCount: 0, clipsTop: false),
+                reviewing: false,
+                minHoldSec: hold
+            ) == WaterfallFit(pairCount: 0, clipsTop: false),
+            "瀑布流最短停留：空池不动"
+        )
+        check(
+            waterfallHoldCount(
+                shown: waterfallShown,
+                now: 1,
+                fit: waterfallBaseFit,
+                reviewing: true,
+                minHoldSec: hold
+            ) == waterfallBaseFit,
+            "瀑布流最短停留：回看不保留"
+        )
+
         let gap = DesignTokens.Space.pairGap
         let pad = DesignTokens.Space.windowPadV * 2
         let exact = waterfallFit(windowHeight: pad + 48, pairHeight: 20, verticalPadding: pad, pairGap: gap)
@@ -404,7 +470,7 @@ enum OverlayMotion {
         check(near(pairOpacity(indexFromNewest: 0, visibleCount: 3, waterfall: false), 1), "旧句变暗：最新一对全亮")
         check(near(pairOpacity(indexFromNewest: 1, visibleCount: 3, waterfall: false), DesignTokens.Opacity.olderPair), "旧句变暗：固定模式用 olderPair")
         check(near(pairOpacity(indexFromNewest: 1, visibleCount: 4, waterfall: true), DesignTokens.Opacity.olderPair), "瀑布流变淡：次新为 olderPair")
-        check(near(pairOpacity(indexFromNewest: 3, visibleCount: 4, waterfall: true), waterfallOldestOpacity), "瀑布流变淡：最旧约 0.35")
+        check(near(pairOpacity(indexFromNewest: 3, visibleCount: 4, waterfall: true), DesignTokens.Opacity.waterfallOldest), "瀑布流变淡：最旧约 0.35")
 
         let reduced = motionSeconds(reduceMotion: true)
         check(reduced.fade == 0 && reduced.shift == 0 && reduced.resize == 0, "减少动态效果：时长为 0")

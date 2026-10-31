@@ -329,8 +329,13 @@ final class OverlayController: NSObject {
     func addTranslation(id: Int, text: String) {
         let hadMarker = failures[id] != nil
         let alreadyShown = pairViews[id]?.didFadeIn == true
+        // 双语模式下原文先上屏、译文后到：只有该 key 第一次拿到非空译文才淡入译文字段。
+        // 之后的润色替换、仅译文模式（整对首次出现）都不再淡，避免重复。
+        let previous = store.lines.first(where: { $0.key == id })?.dstText ?? pendingTranslation[id]
+        let firstTranslation = (previous?.isEmpty ?? true) && !text.isEmpty
         clearFailure(id)
-        if hadMarker && alreadyShown {
+        if alreadyShown,
+           hadMarker || (firstTranslation && style.displayMode == .bilingual) {
             fadeTranslationIDs.insert(id)
         }
         if store.lines.contains(where: { $0.key == id }) {
@@ -778,11 +783,27 @@ final class OverlayController: NSObject {
                 pairHeightsBottomFirst: bottomFirst,
                 pairGap: Double(OverlayStyle.pairGap)
             )
-            let count = min(fit.pairCount, pool.count)
+            let baseCount = min(fit.pairCount, pool.count)
+            let shown = pool.map { line in
+                OverlayMotion.ShownLine(key: line.key, shownAt: appearedAt[line.key] ?? -.infinity)
+            }
+            // 被高度 fit 挤出去的那一对如果还没满 minHold，就多留它一对，靠顶部渐隐裁切。
+            // 回看时不做，否则翻历史会一直顶着多出来的一行。
+            let held = OverlayMotion.waterfallHoldCount(
+                shown: shown,
+                now: now,
+                fit: OverlayMotion.WaterfallFit(pairCount: baseCount, clipsTop: fit.clipsTop),
+                reviewing: review.isReviewing
+            )
+            let count = min(held.pairCount, pool.count)
             visibleKeys = pool.suffix(count).map(\.key)
-            clipsTop = fit.clipsTop && count > 0
-            holdTask?.cancel()
-            holdTask = nil
+            clipsTop = held.clipsTop && count > 0
+            if review.isReviewing {
+                holdTask?.cancel()
+                holdTask = nil
+            } else {
+                scheduleHoldRelease(shown: shown, preferred: baseCount, now: now)
+            }
         } else {
             if review.isReviewing || review.showsBadge {
                 review = .live
@@ -794,7 +815,7 @@ final class OverlayController: NSObject {
             }
             visibleKeys = OverlayMotion.visibleLineKeys(shown: shown, now: now, lines: style.lines)
             clipsTop = false
-            scheduleHoldRelease(history: history, now: now)
+            scheduleHoldRelease(shown: shown, preferred: style.lines, now: now)
         }
         for key in visibleKeys where appearedAt[key] == nil {
             appearedAt[key] = now
@@ -847,14 +868,15 @@ final class OverlayController: NSObject {
         }
     }
 
-    private func scheduleHoldRelease(history: [SubtitleLine], now: Double) {
+    /// `preferred` 是不做最短停留时本该显示的条数。当前正多留一对时，
+    /// 被保留下来的正是 `shown.count - preferred - 1` 那一对，到期后重渲染把它放走。
+    private func scheduleHoldRelease(shown: [OverlayMotion.ShownLine], preferred: Int, now: Double) {
         holdTask?.cancel()
         holdTask = nil
-        let preferred = style.lines
-        guard history.count > preferred else { return }
-        let outside = history[history.count - preferred - 1]
-        guard let shown = appearedAt[outside.key] else { return }
-        let remain = DesignTokens.Motion.minHoldSec - (now - shown)
+        guard preferred > 0, shown.count > preferred else { return }
+        let outside = shown[shown.count - preferred - 1]
+        guard outside.shownAt.isFinite else { return }
+        let remain = DesignTokens.Motion.minHoldSec - (now - outside.shownAt)
         guard remain > 0 else { return }
         let nanos = UInt64((remain + 0.05) * 1_000_000_000)
         holdTask = Task { @MainActor [weak self] in

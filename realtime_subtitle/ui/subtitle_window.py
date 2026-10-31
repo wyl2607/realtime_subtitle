@@ -25,7 +25,8 @@ from PyQt6.QtWidgets import (
     QGraphicsOpacityEffect,
 )
 from PyQt6.QtCore import (
-    Qt, pyqtSignal, QObject, QTimer, QPropertyAnimation, QEasingCurve, QPointF, QRectF,
+    Qt, pyqtSignal, QObject, QTimer, QPropertyAnimation, QVariantAnimation,
+    QEasingCurve, QPointF, QRectF,
 )
 from PyQt6.QtGui import QColor, QPainter, QPen
 import realtime_subtitle.config as config
@@ -237,6 +238,21 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         # _render 测高用的文档缓存（font/size/width 不变则复用；点词路径不用）
         self._doc_cache = None
         self._doc_cache_key = None  # (font_family, font_size, text_width)
+        # P4 出现体验：粘住的可见集合 / minHold / 新句淡入。
+        # _visible_pair_keys 每次 _render 结束时刷新（从旧到新），探针和测试
+        # 用它判断「旧句有没有被 live 行挤掉」；_shown_at 记每个 key 首次上屏
+        # 的 _now() 时刻；_ever_shown 只增不减，用来保证旧 key 不会重新淡入。
+        self._visible_pair_keys = []
+        self._shown_at = {}
+        self._ever_shown = set()
+        self._hold_deadline = None
+        self._fade_key = None
+        self._fade_alpha = 1.0
+        self._fade_view_keys = []
+        self._fade_item_map = {}
+        self._fade_fixed = []
+        self._render_layout_sig = None
+        self._render_lang_revision = None
 
         # 创建主容器窗口（可拖动 + 边缘拖拽缩放）
         self.container = ResizableFramelessWidget()
@@ -247,6 +263,16 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
             Qt.WindowType.Tool
         )
         self.container.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        # minHold 到期用单发定时器释放（不轮询、不 sleep）；语言切换/窗口
+        # 变化时由 _render 重置。淡入用 QVariantAnimation 只驱动颜色 alpha。
+        self._hold_timer = QTimer(self.container)
+        self._hold_timer.setSingleShot(True)
+        self._hold_timer.timeout.connect(self._on_hold_release)
+        self._fade_anim = QVariantAnimation(self.container)
+        self._fade_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._fade_anim.valueChanged.connect(self._on_fade_value)
+        self._fade_anim.finished.connect(self._on_fade_finished)
 
         # 创建按钮样式
         button_style = """
@@ -737,6 +763,9 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         之后到达的、代数更旧的句对/草稿一定是切换前发出的——正是要拒掉的那些。
         """
         self.language_revision = int(revision)
+        # 旧语言的 minHold 截止点不能留到新语言：到点重渲染会把刚上屏的
+        # 新语言句子当成「早该走了」放走。重置并把计时锚到此刻。
+        self._reset_appear_hold()
         self.settings_window.refresh_from_config()
 
     def _on_mode_applied(self, name):
