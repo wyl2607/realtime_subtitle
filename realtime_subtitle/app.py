@@ -282,6 +282,7 @@ class RemoteBridge:
         # 而这里要把「读指纹 → 决定是否 key_modified / http_status」做成原子。
         self._key_lock = __import__("threading").Lock()
         self._cloud_key_digest, _ = self._read_cloud_key_digest()
+        self._cloud_key_seen = self._cloud_key_digest is not None
         # 分段器的 a0 从这次开桥算起。加上开桥时本机识别已经走过的样本，
         # 远端句才能和本机句用同一套 t0/t1。中途才打开时，收件箱里还没
         # 识别的音频可能对不齐，这是已知限制。
@@ -470,12 +471,18 @@ class RemoteBridge:
         if self._stale_remote_generation(generation, "cloud_result"):
             return
         try:
-            self.routing.apply({"type": "segment_success"})
-            if self.ledger is not None:
-                self.ledger.note(
-                    transcript.duration_s,
-                    remaining_requests=transcript.remaining_requests,
-                )
+            with self._key_lock:
+                if not self._cloud_callback_current_locked(generation, transcript.key_fingerprint):
+                    return
+                self.routing.apply({"type": "segment_success"})
+                if self.ledger is not None:
+                    self.ledger.note(
+                        transcript.duration_s,
+                        remaining_requests=transcript.remaining_requests,
+                        reset_requests_s=transcript.reset_requests_s,
+                        key_fp=transcript.key_fingerprint,
+                        sent_at=transcript.sent_at,
+                    )
         except Exception as exc:
             print(f"⚠️  云端记账失败: {type(exc).__name__}")
         self._sync_provider()
@@ -502,39 +509,12 @@ class RemoteBridge:
             status = exc.status
             reached = status is not None
             routed = status in (401, 403, 429) or (reached and 500 <= int(status) <= 599)
-            previous_state = str(getattr(self.routing, "cloud_state", "") or "")
-            status_applied = False
-            stale_key = False
-            if status in (401, 403):
-                # 指纹比较和「打无效」必须是同一把锁里的一个决定。否则旧 key 的
-                # 401 可能在音频线程换 key 之后才落盘，把新 key 永久打成
-                # disabled_invalid_key 且之后再也不恢复。
-                with self._key_lock:
-                    if self._stale_remote_generation(generation, "cloud_exception"):
-                        return
-                    digest, fingerprint = self._read_cloud_key_digest()
-                    if (
-                        digest is not None
-                        and getattr(exc, "key_fingerprint", None) is not None
-                        and exc.key_fingerprint != fingerprint
-                    ):
-                        # _recover_routing 尚未到下一秒检查点时，401/403 仍可能先到。
-                        # 它属于旧 key，不能让 routing_rules 锁死新 key。
-                        stale_key = True
-                        self._apply_cloud_key_modified_locked(digest)
-                    else:
-                        self.routing.apply({
-                            "type": "http_status",
-                            "status": int(status),
-                            "retry_after": exc.retry_after,
-                        })
-                        status_applied = True
-            if stale_key:
-                self._sync_provider()
-                self._announce_route()
-                return
             try:
-                if not status_applied:
+                # 校验、路由和记账与换 key 共用一把锁，所有响应状态都不能重装旧证明。
+                with self._key_lock:
+                    if not self._cloud_callback_current_locked(generation, exc.key_fingerprint):
+                        return
+                    previous_state = str(getattr(self.routing, "cloud_state", "") or "")
                     if routed:
                         self.routing.apply({
                             "type": "http_status",
@@ -543,12 +523,18 @@ class RemoteBridge:
                         })
                     else:
                         self.routing.apply({"type": "segment_failure"})
-                if reached and self.ledger is not None:
-                    self.ledger.note(exc.duration_s, remaining_requests=exc.remaining_requests)
-                if status == 429 and previous_state != "cooldown_rate_limited":
-                    # 只在进入冷却时打一行；和 rslite 同一格式，不含 key 和正文。
-                    seconds = getattr(self.routing, "cooldown_seconds", None) or 60
-                    print(f"rslite.cloud cooldown reason=429 retry_after={int(seconds)}")
+                    if reached and self.ledger is not None:
+                        self.ledger.note(
+                            exc.duration_s,
+                            remaining_requests=exc.remaining_requests,
+                            reset_requests_s=exc.reset_requests_s,
+                            key_fp=exc.key_fingerprint,
+                            sent_at=exc.sent_at,
+                        )
+                    if status == 429 and previous_state != "cooldown_rate_limited":
+                        # 只在进入冷却时打一行；和 rslite 同一格式，不含 key 和正文。
+                        seconds = getattr(self.routing, "cooldown_seconds", None) or 60
+                        print(f"rslite.cloud cooldown reason=429 retry_after={int(seconds)}")
             except Exception as note_exc:
                 print(f"⚠️  云端失败记账出错: {type(note_exc).__name__}")
         else:
@@ -563,7 +549,7 @@ class RemoteBridge:
 
     def _read_cloud_key_digest(self):
         """返回 key 内容的完整摘要和可公开的短指纹；读不到 key 时不改变路由。"""
-        if not self.cloud_on or self.cloud is None or self._cloud_key_path is None:
+        if self.cloud is None or self._cloud_key_path is None:
             return None, None
         from realtime_subtitle.remote.cloud_client import CloudError, read_groq_key
         try:
@@ -577,6 +563,18 @@ class RemoteBridge:
         import hashlib
         digest = hashlib.sha256(key.encode("utf-8")).digest()
         return digest, digest.hex()[:12]
+
+    def _cloud_callback_current_locked(self, generation, fingerprint):
+        """调用方持有 _key_lock，校验后直到记账完成都不能插入一次换 key。"""
+        if self._stale_remote_generation(generation, "cloud_accounting"):
+            return False
+        digest, current_fp = self._read_cloud_key_digest()
+        self._apply_cloud_key_modified_locked(digest)
+        if self._cloud_key_seen and fingerprint != current_fp:
+            self._sync_provider()
+            self._announce_route()
+            return False
+        return True
 
     def _apply_cloud_key_modified(self, digest):
         """换 key：只作废云端自己的在飞请求，再让 routing_rules 恢复云端。
@@ -595,11 +593,15 @@ class RemoteBridge:
 
     def _apply_cloud_key_modified_locked(self, digest):
         """换 key 的实际动作。调用方必须已持有 self._key_lock。"""
-        if not self.cloud_on or self.cloud is None:
-            return False
         if digest == self._cloud_key_digest:
             return False
         self._cloud_key_digest = digest
+        self._cloud_key_seen = self._cloud_key_seen or digest is not None
+        if self.ledger is not None:
+            # 换 key 先作废旧恢复证明，随后 usage() 不能借旧边界重新开放云端。
+            self.ledger.observe_key(digest.hex()[:12] if digest is not None else None)
+        if not self.cloud_on or self.cloud is None or digest is None:
+            return False
         try:
             self.cloud.cancel()
         except Exception as exc:
@@ -647,19 +649,19 @@ class RemoteBridge:
         routing = self.routing
         if routing is None:
             return
-        if self.cloud_on and self.cloud is not None:
-            digest, _fingerprint = self._read_cloud_key_digest()
-            if digest is not None:
-                with self._key_lock:
-                    if self._cloud_key_digest is None:
-                        # 开桥时没有 key、之后才补上：只记指纹，不算一次换 key。
-                        self._cloud_key_digest = digest
-                        changed = False
-                    else:
-                        changed = self._apply_cloud_key_modified_locked(digest)
-                if changed:
-                    self._sync_provider()
-                    self._announce_route()
+        if self.cloud is not None:
+            with self._key_lock:
+                digest, _fingerprint = self._read_cloud_key_digest()
+                if digest is not None and not self._cloud_key_seen:
+                    # 开桥时没有 key、之后才补上：只记指纹，不算一次换 key。
+                    self._cloud_key_digest = digest
+                    self._cloud_key_seen = True
+                    changed = False
+                else:
+                    changed = self._apply_cloud_key_modified_locked(digest)
+            if changed:
+                self._sync_provider()
+                self._announce_route()
         state = str(getattr(routing, "cloud_state", "") or "")
         seconds = getattr(routing, "cooldown_seconds", None)
         if state == "cooldown_quota" or not state.startswith("cooldown_"):
@@ -683,7 +685,11 @@ class RemoteBridge:
             # 冷却结束要把状态行从「… · 云端限流冷却」恢复成原文案。
             self._announce_route()
         if self.ledger is not None:
-            self.ledger.usage()
+            with self._key_lock:
+                # 与观察串行；不能在旧 key 观察和轮询之间插入一次新 key 记账。
+                _digest, fingerprint = self._read_cloud_key_digest()
+                self.ledger.observe_key(fingerprint)
+                self.ledger.usage()
 
     def _sync_provider(self):
         stub = getattr(self.router, "cloud_provider", None)
@@ -1083,6 +1089,7 @@ def open_remote_bridge(
     from realtime_subtitle.remote.routing_rules import RoutingState
     from realtime_subtitle.ui.settings_window import config_dir, groq_key_file, load_node_entries
 
+    use_default_ledger = ledger_factory is None
     if cloud_on:
         if cloud_client_factory is None:
             from realtime_subtitle.remote.cloud_client import CloudClient
@@ -1112,7 +1119,18 @@ def open_remote_bridge(
         segmenter = segmenter_factory()
         qpath = quota_path or (config_dir() / "quota.json")
         qpath.parent.mkdir(parents=True, exist_ok=True)
-        ledger = ledger_factory(qpath, routing=routing)
+        if use_default_ledger:
+            from realtime_subtitle.remote.cloud_client import CloudError, read_groq_key
+            import hashlib
+            try:
+                active_key = read_groq_key(cloud_key_path)
+            except (CloudError, OSError, UnicodeError):
+                active_key = None
+            active_fp = hashlib.sha256(active_key.encode("utf-8")).hexdigest()[:12] if active_key else None
+            # 默认真实账本在 load 自动推进前绑定当前 key；测试工厂保持原来的注入接口。
+            ledger = ledger_factory(qpath, routing=routing, active_key_fp=active_fp)
+        else:
+            ledger = ledger_factory(qpath, routing=routing)
     entries = []
     self_node_id = None
     if node_on:
@@ -1178,6 +1196,8 @@ class SubtitleApp:
         self.running = False
         self.translator = None
         self.audio_capture = None
+        self.live_captions_reader = None
+        self._live_captions_status = "本机·Windows实时字幕"
         self.remote = None
 
         # 这台机器的"正常档位"翻译模型：必须在任何模式切换之前拍快照
@@ -1307,15 +1327,23 @@ class SubtitleApp:
                 return
             # 延迟导入：见模块顶部说明（窗口出现前不付 numpy/requests 的 import）。
             from realtime_subtitle.translate.translator_queue import WhisperQueueTranslator
-            # 翻译器（Whisper 模型 + Ollama 预热，启动耗时大头）
-            translator = WhisperQueueTranslator()
+            from realtime_subtitle.capture.live_captions import prepare_live_captions_reader
+
+            reader = prepare_live_captions_reader(
+                getattr(config, "ASR_SOURCE", "whisper"),
+                hide_window=getattr(config, "LIVE_CAPTIONS_HIDE_WINDOW", True))
+            # 先检查可选识别源，失败时走完整 Whisper 初始化路径。
+            translator = WhisperQueueTranslator(
+                asr_source="livecaptions" if reader is not None else "whisper")
+            self.live_captions_reader = reader
             if self._closing:
                 translator.shutdown()
                 return
 
             # 接线：识别提交的德语立即上屏（live行），翻译完成变句对
             # 两个回调都走Qt信号，从任何线程调都安全
-            translator.on_display = self.subtitle_window.update_live
+            translator.on_display = (self._display_live_captions if reader is not None
+                                     else self.subtitle_window.update_live)
             translator.on_pair = self.subtitle_window.add_pair
             translator.on_draft = self.subtitle_window.update_draft
             translator.on_status = self.subtitle_window.show_status
@@ -1327,6 +1355,8 @@ class SubtitleApp:
             self.translator = translator  # 此后 stop() 会负责 shutdown 它
             # 模型还没好时用户拨的开关只落在文件里。这里按文件决定要不要接远端。
             self._attach_remote()
+            if str(config.ASR_ENGINE).strip().lower() == "sensevoice" and self.remote is None:
+                print("ℹ️ SenseVoice 仅用于节点/分段识别；本机流式识别需要词时间戳，继续使用 Whisper。")
             # 点词查词：窗口点击→translator查Ollama→回调线程安全地弹结果
             # on_partial：流式生成中整行地先上屏，不用干等整段
             self.subtitle_window.on_lookup = (
@@ -1341,21 +1371,30 @@ class SubtitleApp:
             self.subtitle_window.on_deep_explain = (
                 lambda sentence, cb: self.translator.deep_explain(sentence, cb))
 
-            # 音频捕获（设备名/设备切换提示直接上悬浮窗）。构造要开WASAPI流，
-            # 有几百毫秒窗口，之后再查一次 _closing 才真正启动采集/热键
-            from realtime_subtitle.capture.audio_capture import AudioCapture
+            if reader is not None:
+                if self._closing:
+                    return
+                self.running = True
+                reader.start(translator.enqueue_captions, self._on_live_captions_status)
+                # stop() 与后台加载并发；覆盖检查到 start 之间的退出窗口。
+                if self._closing:
+                    reader.stop()
+                    return
+            else:
+                # 构造会开 WASAPI 流；Live Captions 模式不导入音频驱动。
+                from realtime_subtitle.capture.audio_capture import AudioCapture
 
-            audio_capture = AudioCapture(
-                callback=self.on_audio_received,
-                on_status=self.subtitle_window.show_status)
-            if self._closing:
-                audio_capture.stop()
-                return
-            self.audio_capture = audio_capture
+                audio_capture = AudioCapture(
+                    callback=self.on_audio_received,
+                    on_status=self.subtitle_window.show_status)
+                if self._closing:
+                    audio_capture.stop()
+                    return
+                self.audio_capture = audio_capture
+                self.running = True
+                self.audio_capture.start()
 
             print("✅ 所有组件初始化完成")
-            self.running = True
-            self.audio_capture.start()
             # 模型加载完才开始盯内存：加载 Whisper + 预热翻译模型时压力本来就会
             # 冲高，算进去的话一启动就被降档（M2 e2e 实测：启动即 4b→2b，之后
             # 要 5 分钟以上才升回，这段时间中文明显更差）
@@ -1364,6 +1403,9 @@ class SubtitleApp:
             if sys.platform != "darwin":
                 self._setup_hotkey()
         except Exception as e:
+            reader = getattr(self, "live_captions_reader", None)
+            if reader is not None:
+                reader.stop()
             print(f"❌ 初始化失败: {e}")
             import traceback
             traceback.print_exc()
@@ -1435,7 +1477,9 @@ class SubtitleApp:
 
         cloud_on = cloud_active()
         node_on = node_active()
-        if not cloud_on and not node_on:
+        if (getattr(self.translator, "asr_source", "whisper") == "livecaptions"
+                or (not cloud_on and not node_on)):
+            # 系统字幕是完整的本机识别源，不启动任何远端音频识别客户端。
             self._close_remote()
             if self.translator is not None:
                 self.translator.on_pair = self.subtitle_window.add_pair
@@ -1509,7 +1553,23 @@ class SubtitleApp:
             return
         window.settings_window.refresh_from_config()
 
+    def _display_live_captions(self, committed, unstable):
+        if self._closing:
+            return
+        self.subtitle_window.update_live(committed, unstable)
+        # update_live 会清掉状态行；同一线程按序发 Qt 信号把识别来源补回去。
+        self.subtitle_window.show_status(self._route_status_text())
+
+    def _on_live_captions_status(self, text):
+        if self._closing:
+            return
+        self._live_captions_status = text
+        # show_status 发 Qt 信号；不从 UIA 线程直接触碰 QWidget。
+        self.subtitle_window.show_status(text)
+
     def _route_status_text(self):
+        if getattr(getattr(self, "translator", None), "asr_source", "whisper") == "livecaptions":
+            return getattr(self, "_live_captions_status", "本机·Windows实时字幕")
         remote = self.remote
         if remote is not None:
             try:
@@ -1564,7 +1624,7 @@ class SubtitleApp:
 
     def _toggle_pause(self):
         """暂停/继续（和 暂停继续字幕.bat 完全等价：切换.paused标记文件）"""
-        from realtime_subtitle.capture.audio_capture import PAUSE_FLAG_FILE
+        PAUSE_FLAG_FILE = repo_path(".paused")
 
         try:
             if os.path.exists(PAUSE_FLAG_FILE):
@@ -1918,6 +1978,11 @@ class SubtitleApp:
             from realtime_subtitle.ui import macos_hotkeys
             macos_hotkeys.unregister_all()
 
+        # 先停 UIA 生产者并恢复系统字幕窗，再关闭共享翻译队列。
+        reader = getattr(self, "live_captions_reader", None)
+        if reader is not None:
+            reader.stop()
+
         # 先停止音频捕获，避免向已关闭的线程池提交新任务
         if self.audio_capture is not None:
             try:
@@ -1974,11 +2039,15 @@ class SubtitleApp:
         print("   6. 点击 ❌ 按钮可退出程序")
         print("   7. 或按 Ctrl+C 中断程序")
         print("\n⚙️  当前配置：")
-        from realtime_subtitle.asr.backends import describe_whisper_backend
-        print(f"   - 识别: {describe_whisper_backend()}")
-        print(f"   - 处理模式: local agreement 增量识别 (每{config.CHUNK_SUBMIT_SECONDS}秒一块, 缓冲上限{config.BUFFER_TRIM_SEC:.0f}秒)")
-        print(f"   - 收尾静音: {config.IDLE_FLUSH_SEC}秒")
-        print(f"   - 翻译: Qwen + Whisper (Ollama {config.OLLAMA_MODEL})")
+        if getattr(self.translator, "asr_source", "whisper") == "livecaptions":
+            print("   - 识别: Windows 实时字幕（本机，识别语言在 Windows 设置中选择）")
+            print("   - 处理模式: UI Automation 文本轮询（约150毫秒）")
+        else:
+            from realtime_subtitle.asr.backends import describe_whisper_backend
+            print(f"   - 识别: {describe_whisper_backend()}")
+            print(f"   - 处理模式: local agreement 增量识别 (每{config.CHUNK_SUBMIT_SECONDS}秒一块, 缓冲上限{config.BUFFER_TRIM_SEC:.0f}秒)")
+            print(f"   - 收尾静音: {config.IDLE_FLUSH_SEC}秒")
+        print(f"   - 翻译: Ollama {config.OLLAMA_MODEL}")
         print(f"   - 源语言: {config.LANGUAGE_NAMES.get(config.SOURCE_LANGUAGE, config.SOURCE_LANGUAGE)}")
         print(f"   - 路由: {self._route_status_text()}")
         from realtime_subtitle.translate.translator_queue import log_language_startup

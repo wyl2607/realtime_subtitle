@@ -41,16 +41,16 @@ System audio ──WASAPI loopback──▶ Faster-Whisper (CUDA or CPU)
 
 ## Platform status
 
-As of 2026-10-21. The current release is v3.1.0 for Windows / macOS; v3.2.0 is tagged as beta and the final release is not out yet.
+As of 2026-10-25. The current release for Windows / macOS is v3.2.0 (2026-10-25).
 
 Stage legend: ✅ stable · 🟢 usable · 🧪 experimental · ⬜ not started.
 
 | Platform | Form | Stage | Available now | Still missing |
 |---|---|---|---|---|
-| Windows | Desktop app | ✅ Stable | Local recognition and translation; three-tier automatic routing from cloud (Groq) → computer node → local (v3.2.0 beta); the status line shows the current source. Full pytest on a real Windows machine: 1207 passed, 0 failed | Final v3.2.0 release not out yet |
-| macOS | Desktop app + rslite (native Swift) | 🟢 Usable | Local recognition and translation; three-tier automatic routing from cloud → computer node → local (v3.2.0 beta). rslite cloud acceptance mostly passed, hybrid-mode median refine latency 1.47 s | final v3.2.0 release not out yet |
-| Android | Native app (separate private repo) | 🧪 Experimental | v0.4.0-quality released (old architecture); the rewrite/v1 has on-device recognition, cloud tier, node tier, automatic switching, and Keystore-encrypted key storage, with 395 unit tests passing and 0 failures | Rewrite not yet verified on a real device |
-| iOS | Native app (prototype) | 🧪 Experimental | Screen-recording broadcast extension captures audio from other apps, picture-in-picture display, "Auto" mode (falls back to local when the node fails, switches back at sentence end after recovery), daily subtitle archive, cloud tier logic only | Broadcast extension not yet integrated, not yet run on a real device; display is picture-in-picture only, no desktop-style overlay |
+| Windows | Desktop app | ✅ Stable | Local recognition and translation; three-tier automatic routing from cloud (Groq) → computer node → local; the status line shows the current source. Full pytest on a real Windows machine (RTX 4070): 1269 passed, 0 failed; smoke test and 150% HiDPI check passed | Occasionally splits a sentence early (shown as two lines; translation unaffected) |
+| macOS | Desktop app + rslite (native Swift) | 🟢 Usable | Local recognition and translation; three-tier automatic routing from cloud → computer node → local. Cloud segment end → on screen median ~1.1 s, hybrid-mode median refine latency 1.47 s | Still distributed as source (rslite .app packaging is planned for v3.3); rslite release build with Swift 6.3 hangs on CI, under investigation |
+| Android | Native app (separate private repo) | 🧪 Experimental | v0.4.0-quality released (old architecture); the new architecture is merged into main: on-device recognition with live German drafts, cloud tier, node tier, automatic switching, Keystore-encrypted key storage, all unit tests passing | New architecture not yet verified on a real device; no new release yet |
+| iOS | Native app (prototype) | 🧪 Experimental | Screen-recording broadcast extension captures audio from other apps, or use the microphone directly; three-tier cloud → node → local routing; pairing via QR code / `rsnode://pair`; today's subtitle history | Not yet run on a real device; build and install yourself with Xcode; display is picture-in-picture only, no desktop-style overlay |
 | Linux | — | ⬜ Not started | — | No plans |
 
 ## Features
@@ -89,7 +89,7 @@ Stage legend: ✅ stable · 🟢 usable · 🧪 experimental · ⬜ not started.
 | | Recommended | Minimum |
 |---|---|---|
 | OS | Windows 10/11 64-bit | Windows 10/11 (**Windows only** — WASAPI loopback) |
-| GPU | NVIDIA 8 GB+ VRAM | CPU-only works (higher latency) |
+| GPU | NVIDIA 8 GB+ VRAM | CPU-only works (higher latency), or use Windows Live Captions (see "Optional recognition sources") |
 | RAM | 16 GB | 8 GB |
 | Disk | ~10 GB (deps + models) | ~6 GB |
 | Python | 3.10–3.13 | same |
@@ -185,6 +185,27 @@ Offload recognition to another Apple Silicon Mac or NVIDIA Windows machine insid
 - **Free tier limits**: 20 requests per minute, 7,200 seconds of audio per hour, 2,000 requests / 28,800 seconds per day, with each request billed at minimum 10 seconds.
 - **Automatic failover**: when quota approaches limits, the system automatically falls back to your compute node or local recognition; when quota recovers, it switches back at a silence point.
 - **Fallback order**: Cloud → Own compute node → Local.
+
+## Optional recognition sources and subtitle export
+
+All of these go into `config_local.py`; restart the subtitles afterwards.
+
+- **Windows Live Captions (no GPU needed)**: `ASR_SOURCE = "livecaptions"`, then
+  `venv\Scripts\python -m pip install uiautomation`. Speech recognition is done by the Live Captions feature built
+  into Windows 11 (22H2+); the app reads its text and translates it with Ollama. Whisper is not loaded and the GPU
+  is not used, so this suits machines without an NVIDIA card. Pick the recognition language under
+  **Windows Settings → Accessibility → Captions** and keep it in line with the app's source language. The Live
+  Captions window is minimized while the app runs (`LIVE_CAPTIONS_HIDE_WINDOW = False` keeps it visible) and
+  restored on exit. Live Captions holds back the last few words until the next phrase, so the last sentence before
+  a pause arrives late (a ~12 s fallback flushes it). If the requirements are not met (not Windows 11, uiautomation
+  missing, Live Captions not found) the app falls back to Whisper.
+- **SenseVoice (compute nodes, optional)**: `ASR_ENGINE = "sensevoice"` plus `pip install funasr` on the node.
+  Only Chinese / English / Japanese / Korean / Cantonese — **no German**; other languages fall back to Whisper.
+  Local streaming recognition stays on Whisper.
+- **Per-session SRT / CSV**: on by default. Besides the daily txt, every run also writes a bilingual SRT (drop it
+  into a video player) and a CSV (opens in Excel) under `transcripts\sessions\`. Turn off with
+  `SAVE_SESSION_SRT = False` / `SAVE_SESSION_CSV = False`; `SAVE_TRANSCRIPT = False` disables them too.
+  `TRANSCRIPT_KEEP_DAYS` applies to them as well.
 
 ## Windows: Using compute nodes
 

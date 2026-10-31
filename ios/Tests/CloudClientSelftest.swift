@@ -102,6 +102,7 @@ func runCloudClientSelftest(_ check: @escaping (Bool, String) -> Void) {
             headers: [
                 "x_groq.id": "groq-ok",
                 "x-ratelimit-remaining-requests": "1980",
+                "x-ratelimit-reset-requests": "2m59.56s",
             ],
             body: Data(#"{"text":"Hallo Welt","segments":[{"start":0.1,"end":0.4,"text":"Hallo"},{"start":0.5,"end":0.9,"text":"Welt"}]}"#.utf8),
             a0: 12
@@ -114,6 +115,7 @@ func runCloudClientSelftest(_ check: @escaping (Bool, String) -> Void) {
         ], "句时间应映射回 a0 样本时钟")
         check(result?.xGroqID == "groq-ok", "应读出 x_groq.id")
         check(result?.remainingRequests == 1980, "应读出 x-ratelimit-remaining-requests")
+        check(abs((result?.resetRequestsS ?? 0) - 179.56) < 1e-9, "成功响应应读出 resetRequestsS")
     }
 
     do {
@@ -145,7 +147,7 @@ func runCloudClientSelftest(_ check: @escaping (Bool, String) -> Void) {
             body: #"{"error":"invalid key"}"#,
             check
         )
-        if case .httpStatus(let status, let retryAfter, let groqID)? = error {
+        if case .httpStatus(let status, let retryAfter, let groqID, _)? = error {
             check(status == 401, "401 应作为 httpStatus 抛出")
             check(retryAfter == nil, "401 不应带 retry-after")
             check(groqID == "groq-401", "401 应保留请求 ID")
@@ -157,14 +159,21 @@ func runCloudClientSelftest(_ check: @escaping (Bool, String) -> Void) {
     do {
         let error = parseError(
             429,
-            headers: ["retry-after": "61", "x_groq.id": "groq-429"],
+            headers: [
+                "retry-after": "61",
+                "x_groq.id": "groq-429",
+                "x-ratelimit-remaining-requests": "0",
+                "x-ratelimit-reset-requests": "120ms",
+            ],
             body: #"{"error":"rate limit"}"#,
             check
         )
-        if case .httpStatus(let status, let retryAfter, let groqID)? = error {
+        if case .httpStatus(let status, let retryAfter, let groqID, let quota)? = error {
             check(status == 429, "429 应作为 httpStatus 抛出")
             check(retryAfter == 61, "429 应解析 retry-after 整数秒，实际 \(String(describing: retryAfter))")
             check(groqID == "groq-429", "429 应保留请求 ID")
+            check(quota?.remainingRequests == 0, "429 错误应带 remaining=0")
+            check(abs((quota?.resetRequestsS ?? 0) - 0.12) < 1e-9, "429 错误应带 resetRequestsS=0.12")
         } else if error != nil {
             check(false, "429 应抛 httpStatus，实际 \(String(describing: error))")
         }
@@ -177,6 +186,23 @@ func runCloudClientSelftest(_ check: @escaping (Bool, String) -> Void) {
         } else if error != nil {
             check(false, "非法 JSON 应抛 decodeFailed，实际 \(String(describing: error))")
         }
+    }
+
+    do {
+        let fingerprint = CloudClient.keyFingerprint(fakeKey)
+        check(fingerprint == "8ab40e0a271191a4833e19e6db160047d0987086ff44df1c8d662eef0c88d586",
+              "key 指纹应是稳定的 SHA-256 十六进制，实际 \(fingerprint)")
+        check(fingerprint != fakeKey && !fingerprint.contains(fakeKey), "key 指纹不得包含 key 本身")
+        check(CloudClient.keyFingerprint(fakeKey) == fingerprint, "同一把 key 的指纹应稳定")
+        check(CloudClient.keyFingerprint(fakeKey + "x") != fingerprint, "不同 key 的指纹应不同")
+        let quota = CloudQuotaHeaders(
+            remainingRequests: 5,
+            resetRequestsS: 100,
+            keyFingerprint: fingerprint,
+            sentAt: 1_000
+        )
+        check(quota.keyFingerprint == fingerprint && quota.sentAt == 1_000,
+              "额度头应能携带 key 指纹与请求发出时刻")
     }
 
     do {

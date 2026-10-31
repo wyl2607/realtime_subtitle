@@ -4,7 +4,16 @@
 """
 import realtime_subtitle.ui.design_tokens as design_tokens
 
+# ============ 识别来源 ============
+ASR_SOURCE = "whisper"  # whisper / livecaptions
+# livecaptions 仅 Windows 11 22H2+；识别语言在 Windows 实时字幕设置中选择。
+# Windows 实时字幕在设备上识别，音频和文字默认留在本机；翻译仍走现有本机后端。
+# 源/目标语言对仍由本应用设置（请与 Windows 识别语言对应）。
+LIVE_CAPTIONS_HIDE_WINDOW = True  # 读取期间把系统字幕窗最小化（不能隐藏，见 live_captions.py），停止时恢复
+
 # ============ Whisper 模型配置 ============
+# whisper / sensevoice：只用于节点分段识别；本机流式识别仍用 Whisper 词时间戳。
+ASR_ENGINE = "whisper"
 # large-v3-turbo: large-v3的加速蒸馏版，德语准确率明显好于medium，
 # 速度与medium相当，int8下显存占用差不多（~2GB）
 WHISPER_MODEL = "large-v3-turbo"  # tiny, base, small, medium, large-v3, large-v3-turbo
@@ -567,6 +576,8 @@ HALLUCINATION_BLACKLIST = [
 
 # ============ 字幕记录 ============
 SAVE_TRANSCRIPT = True  # 把每条字幕（原文+译文+时间）存到文件，方便回看/搜索/学语言
+SAVE_SESSION_SRT = True  # 单次运行单独导出双语 SRT 文件（transcripts/sessions/）
+SAVE_SESSION_CSV = True  # 单次运行单独导出 CSV 表格（utf-8-sig，方便 Excel 查看）
 TRANSCRIPT_DIR = "transcripts"  # 相对仓库目录，每天一个文件 YYYY-MM-DD.txt
 # 启动时清理超过这么多天的存档文件。**默认 0 = 永久保留**，和一直以来的行为
 # 一致——transcripts 是拿来回看和学德语的，自动删掉用户攒的语料不该是默认。

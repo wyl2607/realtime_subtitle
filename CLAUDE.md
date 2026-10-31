@@ -98,6 +98,9 @@ config.py 同名项）。**永远不要为了适配这台机器去改 config.py*
 | `CHUNK_SUBMIT_SECONDS` / `WHISPER_BEAM_SIZE` | 识别跟不上时降档 |
 | `LANGUAGE_PAIRS` / `AUTO_DETECT_LANGUAGE` 及其滞回参数 | 用户明说了要哪几种语言时（同一个源语言可以配多条，如 `("zh","en")` 和 `("zh","de")`，面板会各出一个按钮，见第 4 节第 41 条） |
 | `LOOPBACK_DEVICE_NAME` | 抓不到声音时指定设备 |
+| `ASR_SOURCE` / `LIVE_CAPTIONS_HIDE_WINDOW` | 没有 N 卡时改用 Windows 实时字幕识别（第 4 节第 50 条）；要另装 `uiautomation` |
+| `ASR_ENGINE` | 算力节点用 SenseVoice（只中/英/日/韩/粤，**不含德语**）；节点上要另装 `funasr` |
+| `SAVE_SESSION_SRT` / `SAVE_SESSION_CSV` | 用户嫌 `transcripts\sessions\` 占地方时关掉（受 `SAVE_TRANSCRIPT` 总开关约束） |
 
 **这三个键会改变"数据往哪去"，绝不能为了"让它跑起来"顺手加**：
 
@@ -116,7 +119,7 @@ install.ps1 按显存自动生成的默认档位：
 
 | 硬件 | WHISPER_MODEL / COMPUTE | OLLAMA_MODEL | 说明 |
 |---|---|---|---|
-| 无 NVIDIA 卡（含 AMD/Intel） | small / cpu / int8 | qwen3.5:2b | 延迟约 5-10 秒；Ollama 自己或许还能用上非 N 卡的 GPU |
+| 无 NVIDIA 卡（含 AMD/Intel） | small / cpu / int8 | qwen3.5:2b | 延迟约 5-10 秒；Ollama 自己或许还能用上非 N 卡的 GPU。Win11 22H2+ 可改 `ASR_SOURCE = "livecaptions"` 把识别交给系统（第 4 节第 50 条） |
 | 显存 ~4GB | small / cuda / int8 | qwen3.5:2b | |
 | 显存 ~6GB | large-v3-turbo / int8 | qwen3.5:2b | 余量 >2.5GB 可升 4b |
 | 显存 ~8GB（主流游戏卡） | large-v3-turbo / float16 | qwen3.5:4b | 9b 会贴上限、层挪 CPU 变慢 |
@@ -972,11 +975,13 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     代码走通——而且**以上都是在 venv 里已经彻底没有 PyQt5 的前提下跑的**。
     真机也起过一次完整程序：悬浮窗置顶/半透明/几何恢复正常，德语识别 +
     中文翻译双语上屏，`.stop` 优雅退出并卸载了 Ollama 模型。
-    ⚠️ **没验的**：没在真正的高缩放屏（125%/150%）上跑过一次，第 43 条那张表
-    是 `QT_SCALE_FACTOR` 模拟的；`rescale_state_for_dpr` 对老存档的换算也只有
-    单元测试——真机上走到的一直是 `saved_dpr == current_dpr` 的短路分支，
-    **换算代码在生产环境里一次都没执行过**。怎么验写在
-    [docs/TODO.md](docs/TODO.md) 第 1 条，验完回来把这段删掉。
+    **高缩放屏真机验收（v3.2.0，`719b786`）**：Windows 150% 缩放下从 100% 切到 150% 再切回，
+    窗口物理尺寸保持不变、字号按比例换算、文字清晰（`.governance/release-notes-v3.2.0.md`
+    「测试」节）。⚠️ 这条记录**不能证明** `rescale_state_for_dpr` 的换算分支在真机上跑过：
+    程序运行中切缩放是 Qt 在线处理的，退出时存档已写成新 DPR，下次启动仍走短路分支；
+    只有「关着程序切缩放再启动」才会进换算（日志会打「ℹ️ 显示缩放变了（存档 … → 当前 …）」），
+    而当时没留这行日志。**没有 `coord_dpr` 的 Qt5 老存档**也走同一个函数（缺字段按 1.0），
+    同样只有单元测试覆盖。
 
 45. **☠️ 桌面上只有五个 bat，而且那张表是单一真相源。**（2026-09-20）
 
@@ -1070,6 +1075,16 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     - **现象**：试图用响应头中的 `x-ratelimit-remaining-requests` 校正分钟限流窗口时，计算出的请求配额产生严重偏差；同时找不到任何返回音频秒数限额的响应头。
     - **根因**：Groq API 返回的 `x-ratelimit-remaining-requests` 对应的是**每日**（Day）维度的剩余请求数（由令牌桶持续回补），并不是 1 分钟窗口内的剩余请求数；此外 Groq 响应头中完全没有音频时间（audio seconds / duration）相关的限流额度头（例如无 `x-ratelimit-remaining-audio-seconds`）。
     - **做法**：本地配额记账必须由客户端独立维护本地滑动窗口记录（1 分钟请求数、1 小时音频秒数、24 小时请求数与音频秒数）；`x-ratelimit-remaining-requests` 仅可用于校正 24 小时每日请求数，绝不能用来校正 1 分钟窗口；音频秒数完全依赖客户端上传时长（按每次至少 10 秒下限计费）在本地日志记账。
+50. **☠️ Windows 实时字幕模式（`ASR_SOURCE = "livecaptions"`）的坑全在系统字幕那一侧**（2026-10-27 真机实测，德语 Win11 build 26300，Hedda TTS 当音源）。
+    识别交给 `LiveCaptions.exe`，`capture/live_captions.py` 用 UIA 读 `CaptionsTextBlock` 的 `Name`，`CaptionDiffer` 把滚动/修订的整段快照变成"每句只交付一次"。
+    - **只能最小化，不能 `SW_HIDE`**：隐藏后那个元素从 UIA 树里消失，`Exists()` 恒为 False，读取线程陷入"连上→隐藏→元素没了→重连"死循环，一个字都读不到，而状态行只是在"本机·Windows实时字幕"和"正在重连"之间来回跳。最小化和移出屏幕都能照常读；选最小化，因为程序崩了用户还能从任务栏点回来。
+    - **窗口里残留着上一次的文字**：不处理的话，启动那一刻整段旧内容会被当新句子送去翻译和存档。连上时 `prime()` 把已有文字记为已交付。
+    - **系统会把最后几个词压着，等下一段语音来了才补**（原始快照：停在 "…Geld für Bahn"，新语音进来才补出 "und Bus."），有时还把旧尾巴和新语音**拼成一句、中间没有句号**（"…Tagesschau Guten Morgen in Berlin beginnt…"）。所以 prime 时尾巴没以句末标点结尾，补完的第一句只在新增部分 ≤3 个词时才当旧内容跳过；更长就保留并去掉开头的半个残词。☠️ 第一版是"整句跳过"，真机上把一整句新内容吞掉了。
+    - 同一个"压着"也意味着：**说话人停下后最后一句会晚到**，要等下一段语音或 `FORCE_FLUSH_SECONDS`（12 秒）兜底。这是系统字幕的行为，别去缩短稳定期来"修"它，那只会让修订中的半截句子提前定稿。
+    - **系统事后补的句号会单独成"句"**（"regnen" 定稿后才补上 "."），不含字母数字的定稿一律丢掉。
+    - **`tasklist` 输出是 OEM 代码页**（德语系统表头是 "Abbildname"），`text=True` 按 cp1252 解码会在读输出的线程里抛 `UnicodeDecodeError`，要写 `encoding="oem"`。
+    - 识别语言在 **Windows 设置 → 辅助功能 → 字幕** 里选，程序管不了；和 `SOURCE_LANGUAGE` 不一致时出的是乱码（德语识别器听英语 → "Goodievening laile the Government…"），不是程序 bug。
+    - 实测的一处异常没能复现：第一次跑出现过 "Kritik."（系统先写 "Kritik." 再改成 "Kritiker sagen,"？），逐帧录原始快照时系统是逐词追加、没出现这种临时版本。**定稿规则因此没改**，别凭这一次去加"后文够长才定稿"——它会让所有句子多等 0.8 秒。再见到就先录原始快照（`el.Name` 每 50ms 打一次）再动规则。
 
 ## 5. 目录地图
 
@@ -1082,6 +1097,7 @@ realtime_subtitle/offline.py  离线批处理实现；导入层(plan_media/resol
                       与处理层(process_media，只认本地媒体)分开，见第4节第38条
 realtime_subtitle/offline_checkpoint.py  离线缓存身份与落盘（checkpoint/指纹/多目标翻译表，第4节第37条）
 realtime_subtitle/capture/audio_capture.py      WASAPI Loopback 采集 + 设备热切换
+realtime_subtitle/capture/live_captions.py      ASR_SOURCE="livecaptions"：读 Windows 实时字幕文本（UIA）+ CaptionDiffer（第4节第50条）
 realtime_subtitle/asr/streaming_asr.py      local agreement 增量识别（词级前缀提交）
 realtime_subtitle/translate/translator_queue.py   Whisper/Ollama 持有者：识别主循环、翻译队列、草稿、术语表
 realtime_subtitle/translate/text_rules.py   切句 + 无空格语言规则（纯函数，第4节第32条那一套）

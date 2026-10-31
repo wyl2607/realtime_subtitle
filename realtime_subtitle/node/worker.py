@@ -843,10 +843,10 @@ def main() -> None:
     faulthandler.enable(file=err)
 
     try:
-        from realtime_subtitle.node.engines import WhisperEngine
+        from realtime_subtitle.node.engines import select_asr_engine
         from realtime_subtitle.node.segmenter import SileroVad
 
-        asr = WhisperEngine()
+        asr = select_asr_engine(warn=lambda message: print(message, file=err, flush=True))
         SileroVad()  # 模型加载失败走退出码 3；每个会话再各自 new（VAD 的 h/c 不能共享）
     except Exception as e:  # noqa: BLE001
         _log(err, "engine_load_failed", err=type(e).__name__)
