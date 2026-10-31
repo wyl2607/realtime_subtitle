@@ -11,6 +11,7 @@ import hashlib
 import logging
 import math
 import os
+import re
 import sys
 import threading
 import wave
@@ -68,6 +69,7 @@ class CloudError(Exception):
         exc_type: str,
         retry_after: int | None = None,
         remaining_requests: int | None = None,
+        reset_requests_s: float | None = None,
         groq_id: str | None = None,
         audio_s: float = 0.0,
         duration_s: float | None = None,
@@ -79,6 +81,7 @@ class CloudError(Exception):
         self.exc_type = _scrub(exc_type, secret)
         self.retry_after = retry_after
         self.remaining_requests = remaining_requests
+        self.reset_requests_s = reset_requests_s
         self.groq_id = _public_id(groq_id, secret)
         self.audio_s = audio_s
         self.key_fingerprint = key_fingerprint if key_fingerprint is not None else _key_fingerprint(secret)
@@ -131,6 +134,7 @@ class CloudTranscript:
     duration_s: float
     status: int
     remaining_requests: int | None
+    reset_requests_s: float | None = None
 
 
 def config_dir() -> Path:
@@ -288,6 +292,7 @@ class CloudClient:
         groq_id = _header(headers, "x-groq-id")
         remaining = _nonnegative_int(_header(headers, "x-ratelimit-remaining-requests"))
         retry_after = _nonnegative_int(_header(headers, "retry-after"))
+        reset_requests_s = _reset_requests_seconds(_header(headers, "x-ratelimit-reset-requests"))
         if status != 200:
             reason = _http_reason(status)
             self._log(secret=secret, groq_id=groq_id, audio_s=audio_s, status=status, reason=reason, exc_type="HTTPStatus")
@@ -297,6 +302,7 @@ class CloudClient:
                 exc_type="HTTPStatus",
                 retry_after=retry_after,
                 remaining_requests=remaining,
+                reset_requests_s=reset_requests_s,
                 groq_id=groq_id,
                 audio_s=audio_s,
                 secret=secret,
@@ -314,6 +320,7 @@ class CloudClient:
                 reason="bad_response",
                 exc_type=exc_type,
                 remaining_requests=remaining,
+                reset_requests_s=reset_requests_s,
                 groq_id=groq_id,
                 audio_s=audio_s,
                 secret=secret,
@@ -325,6 +332,7 @@ class CloudClient:
                 reason="bad_response",
                 exc_type="CloudError",
                 remaining_requests=remaining,
+                reset_requests_s=reset_requests_s,
                 groq_id=groq_id,
                 audio_s=audio_s,
                 secret=secret,
@@ -343,6 +351,7 @@ class CloudClient:
             duration_s=duration_s,
             status=status,
             remaining_requests=remaining,
+            reset_requests_s=reset_requests_s,
         )
 
     def _transport_failure(self, generation: int, audio_s: float, reason: str, exc: BaseException, secret: str) -> None:
@@ -477,6 +486,28 @@ def _nonnegative_int(value: str | None) -> int | None:
     if number < 0:
         return None
     return number
+
+
+_RESET_DURATION_TOKEN = re.compile(r"(\d+(?:\.\d+)?)(ms|h|m|s)")
+
+
+def _reset_requests_seconds(value: str | None) -> float | None:
+    """解析 Groq 连续单位时长；未知格式不能被误认为额度恢复时间。"""
+    text = value.strip() if value is not None else ""
+    if not text:
+        return None
+    seconds = 0.0
+    index = 0
+    for match in _RESET_DURATION_TOKEN.finditer(text):
+        if match.start() != index:
+            return None
+        number = float(match.group(1))
+        multiplier = {"h": 3600.0, "m": 60.0, "s": 1.0, "ms": 0.001}[match.group(2)]
+        seconds += number * multiplier
+        if not math.isfinite(seconds):
+            return None
+        index = match.end()
+    return seconds if index == len(text) else None
 
 
 def _status_code(response: Any) -> int:

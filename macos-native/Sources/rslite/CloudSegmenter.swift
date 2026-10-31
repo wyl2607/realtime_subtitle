@@ -725,8 +725,15 @@ final class CloudUploadController: @unchecked Sendable {
         if dropResolvedResultLocked(cancel: cancel) || segmentEpoch[id] != epoch {
             return reconcileLocked(atSilence: false, node: node, lines: [], discard: true, cancel: cancel)
         }
+        var quotaHeaders: [AnyHashable: Any] = [:]
         if let remaining = result.remainingRequests {
-            try? ledger.correctRemainingRequests(["x-ratelimit-remaining-requests": NSNumber(value: remaining)], at: now)
+            quotaHeaders["x-ratelimit-remaining-requests"] = NSNumber(value: remaining)
+        }
+        if let resetSeconds = result.resetRequestsS {
+            quotaHeaders["x-ratelimit-reset-requests"] = "\(resetSeconds)s"
+        }
+        if !quotaHeaders.isEmpty {
+            try? ledger.correctRemainingRequests(quotaHeaders, at: now)
         }
         context.apply(RouteEvent(type: "segment_success", status: nil, retryAfter: nil, usagePercent: nil))
         clearCooldownIfResumed()
@@ -745,8 +752,18 @@ final class CloudUploadController: @unchecked Sendable {
         if dropResolvedResultLocked(cancel: cancel) || segmentEpoch[id] != epoch || Self.isCancellation(error) {
             return reconcileLocked(atSilence: false, node: node, lines: [], discard: true, cancel: cancel)
         }
-        if let http = error as? CloudClientError, case .httpStatus(let status, let retryAfter, _) = http {
+        if let http = error as? CloudClientError, case .httpStatus(let status, let retryAfter, _, let quota) = http {
             let wasRateLimited = context.cloudState == .cooldownRateLimited
+            var quotaHeaders: [AnyHashable: Any] = [:]
+            if let remaining = quota?.remainingRequests {
+                quotaHeaders["x-ratelimit-remaining-requests"] = NSNumber(value: remaining)
+            }
+            if let resetSeconds = quota?.resetRequestsS {
+                quotaHeaders["x-ratelimit-reset-requests"] = "\(resetSeconds)s"
+            }
+            if !quotaHeaders.isEmpty {
+                try? ledger.correctRemainingRequests(quotaHeaders, at: now)
+            }
             context.apply(RouteEvent(type: "http_status", status: status, retryAfter: retryAfter, usagePercent: nil))
             noteCooldown(now)
             if status == 429 && !wasRateLimited {
@@ -1227,6 +1244,27 @@ final class CloudUploadController: @unchecked Sendable {
             check(again.uploads.count == 1, "retry-after 到期后的下一段应试探一次，实际 \(again.uploads.count)")
         } else {
             check(false, "429 用例应先准备好一段已接受的上传")
+        }
+
+        let httpQuotaLedger = QuotaLedger(url: root.appendingPathComponent("quota-http-429.json"))
+        let httpQuota = CloudUploadController(
+            localeID: "de-DE",
+            ledger: httpQuotaLedger,
+            readSwitch: { rateBox.snapshot },
+            makeClient: { _ in FakeCloud() }
+        )
+        _ = httpQuota.ingest(samples: [Float](repeating: 0.05, count: 32_000), startSeconds: 0, now: now, node: idle)
+        let httpClosed = httpQuota.ingest(samples: [Float](repeating: 0, count: 9_600), startSeconds: 2, now: now, node: idle)
+        if let segment = httpClosed.uploads.first, httpQuota.prepareSend(segment, now: now) != nil {
+            _ = httpQuota.resolveFailure(
+                id: segment.id,
+                error: CloudClientError.httpStatus(429, retryAfter: 3, xGroqID: nil, quota: CloudQuotaHeaders(remainingRequests: 0, resetRequestsS: 100)),
+                now: now,
+                node: idle
+            )
+            check(httpQuotaLedger.usage(at: now).dayRequests == 2_000, "429 错误响应的 remaining 应校正每日额度")
+        } else {
+            check(false, "带配额头的 429 用例应先准备好一段上传")
         }
 
         let invalidLedger = QuotaLedger(url: root.appendingPathComponent("quota-invalid.json"))

@@ -673,10 +673,15 @@ final class SubtitleEngine {
         guard !stale else { return }
         let decision = handleAutoEvent(.cloudSegmentSucceeded)
         // 响应头里的每日剩余请求数：只用来校正 24 小时的计数，不校正分钟窗口。
+        var quotaHeaders: [AnyHashable: Any] = [:]
         if let remaining = result.remainingRequests {
-            try? cloudLedger?.correctRemainingRequests(
-                ["x-ratelimit-remaining-requests": NSNumber(value: remaining)]
-            )
+            quotaHeaders["x-ratelimit-remaining-requests"] = NSNumber(value: remaining)
+        }
+        if let resetSeconds = result.resetRequestsS {
+            quotaHeaders["x-ratelimit-reset-requests"] = "\(resetSeconds)s"
+        }
+        if !quotaHeaders.isEmpty {
+            try? cloudLedger?.correctRemainingRequests(quotaHeaders)
         }
         let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else {
@@ -701,7 +706,17 @@ final class SubtitleEngine {
         }
         guard !stale else { return }
         switch error {
-        case .httpStatus(let status, let retryAfter, _):
+        case .httpStatus(let status, let retryAfter, _, let quota):
+            var quotaHeaders: [AnyHashable: Any] = [:]
+            if let remaining = quota?.remainingRequests {
+                quotaHeaders["x-ratelimit-remaining-requests"] = NSNumber(value: remaining)
+            }
+            if let resetSeconds = quota?.resetRequestsS {
+                quotaHeaders["x-ratelimit-reset-requests"] = "\(resetSeconds)s"
+            }
+            if !quotaHeaders.isEmpty {
+                try? cloudLedger?.correctRemainingRequests(quotaHeaders)
+            }
             applyAutoDecision(handleAutoEvent(.cloudHTTPStatus(status, retryAfter: retryAfter)))
         case .cancelled:
             break

@@ -20,6 +20,7 @@ from realtime_subtitle.remote.cloud_client import (
     CloudCancelled,
     CloudClient,
     CloudError,
+    _reset_requests_seconds,
     config_dir,
     groq_key_path,
     read_groq_key,
@@ -127,7 +128,11 @@ def test_post_is_verbose_json_wav_and_maps_segments_onto_a0(tmp_path, caplog):
     }
     session = FakeSession(FakeResponse(
         200,
-        {"x-groq-id": "req_abc", "x-ratelimit-remaining-requests": "1990"},
+        {
+            "x-groq-id": "req_abc",
+            "x-ratelimit-remaining-requests": "1990",
+            "x-ratelimit-reset-requests": "2m59.56s",
+        },
         payload,
     ))
     client = _client(tmp_path, session)
@@ -136,6 +141,7 @@ def test_post_is_verbose_json_wav_and_maps_segments_onto_a0(tmp_path, caplog):
     assert result.audio_s == 1.0
     assert result.duration_s == 2.5
     assert result.remaining_requests == 1990
+    assert result.reset_requests_s == 179.56
     assert result.groq_id == "req_abc"
     assert [(seg.start, seg.end, seg.text) for seg in result.segments] == [
         (10.25, 10.5, " hallo"),
@@ -166,6 +172,23 @@ def test_post_is_verbose_json_wav_and_maps_segments_onto_a0(tmp_path, caplog):
     assert "status=200" in caplog.text
     assert FAKE_KEY not in caplog.text
     assert "Bearer" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("2m59.56s", 179.56),
+        ("7.66s", 7.66),
+        ("1h2m3s", 3723.0),
+        ("0.5s", 0.5),
+        ("120ms", 0.12),
+        (" abc", None),
+        (None, None),
+        ("", None),
+    ],
+)
+def test_reset_requests_header_parses_only_complete_groq_durations(raw, expected):
+    assert _reset_requests_seconds(raw) == expected
 
 
 def test_float_pcm_is_encoded_as_s16le(tmp_path):
@@ -227,6 +250,7 @@ def test_http_errors_do_not_leak_the_key(tmp_path, caplog, status, reason):
         "x-groq-id": "req_err",
         "retry-after": "12",
         "x-ratelimit-remaining-requests": "10",
+        "x-ratelimit-reset-requests": "120ms",
     }
     session = FakeSession(FakeResponse(status, headers, {"error": FAKE_KEY + " Bearer"}))
     client = _client(tmp_path, session)
@@ -238,6 +262,7 @@ def test_http_errors_do_not_leak_the_key(tmp_path, caplog, status, reason):
     assert err.exc_type == "HTTPStatus"
     assert err.remaining_requests == 10
     assert err.retry_after == 12
+    assert err.reset_requests_s == 0.12
     assert f"status={status}" in caplog.text
     assert f"reason={reason}" in caplog.text
     _assert_clean(caplog, err)
@@ -334,12 +359,13 @@ def test_bad_json_does_not_include_the_body(tmp_path, caplog):
 
     session = BadSession()
     session.status_code = 200
-    session.headers = {"x-groq-id": "req_bad"}
+    session.headers = {"x-groq-id": "req_bad", "x-ratelimit-reset-requests": "7.66s"}
     client = _client(tmp_path, session)
     with pytest.raises(CloudError) as caught:
         client.transcribe(_pcm(0.2), a0=0.0, language="de")
     assert caught.value.reason == "bad_response"
     assert caught.value.exc_type == "ValueError"
+    assert caught.value.reset_requests_s == 7.66
     _assert_clean(caplog, caught.value)
 
 

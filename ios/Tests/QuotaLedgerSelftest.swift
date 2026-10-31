@@ -154,6 +154,99 @@ func runQuotaLedgerSelftest(_ check: @escaping (Bool, String) -> Void) {
         } else {
             check(false, "旧账本兼容用例应能解码")
         }
+
+        let resetCases: [(String?, Double?)] = [
+            ("2m59.56s", 179.56), ("7.66s", 7.66), ("1h2m3s", 3723),
+            ("0.5s", 0.5), ("120ms", 0.12), ("abc", nil), ("", nil),
+            (nil, nil), ("1h 2m", nil), ("5x", nil),
+        ]
+        for (raw, expected) in resetCases {
+            let actual = QuotaLedger.parseResetRequestsSeconds(raw)
+            let matches: Bool
+            if let expected {
+                matches = actual.map { abs($0 - expected) < 1e-9 } ?? false
+            } else {
+                matches = actual == nil
+            }
+            check(matches, "恢复头解析应符合规格：\(raw ?? "nil")")
+        }
+
+        let at1000 = Date(timeIntervalSince1970: 1_000)
+        let unlock = QuotaLedger(url: root.appendingPathComponent("quota-unlock.json"), now: at1000)
+        try unlock.recordRequest(duration: 10, at: at1000)
+        try unlock.correctRemainingRequests([
+            "x-ratelimit-remaining-requests": "5",
+            "x-ratelimit-reset-requests": "100s",
+        ], at: at1000)
+        var resetContext = routeContext(.available)
+        check(unlock.usage(at: at1000).usagePercent >= 90, "恢复前配额应达到冷却阈值")
+        unlock.applyQuotaEvent(to: &resetContext, at: at1000)
+        check(resetContext.cloudState == .cooldownQuota, "恢复前应进入额度冷却")
+        check(unlock.usage(at: at1000.addingTimeInterval(50)).usagePercent >= 90, "恢复点前不应解锁")
+        let afterReset = at1000.addingTimeInterval(101)
+        let afterResetUsage = unlock.usage(at: afterReset)
+        check(afterResetUsage.dayRequests == 0 && afterResetUsage.usagePercent < 80, "恢复点后旧周期日请求应清零")
+        check(afterResetUsage.dayAudioSeconds == 10, "恢复点不应清掉日音频窗口")
+        unlock.applyQuotaEvent(to: &resetContext, at: afterReset)
+        check(resetContext.cloudState == .available, "恢复点后应通过 90/80 滞回解锁")
+
+        let decrease = QuotaLedger(url: root.appendingPathComponent("quota-decrease.json"), now: at1000)
+        try decrease.recordRequest(duration: 10, at: at1000)
+        try decrease.correctRemainingRequests(["x-ratelimit-remaining-requests": "5"], at: at1000)
+        try decrease.recordRequest(duration: 10, at: at1000.addingTimeInterval(30))
+        try decrease.correctRemainingRequests(["x-ratelimit-remaining-requests": "1999"], at: at1000.addingTimeInterval(30))
+        check(decrease.usage(at: at1000.addingTimeInterval(30)).dayRequests == 1_995, "60 秒内更小的服务端用量应被忽略")
+        try decrease.recordRequest(duration: 10, at: at1000.addingTimeInterval(61))
+        try decrease.correctRemainingRequests(["x-ratelimit-remaining-requests": "1999"], at: at1000.addingTimeInterval(61))
+        check(decrease.usage(at: at1000.addingTimeInterval(61)).dayRequests == 3, "60 秒后更小的服务端用量应被接受")
+
+        let baselineURL = root.appendingPathComponent("quota-baseline.json")
+        let baseline = QuotaLedger(url: baselineURL, now: at1000)
+        try baseline.recordRequest(duration: 10, at: at1000)
+        try baseline.correctRemainingRequests([
+            "x-ratelimit-remaining-requests": "5",
+            "x-ratelimit-reset-requests": "100s",
+        ], at: at1000)
+        try baseline.recordRequest(duration: 10, at: afterReset)
+        try baseline.correctRemainingRequests(["x-ratelimit-remaining-requests": "1900"], at: afterReset)
+        check(baseline.usage(at: afterReset).dayRequests == 100, "恢复后无恢复头的 remaining 应成为新周期基线")
+        let baselineReloaded = QuotaLedger(url: baselineURL, now: afterReset.addingTimeInterval(1))
+        check(baselineReloaded.usage(at: afterReset.addingTimeInterval(1)).dayRequests == 100, "已消费恢复点应持久化，重载后不得重算旧本地事件")
+
+        let at2000 = Date(timeIntervalSince1970: 2_000)
+        let persistedURL = root.appendingPathComponent("quota-reset-persisted.json")
+        let persisted = QuotaLedger(url: persistedURL, now: at2000)
+        try persisted.recordRequest(duration: 10, at: at2000)
+        try persisted.correctRemainingRequests([
+            "x-ratelimit-remaining-requests": "5",
+            "x-ratelimit-reset-requests": "100s",
+        ], at: at2000)
+        let persistedJSON = try JSONSerialization.jsonObject(with: Data(contentsOf: persistedURL)) as? [String: Any]
+        check(persistedJSON?["server_reset_at"] as? Double == 2_100, "恢复时刻应写入 server_reset_at")
+        let persistedReloaded = QuotaLedger(url: persistedURL, now: at2000.addingTimeInterval(50))
+        check(persistedReloaded.usage(at: at2000.addingTimeInterval(50)).dayRequests == 1_995, "恢复前重载应保留校正")
+        check(persistedReloaded.usage(at: at2000.addingTimeInterval(101)).dayRequests == 0, "恢复后重载应清零")
+
+        let oldFormatURL = root.appendingPathComponent("quota-old-format.json")
+        try Data(#"{"events":[{"ts":1000,"billed_s":10}],"request_corrections":[{"ts":1000,"used_requests":3}]}"#.utf8).write(to: oldFormatURL)
+        let oldFormat = QuotaLedger(url: oldFormatURL, now: at1000)
+        check(oldFormat.usage(at: at1000).dayRequests == 3, "没有新字段的旧账本应照常读取")
+        check(!FileManager.default.fileExists(atPath: oldFormatURL.appendingPathExtension("corrupt").path), "旧账本不应生成 corrupt")
+        let missingKeysURL = root.appendingPathComponent("quota-missing-keys.json")
+        try Data("{}".utf8).write(to: missingKeysURL)
+        check(QuotaLedger(url: missingKeysURL, now: at1000).usage(at: at1000).usagePercent == 100, "缺 events 键的账本应隔离并饱和")
+
+        let override = QuotaLedger(url: root.appendingPathComponent("quota-reset-override.json"), now: at1000)
+        try override.correctRemainingRequests([
+            "x-ratelimit-remaining-requests": "5",
+            "x-ratelimit-reset-requests": "100s",
+        ], at: at1000)
+        try override.correctRemainingRequests([
+            "x-ratelimit-remaining-requests": "5",
+            "x-ratelimit-reset-requests": "200s",
+        ], at: at1000.addingTimeInterval(10))
+        check(override.usage(at: at1000.addingTimeInterval(101)).usagePercent >= 90, "最新恢复头应覆盖旧恢复点")
+        check(override.usage(at: at1000.addingTimeInterval(211)).dayRequests == 0, "最新恢复点后应清零")
     } catch {
         check(false, "QuotaLedger selftest 异常：\(error)")
     }
