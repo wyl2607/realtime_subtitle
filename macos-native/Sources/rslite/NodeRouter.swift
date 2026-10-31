@@ -803,8 +803,8 @@ final class NodeRouter: @unchecked Sendable {
                     currentClient,
                     currentSession,
                     connectingClient,
-                    connectingSession,
-                    connectingSession != nil && connectingReplaySession == connectingSession
+                    self.connectingSession,
+                    self.connectingSession != nil && connectingReplaySession == self.connectingSession
                 )
             }
             do {

@@ -1053,7 +1053,7 @@ final class SubtitleEngine {
 
         // 自动档在本机/云端时已在上面 return，故节点 ready 后的缓冲只含真正走节点的音频，
         // 不会把本机已经处理过的语音再发一次。
-        let currentSession = stateQueue.sync { session }
+        let currentSession = stateQueue.sync { self.session }
         guard let session = currentSession else {
             // 还没有会话：这些帧白转了，计入丢弃。
             stateQueue.sync { preReadyDropped &+= UInt64(frames.count) }
