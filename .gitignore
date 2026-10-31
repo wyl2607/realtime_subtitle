@@ -33,6 +33,7 @@ uv.lock
 .stop
 transcripts/
 downloads/
+/dist/
 subtitle.err.log
 window_state.json
 window_state.json.tmp

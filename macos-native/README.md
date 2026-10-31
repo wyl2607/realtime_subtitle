@@ -1,5 +1,9 @@
 # rsbench
 
+## 打包成 .app
+
+`bash scripts/macos/build_rslite_app.sh` 会产出 `dist/macos/rslite.app`（同目录还有 `rslite-<版本>-macos-arm64.zip` 和对应的 `.sha256`）。把 `rslite.app` 拖进「应用程序」后双击即可，菜单栏会出现「字·…」，没有 Dock 图标（LSUIElement）。需要 macOS 27+、Apple Silicon 和 Xcode（swift 工具链）。只做了 ad-hoc 签名、**没有公证**（没有付费开发者账号）：本机构建的 .app 直接能开；从别处下载的 zip 首次打开会被 Gatekeeper 拦——macOS 15 起 Control/右键→打开 已不再能绕过，要去「系统设置 → 隐私与安全性」点「仍要打开」，或在终端运行 `xattr -dr com.apple.quarantine /Applications/rslite.app`。首次启动会弹「系统音频录制」（抓系统声音，Process Tap）权限，麦克风模式会弹「麦克风」权限；每次重新构建后系统可能再次询问（ad-hoc 签名）。从源码运行的旧方式仍然可用：`cd macos-native && swift build -c release`，然后 `.build/release/rslite`。
+
 ```bash
 cd macos-native && swift build -c release
 python ../scripts/bench/native_export.py --parquet ../rs-mac-native-data/fleurs_de_80.parquet --n 60 --wav-dir /tmp/rs-wav --refs /tmp/rs-refs.jsonl

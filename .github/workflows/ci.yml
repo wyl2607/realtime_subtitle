@@ -173,6 +173,8 @@ jobs:
             *"SELFTEST OK"*) echo "rslite selftest: OK" ;;
             *) echo "::error::rslite --selftest 未输出 SELFTEST OK"; exit 1 ;;
           esac
+      - name: Build rslite.app
+        run: bash scripts/macos/build_rslite_app.sh --out dist/macos
       - name: Check design tokens are up to date
         run: python3 scripts/design/gen_tokens.py --check
 
