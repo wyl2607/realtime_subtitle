@@ -490,11 +490,14 @@ final class SubtitleEngine {
 
     /// 把云端的事实喂给路由状态机（key/开关变了要在这里反映出来）。
     private func updateCloudAvailability(_ availability: CloudAvailability) {
+        let key = SharedKeychain.readGroqKey()
         // key 换了：客户端要换（Authorization 头里带的是旧 key）。
-        if let key = SharedKeychain.readGroqKey(), key.hashValue != cloudKeyRevision {
+        if let key, key.hashValue != cloudKeyRevision {
             rotateCloudClient(key: key)
         }
         let outcome = stateQueue.sync { () -> (AutoFallbackDecision?, Bool) in
+            // 关闭云端或清空 key 时也先作废恢复证明，不能等重新上传才观察身份。
+            try? cloudLedger?.bindKeyFingerprint(key.map { CloudClient.keyFingerprint($0) })
             guard engineMode == "auto", var fallback = autoFallback else { return (nil, false) }
             let result = fallback.updateCloud(availability)
             autoFallback = fallback
@@ -517,14 +520,18 @@ final class SubtitleEngine {
     /// 顺序不能反——先换的话取消会落到新客户端上，旧 key 的迟到 401 还能把新 key 打成无效。
     private func rotateCloudClient(key: String) {
         let old = cloudClient
-        if HandoffRules.keyRotated(clientRevision: old == nil ? nil : cloudKeyRevision, keyRevision: key.hashValue) {
-            stateQueue.sync {
+        let rotated = HandoffRules.keyRotated(clientRevision: old == nil ? nil : cloudKeyRevision, keyRevision: key.hashValue)
+        stateQueue.sync {
+            if rotated {
                 cloudGeneration &+= 1
                 cloudUploadBusy = false
                 cloudProbeUsed = false
             }
-            old?.cancelInflightRequests()
+            // 跟代次推进共用串行边界；回调校验与额度记账也在这条队列上。
+            try? cloudLedger?.bindKeyFingerprint(CloudClient.keyFingerprint(key))
         }
+        if rotated { old?.cancelInflightRequests() }
+        // 换 key 的事实在发送前已经确定，不能等 B 回包才废弃 A 的翻日证明。
         cloudClient = CloudClient(key: key)
         cloudKeyRevision = key.hashValue
     }
@@ -541,7 +548,9 @@ final class SubtitleEngine {
             rotateCloudClient(key: key)
         }
         if cloudLedger == nil {
-            cloudLedger = QuotaLedger(url: Self.quotaLedgerURL())
+            cloudLedger = QuotaLedger(
+                url: Self.quotaLedgerURL(), activeKeyFingerprint: CloudClient.keyFingerprint(key)
+            )
         }
         if cloudSegmenter == nil {
             cloudSegmenter = CloudSegmenter()
@@ -621,68 +630,73 @@ final class SubtitleEngine {
         if skip { return }
 
         // 额度记账：每请求按 max(10, 时长) 计费（规则在 QuotaLedger 里）。
-        _ = try? ledger.recordRequest(duration: segment.duration)
-        // 额度百分比喂给路由状态机（90% 进冷却、80% 以下才恢复的滞回在 Routing.swift 里）。
-        let percent = ledger.usage().usagePercent
+        let requestID = UUID().uuidString
+        _ = try? ledger.recordRequest(duration: segment.duration, requestID: requestID)
+        // 额度事件喂给路由状态机（90% 进冷却、80% 以下才恢复的滞回在 Routing.swift 里）。
+        // 可信翻日刚成立且此前进过冷却时，routeEvent 返回 quota_reset_confirmed，
+        // 直接原样应用，保留 type 让路由状态机按 <80% 滞回放行。
+        let quotaEvent = ledger.routeEvent()
         let quotaDecision = stateQueue.sync { () -> AutoFallbackDecision? in
             guard var fallback = autoFallback else { return nil }
-            let result = fallback.applyQuotaUsage(percent)
+            let result = fallback.applyRouteEvent(quotaEvent)
             autoFallback = fallback
             return result
         }
-        if let quotaDecision {
-            applyAutoDecision(quotaDecision)
-        }
-
-        let generation = stateQueue.sync { cloudGeneration }
-        let language = cloudLanguage
-        stateQueue.sync {
-            cloudUploadBusy = true
-            cloudUploadedSegments += 1
-        }
-        Task { [weak self] in
-            do {
-                let result = try await client.transcribe(
-                    pcm16Mono16k: segment.pcm16,
-                    a0: segment.audioOrigin,
-                    duration: segment.duration,
-                    language: language,
-                    segmentID: segment.id
-                )
-                self?.handleCloudSuccess(result, segment: segment, generation: generation)
-            } catch let error as CloudClientError {
-                self?.handleCloudFailure(error, generation: generation)
-            } catch {
-                self?.handleCloudFailure(.network("unknown"), generation: generation)
+        CloudUploadGate.submit(
+            applyDecision: { if let quotaDecision { self.applyAutoDecision(quotaDecision) } },
+            cloudIsActive: { self.stateQueue.sync { self.autoFallback?.usingCloud == true } },
+            send: {
+                let generation = self.stateQueue.sync { self.cloudGeneration }
+                let language = self.cloudLanguage
+                self.stateQueue.sync {
+                    self.cloudUploadBusy = true
+                    self.cloudUploadedSegments += 1
+                }
+                Task { [weak self] in
+                    do {
+                        let result = try await client.transcribe(
+                            pcm16Mono16k: segment.pcm16,
+                            a0: segment.audioOrigin,
+                            duration: segment.duration,
+                            language: language,
+                            segmentID: segment.id
+                        )
+                        self?.handleCloudSuccess(result, segment: segment, generation: generation, requestID: requestID)
+                    } catch let error as CloudClientError {
+                        self?.handleCloudFailure(error, generation: generation, requestID: requestID)
+                    } catch {
+                        self?.handleCloudFailure(.network("unknown"), generation: generation, requestID: requestID)
+                    }
+                }
             }
-        }
+        )
     }
 
     /// 云端回了结果：喂状态机 → 按 P5 覆盖本机句 → 上屏 → 本机翻译。
     private func handleCloudSuccess(
         _ result: CloudTranscriptionResult,
         segment: EmittedCloudSegment,
-        generation: UInt64
+        generation: UInt64,
+        requestID: String
     ) {
         // 先判作废：旧代次（换过 key / 关过开关）的结果不进路由状态机、不记额度、不上屏。
         let stale = stateQueue.sync { () -> Bool in
             let stale = HandoffRules.isStaleCloudResponse(requestGeneration: generation, currentGeneration: cloudGeneration)
-            if !stale { cloudUploadBusy = false }
+            if !stale {
+                cloudUploadBusy = false
+                // 校验与记账不能被换 key 插入；每日头只校正 24h，不校正分钟窗口。
+                try? cloudLedger?.observeResponse(
+                    remainingRequests: result.remainingRequests,
+                    resetRequestsSeconds: result.resetRequestsS,
+                    keyFingerprint: result.keyFingerprint,
+                    sentAt: result.sentAt.map { Date(timeIntervalSince1970: $0) },
+                    requestID: requestID
+                )
+            }
             return stale
         }
         guard !stale else { return }
         let decision = handleAutoEvent(.cloudSegmentSucceeded)
-        // 响应头里的每日剩余请求数：只用来校正 24 小时的计数，不校正分钟窗口。
-        var quotaHeaders: [AnyHashable: Any] = [:]
-        if let remaining = result.remainingRequests {
-            quotaHeaders["x-ratelimit-remaining-requests"] = NSNumber(value: remaining)
-        }
-        if let resetSeconds = result.resetRequestsS {
-            quotaHeaders["x-ratelimit-reset-requests"] = "\(resetSeconds)s"
-        }
-        if !quotaHeaders.isEmpty {
-            try? cloudLedger?.correctRemainingRequests(quotaHeaders)
-        }
         let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else {
             applyAutoDecision(decision)
@@ -697,32 +711,50 @@ final class SubtitleEngine {
 
     /// 云端这一段失败：HTTP 状态码喂给状态机（401/429/5xx 各自的规则在 Routing.swift 里），
     /// 其余按段失败处理。
-    private func handleCloudFailure(_ error: CloudClientError, generation: UInt64) {
+    private func handleCloudFailure(_ error: CloudClientError, generation: UInt64, requestID: String) {
         let stale = stateQueue.sync { () -> Bool in
             let stale = HandoffRules.isStaleCloudResponse(requestGeneration: generation, currentGeneration: cloudGeneration)
             // 旧代次的回执不能清 busy：那会放行新 key 的第二段并发上传。作废时 busy 已在推进代次处清掉。
-            if !stale { cloudUploadBusy = false }
+            if !stale {
+                cloudUploadBusy = false
+                if case .httpStatus(_, _, _, let quota) = error {
+                    try? cloudLedger?.observeResponse(
+                        remainingRequests: quota?.remainingRequests,
+                        resetRequestsSeconds: quota?.resetRequestsS,
+                        keyFingerprint: quota?.keyFingerprint,
+                        sentAt: quota?.sentAt.map { Date(timeIntervalSince1970: $0) },
+                        requestID: requestID
+                    )
+                }
+            }
             return stale
         }
         guard !stale else { return }
         switch error {
-        case .httpStatus(let status, let retryAfter, _, let quota):
-            var quotaHeaders: [AnyHashable: Any] = [:]
-            if let remaining = quota?.remainingRequests {
-                quotaHeaders["x-ratelimit-remaining-requests"] = NSNumber(value: remaining)
-            }
-            if let resetSeconds = quota?.resetRequestsS {
-                quotaHeaders["x-ratelimit-reset-requests"] = "\(resetSeconds)s"
-            }
-            if !quotaHeaders.isEmpty {
-                try? cloudLedger?.correctRemainingRequests(quotaHeaders)
-            }
+        case .httpStatus(let status, let retryAfter, _, _):
             applyAutoDecision(handleAutoEvent(.cloudHTTPStatus(status, retryAfter: retryAfter)))
         case .cancelled:
             break
         case .network, .invalidResponse, .decodeFailed:
             applyAutoDecision(handleAutoEvent(.cloudSegmentFailed))
         }
+    }
+
+    /// 周期轮询账本：限流等待中也要锁住耗尽额度，恢复证明仍只在额度冷却时消费。
+    private func pollLedgerQuotaReset() {
+        guard let ledger = cloudLedger else { return }
+        let keyFingerprint = SharedKeychain.readGroqKey().map { CloudClient.keyFingerprint($0) }
+        let decision = stateQueue.sync { () -> AutoFallbackDecision? in
+            try? ledger.bindKeyFingerprint(keyFingerprint)
+            guard var fallback = autoFallback else { return nil }
+            let result = fallback.pollQuota(
+                usage: { ledger.usage().usagePercent },
+                confirmedReset: { ledger.takeConfirmedReset() }
+            )
+            autoFallback = fallback
+            return result
+        }
+        if let decision { applyAutoDecision(decision) }
     }
 
     /// 云端这一句上屏：按 P5 当远程行处理（来源 cloud:groq），覆盖同一时段的本机句。
@@ -1021,8 +1053,10 @@ final class SubtitleEngine {
             lastStatusWriteTime = now
             // 冷却到点 → 试探一次；顺带看一眼开关/key 是不是被用户改了。
             if engineMode == "auto" {
-                handleAutoTick()
                 refreshCloudAvailability()
+                // 先锁住耗尽额度，再处理 retry-after 到期，避免短暂启动一个仍不能上传的 probe。
+                pollLedgerQuotaReset()
+                handleAutoTick()
             }
         }
 
