@@ -88,6 +88,31 @@ final class TranscriptStore: ObservableObject {
         "\(session)#\(id)"
     }
 
+    /// 搜索框的纯逻辑过滤：空查询原样返回；否则原文或译文命中即保留。
+    /// 用 diacriticInsensitive 是因为德语用户常把 ä/ö/ü 打成 a/o/u。
+    static func filter(_ lines: [Line], query: String) -> [Line] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return lines }
+        return lines.filter { line in
+            line.src.range(of: trimmed, options: [.caseInsensitive, .diacriticInsensitive]) != nil
+                || line.dst.range(of: trimmed, options: [.caseInsensitive, .diacriticInsensitive]) != nil
+        }
+    }
+
+    /// 「复制全部」用的纯文本：时间 + 原文一行，译文另起一行；没有译文就只留原文。
+    /// 句与句之间空一行，贴到聊天/笔记里能直接读。
+    static func plainText(_ lines: [Line]) -> String {
+        lines
+            .map { line in
+                var text = "\(line.time)  \(line.src)"
+                if !line.dst.isEmpty {
+                    text += "\n\(line.dst)"
+                }
+                return text
+            }
+            .joined(separator: "\n\n")
+    }
+
     /// 喂入 Keychain 里当前的最近句对。同一句（同键）会被合并，译文后到会原地更新。
     func ingest(_ sentences: [Sentence]) {
         guard !sentences.isEmpty else { return }

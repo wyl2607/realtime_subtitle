@@ -10,6 +10,14 @@ import UniformTypeIdentifiers
 import Speech
 import Translation
 
+/// 设置页的四个目的页。用枚举而不是字符串，`navigationDestination` 才能按类型精确分派。
+enum SettingsRoute: Hashable {
+    case style
+    case recognition
+    case node
+    case diagnostics
+}
+
 struct ContentView: View {
     @StateObject private var pipManager = PiPManager()
     @StateObject private var statusMonitor = StatusMonitor()
@@ -42,6 +50,18 @@ struct ContentView: View {
     /// 每次收到新句对就 +1：「今天的字幕」页面靠它触发重新读存档文件。
     @State private var transcriptRefresh = 0
 
+    @State private var selectedTab = 0
+    @State private var settingsPath: [SettingsRoute] = []
+    /// 状态行只在档位信息存在时更新；解析返回 nil（如 started）时保留上一次，
+    /// 否则状态词会每秒闪一下空白。
+    @State private var statusSummary: StatusSummary?
+    /// 字幕样式存 UserDefaults：扩展和画中画都要读同一份，不能只活在主 App 内存里。
+    @AppStorage("subtitleStyle") private var subtitleStyleData: Data = Data()
+
+    private var subtitleStyle: SubtitleStyle {
+        SubtitleStyle.load(from: subtitleStyleData.isEmpty ? nil : subtitleStyleData)
+    }
+
     private var micStatusText: String {
         switch micCapture.state {
         case .idle:
@@ -70,351 +90,509 @@ struct ContentView: View {
 
     var body: some View {
         wrapped(
-        NavigationStack {
-            // 内容比一屏高：必须能滚动。没有 ScrollView 时 VStack 居中溢出，顶部的 Broadcast 按钮、
-            // 配对输入框被裁到状态栏后面，用户既滑不动也点不到（iPhone 15 Pro 真机复现）。
-            ScrollView {
-                VStack(spacing: 24) {
-                    Text("RSiOS Spike")
-                        .font(.largeTitle)
-                        .fontWeight(.bold)
+            TabView(selection: $selectedTab) {
+                NavigationStack {
+                    // 内容比一屏高：必须能滚动。没有 ScrollView 时 VStack 居中溢出，顶部的 Broadcast 按钮、
+                    // 配对输入框被裁到状态栏后面，用户既滑不动也点不到（iPhone 15 Pro 真机复现）。
+                    ScrollView {
+                        VStack(spacing: DesignTokens.Space.l) {
+                            SubtitleCardView(
+                                lines: linesMonitor.lines,
+                                style: subtitleStyle,
+                                status: statusSummary
+                            )
 
-                    VStack(spacing: 12) {
-                        Text("Broadcast Extension Picker")
-                            .font(.headline)
-                        BroadcastPickerView()
-                            .frame(width: 60, height: 60)
-                        Text("点上面的圆形按钮 → 选「实时字幕」→ 开始直播")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    VStack(spacing: 12) {
-                        Text(DesignTokens.Text.micSubtitleTitle)
-                            .font(.headline)
-                        HStack {
-                            Button(DesignTokens.Text.micStartButton) {
-                                micCapture.start(
-                                    extensionStatus: statusMonitor.keychainStatus,
-                                    extensionStatusUpdatedAt: statusMonitor.lastStatusUpdate
-                                )
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .disabled(micCapture.isRunning)
-
-                            Button(DesignTokens.Text.micStopButton) {
-                                micCapture.stop()
-                            }
-                            .buttonStyle(.bordered)
-                            .disabled(!micCapture.isRunning)
-                        }
-                        Text(micStatusText)
-                            .font(.caption)
-                            .foregroundStyle(micStatusColor)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        if let speechDenied = micCapture.speechDeniedHint {
-                            Text(speechDenied)
-                                .font(.caption)
-                                .foregroundColor(.red)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                    }
-
-                    Divider()
-
-                    VStack(spacing: 12) {
-                        Text("节点配对")
-                            .font(.headline)
-
-                        HStack {
-                            TextField("粘贴 rsnode://pair?... 链接", text: $pairingLinkText)
-                                .textFieldStyle(.roundedBorder)
-                                .autocapitalization(.none)
-                                .disableAutocorrection(true)
-
-                            Button("粘贴配对链接") {
-                                if let pasteboard = UIPasteboard.general.string {
-                                    pairingLinkText = pasteboard
-                                }
-                            }
-                            .buttonStyle(.bordered)
-                        }
-
-                        Button("应用配对") {
-                            applyPairingLink()
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(pairingLinkText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-
-                        if !pairingStatus.isEmpty {
-                            Text(pairingStatus)
-                                .font(.caption)
-                                .foregroundColor(pairingStatus.hasPrefix("已配对") ? .green : .red)
-                        }
-
-                        if !pairedConfigDisplay.isEmpty {
-                            Text("已配对：\(pairedConfigDisplay)")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-
-                    Divider()
-
-                    VStack(spacing: 12) {
-                        Text("识别引擎")
-                            .font(.headline)
-
-                        Picker("引擎", selection: $engineMode) {
-                            Text("自动").tag("auto")
-                            Text("电脑节点").tag("node")
-                            Text("本机").tag("local")
-                        }
-                        .pickerStyle(.segmented)
-                        .onChange(of: engineMode) { _, newValue in
-                            // 档位只进 Keychain；写失败时不能让界面看起来像已经生效。
-                            engineModeSaveFailed = !SharedKeychain.writeEngineMode(newValue)
-                        }
-                        .onAppear {
-                            engineMode = SharedKeychain.readEngineMode()
-                        }
-
-                        if engineModeSaveFailed {
-                            Text("保存引擎档位失败，请重试")
-                                .font(.caption)
-                                .foregroundColor(.red)
-                        }
-
-                        // 只有启动后真的换过档位才提示：否则麦克风一开就常驻这句话，
-                        // 用户会以为自己刚改了什么。
-                        if micCapture.isRunning,
-                           let startedMode = micCapture.startedEngineMode,
-                           startedMode != engineMode {
-                            Text("麦克风停止后重新开始才生效")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-
-                        Button(action: prepareLocalAssets) {
-                            HStack {
-                                if isPreparing {
-                                    ProgressView().scaleEffect(0.8)
-                                }
-                                Text(isPreparing ? "准备中..." : "准备本机识别资源")
-                            }
-                            .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(isPreparing)
-
-                        if !prepareStatus.isEmpty {
-                            Text(prepareStatus)
-                                .font(.caption)
-                                .foregroundColor(prepareStatus.hasPrefix("错误") || prepareStatus.hasPrefix("需要") ? .red : .green)
-                        }
-
-                        if let speechDenied = prepareSpeechDeniedHint {
-                            Text(speechDenied)
-                                .font(.caption)
-                                .foregroundColor(.red)
-                        }
-                    }
-
-                    Divider()
-
-                    VStack(spacing: 12) {
-                        Text("云端识别（Groq）")
-                            .font(.headline)
-
-                        if groqKeyMasked.isEmpty {
-                            SecureField("Groq API key", text: $groqKeyInput)
-                                .textFieldStyle(.roundedBorder)
-                                .autocapitalization(.none)
-                                .disableAutocorrection(true)
-
-                            Button("保存 key") {
-                                saveGroqKey()
-                            }
-                            .buttonStyle(.bordered)
-                            .disabled(groqKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                        } else {
-                            HStack {
-                                Text("已保存：\(groqKeyMasked)")
+                            // 本机引擎失败时把原始码映射成可读提示（纯逻辑，不删原状态行）。
+                            if let localMsg = LocalEngineStatus.userMessage(forStatusLine: statusMonitor.keychainStatus) {
+                                Text(localMsg)
                                     .font(.caption)
-                                    .foregroundColor(.secondary)
-                                Spacer()
-                                Button("清除 key") {
-                                    clearGroqKey()
-                                }
-                                .buttonStyle(.bordered)
-                            }
-                        }
-
-                        Toggle("启用云端识别", isOn: $cloudEnabled)
-                            .onChange(of: cloudEnabled) { _, newValue in
-                                SharedKeychain.writeCloudEnabled(newValue)
+                                    .foregroundColor(.red)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
                             }
 
-                        if !cloudKeyStatus.isEmpty {
-                            Text(cloudKeyStatus)
-                                .font(.caption)
-                                .foregroundColor(cloudKeyStatus.hasPrefix("已保存") ? .green : .red)
-                        }
+                            broadcastSection
+                            micSection
+                            pipSection
 
-                        Text("开着时音频片段会发给 Groq；关掉后只走电脑节点和本机。")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-
-                    Divider()
-
-                    VStack(spacing: 12) {
-                        Text("App State: \(appStateMonitor.isInBackground ? "后台" : "前台")")
-                            .font(.headline)
-                            .foregroundColor(appStateMonitor.isInBackground ? .orange : .green)
-
-                        Text("Picture-in-Picture")
-                            .font(.headline)
-
-                        PiPHostView(pipManager: pipManager)
-                            .frame(width: 320, height: 90)
-                            .background(Color(.systemGray6))
-                            .cornerRadius(8)
-
-                        Button(action: {
-                            if pipManager.isPiPActive {
-                                pipManager.stopPiP()
-                            } else {
-                                pipManager.startPiP()
+                            NavigationLink("查看今天的字幕") {
+                                TranscriptView(store: transcriptStore, refreshToken: transcriptRefresh)
                             }
-                        }) {
-                            Text(pipManager.isPiPActive ? "Stop PiP" : "Start PiP")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(pipManager.isStarting)
+                            .buttonStyle(.bordered)
 
-                        HStack {
-                            Text("PiP Possible: \(pipManager.isPictureInPicturePossible ? "Yes" : "No")")
-                                .font(.caption)
-                                .foregroundColor(pipManager.isPictureInPicturePossible ? .green : .red)
                             Spacer()
-                            Text(pipManager.pipStatusLine)
-                                .font(.caption)
-                                .foregroundColor(.secondary)
                         }
+                        .padding()
+                    }
+                    .scrollDismissesKeyboard(.interactively)
+                    .navigationTitle("实时字幕")
+                    .onAppear {
+                        self.loadPairedConfig()
+                        self.loadCloudSettings()
+                    }
+                    // 相机扫配对码 / 点 rsnode://pair 链接：只把链接填进配对框，用户点「应用配对」才写入钥匙串。
+                    // 顺手切到设置里的配对页，省得用户在字幕页找不到输入框。
+                    .onOpenURL { url in
+                        guard let text = PairingLink.prefillText(for: url) else { return }
+                        self.pairingLinkText = text
+                        self.pairingStatus = "已填入配对链接，确认后点「应用配对」"
+                        self.selectedTab = 1
+                        self.settingsPath = [.node]
+                    }
+                    .onReceive(linesMonitor.$lines) { lines in
+                        self.transcriptStore.ingest(lines.map {
+                            TranscriptStore.Sentence(id: $0.id, session: $0.session, src: $0.src, dst: $0.dst)
+                        })
+                        self.transcriptRefresh += 1
+                    }
+                }
+                .tabItem {
+                    Label("字幕", systemImage: "captions.bubble")
+                }
+                .tag(0)
 
-                        if let error = pipManager.lastError {
-                            Text("Error: \(error)")
-                                .font(.caption)
-                                .foregroundColor(.red)
+                NavigationStack(path: $settingsPath) {
+                    List {
+                        NavigationLink("字幕样式", value: SettingsRoute.style)
+                        NavigationLink("识别与语言", value: SettingsRoute.recognition)
+                        NavigationLink("算力节点", value: SettingsRoute.node)
+                        Section {
+                            NavigationLink("诊断", value: SettingsRoute.diagnostics)
                         }
                     }
-
-                    Divider()
-
-                    VStack(spacing: 8) {
-                        Text("Extension Status (Keychain)")
-                            .font(.headline)
-                        Text(statusMonitor.keychainStatus)
-                            .font(.system(.body, design: .monospaced))
-                            .foregroundColor(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding()
-                            .background(Color(.systemGray6))
-                            .cornerRadius(8)
+                    .navigationTitle("设置")
+                    .navigationDestination(for: SettingsRoute.self) { route in
+                        switch route {
+                        case .style:
+                            self.styleSettings
+                        case .recognition:
+                            self.recognitionSettings
+                        case .node:
+                            self.nodeSettings
+                        case .diagnostics:
+                            self.diagnostics
+                        }
                     }
+                }
+                .tabItem {
+                    Label("设置", systemImage: "gearshape")
+                }
+                .tag(1)
+            }
+            .onReceive(statusMonitor.$lastStatusUpdate) { updatedAt in
+                self.micCapture.reconcileBroadcast(
+                    extensionStatus: self.statusMonitor.keychainStatus,
+                    extensionStatusUpdatedAt: updatedAt
+                )
+            }
+            .onReceive(statusMonitor.$keychainStatus) { line in
+                if let summary = StatusSummaryParser.summary(forStatusLine: line) {
+                    self.statusSummary = summary
+                }
+            }
+        )
+    }
 
-                    // 本机引擎失败时把原始码映射成可读提示（纯逻辑，不删原状态行）。
-                    if let localMsg = LocalEngineStatus.userMessage(forStatusLine: statusMonitor.keychainStatus) {
-                        Text(localMsg)
+    @ViewBuilder
+    private var broadcastSection: some View {
+        VStack(spacing: DesignTokens.Space.m) {
+            Text("屏幕广播")
+                .font(.headline)
+            BroadcastPickerView()
+                .frame(width: 60, height: 60)
+            Text("点上面的圆形按钮 → 选「实时字幕」→ 开始直播")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    @ViewBuilder
+    private var micSection: some View {
+        VStack(spacing: DesignTokens.Space.m) {
+            Text(DesignTokens.Text.micSubtitleTitle)
+                .font(.headline)
+            HStack {
+                Button(DesignTokens.Text.micStartButton) {
+                    self.micCapture.start(
+                        extensionStatus: self.statusMonitor.keychainStatus,
+                        extensionStatusUpdatedAt: self.statusMonitor.lastStatusUpdate
+                    )
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(self.micCapture.isRunning)
+
+                Button(DesignTokens.Text.micStopButton) {
+                    self.micCapture.stop()
+                }
+                .buttonStyle(.bordered)
+                .disabled(!self.micCapture.isRunning)
+            }
+            Text(self.micStatusText)
+                .font(.caption)
+                .foregroundStyle(self.micStatusColor)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if let speechDenied = self.micCapture.speechDeniedHint {
+                Text(speechDenied)
+                    .font(.caption)
+                    .foregroundColor(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var pipSection: some View {
+        VStack(spacing: DesignTokens.Space.m) {
+            Text("画中画")
+                .font(.headline)
+
+            PiPHostView(pipManager: self.pipManager)
+                .frame(width: 320, height: 90)
+                .background(Color(.systemGray6))
+                .cornerRadius(8)
+
+            Button {
+                if self.pipManager.isPiPActive {
+                    self.pipManager.stopPiP()
+                } else {
+                    self.pipManager.startPiP()
+                }
+            } label: {
+                Text(self.pipManager.isPiPActive ? "关闭画中画" : "开启画中画")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(self.pipManager.isStarting)
+
+            if let error = self.pipManager.lastError {
+                Text("Error: \(error)")
+                    .font(.caption)
+                    .foregroundColor(.red)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var styleSettings: some View {
+        Form {
+            Section {
+                SubtitleCardView(
+                    lines: [
+                        RecentLine(
+                            id: 0,
+                            src: "Guten Abend, meine Damen und Herren.",
+                            dst: "女士们先生们，晚上好。",
+                            session: "preview"
+                        ),
+                        RecentLine(
+                            id: 1,
+                            src: "Willkommen bei den Echtzeit-Untertiteln.",
+                            dst: "",
+                            session: "preview"
+                        ),
+                    ],
+                    style: self.subtitleStyle,
+                    status: self.statusSummary,
+                    maxPairs: 2
+                )
+                .listRowInsets(EdgeInsets())
+                .listRowBackground(Color.clear)
+            }
+
+            Section("字号") {
+                HStack {
+                    Slider(
+                        value: self.fontSizeBinding,
+                        in: DesignTokens.TypeScale.subtitleMin...DesignTokens.TypeScale.subtitleMax,
+                        step: 1
+                    )
+                    Text("\(Int(self.subtitleStyle.fontSize))")
+                        .font(.system(.body, design: .monospaced))
+                        .frame(width: 40, alignment: .trailing)
+                }
+            }
+
+            Section("原文颜色") {
+                self.colorSwatches(
+                    DesignTokens.Palette.text,
+                    selectedHex: self.subtitleStyle.sourceHex
+                ) { hex in
+                    self.updateStyle { $0.sourceHex = hex }
+                }
+            }
+
+            Section("译文颜色") {
+                self.colorSwatches(
+                    DesignTokens.Palette.text,
+                    selectedHex: self.subtitleStyle.translationHex
+                ) { hex in
+                    self.updateStyle { $0.translationHex = hex }
+                }
+            }
+
+            Section("背景颜色") {
+                self.colorSwatches(
+                    DesignTokens.Palette.background,
+                    selectedHex: self.subtitleStyle.backgroundHex
+                ) { hex in
+                    self.updateStyle { $0.backgroundHex = hex }
+                }
+            }
+
+            Section("背景不透明度") {
+                Slider(value: self.backgroundOpacityBinding, in: 0.2...1.0)
+            }
+
+            Section {
+                Button("恢复默认") {
+                    self.subtitleStyleData = SubtitleStyle.standard.clamped().encoded() ?? Data()
+                }
+            }
+        }
+        .navigationTitle("字幕样式")
+    }
+
+    @ViewBuilder
+    private var recognitionSettings: some View {
+        Form {
+            Section("语言") {
+                Text("德语 → 中文")
+                    .foregroundColor(.secondary)
+            }
+
+            Section("识别引擎") {
+                Picker("引擎", selection: $engineMode) {
+                    Text("自动").tag("auto")
+                    Text("电脑节点").tag("node")
+                    Text("本机").tag("local")
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: engineMode) { _, newValue in
+                    // 档位只进 Keychain；写失败时不能让界面看起来像已经生效。
+                    self.engineModeSaveFailed = !SharedKeychain.writeEngineMode(newValue)
+                }
+                .onAppear {
+                    self.engineMode = SharedKeychain.readEngineMode()
+                }
+
+                if self.engineModeSaveFailed {
+                    Text("保存引擎档位失败，请重试")
+                        .font(.caption)
+                        .foregroundColor(.red)
+                }
+
+                // 只有启动后真的换过档位才提示：否则麦克风一开就常驻这句话，
+                // 用户会以为自己刚改了什么。
+                if self.micCapture.isRunning,
+                   let startedMode = self.micCapture.startedEngineMode,
+                   startedMode != self.engineMode {
+                    Text("麦克风停止后重新开始才生效")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                Button {
+                    self.prepareLocalAssets()
+                } label: {
+                    HStack {
+                        if self.isPreparing {
+                            ProgressView().scaleEffect(0.8)
+                        }
+                        Text(self.isPreparing ? "准备中..." : "准备本机识别资源")
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(self.isPreparing)
+
+                if !self.prepareStatus.isEmpty {
+                    Text(self.prepareStatus)
+                        .font(.caption)
+                        .foregroundColor(self.prepareStatus.hasPrefix("错误") || self.prepareStatus.hasPrefix("需要") ? .red : .green)
+                }
+
+                if let speechDenied = self.prepareSpeechDeniedHint {
+                    Text(speechDenied)
+                        .font(.caption)
+                        .foregroundColor(.red)
+                }
+            }
+
+            Section("云端识别（Groq）") {
+                if self.groqKeyMasked.isEmpty {
+                    SecureField("Groq API key", text: $groqKeyInput)
+                        .textFieldStyle(.roundedBorder)
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
+
+                    Button("保存 key") {
+                        self.saveGroqKey()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(self.groqKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                } else {
+                    HStack {
+                        Text("已保存：\(self.groqKeyMasked)")
                             .font(.caption)
-                            .foregroundColor(.red)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.top, 4)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        Button("清除 key") {
+                            self.clearGroqKey()
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+
+                Toggle("启用云端识别", isOn: $cloudEnabled)
+                    .onChange(of: cloudEnabled) { _, newValue in
+                        SharedKeychain.writeCloudEnabled(newValue)
                     }
 
-                    VStack(spacing: 8) {
-                        Text("最近句对 (来自扩展)")
-                            .font(.headline)
-                        if linesMonitor.lines.isEmpty {
-                            Text("暂无字幕")
+                if !self.cloudKeyStatus.isEmpty {
+                    Text(self.cloudKeyStatus)
+                        .font(.caption)
+                        .foregroundColor(self.cloudKeyStatus.hasPrefix("已保存") ? .green : .red)
+                }
+
+                Text("开着时音频片段会发给 Groq；关掉后只走电脑节点和本机。")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .navigationTitle("识别与语言")
+    }
+
+    @ViewBuilder
+    private var nodeSettings: some View {
+        Form {
+            Section("节点配对") {
+                HStack {
+                    TextField("粘贴 rsnode://pair?... 链接", text: $pairingLinkText)
+                        .textFieldStyle(.roundedBorder)
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
+
+                    Button("粘贴配对链接") {
+                        if let pasteboard = UIPasteboard.general.string {
+                            self.pairingLinkText = pasteboard
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                Button("应用配对") {
+                    self.applyPairingLink()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(self.pairingLinkText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                if !self.pairingStatus.isEmpty {
+                    Text(self.pairingStatus)
+                        .font(.caption)
+                        .foregroundColor(self.pairingStatus.hasPrefix("已配对") ? .green : .red)
+                }
+
+                if !self.pairedConfigDisplay.isEmpty {
+                    Text("已配对：\(self.pairedConfigDisplay)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+        .navigationTitle("算力节点")
+    }
+
+    @ViewBuilder
+    private var diagnostics: some View {
+        List {
+            Section("App 状态") {
+                Text("前后台：\(self.appStateMonitor.isInBackground ? "后台" : "前台")")
+                    .foregroundColor(self.appStateMonitor.isInBackground ? .orange : .green)
+                Text("PiP Possible：\(self.pipManager.isPictureInPicturePossible ? "Yes" : "No")")
+                    .foregroundColor(self.pipManager.isPictureInPicturePossible ? .green : .red)
+                Text(self.pipManager.pipStatusLine)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            Section("Extension Status") {
+                Text(self.statusMonitor.keychainStatus)
+                    .font(.system(.body, design: .monospaced))
+                    .foregroundColor(.secondary)
+            }
+
+            Section("最近句对（原始）") {
+                if self.linesMonitor.lines.isEmpty {
+                    Text("暂无字幕")
+                        .font(.system(.body, design: .monospaced))
+                        .foregroundColor(.secondary)
+                } else {
+                    ForEach(Array(self.linesMonitor.lines.enumerated()), id: \.offset) { _, line in
+                        VStack(alignment: .leading, spacing: DesignTokens.Space.xs) {
+                            Text("[\(line.id)] \(line.src)")
+                                .font(.system(.body, design: .monospaced))
+                            Text(line.dst.isEmpty ? "…" : line.dst)
                                 .font(.system(.body, design: .monospaced))
                                 .foregroundColor(.secondary)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding()
-                                .background(Color(.systemGray6))
-                                .cornerRadius(8)
-                        } else {
-                            ForEach(linesMonitor.lines.indices, id: \.self) { idx in
-                                let line = linesMonitor.lines[idx]
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text("[\(line.id)] \(line.src)")
-                                        .font(.system(.body, design: .monospaced))
-                                        .foregroundColor(.primary)
-                                    Text(line.dst.isEmpty ? "…" : line.dst)
-                                        .font(.system(.body, design: .monospaced))
-                                        .foregroundColor(.secondary)
-                                }
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding()
-                                .background(Color(.systemGray6))
-                                .cornerRadius(8)
-                            }
                         }
                     }
-
-                    VStack(spacing: 8) {
-                        Text("Darwin Notifications")
-                            .font(.headline)
-                        Text("Tick: \(statusMonitor.darwinNotificationCount)  Lines: \(linesMonitor.darwinNotificationCount)")
-                            .font(.system(.body, design: .monospaced))
-                            .foregroundColor(.secondary)
-                    }
-
-                    Divider()
-
-                    VStack(spacing: 12) {
-                        Text("今天的字幕")
-                            .font(.headline)
-                        NavigationLink {
-                            TranscriptView(store: transcriptStore, refreshToken: transcriptRefresh)
-                        } label: {
-                            Text("查看今天的字幕")
-                        }
-                    }
-
-                    Spacer()
                 }
-                .padding()
             }
-            .scrollDismissesKeyboard(.interactively)
-            .navigationTitle("RSiOS")
-            .onAppear {
-                loadPairedConfig()
-                loadCloudSettings()
-            }
-            // 相机扫配对码 / 点 rsnode://pair 链接：只把链接填进配对框，用户点「应用配对」才写入钥匙串。
-            .onOpenURL { url in
-                guard let text = PairingLink.prefillText(for: url) else { return }
-                pairingLinkText = text
-                pairingStatus = "已填入配对链接，确认后点「应用配对」"
-            }
-            .onReceive(linesMonitor.$lines) { lines in
-                transcriptStore.ingest(lines.map {
-                    TranscriptStore.Sentence(id: $0.id, session: $0.session, src: $0.src, dst: $0.dst)
-                })
-                transcriptRefresh += 1
+
+            Section("Darwin Notifications") {
+                Text("Tick: \(self.statusMonitor.darwinNotificationCount)  Lines: \(self.linesMonitor.darwinNotificationCount)")
+                    .font(.system(.body, design: .monospaced))
+                    .foregroundColor(.secondary)
             }
         }
-        .onReceive(statusMonitor.$lastStatusUpdate) { updatedAt in
-            micCapture.reconcileBroadcast(
-                extensionStatus: statusMonitor.keychainStatus,
-                extensionStatusUpdatedAt: updatedAt
-            )
-        }
+        .navigationTitle("诊断")
+    }
+
+    private var fontSizeBinding: Binding<Double> {
+        Binding(
+            get: { self.subtitleStyle.fontSize },
+            set: { newValue in self.updateStyle { $0.fontSize = newValue } }
         )
+    }
+
+    private var backgroundOpacityBinding: Binding<Double> {
+        Binding(
+            get: { self.subtitleStyle.backgroundOpacity },
+            set: { newValue in self.updateStyle { $0.backgroundOpacity = newValue } }
+        )
+    }
+
+    /// 所有样式修改都经过这里：先夹值再编码，坏值不会写进 UserDefaults 传给扩展。
+    private func updateStyle(_ mutate: (inout SubtitleStyle) -> Void) {
+        var next = self.subtitleStyle
+        mutate(&next)
+        self.subtitleStyleData = next.clamped().encoded() ?? Data()
+    }
+
+    @ViewBuilder
+    private func colorSwatches(
+        _ palette: [(name: String, hex: String)],
+        selectedHex: String,
+        onSelect: @escaping (String) -> Void
+    ) -> some View {
+        HStack(spacing: DesignTokens.Space.s) {
+            ForEach(Array(palette.enumerated()), id: \.offset) { _, item in
+                Button {
+                    onSelect(item.hex)
+                } label: {
+                    Circle()
+                        .fill(Color(styleHex: item.hex))
+                        .frame(width: 28, height: 28)
+                        .overlay(
+                            Circle()
+                                .strokeBorder(item.hex == selectedHex ? Color.primary : Color.clear, lineWidth: 2)
+                        )
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(item.name)
+            }
+        }
     }
 
     /// `.translationTask` 是唯一能拿到 TranslationSession 的入口（普通 Task 拿不到），
@@ -662,6 +840,14 @@ struct RecentLine: Codable, Identifiable {
     let session: String
 }
 
+/// 画中画走 Core Graphics，不能直接吃 SwiftUI 的 Color；颜色仍从同一份令牌/样式解析。
+fileprivate func uiColor(hex: String, alpha: CGFloat) -> UIColor {
+    guard let rgb = SubtitleStyle.rgb(hex: hex) else {
+        return UIColor.white.withAlphaComponent(alpha)
+    }
+    return UIColor(red: CGFloat(rgb.r), green: CGFloat(rgb.g), blue: CGFloat(rgb.b), alpha: alpha)
+}
+
 final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBufferPlaybackDelegate {
     @Published var isPiPActive = false
     @Published var isStarting = false
@@ -850,6 +1036,10 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
         guard let layer = sampleBufferDisplayLayer else { return }
 
         let status = SharedKeychain.readExtStatus() ?? "无"
+        // 解析不到档位（如刚 started）时保留上一次，避免状态词闪空。
+        if let summary = StatusSummaryParser.summary(forStatusLine: status) {
+            lastStatusSummary = summary
+        }
         let timeString = DateFormatter.timeFormatter.string(from: Date())
 
         guard let image = renderSubtitleImage(status: status, time: timeString),
@@ -901,6 +1091,8 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
     private var cachedLines: [RecentLine] = []
     private var lastRenderedLinesJSON: String = ""
     private var lastRenderedStatus: String = ""
+    private var lastRenderedStyle: SubtitleStyle?
+    private var lastStatusSummary: StatusSummary?
 
     private func renderSubtitleImage(status: String, time: String) -> UIImage? {
         var linesJSON = ""
@@ -911,84 +1103,91 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
             linesJSON = json
         }
 
-        if linesJSON == lastRenderedLinesJSON && status == lastRenderedStatus {
+        // 样式也要参与变化判断：用户改颜色/字号后即使句子没变也得立刻重绘。
+        let style = SubtitleStyle.load(from: UserDefaults.standard.data(forKey: "subtitleStyle"))
+
+        if linesJSON == lastRenderedLinesJSON && status == lastRenderedStatus && style == lastRenderedStyle {
             return nil
         }
         lastRenderedLinesJSON = linesJSON
         lastRenderedStatus = status
+        lastRenderedStyle = style
 
         let displayLines = Array(cachedLines.suffix(2))
+
+        // 画中画画面按样式字号等比缩放：译文基准 48，原文再乘 sourceScale。
+        let scale = style.fontSize / DesignTokens.TypeScale.subtitleDefault
+        let translationSize = CGFloat(48.0 * scale)
+        let sourceSize = translationSize * CGFloat(DesignTokens.TypeScale.sourceScale)
 
         let size = CGSize(width: 1280, height: 360)
         let renderer = UIGraphicsImageRenderer(size: size)
         return renderer.image { ctx in
-            UIColor.black.withAlphaComponent(0.85).setFill()
+            uiColor(hex: style.backgroundHex, alpha: CGFloat(style.backgroundOpacity)).setFill()
             ctx.fill(CGRect(origin: .zero, size: size))
 
             let paragraphStyle = NSMutableParagraphStyle()
             paragraphStyle.alignment = .left
 
-            let srcAttrs: [NSAttributedString.Key: Any] = [
-                .font: UIFont.systemFont(ofSize: 48, weight: .medium),
-                .foregroundColor: UIColor(red: 0xF0/255, green: 0xF0/255, blue: 0xF0/255, alpha: 1.0),
-                .paragraphStyle: paragraphStyle
-            ]
-            let dstAttrs: [NSAttributedString.Key: Any] = [
-                .font: UIFont.systemFont(ofSize: 42, weight: .regular),
-                .foregroundColor: UIColor(red: 0xFF/255, green: 0xE8/255, blue: 0x94/255, alpha: 1.0),
-                .paragraphStyle: paragraphStyle
-            ]
-            let dstEmptyAttrs: [NSAttributedString.Key: Any] = [
-                .font: UIFont.systemFont(ofSize: 42, weight: .regular),
-                .foregroundColor: UIColor(red: 0xFF/255, green: 0xE8/255, blue: 0x94/255, alpha: 0.5),
-                .paragraphStyle: paragraphStyle
-            ]
-            let statusAttrs: [NSAttributedString.Key: Any] = [
-                .font: UIFont.systemFont(ofSize: 28, weight: .regular),
-                .foregroundColor: UIColor.white.withAlphaComponent(0.7),
-                .paragraphStyle: paragraphStyle
-            ]
-
-            let statusLine = extractStatusLine() ?? ""
-            let statusStr = "\(time) · \(statusLine)" as NSString
-
-            let lineHeight: CGFloat = 56
             let gap: CGFloat = 8
             let pairGap: CGFloat = 16
             let startY: CGFloat = 20
 
             var y = startY
             for (idx, line) in displayLines.enumerated() {
-                let alpha = idx == 0 ? 0.55 : 1.0
+                let isNewest = idx == displayLines.count - 1
+                let alpha = CGFloat(SubtitleDisplay.pairOpacity(index: idx, count: displayLines.count))
+                let translation = SubtitleDisplay.translation(line.dst, isNewest: isNewest)
 
-                let srcText = "[\(line.id)] \(line.src)" as NSString
-                let srcAttrsWithAlpha = idx == 0 ? srcAttrs.mapValues { value in
-                    if let color = value as? UIColor {
-                        return color.withAlphaComponent(0.55)
-                    }
-                    return value
-                } : srcAttrs
+                let srcAttrs: [NSAttributedString.Key: Any] = [
+                    .font: UIFont.systemFont(ofSize: sourceSize, weight: .medium),
+                    .foregroundColor: uiColor(hex: style.sourceHex, alpha: alpha),
+                    .paragraphStyle: paragraphStyle
+                ]
+                let dstAttrs: [NSAttributedString.Key: Any] = [
+                    .font: UIFont.systemFont(ofSize: translationSize, weight: .regular),
+                    .foregroundColor: uiColor(
+                        hex: translation.isPlaceholder ? DesignTokens.Color.untranslated : style.translationHex,
+                        alpha: alpha
+                    ),
+                    .paragraphStyle: paragraphStyle
+                ]
+
+                let srcText = line.src as NSString
                 let srcHeight = srcText.boundingRect(with: CGSize(width: 1200, height: 200),
                                                       options: .usesLineFragmentOrigin,
-                                                      attributes: srcAttrsWithAlpha, context: nil).height
-                srcText.draw(in: CGRect(x: 40, y: y, width: 1200, height: srcHeight), withAttributes: srcAttrsWithAlpha)
+                                                      attributes: srcAttrs, context: nil).height
+                srcText.draw(in: CGRect(x: 40, y: y, width: 1200, height: srcHeight), withAttributes: srcAttrs)
                 y += srcHeight + gap
 
-                let dstText = (line.dst.isEmpty ? "…" : line.dst) as NSString
-                let dstAttrsFinal = line.dst.isEmpty ? dstEmptyAttrs : dstAttrs
-                let dstAttrsWithAlpha = idx == 0 ? dstAttrsFinal.mapValues { value in
-                    if let color = value as? UIColor {
-                        return color.withAlphaComponent(0.55)
-                    }
-                    return value
-                } : dstAttrsFinal
+                let dstText = translation.text as NSString
                 let dstHeight = dstText.boundingRect(with: CGSize(width: 1200, height: 200),
                                                       options: .usesLineFragmentOrigin,
-                                                      attributes: dstAttrsWithAlpha, context: nil).height
-                dstText.draw(in: CGRect(x: 40, y: y, width: 1200, height: dstHeight), withAttributes: dstAttrsWithAlpha)
+                                                      attributes: dstAttrs, context: nil).height
+                dstText.draw(in: CGRect(x: 40, y: y, width: 1200, height: dstHeight), withAttributes: dstAttrs)
                 y += dstHeight + pairGap
             }
 
+            let summaryLevel = self.lastStatusSummary?.level ?? .idle
+            let statusHex: String
+            switch summaryLevel {
+            case .normal:
+                statusHex = DesignTokens.Color.statusNormal
+            case .warning:
+                statusHex = DesignTokens.Color.statusWarning
+            case .error:
+                statusHex = DesignTokens.Color.statusError
+            case .idle:
+                statusHex = DesignTokens.Color.subtitleSecondary
+            }
+            let statusAttrs: [NSAttributedString.Key: Any] = [
+                .font: UIFont.systemFont(ofSize: 28, weight: .regular),
+                .foregroundColor: uiColor(hex: statusHex, alpha: 0.9),
+                .paragraphStyle: paragraphStyle
+            ]
+
+            let label = self.lastStatusSummary?.label ?? DesignTokens.Text.micStatusIdle
+            let statusStr = "\(time) · \(label)" as NSString
             let statusHeight = statusStr.boundingRect(with: CGSize(width: 1200, height: 100),
                                                        options: .usesLineFragmentOrigin,
                                                        attributes: statusAttrs, context: nil).height

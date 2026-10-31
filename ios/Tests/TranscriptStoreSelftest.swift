@@ -103,6 +103,36 @@ func runTranscriptStoreSelftest(_ check: @escaping (Bool, String) -> Void) {
     check(pageLines.count == 3, "回看页面应读出 3 行（实际 \(pageLines.count)）")
     check(pageLines.first?.time == "23:59:50", "回看页面首行时间应与文件一致")
     check(pageLines.last?.src == "Guten Abend.", "回看页面末行原文应与文件一致")
+
+    // 搜索过滤：空查询原样返回，大小写/变音符号不敏感，任一列命中都算。
+    let filterLines = [
+        TranscriptStore.Line(id: 0, time: "10:00:00", src: "Guten Tag.", dst: "你好"),
+        TranscriptStore.Line(id: 1, time: "10:00:05", src: "Schöne Grüße", dst: ""),
+        TranscriptStore.Line(id: 2, time: "10:00:09", src: "Äpfel und Birnen", dst: "苹果和梨"),
+    ]
+    check(TranscriptStore.filter(filterLines, query: "").count == 3, "空查询应原样返回全部行")
+    check(TranscriptStore.filter(filterLines, query: "   ").count == 3, "空白查询应原样返回全部行")
+    check(TranscriptStore.filter(filterLines, query: "guten").map(\.id) == [0], "搜索应不区分大小写")
+    check(TranscriptStore.filter(filterLines, query: "schone").map(\.id) == [1], "搜索应忽略变音符号 ö→o")
+    check(TranscriptStore.filter(filterLines, query: "apfel").map(\.id) == [2], "搜索应忽略变音符号 ä→a")
+    check(TranscriptStore.filter(filterLines, query: "你好").map(\.id) == [0], "只命中译文也算匹配")
+    check(TranscriptStore.filter(filterLines, query: "xyz").isEmpty, "没有命中应返回空数组")
+
+    // 复制全部：时间 + 原文，译文另起一行；没有译文只留原文；句间空一行。
+    let expectedPlainText = """
+    10:00:00  Guten Tag.
+    你好
+
+    10:00:05  Schöne Grüße
+
+    10:00:09  Äpfel und Birnen
+    苹果和梨
+    """
+    check(
+        TranscriptStore.plainText(filterLines) == expectedPlainText,
+        "plainText 的格式或空译文的省略不对（实际 \(TranscriptStore.plainText(filterLines))）"
+    )
+    check(TranscriptStore.plainText([]) == "", "没有行时 plainText 应为空串")
 }
 
 private func date(
