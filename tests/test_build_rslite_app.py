@@ -17,7 +17,6 @@ pytestmark = pytest.mark.skipif(
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "macos" / "build_rslite_app.sh"
 VERSION_FILE = REPO_ROOT / "realtime_subtitle" / "version.py"
-PACKAGE = REPO_ROOT / "macos-native" / "Package.swift"
 
 
 def _bash(script: str, *args: Path | str) -> subprocess.CompletedProcess[str]:
@@ -48,10 +47,19 @@ def test_read_version_reads_plain_version_py():
     assert result.stdout.strip() == _declared_version()
 
 
-def test_read_macos_min_version_matches_package_platform():
-    result = _bash('source "$1"; read_macos_min_version "$2"', SCRIPT, PACKAGE)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "26.0"
+def test_app_min_macos_is_27_and_written_to_info_plist():
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert 'APP_MIN_MACOS="27.0"' in text
+    assert (
+        'write_info_plist "${app_path}/Contents/Info.plist" "${version}" "${APP_MIN_MACOS}"' in text
+    )
+
+
+def test_self_check_runs_before_zipping():
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert "--selftest" in text
+    assert "SELFTEST OK" in text
+    assert text.index("--selftest") < text.index("ditto -c -k --keepParent")
 
 
 def test_generated_info_plist_contains_required_bundle_and_privacy_keys(tmp_path):

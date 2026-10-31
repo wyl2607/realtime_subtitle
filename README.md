@@ -167,6 +167,8 @@ bash scripts/macos/stop.sh
 
 系统识别 + 系统翻译的原生小程序，不需要 Python 和 Ollama；不插电运行时整机功耗只比空闲多约 0.1W。构建：`cd macos-native && swift build -c release`；运行：`.build/release/rslite`（界面模式）。菜单栏状态项（标题为「字·」加当前模式，例如「字·本机」）里的「设置…」（⌘,）打开「rslite 设置」。完整说明见 `macos-native/README.md`。
 
+打包成 .app：`bash scripts/macos/build_rslite_app.sh` 会产出 `dist/macos/rslite.app`（同目录还有 `rslite-<版本>-macos-arm64.zip` 和对应的 `.sha256`）。把 `rslite.app` 拖进「应用程序」后双击即可，菜单栏会出现「字·…」，没有 Dock 图标（LSUIElement）。需要 macOS 27+、Apple Silicon 和 Xcode（swift 工具链）。只做了 ad-hoc 签名、**没有公证**（没有付费开发者账号）：本机构建的 .app 直接能开；从别处下载的 zip 首次打开会被 Gatekeeper 拦——macOS 15 起 Control/右键→打开 已不再能绕过，要去「系统设置 → 隐私与安全性」点「仍要打开」，或在终端运行 `xattr -dr com.apple.quarantine /Applications/rslite.app`。首次启动会弹「系统音频录制」（抓系统声音，Process Tap）权限，麦克风模式会弹「麦克风」权限；每次重新构建后系统可能再次询问（ad-hoc 签名）。从源码运行的旧方式仍然可用：`cd macos-native && swift build -c release`，然后 `.build/release/rslite`。
+
 ### 算力节点（实验性）
 
 把识别交给 tailnet 里另一台 Apple Silicon Mac 或 NVIDIA Windows 电脑：本机先出字幕，节点精修结果随后替换上去；节点掉线时字幕不断、自动回到本机，节点恢复后自动接回。装法：Mac 节点 `bash scripts/node/install_node.sh <ssh 别名>`，Windows 节点 `bash scripts/node/install_node_windows.sh <ssh 别名>`（都在 Mac 上运行）。隐私边界：节点只监听 Tailscale 地址（`100.64.0.0/10`），token 鉴权、只经文件传递，音频只进内存不落盘，日志不写字幕正文；音频会离开本机、但只到你自己的节点机器。rslite 与 Windows 桌面字幕程序均已支持算力节点（Windows 配置见下文）。协议细节见 `docs/protocol-v2.md`。

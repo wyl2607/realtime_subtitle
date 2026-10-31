@@ -10,6 +10,12 @@ PRODUCT="rslite"
 APP_BUNDLE="rslite.app"
 BUNDLE_ID="com.realtimesubtitle.rslite"
 DEFAULT_OUT_DIR="${REPO_ROOT}/dist/macos"
+# RSLite.swift 运行时用 `guard #available(macOS 27.0, *)`，不满足只往 stderr 打一行
+# 后退出；从 Finder 双击时 stderr 看不见，用户只会觉得“点了没反应”。所以 Info.plist
+# 的最低系统版本必须写真实的 27.0，让旧系统上的 Finder 直接提示“需要更新的 macOS”。
+# ☠️ 不要改成去读 Package.swift 的 `.macOS(.v26)`：那个值必须留在 v26，因为 CI
+# runner 用的是 macos-26 SDK。两者含义不同——构建 SDK 版本 ≠ 运行时最低要求。
+APP_MIN_MACOS="27.0"
 
 usage() {
     cat <<'EOF'
@@ -35,21 +41,6 @@ read_version() {
     version="$(printf '%s\n' "${line}" | sed -E 's/^[[:space:]]*__version__[[:space:]]*=[[:space:]]*"([^"]+)".*$/\1/')"
     [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "could not read semver __version__ from ${version_file}"
     printf '%s\n' "${version}"
-}
-
-read_macos_min_version() {
-    local package_file="${1:-${PACKAGE_DIR}/Package.swift}"
-    local text major minor
-
-    [[ -f "${package_file}" ]] || die "Package.swift not found: ${package_file}"
-    text="$(tr '\n' ' ' < "${package_file}")"
-    if [[ "${text}" =~ \.macOS\(\.v([0-9]+)(_([0-9]+))?\) ]]; then
-        major="${BASH_REMATCH[1]}"
-        minor="${BASH_REMATCH[3]:-0}"
-        printf '%s.%s\n' "${major}" "${minor}"
-        return 0
-    fi
-    die "could not read macOS platform from ${package_file}"
 }
 
 write_info_plist() {
@@ -127,12 +118,11 @@ main() {
     command -v ditto >/dev/null 2>&1 || die "ditto not found"
     command -v shasum >/dev/null 2>&1 || die "shasum not found"
 
-    local version minimum_system_version bin_dir binary app_path zip_name zip_path sha_path
+    local version bin_dir binary app_path zip_name zip_path sha_path
     version="$(read_version)"
-    minimum_system_version="$(read_macos_min_version)"
     mkdir -p "${OUT_DIR}"
 
-    echo "[1/5] swift build -c release --package-path macos-native --product ${PRODUCT}"
+    echo "[1/6] swift build -c release --package-path macos-native --product ${PRODUCT}"
     swift build -c release --package-path "${PACKAGE_DIR}" --product "${PRODUCT}"
     bin_dir="$(swift build -c release --package-path "${PACKAGE_DIR}" --product "${PRODUCT}" --show-bin-path)"
     binary="${bin_dir}/${PRODUCT}"
@@ -142,31 +132,44 @@ main() {
     rm -rf "${app_path}"
     mkdir -p "${app_path}/Contents/MacOS" "${app_path}/Contents/Resources"
 
-    echo "[2/5] assemble ${APP_BUNDLE}"
+    echo "[2/6] assemble ${APP_BUNDLE}"
     install -m 755 "${binary}" "${app_path}/Contents/MacOS/${PRODUCT}"
-    write_info_plist "${app_path}/Contents/Info.plist" "${version}" "${minimum_system_version}"
+    write_info_plist "${app_path}/Contents/Info.plist" "${version}" "${APP_MIN_MACOS}"
     printf 'APPL????' > "${app_path}/Contents/PkgInfo"
     if command -v plutil >/dev/null 2>&1; then
         plutil -lint "${app_path}/Contents/Info.plist" >/dev/null
     fi
 
-    echo "[3/5] ad-hoc codesign"
+    echo "[3/6] ad-hoc codesign"
+    # 只做 ad-hoc 签名（`--sign -`），不打开 hardened runtime，也不带 entitlements：
+    # 因此不需要 com.apple.security.device.audio-input 之类的 entitlement。TCC 授权按
+    # ad-hoc 签名的 cdhash 记账，每次重新构建后系统可能再次询问权限。
     codesign --force --deep --sign - "${app_path}"
     codesign --verify --deep --strict "${app_path}"
+    codesign -dv "${app_path}"
+
+    echo "[4/6] self-check"
+    local selftest_output
+    selftest_output="$("${app_path}/Contents/MacOS/${PRODUCT}" --selftest)"
+    printf '%s\n' "${selftest_output}"
+    case "${selftest_output}" in
+        *"SELFTEST OK"*) ;;
+        *) die "self-check failed: --selftest did not print SELFTEST OK" ;;
+    esac
 
     zip_name="rslite-${version}-macos-arm64.zip"
     zip_path="${OUT_DIR}/${zip_name}"
     sha_path="${zip_path}.sha256"
     rm -f "${zip_path}" "${sha_path}"
 
-    echo "[4/5] zip ${zip_name}"
+    echo "[5/6] zip ${zip_name}"
     (
         cd "${OUT_DIR}"
         ditto -c -k --keepParent "${APP_BUNDLE}" "${zip_name}"
         shasum -a 256 "${zip_name}" > "${zip_name}.sha256"
     )
 
-    echo "[5/5] done"
+    echo "[6/6] done"
     echo "app: ${app_path}"
     echo "zip: ${zip_path}"
     echo "sha256: ${sha_path}"
