@@ -36,3 +36,6 @@ xcrun swiftc -O ios/Shared/LocalEngineStatus.swift ios/Shared/DesignTokens.swift
 # 单独编一组验证解析规则和持久化夹值，不把 SwiftUI 带进自测。
 xcrun swiftc -O ios/Shared/StatusSummary.swift ios/Shared/SubtitleStyle.swift ios/Shared/LocalEngineStatus.swift ios/Shared/DesignTokens.swift ios/Tests/StatusSummarySelftest.swift ios/Tests/SubtitleStyleSelftest.swift ios/Tests/UISelftestMain.swift -o .tmp/uiselftest
 .tmp/uiselftest
+# 定稿分句是纯逻辑：本机档十几秒才定稿一次，切句规则错一点就会退回「一条字幕塞好几句」。
+xcrun swiftc -O ios/Shared/SentenceSplitter.swift ios/Tests/SentenceSplitterSelftest.swift -o .tmp/sentencesplitterselftest
+.tmp/sentencesplitterselftest
