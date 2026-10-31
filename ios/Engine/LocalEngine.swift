@@ -343,10 +343,10 @@ final class LocalEngine {
         // 音频线程约束：锁内只做 O(1) 的检查和取快照，不分配、不做格式转换、
         // 不 yield、不调回调。后面的 buffer / converter / yield 全部在锁外用快照做。
         let snapshot = stateLock.withLock { () -> (AsyncStream<AnalyzerInput>.Continuation, AVAudioFormat, AVAudioConverter?)? in
-            guard isRunning,
-                  let continuation = inputContinuation,
-                  let format = analyzerFormat else { return nil }
-            return (continuation, format, converter)
+            guard self.isRunning,
+                  let continuation = self.inputContinuation,
+                  let format = self.analyzerFormat else { return nil }
+            return (continuation, format, self.converter)
         }
         guard let snapshot = snapshot else { return }
         let continuation = snapshot.0
@@ -380,7 +380,7 @@ final class LocalEngine {
             let made = AVAudioConverter(from: sourceFormat, to: analyzerFormat)
             if let made = made {
                 converter = stateLock.withLock { () -> AVAudioConverter? in
-                    guard !stopped else { return nil }
+                    guard !self.stopped else { return nil }
                     if let existing = self.converter { return existing }
                     self.converter = made
                     return made
