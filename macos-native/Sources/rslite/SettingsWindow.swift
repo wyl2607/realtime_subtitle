@@ -880,12 +880,12 @@ enum NodeCompareBoard {
     static func localRow() -> NodeCompareRow {
         NodeCompareRow(
             id: localID,
-            name: "本机",
+            name: DesignTokens.Text.statusLocal,
             model: modelText(model: nil, local: true),
             translation: translationText(translator: nil, translatorOK: nil, local: true),
             latency: "—",
             rtf: "—",
-            status: "本机",
+            status: DesignTokens.Text.statusLocal,
             estimate: "—",
             estimateSeconds: nil,
             isFastest: false
@@ -1001,7 +1001,7 @@ enum NodeCompareBoard {
         check(rows.first?.id == "mini2" && rows.first?.isFastest == true, "最快只标一台，且按预计耗时排在最前")
         check(rows.filter(\.isFastest).count == 1, "相同比较里只有一台标最快")
         let local = rows.first { $0.id == localID }
-        check(local?.name == "本机" && local?.model == "Apple 语音识别" && local?.translation == "Apple 翻译", "本机行写 Apple 语音识别和 Apple 翻译")
+        check(local?.name == DesignTokens.Text.statusLocal && local?.model == "Apple 语音识别" && local?.translation == "Apple 翻译", "本机行写 Apple 语音识别和 Apple 翻译")
         check(local?.latency == "—" && local?.estimateSeconds == nil && local?.isFastest == false, "本机没有 RTT 时不参与最快")
         let miniRow = rows.first { $0.id == "mini2" }
         check(miniRow?.model == "whisper-large-v3-turbo", "节点识别模型取 asr.model")

@@ -224,7 +224,7 @@ final class OverlayController: NSObject {
     private let reviewBadge = ReviewBadgeButton(title: OverlayMotion.newCaptionBadgeTitle, target: nil, action: nil)
     private let volatileLabel = NSTextField(labelWithString: "")
     /// 当前识别层。和草稿分开，避免 setStatus/setVolatile 把「云端·Groq」盖掉。
-    private let tierLabel = NSTextField(labelWithString: "本机")
+    private let tierLabel = NSTextField(labelWithString: DesignTokens.Text.statusLocal)
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let statusMenu = NSMenu()
     private let styleMenu = NSMenu(title: "字幕样式")
