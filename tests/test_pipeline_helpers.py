@@ -447,7 +447,8 @@ def test_save_transcript_omits_empty_translation_line(tmp_path):
     t._save_transcript("Hallo Welt.", "你好世界")
     t._save_transcript("Nur Deutsch.", "")
 
-    written = next(tmp_path.iterdir()).read_text(encoding="utf-8")
+    # tmp_path 下还有 sessions/ 会话导出目录，只读当天的存档文件
+    written = next(p for p in tmp_path.iterdir() if p.is_file()).read_text(encoding="utf-8")
     assert "你好世界" in written
     assert "Nur Deutsch." in written
     # 空译文不该留下只有空格的一行
