@@ -201,6 +201,14 @@ def test_android_tokens_and_kotlin_self_consistent_but_drifted(parity, generator
     assert "DesignTokens.kt" in out
 
 
+def test_new_repo_fixture_without_ios_copy_is_missing(parity, generator, tmp_path, capsys):
+    repo = _make_repo(tmp_path, generator)
+    (repo / "tests" / "fixtures" / "new_cases.json").write_text('{"cases": [9]}\n', encoding="utf-8")
+
+    assert parity.main([], root=repo) == 1
+    assert "MISSING ios/Tests/fixtures/new_cases.json" in capsys.readouterr().out
+
+
 def test_crlf_checkout_is_not_drift(tmp_path):
     """Windows 签出（autocrlf）把副本变成 CRLF，内容没变，不能报 DRIFT。"""
     from pathlib import Path as _P

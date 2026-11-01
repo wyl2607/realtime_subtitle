@@ -40,7 +40,6 @@ import gen_tokens  # noqa: E402
 REPO_FIXTURES = ROOT / "tests" / "fixtures"
 REPO_IOS_FIXTURES = ROOT / "ios" / "Tests" / "fixtures"
 REPO_IOS_TOKENS = ROOT / "ios" / "Shared" / "DesignTokens.swift"
-IOS_FIXTURE_NAMES = ("route_cases.json", "p5_cases.json")
 
 
 def _display(path: Path, root: Path) -> str:
@@ -110,10 +109,11 @@ def _compare_text(expected_text: str, actual: Path, root: Path, allow_missing: b
 
 def _check_repo(root: Path, allow_missing: bool) -> bool:
     ok = True
-    for name in IOS_FIXTURE_NAMES:
+    # 与 Android 一样按主仓库夹具全量比对：新增夹具忘了同步到 iOS 也会报 MISSING。
+    for expected in sorted((root / "tests" / "fixtures").glob("*.json")):
         ok = _compare_file(
-            root / "tests" / "fixtures" / name,
-            root / "ios" / "Tests" / "fixtures" / name,
+            expected,
+            root / "ios" / "Tests" / "fixtures" / expected.name,
             root,
             allow_missing,
         ) and ok
