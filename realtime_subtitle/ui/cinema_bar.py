@@ -20,7 +20,7 @@
    文字走。所以底衬做在 QLabel 上（padding + border-radius），窗口本身
    WA_TranslucentBackground 全透。
 
-调用约定和 TVWindow 一致：append_pair/update_draft 都在主线程槽里被调
+调用约定和 TVWindow 一致：store 事件/update_draft 都在主线程槽里被调
 （subtitle_render），本窗不需要自己的信号层。
 """
 import sys
@@ -31,13 +31,15 @@ from PyQt6.QtCore import Qt, QTimer
 
 import realtime_subtitle.config as config
 import realtime_subtitle.ui.design_tokens as design_tokens
+from realtime_subtitle.ui.history_store import HistoryEvent, HistoryRow, SubtitleHistoryStore
 
 
 class CinemaBar(QWidget):
     """屏幕底部的透明字幕条：只显示最新一句，静默一段时间后自动淡出。"""
 
-    def __init__(self):
+    def __init__(self, store: SubtitleHistoryStore):
         super().__init__()
+        self.store = store
         self.setWindowTitle("🎞 影院字幕条")
         # Tool 而不是 Window：不进任务栏/Alt+Tab（它是覆盖层不是应用窗口）
         self.setWindowFlags(
@@ -73,6 +75,7 @@ class CinemaBar(QWidget):
         self._hold_timer.timeout.connect(self.clear_text)
 
         self._apply_font()
+        self.store.subscribe(self._on_history_event)
 
     @staticmethod
     def _make_label(german):
@@ -87,53 +90,46 @@ class CinemaBar(QWidget):
     # ------------------------------------------------------------------
     # 内容
     # ------------------------------------------------------------------
-    def append_pair(self, german, chinese, key=None):
-        """新句对上屏。影院条只显示**最新一句**，不滚动、不留历史。
-
-        要回看历史请用 📜 历史窗或 📺 电视窗——在视频上叠多行会挡画面，
-        而挡画面正是这个条要解决的问题。
-        """
+    def _on_history_event(self, event: HistoryEvent):
         if not self.isVisible():
             return
+        if event.kind == "insert" and event.index == len(self.store) - 1:
+            self._show_row(self.store.get(event.keys[0]))
+        elif event.kind == "update" and event.keys and event.keys[0] == self._current_key:
+            self._show_row(self.store.get(self._current_key))
+        elif event.kind == "delete" and self._current_key in event.keys:
+            self._current_key = None
+            self._hold_timer.stop()
+            self.clear_text()
+        elif event.kind in {"move", "reset"} and self.store.get(self._current_key) is None:
+            self._current_key = None
+            self._hold_timer.stop()
+            self.clear_text()
+
+    def show_last(self):
+        self._show_row(self.store.last())
+
+    def _show_row(self, row: HistoryRow | None):
+        """影院条只显示最新一句，不留历史：要回看用 📜/📺，叠多行会挡画面。"""
+        if row is None or not self.isVisible():
+            return
+        german, chinese = row.src, row.dst
         chinese = (chinese or "").strip()
         german = (german or "").strip()
-        is_untranslated = (chinese in (design_tokens.TEXT_UNTRANSLATED, "翻译中…"))
+        is_untranslated = chinese in (design_tokens.TEXT_UNTRANSLATED, design_tokens.TEXT_TRANSLATING)
         if not chinese and not (german and is_untranslated):
             return
-        self._current_key = key
+        self._current_key = row.key
         show_german = getattr(config, "CINEMA_SHOW_GERMAN", True) or is_untranslated
         self._set_line(self.german_label, german if show_german else "")
         self._set_line(self.chinese_label, chinese, draft=False)
         self._restart_hold()
 
-    def update_dst(self, key, dst, german=None):
-        """按 key 原地更新译文（若之前是未翻译标记，更新为正式译文）"""
-        if not self.isVisible() or self._current_key != key:
-            return
-        dst = (dst or "").strip()
-        is_untranslated = (dst in (design_tokens.TEXT_UNTRANSLATED, "翻译中…"))
-        show_german = getattr(config, "CINEMA_SHOW_GERMAN", True) or is_untranslated
-        if german:
-            self._set_line(self.german_label, german if show_german else "")
-        self._set_line(self.chinese_label, dst, draft=False)
-        self._restart_hold()
-
-    def drop_keys(self, keys):
-        """按句 id 移除当前句（远端句替换本机句时调用）。
-
-        影院条只显示最新一句，所以只有"被替换的正是当前这句"才需要动：清空，
-        紧接着远端句 append_pair 会把两行重写成远端文本。其余 key 静默忽略。
-        """
-        if self._current_key is not None and self._current_key in set(keys or []):
-            self._current_key = None
-            self._hold_timer.stop()
-            self.clear_text()
-
     def update_draft(self, chinese):
         """草稿中文：原地替换中文行，德语行保持不动（它已经是定稿原文）。
 
         空串 = 撤掉草稿。☠️ 撤稿时**不能连德语行一起清**：草稿退场的正常路径
-        是"正式翻译到了"，紧接着 append_pair 会把两行都重写；中间那一拍如果
+        是"正式翻译到了"，紧接着 store 事件会把两行都重写；中间那一拍如果
         把德语也清掉，画面上会闪一下。
         """
         if not self.isVisible():

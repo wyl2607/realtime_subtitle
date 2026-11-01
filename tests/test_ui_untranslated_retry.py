@@ -4,7 +4,7 @@
 1. 令牌默认值等于 config 默认值
 2. 失败句标记渲染与颜色
 3. 只显译文模式不吞失败句（原文+标记均上屏）
-4. 点击「未翻译 ⟳」调用 retry_translation，成功变「翻译中…」
+4. 点击「未翻译 ⟳」调用 retry_translation，成功变 design token
 5. 过期 key 提示「这句已过期，无法重试」
 6. revision 旧代数在消费端被拒
 7. reason == "dropped" 同样渲染标记并可重试
@@ -78,10 +78,10 @@ def test_token_defaults_match_config():
 def test_failed_sentence_renders_untranslated_marker():
     """失败句渲染 TEXT_UNTRANSLATED 标记与 COLOR_UNTRANSLATED 颜色。"""
     win = _window()
-    win.sentence_pairs.clear()
+    win.history.clear()
 
     win.on_translate_failed("Das ist ein Test", 0, 1000, "k_fail_1", 0, "timeout")
-    assert _pump_until(lambda: any(len(p) >= 7 and p[6] == "k_fail_1" for p in win.sentence_pairs))
+    assert _pump_until(lambda: win.history.get("k_fail_1") is not None)
 
     html = win._last_html
     assert design_tokens.TEXT_UNTRANSLATED in html
@@ -93,7 +93,7 @@ def test_failed_sentence_renders_untranslated_marker():
 def test_target_only_mode_does_not_swallow_failed_sentence():
     """「只显译文」模式下失败句改显示原文 + 该标记，绝不整句隐形。"""
     win = _window()
-    win.sentence_pairs.clear()
+    win.history.clear()
     orig_mode = config.DISPLAY_MODE
     orig_bilingual = config.SHOW_BILINGUAL
     try:
@@ -101,21 +101,20 @@ def test_target_only_mode_does_not_swallow_failed_sentence():
         config.SHOW_BILINGUAL = False
 
         win.on_translate_failed("Untersuchung läuft", 0, 1000, "k_target_fail", 0, "timeout")
-        assert _pump_until(lambda: any(len(p) >= 7 and p[6] == "k_target_fail" for p in win.sentence_pairs))
+        assert _pump_until(lambda: win.history.get("k_target_fail") is not None)
 
         html = win._last_html
         assert "Untersuchung läuft" in html, "只显译文模式下失败句不能吞掉德语原文"
         assert design_tokens.TEXT_UNTRANSLATED in html
 
         # 电视窗也不吞句
-        tv_entries = getattr(win.tv_window, "_entries", [])
-        assert any(e.get("key") == "k_target_fail" for e in tv_entries)
-        tv_entry = next(e for e in tv_entries if e.get("key") == "k_target_fail")
-        assert "Untersuchung läuft" in tv_entry.get("text", "")
+        win.tv_window.show()
+        win.tv_window.rebuild_from_store()
+        assert "Untersuchung läuft" in win.tv_window.text.toPlainText()
 
         # 影院条显式展示时不吞句（德语行与未翻译标记行均可见）
         win.cinema_bar.show()
-        win.cinema_bar.append_pair("Untersuchung läuft", design_tokens.TEXT_UNTRANSLATED, key="k_target_fail")
+        win.cinema_bar.show_last()
         assert win.cinema_bar.german_label.text() == "Untersuchung läuft"
         assert win.cinema_bar.chinese_label.text() == design_tokens.TEXT_UNTRANSLATED
         win.cinema_bar.hide()
@@ -125,37 +124,37 @@ def test_target_only_mode_does_not_swallow_failed_sentence():
 
 
 def test_retry_translation_success_flow():
-    """点击「未翻译 ⟳」调用 retry_translation，返回 True 时变「翻译中…」，成功后原地更新。"""
+    """点击「未翻译 ⟳」调用 retry_translation，返回 True 时变重试令牌，成功后原地更新。"""
     win = _window()
-    win.sentence_pairs.clear()
+    win.history.clear()
 
     retried_keys = []
     win.on_retry_translation = lambda k: (retried_keys.append(k), True)[1]
 
     win.on_translate_failed("Satz zum Wiederholen", 0, 1000, "k_retry_ok", 0, "timeout")
-    assert _pump_until(lambda: any(len(p) >= 7 and p[6] == "k_retry_ok" for p in win.sentence_pairs))
+    assert _pump_until(lambda: win.history.get("k_retry_ok") is not None)
 
     # 触发重试点击
     win._handle_retry_click("k_retry_ok")
     assert retried_keys == ["k_retry_ok"]
-    assert "翻译中…" in win._last_html
+    assert design_tokens.TEXT_TRANSLATING in win._last_html
 
     # 重试成功：带同一 key 重新到达
     win.add_pair("Satz zum Wiederholen", "重试成功译文", 0, 1000, "k_retry_ok", 0)
     assert _pump_until(lambda: "重试成功译文" in win._last_html)
-    assert len(win.sentence_pairs) == 1, "同一 key 原地更新，不得新增一行"
+    assert len(win.history) == 1, "同一 key 原地更新，不得新增一行"
     assert "重试成功译文" in win._last_html
 
 
 def test_retry_translation_expired_hint():
     """retry_translation 返回 False 时，短暂提示「这句已过期，无法重试」。"""
     win = _window()
-    win.sentence_pairs.clear()
+    win.history.clear()
 
     win.on_retry_translation = lambda k: False
 
     win.on_translate_failed("Alte abgelaufene Zeile", 0, 1000, "k_expired", 0, "timeout")
-    assert _pump_until(lambda: any(len(p) >= 7 and p[6] == "k_expired" for p in win.sentence_pairs))
+    assert _pump_until(lambda: win.history.get("k_expired") is not None)
 
     win._handle_retry_click("k_expired")
     assert win.status_line == "这句已过期，无法重试"
@@ -165,25 +164,23 @@ def test_retry_translation_expired_hint():
 def test_stale_language_revision_rejected():
     """按 CLAUDE.md 第 42 条：跨语言的旧事件在消费端拦，旧代数 translate_failed 被拒。"""
     win = _window()
-    win.sentence_pairs.clear()
+    win.history.clear()
     win.language_revision = 3
 
     # 发送代数 2 的事件（旧语言）
     win.on_translate_failed("Alter Satz", 0, 1000, "k_stale", 2, "timeout")
     _pump_until(lambda: False, timeout_ms=50)
 
-    # 句对列表里不应该有 k_stale
-    keys = [p[6] for p in win.sentence_pairs if len(p) >= 7]
-    assert "k_stale" not in keys
+    assert win.history.get("k_stale") is None
 
 
 def test_dropped_reason_renders_marker():
     """reason == 'dropped' 也显示同样标记（用户能看到有句子被丢了）。"""
     win = _window()
-    win.sentence_pairs.clear()
+    win.history.clear()
 
     win.on_translate_failed("Zu voll im Puffer", 0, 1000, "k_dropped", win.language_revision, "dropped")
-    assert _pump_until(lambda: any(len(p) >= 7 and p[6] == "k_dropped" for p in win.sentence_pairs))
+    assert _pump_until(lambda: win.history.get("k_dropped") is not None)
 
     html = win._last_html
     assert design_tokens.TEXT_UNTRANSLATED in html
@@ -193,7 +190,7 @@ def test_dropped_reason_renders_marker():
 def test_update_dst_syncs_all_windows():
     """update_dst 按 key 原地更新译文：主窗、历史窗、电视窗、影院条一致。"""
     win = _window()
-    win.sentence_pairs.clear()
+    win.history.clear()
 
     win.add_pair("Erste Zeile", "初版译文", 0, 1000, "k_multi", win.language_revision)
     assert _pump_until(lambda: "初版译文" in win._last_html)
@@ -202,22 +199,16 @@ def test_update_dst_syncs_all_windows():
     assert "修正后的终版译文" in win._last_html
 
     # 历史窗
-    history_matches = [
-        e for e in win.history_window._entries if e.get("key") == "k_multi"
-    ]
-    assert len(history_matches) == 1
-    assert history_matches[0]["chinese"] == "修正后的终版译文"
+    assert win.history.get("k_multi").dst == "修正后的终版译文"
 
     # 电视窗
-    tv_matches = [
-        e for e in win.tv_window._entries if e.get("key") == "k_multi"
-    ]
-    assert len(tv_matches) == 1
-    assert tv_matches[0]["text"] == "修正后的终版译文"
+    win.tv_window.show()
+    win.tv_window.rebuild_from_store()
+    assert "修正后的终版译文" in win.tv_window.text.toPlainText()
 
     # 影院条
     win.cinema_bar.show()
-    win.cinema_bar.append_pair("Erste Zeile", "初版译文", key="k_multi")
+    win.cinema_bar.show_last()
     win.update_dst("k_multi", "修正后的终版译文")
     assert win.cinema_bar.chinese_label.text() == "修正后的终版译文"
     win.cinema_bar.hide()

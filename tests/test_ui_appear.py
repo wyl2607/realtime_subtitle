@@ -72,7 +72,7 @@ def _new_window():
 
 
 def _reset_view(win):
-    win.sentence_pairs.clear()
+    win.history.clear()
     win.live_committed = ""
     win.live_unstable = ""
     win.live_draft = ""

@@ -187,40 +187,6 @@ def _coerce_revision(value):
         return 0
 
 
-def _reinsert_pair_by_t0(window, key, source):
-    """远端句替换后按 t0 插回 sentence_pairs，保持时间递增。
-
-    add_pair 只会追加。远端结果往往比后出现的本机句更早，留在末尾会把旧句顶到底行。
-    """
-    pairs = window.sentence_pairs
-    found = None
-    for index in range(len(pairs) - 1, -1, -1):
-        item = pairs[index]
-        if len(item) >= 7 and item[6] == key:
-            found = index
-            break
-    if found is None:
-        return
-    item = pairs.pop(found)
-    item = (item[0], item[1], item[2], item[3], item[4], source, item[6])
-    t0 = item[3]
-    insert_at = len(pairs)
-    if t0 is not None:
-        for index, existing in enumerate(pairs):
-            existing_t0 = existing[3] if len(existing) > 3 else None
-            if existing_t0 is None:
-                existing_t0 = float("-inf")
-            try:
-                later = existing_t0 > t0
-            except TypeError:
-                later = False
-            if later:
-                insert_at = index
-                break
-    pairs.insert(insert_at, item)
-    window._render()
-
-
 class RemoteBridge:
     """本机句和远端句的汇合点。
 
@@ -1594,7 +1560,7 @@ class SubtitleApp:
             window.add_pair(src or "", dst or "", t0, t1, key, rev)
             if source == "local":
                 return
-            _reinsert_pair_by_t0(window, key, source)
+            window.history.move_by_t0(key, source=source)
         self._ui_invoke(_go)
 
     def _ui_drop_keys(self, keys):
@@ -1604,19 +1570,7 @@ class SubtitleApp:
 
         def _go():
             window = self.subtitle_window
-            window.sentence_pairs = [
-                item for item in window.sentence_pairs
-                if not (len(item) >= 7 and item[6] in drop)
-            ]
-            # 远端句替换本机句：历史窗/电视窗/影院条也按同一句 id 去掉最初那条
-            # 本机句，否则它们会保留旧内容、随后又多出一条远端句（同一内容两遍）。
-            # 缺这些属性的测试替身用 getattr 兜底。
-            for name in ("history_window", "tv_window", "cinema_bar"):
-                view = getattr(window, name, None)
-                drop_fn = getattr(view, "drop_keys", None)
-                if drop_fn is not None:
-                    drop_fn(drop)
-            window._render()
+            window.history.drop(drop)
         self._ui_invoke(_go)
 
     def _ui_update_dst(self, key, dst):

@@ -464,20 +464,20 @@ def test_emit_pair_reaches_subtitle_window_and_rejects_stale_revision(monkeypatc
     t._lang_revision = 1
     t._emit_pair("Alt.", "旧", t0=1.5, t1=2.0, key="local:1.500-2.000:1")
     app.processEvents()
-    assert win.sentence_pairs == []
+    assert win.history.rows() == []
 
     t._lang_revision = 2
     t._emit_pair("Neu.", "新", t0=3.25, t1=4.5, key="local:3.250-4.500:9")
     app.processEvents()
-    last = win.sentence_pairs[-1]
-    assert last[0] == "Neu."
-    assert last[3] == 3.25
-    assert last[4] == 4.5
-    assert last[5] == "local"
-    assert last[6] == "local:3.250-4.500:9"
+    last = win.history.last()
+    assert last.src == "Neu."
+    assert last.t0 == 3.25
+    assert last.t1 == 4.5
+    assert last.source == "local"
+    assert last.key == "local:3.250-4.500:9"
 
     t._lang_revision = 0
     t._emit_pair("Spaet.", "晚", t0=9.0, t1=9.5, key="local:9.000-9.500:10")
     app.processEvents()
-    assert len(win.sentence_pairs) == 1
-    assert win.sentence_pairs[-1][0] == "Neu."
+    assert len(win.history) == 1
+    assert win.history.last().src == "Neu."
