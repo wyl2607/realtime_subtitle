@@ -8,10 +8,20 @@ from realtime_subtitle.remote.quota import QuotaLedger
 from realtime_subtitle.remote.routing_rules import RoutingState
 
 
-def _ledger(tmp_path, now=0.0, state=None, name="quota.json"):
+def _ledger(tmp_path, now=0.0, state=None, name="quota.json", monotonic=None):
     routing = state if state is not None else RoutingState(has_key=True, cloud_enabled=True)
     clock = now if callable(now) else (lambda now=now: now)
-    return QuotaLedger(tmp_path / name, routing=routing, now=clock), routing
+    return QuotaLedger(tmp_path / name, routing=routing, now=clock, monotonic=monotonic), routing
+
+
+class _RecordingRouting(RoutingState):
+    def __init__(self):
+        super().__init__(has_key=True, cloud_enabled=True)
+        self.events = []
+
+    def apply(self, event):
+        self.events.append(dict(event))
+        super().apply(event)
 
 
 def test_billed_seconds_are_at_least_10(tmp_path):
@@ -141,17 +151,123 @@ def test_day_request_header_hysteresis_and_later_local_requests(tmp_path):
     assert state.action == "resume_cloud"
 
 
-def test_reset_header_releases_day_request_cooldown_at_its_deadline(tmp_path):
-    ledger, state = _ledger(tmp_path, now=1000)
-    initial = ledger.note(10, now=1000, remaining_requests=5, reset_requests_s=100)
-    assert initial.usage_percent >= 90
-    assert state.cloud_state == "cooldown_quota"
-    assert ledger.usage(now=1050).usage_percent >= 90
+def test_trusted_reset_record_requires_both_headers_and_key_fingerprint(tmp_path):
+    ledger, _state = _ledger(tmp_path, now=1000, name="both.json", monotonic=lambda: 0)
+    ledger.note(10, now=1000, remaining_requests=5, reset_requests_s=100, key_fp="key-a", sent_at=1000)
+    assert json.loads((tmp_path / "both.json").read_text(encoding="utf-8"))["reset_record"] == {
+        "consumed": False, "key_fp": "key-a", "observed_at": 1000.0, "reset_at": 1100.0,
+    }
 
-    recovered = ledger.usage(now=1101)
-    assert recovered.day_requests == 0
-    assert recovered.usage_percent < 80
-    assert state.cloud_state == "available"
+    reset_only, _state = _ledger(tmp_path, now=1000, name="reset-only.json", monotonic=lambda: 0)
+    reset_only.note(10, now=1000, reset_requests_s=100, key_fp="key-a", sent_at=1000)
+    assert json.loads((tmp_path / "reset-only.json").read_text(encoding="utf-8"))["reset_record"] is None
+
+    remaining_only, _state = _ledger(tmp_path, now=1000, name="remaining-only.json", monotonic=lambda: 0)
+    remaining_only.note(10, now=1000, remaining_requests=5, key_fp="key-a", sent_at=1000)
+    assert json.loads((tmp_path / "remaining-only.json").read_text(encoding="utf-8"))["reset_record"] is None
+
+    too_far, _state = _ledger(tmp_path, now=1000, name="too-far.json", monotonic=lambda: 0)
+    too_far.note(10, now=1000, remaining_requests=5, reset_requests_s=86460.1, key_fp="key-a", sent_at=1000)
+    assert json.loads((tmp_path / "too-far.json").read_text(encoding="utf-8"))["reset_record"] is None
+
+
+def test_trusted_reset_emits_once_after_both_clocks_and_preserves_audio_windows(tmp_path):
+    mono = [0.0]
+    state = _RecordingRouting()
+    ledger, _state = _ledger(tmp_path, now=100, state=state, monotonic=lambda: mono[0])
+    before = ledger.note(3600, now=100, remaining_requests=5, reset_requests_s=10, key_fp="key-a", sent_at=100)
+    assert before.hour_audio_s == before.day_audio_s == 3600
+    assert state.cloud_state == "cooldown_quota"
+
+    mono[0] = 9.0
+    after = ledger.usage(now=110)
+    assert after.day_requests == 0
+    assert after.hour_audio_s == before.hour_audio_s
+    assert after.day_audio_s == before.day_audio_s
+    assert state.events[-1] == {"type": "quota_reset_confirmed", "usage_percent": 50.0}
+    assert sum(event["type"] == "quota_reset_confirmed" for event in state.events) == 1
+
+    ledger.usage(now=111)
+    assert sum(event["type"] == "quota_reset_confirmed" for event in state.events) == 1
+
+
+def test_untrusted_wall_clock_changes_keep_server_floor_and_do_not_emit_reset(tmp_path):
+    mono = [0.0]
+    state = _RecordingRouting()
+    ledger, _state = _ledger(tmp_path, now=100, state=state, monotonic=lambda: mono[0])
+    ledger.note(10, now=100, remaining_requests=5, reset_requests_s=10, key_fp="key-a", sent_at=100)
+
+    rolled_back = ledger.usage(now=94)
+    assert rolled_back.day_requests == 1995
+    assert not any(event["type"] == "quota_reset_confirmed" for event in state.events)
+    assert json.loads((tmp_path / "quota.json").read_text(encoding="utf-8"))["reset_record"] is None
+
+    mono = [0.0]
+    state = _RecordingRouting()
+    ledger, _state = _ledger(tmp_path, now=100, state=state, name="jump.json", monotonic=lambda: mono[0])
+    ledger.note(10, now=100, remaining_requests=5, reset_requests_s=10, key_fp="key-a", sent_at=100)
+    jumped = ledger.usage(now=110)
+    assert jumped.day_requests == 1995
+    assert not any(event["type"] == "quota_reset_confirmed" for event in state.events)
+
+
+def test_reset_record_binds_key_and_rejects_late_old_cycle_headers(tmp_path):
+    mono = [0.0]
+    ledger, _state = _ledger(tmp_path, now=100, monotonic=lambda: mono[0])
+    ledger.note(10, now=100, remaining_requests=5, reset_requests_s=10, key_fp="key-a", sent_at=100)
+
+    ledger.note(10, now=110, remaining_requests=1999, reset_requests_s=50, key_fp="key-a", sent_at=99)
+    assert ledger.usage(now=110).day_requests == 1996
+    ledger.note(10, now=111, remaining_requests=1999, reset_requests_s=50, key_fp="key-a", sent_at=None)
+    assert ledger.usage(now=111).day_requests == 1997
+
+    ledger.note(10, now=112, remaining_requests=1999, reset_requests_s=50, key_fp="key-b", sent_at=112)
+    saved = json.loads((tmp_path / "quota.json").read_text(encoding="utf-8"))
+    assert saved["reset_record"]["key_fp"] == "key-b"
+    assert ledger.usage(now=112).day_requests == 1995
+
+    ledger.note(10, now=113, remaining_requests=1999, reset_requests_s=50, key_fp=None, sent_at=113)
+    saved = json.loads((tmp_path / "quota.json").read_text(encoding="utf-8"))
+    assert saved["reset_record"] is None
+    assert ledger.usage(now=113).day_requests == 1995
+
+
+def test_reset_record_persists_consumption_and_bad_record_is_not_quarantined(tmp_path):
+    mono = [0.0]
+    state = _RecordingRouting()
+    ledger, _state = _ledger(tmp_path, now=100, state=state, monotonic=lambda: mono[0])
+    ledger.note(10, now=100, remaining_requests=5, reset_requests_s=10, key_fp="key-a", sent_at=100)
+    mono[0] = 9
+    ledger.usage(now=110)
+    saved = json.loads((tmp_path / "quota.json").read_text(encoding="utf-8"))
+    assert saved["reset_record"]["consumed"] is True
+
+    restarted = _RecordingRouting()
+    reloaded, _state = _ledger(tmp_path, now=lambda: 110, state=restarted, monotonic=lambda: 0)
+    assert reloaded.usage(now=111).day_requests == 0
+    assert not any(event["type"] == "quota_reset_confirmed" for event in restarted.events)
+
+    path = tmp_path / "bad-record.json"
+    path.write_text(json.dumps({
+        "version": 1, "events": [], "server_day_used": 3, "server_day_used_at": 100,
+        "reset_record": {"reset_at": "bad", "observed_at": 100, "key_fp": "key-a", "consumed": False},
+    }), encoding="utf-8")
+    bad, _state = _ledger(tmp_path, now=100, name="bad-record.json")
+    assert bad.usage(now=100).day_requests == 3
+    assert not (tmp_path / "bad-record.json.corrupt").exists()
+
+
+def test_restarted_ledger_trusts_elapsed_reset_without_a_monotonic_observation(tmp_path):
+    mono = [0.0]
+    ledger, _state = _ledger(tmp_path, now=100, monotonic=lambda: mono[0])
+    ledger.note(10, now=100, remaining_requests=5, reset_requests_s=10, key_fp="key-a", sent_at=100)
+
+    restarted = _RecordingRouting()
+    reloaded, _state = _ledger(tmp_path, now=lambda: 110, state=restarted, monotonic=lambda: 0)
+    assert reloaded.usage(now=110).day_requests == 0
+    saved = json.loads((tmp_path / "quota.json").read_text(encoding="utf-8"))
+    assert saved["reset_record"]["consumed"] is True
+    assert not any(event["type"] == "quota_reset_confirmed" for event in restarted.events)
 
 
 def test_smaller_server_usage_waits_60_seconds_before_it_is_accepted(tmp_path):
@@ -167,17 +283,19 @@ def test_smaller_server_usage_waits_60_seconds_before_it_is_accepted(tmp_path):
 
 
 def test_remaining_after_reset_is_a_new_server_day_baseline(tmp_path):
-    ledger, _state = _ledger(tmp_path, now=1000)
-    ledger.note(10, now=1000, remaining_requests=5, reset_requests_s=100)
-    ledger.note(10, now=1101, remaining_requests=1900)
+    mono = [0.0]
+    ledger, _state = _ledger(tmp_path, now=1000, monotonic=lambda: mono[0])
+    ledger.note(10, now=1000, remaining_requests=5, reset_requests_s=100, key_fp="key-a", sent_at=1000)
+    mono[0] = 99
+    ledger.note(10, now=1101, remaining_requests=1900, key_fp="key-a", sent_at=1101)
     assert ledger.usage(now=1101).day_requests == 100
 
 
 def test_reset_timestamp_round_trips_and_old_ledger_still_loads(tmp_path):
-    ledger, _state = _ledger(tmp_path, now=2000)
-    ledger.note(10, now=2000, remaining_requests=5, reset_requests_s=100)
+    ledger, _state = _ledger(tmp_path, now=2000, monotonic=lambda: 0)
+    ledger.note(10, now=2000, remaining_requests=5, reset_requests_s=100, key_fp="key-a", sent_at=2000)
     path = tmp_path / "quota.json"
-    assert json.loads(path.read_text(encoding="utf-8"))["server_reset_at"] == 2100.0
+    assert json.loads(path.read_text(encoding="utf-8"))["reset_record"]["reset_at"] == 2100.0
 
     reloaded, _state = _ledger(tmp_path, now=2050)
     assert reloaded.usage(now=2050).day_requests == 1995
@@ -196,15 +314,15 @@ def test_reset_timestamp_round_trips_and_old_ledger_still_loads(tmp_path):
     assert not (tmp_path / "quota.json.corrupt").exists()
 
 
-def test_nonfinite_server_reset_timestamp_quarantines_the_ledger(tmp_path):
+def test_old_or_nonfinite_reset_fields_do_not_quarantine_the_ledger(tmp_path):
     path = tmp_path / "quota.json"
     path.write_bytes(
         b'{"version":1,"events":[],"server_day_used":3,'
         b'"server_day_used_at":1000,"server_reset_at":Infinity}'
     )
     ledger, _state = _ledger(tmp_path, now=1000)
-    assert ledger.usage(now=1000).saturated is True
-    assert (tmp_path / "quota.json.corrupt").exists()
+    assert ledger.usage(now=1000).day_requests == 3
+    assert not (tmp_path / "quota.json.corrupt").exists()
 
 
 @pytest.mark.parametrize("bad", [-1, float("nan"), float("inf"), float("-inf")])
