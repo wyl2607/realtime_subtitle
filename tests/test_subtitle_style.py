@@ -109,7 +109,7 @@ def test_style_controls_render_and_persist_via_tuning(tmp_path, monkeypatch):
         assert config.DISPLAY_MODE == "target"
         assert config.SHOW_BILINGUAL is False
 
-        win.sentence_pairs.clear()
+        win.history.clear()
         win._add_pair("Quelle", "译文")
         html = win._last_html
         assert "译文" in html
@@ -178,7 +178,7 @@ def test_source_only_mode_shows_source_and_hides_translation(tmp_path, monkeypat
     try:
         win, _state_path = _new_window(tmp_path, monkeypatch)
         win.settings_window.display_mode_row["buttons"]["source"].click()
-        win.sentence_pairs.clear()
+        win.history.clear()
         win._add_pair("Nur Original", "只应隐藏的译文")
 
         assert config.DISPLAY_MODE == "source"

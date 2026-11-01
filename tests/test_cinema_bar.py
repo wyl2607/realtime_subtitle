@@ -18,6 +18,7 @@ from PyQt6.QtCore import QEvent
 
 import realtime_subtitle.config as config
 from realtime_subtitle.ui.cinema_bar import CinemaBar
+from realtime_subtitle.ui.history_store import SubtitleHistoryStore
 
 
 _APP = None  # 必须持有引用，理由同 test_tv_window
@@ -33,12 +34,16 @@ def _app():
 
 
 def _shown_bar():
-    """建一个普通 show（非覆盖层全屏）的 CinemaBar：append/draft 有 isVisible 门控。"""
+    """建一个普通 show（非覆盖层全屏）的 CinemaBar。"""
     _app()
-    bar = CinemaBar()
+    bar = CinemaBar(SubtitleHistoryStore())
     bar.resize(600, 200)
     bar.show()
     return bar
+
+
+def _add(bar, german, chinese, key=None):
+    bar.store.add(german, chinese, key=key)
 
 
 # ---------------------------------------------------------------------------
@@ -80,47 +85,47 @@ def test_ui_code_never_references_nonexistent_qevent_members():
 def test_hidden_bar_drops_content():
     """藏着时不攒内容：打开时由 _toggle_cinema 灌最后一句。"""
     _app()
-    bar = CinemaBar()  # 没 show
-    bar.append_pair("Hallo", "你好")
+    bar = CinemaBar(SubtitleHistoryStore())  # 没 show
+    _add(bar, "Hallo", "你好")
     bar.update_draft("草稿")
     assert bar.chinese_label.text() == ""
     assert bar.german_label.text() == ""
 
 
-def test_append_pair_shows_only_latest():
+def test_store_insert_shows_only_latest():
     """☠️ 影院条是"只显示最新一句"，不是滚动流——多来几句只留最后一句。
 
     在视频上叠多行会挡画面，而挡画面正是这个条要解决的问题。要回看历史用
     📜 历史窗或 📺 电视窗。
     """
     bar = _shown_bar()
-    bar.append_pair("Erster Satz.", "第一句。")
-    bar.append_pair("Zweiter Satz.", "第二句。")
+    _add(bar, "Erster Satz.", "第一句。")
+    _add(bar, "Zweiter Satz.", "第二句。")
     assert bar.chinese_label.text() == "第二句。"
     assert bar.german_label.text() == "Zweiter Satz."
 
 
 def test_blank_chinese_is_ignored():
     bar = _shown_bar()
-    bar.append_pair("Hallo", "你好")
-    bar.append_pair("Leer", "   ")
+    _add(bar, "Hallo", "你好")
+    _add(bar, "Leer", "   ")
     assert bar.chinese_label.text() == "你好", "空翻译不该把上一句冲掉"
 
 
 def test_draft_replaces_chinese_but_keeps_german():
     """☠️ 草稿只换中文行，德语行必须保持。
 
-    草稿退场的正常路径是"正式翻译到了"，紧接着 append_pair 会把两行都重写；
+    草稿退场的正常路径是"正式翻译到了"，紧接着 store insert 会把两行都重写；
     中间那一拍如果把德语也清掉，画面上会闪一下。
     """
     bar = _shown_bar()
-    bar.append_pair("Das ist ein Test.", "这是一个测试。")
+    _add(bar, "Das ist ein Test.", "这是一个测试。")
     bar.update_draft("这是一个…")
     assert bar.chinese_label.text() == "这是一个…"
     assert bar.german_label.text() == "Das ist ein Test.", "草稿不该动德语行"
     assert bar.chinese_label.property("draft") is True
 
-    bar.append_pair("Das ist ein Test.", "这是一个测试。")
+    _add(bar, "Das ist ein Test.", "这是一个测试。", key="next")
     assert bar.chinese_label.property("draft") is False, "正式translation要清掉草稿态"
 
 
@@ -130,7 +135,7 @@ def test_show_german_false_hides_german_line():
     orig = config.CINEMA_SHOW_GERMAN
     try:
         config.CINEMA_SHOW_GERMAN = False
-        bar.append_pair("Guten Tag", "你好")
+        _add(bar, "Guten Tag", "你好")
         assert bar.chinese_label.text() == "你好"
         assert bar.german_label.text() == ""
         assert not bar.german_label.isVisible(), "空德语行不该占位显示空底衬"
@@ -140,7 +145,7 @@ def test_show_german_false_hides_german_line():
 
 def test_clear_text_empties_both_lines():
     bar = _shown_bar()
-    bar.append_pair("Hallo", "你好")
+    _add(bar, "Hallo", "你好")
     bar.clear_text()
     assert bar.chinese_label.text() == ""
     assert bar.german_label.text() == ""
@@ -152,12 +157,12 @@ def test_hold_timer_restarts_on_each_line():
     orig = config.CINEMA_HOLD_SEC
     try:
         config.CINEMA_HOLD_SEC = 5.0
-        bar.append_pair("Hallo", "你好")
+        _add(bar, "Hallo", "你好")
         assert bar._hold_timer.isActive()
 
         config.CINEMA_HOLD_SEC = 0
         bar.clear_text()
-        bar.append_pair("Hallo", "你好")
+        _add(bar, "Hallo", "你好", key="again")
         assert not bar._hold_timer.isActive(), "0 = 不自动隐藏，不该起计时器"
     finally:
         config.CINEMA_HOLD_SEC = orig
@@ -188,7 +193,7 @@ def test_adjust_font_clamps_and_syncs_config():
 
 def test_clamp_screen_index():
     _app()
-    bar = CinemaBar()
+    bar = CinemaBar(SubtitleHistoryStore())
     n = len(QApplication.screens())
     assert bar._clamp_screen_index(0) == 0
     assert bar._clamp_screen_index(-3) == 0
@@ -205,7 +210,7 @@ def _panel_with_bar():
     from realtime_subtitle.ui.settings_window import SettingsWindow
     _app()
     win = SettingsWindow()
-    bar = CinemaBar()
+    bar = CinemaBar(SubtitleHistoryStore())
     bar.resize(600, 200)
     bar.show()
     win._cinema_bar = bar
@@ -248,7 +253,7 @@ def test_panel_pushes_style_to_the_bar_live():
     win, bar = _panel_with_bar()
     orig = config.CINEMA_FONT_SIZE
     try:
-        bar.append_pair("Hallo", "你好")
+        _add(bar, "Hallo", "你好")
         info = win.cinema_font_slider
         info["slider"].setValue(round(48 / info["step"]))
         assert "48px" in bar.chinese_label.styleSheet(), "字号没推到样式表"
@@ -265,7 +270,7 @@ def test_hiding_german_clears_the_stale_german_line():
     win, bar = _panel_with_bar()
     orig = config.CINEMA_SHOW_GERMAN
     try:
-        bar.append_pair("Guten Abend", "晚上好")
+        _add(bar, "Guten Abend", "晚上好")
         assert bar.german_label.text() == "Guten Abend"
         win.cinema_german_cb.setChecked(False)
         assert bar.german_label.text() == "", "残留的德语行没清掉"

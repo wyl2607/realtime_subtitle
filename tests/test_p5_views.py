@@ -23,6 +23,7 @@ from realtime_subtitle.app import SubtitleApp
 from realtime_subtitle.ui.cinema_bar import CinemaBar
 from realtime_subtitle.ui.popups import HistoryWindow
 from realtime_subtitle.ui.tv_window import TVWindow
+from realtime_subtitle.ui.history_store import SubtitleHistoryStore
 
 
 _APP = None  # 必须持有引用，理由同上
@@ -37,71 +38,74 @@ def _app():
     return app
 
 
-def _shown_bar():
+def _shown_bar(store=None):
     _app()
-    bar = CinemaBar()
+    bar = CinemaBar(store if store is not None else SubtitleHistoryStore())
     bar.resize(600, 200)
     bar.show()
     return bar
 
 
 # ---------------------------------------------------------------------------
-# 各视图的 drop_keys（按 id 移除，找不到静默忽略）
+# 共享 store 的删除事件（按 id 移除，找不到静默忽略）
 # ---------------------------------------------------------------------------
 
-def test_history_drop_keys_removes_only_matching():
+def test_history_delete_removes_only_matching():
     _app()
-    win = HistoryWindow()
-    win.append_pair("Hallo", "你好", key="a")
-    win.append_pair("Welt", "世界", key="b")
+    store = SubtitleHistoryStore()
+    HistoryWindow(store)
+    store.add("Hallo", "你好", key="a")
+    store.add("Welt", "世界", key="b")
 
-    win.drop_keys(["a"])
-    assert [e["key"] for e in win._entries] == ["b"]
+    store.drop(["a"])
+    assert [row.key for row in store.rows()] == ["b"]
 
     # 未知 id 静默忽略，不新增、不崩
-    win.drop_keys(["missing"])
-    assert [e["key"] for e in win._entries] == ["b"]
+    store.drop(["missing"])
+    assert [row.key for row in store.rows()] == ["b"]
 
     # 空集合不做事
-    win.drop_keys([])
-    win.drop_keys(None)
-    assert [e["key"] for e in win._entries] == ["b"]
+    store.drop([])
+    store.drop(None)
+    assert [row.key for row in store.rows()] == ["b"]
 
 
-def test_tv_drop_keys_removes_only_matching():
+def test_tv_delete_rebuilds_only_matching():
     _app()
-    win = TVWindow()
+    store = SubtitleHistoryStore()
+    win = TVWindow(store)
     win.resize(400, 300)
     win.show()
     try:
-        win.append_pair("第一句", key="a")
-        win.append_pair("第二句", key="b")
+        store.add("第一句", "第一句", key="a")
+        store.add("第二句", "第二句", key="b")
 
-        win.drop_keys(["a"])
-        assert [e["key"] for e in win._entries] == ["b"]
+        store.drop(["a"])
+        assert [row.key for row in store.rows()] == ["b"]
         assert win.text.toPlainText() == "第二句"
 
-        win.drop_keys(["missing"])
+        store.drop(["missing"])
         assert win.text.toPlainText() == "第二句"
     finally:
         win.hide()
 
 
-def test_cinema_drop_keys_clears_current_only():
-    bar = _shown_bar()
-    bar.append_pair("Hallo", "你好", key="a")
+def test_cinema_delete_clears_current_only():
+    store = SubtitleHistoryStore()
+    bar = _shown_bar(store)
+    store.add("Hallo", "你好", key="a")
 
-    bar.drop_keys(["b"])  # 不是当前句：影院条不受影响
+    store.drop(["b"])  # 不是当前句：影院条不受影响
     assert bar.chinese_label.text() == "你好"
 
-    bar.drop_keys(["a"])
+    store.drop(["a"])
     assert bar._current_key is None
     assert bar.chinese_label.text() == ""
     assert bar.german_label.text() == ""
 
 
 # ---------------------------------------------------------------------------
-# 端到端接线：_ui_drop_keys 要传播到三个辅助视图
+# 端到端接线：删除走 store 并通知三个辅助视图
 # ---------------------------------------------------------------------------
 
 def _wired_views(window):
@@ -124,20 +128,21 @@ def test_remote_replacement_keeps_single_entry_per_view(tmp_path, monkeypatch):
     window = sw_mod.SubtitleWindow()
     _wired_views(window)
     try:
+        window.history_window.show()
         window.add_pair("Hallo Welt", "你好世界", 0.0, 2.0, "local-1", 0)
-        assert len(window.history_window._entries) == 1
-        assert len(window.tv_window._entries) == 1
+        assert len(window.history) == 1
         assert window.cinema_bar._current_key == "local-1"
 
         app = _app_with(window)
         app._ui_drop_keys(["local-1"])
         app._ui_show_line("Hallo Welt", "云端世界", 0.0, 2.0, -1, "remote", 0)
 
-        assert [e["key"] for e in window.history_window._entries] == [-1]
-        assert window.history_window._entries[0]["chinese"] == "云端世界"
-        assert [e["key"] for e in window.tv_window._entries] == [-1]
-        assert window.tv_window._entries[0]["text"] == "云端世界"
-        assert window.cinema_bar._current_key == -1
+        assert [row.key for row in window.history.rows()] == ["-1"]
+        assert window.history.last().dst == "云端世界"
+        for view in (window.history_window, window.tv_window):
+            text = view.text.toPlainText()
+            assert text.count("云端世界") == 1 and "你好世界" not in text
+        assert window.cinema_bar._current_key == "-1"
         assert window.cinema_bar.chinese_label.text() == "云端世界"
     finally:
         window.container.close()
@@ -153,35 +158,34 @@ def test_replaced_untranslated_marker_clears_in_all_views(tmp_path, monkeypatch)
     try:
         window.add_pair("Hallo Welt", "翻译中…", 0.0, 2.0, "local-1", 0)
         window.on_translate_failed("Hallo Welt", 0.0, 2.0, "local-1", 0, "boom")
-        assert window.history_window._entries[0]["chinese"] == marker
-        assert window.tv_window._entries[0]["text"] == f"Hallo Welt {marker}"
+        assert window.history.last().dst == marker
+        window.tv_window.show()
+        window.tv_window.rebuild_from_store()
+        assert window.tv_window.text.toPlainText() == f"Hallo Welt {marker}"
         assert window.cinema_bar.chinese_label.text() == marker
 
         app = _app_with(window)
         app._ui_drop_keys(["local-1"])
         app._ui_show_line("Hallo Welt", "云端世界", 0.0, 2.0, -1, "remote", 0)
 
-        assert all(e["chinese"] != marker for e in window.history_window._entries)
-        assert all(e["text"] != marker for e in window.tv_window._entries)
+        assert all(row.dst != marker for row in window.history.rows())
+        assert marker not in window.tv_window.text.toPlainText()
+        assert "云端世界" in window.tv_window.text.toPlainText()
         assert window.cinema_bar.chinese_label.text() == "云端世界"
     finally:
         window.container.close()
 
 
-def test_drop_keys_on_shadow_window_without_views_is_safe():
-    """测试替身没有 history/tv/cinema 时 _ui_drop_keys 不能炸（回归守卫）。"""
+def test_delete_on_shadow_window_with_store_is_safe():
+    """测试替身只要提供 store，应用删除路径就无需辅助视图。"""
     _app()
 
     class _Window:
         def __init__(self):
-            self.sentence_pairs = [("a", "b", 0.0, 0.0, 1.0, "local", "k")]
-            self.rendered = 0
-
-        def _render(self):
-            self.rendered += 1
+            self.history = SubtitleHistoryStore()
+            self.history.add("a", "b", key="k", t0=0.0, t1=1.0)
 
     window = _Window()
     app = _app_with(window)
     app._ui_drop_keys(["k"])
-    assert window.sentence_pairs == []
-    assert window.rendered == 1
+    assert window.history.rows() == []

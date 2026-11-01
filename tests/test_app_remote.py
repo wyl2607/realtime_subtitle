@@ -1103,39 +1103,36 @@ def test_show_line_uses_real_revision_and_inserts_remote_by_t0():
 
     class _Window:
         def __init__(self):
+            from realtime_subtitle.ui.history_store import SubtitleHistoryStore
             self.language_revision = 2
-            self.sentence_pairs = [
-                ("early", "早", 1.0, 0.0, 1.0, "local", "early"),
-                ("late", "晚", 2.0, 3.0, 4.0, "local", "late"),
-            ]
+            self.history = SubtitleHistoryStore()
+            self.history.add("early", "早", key="early", t0=0.0, t1=1.0, wall=1.0)
+            self.history.add("late", "晚", key="late", t0=3.0, t1=4.0, wall=2.0)
             self.added = []
 
         def add_pair(self, german, chinese, t0=None, t1=None, key=None, revision=0):
             self.added.append(revision)
             if int(revision or 0) < self.language_revision:
                 return
-            self.sentence_pairs.append((german, chinese, 0.0, t0, t1, "local", key))
-
-        def _render(self):
-            return None
+            self.history.add(german, chinese, key=key, t0=t0, t1=t1, revision=revision)
 
     window = _Window()
     app.subtitle_window = window
     app._ui_show_line("stale", "旧", 0.2, 0.4, "stale", "local", 0)
     assert window.added[-1] == 0
-    assert all(item[6] != "stale" for item in window.sentence_pairs)
+    assert window.history.get("stale") is None
 
     app._ui_show_line("later", "后", 5.0, 6.0, "later", "local", 2)
-    assert window.sentence_pairs[-1][6] == "later"
+    assert window.history.last().key == "later"
 
     # 更晚的本机句已经在末尾。远端替换更早的那句时，不能再追加到它后面。
     app._ui_drop_keys(["early"])
     app._ui_show_line("cloud", "云", 0.0, 1.0, -1, "remote", 0)
     assert window.added[-1] == 2
-    assert [item[3] for item in window.sentence_pairs] == [0.0, 3.0, 5.0]
-    assert window.sentence_pairs[0][0] == "cloud"
-    assert window.sentence_pairs[0][5] == "remote"
-    assert window.sentence_pairs[-1][0] == "later"
+    assert [row.t0 for row in window.history.rows()] == [0.0, 3.0, 5.0]
+    assert window.history.rows()[0].src == "cloud"
+    assert window.history.rows()[0].source == "remote"
+    assert window.history.last().src == "later"
 
 
 class _ClockSegmenter:

@@ -3,7 +3,7 @@
 
 照 HistoryWindow 的 QTextEdit 滚动流模式——黑底不透明全屏窗没有
 半透明悬浮窗那些坑（穿透/手动布局/命中测试），不要往那套方案上靠。
-调用约定：append_pair/update_draft 都在主线程槽里被调（subtitle_render），
+调用约定：store 事件/update_draft 都在主线程槽里被调（subtitle_render），
 本窗不需要自己的信号层。
 """
 import html
@@ -14,19 +14,21 @@ from PyQt6.QtCore import Qt, QEvent, QTimer
 # QShortcut 在 Qt6 里从 QtWidgets 搬到了 QtGui（它不是控件，本来就不该在那）
 from PyQt6.QtGui import QTextCursor, QTextBlockFormat, QKeySequence, QShortcut
 import realtime_subtitle.config as config
-import realtime_subtitle.ui.design_tokens as design_tokens
+from realtime_subtitle.ui.history_store import HistoryEvent, HistoryRow, SubtitleHistoryStore
+
+
 class TVWindow(QWidget):
     """全屏滚动大字窗：新句从底部进入自动上滚；上翻回看时不打扰。"""
 
-    def __init__(self):
+    def __init__(self, store: SubtitleHistoryStore):
         super().__init__()
+        self.store = store
         self.setWindowTitle("📺 电视全屏字幕")
         # 置顶：电视/副屏上不该被任务栏或别的窗口盖住
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
         # 持久化恢复用；None = 首开走默认选屏（非主字幕窗所在屏）
         self.screen_index = None
         self._has_draft = False  # 草稿永远只占文档最后一个 block
-        self._entries = []  # 记录句子 [{"key": k, "text": t}]
 
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -67,31 +69,31 @@ class TVWindow(QWidget):
         self.close_btn.setStyleSheet(btn_style)
         self.close_btn.setToolTip("关闭全屏字幕（Esc）")
         self.close_btn.clicked.connect(self.hide)
+        self.store.subscribe(self._on_history_event)
 
     # ------------------------------------------------------------------
     # 内容
     # ------------------------------------------------------------------
-    def append_pair(self, chinese, key=None, german=None):
-        """正式中文句子追加为新段；替换掉当前草稿行（草稿已被它取代）。"""
-        chinese = (chinese or "").strip()
-        is_untranslated = (chinese in (design_tokens.TEXT_UNTRANSLATED, "翻译中…"))
-        if not chinese and not (german and is_untranslated):
-            return
-        text = f"{german} {chinese}" if (german and is_untranslated) else chinese
-        if not text.strip():
-            return
-        if key:
-            for entry in self._entries:
-                if entry.get("key") == key:
-                    entry["text"] = text
-                    if self.isVisible():
-                        self._rebuild()
-                    return
-            self._entries.append({"key": key, "text": text})
-            if len(self._entries) > 2000:
-                self._entries.pop(0)
+    @staticmethod
+    def _row_text(row: HistoryRow) -> str:
+        dst = (row.dst or "").strip()
+        return f"{row.src} {dst}" if row.status != "ok" else dst
+
+    def _on_history_event(self, event: HistoryEvent):
         if not self.isVisible():
-            return  # 藏着就不攒：打开时由 backfill 回填最近内容
+            return
+        if event.kind == "insert" and event.index == len(self.store) - 1:
+            row = self.store.get(event.keys[0])
+            if row is not None:
+                self._append_row(row)
+            return
+        self._rebuild()
+
+    def _append_row(self, row: HistoryRow):
+        """正式中文句子追加为新段；替换掉当前草稿行（草稿已被它取代）。"""
+        text = self._row_text(row).strip()
+        if not text:
+            return
         sb = self.text.verticalScrollBar()
         at_bottom = sb.value() >= sb.maximum() - 10
         self._remove_draft()
@@ -100,43 +102,13 @@ class TVWindow(QWidget):
         if at_bottom:
             sb.setValue(sb.maximum())
 
-    def update_dst(self, key, dst, german=None):
-        """按 key 原地更新译文（若之前是未翻译标记，更新为正式译文）"""
-        if not key:
-            return
-        changed = False
-        dst = (dst or "").strip()
-        is_untranslated = (dst in (design_tokens.TEXT_UNTRANSLATED, "翻译中…"))
-        text = f"{german} {dst}" if (german and is_untranslated) else dst
-        for entry in self._entries:
-            if entry.get("key") == key:
-                entry["text"] = text
-                changed = True
-                break
-        if changed and self.isVisible():
-            self._rebuild()
-
-    def drop_keys(self, keys):
-        """按句 id 移除句对（远端句替换本机句时调用）。理由同 HistoryWindow.drop_keys。
-
-        藏起来时也只清 _entries、不动文档——隐藏期间内容本来就不增量维护，
-        打开时由 backfill 回填。
-        """
-        drop = set(keys or [])
-        if not drop:
-            return
-        before = len(self._entries)
-        self._entries = [e for e in self._entries if e.get("key") not in drop]
-        if len(self._entries) != before and self.isVisible():
-            self._rebuild()
-
     def _rebuild(self):
         sb = self.text.verticalScrollBar()
         at_bottom = sb.value() >= sb.maximum() - 10
         self.text.clear()
         self._has_draft = False
-        for entry in self._entries:
-            t = entry.get("text", "")
+        for row in self.store.rows():
+            t = self._row_text(row)
             if t and t.strip():
                 self._append_block(html.escape(t.strip()), draft=False)
         self._update_bottom_anchor()
@@ -157,24 +129,13 @@ class TVWindow(QWidget):
         if at_bottom:
             sb.setValue(sb.maximum())
 
-    def backfill(self, items):
-        """打开时回填最近句子（清空重建；隐藏期间内容不做增量维护）。"""
+    def rebuild_from_store(self):
+        """打开时从共享历史重建；隐藏期间内容不做增量维护。"""
         self.text.clear()
         self._has_draft = False
-        self._entries.clear()
-        for item in items:
-            if isinstance(item, (tuple, list)):
-                g = item[0] if len(item) > 0 else ""
-                c = item[1] if len(item) > 1 else ""
-                k = item[6] if len(item) >= 7 else None
-                is_untranslated = (c in (design_tokens.TEXT_UNTRANSLATED, "翻译中…"))
-                t = f"{g} {c}" if (g and is_untranslated) else c
-            else:
-                t = str(item or "")
-                k = None
-            t = t.strip()
+        for row in self.store.rows():
+            t = self._row_text(row).strip()
             if t:
-                self._entries.append({"key": k, "text": t})
                 self._append_block(html.escape(t), draft=False)
         self._update_bottom_anchor()
         sb = self.text.verticalScrollBar()

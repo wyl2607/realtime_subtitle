@@ -189,7 +189,7 @@ enum OverlayMotion {
     static let markerFontScale = 0.8
     /// retry 返回 false 后，过这么久锁定为不可再点的静态「已过期」。
     static let expiredLockSec = 3.0
-    static let retryingText = "翻译中…"
+    static let retryingText = DesignTokens.Text.translating
     static let expiredText = "已过期"
 
     /// 一句的翻译结局。`.none` 表示还没失败（可能已有译文，也可能还在等）。

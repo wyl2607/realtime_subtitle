@@ -63,6 +63,7 @@ enum DesignTokens {
         static let statusCloudKeyInvalid: String = "云端 key 无效"
         static let statusCloudCooldownSuffix: String = " · 云端限流冷却"
         static let untranslated: String = "未翻译 ⟳"
+        static let translating: String = "翻译中…"
         static let nodeUnavailableSuffix: String = " 不可用，已用本机"
         static let nodeRecoveredWaitingSuffix: String = " 已恢复，等本句结束后切回"
         static let nodeRecoveredSwitchedSuffix: String = " 已恢复，已切回节点"

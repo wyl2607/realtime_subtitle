@@ -96,7 +96,7 @@ def test_toolbar_button_text_contains_no_emoji_or_symbol_pictographs():
             assert not 0x2600 <= codepoint <= 0x27BF
 
 
-def test_old_sentence_pairs_are_dimmed_but_latest_pair_is_not():
+def test_old_history_rows_are_dimmed_but_latest_pair_is_not():
     win = _window()
     snap = _snap_keys(
         "FONT_SIZE",
@@ -112,7 +112,7 @@ def test_old_sentence_pairs_are_dimmed_but_latest_pair_is_not():
         config.TEXT_COLOR = "#F0F0F0"
         config.MAX_SENTENCE_PAIRS = 3
         win.window.resize(900, 500)
-        win.sentence_pairs.clear()
+        win.history.clear()
         win.live_committed = ""
         win.live_unstable = ""
         win.live_draft = ""
@@ -134,5 +134,5 @@ def test_old_sentence_pairs_are_dimmed_but_latest_pair_is_not():
         assert latest_pos > dim_pos
     finally:
         _restore(snap)
-        win.sentence_pairs.clear()
+        win.history.clear()
         win._update_live("", "")

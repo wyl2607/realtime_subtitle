@@ -3,12 +3,16 @@
 """
 import html
 import time
-from PyQt6.QtWidgets import QLabel, QWidget, QVBoxLayout, QTextEdit, QPushButton
+from PyQt6.QtWidgets import (
+    QApplication, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QWidget, QVBoxLayout,
+    QTextEdit, QPushButton,
+)
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QTextCursor
 import realtime_subtitle.config as config
 import realtime_subtitle.ui.design_tokens as design_tokens
 from realtime_subtitle.ui.window_geometry import _screen_area_at
+from realtime_subtitle.ui.history_store import HistoryEvent, HistoryRow, SubtitleHistoryStore
 
 
 # 弹窗内操作按钮共用样式（深色半透明，压在圆角框里不抢戏）
@@ -52,18 +56,28 @@ class HistoryWindow(QWidget):
     只存内存里的本场内容；跨天/跨场的完整记录在 transcripts/ 目录。
     """
 
-    def __init__(self):
+    def __init__(self, store: SubtitleHistoryStore):
         super().__init__()
+        self.store = store
         self.setWindowTitle("📜 字幕历史（本场）")
         self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint)
         self.setGeometry(150, 120, 720, 560)
 
         layout = QVBoxLayout()
+        controls = QHBoxLayout()
+        self.search_box = QLineEdit()
+        self.search_box.setPlaceholderText("搜索原文或译文")
+        self.search_box.textChanged.connect(self._rebuild)
+        self.copy_btn = QPushButton("复制全文")
+        self.copy_btn.clicked.connect(self._copy_all)
+        self.export_btn = QPushButton("导出 SRT")
+        self.export_btn.clicked.connect(self._export_srt)
+        controls.addWidget(self.search_box)
+        controls.addWidget(self.copy_btn)
+        controls.addWidget(self.export_btn)
+        layout.addLayout(controls)
         self.text = QTextEdit()
         self.text.setReadOnly(True)
-        # 封顶：几小时的session能攒上千句对，QTextEdit无限增长会越来越卡。
-        # 超出自动丢最旧的（完整记录永远在 transcripts/ 里）
-        self.text.document().setMaximumBlockCount(2000)
         self.text.setStyleSheet(f"""
             QTextEdit {{
                 background-color: rgb(20, 20, 20);
@@ -76,95 +90,89 @@ class HistoryWindow(QWidget):
         """)
         layout.addWidget(self.text)
 
-        hint = QLabel("往上滚动可回看；停在底部时新字幕自动跟进。完整记录在 transcripts\\ 目录。")
+        self.hint = hint = QLabel("往上滚动可回看；停在底部时新字幕自动跟进。完整记录在 transcripts\\ 目录。")
         hint.setStyleSheet("color: #888; font-size: 12px;")
         layout.addWidget(hint)
         self.setLayout(layout)
-        self._entries = []
+        self._dirty = True
+        self.store.subscribe(self._on_history_event)
 
-    def append_pair(self, german, chinese, key=None):
-        if key:
-            for entry in self._entries:
-                if entry.get("key") == key:
-                    self.update_dst(key, chinese, german=german)
-                    return
-        stamp = time.strftime("%H:%M:%S")
-        self._entries.append({"key": key, "stamp": stamp, "german": german, "chinese": chinese})
-        if len(self._entries) > 2000:
-            self._entries.pop(0)
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._dirty:
+            self._rebuild()
 
+    def _on_history_event(self, event: HistoryEvent):
+        if not self.isVisible():
+            # 藏着不重建（2000 条 insertHtml 不便宜，而 update 每句都可能来），打开时补
+            self._dirty = True
+            return
+        if event.kind == "insert" and event.index == len(self.store) - 1 and not self.search_box.text().strip():
+            rows = self.store.rows()
+            self._append_row(self.store.get(event.keys[0]), rows[-2] if len(rows) > 1 else None)
+            return
+        self._rebuild()
+
+    def _rows(self):
+        return self.store.search(self.search_box.text())
+
+    def _append_row(self, row: HistoryRow | None, previous: HistoryRow | None = None):
+        if row is None:
+            return
         sb = self.text.verticalScrollBar()
-        at_bottom = sb.value() >= sb.maximum() - 10  # 用户没往上翻才自动跟进
-
+        at_bottom = sb.value() >= sb.maximum() - 10
         cursor = self.text.textCursor()
         # ☠️ 写成 `cursor.End` 会漏过第 1 步那道枚举守卫（它只看 `Q…` 开头的
         # 前缀），Qt6 下这里是当场 AttributeError。见 test_qt_enum_style。
         cursor.movePosition(QTextCursor.MoveOperation.End)
-        color = (
-            design_tokens.COLOR_UNTRANSLATED
-            if chinese in (design_tokens.TEXT_UNTRANSLATED, "翻译中…")
-            else "#9ad0ff"
+        if previous is not None and previous.revision != row.revision:
+            label = self.store.language_label(row.revision)
+            divider = f"── 切换到 {label} ──" if label else "── 切换语言 ──"
+            cursor.insertHtml(f'<span style="color:#777">{html.escape(divider)}</span><br>')
+        stamp = time.strftime("%H:%M:%S", time.localtime(row.wall))
+        source = "远端" if row.source == "remote" else design_tokens.TEXT_STATUS_LOCAL
+        color = design_tokens.COLOR_UNTRANSLATED if row.status != "ok" else "#9ad0ff"
+        block = (
+            f'<span style="color:#777">[{stamp}] [{source}]</span> {html.escape(row.src)}<br>'
+            f'<span style="color:{color}">{html.escape(row.dst)}</span><br><br>'
         )
-        block = f'<span style="color:#777">[{stamp}]</span> {html.escape(german)}<br>' if german else ""
-        block += f'<span style="color:{color}">{html.escape(chinese)}</span><br><br>'
         cursor.insertHtml(block)
-
         if at_bottom:
             sb.setValue(sb.maximum())
 
-    def update_dst(self, key, dst, german=None):
-        if not key:
-            return
-        updated = False
-        for entry in self._entries:
-            if entry.get("key") == key:
-                entry["chinese"] = dst
-                if german:
-                    entry["german"] = german
-                updated = True
-                break
-        if not updated:
-            return
-        self._rebuild()
-
-    def drop_keys(self, keys):
-        """按句 id 移除句对（远端句替换本机句时调用）。
-
-        ☠️ 替换=「删掉本机句 + 由远端句重新上屏」，不是就地改文本：远端句在
-        LineStore 里是负数新 key，后面的节点译文更新按那个 key 找，就地改文本会
-        让更新找不到条目。找不到的 key 静默忽略（已滚出/已清空属正常）。
-        """
-        drop = set(keys or [])
-        if not drop:
-            return
-        before = len(self._entries)
-        self._entries = [e for e in self._entries if e.get("key") not in drop]
-        if len(self._entries) != before:
-            self._rebuild()
-
-    def _rebuild(self):
+    def _rebuild(self, *_):
+        self._dirty = False
         sb = self.text.verticalScrollBar()
         val = sb.value()
         at_bottom = val >= sb.maximum() - 10
         self.text.clear()
         cursor = self.text.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
-        for entry in self._entries:
-            stamp = entry.get("stamp", "")
-            german = entry.get("german", "")
-            chinese = entry.get("chinese", "")
-            color = (
-                design_tokens.COLOR_UNTRANSLATED
-                if chinese in (design_tokens.TEXT_UNTRANSLATED, "翻译中…")
-                else "#9ad0ff"
-            )
-            block = f'<span style="color:#777">[{stamp}]</span> {html.escape(german)}<br>' if german else ""
-            block += f'<span style="color:{color}">{html.escape(chinese)}</span><br><br>'
-            cursor.insertHtml(block)
+        previous = None
+        for row in self._rows():
+            self._append_row(row, previous)
+            previous = row
         if at_bottom:
             sb.setValue(sb.maximum())
         else:
             sb.setValue(val)
+
+    def _copy_all(self):
+        QApplication.clipboard().setText(self.store.to_text(self._rows()))
+
+    def _export_srt(self):
+        default = f"subtitles_{time.strftime('%Y%m%d_%H%M%S')}.srt"
+        path, _ = QFileDialog.getSaveFileName(self, "导出 SRT", default, "SRT 文件 (*.srt)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(self.store.to_srt(self._rows()))
+        except OSError as e:
+            # 槽里抛出去会 abort 整个进程；写不进去（权限/盘满）只提示
+            self.hint.setText(f"⚠️ 导出失败：{e}")
+            return
+        self.hint.setText(f"已导出 {path}")
 
 
 class _AnalysisPopupBase(QWidget):

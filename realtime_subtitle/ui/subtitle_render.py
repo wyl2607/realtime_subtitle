@@ -108,47 +108,29 @@ class LiveTextRenderMixin:
         self.cinema_bar.update_draft(chinese)
         self._render()
 
+    def _on_history_event(self, event):
+        """主窗不做原位替换（P4 未做的那半）：任何 history 事件都整窗重绘，第 20 条量过它很便宜。"""
+        if event.kind == "insert":
+            self.live_draft = ""
+            self.status_line = ""
+            self._status_clear_timer.stop()
+        self._render()
+
     def _on_translate_failed(self, source_text, t0, t1, key, revision, reason):
         if self._is_stale_language(revision):
             return
         untranslated = design_tokens.TEXT_UNTRANSLATED
-        found = False
-        for index, item in enumerate(self.sentence_pairs):
-            if len(item) >= 7 and item[6] == key:
-                self.sentence_pairs[index] = (
-                    item[0] or source_text, untranslated, item[2], item[3], item[4], item[5], item[6]
-                )
-                found = True
-                break
-        if not found:
-            meta = {"revision": revision, "t0": t0, "t1": t1, "key": key, "source": "local"}
-            self._add_pair(source_text, untranslated, meta)
+        if self.history.get(key) is None:
+            self.history.add(source_text, untranslated, key=key, t0=t0, t1=t1,
+                             source="local", revision=revision)
         else:
-            self._render()
-            self.history_window.update_dst(key, untranslated, german=source_text)
-            self.tv_window.update_dst(key, untranslated, german=source_text)
-            self.cinema_bar.update_dst(key, untranslated, german=source_text)
+            self.history.update(key, dst=untranslated, src=source_text)
 
     def update_dst(self, key, dst, german=None):
         """按 key 原地更新译文（主窗、历史窗、电视窗、影院条一致）"""
         if not key:
             return
-        changed = False
-        actual_german = german
-        for index, item in enumerate(self.sentence_pairs):
-            if len(item) >= 7 and item[6] == key:
-                if not actual_german:
-                    actual_german = item[0]
-                self.sentence_pairs[index] = (
-                    item[0], dst, item[2], item[3], item[4], item[5], item[6]
-                )
-                changed = True
-                break
-        if changed:
-            self._render()
-            self.history_window.update_dst(key, dst, german=actual_german)
-            self.tv_window.update_dst(key, dst, german=actual_german)
-            self.cinema_bar.update_dst(key, dst, german=actual_german)
+        self.history.update(key, dst=dst, src=german)
 
     def _is_stale_language(self, revision):
         """这条事件是切换语言**之前**发出的吗（审核 O04）。
@@ -178,21 +160,8 @@ class LiveTextRenderMixin:
             if config.SHOW_PERFORMANCE:
                 print(f"   🌐 丢弃切换语言前的句对（代数 {revision}）")
             return
-        if key:
-            for index, item in enumerate(self.sentence_pairs):
-                if len(item) >= 7 and item[6] == key:
-                    self.update_dst(key, chinese, german=german)
-                    return
-        self.sentence_pairs.append((german, chinese, time.time(), t0, t1, source, key))
-        while len(self.sentence_pairs) > self.HISTORY_KEEP:
-            self.sentence_pairs.pop(0)
-        self.live_draft = ""  # 正式翻译到了，草稿退场
-        self.status_line = ""
-        self._status_clear_timer.stop()
-        self.history_window.append_pair(german, chinese, key=key)
-        self.tv_window.append_pair(chinese, key=key, german=german)
-        self.cinema_bar.append_pair(german, chinese, key=key)
-        self._render()
+        self.history.add(german, chinese, key=key, t0=t0, t1=t1,
+                         source=source, revision=revision)
         if config.SHOW_PERFORMANCE:
             print(f"💬 字幕: {chinese[:50]}{'...' if len(chinese) > 50 else ''}")
 
@@ -242,7 +211,7 @@ class LiveTextRenderMixin:
         source_size = round(config.FONT_SIZE * design_tokens.TYPE_SOURCE_SCALE)
         source_color = getattr(config, "SOURCE_TEXT_COLOR",
                                getattr(config, "TEXT_COLOR", design_tokens.COLOR_SUBTITLE_SOURCE))
-        is_untranslated = (chinese in (design_tokens.TEXT_UNTRANSLATED, "翻译中…"))
+        is_untranslated = chinese in (design_tokens.TEXT_UNTRANSLATED, design_tokens.TEXT_TRANSLATING)
         if is_untranslated:
             target_color = design_tokens.COLOR_UNTRANSLATED
         else:
@@ -357,17 +326,8 @@ class LiveTextRenderMixin:
         return time.monotonic()
 
     @staticmethod
-    def _pair_key(item):
-        """句对的稳定标识：优先用业务 key，没有就退回首次加入时的墙钟。
-
-        update_dst 会整个替换 tuple，所以 id(item) 不稳定；item[2] 是 append
-        时写下的墙钟，替换时保持不变，拿它当无 key 句对的身份正合适。
-        """
-        key = item[6] if len(item) >= 7 else None
-        if key:
-            return key
-        stamp = item[2] if len(item) >= 3 else None
-        return f"@ts:{stamp}"
+    def _pair_key(row):
+        return row.key
 
     def _html_for_keys(self, keys, item_map, fixed, fade=True):
         """按 key 顺序拼整段富文本；fade=False 时忽略淡入 alpha（终值）。"""
@@ -494,13 +454,12 @@ class LiveTextRenderMixin:
         doc = self._doc_for_render()
         avail_h = self.window.height() - 40
 
-        # 从最新往回只构造到 MAX_SENTENCE_PAIRS 条为止（理由见旧实现：
-        # sentence_pairs 内存里留 50 条，上屏上限只有 4-20 条）。
+        # 从最新往回只构造到 MAX_SENTENCE_PAIRS 条为止。
         keep = max(1, int(getattr(config, "MAX_SENTENCE_PAIRS", 20)))
         items = []
-        for item in reversed(self.sentence_pairs):
-            german, chinese = item[0], item[1]
-            key = self._pair_key(item)
+        for row in reversed(self.history.rows()):
+            german, chinese = row.src, row.dst
+            key = self._pair_key(row)
             block = self._pair_html(german, chinese, key=key)
             if not block:
                 continue
@@ -645,7 +604,7 @@ class LiveTextRenderMixin:
                 print(f"⚠️ retry_translation 出错: {e}")
                 success = False
         if success:
-            self.update_dst(key, "翻译中…")
+            self.update_dst(key, design_tokens.TEXT_TRANSLATING)
         else:
             self.show_status("这句已过期，无法重试")
 

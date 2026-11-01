@@ -52,6 +52,7 @@ from realtime_subtitle.ui.settings_window import (  # noqa: F401
 from realtime_subtitle.ui.popups import HistoryWindow, WordPopup, AIAnalysisPopup
 from realtime_subtitle.ui.tv_window import TVWindow
 from realtime_subtitle.ui.cinema_bar import CinemaBar
+from realtime_subtitle.ui.history_store import SubtitleHistoryStore
 from realtime_subtitle.ui.window_chrome import WindowChromeMixin
 from realtime_subtitle.ui.subtitle_render import LiveTextRenderMixin
 
@@ -226,11 +227,8 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         # 创建信号对象
         self.signals = SubtitleSignals()
         
-        # 德语先行双层显示状态
-        # 内存里多留一些句对（HISTORY_KEEP条），实际显示条数由窗口高度自适应决定：
-        # 窗口拉大 → 自动多显示历史；拉小 → 只留最新的
-        self.HISTORY_KEEP = 50
-        self.sentence_pairs = []  # 已完成句对 [(原文, 译文, 墙钟, t0, t1, source, key)]
+        # 德语先行双层显示状态；正式句对唯一真相源是共享 history。
+        self.history = SubtitleHistoryStore()
         self.live_committed = ""  # live行：已提交未翻译的德语
         self.live_unstable = ""   # live行：未稳定尾部（灰色）
         self.live_draft = ""      # live行的草稿中文（等正式翻译时先显示）
@@ -489,7 +487,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         self._update_mode_indicator(self.settings_window._active_preset)
 
         # 创建历史窗口（初始隐藏）
-        self.history_window = HistoryWindow()
+        self.history_window = HistoryWindow(self.history)
 
         # 电视全屏窗（初始隐藏）：字号/所在屏从 state 的 "tv" 段恢复
         tv_state = self._state.get("tv") or {}
@@ -497,7 +495,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
             config.TV_FONT_SIZE = int(tv_state["font_size"])
         except (KeyError, TypeError, ValueError):
             pass
-        self.tv_window = TVWindow()
+        self.tv_window = TVWindow(self.history)
         self.tv_window._apply_font()  # 恢复的字号要落到样式表
         si = tv_state.get("screen_index")
         self.tv_window.screen_index = si if isinstance(si, int) else None
@@ -513,9 +511,10 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         # 这里**不要**再从 state["cinema"] 读一遍——两个数据源必然会漂。
         # state["cinema"] 只剩 screen_index：那是窗口状态不是 config 值。
         cine_state = self._state.get("cinema") or {}
-        self.cinema_bar = CinemaBar()
+        self.cinema_bar = CinemaBar(self.history)
         ci = cine_state.get("screen_index")
         self.cinema_bar.screen_index = ci if isinstance(ci, int) else None
+        self.history.subscribe(self._on_history_event)
         # 面板比它先构造，建好后回挂，⚙️ 里那三个控件才推得动它
         self.settings_window._cinema_bar = self.cinema_bar
 
@@ -763,6 +762,8 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         之后到达的、代数更旧的句对/草稿一定是切换前发出的——正是要拒掉的那些。
         """
         self.language_revision = int(revision)
+        from realtime_subtitle.language_policy import language_name
+        self.history.mark_language(language_name(src), language_name(tgt), self.language_revision)
         # 旧语言的 minHold 截止点不能留到新语言：到点重渲染会把刚上屏的
         # 新语言句子当成「早该走了」放走。重置并把计时锚到此刻。
         self._reset_appear_hold()
@@ -870,7 +871,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
         if self.tv_window.isVisible():
             self.tv_window.hide()
         else:
-            self.tv_window.backfill(self.sentence_pairs)
+            self.tv_window.rebuild_from_store()
             self.tv_window.open_fullscreen(
                 avoid_center=self.container.frameGeometry().center())
 
@@ -885,9 +886,7 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
             return
         self.cinema_bar.open_on(
             prefer_center=self.container.frameGeometry().center())
-        if self.sentence_pairs:
-            de, zh = self.sentence_pairs[-1][0], self.sentence_pairs[-1][1]
-            self.cinema_bar.append_pair(de, zh)
+        self.cinema_bar.show_last()
 
     def _on_ai_analysis_clicked(self):
         """🤖：过滤最近 N 分钟德文 → 本地总结；空内容直接提示不打 Ollama。"""
@@ -895,7 +894,9 @@ class SubtitleWindow(WindowChromeMixin, LiveTextRenderMixin):
             filter_recent_german_context,
             build_web_query_for_background,
         )
-        german_text = filter_recent_german_context(self.sentence_pairs)
+        german_text = filter_recent_german_context(
+            [(row.src, row.dst, row.wall) for row in self.history.rows()]
+        )
         # 弹窗锚在主字幕窗中心偏上，避免挡死最新字幕
         anchor = self.container.frameGeometry().center()
         from PyQt6.QtCore import QPoint

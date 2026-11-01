@@ -926,9 +926,9 @@ def test_on_ai_analysis_clicked_bumps_seq_and_shows_web_while_loading():
 
     app = _app()
     w = _ai_gate_stub()
-    w.sentence_pairs = [
-        ("Das ist ein laengerer Satz.", "这是一句较长的话。", time.time()),
-    ]
+    from realtime_subtitle.ui.history_store import SubtitleHistoryStore
+    w.history = SubtitleHistoryStore()
+    w.history.add("Das ist ein laengerer Satz.", "这是一句较长的话。", wall=time.time())
 
     class _Container:
         def frameGeometry(self):

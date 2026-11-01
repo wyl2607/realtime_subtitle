@@ -110,21 +110,13 @@ class _VirtualTimer:
         return self._active
 
 
-def _item_key(win, item):
-    fn = getattr(win, "_pair_key", None)
-    if fn is not None:
-        return fn(item)
-    return item[6] if len(item) >= 7 else None
-
-
 def _visible_pair_items(win):
     """按 _render 的同一套规则，返回候选句对 [(key, german, chinese)]。"""
     import realtime_subtitle.config as config
     keep = max(1, int(getattr(config, "MAX_SENTENCE_PAIRS", 20)))
     items = []
-    for item in reversed(win.sentence_pairs):
-        g, c = item[0], item[1]
-        k = _item_key(win, item)
+    for row in reversed(win.history.rows()):
+        g, c, k = row.src, row.dst, row.key
         if not win._pair_html(g, c, key=k):
             continue
         items.append((k, g, c))
@@ -305,7 +297,7 @@ def run(pairs_fit):
     # 否则首句 pair 会把一次性 font-cache 开销算进「首字延迟」。
     win._add_pair("Warm-up sentence for layout cache.", "用于预热排版的句子。",
                   {"revision": 0, "t0": None, "t1": None, "key": "warmup", "source": "local"})
-    win.sentence_pairs.clear()
+    win.history.clear()
     win.live_draft = ""
     win._render()
     _app().processEvents()

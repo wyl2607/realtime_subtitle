@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import QApplication
 
 import realtime_subtitle.config as config
 from realtime_subtitle.ui.tv_window import TVWindow
+from realtime_subtitle.ui.history_store import SubtitleHistoryStore
 
 
 _APP = None  # 必须持有引用：QApplication 没引用会被立即GC，后续建QWidget触发qFatal秒退
@@ -32,17 +33,21 @@ def _app():
 def _shown_tv():
     """建一个普通 show（非全屏）的 TVWindow：append/draft 有 isVisible 门控。"""
     _app()
-    win = TVWindow()
+    win = TVWindow(SubtitleHistoryStore())
     win.resize(400, 300)
     win.show()
     return win
 
 
-def test_append_pair_appends_blocks():
+def _add(win, text):
+    win.store.add(text or "", text or "")
+
+
+def test_store_insert_appends_blocks():
     win = _shown_tv()
     try:
-        win.append_pair("第一句")
-        win.append_pair("第二句")
+        _add(win, "第一句")
+        _add(win, "第二句")
         assert win.text.toPlainText() == "第一句\n第二句"
     finally:
         win.hide()
@@ -51,9 +56,9 @@ def test_append_pair_appends_blocks():
 def test_empty_or_blank_chinese_is_ignored():
     win = _shown_tv()
     try:
-        win.append_pair("")
-        win.append_pair("   ")
-        win.append_pair(None)
+        _add(win, "")
+        _add(win, "   ")
+        _add(win, None)
         assert win.text.toPlainText() == ""
     finally:
         win.hide()
@@ -62,14 +67,14 @@ def test_empty_or_blank_chinese_is_ignored():
 def test_draft_occupies_last_block_and_gets_replaced_by_pair():
     win = _shown_tv()
     try:
-        win.append_pair("正式一")
+        _add(win, "正式一")
         win.update_draft("草稿中")
         assert win.text.toPlainText() == "正式一\n草稿中"
         # 草稿只更新不叠加
         win.update_draft("草稿更长了")
         assert win.text.toPlainText() == "正式一\n草稿更长了"
         # 正式句对到达：草稿退场，被正式文本替换
-        win.append_pair("正式二")
+        _add(win, "正式二")
         assert win.text.toPlainText() == "正式一\n正式二"
         # 空草稿 = 清掉草稿行
         win.update_draft("又一条草稿")
@@ -81,17 +86,20 @@ def test_draft_occupies_last_block_and_gets_replaced_by_pair():
 
 def test_hidden_window_drops_content():
     _app()
-    win = TVWindow()  # 不 show
-    win.append_pair("看不见就别攒")
+    win = TVWindow(SubtitleHistoryStore())  # 不 show
+    _add(win, "看不见就别攒")
     win.update_draft("草稿也别攒")
     assert win.text.toPlainText() == ""
 
 
-def test_backfill_replaces_document():
+def test_rebuild_from_store_replaces_document():
     win = _shown_tv()
     try:
-        win.append_pair("旧的")
-        win.backfill(["一", "二", "三"])
+        _add(win, "旧的")
+        win.store.clear()
+        for text in ("一", "二", "三"):
+            _add(win, text)
+        win.rebuild_from_store()
         assert win.text.toPlainText() == "一\n二\n三"
     finally:
         win.hide()
@@ -102,7 +110,7 @@ def test_warm_up_leaves_window_hidden_with_full_opacity():
     要吃掉 400-500ms，opacity=0 时用户看不到）；预热完必须恢复隐藏+不透明，
     不能让用户下次看到一个残留可见或半透明的窗口。"""
     _app()
-    win = TVWindow()
+    win = TVWindow(SubtitleHistoryStore())
     win.warm_up()
     assert win.isHidden()
     assert win.windowOpacity() == 1.0
@@ -114,7 +122,7 @@ def test_bottom_anchor_pads_sparse_content_to_viewport_bottom():
     win = _shown_tv()
     try:
         win.resize(400, 600)
-        win.append_pair("只有一行")
+        _add(win, "只有一行")
         pad = win.text.document().rootFrame().frameFormat().topMargin()
         viewport_h = win.text.viewport().height()
         # 默认文档边距只有几像素；真正生效的留白应占掉视口大半高度
@@ -130,7 +138,7 @@ def test_bottom_anchor_clears_once_content_fills_viewport():
     try:
         win.resize(400, 200)  # 矮窗口，几行就能撑满
         for i in range(20):
-            win.append_pair(f"第{i}行足够长的中文字幕内容撑满窗口宽度测试用")
+            _add(win, f"第{i}行足够长的中文字幕内容撑满窗口宽度测试用")
         pad = win.text.document().rootFrame().frameFormat().topMargin()
         assert pad == 0
     finally:
@@ -149,7 +157,7 @@ def test_bottom_anchor_stays_stable_across_repeated_updates():
     try:
         win.resize(400, 200)
         for i in range(20):
-            win.append_pair(f"第{i}行足够长的中文字幕内容撑满窗口宽度测试用")
+            _add(win, f"第{i}行足够长的中文字幕内容撑满窗口宽度测试用")
         for _ in range(5):
             win.update_draft("草稿中文在流式生成中")
             win.update_draft("")
@@ -157,7 +165,9 @@ def test_bottom_anchor_stays_stable_across_repeated_updates():
         assert pad == 0
 
         # 反向：内容清空回到稀疏态，留白要能重新长出来（短路不能把这条路堵死）
-        win.backfill(["只有一行"])
+        win.store.clear()
+        _add(win, "只有一行")
+        win.rebuild_from_store()
         pad = win.text.document().rootFrame().frameFormat().topMargin()
         assert pad > 0
     finally:
@@ -168,7 +178,7 @@ def test_adjust_font_clamps_and_syncs_config():
     _app()
     snap = config.TV_FONT_SIZE
     try:
-        win = TVWindow()
+        win = TVWindow(SubtitleHistoryStore())
         config.TV_FONT_SIZE = config.TV_FONT_SIZE_MAX - 2
         win._adjust_font(+1)
         assert config.TV_FONT_SIZE == config.TV_FONT_SIZE_MAX  # +4 被钳到上限
@@ -185,7 +195,7 @@ def test_adjust_font_clamps_and_syncs_config():
 
 def test_clamp_screen_index():
     _app()
-    win = TVWindow()
+    win = TVWindow(SubtitleHistoryStore())
     n = len(QApplication.screens())
     assert win._clamp_screen_index(0) == 0
     assert win._clamp_screen_index(-3) == 0
