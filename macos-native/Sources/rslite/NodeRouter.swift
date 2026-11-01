@@ -1521,7 +1521,7 @@ final class NodeRouter: @unchecked Sendable {
     }
 
     static func pinnedMissingStatus(id: String) -> String {
-        "\(id) 不在节点列表，已用本机"
+        id + DesignTokens.Text.nodeNotListedSuffix
     }
 
     static func selfTest() -> [String] {
@@ -1642,7 +1642,7 @@ final class NodeRouter: @unchecked Sendable {
               "回到本机节点时也提示指定节点不可用")
         check(Self.pinnedUnavailableNotice(nodeIDs: manifestIDs, pinnedNode: "win", bestID: "win") == nil,
               "指定节点可用时不报不可用")
-        check(Self.pinnedMissingStatus(id: "ghost") == "ghost 不在节点列表，已用本机",
+        check(Self.pinnedMissingStatus(id: "ghost") == "ghost" + DesignTokens.Text.nodeNotListedSuffix,
               "清单里没有该节点的提示")
         check(RoutingDecider.choose(candidates: [better, RouteCandidate(id: "off", expectedNodeID: "n1", info: goodInfo, rttMS: 10, isLocal: false, offlineUntil: 100)], now: 1, localAccurate: true)?.id == "better",
               "offline_until 内节点应排除")

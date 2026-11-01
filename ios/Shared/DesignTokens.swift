@@ -77,6 +77,8 @@ enum DesignTokens {
         static let localTxUnavailable: String = "本机翻译资源未下载，只显示原文"
         static let localNeedsIOS26: String = "本机识别需要 iOS 26 或更新"
         static let localSpeechDenied: String = "语音识别权限被拒绝，请到 设置 → 实时字幕 打开"
+        static let nodeNotListedSuffix: String = " 不在节点列表，已用本机"
+        static let playbackCaptureBlocked: String = "该应用禁止内录，请改用麦克风"
     }
     enum Palette {
         static let text: [(name: String, hex: String)] = [(name: "白", hex: "#F0F0F0"), (name: "暖黄", hex: "#FFE894"), (name: "浅青", hex: "#9FE7F5"), (name: "浅绿", hex: "#B8F2B0"), (name: "浅粉", hex: "#FFC4D6")]
