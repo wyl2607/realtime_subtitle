@@ -2295,6 +2295,18 @@ def _write_secret(path: Path, text: str, mode: int = 0o600) -> Path:
     return path
 
 
+def _bump_dir_mtime_ns(directory: Path) -> None:
+    """把目录 mtime 显式推进到严格更大的 ns 值。
+
+    Windows/NTFS 更新目录 mtime 的时机和粒度跟 macOS 不同：同一个时间粒度内的
+    连续文件操作可能读回同一个 st_mtime_ns，reload_if_dir_changed() 就会误判成
+    "没变"。这里要验的是"变了就重读"，不是文件系统的时钟粒度，所以不依赖写入
+    自身会不会刷新 mtime。
+    """
+    st = directory.stat()
+    os.utime(directory, ns=(st.st_atime_ns, max(st.st_mtime_ns, time.time_ns()) + 1_000_000_000))
+
+
 TOK_DEFAULT = "d" * 32
 TOK_MAC = "m" * 32
 TOK_PHONE = "p" * 32
@@ -2491,6 +2503,7 @@ def test_token_book_constant_time_and_dir_mtime_reload(tmp_path, caplog):
         assert len(calls) == 1
         phone = _write_secret(d / "tokens" / "phone.token", "b" * 32)
         _write_secret(d / "tokens" / "mac.token", "c" * 32)
+        _bump_dir_mtime_ns(d / "tokens")
         assert book.reload_if_dir_changed() is True
         calls.clear()
         assert book.match("Bearer " + "b" * 32) == "phone"
@@ -2499,6 +2512,7 @@ def test_token_book_constant_time_and_dir_mtime_reload(tmp_path, caplog):
         assert book.match("Bearer nope") is None
         assert len(calls) == 3
         phone.unlink()
+        _bump_dir_mtime_ns(d / "tokens")
         assert book.reload_if_dir_changed() is True
         assert book.match("Bearer " + "b" * 32) is None
         assert book.match("Bearer " + "c" * 32) == "mac"
