@@ -159,7 +159,7 @@ jobs:
       # 缓存 SwiftPM 构建产物。key 里带上 Package.resolved（仓库当前没有依赖，
       # hashFiles 取不到时返回空串、不会报错）和 Sources 的哈希——源码一改就换
       # key，避免用旧编译结果糊弄出一份假的绿。
-      - uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57  # v4.2.0
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: macos-native/.build
           key: ${{ runner.os }}-swiftpm-${{ hashFiles('macos-native/Package.resolved', 'macos-native/Sources/**/*.swift') }}
