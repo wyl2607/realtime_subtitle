@@ -1,359 +1,429 @@
 #!/bin/bash
-# macOS 自动验收脚本 for v3.2.0
-# 兼容 macOS 自带 bash 3.2：set -u 下不要展开空数组
+# macOS 自动验收脚本 for v3.2.0。
+# 兼容 macOS 自带 bash 3.2；不运行时不修改用户的 rslite 配置。
 
 set -u
 
-# 默认参数
+REAL_HOME="$HOME"
+DATA="$REAL_HOME/projects/rs-mac-native-data"
+REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
+PYTHON="$REPO/venv/bin/python"
+
 OUT_DIR=""
 ONLY=""
-SKIP_PTEST=false
+SKIP_PYTEST=false
+FAKE=""
 
-# 解析命令行参数
-while [ $# -gt 0 ]; do
+usage() {
+    printf '%s\n' '用法: run_mac_auto.sh [--out DIR] [--only gates|docs|fallback] [--skip-pytest]' >&2
+}
+
+while [ "$#" -gt 0 ]; do
     case "$1" in
         --out)
+            [ "$#" -ge 2 ] || { usage; exit 1; }
             OUT_DIR="$2"
             shift 2
             ;;
         --only)
+            [ "$#" -ge 2 ] || { usage; exit 1; }
             ONLY="$2"
             shift 2
             ;;
         --skip-pytest)
-            SKIP_PTEST=true
+            SKIP_PYTEST=true
             shift
             ;;
         *)
-            echo "未知参数: $1" >&2
+            usage
             exit 1
             ;;
     esac
 done
 
-# 设置默认输出目录
+case "$ONLY" in
+    ""|gates|docs|fallback) ;;
+    *) usage; exit 1 ;;
+esac
+
 if [ -z "$OUT_DIR" ]; then
-    TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
-    OUT_DIR="$HOME/projects/rs-mac-native-data/accept-v320/$TIMESTAMP"
+    OUT_DIR="$DATA/accept-v320/$(date +'%Y%m%d-%H%M%S')"
 fi
 
-# 创建输出目录
-mkdir -p "$OUT_DIR"
+cd "$REPO" || exit 1
+mkdir -p "$OUT_DIR" || exit 1
 SUMMARY_FILE="$OUT_DIR/summary.tsv"
-echo -e "项⽬名\t结果\t原因" > "$SUMMARY_FILE"
+printf '项目名\t结果\t原因\n' > "$SUMMARY_FILE"
 
-# 前置检查：确保没有 rslite 或 Python main.py 在运行
-if pgrep -f "macos-native/.build/release/rslite" >/dev/null 2>&1 || \
-   pgrep -f "python.*main.py" >/dev/null 2>&1; then
-    echo "错误: 检测到正在运行的 rslite 或 Python 主程序，请先停止它们"
-    echo "rslite\tFAIL\t检测到正在运行的 rslite 或 Python 主程序" >> "$SUMMARY_FILE"
-    exit 2
-fi
-
-# 定义日志函数
 log_result() {
-    local test_name="$1"
-    local result="$2"  # PASS|FAIL|SKIP
+    local name="$1"
+    local result="$2"
     local reason="$3"
-    
-    echo -e "$test_name\t$result\t$reason" | tee -a "$SUMMARY_FILE"
+    printf '%s %s %s\n' "$result" "$name" "$reason"
+    printf '%s\t%s\t%s\n' "$name" "$result" "$reason" >> "$SUMMARY_FILE"
 }
 
-# 创建假ホーム目录
-setup_fake_home() {
-    local fakehome="$OUT_DIR/fakehome"
-    mkdir -p "$fakehome"
-    chmod 700 "$fakehome"
-    
-    # 创建必要的目录结构
-    mkdir -p "$fakehome/.config/rslite"
-    chmod 700 "$fakehome/.config/rslite"
-    
-    # 如果存在真实的 nodes.json 和 tokens，只读复制进去
-    if [ -d "$HOME/.config/rslite" ]; then
-        if [ -f "$HOME/.config/rslite/nodes.json" ]; then
-            cp -p "$HOME/.config/rslite/nodes.json" "$fakehome/.config/rslite/nodes.json"
-            chmod 600 "$fakehome/.config/rslite/nodes.json"
-        fi
-        
-        if [ -d "$HOME/.config/rslite/tokens" ]; then
-            cp -p "$HOME/.config/rslite/tokens/"* "$fakehome/.config/rslite/tokens/" 2>/dev/null || true
-            chmod -R 600 "$fakehome/.config/rslite/tokens" 2>/dev/null || true
-            chmod 700 "$fakehome/.config/rslite/tokens" 2>/dev/null || true
-        fi
-    fi
-    
-    echo "$fakehome"
-}
-
-# 清理假ホーム目录
 cleanup_fake_home() {
-    local fakehome="$1"
-    if [ -n "$fakehome" ] && [ -d "$fakehome" ]; then
-        # 删除 groq.key（如果存在）
-        rm -f "$fakehome/.config/rslite/groq.key"
-        # 删除整个假ホーム目录
-        rm -rf "$fakehome"
+    if [ -n "$FAKE" ] && [ -d "$FAKE" ]; then
+        rm -f "$FAKE/.config/rslite/groq.key"
+        rm -rf "$FAKE"
+    fi
+    FAKE=""
+}
+
+# $1=yes 时才复制真实节点资料；每个 fallback 场景均会先重建这个目录。
+setup_fake_home() {
+    local copy_nodes="$1"
+    local token_source
+    local token_target
+
+    cleanup_fake_home
+    FAKE="$OUT_DIR/fakehome"
+    mkdir -m 700 "$FAKE" || return 1
+    mkdir -p "$FAKE/.config"
+    chmod 700 "$FAKE/.config"
+    mkdir -m 700 "$FAKE/.config/rslite" || return 1
+
+    if [ "$copy_nodes" != "yes" ]; then
+        return 0
+    fi
+
+    if [ -f "$REAL_HOME/.config/rslite/nodes.json" ]; then
+        cp -p "$REAL_HOME/.config/rslite/nodes.json" "$FAKE/.config/rslite/nodes.json" || return 1
+        chmod 600 "$FAKE/.config/rslite/nodes.json"
+    fi
+
+    if [ -d "$REAL_HOME/.config/rslite/tokens" ]; then
+        mkdir -m 700 "$FAKE/.config/rslite/tokens" || return 1
+        for token_source in "$REAL_HOME/.config/rslite/tokens/"*; do
+            [ -f "$token_source" ] || continue
+            token_target="$FAKE/.config/rslite/tokens/$(basename "$token_source")"
+            cp -p "$token_source" "$token_target" || return 1
+            chmod 600 "$token_target"
+        done
     fi
 }
 
-# 运行质量门禁 (Done 7)
 run_quality_gates() {
-    local fakehome="$1"
-    local result_file="$OUT_DIR/quality_gates.log"
-    
-    {
-        echo "=== 运行 pytest ==="
-        if [ "$SKIP_PTEST" = false ]; then
-            TMPDIR=/tmp HOME="$fakehome" ~/projects/rs-mac-native/venv/bin/python -m pytest -q -p no:cacheprovider --basetemp=/tmp/rs-accept-pytest
-            pytest_result=$?
+    local log_file
+    local rc
+
+    if [ "$SKIP_PYTEST" = true ]; then
+        log_result "gates_pytest" "SKIP" "--skip-pytest"
+    else
+        log_file="$OUT_DIR/gates_pytest.log"
+        TMPDIR=/tmp "$PYTHON" -m pytest -q -p no:cacheprovider --basetemp=/tmp/rs-accept-pytest > "$log_file" 2>&1
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
+            log_result "gates_pytest" "PASS" "pytest 退出码 0"
         else
-            echo "跳过 pytest (--skip-pytest)"
-            pytest_result=0
+            log_result "gates_pytest" "FAIL" "pytest 退出码 $rc；见 $log_file"
         fi
-        
-        echo "=== 运行 ruff ==="
-        TMPDIR=/tmp HOME="$fakehome" ~/projects/rs-mac-native/venv/bin/ruff check .
-        ruff_result=$?
-        
-        echo "=== 编译 Swift release ==="
-        (cd macos-native && swift build -c release)
-        swift_build_result=$?
-        
-        echo "=== 运行 rslite 自检 ==="
-        TMPDIR=/tmp HOME="$fakehome" macos-native/.build/release/rslite --selftest
-        selftest_result=$?
-        
-        # 检查 CI 中 rslite-macos job 实际做的事情：swift build + selftest + 设计令牌检查
-        echo "=== 检查设计令牌 ==="
-        python3 scripts/design/gen_tokens.py --check
-        design_tokens_result=$?
-        
-        # 汇总结果
-        if [ "$SKIP_PTEST" = false ] && [ $pytest_result -ne 0 ]; then
-            echo "质量门禁 FAIL: pytest 失败 (退出码 $pytest_result)"
-            return 1
-        elif [ $ruff_result -ne 0 ]; then
-            echo "质量门禁 FAIL: ruff 检查失败 (退出码 $ruff_result)"
-            return 1
-        elif [ $swift_build_result -ne 0 ]; then
-            echo "质量门禁 FAIL: Swift 编译失败 (退出码 $swift_build_result)"
-            return 1
-        elif [ $selftest_result -ne 0 ]; then
-            echo "质量门禁 FAIL: rslite 自检失败 (退出码 $selftest_result)"
-            return 1
-        elif [ $design_tokens_result -ne 0 ]; then
-            echo "质量门禁 FAIL: 设计令牌检查失败 (退出码 $design_tokens_result)"
-            return 1
-        else
-            echo "质量门禁 PASS"
-            return 0
-        fi
-    } > "$result_file" 2>&1
+    fi
+
+    log_file="$OUT_DIR/gates_ruff.log"
+    "$REPO/venv/bin/ruff" check . > "$log_file" 2>&1
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        log_result "gates_ruff" "PASS" "ruff check 退出码 0"
+    else
+        log_result "gates_ruff" "FAIL" "ruff 退出码 $rc；见 $log_file"
+    fi
+
+    log_file="$OUT_DIR/gates_swift_build.log"
+    (cd "$REPO/macos-native" && swift build -c release) > "$log_file" 2>&1
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        log_result "gates_swift_build" "PASS" "swift build -c release 退出码 0"
+    else
+        log_result "gates_swift_build" "FAIL" "Swift build 退出码 $rc；见 $log_file"
+    fi
+
+    log_file="$OUT_DIR/gates_selftest.log"
+    HOME="$FAKE" "$REPO/macos-native/.build/release/rslite" --selftest > "$log_file" 2>&1
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log_result "gates_selftest" "FAIL" "rslite --selftest 退出码 $rc；见 $log_file"
+    elif grep -Fq 'SELFTEST OK' "$log_file"; then
+        log_result "gates_selftest" "PASS" "输出含 SELFTEST OK"
+    else
+        log_result "gates_selftest" "FAIL" "输出不含 SELFTEST OK；见 $log_file"
+    fi
+
+    log_file="$OUT_DIR/gates_tokens.log"
+    python3 scripts/design/gen_tokens.py --check > "$log_file" 2>&1
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        log_result "gates_tokens" "PASS" "设计令牌同步检查退出码 0"
+    else
+        log_result "gates_tokens" "FAIL" "设计令牌检查退出码 $rc；见 $log_file"
+    fi
 }
 
-# 检查文档 (Done 8)
-check_documentation() {
-    local fakehome="$1"
-    
-    # 检查 version.py
-    if ! grep -q '__version__ = "3.2.0"' realtime_subtitle/version.py; then
-        log_result "文档检查" "FAIL" "realtime_subtitle/version.py 中未找到 __version__ = \"3.2.0\""
+DOC_ERROR=""
+require_readme_text() {
+    local file="$1"
+    local label="$2"
+    local needle="$3"
+    if ! grep -Fq -- "$needle" "$file"; then
+        DOC_ERROR="$file 缺少 $label（$needle）"
         return 1
     fi
-    
-    # 检查 README 文件中是否提到 Groq、开关方法、隐私/数据保留、key 配置
-    local readme_files="README.md README.en.md README.de.md"
-    local all_passed=0
-    
-    for readme in $readme_files; do
-        if [ ! -f "$readme" ]; then
-            log_result "文档检查" "FAIL" "找不到文件 $readme"
-            return 1
-        fi
-        
-        # 检查 Groq 提及
-        if ! grep -qi "groq" "$readme"; then
-            log_result "文档检查" "FAIL" "$readme 中未提到 Groq"
-            return 1
-        fi
-        
-        # 检查开关方法（关闭云端的方法）
-        if ! grep -qi "\-\-cloud.*off\|云端.*关闭\|关闭.*云端" "$readme"; then
-            log_result "文档检查" "FAIL" "$readme 中未提到关闭云端的方法"
-            return 1
-        fi
-        
-        # 检查隐私/数据保留
-        if ! grep -qi "隐私\|数据保留\|data retention\|不向任何云端发送\|默认完全本地" "$readme"; then
-            log_result "文档检查" "FAIL" "$readme 中未提到隐私/数据保留"
-            return 1
-        fi
-        
-        # 检查 key 配置方法
-        if ! grep -qi "\-\-set\-groq\-key\|设置.*key\|key.*配置" "$readme"; then
-            log_result "文档检查" "FAIL" "$readme 中未提到 key 配置方法"
-            return 1
-        fi
-    done
-    
-    log_result "文档检查" "PASS" "所有 README 文件符合要求"
-    return 0
 }
 
-# 运行 fallback 测试
+check_documentation() {
+    if ! grep -Fq '__version__ = "3.2.0"' realtime_subtitle/version.py; then
+        log_result "docs" "FAIL" "realtime_subtitle/version.py 不是 3.2.0"
+        return 1
+    fi
+
+    require_readme_text README.md 'Groq' 'Groq' &&
+        require_readme_text README.md '云端关闭命令' '--cloud on|off' &&
+        require_readme_text README.md '隐私说明' '隐私承诺' &&
+        require_readme_text README.md '数据保留说明' '数据保留' &&
+        require_readme_text README.md 'key 配置命令' '--set-groq-key' &&
+        require_readme_text README.en.md 'Groq' 'Groq' &&
+        require_readme_text README.en.md 'cloud-off command' '--cloud on|off' &&
+        require_readme_text README.en.md 'privacy statement' 'Privacy commitment' &&
+        require_readme_text README.en.md 'data-retention statement' 'data retention' &&
+        require_readme_text README.en.md 'key command' '--set-groq-key' &&
+        require_readme_text README.de.md 'Groq' 'Groq' &&
+        require_readme_text README.de.md 'Cloud-off-Befehl' '--cloud on|off' &&
+        require_readme_text README.de.md 'Datenschutzangabe' 'Datenschutzversprechen' &&
+        require_readme_text README.de.md 'Datenspeicherungsangabe' 'Datenspeicherung' &&
+        require_readme_text README.de.md 'Schlüsselbefehl' '--set-groq-key'
+    if [ "$?" -ne 0 ]; then
+        log_result "docs" "FAIL" "$DOC_ERROR"
+        return 1
+    fi
+
+    log_result "docs" "PASS" "version 与三种语言 README 的 Groq、关闭、隐私/保留、key 判据均存在"
+}
+
+check_events() {
+    local scenario="$1"
+    local events_file="$2"
+    local stderr_file="$3"
+    local fake_key="$4"
+
+    "$PYTHON" - "$scenario" "$events_file" "$stderr_file" "$fake_key" <<'PY'
+import json
+import sys
+
+scenario, events_path, stderr_path, fake_key = sys.argv[1:]
+try:
+    with open(events_path, encoding="utf-8") as fh:
+        raw_events = fh.read()
+    events = [json.loads(line) for line in raw_events.splitlines() if line.strip()]
+    with open(stderr_path, encoding="utf-8") as fh:
+        stderr = fh.read()
+except (OSError, ValueError) as exc:
+    raise SystemExit("cannot parse events/stderr: %s" % exc)
+
+statuses = [event.get("text", "") for event in events if event.get("ev") == "status"]
+node_final = any(
+    event.get("ev") == "final" and event.get("text", "").startswith("[")
+    for event in events
+)
+any_final = any(event.get("ev") == "final" for event in events)
+
+if scenario == "bad-key":
+    if "模式：云端 key 无效" not in statuses:
+        raise SystemExit("missing status: 模式：云端 key 无效")
+    if not node_final:
+        raise SystemExit("missing node final event")
+    if fake_key and (fake_key in raw_events or fake_key in stderr):
+        raise SystemExit("fake key appears in events or stderr")
+elif scenario == "cloud-off":
+    if "模式：云端·Groq" in statuses:
+        raise SystemExit("cloud-off emitted 模式：云端·Groq")
+    if not node_final and "rslite.route select node=" not in stderr:
+        raise SystemExit("missing node final and select node route log")
+elif scenario == "node-down":
+    if "rslite.route select local reason=no_available_node" not in stderr:
+        raise SystemExit("missing no_available_node route log")
+    if not any_final:
+        raise SystemExit("missing final event")
+    if any(text.startswith("模式：混合·") for text in statuses):
+        raise SystemExit("node-down emitted 模式：混合·")
+else:
+    raise SystemExit("unknown scenario: %s" % scenario)
+
+print("events validated")
+PY
+}
+
+check_score() {
+    local score_file="$1"
+    "$PYTHON" - "$score_file" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        result = json.load(fh)
+except (OSError, ValueError) as exc:
+    raise SystemExit("cannot parse score JSON: %s" % exc)
+
+if not isinstance(result, dict) or result.get("problems") != []:
+    raise SystemExit("score problems is not an empty list: %r" % result.get("problems"))
+final_wer = result.get("final_wer")
+if not isinstance(final_wer, (int, float)):
+    raise SystemExit("score final_wer is missing or non-numeric")
+print("final_wer=%s" % final_wer)
+PY
+}
+
 run_fallback_test() {
-    local scenario_name="$1"
-    local extra_args="$2"
-    local expected_log_pattern="$3"  # 需要在 stderr 中找到的模式
+    local scenario="$1"
+    local scenario_dir="$OUT_DIR/$scenario"
+    local events_file="$scenario_dir/events.jsonl"
+    local stderr_file="$scenario_dir/stderr.log"
+    local config_log="$scenario_dir/config.log"
+    local score_file="$scenario_dir/score.json"
+    local score_log="$scenario_dir/score.stderr.log"
     local timeout_sec=240
-    
-    local fakehome="$OUT_DIR/fakehome"
-    local events_file="$OUT_DIR/${scenario_name}_events.jsonl"
-    local stderr_file="$OUT_DIR/${scenario_name}.stderr.log"
-    local score_file="$OUT_DIR/${scenario_name}/score.json"
-    
-    # 创建 score 目录
-    mkdir -p "$(dirname "$score_file")"
-    
-    # 设置环境变量
-    export HOME="$fakehome"
-    export TMPDIR=/tmp
-    
-    # 运行 rslite 并捕获输出，使用后台进程和 kill 实现超时
-    {
-        # 如果是 bad-key 场景，先设置假 key
-        if [ "$scenario_name" = "bad-key" ]; then
-            # 生成 40 个随机字母数字
-            local random_string=$(LC_ALL=C tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 40)
-            printf 'gsk_%s\n' "$random_string" | macos-native/.build/release/rslite --set-groq-key
-        fi
-        
-        # 运行 rslite
-        macos-native/.build/release/rslite --mode hybrid --source file:$HOME/projects/rs-mac-native-data/concat5.wav --headless $extra_args
-    } > "$events_file" 2> "$stderr_file" &
-    local rslite_pid=$!
-    
-    # 等待进程完成或超时
+    local pid
     local elapsed=0
-    while [ $elapsed -lt $timeout_sec ]; do
-        if ! kill -0 $rslite_pid 2>/dev/null; then
-            # 进程已经结束
+    local rc
+    local random_string=""
+    local fake_key=""
+    local event_result
+    local score_result
+
+    mkdir -p "$scenario_dir" || {
+        log_result "fallback_$scenario" "FAIL" "无法创建 $scenario_dir"
+        return 1
+    }
+
+    case "$scenario" in
+        bad-key|cloud-off) setup_fake_home yes ;;
+        node-down) setup_fake_home no ;;
+        *) log_result "fallback_$scenario" "FAIL" "未知场景"; return 1 ;;
+    esac
+    if [ "$?" -ne 0 ]; then
+        log_result "fallback_$scenario" "FAIL" "无法重建 fakehome"
+        return 1
+    fi
+
+    # 配置命令会在 main.swift 中优先执行并退出，必须和回放命令分开运行。
+    case "$scenario" in
+        bad-key)
+            random_string="$(LC_ALL=C tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 40)"
+            fake_key="gsk_$random_string"
+            printf '%s\n' "$fake_key" | HOME="$FAKE" "$REPO/macos-native/.build/release/rslite" --set-groq-key > "$config_log" 2>&1
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+                log_result "fallback_bad-key" "FAIL" "--set-groq-key 退出码 $rc；见 $config_log"
+                return 1
+            fi
+            HOME="$FAKE" "$REPO/macos-native/.build/release/rslite" --cloud on >> "$config_log" 2>&1
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+                log_result "fallback_bad-key" "FAIL" "--cloud on 退出码 $rc；见 $config_log"
+                return 1
+            fi
+            ;;
+        cloud-off)
+            HOME="$FAKE" "$REPO/macos-native/.build/release/rslite" --cloud off > "$config_log" 2>&1
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+                log_result "fallback_cloud-off" "FAIL" "--cloud off 退出码 $rc；见 $config_log"
+                return 1
+            fi
+            ;;
+    esac
+
+    HOME="$FAKE" "$REPO/macos-native/.build/release/rslite" --mode hybrid --source "file:$DATA/concat5.wav" --headless > "$events_file" 2> "$stderr_file" &
+    pid=$!
+    while [ "$elapsed" -lt "$timeout_sec" ]; do
+        if ! kill -0 "$pid" 2>/dev/null; then
             break
         fi
         sleep 1
         elapsed=$((elapsed + 1))
     done
-    
-    # 如果超时，杀死进程
-    if kill -0 $rslite_pid 2>/dev/null; then
-        kill $rslite_pid 2>/dev/null
-        wait $rslite_pid 2>/dev/null
-        log_result "fallback_$scenario_name" "FAIL" "测试超时 (${timeout_sec}s)"
+
+    if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null
+        log_result "fallback_$scenario" "FAIL" "回放超时（${timeout_sec}s）"
         return 1
     fi
-    
-    # 检查 stderr 中是否包含期望的日志模式
-    if ! grep -q "$expected_log_pattern" "$stderr_file"; then
-        log_result "fallback_$scenario_name" "FAIL" "stderr 中未找到期望的日志模式: $expected_log_pattern"
+    wait "$pid"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log_result "fallback_$scenario" "FAIL" "rslite 回放退出码 $rc；见 $stderr_file"
         return 1
     fi
-    
-    # 运行 hybrid_score.py 评估
-    if ! python3 scripts/bench/hybrid_score.py "$events_file" --refs $HOME/projects/rs-mac-native-data/refs.jsonl --json > "$score_file"; then
-        log_result "fallback_$scenario_name" "FAIL" "hybrid_score.py 运行失败"
+
+    event_result="$(check_events "$scenario" "$events_file" "$stderr_file" "$fake_key" 2>&1)"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log_result "fallback_$scenario" "FAIL" "$event_result"
         return 1
     fi
-    
-    # 检查评估结果中是否没有重复或丢句
-    if ! grep -q '"problem_counts":{"duplicates":0,"dropped":0}' "$score_file"; then
-        log_result "fallback_$scenario_name" "FAIL" "hybrid_score.py 评估显示有重复或丢句"
+
+    "$PYTHON" "$REPO/scripts/bench/hybrid_score.py" "$events_file" --refs "$DATA/refs.jsonl" --json > "$score_file" 2> "$score_log"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log_result "fallback_$scenario" "FAIL" "hybrid_score.py 退出码 $rc；见 $score_log"
         return 1
     fi
-    
-    # 对于 bad-key 场景，额外检查假 key 字符串不出现在 stdout/stderr 任何位置
-    if [ "$scenario_name" = "bad-key" ]; then
-        if grep -q "$random_string" "$events_file" || grep -q "$random_string" "$stderr_file"; then
-            log_result "fallback_bad-key" "FAIL" "假 key 字符串出现在了输出中"
-            return 1
-        fi
+    score_result="$(check_score "$score_file" 2>&1)"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log_result "fallback_$scenario" "FAIL" "$score_result"
+        return 1
     fi
-    
-    log_result "fallback_$scenario_name" "PASS" "所有检查通过"
-    return 0
+
+    log_result "fallback_$scenario" "PASS" "$event_result；$score_result"
 }
 
-# 主函数
+print_summary() {
+    local name
+    local result
+    local reason
+    printf '\n%s\n' '=== 验收汇总 ==='
+    while IFS="$(printf '\t')" read -r name result reason; do
+        printf '%-24s %-4s %s\n' "$name" "$result" "$reason"
+    done < "$SUMMARY_FILE"
+}
+
 main() {
-    # 设置假ホーム目录
-    local fakehome=$(setup_fake_home)
-    
-    # 根据 --only 参数决定运行哪些检查
-    if [ -z "$ONLY" ] || [ "$ONLY" = "gates" ]; then
-        # 运行质量门禁
-        if run_quality_gates "$fakehome"; then
-            log_result "gates" "PASS" "质量门禁所有检查通过"
-        else
-            log_result "gates" "FAIL" "质量门禁检查失败，详见 $OUT_DIR/quality_gates.log"
-        fi
+    # 单实例锁：rslite 与 Python 主程序不能和验收回放并行运行。
+    if pgrep -f 'macos-native/.build/release/rslite' >/dev/null 2>&1 || \
+       pgrep -f 'python.*main.py' >/dev/null 2>&1; then
+        log_result "preflight" "FAIL" "检测到正在运行的 rslite 或 Python 主程序"
+        print_summary
+        exit 2
     fi
-    
-    if [ -z "$ONLY" ] || [ "$ONLY" = "docs" ]; then
-        # 检查文档
-        if check_documentation "$fakehome"; then
-            log_result "docs" "PASS" "文档检查通过"
-        else
-            log_result "docs" "FAIL" "文档检查失败"
-        fi
-    fi
-    
-    if [ -z "$ONLY" ] || [ "$ONLY" = "fallback" ]; then
-        # 运行 fallback 测试
-        if [ -z "$ONLY" ]; then
-            # 只有在非 --only 模式下才运行 fallback 测试
-            mkdir -p "$OUT_DIR"
-        fi
-        
-        # 场景 1: bad-key
-        if run_fallback_test "bad-key" "--cloud on" "mark_key_invalid\|disabled_invalid_key"; then
-            :
-        else
-            # 失败已经在函数内部记录了
-            :
-        fi
-        
-        # 场景 2: cloud-off
-        if run_fallback_test "cloud-off" "--cloud off" "disabled\|disabled_switch_off"; then
-            :
-        else
-            :
-        fi
-        
-        # 场景 3: node-down
-        if run_fallback_test "node-down" "" "no_available_node\|consecutive_failure_backoff"; then
-            :
-        else
-            :
-        fi
-    fi
-    
-    # 清理假ホーム目录
-    cleanup_fake_home "$fakehome"
-    
-    # 打印汇总
-    echo
-    echo "=== 验收汇总 ==="
-    column -t -s $'\t' "$SUMMARY_FILE"
-    
-    # 检查是否有任何 FAIL
-    if grep -q $'\tFAIL\t' "$SUMMARY_FILE"; then
-        echo "验收失败：存在不通过的检查项"
+
+    trap 'cleanup_fake_home' EXIT HUP INT TERM
+    setup_fake_home no || {
+        log_result "preflight" "FAIL" "无法创建 fakehome"
+        print_summary
         exit 1
-    else
-        echo "所有检查项均通过"
-        exit 0
+    }
+
+    if [ -z "$ONLY" ] || [ "$ONLY" = gates ]; then
+        run_quality_gates
     fi
+    if [ -z "$ONLY" ] || [ "$ONLY" = docs ]; then
+        check_documentation
+    fi
+    if [ -z "$ONLY" ] || [ "$ONLY" = fallback ]; then
+        run_fallback_test bad-key
+        run_fallback_test cloud-off
+        run_fallback_test node-down
+    fi
+
+    print_summary
+    if grep -Fq "$(printf '\t')FAIL$(printf '\t')" "$SUMMARY_FILE"; then
+        printf '%s\n' '验收失败：存在不通过的检查项'
+        exit 1
+    fi
+    printf '%s\n' '所有检查项均通过'
 }
 
-# 执行主函数
-main "$@"
+main
