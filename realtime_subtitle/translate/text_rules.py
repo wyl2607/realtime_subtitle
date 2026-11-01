@@ -143,7 +143,7 @@ _GERMAN_EXTRA_ABBREVIATIONS = {
     # 常见短语缩写
     "z.bsp", "u.ä", "o.ä", "z.zt", "e.v",
     # 学位与头衔修饰
-    "med", "jur", "phil", "rer", "theol", "nat",
+    "med", "jur", "rer", "theol", "nat",
 }
 
 # 常见德语带空格多词缩写（如 "z. B.", "u. a.", "i. d. R."）
@@ -159,6 +159,7 @@ _INCOMPLETE_BEFORE_ELLIPSIS = {
     "und", "oder", "aber", "dass", "daß", "weil", "wenn", "ob", "als", "wie", "denn", "sowie",
     "haben", "hat", "hatte", "hatten", "habe", "bin", "ist", "sind", "war", "waren", "wird", "werden", "wurde", "wurden",
     "brauchen", "braucht", "brauchte",
+    "kann", "können", "muss", "müssen", "will", "wollen", "soll", "sollen", "darf", "dürfen", "mag", "mögen", "werde",
 }
 
 
@@ -192,7 +193,7 @@ def _boundary_is_real(candidate, remainder, final, lang=None):
         words = tail[:-1].split()
         token = words[-1] if words else ""
         clean_token = token.lower().strip(_QUOTE_CHARS)
-        abbrevs = getattr(config, "SENTENCE_ABBREVIATIONS", set()) | _GERMAN_EXTRA_ABBREVIATIONS
+        abbrevs = config.SENTENCE_ABBREVIATIONS | _GERMAN_EXTRA_ABBREVIATIONS
 
         # ①a 单词缩写否决（德语 bzw./z.B./ca./hr./fr. 等自带句号，含 Schiller-Str. 这类连字符复合）
         token_base = clean_token.rsplit("-", 1)[-1]
@@ -261,12 +262,15 @@ def _boundary_is_real(candidate, remainder, final, lang=None):
     return not remainder[0].islower()
 
 
-def _split_sentences(text, final=False, lang=None):
+def _split_sentences(text, final=False, lang=None, lookahead=""):
     """切出完整句子 + 剩余残句。返回 (sentences, rest)。
 
     模块级纯函数：单测直接测它，不用在测试里复制一份切分逻辑（复制必然漂移）。
     lang 缺省读 config.SOURCE_LANGUAGE；中文/日文走另一套终止符，见
     _SENTENCE_TERMINATOR_CJK 的注释。
+    lookahead：仅当候选句的 remainder 为空（正好落在文本末尾）时，用它代替空 remainder
+    去调 _boundary_is_real，实现 D1 lookahead（识别轮未稳定首词作为下文判定）。
+    绝不拼进句子或 pending_text。无空格语言行为与改前完全相同。
     """
     sentences = []
     start = 0
@@ -276,7 +280,13 @@ def _split_sentences(text, final=False, lang=None):
         if not candidate:
             continue
         remainder = text[end:].lstrip()
-        if not _boundary_is_real(candidate, remainder, final, lang):
+        # D1 lookahead：当 remainder 为空（句尾正好在文本末尾）且有 lookahead 时，
+        # 用 lookahead.lstrip() 做边界判定（只用于判定，不拼进句子）
+        if not remainder and lookahead:
+            boundary_remainder = lookahead.lstrip()
+        else:
+            boundary_remainder = remainder
+        if not _boundary_is_real(candidate, boundary_remainder, final, lang):
             continue  # 不是真句尾：跳过这个终止符，接着往后找
         sentences.append(candidate)
         start = end

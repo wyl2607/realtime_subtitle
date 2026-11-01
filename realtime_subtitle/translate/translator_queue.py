@@ -1780,16 +1780,17 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
     # ------------------------------------------------------------------
     # 识别（ASR线程，单线程executor保证串行）
     # ------------------------------------------------------------------
-    def _extract_sentences(self, final=False):
+    def _extract_sentences(self, final=False, lookahead=""):
         """从pending_text里切出完整句子（切分规则见 _split_sentences），残句留下。
 
         final=False 时，正好落在文本末尾的句尾会被【扣留】——还看不见下一个词，
         判断不了这个句号是不是 Whisper 在缩写/停顿处误打的。连续说话时下一块
         音频 0.4 秒就到，自然就判定了；说完一段没有下文时由 flush_pending 的
         有界放行兜底（最多 SENTENCE_HOLD_SEC）。
+        lookahead：D1 放行时传入本轮 unstable 文本，作为"下文"参与边界判定。
         """
         original_words = list(getattr(self, "pending_words", []))
-        sentences, rest = _split_sentences(self.pending_text, final=final)
+        sentences, rest = _split_sentences(self.pending_text, final=final, lookahead=lookahead)
         self.pending_text = rest
         timed = []
         word_idx = 0
@@ -1806,11 +1807,12 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
             self._held_since = 0.0
         return timed
 
-    def _release_held_boundary(self, force=False):
+    def _release_held_boundary(self, force=False, lookahead=""):
         """扣留的句尾到点，或已看见下一个候选词时放行。
 
         ☠️ 只动文字，绝不碰 processor.finish()——那会清掉正在用的音频缓冲，
         而这时候用户很可能只是句子中间换了口气，音频还要接着识别。
+        lookahead：D1 放行时传入本轮 unstable 文本，作为"下文"参与边界判定。
         """
         held = self._held_since
         if not held:
@@ -1818,7 +1820,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         if (not force
                 and time.time() - held < getattr(config, "SENTENCE_HOLD_SEC", 0.6)):
             return
-        sentences = self._extract_sentences(final=True)
+        sentences = self._extract_sentences(final=True, lookahead=lookahead)
         if sentences:
             # 计数进概况：放行次数高 = SENTENCE_HOLD_SEC 太短，很多是说话人
             # 句中换气就被切了（这个问题在 transcripts 里看不出来，
@@ -2132,7 +2134,9 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
                 # MLX 一轮识别常比 0.5 秒分块久，持续环境声会让收件箱一直非空，
                 # flush_pending 排不上；而下一词通常已在 unstable 里，没必要再等
                 # 下一轮 local agreement。小写仍须扣住，否则会废掉③a 的续行否决。
-                self._release_held_boundary(force=True)
+                # D1 lookahead：把本轮 unstable 文本作为"下文"传进边界判定，
+                # 避免 "Wir brauchen …" + "Geduld" 被误切、"Das gilt z." + "B." 被误切。
+                self._release_held_boundary(force=True, lookahead=unstable)
 
         # 聊天/嘈杂语音下Whisper经常整段不打标点，残句永远凑不成句 →
         # 超长就不等标点直接翻（实测聊天时德语堆在live行、中文迟迟不出）。
