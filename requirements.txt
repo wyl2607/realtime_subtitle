@@ -10,7 +10,7 @@
 # Python 上有没有轮子——numpy 那条注释就是踩过之后写的。
 faster-whisper>=1.2.1,<2.0.0   # Whisper 语音识别
 mlx-whisper>=0.4.3; sys_platform == "darwin" and platform_machine == "arm64"
-ctranslate2>=4.8.3,<5.0.0      # RTX 50系(Blackwell/sm_120)最低要 4.6.2：旧版int8路径
+ctranslate2>=4.8.4,<5.0.0      # RTX 50系(Blackwell/sm_120)最低要 4.6.2：旧版int8路径
                                # 直接CUBLAS_STATUS_NOT_SUPPORTED崩溃，4.6.2起自动禁用。
                                # 下限升到 4.8.2；4.8.1 曾在 RTX 5060 实测过
 requests>=2.34.2,<3.0.0         # Ollama API 调用
