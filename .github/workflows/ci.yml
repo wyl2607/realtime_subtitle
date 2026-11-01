@@ -47,6 +47,9 @@ jobs:
       # Android 部分只能本地跑（私有仓库，CI 拿不到），这里不带 --android。
       - name: Cross-platform parity (repo side)
         run: python3 scripts/design/check_parity.py
+      - name: Check status copy literals (spec 010)
+        # 不带 --android：Android 是私有仓库，CI 拿不到，只在本地手动跑
+        run: python3 scripts/design/check_copy_literals.py
 
   # requirements.txt 必须在**所有声明支持的 Python** 上解得出来。
   #
