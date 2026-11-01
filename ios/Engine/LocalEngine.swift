@@ -35,10 +35,15 @@ final class LocalEngine {
     private var translationReady: Task<TranslationSession?, Never>?
     /// 最近一句的翻译任务；下一句接在它后面。
     private var translationTail: Task<Void, Never>?
-    /// 守 translationReady / translationTail 和 stop() 对 stopped 的写入。
-    /// 本类没有任何隔离：stop() 跑在调用方线程，启动和结果循环跑在全局执行器上，
-    /// 不加锁时两边会同时读写同一个 Task 引用。
+    /// 守所有可变状态：analyzer / transcriber / translationSession / inputContinuation /
+    /// analysisTask / resultTask / translationReady / translationTail / isRunning / stopped /
+    /// analyzerFormat / converter。调用方无隔离：start() 在全局执行器上跑、await 后可能被
+    /// stop() 打断；append() 在音频实时线程上同步调用（每帧几十毫秒，锁内只能读快照、
+    /// 不许分配内存、不许做格式转换、不许调回调、不许 await、不许 yield）；
+    /// translate() 在另一队列上同步调用；stop() 在调用方线程上同步调用。
+    /// 锁内绝不 await、不调用回调、不调用 cancel()/finish()、不访问 Speech/Translation API。
     private let taskLock = NSLock()
+    /// 只在结果循环（单个串行 for-await 循环里的 handleResult）读写，没有并发访问者，可不加锁。
     private var nextID = 1
     private var isRunning = false
     /// stop() 之后一律不再回调。
@@ -84,7 +89,11 @@ final class LocalEngine {
     }
 
     func start() async {
-        guard !isRunning, !stopped else { return }
+        let shouldProceed: Bool = taskLock.withLock { () -> Bool in
+            guard !isRunning, !stopped else { return false }
+            return true
+        }
+        guard shouldProceed else { return }
         switch mode {
         case .translateOnly:
             await startTranslationOnly()
@@ -94,22 +103,38 @@ final class LocalEngine {
     }
 
     private func emitStatus(_ status: String) {
-        guard !stopped else { return }
+        let shouldEmit: Bool = taskLock.withLock { () -> Bool in
+            guard !stopped else { return false }
+            return true
+        }
+        guard shouldEmit else { return }
         onStatus(status)
     }
 
     private func emitFinal(_ id: Int, _ text: String, _ range: LocalSentenceRange?) {
-        guard !stopped else { return }
+        let shouldEmit: Bool = taskLock.withLock { () -> Bool in
+            guard !stopped else { return false }
+            return true
+        }
+        guard shouldEmit else { return }
         onFinal(id, text, range)
     }
 
     private func emitTranslation(_ id: Int, _ text: String) {
-        guard !stopped else { return }
+        let shouldEmit: Bool = taskLock.withLock { () -> Bool in
+            guard !stopped else { return false }
+            return true
+        }
+        guard shouldEmit else { return }
         onTranslation(id, text)
     }
 
     private func emitSettled(_ id: Int) {
-        guard !stopped else { return }
+        let shouldEmit: Bool = taskLock.withLock { () -> Bool in
+            guard !stopped else { return false }
+            return true
+        }
+        guard shouldEmit else { return }
         onSentenceSettled(id)
     }
 
@@ -119,7 +144,10 @@ final class LocalEngine {
     /// 翻译不可用时回调 `tx_unavailable`，上层据此把云端这一档关掉。
     private func startTranslationOnly() async {
         let txStatus = await LanguageAvailability().status(from: sourceLocale, to: targetLocale)
-        guard !stopped else { return }
+        let stoppedAfterAwait: Bool = taskLock.withLock { () -> Bool in
+            return stopped
+        }
+        guard !stoppedAfterAwait else { return }
         guard txStatus == .installed else {
             emitStatus("tx_unavailable")
             return
@@ -127,10 +155,19 @@ final class LocalEngine {
         do {
             let session = TranslationSession(installedSource: sourceLocale, target: targetLocale)
             try await session.prepareTranslation()
-            guard !stopped else { return }
-            self.translationSession = session
-            isRunning = true
-            emitStatus("tx_ready")
+            let stoppedAfterPrepare: Bool = taskLock.withLock { () -> Bool in
+                return stopped
+            }
+            guard !stoppedAfterPrepare else { return }
+            let kept: Bool = taskLock.withLock { () -> Bool in
+                guard !stopped else { return false }
+                self.translationSession = session
+                self.isRunning = true
+                return true
+            }
+            if kept {
+                emitStatus("tx_ready")
+            }
         } catch {
             logger.error("TranslationSession prepare failed: \(error.localizedDescription)")
             emitStatus("tx_prepare_failed")
@@ -143,7 +180,10 @@ final class LocalEngine {
             emitStatus("asr_unsupported")
             return
         }
-        guard !stopped else { return }
+        let stoppedAfterLocale: Bool = taskLock.withLock { () -> Bool in
+            return stopped
+        }
+        guard !stoppedAfterLocale else { return }
 
         let transcriber = SpeechTranscriber(
             locale: supported,
@@ -153,20 +193,28 @@ final class LocalEngine {
         )
 
         let assetStatus = await AssetInventory.status(forModules: [transcriber])
-        guard !stopped else { return }
+        let stoppedAfterAssets: Bool = taskLock.withLock { () -> Bool in
+            return stopped
+        }
+        guard !stoppedAfterAssets else { return }
         if assetStatus != .installed {
             emitStatus("asr_assets_missing")
             return
         }
 
         let txStatus = await LanguageAvailability().status(from: sourceLocale, to: targetLocale)
-        guard !stopped else { return }
+        let stoppedAfterTxStatus: Bool = taskLock.withLock { () -> Bool in
+            return stopped
+        }
+        guard !stoppedAfterTxStatus else { return }
         if txStatus != .installed {
             emitStatus("tx_unavailable")
         }
 
         let inputStream = AsyncStream<AnalyzerInput> { continuation in
-            self.inputContinuation = continuation
+            taskLock.withLock {
+                self.inputContinuation = continuation
+            }
         }
 
         let modules: [any SpeechModule] = [transcriber]
@@ -178,27 +226,57 @@ final class LocalEngine {
             emitStatus("analyzer_format_failed")
             return
         }
-        guard !stopped else { return }
-        self.analyzerFormat = analyzerFormat
+        let stoppedAfterFormat: Bool = taskLock.withLock { () -> Bool in
+            return stopped
+        }
+        guard !stoppedAfterFormat else { return }
+        let keptFormat = taskLock.withLock { () -> Bool in
+            guard !stopped else { return false }
+            self.analyzerFormat = analyzerFormat
+            return true
+        }
+        guard keptFormat else { return }
 
         let analyzer = SpeechAnalyzer(modules: modules)
-        self.analyzer = analyzer
-        self.transcriber = transcriber
-        isRunning = true
+        let keptAnalyzer = taskLock.withLock { () -> Bool in
+            guard !stopped else { return false }
+            self.analyzer = analyzer
+            self.transcriber = transcriber
+            self.isRunning = true
+            return true
+        }
+        guard keptAnalyzer else { return }
 
         if txStatus == .installed {
             // 翻译模型首次准备可能很久，独立执行才能让识别任务立即消费已到的音频。
             // 放在识别器预热和结果任务之前创建：两边的准备并行，最早的结果也一定看得到这个任务。
             let ready = Task { [weak self] () -> TranslationSession? in
-                guard let self, !self.stopped else { return nil }
+                guard let self else { return nil }
+                let stoppedNow: Bool = taskLock.withLock { () -> Bool in
+                    return self.stopped
+                }
+                guard !stoppedNow else { return nil }
                 let session = TranslationSession(installedSource: self.sourceLocale, target: self.targetLocale)
                 do {
                     try await session.prepareTranslation()
-                    guard !self.stopped else { return nil }
-                    self.translationSession = session
-                    return session
+                    let stoppedAfterPrepare: Bool = taskLock.withLock { () -> Bool in
+                        return self.stopped
+                    }
+                    guard !stoppedAfterPrepare else { return nil }
+                    let keptSession: Bool = taskLock.withLock { () -> Bool in
+                        guard !self.stopped else { return false }
+                        self.translationSession = session
+                        return true
+                    }
+                    if keptSession {
+                        return session
+                    }
+                    return nil
                 } catch {
-                    guard !self.stopped else { return nil }
+                    let stoppedAfterError: Bool = taskLock.withLock { () -> Bool in
+                        return self.stopped
+                    }
+                    guard !stoppedAfterError else { return nil }
                     self.logger.error("TranslationSession prepare failed: \(error.localizedDescription)")
                     self.emitStatus("tx_prepare_failed")
                     return nil
@@ -219,12 +297,19 @@ final class LocalEngine {
             // 预热失败时后续分析仍会自行加载模型，不能为此放弃已经可用的识别链路。
             logger.error("SpeechAnalyzer prepare failed: \(error.localizedDescription)")
         }
-        guard !stopped else { return }
+        let stoppedAfterPrepareAnalyze: Bool = taskLock.withLock { () -> Bool in
+            return stopped
+        }
+        guard !stoppedAfterPrepareAnalyze else { return }
 
-        resultTask = Task { [weak self] in
+        let resultTaskLocal = Task { [weak self] in
             guard let self else { return }
             do {
-                for try await result in transcriber.results {
+                let transcriberLocal: SpeechTranscriber? = taskLock.withLock { () -> SpeechTranscriber? in
+                    return self.transcriber
+                }
+                guard let transcriberLocal else { return }
+                for try await result in transcriberLocal.results {
                     await self.handleResult(result)
                 }
             } catch is CancellationError {
@@ -233,8 +318,16 @@ final class LocalEngine {
                 self.emitStatus("asr_result_failed: \(error.localizedDescription)")
             }
         }
+        let keptResult = taskLock.withLock { () -> Bool in
+            guard !stopped else { return false }
+            resultTask = resultTaskLocal
+            return true
+        }
+        if !keptResult {
+            resultTaskLocal.cancel()
+        }
 
-        analysisTask = Task { [weak self, inputStream, analyzer] in
+        let analysisTaskLocal = Task { [weak self, inputStream, analyzer] in
             guard let self else { return }
             do {
                 _ = try await analyzer.analyzeSequence(inputStream)
@@ -248,13 +341,26 @@ final class LocalEngine {
                 await self.finish()
             }
         }
+        let keptAnalysis = taskLock.withLock { () -> Bool in
+            guard !stopped else { return false }
+            analysisTask = analysisTaskLocal
+            return true
+        }
+        if !keptAnalysis {
+            analysisTaskLocal.cancel()
+        }
     }
 
     func append(pcm16k: Data) {
-        guard mode == .recognizeAndTranslate,
-              isRunning,
-              let continuation = inputContinuation,
-              let analyzerFormat = analyzerFormat else { return }
+        // 音频线程约束：锁内只读快照（O(1)、无分配、无回调、无 await、无 yield、无格式转换）；
+        // 转换和 continuation.yield 在锁外用快照执行。
+        let snapshot = taskLock.withLock { () -> (running: Bool, continuation: AsyncStream<AnalyzerInput>.Continuation?, fmt: AVAudioFormat?, converter: AVAudioConverter?, mode: Mode) in
+            return (isRunning, inputContinuation, analyzerFormat, converter, self.mode)
+        }
+        guard snapshot.mode == .recognizeAndTranslate,
+              snapshot.running,
+              let continuation = snapshot.continuation,
+              let analyzerFormat = snapshot.fmt else { return }
 
         let frameCount = pcm16k.count / 2
         guard frameCount > 0,
@@ -276,10 +382,19 @@ final class LocalEngine {
         guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: analyzerFormat, frameCapacity: AVAudioFrameCount(Double(frameCount) * analyzerFormat.sampleRate / sourceFormat.sampleRate) + 1024) else {
             return
         }
-        if converter == nil {
-            converter = AVAudioConverter(from: sourceFormat, to: analyzerFormat)
+
+        // 懒建 converter：先锁外建，再锁内「若仍为 nil 且未停才存」。
+        var converterToUse: AVAudioConverter? = snapshot.converter
+        if converterToUse == nil {
+            let newConverter = AVAudioConverter(from: sourceFormat, to: analyzerFormat)
+            let keptConverter = taskLock.withLock { () -> Bool in
+                guard !stopped, converter == nil else { return false }
+                converter = newConverter
+                return true
+            }
+            converterToUse = keptConverter ? newConverter : (converterToUse ?? newConverter)
         }
-        guard let converter else { return }
+        guard let converter = converterToUse else { return }
         var didProvideInput = false
         var convertError: NSError?
         let status = converter.convert(to: outputBuffer, error: &convertError) { _, outStatus in
@@ -305,8 +420,11 @@ final class LocalEngine {
     /// 翻译成功、失败、压根没有会话，这一句都算收尾（回调 onSentenceSettled）。
     func translate(_ text: String, id: Int) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !stopped else { return }
-        guard let session = translationSession else {
+        let (stoppedNow, sessionSnapshot): (Bool, TranslationSession?) = taskLock.withLock { () -> (Bool, TranslationSession?) in
+            return (stopped, translationSession)
+        }
+        guard !trimmed.isEmpty, !stoppedNow else { return }
+        guard let session = sessionSnapshot else {
             emitStatus("tx_unavailable")
             emitSettled(id)
             return
@@ -315,7 +433,10 @@ final class LocalEngine {
             guard let self else { return }
             do {
                 let response = try await session.translate(trimmed)
-                guard !self.stopped else { return }
+                let stoppedAfterTranslate: Bool = taskLock.withLock { () -> Bool in
+                    return self.stopped
+                }
+                guard !stoppedAfterTranslate else { return }
                 let translated = response.targetText.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !translated.isEmpty {
                     self.emitTranslation(id, translated)
@@ -323,7 +444,10 @@ final class LocalEngine {
                     self.emitStatus("tx_empty")
                 }
             } catch {
-                guard !self.stopped else { return }
+                let stoppedAfterError: Bool = taskLock.withLock { () -> Bool in
+                    return self.stopped
+                }
+                guard !stoppedAfterError else { return }
                 self.logger.error("Translation failed: \(error.localizedDescription)")
                 self.emitStatus("tx_error")
             }
@@ -334,33 +458,43 @@ final class LocalEngine {
     func stop() {
         // 必须在 isRunning 那道 guard 之前置真：启动中途被停时 isRunning 还是 false，
         // 这时候更要挡住启动期回调。
-        let tasks = taskLock.withLock { () -> (Task<TranslationSession?, Never>?, Task<Void, Never>?) in
+        let (readyTask, tailTask, wasRunning, cont, fmt, an, tr, session, anTask, resTask, convVal) = taskLock.withLock { () -> (Task<TranslationSession?, Never>?, Task<Void, Never>?, Bool, AsyncStream<AnalyzerInput>.Continuation?, AVAudioFormat?, SpeechAnalyzer?, SpeechTranscriber?, TranslationSession?, Task<Void, Never>?, Task<Void, Never>?, AVAudioConverter?) in
+            let running = isRunning
             stopped = true
-            defer {
+            isRunning = false
+            if running {
+                let r = translationReady; translationReady = nil
+                let t = translationTail; translationTail = nil
+                let c = inputContinuation; inputContinuation = nil
+                let f = analyzerFormat; analyzerFormat = nil
+                let a = analyzer; analyzer = nil
+                let trVal = transcriber; transcriber = nil
+                let s = translationSession; translationSession = nil
+                let at = analysisTask; analysisTask = nil
+                let rt = resultTask; resultTask = nil
+                let conv = converter; converter = nil
+                return (r, t, true, c, f, a, trVal, s, at, rt, conv)
+            } else {
+                // 即使未运行，translationReady / translationTail 仍要清（和原行为一致）
                 translationReady = nil
                 translationTail = nil
+                return (nil, nil, false, nil, nil, nil, nil, nil, nil, nil, nil)
             }
-            return (translationReady, translationTail)
         }
-        tasks.0?.cancel()
-        tasks.1?.cancel()
-        guard isRunning else { return }
-        isRunning = false
-        inputContinuation?.finish()
-        inputContinuation = nil
-        analysisTask?.cancel()
-        analysisTask = nil
-        resultTask?.cancel()
-        resultTask = nil
-        analyzer = nil
-        transcriber = nil
-        translationSession = nil
-        analyzerFormat = nil
-        converter = nil
+        readyTask?.cancel()
+        tailTask?.cancel()
+        if wasRunning {
+            cont?.finish()
+            anTask?.cancel()
+            resTask?.cancel()
+        }
     }
 
     private func handleResult(_ result: SpeechTranscriber.Result) async {
-        guard !stopped else { return }
+        let stoppedNow: Bool = taskLock.withLock { () -> Bool in
+            return stopped
+        }
+        guard !stoppedNow else { return }
         let raw = String(result.text.characters)
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, result.isFinal else { return }
@@ -368,7 +502,10 @@ final class LocalEngine {
         let id = nextID
         nextID += 1
 
-        guard !stopped else { return }
+        let stoppedAfterID: Bool = taskLock.withLock { () -> Bool in
+            return stopped
+        }
+        guard !stoppedAfterID else { return }
         emitFinal(id, text, Self.rangeSeconds(result.range))
 
         // 翻译挂到串行尾链上，不在结果循环里等：否则翻译还在准备（或上一句还在翻）时，
@@ -384,12 +521,18 @@ final class LocalEngine {
     }
 
     private func translateAndSettle(id: Int, text: String) async {
-        guard !stopped else { return }
+        let stoppedNow: Bool = taskLock.withLock { () -> Bool in
+            return stopped
+        }
+        guard !stoppedNow else { return }
         let ready = taskLock.withLock { translationReady }
         if let session = await ready?.value {
             do {
                 let response = try await session.translate(text)
-                guard !stopped else { return }
+                let stoppedAfterTranslate: Bool = taskLock.withLock { () -> Bool in
+                    return stopped
+                }
+                guard !stoppedAfterTranslate else { return }
                 let translated = response.targetText.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !translated.isEmpty {
                     emitTranslation(id, translated)
@@ -397,7 +540,10 @@ final class LocalEngine {
                     emitStatus("tx_empty")
                 }
             } catch {
-                guard !stopped else { return }
+                let stoppedAfterError: Bool = taskLock.withLock { () -> Bool in
+                    return stopped
+                }
+                guard !stoppedAfterError else { return }
                 logger.error("Translation failed: \(error.localizedDescription)")
                 emitStatus("tx_error")
             }
@@ -418,8 +564,12 @@ final class LocalEngine {
     }
 
     private func waitForResults() async {
-        await resultTask?.value
-        resultTask = nil
+        let resultTaskLocal: Task<Void, Never>? = taskLock.withLock { () -> Task<Void, Never>? in
+            let r = resultTask
+            resultTask = nil
+            return r
+        }
+        await resultTaskLocal?.value
         // 最后一句的译文也要等它落地，finish 才能放掉会话。
         // 结果流已经结束，不会再有新句子接到尾链上：这里拿到的就是最后一句。
         let tail = taskLock.withLock { translationTail }
@@ -428,8 +578,10 @@ final class LocalEngine {
     }
 
     private func finish() async {
-        analyzer = nil
-        transcriber = nil
-        translationSession = nil
+        taskLock.withLock {
+            analyzer = nil
+            transcriber = nil
+            translationSession = nil
+        }
     }
 }
