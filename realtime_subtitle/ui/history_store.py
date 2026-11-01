@@ -126,7 +126,8 @@ class SubtitleHistoryStore:
 
     # ---- write --------------------------------------------------------
     def add(self, src, dst, *, key=None, t0=None, t1=None, source="local", revision=0, wall=None) -> HistoryRow:
-        row_key = str(key) if key else self._next_key()
+        row_key = "" if key is None else str(key)
+        row_key = row_key or self._next_key()
         old = self._by_key.get(row_key)
         if old is not None:
             self.update(row_key, src=src, dst=dst)

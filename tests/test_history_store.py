@@ -102,3 +102,11 @@ def test_listener_failure_does_not_block_later_listener(capsys):
     store.add("Hallo", "你好")
     assert observed[0].kind == "insert"
     assert "⚠️" in capsys.readouterr().out
+
+
+def test_zero_is_a_real_key_not_missing():
+    store = SubtitleHistoryStore()
+    store.add("Null", "零", key=0)
+    assert store.get(0) is not None and store.get("0").dst == "零"
+    store.add("Null", "零号", key=0)
+    assert len(store) == 1 and store.get(0).dst == "零号"

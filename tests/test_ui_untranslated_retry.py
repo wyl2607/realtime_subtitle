@@ -195,16 +195,17 @@ def test_update_dst_syncs_all_windows():
     win.add_pair("Erste Zeile", "初版译文", 0, 1000, "k_multi", win.language_revision)
     assert _pump_until(lambda: "初版译文" in win._last_html)
 
+    win.history_window.show()
+    win.tv_window.show()
+    win.tv_window.rebuild_from_store()
     win.update_dst("k_multi", "修正后的终版译文")
     assert "修正后的终版译文" in win._last_html
 
-    # 历史窗
-    assert win.history.get("k_multi").dst == "修正后的终版译文"
-
-    # 电视窗
-    win.tv_window.show()
-    win.tv_window.rebuild_from_store()
-    assert "修正后的终版译文" in win.tv_window.text.toPlainText()
+    # 历史窗/电视窗：靠 update 事件刷新，不手动重建
+    for view in (win.history_window, win.tv_window):
+        text = view.text.toPlainText()
+        assert "修正后的终版译文" in text and "初版译文" not in text
+    win.history_window.hide()
 
     # 影院条
     win.cinema_bar.show()

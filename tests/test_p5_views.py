@@ -128,6 +128,7 @@ def test_remote_replacement_keeps_single_entry_per_view(tmp_path, monkeypatch):
     window = sw_mod.SubtitleWindow()
     _wired_views(window)
     try:
+        window.history_window.show()
         window.add_pair("Hallo Welt", "你好世界", 0.0, 2.0, "local-1", 0)
         assert len(window.history) == 1
         assert window.cinema_bar._current_key == "local-1"
@@ -138,6 +139,9 @@ def test_remote_replacement_keeps_single_entry_per_view(tmp_path, monkeypatch):
 
         assert [row.key for row in window.history.rows()] == ["-1"]
         assert window.history.last().dst == "云端世界"
+        for view in (window.history_window, window.tv_window):
+            text = view.text.toPlainText()
+            assert text.count("云端世界") == 1 and "你好世界" not in text
         assert window.cinema_bar._current_key == "-1"
         assert window.cinema_bar.chinese_label.text() == "云端世界"
     finally:
@@ -165,6 +169,8 @@ def test_replaced_untranslated_marker_clears_in_all_views(tmp_path, monkeypatch)
         app._ui_show_line("Hallo Welt", "云端世界", 0.0, 2.0, -1, "remote", 0)
 
         assert all(row.dst != marker for row in window.history.rows())
+        assert marker not in window.tv_window.text.toPlainText()
+        assert "云端世界" in window.tv_window.text.toPlainText()
         assert window.cinema_bar.chinese_label.text() == "云端世界"
     finally:
         window.container.close()
