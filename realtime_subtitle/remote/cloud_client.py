@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import threading
+import time
 import wave
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -74,6 +75,7 @@ class CloudError(Exception):
         audio_s: float = 0.0,
         duration_s: float | None = None,
         key_fingerprint: str | None = None,
+        sent_at: float | None = None,
         secret: str = "",
     ):
         self.status = status
@@ -85,6 +87,7 @@ class CloudError(Exception):
         self.groq_id = _public_id(groq_id, secret)
         self.audio_s = audio_s
         self.key_fingerprint = key_fingerprint if key_fingerprint is not None else _key_fingerprint(secret)
+        self.sent_at = sent_at
         # 计费时长：有响应 duration 用响应的，否则用送出去的音频长度。max(10, ·) 在 quota。
         self.duration_s = audio_s if duration_s is None else duration_s
         super().__init__(f"status={self.status} reason={self.reason} exc={self.exc_type}")
@@ -103,6 +106,7 @@ class CloudCancelled(CloudError):
         groq_id: str | None = None,
         status: int | None = None,
         key_fingerprint: str | None = None,
+        sent_at: float | None = None,
         secret: str = "",
     ):
         super().__init__(
@@ -112,6 +116,7 @@ class CloudCancelled(CloudError):
             groq_id=groq_id,
             audio_s=audio_s,
             key_fingerprint=key_fingerprint,
+            sent_at=sent_at,
             secret=secret,
         )
 
@@ -135,6 +140,8 @@ class CloudTranscript:
     status: int
     remaining_requests: int | None
     reset_requests_s: float | None = None
+    key_fingerprint: str | None = None
+    sent_at: float | None = None
 
 
 def config_dir() -> Path:
@@ -212,7 +219,9 @@ class CloudClient:
             raise CloudError(status=None, reason="no_key", exc_type="CloudError", audio_s=audio_s) from None
         if self._generation_now() != generation:
             self._log(secret=key, groq_id=None, audio_s=audio_s, status=None, reason="cancelled", exc_type="CloudCancelled")
-            raise CloudCancelled(audio_s=audio_s, secret=key) from None
+            key_fp = _key_fingerprint(key)
+            sent_at = time.time()
+            raise CloudCancelled(audio_s=audio_s, key_fingerprint=key_fp, sent_at=sent_at, secret=key) from None
         wav = _wav_bytes(samples)
         outcome: dict[str, Any] = {}
         finished = threading.Event()
@@ -252,11 +261,15 @@ class CloudClient:
             _close_quietly(outcome.get("response"))
             _close_quietly(outcome.get("discarded"))
             self._log(secret=key, groq_id=None, audio_s=audio_s, status=None, reason="timeout", exc_type="Timeout")
+            key_fp = _key_fingerprint(key)
+            sent_at = time.time()
             raise CloudError(
                 status=None,
                 reason="timeout",
                 exc_type="Timeout",
                 audio_s=audio_s,
+                key_fingerprint=key_fp,
+                sent_at=sent_at,
                 secret=key,
             ) from None
         error = outcome.get("error")
@@ -273,14 +286,18 @@ class CloudClient:
             groq_id = _header(getattr(discarded, "headers", None), "x-groq-id")
             status = _status_code(discarded) if discarded is not None else None
             self._log(secret=key, groq_id=groq_id, audio_s=audio_s, status=status, reason="cancelled", exc_type="CloudCancelled")
-            raise CloudCancelled(audio_s=audio_s, groq_id=groq_id, status=status, secret=key) from None
+            key_fp = _key_fingerprint(key)
+            sent_at = time.time()
+            raise CloudCancelled(audio_s=audio_s, groq_id=groq_id, status=status, key_fingerprint=key_fp, sent_at=sent_at, secret=key) from None
         response = outcome["response"]
         if self._generation_now() != generation:
             _close_quietly(response)
             groq_id = _header(getattr(response, "headers", None), "x-groq-id")
             status = _status_code(response)
             self._log(secret=key, groq_id=groq_id, audio_s=audio_s, status=status, reason="cancelled", exc_type="CloudCancelled")
-            raise CloudCancelled(audio_s=audio_s, groq_id=groq_id, status=status, secret=key) from None
+            key_fp = _key_fingerprint(key)
+            sent_at = time.time()
+            raise CloudCancelled(audio_s=audio_s, groq_id=groq_id, status=status, key_fingerprint=key_fp, sent_at=sent_at, secret=key) from None
         try:
             return self._handle_response(response, a0=float(a0), audio_s=audio_s, secret=key)
         finally:
@@ -293,6 +310,8 @@ class CloudClient:
         remaining = _nonnegative_int(_header(headers, "x-ratelimit-remaining-requests"))
         retry_after = _nonnegative_int(_header(headers, "retry-after"))
         reset_requests_s = _reset_requests_seconds(_header(headers, "x-ratelimit-reset-requests"))
+        key_fp = _key_fingerprint(secret)
+        sent_at = time.time()
         if status != 200:
             reason = _http_reason(status)
             self._log(secret=secret, groq_id=groq_id, audio_s=audio_s, status=status, reason=reason, exc_type="HTTPStatus")
@@ -305,6 +324,8 @@ class CloudClient:
                 reset_requests_s=reset_requests_s,
                 groq_id=groq_id,
                 audio_s=audio_s,
+                key_fingerprint=key_fp,
+                sent_at=sent_at,
                 secret=secret,
             ) from None
         try:
@@ -323,6 +344,8 @@ class CloudClient:
                 reset_requests_s=reset_requests_s,
                 groq_id=groq_id,
                 audio_s=audio_s,
+                key_fingerprint=key_fp,
+                sent_at=sent_at,
                 secret=secret,
             ) from None
         if not isinstance(payload, dict):
@@ -335,6 +358,8 @@ class CloudClient:
                 reset_requests_s=reset_requests_s,
                 groq_id=groq_id,
                 audio_s=audio_s,
+                key_fingerprint=key_fp,
+                sent_at=sent_at,
                 secret=secret,
             ) from None
         duration_s = _response_duration(payload, audio_s)
@@ -352,15 +377,19 @@ class CloudClient:
             status=status,
             remaining_requests=remaining,
             reset_requests_s=reset_requests_s,
+            key_fingerprint=key_fp,
+            sent_at=sent_at,
         )
 
     def _transport_failure(self, generation: int, audio_s: float, reason: str, exc: BaseException, secret: str) -> None:
         exc_type = type(exc).__name__
+        key_fp = _key_fingerprint(secret)
+        sent_at = time.time()
         if self._generation_now() != generation:
             self._log(secret=secret, groq_id=None, audio_s=audio_s, status=None, reason="cancelled", exc_type=exc_type)
-            raise CloudCancelled(audio_s=audio_s, secret=secret) from None
+            raise CloudCancelled(audio_s=audio_s, key_fingerprint=key_fp, sent_at=sent_at, secret=secret) from None
         self._log(secret=secret, groq_id=None, audio_s=audio_s, status=None, reason=reason, exc_type=exc_type)
-        raise CloudError(status=None, reason=reason, exc_type=exc_type, audio_s=audio_s, secret=secret) from None
+        raise CloudError(status=None, reason=reason, exc_type=exc_type, audio_s=audio_s, key_fingerprint=key_fp, sent_at=sent_at, secret=secret) from None
 
     def _read_key(self) -> str | None:
         return read_groq_key(self._key_path)

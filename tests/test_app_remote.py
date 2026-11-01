@@ -94,7 +94,7 @@ class _Ledger:
         self.routing = routing
         self.notes = []
 
-    def note(self, duration_s, *, now=None, remaining_requests=None, reset_requests_s=None):
+    def note(self, duration_s, *, now=None, remaining_requests=None, reset_requests_s=None, key_fp=None, sent_at=None):
         self.notes.append((duration_s, remaining_requests, reset_requests_s))
 
     def usage(self, now=None):

@@ -5,6 +5,16 @@
 2000 - remaining（这是每日令牌桶，不能拿去改 1 分钟窗口）。
 任一窗口 ≥90% 就向 routing_rules 发 quota_update，<80% 由那台状态机恢复。
 这里不自己记云端状态。
+
+RPD 翻日信任门（R1–R7）：
+- 恢复记录只有在同一个响应**同时**带合法 remaining-requests 和 reset-requests 时建立/替换。
+- 恢复记录 = {reset_at, observed_at, observed_mono, key_fp, consumed}。
+- key_fp 变化 → 丢弃恢复记录、保留 server_day_used 下限；key_fp=None 不建记录。
+- 已过恢复点（R4）的旧周期/乱序响应：sent_at 为 None 或 sent_at < reset_at 的头一律不采信。
+- 翻日成立（R4）需：a) 墙钟 now >= reset_at 且 now >= observed_at - 5；b) 若有 observed_mono，单调钟流逝 >= reset_at - observed_at - 1。
+- 翻日只清 24h 请求数的服务端分量（R5）。
+- 仅在 _quota_hot 且翻日**首次**成立时发 quota_reset_confirmed（R6），用 consumed 标志防重复。
+- 落盘含恢复记录字段，observed_mono 不落盘（R7）。
 """
 from __future__ import annotations
 
@@ -77,9 +87,16 @@ class QuotaLedger:
         self._server_day_used: int | None = None
         self._server_day_used_at: float | None = None
         self._server_reset_at: float | None = None
+        # 恢复记录：只有同一响应同时带 remaining+reset 才建立/替换
+        self._recovery_reset_at: float | None = None
+        self._recovery_observed_at: float | None = None
+        self._recovery_observed_mono: float | None = None
+        self._recovery_key_fp: str | None = None
+        self._recovery_consumed: bool = False
         # 自己记得「已经把额度打进冷却」，恢复事件才发得出去。
         # 不读状态机的状态名：那串字只活在 routing_rules。
         self._quota_hot = False
+        self._quota_hot_persisted = False
         self.load()
 
     def note(
@@ -89,8 +106,14 @@ class QuotaLedger:
         now: float | None = None,
         remaining_requests: int | None = None,
         reset_requests_s: float | None = None,
+        key_fp: str | None = None,
+        sent_at: float | None = None,
     ) -> QuotaUsage:
-        """记一次已发出的请求。duration_s 是响应里的 duration，没有响应就用送出的音频秒。"""
+        """记一次已发出的请求。duration_s 是响应里的 duration，没有响应就用送出的音频秒。
+
+        key_fp: 请求实际使用的 key 指纹（sha256 前 12 字符），没有传 None。
+        sent_at: 请求发出时的墙钟秒（time.time()），未知传 None。
+        """
         billed = _billed(duration_s)
         if remaining_requests is not None and (
             isinstance(remaining_requests, bool) or not isinstance(remaining_requests, int)
@@ -101,28 +124,92 @@ class QuotaLedger:
                 raise TypeError("reset_requests_s")
             if not math.isfinite(float(reset_requests_s)) or float(reset_requests_s) < 0:
                 raise ValueError("reset_requests_s")
+            # R1: reset 时长 > 86400+60 秒视为非法
+            if float(reset_requests_s) > WINDOW_DAY_S + 60.0:
+                reset_requests_s = None
+        if key_fp is not None and not isinstance(key_fp, str):
+            raise TypeError("key_fp")
+        if sent_at is not None and (
+            isinstance(sent_at, bool) or not isinstance(sent_at, (int, float)) or not math.isfinite(float(sent_at))
+        ):
+            raise TypeError("sent_at")
+
         with self._lock:
             ts = self._clock(now)
+            mono_now = time.monotonic() if self._now is None else None
             self._events.append(_Event(ts, billed, False))
-            # 最新带恢复头的响应为准；缺头不能推翻已确认的恢复时刻。
-            if reset_requests_s is not None:
+
+            # R4a: 墙钟回拨检查（now < observed_at - 5）→ 丢弃恢复记录、保留下限
+            if (
+                self._recovery_observed_at is not None
+                and ts < self._recovery_observed_at - 5.0
+            ):
+                self._recovery_reset_at = None
+                self._recovery_observed_at = None
+                self._recovery_observed_mono = None
+                self._recovery_key_fp = None
+                self._recovery_consumed = False
+                # 保留 server_day_used 下限（fail-closed）
+
+            # R1: 只有同一响应同时带合法 remaining-requests 和 reset-requests 才能生成/替换恢复记录
+            has_both = (
+                remaining_requests is not None
+                and remaining_requests >= 0
+                and reset_requests_s is not None
+            )
+
+            # R3: 如果已过恢复点，sent_at 为 None 或 sent_at < reset_at 的响应头一律不采信
+            past_reset = (
+                self._recovery_reset_at is not None
+                and ts >= self._recovery_reset_at
+            )
+            stale_response = past_reset and (sent_at is None or sent_at < self._recovery_reset_at)
+
+            # 处理 reset_requests_s：更新服务端恢复时刻
+            if reset_requests_s is not None and not stale_response:
                 self._server_reset_at = ts + float(reset_requests_s)
-            elif remaining_requests is not None and self._server_reset_at is not None and ts >= self._server_reset_at:
+            elif (
+                remaining_requests is not None
+                and self._server_reset_at is not None
+                and ts >= self._server_reset_at
+            ):
                 # 过恢复点的 remaining 已属于新周期，旧样本也不能触发其乱序宽限。
                 self._server_reset_at = None
                 self._server_day_used = None
                 self._server_day_used_at = None
-            if remaining_requests is not None and remaining_requests >= 0:
-                # 响应头是这一次请求之后的每日剩余。只动 24h 请求窗口。
+
+            # 处理 remaining_requests：校正 24h 请求窗口
+            if remaining_requests is not None and remaining_requests >= 0 and not stale_response:
+                # R2: key_fp 变化 → 丢弃恢复记录，保留 server_day_used 下限
+                if self._recovery_key_fp is not None and key_fp is not None and key_fp != self._recovery_key_fp:
+                    self._recovery_reset_at = None
+                    self._recovery_observed_at = None
+                    self._recovery_observed_mono = None
+                    self._recovery_key_fp = None
+                    self._recovery_consumed = False
+                    # 保留 server_day_used 下限（fail-closed），不清理
+
                 used = LIMIT_REQUESTS_PER_DAY - remaining_requests
                 if used < 0:
                     used = 0
                 self._raise_day_request_floor(used, ts)
                 for event in self._events:
                     event.in_server_day = True
+
+                # R1: 建立/替换恢复记录（需要同时有 remaining 和 reset）
+                if has_both and key_fp is not None:
+                    self._recovery_reset_at = ts + float(reset_requests_s)
+                    self._recovery_observed_at = ts
+                    self._recovery_observed_mono = mono_now
+                    self._recovery_key_fp = key_fp
+                    self._recovery_consumed = False
+                elif not has_both:
+                    # 只带其一 → 不动恢复记录
+                    pass
+
             self._prune(ts)
             usage = self._measure(ts)
-            self._publish(usage)
+            self._publish(usage, ts)
             self.save()
             return usage
 
@@ -133,7 +220,7 @@ class QuotaLedger:
             before = self._markers()
             self._prune(ts)
             usage = self._measure(ts)
-            self._publish(usage)
+            self._publish(usage, ts)
             if self._markers() != before:
                 self.save()
             return usage
@@ -148,7 +235,8 @@ class QuotaLedger:
 
     def _load_locked(self) -> None:
         if not self.path.exists():
-            self._publish(self._measure(self._clock(None)))
+            now = self._clock(None)
+            self._publish(self._measure(now), now)
             return
         try:
             data = json.loads(_normalize_nonfinite(self.path.read_bytes()))
@@ -162,7 +250,7 @@ class QuotaLedger:
         if legacy_saturated:
             # 旧文件只有无时间戳的 saturated。迁成从这次读取起算的 24h 封顶，然后把标志抹掉。
             self._raise_day_request_floor(LIMIT_REQUESTS_PER_DAY, now)
-        self._publish(self._measure(now))
+        self._publish(self._measure(now), now)
         if legacy_saturated or self._markers() != before:
             self.save()
 
@@ -198,10 +286,50 @@ class QuotaLedger:
             if not isinstance(saturated, bool):
                 raise ValueError("saturated")
             legacy_saturated = saturated
+
+        # R7: 读取恢复记录字段（旧文件没有这些字段 → 视为无恢复记录）
+        recovery_reset_at = None
+        recovery_observed_at = None
+        try:
+            recovery_reset_at = _parse_optional_timestamp(data.get("recovery_reset_at", None))
+        except ValueError:
+            recovery_reset_at = None
+        try:
+            recovery_observed_at = _parse_optional_timestamp(data.get("recovery_observed_at", None))
+        except ValueError:
+            recovery_observed_at = None
+        # 如果时间戳解析失败，整个恢复记录无效
+        if recovery_reset_at is None or recovery_observed_at is None:
+            recovery_key_fp = None
+            recovery_consumed = False
+        else:
+            recovery_key_fp = data.get("recovery_key_fp", None)
+            recovery_consumed = data.get("recovery_consumed", False)
+            if recovery_key_fp is not None and not isinstance(recovery_key_fp, str):
+                recovery_key_fp = None
+                recovery_consumed = False
+        # 字段类型不对/非有限数 → 只丢弃恢复记录，不隔离整份账本
+        if recovery_reset_at is not None and not math.isfinite(recovery_reset_at):
+            recovery_reset_at = None
+            recovery_observed_at = None
+            recovery_key_fp = None
+            recovery_consumed = False
+        if recovery_observed_at is not None and not math.isfinite(recovery_observed_at):
+            recovery_reset_at = None
+            recovery_observed_at = None
+            recovery_key_fp = None
+            recovery_consumed = False
+
         self._events = parsed
         self._server_day_used = server_used
         self._server_day_used_at = server_at
         self._server_reset_at = reset_at
+        self._recovery_reset_at = recovery_reset_at
+        self._recovery_observed_at = recovery_observed_at
+        self._recovery_observed_mono = None  # 不落盘，重启后为 None
+        self._recovery_key_fp = recovery_key_fp
+        self._recovery_consumed = recovery_consumed
+        self._quota_hot_persisted = data.get("quota_hot_persisted", False)
         return legacy_saturated
 
     def _quarantine_and_cap(self) -> None:
@@ -213,7 +341,12 @@ class QuotaLedger:
         self._server_day_used = LIMIT_REQUESTS_PER_DAY
         self._server_day_used_at = now
         self._server_reset_at = None
-        self._publish(self._measure(now))
+        self._recovery_reset_at = None
+        self._recovery_observed_at = None
+        self._recovery_observed_mono = None
+        self._recovery_key_fp = None
+        self._recovery_consumed = False
+        self._publish(self._measure(now), now)
         if moved:
             self.save()
 
@@ -228,17 +361,53 @@ class QuotaLedger:
         self._server_day_used = used
         self._server_day_used_at = ts
 
-    def _publish(self, usage: QuotaUsage) -> None:
+    def _publish(self, usage: QuotaUsage, now: float) -> None:
         # 没到阈值就别发事件：apply() 每次都会清掉 cooldown_seconds，
         # 空发会把 429 的 retry-after 擦掉。只有本账本已经把额度打进冷却之后，
         # 才继续发 quota_update，让状态机在降到 80% 以下时恢复。
         hot = usage.usage_percent >= ENTER_PERCENT
         if hot:
             self._quota_hot = True
-        if hot or self._quota_hot:
+            self._quota_hot_persisted = True
+
+        # R6: 翻日成立且此前在冷却 → 发 quota_reset_confirmed 代替 quota_update
+        # 这里用 _quota_hot_persisted 作为"此前已把额度打进冷却"的持久化标志
+        if self._is_daily_reset_confirmed(usage, now):
+            if self._quota_hot_persisted and not self._recovery_consumed:
+                self._recovery_consumed = True
+                self.routing.apply({"type": "quota_reset_confirmed", "usage_percent": usage.usage_percent})
+                # 发完恢复事件后仍保持 _quota_hot=True，直到用量真降到 80% 以下
+        elif hot or self._quota_hot:
             self.routing.apply({"type": "quota_update", "usage_percent": usage.usage_percent})
+
         if usage.usage_percent < 80:
             self._quota_hot = False
+            # _quota_hot_persisted 一旦为 True 就不再清除，除非翻日消费后重置
+            if self._recovery_consumed:
+                self._quota_hot_persisted = False
+
+    def _is_daily_reset_confirmed(self, usage: QuotaUsage, now: float) -> bool:
+        """R4: 翻日成立的判定——两个条件都满足才算。"""
+        if self._recovery_reset_at is None or self._recovery_observed_at is None:
+            return False
+        # a) 墙钟 now >= reset_at，且 now >= observed_at - 5（墙钟没有回拨超过 5 秒）
+        if not (now >= self._recovery_reset_at and now >= self._recovery_observed_at - 5.0):
+            return False
+        # 墙钟回拨了 → 丢弃恢复记录、保留下限
+        if now < self._recovery_observed_at - 5.0:
+            self._recovery_reset_at = None
+            self._recovery_observed_at = None
+            self._recovery_observed_mono = None
+            self._recovery_key_fp = None
+            self._recovery_consumed = False
+            return False
+        # b) 若本进程有 observed_mono：单调钟流逝 >= reset_at - observed_at - 1
+        if self._recovery_observed_mono is not None:
+            mono_now = time.monotonic()
+            required_elapsed = self._recovery_reset_at - self._recovery_observed_at - 1.0
+            if mono_now - self._recovery_observed_mono < required_elapsed:
+                return False
+        return True
 
     def _measure(self, now: float) -> QuotaUsage:
         minute = self._count(now, WINDOW_MINUTE_S)
@@ -260,6 +429,25 @@ class QuotaLedger:
         )
 
     def _day_requests(self, now: float) -> int:
+        # R5: 翻日成立时只清 24h 请求数的服务端分量
+        if self._is_daily_reset_confirmed(None, now):
+            # 已过恢复点：只计 reset_at 之后且在 24h 窗口内的本地事件
+            return sum(
+                1
+                for event in self._events
+                if event.ts > self._recovery_reset_at and self._in_window(event.ts, now, WINDOW_DAY_S)
+            )
+        # 如果有恢复记录但翻日未确认，不使用旧的 server_reset_at 逻辑（避免过早重置）
+        # 改用正常的 server_day_used 逻辑
+        if self._recovery_reset_at is not None:
+            local = self._count(now, WINDOW_DAY_S)
+            if not self._server_active(now):
+                return local
+            extra = 0
+            for event in self._events:
+                if self._in_window(event.ts, now, WINDOW_DAY_S) and not event.in_server_day:
+                    extra += 1
+            return int(self._server_day_used or 0) + extra
         if self._server_reset_at is not None and now >= self._server_reset_at:
             return sum(
                 1
@@ -288,16 +476,26 @@ class QuotaLedger:
     def _server_active(self, now: float) -> bool:
         if self._server_day_used is None or self._server_day_used_at is None:
             return False
+        # 如果有恢复记录，翻日由恢复记录控制，不再看 server_reset_at
+        if self._recovery_reset_at is not None:
+            return self._in_window(self._server_day_used_at, now, WINDOW_DAY_S)
         if self._server_reset_at is not None and now >= self._server_reset_at:
             return False
         return self._in_window(self._server_day_used_at, now, WINDOW_DAY_S)
 
     def _prune(self, now: float) -> None:
         self._events = [event for event in self._events if now - event.ts <= WINDOW_DAY_S]
-        if self._server_reset_at is not None and now >= self._server_reset_at:
+        # R5: 翻日后清理服务端分量
+        if self._is_daily_reset_confirmed(None, now):
             self._server_day_used = None
             self._server_day_used_at = None
             return
+        # 如果有恢复记录，翻日由恢复记录控制，不再用 server_reset_at 清理
+        if self._recovery_reset_at is None:
+            if self._server_reset_at is not None and now >= self._server_reset_at:
+                self._server_day_used = None
+                self._server_day_used_at = None
+                return
         if self._server_day_used_at is not None and now - self._server_day_used_at > WINDOW_DAY_S:
             self._server_day_used = None
             self._server_day_used_at = None
@@ -315,6 +513,12 @@ class QuotaLedger:
             "server_day_used": self._server_day_used,
             "server_day_used_at": self._server_day_used_at,
             "server_reset_at": self._server_reset_at,
+            # R7: 恢复记录落盘（observed_mono 不落盘）
+            "recovery_reset_at": self._recovery_reset_at,
+            "recovery_observed_at": self._recovery_observed_at,
+            "recovery_key_fp": self._recovery_key_fp,
+            "recovery_consumed": self._recovery_consumed,
+            "quota_hot_persisted": self._quota_hot_persisted,
         }
 
     def _markers(self) -> tuple[int, int | None, float | None, float | None]:
