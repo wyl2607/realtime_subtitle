@@ -365,7 +365,7 @@ struct ContentView: View {
                 Picker("引擎", selection: $engineMode) {
                     Text("自动").tag("auto")
                     Text("电脑节点").tag("node")
-                    Text("本机").tag("local")
+                    Text(DesignTokens.Text.statusLocal).tag("local")
                 }
                 .pickerStyle(.segmented)
                 .onChange(of: engineMode) { _, newValue in
