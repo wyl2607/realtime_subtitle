@@ -41,6 +41,9 @@ jobs:
       - name: ruff check
         # --output-format github 让告警直接标在 PR 的对应行上
         run: ruff check --output-format github .
+      - name: Check status copy literals (spec 010)
+        # 不带 --android：Android 是私有仓库，CI 拿不到，只在本地手动跑
+        run: python3 scripts/design/check_copy_literals.py
 
   # requirements.txt 必须在**所有声明支持的 Python** 上解得出来。
   #
