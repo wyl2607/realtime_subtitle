@@ -70,6 +70,8 @@ TEXT_LOCAL_ASR_FAILED = '本机识别出错，请停止后重新开始'
 TEXT_LOCAL_TX_UNAVAILABLE = '本机翻译资源未下载，只显示原文'
 TEXT_LOCAL_NEEDS_I_O_S26 = '本机识别需要 iOS 26 或更新'
 TEXT_LOCAL_SPEECH_DENIED = '语音识别权限被拒绝，请到 设置 → 实时字幕 打开'
+TEXT_NODE_NOT_LISTED_SUFFIX = ' 不在节点列表，已用本机'
+TEXT_PLAYBACK_CAPTURE_BLOCKED = '该应用禁止内录，请改用麦克风'
 
 PALETTE_TEXT = (('白', '#F0F0F0'), ('暖黄', '#FFE894'), ('浅青', '#9FE7F5'), ('浅绿', '#B8F2B0'), ('浅粉', '#FFC4D6'),)
 PALETTE_BACKGROUND = (('黑', '#000000'), ('深灰', '#1E1E1E'), ('深蓝', '#0F1B2D'), ('深绿', '#10241A'), ('深紫', '#1F1630'),)

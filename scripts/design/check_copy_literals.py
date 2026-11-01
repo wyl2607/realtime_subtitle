@@ -3,6 +3,9 @@
 design/tokens.json 的 text 段是跨端状态文案的唯一真相源。生成物提供了每个平台
 应引用的常量；若业务代码重新写入相同文案，令牌更新时就会悄悄漂移。因此本脚本
 只读扫描各端的字符串字面量，并以非零退出码让 CI 能证明不存在未经说明的副本。
+
+Android 是私有仓库，CI 拿不到，Android 部分只在本地/手动用
+`--android ~/projects/realtime_subtitle_android` 跑；CI 只扫本仓库的 Python/rslite/iOS。
 """
 from __future__ import annotations
 
@@ -27,6 +30,13 @@ ALLOW: dict[str, str] = {
     "realtime_subtitle/ui/subtitle_render.py:untranslated": (
         "重试处理函数的 docstring，未作为 UI 文案显示。"
     ),
+    "android:app/src/main/java/com/wyl26/dezhsubtitle/v2/ui/model/UiDefaults.kt:statusLocal": (
+        "字幕行来源标签（本机/节点/云端）三值一组，另两个不是路由状态、令牌里没有；"
+        "只把「本机」绑到 statusLocal 会把这组拆开，令牌改了行标签跟着变。"
+    ),
+    "android:app/src/main/java/com/wyl26/dezhsubtitle/v2/ui/home/HomeScreen.kt:statusLocal": (
+        "@Preview 的示例数据（字幕行来源标签），不进运行时。"
+    ),
 }
 
 GENERATED = {
@@ -34,6 +44,8 @@ GENERATED = {
     Path("macos-native/Sources/rslite/DesignTokens.swift"),
     Path("ios/Shared/DesignTokens.swift"),
 }
+# 相对 Android 仓库根
+ANDROID_GENERATED = Path("core/src/main/kotlin/com/wyl26/dezhsubtitle/core/DesignTokens.kt")
 ROUTE_STATUS_VALUES = {"本机", "混合·", "云端·Groq"}
 DOUBLE_QUOTED_LITERAL = re.compile(r'"(?:\\.|[^"\\])*"')
 
@@ -71,6 +83,15 @@ def _is_excluded(path: Path, root: Path) -> bool:
     )
 
 
+def _android_files(android: Path) -> Iterable[Path]:
+    # 只看一级模块目录（app/core/engine…）：Android 仓库里 .claude/worktrees 下还有整套副本
+    for module_main in android.glob("*/src/main"):
+        for path in module_main.rglob("*.kt"):
+            relative = path.relative_to(android)
+            if relative != ANDROID_GENERATED and "build" not in relative.parts:
+                yield path
+
+
 def _source_files(root: Path, android: Path | None) -> Iterable[Path]:
     for directory, suffix in (
         (root / "realtime_subtitle", ".py"),
@@ -80,9 +101,7 @@ def _source_files(root: Path, android: Path | None) -> Iterable[Path]:
         if directory.exists():
             yield from (path for path in directory.rglob(f"*{suffix}") if not _is_excluded(path, root))
     if android is not None:
-        kotlin_root = android / "app" / "src" / "main"
-        if kotlin_root.exists():
-            yield from kotlin_root.rglob("*.kt")
+        yield from _android_files(android)
 
 
 def _python_literals(path: Path) -> Iterable[tuple[int, str]]:
@@ -122,7 +141,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     root = args.root.resolve()
-    if args.android is not None and not args.android.exists():
+    android_root = args.android.resolve() if args.android is not None else None
+    if android_root is not None and not android_root.exists():
         print(f"ERROR Android 路径不存在: {args.android}", file=sys.stderr)
         return 2
 
@@ -133,10 +153,14 @@ def main(argv: list[str] | None = None) -> int:
     findings = 0
     files = 0
     try:
-        for path in sorted(_source_files(root, args.android)):
+        for path in sorted(_source_files(root, android_root)):
             files += 1
             # 豁免键和输出一律用正斜杠，Windows 上 str(Path) 是反斜杠，ALLOW 会全部对不上
-            display = path.relative_to(root).as_posix() if path.is_relative_to(root) else path.as_posix()
+            # Android 文件加 android: 前缀、相对 Android 根，ALLOW 才能跨机器写
+            if android_root is not None and path.is_relative_to(android_root):
+                display = f"android:{path.relative_to(android_root).as_posix()}"
+            else:
+                display = path.relative_to(root).as_posix()
             for line, literal in _literals(path):
                 for key, token, exact in tokens:
                     if not _matches(literal, token, exact):

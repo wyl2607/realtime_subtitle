@@ -21,7 +21,23 @@ SRC = ROOT / "design" / "tokens.json"
 SWIFT_OUT = ROOT / "macos-native" / "Sources" / "rslite" / "DesignTokens.swift"
 IOS_SWIFT_OUT = ROOT / "ios" / "Shared" / "DesignTokens.swift"
 PY_OUT = ROOT / "realtime_subtitle" / "ui" / "design_tokens.py"
+ANDROID_KT_REL = Path("core/src/main/kotlin/com/wyl26/dezhsubtitle/core/DesignTokens.kt")
 HEADER = "由 scripts/design/gen_tokens.py 从 design/tokens.json 生成，不要手改。"
+# Android 仓库的生成器（scripts/gen_design_tokens.py）用的是自己的源路径，头注释照抄。
+KT_HEADER = (
+    "由 scripts/gen_design_tokens.py 从 design/tokens.json 生成，不要手改。\n"
+    "来源：与 Mac/Windows 共用的 design/tokens.json（spec 006 / spec 008）。\n"
+    "同步：改 design/tokens.json 后运行 python3 scripts/gen_design_tokens.py。"
+)
+KT_GROUPS = (
+    ("color", "Color"),
+    ("opacity", "Opacity"),
+    ("type", "TypeScale"),
+    ("space", "Space"),
+    ("radius", "Radius"),
+    ("motion", "Motion"),
+    ("text", "Text"),
+)
 
 
 def _swift_value(v):
@@ -70,6 +86,50 @@ def render_python(tokens: dict) -> str:
     for kind in ("text", "background"):
         items = ", ".join(f"({i['name']!r}, {i['hex']!r})" for i in tokens["palette"][kind])
         lines.append(f"PALETTE_{kind.upper()} = ({items},)")
+    return "\n".join(lines) + "\n"
+
+
+def _kt_literal(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return repr(float(value))
+    if isinstance(value, float):
+        return repr(value)
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _kt_type(value):
+    if isinstance(value, bool):
+        return "Boolean"
+    if isinstance(value, (int, float)):
+        return "Double"
+    return "String"
+
+
+def render_kotlin(tokens: dict) -> str:
+    """Android 仓库 core/DesignTokens.kt 的内容，必须与那边生成器逐字节相同。"""
+    lines = [f"// {part}" for part in KT_HEADER.split("\n")]
+    lines += ["", "package com.wyl26.dezhsubtitle.core", "",
+              "data class PaletteSwatch(val name: String, val hex: String)", "", "object DesignTokens {"]
+    for group, type_name in KT_GROUPS:
+        lines.append(f"    object {type_name} {{")
+        for key, value in tokens[group].items():
+            number = float(value) if isinstance(value, int) and not isinstance(value, bool) else value
+            lines.append(f"        const val {key}: {_kt_type(value)} = {_kt_literal(number)}")
+        lines.append("    }")
+    lines.append("    object Palette {")
+    for kind in ("text", "background"):
+        lines.append(f"        val {kind}: List<PaletteSwatch> = listOf(")
+        items = tokens["palette"][kind]
+        for index, item in enumerate(items):
+            name = json.dumps(item["name"], ensure_ascii=False)
+            hex_value = json.dumps(item["hex"], ensure_ascii=False)
+            comma = "," if index < len(items) - 1 else ""
+            lines.append(f"            PaletteSwatch(name = {name}, hex = {hex_value}){comma}")
+        lines.append("        )")
+    lines.append("    }")
+    lines.append("}")
     return "\n".join(lines) + "\n"
 
 
