@@ -61,6 +61,8 @@ class _Cloud:
             status=200,
             remaining_requests=9,
             reset_requests_s=12.5,
+            key_fingerprint="fp-cloud",
+            sent_at=123.0,
         )
 
     def cancel(self):
@@ -93,9 +95,14 @@ class _Ledger:
         self.path = path
         self.routing = routing
         self.notes = []
+        self.calls = []
 
-    def note(self, duration_s, *, now=None, remaining_requests=None, reset_requests_s=None):
+    def note(
+        self, duration_s, *, now=None, remaining_requests=None, reset_requests_s=None,
+        key_fp=None, sent_at=None,
+    ):
         self.notes.append((duration_s, remaining_requests, reset_requests_s))
+        self.calls.append((duration_s, remaining_requests, reset_requests_s, key_fp, sent_at))
 
     def usage(self, now=None):
         return None
@@ -179,6 +186,7 @@ def test_cloud_on_builds_cloud_stack_not_node_client(tmp_path):
         assert cloud.calls and cloud.calls[0][1]
         assert translator.calls == [("Hallo", "")]
         assert ledgers[0].notes == [(1.0, 9, 12.5)]
+        assert ledgers[0].calls == [(1.0, 9, 12.5, "fp-cloud", 123.0)]
         assert any(line["dst"] == "中文译文" and line["source"] == "remote" for line in ui.lines)
         assert node_calls == []
     finally:
@@ -316,9 +324,13 @@ def test_cloud_429_logs_cooldown_once_without_key(tmp_path, capsys):
     try:
         error = CloudError(
             status=429, reason="rate limited", exc_type="HTTPError",
-            retry_after=7, reset_requests_s=0.12, secret="gsk_test_fake_key_never_logged")
+            retry_after=7, reset_requests_s=0.12, sent_at=456.0,
+            secret="gsk_test_fake_key_never_logged")
         bridge._on_cloud_exception(error, 0)
         assert bridge.ledger.notes == [(0.0, None, 0.12)]
+        assert bridge.ledger.calls == [
+            (0.0, None, 0.12, error.key_fingerprint, 456.0),
+        ]
         out = capsys.readouterr().out
         assert "rslite.cloud cooldown reason=429 retry_after=7" in out
         assert "gsk_test_fake_key_never_logged" not in out

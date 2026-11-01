@@ -8,10 +8,36 @@ from realtime_subtitle.remote.quota import QuotaLedger
 from realtime_subtitle.remote.routing_rules import RoutingState
 
 
-def _ledger(tmp_path, now=0.0, state=None, name="quota.json"):
+def _ledger(tmp_path, now=0.0, state=None, name="quota.json", mono=None):
     routing = state if state is not None else RoutingState(has_key=True, cloud_enabled=True)
     clock = now if callable(now) else (lambda now=now: now)
-    return QuotaLedger(tmp_path / name, routing=routing, now=clock), routing
+    mono_clock = None if mono is None else (mono if callable(mono) else (lambda mono=mono: mono))
+    return QuotaLedger(tmp_path / name, routing=routing, now=clock, mono=mono_clock), routing
+
+
+class _Recorder(RoutingState):
+    def __init__(self):
+        super().__init__(has_key=True, cloud_enabled=True)
+        self.events = []
+
+    def apply(self, event):
+        self.events.append(dict(event))
+        super().apply(event)
+
+
+def _events_of(state, kind):
+    return [event for event in state.events if event["type"] == kind]
+
+
+def _seed_recovery(ledger, *, now=1000.0, remaining=5, reset_s=100.0, key_fp="fp-a"):
+    ledger.note(
+        10,
+        now=now,
+        remaining_requests=remaining,
+        reset_requests_s=reset_s,
+        key_fp=key_fp,
+        sent_at=now,
+    )
 
 
 def test_billed_seconds_are_at_least_10(tmp_path):
@@ -142,12 +168,17 @@ def test_day_request_header_hysteresis_and_later_local_requests(tmp_path):
 
 
 def test_reset_header_releases_day_request_cooldown_at_its_deadline(tmp_path):
-    ledger, state = _ledger(tmp_path, now=1000)
-    initial = ledger.note(10, now=1000, remaining_requests=5, reset_requests_s=100)
+    mono = {"t": 50.0}
+    ledger, state = _ledger(tmp_path, now=1000, mono=lambda: mono["t"])
+    initial = ledger.note(
+        10, now=1000, remaining_requests=5, reset_requests_s=100, key_fp="fp-a", sent_at=1000,
+    )
     assert initial.usage_percent >= 90
     assert state.cloud_state == "cooldown_quota"
     assert ledger.usage(now=1050).usage_percent >= 90
 
+    # 墙钟过了恢复点，单调钟也必须真的流过同样时长，翻了才算。
+    mono["t"] += 101
     recovered = ledger.usage(now=1101)
     assert recovered.day_requests == 0
     assert recovered.usage_percent < 80
@@ -167,15 +198,17 @@ def test_smaller_server_usage_waits_60_seconds_before_it_is_accepted(tmp_path):
 
 
 def test_remaining_after_reset_is_a_new_server_day_baseline(tmp_path):
-    ledger, _state = _ledger(tmp_path, now=1000)
-    ledger.note(10, now=1000, remaining_requests=5, reset_requests_s=100)
-    ledger.note(10, now=1101, remaining_requests=1900)
+    mono = {"t": 50.0}
+    ledger, _state = _ledger(tmp_path, now=1000, mono=lambda: mono["t"])
+    ledger.note(10, now=1000, remaining_requests=5, reset_requests_s=100, key_fp="fp-a", sent_at=1000)
+    mono["t"] += 101
+    ledger.note(10, now=1101, remaining_requests=1900, key_fp="fp-a", sent_at=1101)
     assert ledger.usage(now=1101).day_requests == 100
 
 
 def test_reset_timestamp_round_trips_and_old_ledger_still_loads(tmp_path):
     ledger, _state = _ledger(tmp_path, now=2000)
-    ledger.note(10, now=2000, remaining_requests=5, reset_requests_s=100)
+    ledger.note(10, now=2000, remaining_requests=5, reset_requests_s=100, key_fp="fp-a", sent_at=2000)
     path = tmp_path / "quota.json"
     assert json.loads(path.read_text(encoding="utf-8"))["server_reset_at"] == 2100.0
 
@@ -196,15 +229,18 @@ def test_reset_timestamp_round_trips_and_old_ledger_still_loads(tmp_path):
     assert not (tmp_path / "quota.json.corrupt").exists()
 
 
-def test_nonfinite_server_reset_timestamp_quarantines_the_ledger(tmp_path):
+def test_nonfinite_server_reset_timestamp_only_drops_the_record(tmp_path):
     path = tmp_path / "quota.json"
     path.write_bytes(
         b'{"version":1,"events":[],"server_day_used":3,'
-        b'"server_day_used_at":1000,"server_reset_at":Infinity}'
+        b'"server_day_used_at":1000,"server_reset_at":Infinity,'
+        b'"server_reset_observed_at":1000,"server_reset_key_fp":"fp-a",'
+        b'"server_reset_consumed":false}'
     )
     ledger, _state = _ledger(tmp_path, now=1000)
-    assert ledger.usage(now=1000).saturated is True
-    assert (tmp_path / "quota.json.corrupt").exists()
+    assert ledger.usage(now=1000).day_requests == 3
+    assert ledger.usage(now=1000).saturated is False
+    assert not (tmp_path / "quota.json.corrupt").exists()
 
 
 @pytest.mark.parametrize("bad", [-1, float("nan"), float("inf"), float("-inf")])
@@ -431,6 +467,235 @@ def test_note_still_rejects_negative_nan_and_inf(tmp_path):
             ledger.note(bad, now=1)
     assert ledger.usage(now=1).minute_requests == 0
     assert ledger.usage(now=1).saturated is False
+
+
+def test_recovery_record_needs_both_headers(tmp_path):
+    ledger, _state = _ledger(tmp_path, now=1000)
+    ledger.note(10, now=1000, remaining_requests=5)
+    path = tmp_path / "quota.json"
+    assert json.loads(path.read_text(encoding="utf-8"))["server_reset_at"] is None
+
+    ledger.note(10, now=1010, reset_requests_s=100)
+    assert json.loads(path.read_text(encoding="utf-8"))["server_reset_at"] is None
+
+    ledger.note(10, now=1020, remaining_requests=5, reset_requests_s=100, key_fp="fp-a", sent_at=1020)
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["server_reset_at"] == 1120.0
+    assert saved["server_reset_observed_at"] == 1020.0
+    assert saved["server_reset_key_fp"] == "fp-a"
+    assert saved["server_reset_consumed"] is False
+
+    # 只有 reset 的迟到响应不能把已确认的恢复点改早。
+    ledger.note(10, now=1030, reset_requests_s=100)
+    assert json.loads(path.read_text(encoding="utf-8"))["server_reset_at"] == 1120.0
+
+
+def test_smaller_usage_before_reset_does_not_confirm_rollover(tmp_path):
+    state = _Recorder()
+    mono = {"t": 50.0}
+    ledger, _state = _ledger(tmp_path, now=1000, state=state, mono=lambda: mono["t"])
+    _seed_recovery(ledger)
+    assert state.cloud_state == "cooldown_quota"
+    state.events.clear()
+
+    usage = ledger.note(10, now=1099, remaining_requests=1999, key_fp="fp-a", sent_at=1099)
+    assert usage.day_requests == 1
+    assert _events_of(state, "quota_reset_confirmed") == []
+    saved = json.loads((tmp_path / "quota.json").read_text(encoding="utf-8"))
+    assert saved["server_reset_consumed"] is False
+
+
+def test_confirmed_rollover_emits_one_reset_event_with_max_percent(tmp_path):
+    state = _Recorder()
+    mono = {"t": 50.0}
+    ledger, _state = _ledger(tmp_path, now=1000, state=state, mono=lambda: mono["t"])
+    _seed_recovery(ledger)
+    state.events.clear()
+
+    mono["t"] += 101
+    usage = ledger.usage(now=1101)
+    events = _events_of(state, "quota_reset_confirmed")
+    assert len(events) == 1
+    assert usage.day_requests == 0
+    assert usage.usage_percent == max(
+        usage.minute_requests / 20 * 100,
+        usage.hour_audio_s / 7200 * 100,
+        usage.day_audio_s / 28800 * 100,
+        usage.day_requests / 2000 * 100,
+    )
+    assert events[0]["usage_percent"] == pytest.approx(usage.usage_percent)
+    assert json.loads((tmp_path / "quota.json").read_text(encoding="utf-8"))["server_reset_consumed"] is True
+
+    ledger.usage(now=1101)
+    assert len(_events_of(state, "quota_reset_confirmed")) == 1
+
+
+def test_wall_clock_rollback_drops_recovery_but_keeps_floor(tmp_path):
+    state = _Recorder()
+    mono = {"t": 50.0}
+    ledger, _state = _ledger(tmp_path, now=1000, state=state, mono=lambda: mono["t"])
+    _seed_recovery(ledger)
+    state.events.clear()
+
+    usage = ledger.usage(now=994)
+    assert usage.day_requests == 1995
+    assert _events_of(state, "quota_reset_confirmed") == []
+    saved = json.loads((tmp_path / "quota.json").read_text(encoding="utf-8"))
+    assert saved["server_reset_at"] is None
+    assert saved["server_day_used"] == 1995
+
+
+def test_wall_jump_forward_without_monotonic_elapsed_is_not_rollover(tmp_path):
+    state = _Recorder()
+    mono = {"t": 50.0}
+    ledger, _state = _ledger(tmp_path, now=1000, state=state, mono=lambda: mono["t"])
+    _seed_recovery(ledger)
+    state.events.clear()
+
+    jumped = ledger.usage(now=1101)
+    assert jumped.day_requests == 1995
+    assert _events_of(state, "quota_reset_confirmed") == []
+    assert json.loads((tmp_path / "quota.json").read_text(encoding="utf-8"))["server_reset_consumed"] is False
+
+    mono["t"] += 101
+    confirmed = ledger.usage(now=1101)
+    assert confirmed.day_requests == 0
+    assert len(_events_of(state, "quota_reset_confirmed")) == 1
+
+
+def test_key_change_drops_record_but_keeps_floor_and_none_never_records(tmp_path):
+    state = _Recorder()
+    mono = {"t": 50.0}
+    ledger, _state = _ledger(tmp_path, now=1000, state=state, mono=lambda: mono["t"])
+    _seed_recovery(ledger, key_fp="fp-a")
+    state.events.clear()
+    path = tmp_path / "quota.json"
+
+    ledger.note(10, now=1010, remaining_requests=1999, key_fp="fp-b", sent_at=1010)
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["server_reset_at"] is None
+    assert saved["server_day_used"] == 1995
+
+    ledger.note(10, now=1020, remaining_requests=1990, reset_requests_s=100, key_fp=None, sent_at=1020)
+    assert json.loads(path.read_text(encoding="utf-8"))["server_reset_at"] is None
+
+    ledger.note(10, now=1030, remaining_requests=1980, reset_requests_s=100, key_fp="fp-b", sent_at=1030)
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["server_reset_at"] == 1130.0
+    assert saved["server_reset_key_fp"] == "fp-b"
+
+
+def test_late_response_from_old_period_is_not_trusted_after_rollover(tmp_path):
+    state = _Recorder()
+    mono = {"t": 50.0}
+    ledger, _state = _ledger(tmp_path, now=1000, state=state, mono=lambda: mono["t"])
+    _seed_recovery(ledger)
+    mono["t"] += 101
+    ledger.usage(now=1101)
+    state.events.clear()
+    path = tmp_path / "quota.json"
+
+    stale = ledger.note(
+        10, now=1102, remaining_requests=1900, reset_requests_s=500, key_fp="fp-a", sent_at=1050,
+    )
+    assert stale.day_requests == 1
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["server_reset_at"] == 1100.0
+    assert saved["server_reset_consumed"] is True
+
+    unknown = ledger.note(
+        10, now=1103, remaining_requests=1800, reset_requests_s=500, key_fp="fp-a", sent_at=None,
+    )
+    assert unknown.day_requests == 2
+    assert json.loads(path.read_text(encoding="utf-8"))["server_reset_at"] == 1100.0
+    assert _events_of(state, "quota_reset_confirmed") == []
+
+
+def test_rollover_leaves_minute_hour_and_day_audio_windows_unchanged(tmp_path):
+    state = _Recorder()
+    mono = {"t": 50.0}
+    ledger, _state = _ledger(tmp_path, now=1000, state=state, mono=lambda: mono["t"])
+    _seed_recovery(ledger)
+
+    before = ledger.usage(now=1101)
+    mono["t"] += 101
+    after = ledger.usage(now=1101)
+    assert before.minute_requests == after.minute_requests == 0
+    assert before.hour_audio_s == after.hour_audio_s == 10
+    assert before.day_audio_s == after.day_audio_s == 10
+    assert after.day_requests == 0
+
+
+def test_recovery_round_trips_and_bad_fields_only_drop_the_record(tmp_path):
+    state = _Recorder()
+    mono = {"t": 50.0}
+    ledger, _state = _ledger(tmp_path, now=1000, state=state, mono=lambda: mono["t"])
+    _seed_recovery(ledger)
+    mono["t"] += 101
+    ledger.usage(now=1101)
+    path = tmp_path / "quota.json"
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["server_reset_at"] == 1100.0
+    assert saved["server_reset_observed_at"] == 1000.0
+    assert saved["server_reset_key_fp"] == "fp-a"
+    assert saved["server_reset_consumed"] is True
+
+    reloaded, _state = _ledger(tmp_path, now=1101, mono=999)
+    reloaded.usage(now=1101)
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["server_reset_consumed"] is True
+    assert saved["server_reset_key_fp"] == "fp-a"
+
+    # #87 的旧格式：只有 server_reset_at，没有观察时刻/指纹 → 当成没有恢复记录。
+    path.write_text(
+        json.dumps({
+            "version": 1,
+            "events": [],
+            "server_day_used": 3,
+            "server_day_used_at": 1000,
+            "server_reset_at": 2100,
+        }),
+        encoding="utf-8",
+    )
+    old, _state = _ledger(tmp_path, now=1101)
+    assert old.usage(now=1101).day_requests == 3
+    assert not (tmp_path / "quota.json.corrupt").exists()
+
+    path.write_text(
+        json.dumps({
+            "version": 1,
+            "events": [],
+            "server_day_used": 3,
+            "server_day_used_at": 1000,
+            "server_reset_at": 2100,
+            "server_reset_observed_at": "nope",
+            "server_reset_key_fp": "fp-a",
+            "server_reset_consumed": False,
+        }),
+        encoding="utf-8",
+    )
+    broken, _state = _ledger(tmp_path, now=1101)
+    assert broken.usage(now=1101).day_requests == 3
+    assert not (tmp_path / "quota.json.corrupt").exists()
+
+
+def test_restart_past_reset_confirms_by_wall_clock_once(tmp_path):
+    mono = {"t": 50.0}
+    ledger, _state = _ledger(tmp_path, now=1000, mono=lambda: mono["t"])
+    _seed_recovery(ledger)
+    assert json.loads((tmp_path / "quota.json").read_text(encoding="utf-8"))["server_reset_consumed"] is False
+
+    state = _Recorder()
+    restarted, _state = _ledger(tmp_path, now=2000, state=state)
+    usage = restarted.usage(now=2000)
+    assert usage.day_requests == 0
+    assert json.loads((tmp_path / "quota.json").read_text(encoding="utf-8"))["server_reset_consumed"] is True
+    # 新实例没有「之前已打进冷却」的记忆，重启本身不会凭空发恢复事件。
+    assert _events_of(state, "quota_reset_confirmed") == []
+
+    state.events.clear()
+    restarted.usage(now=2001)
+    assert _events_of(state, "quota_reset_confirmed") == []
 
 
 def test_quota_publishes_routing_events_and_does_not_own_cloud_state():

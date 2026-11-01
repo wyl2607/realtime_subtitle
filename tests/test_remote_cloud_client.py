@@ -143,6 +143,8 @@ def test_post_is_verbose_json_wav_and_maps_segments_onto_a0(tmp_path, caplog):
     assert result.remaining_requests == 1990
     assert result.reset_requests_s == 179.56
     assert result.groq_id == "req_abc"
+    assert isinstance(result.key_fingerprint, str) and len(result.key_fingerprint) == 12
+    assert isinstance(result.sent_at, float)
     assert [(seg.start, seg.end, seg.text) for seg in result.segments] == [
         (10.25, 10.5, " hallo"),
         (10.5, 11.0, " welt"),
@@ -263,6 +265,8 @@ def test_http_errors_do_not_leak_the_key(tmp_path, caplog, status, reason):
     assert err.remaining_requests == 10
     assert err.retry_after == 12
     assert err.reset_requests_s == 0.12
+    assert isinstance(err.key_fingerprint, str) and len(err.key_fingerprint) == 12
+    assert isinstance(err.sent_at, float)
     assert f"status={status}" in caplog.text
     assert f"reason={reason}" in caplog.text
     _assert_clean(caplog, err)
@@ -326,6 +330,7 @@ def test_transport_errors_do_not_leak_the_key(tmp_path, caplog, exc, reason, exc
     assert caught.value.status is None
     assert caught.value.reason == reason
     assert caught.value.exc_type == exc_type
+    assert isinstance(caught.value.sent_at, float)
     assert f"reason={reason}" in caplog.text
     assert f"exc={exc_type}" in caplog.text
     _assert_clean(caplog, caught.value)
