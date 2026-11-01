@@ -181,11 +181,11 @@ class SubtitleHistoryStore:
             row.source = str(source)
         self._rows.remove(row)
         index = len(self._rows)
-        for candidate_index, candidate in enumerate(self._rows):
+        # 被挪的行没有 t0 就留在末尾（原 _reinsert_pair_by_t0 的行为）；别把它当 -inf 插到最前
+        for candidate_index, candidate in enumerate(self._rows if row.t0 is not None else ()):
             candidate_t0 = candidate.t0 if candidate.t0 is not None else float("-inf")
-            row_t0 = row.t0 if row.t0 is not None else float("-inf")
             try:
-                later = candidate_t0 > row_t0
+                later = candidate_t0 > row.t0
             except TypeError:
                 later = False
             if later:

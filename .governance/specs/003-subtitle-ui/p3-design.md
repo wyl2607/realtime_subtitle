@@ -108,7 +108,7 @@ class SubtitleHistoryStore:
         # 值没变不发事件、返回 False；key 不存在返回 False。
     def drop(self, keys) -> list[str]           # 返回真删掉的 key；不存在的静默忽略
     def move_by_t0(self, key, *, source=None) -> bool
-        # 把该行按 t0 挪到时间顺序位置（t0 None 视为 -inf，比较 TypeError 视为不更晚）；
+        # 把该行按 t0 挪到时间顺序位置（被挪行 t0 为 None → 放末尾；其它行 t0 None 视为 -inf；比较 TypeError 视为不更晚）；
         # source 非 None 时一并改来源。发一个 move 事件；source 变了再发 update(fields={"source"})。
     def clear(self) -> None                     # 发 reset
     def mark_language(self, src, tgt, revision) -> None  # 记标签并发 language 事件

@@ -110,3 +110,13 @@ def test_zero_is_a_real_key_not_missing():
     assert store.get(0) is not None and store.get("0").dst == "零"
     store.add("Null", "零号", key=0)
     assert len(store) == 1 and store.get(0).dst == "零号"
+
+
+def test_move_without_t0_stays_at_end():
+    store = SubtitleHistoryStore()
+    store.add("Eins", "一", key="a", t0=1.0)
+    store.add("Zwei", "二", key="b", t0=2.0)
+    store.add("Fern", "远", key="r")
+    assert store.move_by_t0("r", source="remote")
+    assert [row.key for row in store.rows()] == ["a", "b", "r"]
+    assert store.get("r").source == "remote"
