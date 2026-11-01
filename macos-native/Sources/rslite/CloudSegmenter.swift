@@ -792,6 +792,24 @@ final class CloudUploadController: @unchecked Sendable {
             }
             return reconcileLocked(atSilence: false, node: node, lines: [], discard: false, cancel: false)
         }
+        if let decode = error as? CloudClientError, case .decodeFailed(let quota) = decode {
+            var quotaHeaders: [AnyHashable: Any] = [:]
+            if let remaining = quota?.remainingRequests {
+                quotaHeaders["x-ratelimit-remaining-requests"] = NSNumber(value: remaining)
+            }
+            if let resetSeconds = quota?.resetRequestsS {
+                quotaHeaders["x-ratelimit-reset-requests"] = "\(resetSeconds)s"
+            }
+            if !quotaHeaders.isEmpty {
+                try? ledger.note(
+                    quotaHeaders,
+                    at: now,
+                    keyFingerprint: quota?.keyFingerprint,
+                    sentAt: quota?.sentAt,
+                    requestID: requestID
+                )
+            }
+        }
         context.apply(RouteEvent(type: "segment_failure", status: nil, retryAfter: nil, usagePercent: nil))
         noteCooldown(now)
         return reconcileLocked(atSilence: false, node: node, lines: [], discard: false, cancel: false)
@@ -1335,6 +1353,33 @@ final class CloudUploadController: @unchecked Sendable {
             check(httpQuotaLedger.usage(at: now).dayRequests == 2_000, "429 错误响应的 remaining 应校正每日额度")
         } else {
             check(false, "带配额头的 429 用例应先准备好一段上传")
+        }
+
+        // 200 + 合法配额头 + 非法 JSON：解析失败仍须把配额送进账本，和成功响应结果一致。
+        let decodeLedgerURL = root.appendingPathComponent("quota-decode-failed.json")
+        let decodeLedger = QuotaLedger(url: decodeLedgerURL)
+        let decode = CloudUploadController(
+            localeID: "de-DE",
+            ledger: decodeLedger,
+            readSwitch: { rateBox.snapshot },
+            makeClient: { _ in FakeCloud() }
+        )
+        _ = decode.ingest(samples: [Float](repeating: 0.05, count: 32_000), startSeconds: 0, now: now, node: idle)
+        let decodeClosed = decode.ingest(samples: [Float](repeating: 0, count: 9_600), startSeconds: 2, now: now, node: idle)
+        if let segment = decodeClosed.uploads.first, decode.prepareSend(segment, now: now) != nil {
+            let keyFP = rateBox.snapshot.key.map(Self.quotaKeyFingerprint)
+            _ = decode.resolveFailure(
+                id: segment.id,
+                error: CloudClientError.decodeFailed(quota: CloudQuotaHeaders(remainingRequests: 5, resetRequestsS: 100, keyFingerprint: keyFP, sentAt: now)),
+                now: now,
+                node: idle
+            )
+            check(decodeLedger.usage(at: now).dayRequests == 1_995, "decodeFailed 的 remaining 应校正每日额度下限")
+            let record = (try? JSONDecoder().decode(QuotaLedgerSnapshot.self, from: Data(contentsOf: decodeLedgerURL)))
+            check(record?.resetAt == now.timeIntervalSince1970 + 100, "decodeFailed 应建立恢复记录")
+            check(record?.resetKeyFingerprint == keyFP, "decodeFailed 恢复记录应绑定 key 指纹")
+        } else {
+            check(false, "200 非法 JSON 用例应先准备好一段上传")
         }
 
         let invalidLedger = QuotaLedger(url: root.appendingPathComponent("quota-invalid.json"))
