@@ -31,6 +31,19 @@ def _dim_color(color, factor=design_tokens.OPACITY_OLDER_PAIR):
     return "#" + "".join(f"{round(channel * factor):02x}" for channel in rgb)
 
 
+def _rgba_color(color, alpha):
+    """把颜色换成真正的 rgba（淡入用）：alpha=0 完全透明，不是变黑。
+
+    默认背景是黑的，乘 RGB 也看不出区别；但用户能把背景改成浅色，那时乘
+    RGB 会先闪一块深色再亮起来，而 rgba 在任何底色上都对。
+    """
+    rgb = _hex_to_rgb(color)
+    if rgb is None:
+        return color
+    a = max(0, min(255, round(alpha * 255)))
+    return f"rgba({rgb[0]},{rgb[1]},{rgb[2]},{a})"
+
+
 def _display_mode():
     mode = str(getattr(config, "DISPLAY_MODE", "") or "").lower()
     if mode not in {"bilingual", "target", "source"}:
@@ -217,8 +230,12 @@ class LiveTextRenderMixin:
             return text[:config.MAX_SUBTITLE_LENGTH] + "..."
         return text
 
-    def _pair_html(self, german, chinese, *, dim=False, top_gap=False, key=None):
-        """一条已完成句对的富文本块"""
+    def _pair_html(self, german, chinese, *, dim=False, top_gap=False, key=None, alpha=None):
+        """一条已完成句对的富文本块。
+
+        alpha 只用于新句淡入：把颜色换成 rgba（alpha 从 0 到 1），不改 CSS
+        opacity——后者会把整块一起压暗，和 dim 叠起来看不对。
+        """
         lines = []
         opacity = design_tokens.OPACITY_OLDER_PAIR if dim else 1.0
         mode = _display_mode()
@@ -233,6 +250,9 @@ class LiveTextRenderMixin:
         if dim:
             source_color = _dim_color(source_color, opacity)
             target_color = _dim_color(target_color, opacity)
+        if alpha is not None and alpha < 1.0:
+            source_color = _rgba_color(source_color, alpha)
+            target_color = _rgba_color(target_color, alpha)
         if german and (mode in {"bilingual", "source"} or is_untranslated or not chinese):
             lines.append(
                 f'<span style="color:{source_color};font-size:{source_size}px">'
@@ -329,13 +349,143 @@ class LiveTextRenderMixin:
         self._doc_cache_key = key
         return doc
 
-    def _render(self):
+    # ------------------------------------------------------------------
+    # 出现体验：粘住可见集合 / 最短显示时长 / 新句淡入
+    # ------------------------------------------------------------------
+    def _now(self):
+        """单调时钟秒数（minHold 一律走它，测试/探针可替换成虚拟时钟）。"""
+        return time.monotonic()
+
+    @staticmethod
+    def _pair_key(item):
+        """句对的稳定标识：优先用业务 key，没有就退回首次加入时的墙钟。
+
+        update_dst 会整个替换 tuple，所以 id(item) 不稳定；item[2] 是 append
+        时写下的墙钟，替换时保持不变，拿它当无 key 句对的身份正合适。
+        """
+        key = item[6] if len(item) >= 7 else None
+        if key:
+            return key
+        stamp = item[2] if len(item) >= 3 else None
+        return f"@ts:{stamp}"
+
+    def _html_for_keys(self, keys, item_map, fixed, fade=True):
+        """按 key 顺序拼整段富文本；fade=False 时忽略淡入 alpha（终值）。"""
+        blocks = []
+        last = len(keys) - 1
+        for index, key in enumerate(keys):
+            _, german, chinese = item_map[key]
+            alpha = None
+            if fade and self._fade_key is not None and key == self._fade_key:
+                alpha = self._fade_alpha
+            blocks.append(self._pair_html(
+                german, chinese,
+                dim=(index < last), top_gap=(index > 0), key=key, alpha=alpha,
+            ))
+        return self._join_render_blocks(blocks, fixed)
+
+    def _fits_keys(self, keys, item_map, fixed, doc, avail_h):
+        doc.setHtml(self._html_for_keys(keys, item_map, fixed))
+        return doc.size().height() <= avail_h
+
+    def _fit_from_scratch(self, item_keys, item_map, fixed, doc, avail_h):
+        """从最新往回二分，找「装得下」的最多句对（窗口/字号/模式变了才走）。"""
+        cap = len(item_keys)
+        if not cap:
+            return []
+        shown = 1
+        lo, hi = 2, cap
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if self._fits_keys(item_keys[cap - mid:], item_map, fixed, doc, avail_h):
+                shown = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return item_keys[cap - shown:]
+
+    def _schedule_hold(self):
+        """按 _hold_deadline 起一个单发定时器；没有待释放就停掉。"""
+        timer = getattr(self, "_hold_timer", None)
+        if timer is None:
+            return
+        if self._hold_deadline is None:
+            timer.stop()
+            return
+        remaining_ms = max(1, int((self._hold_deadline - self._now()) * 1000) + 1)
+        timer.start(remaining_ms)
+
+    def _reset_appear_hold(self):
+        """语言切换时清掉旧的 minHold 截止点。
+
+        旧截止点是按旧语言句子的上屏时刻算的；留着它到点重渲染，会把刚上屏
+        的新语言句子当成「早该走了」直接放走。这里同时把当前可见句的计时
+        重新锚到此刻，切完语言重新给满一个 minHold。
+        """
+        self._hold_deadline = None
+        timer = getattr(self, "_hold_timer", None)
+        if timer is not None:
+            timer.stop()
+        now = self._now()
+        visible = getattr(self, "_visible_pair_keys", [])
+        self._shown_at = {key: now for key in visible}
+        self._render_lang_revision = int(getattr(self, "language_revision", 0))
+        self._stop_fade()
+
+    def _on_hold_release(self):
+        """minHold 到期：放开受保护的旧句，重新按「装得下」收拢。"""
+        self._hold_deadline = None
+        timer = getattr(self, "_hold_timer", None)
+        if timer is not None:
+            timer.stop()
+        self._render(_allow_evict=True)
+
+    def _stop_fade(self):
+        anim = getattr(self, "_fade_anim", None)
+        if anim is not None:
+            anim.stop()
+        self._fade_key = None
+        self._fade_alpha = 1.0
+
+    def _finish_fade(self):
+        """立即把淡入推到终值（新句抢进来/探针不等 150ms 时用）。"""
+        if self._fade_key is None:
+            return
+        self._stop_fade()
+        self._render_fade_frame()
+
+    def _on_fade_value(self, value):
+        self._fade_alpha = float(value)
+        self._render_fade_frame()
+
+    def _on_fade_finished(self):
+        self._fade_alpha = 1.0
+        self._fade_key = None
+        self._render_fade_frame()
+
+    def _render_fade_frame(self):
+        """淡入每一帧只重建 HTML + setText，不重跑可见集合二分。"""
+        keys = getattr(self, "_fade_view_keys", None)
+        if not keys or not self.window.isVisible():
+            return
+        html_str = self._html_for_keys(keys, self._fade_item_map, self._fade_fixed, fade=True)
+        # _last_html 始终保留终值版本：点词命中测试按它重建排版，没必要
+        # 去解析一个可能正淡到一半颜色的文档；屏幕上的标签才用 faded 版。
+        self.window.setText(html_str)
+
+    def _render(self, _allow_evict=False):
         """把句对历史+live行渲染成富文本。
 
         显示几条句对由真实排版高度决定：用 QTextDocument 按 QLabel 相同的
         字体/宽度排版测高，从最新往旧塞，塞到窗口装不下为止——窗口拉多大
         就填多满（瀑布式），不再靠折行估算（之前估得保守，顶部留大片空黑）。
+
+        2026-10-31 P4：可见集合「粘住」。live 行变高/草稿/译文原位替换不再
+        把已上屏句对挤出去——装不下就让 QLabel 底对齐把顶部裁掉（比消失再
+        回来更不闪）。只有新句对到来装不下、窗口/字号/模式变化、minHold
+        到期这三种情况才收缩。
         """
+        now = self._now()
         live_block = self._live_block_html()
         status = html.escape(self.status_line) if self.status_line else ""
         fixed = [b for b in (live_block, status) if b]
@@ -344,64 +494,145 @@ class LiveTextRenderMixin:
         doc = self._doc_for_render()
         avail_h = self.window.height() - 40
 
-        # 从最新往回只构造到 MAX_SENTENCE_PAIRS 条为止。sentence_pairs 内存里
-        # 留着 HISTORY_KEEP(50) 条，而上屏的最多 MAX_SENTENCE_PAIRS 条（「⚡性能」
-        # 模式只有 4 条）——以前是把 50 条全部 escape+_clip+拼接一遍再切，
-        # 其中绝大多数永远不会被显示。这段正好落在草稿流式那条 0.15 秒一次的
-        # 热路径上（on_partial → _update_draft → _render）。
-        # 结果与"全构造再取末尾 MAX 条非空"完全等价：这里同样跳过空块继续往回找
+        # 从最新往回只构造到 MAX_SENTENCE_PAIRS 条为止（理由见旧实现：
+        # sentence_pairs 内存里留 50 条，上屏上限只有 4-20 条）。
         keep = max(1, int(getattr(config, "MAX_SENTENCE_PAIRS", 20)))
-        pair_items = []
+        items = []
         for item in reversed(self.sentence_pairs):
-            g, c = item[0], item[1]
-            k = item[6] if len(item) >= 7 else None
-            block = self._pair_html(g, c, key=k)
+            german, chinese = item[0], item[1]
+            key = self._pair_key(item)
+            block = self._pair_html(german, chinese, key=key)
             if not block:
                 continue
-            pair_items.append((g, c, k))
-            if len(pair_items) >= keep:
+            items.append((key, german, chinese))
+            if len(items) >= keep:
                 break
-        pair_items.reverse()
-        cap = len(pair_items)
+        items.reverse()
+        item_map = {key: (key, german, chinese) for key, german, chinese in items}
+        item_keys = [key for key, _, _ in items]
 
-        def pair_blocks_for(count):
-            selected = pair_items[len(pair_items) - count:]
-            return [
-                self._pair_html(
-                    g, c,
-                    dim=(idx < len(selected) - 1),
-                    top_gap=(idx > 0),
-                    key=k,
-                )
-                for idx, (g, c, k) in enumerate(selected)
-            ]
+        # 布局签名只包含会改变「装得下几条」的东西；live/草稿/译文内容不算。
+        layout_sig = (
+            self.window.width(), self.window.height(),
+            int(config.FONT_SIZE), _display_mode(), keep,
+        )
+        env_changed = layout_sig != getattr(self, "_render_layout_sig", None)
+        self._render_layout_sig = layout_sig
+        lang = int(getattr(self, "language_revision", 0))
+        if lang != getattr(self, "_render_lang_revision", None):
+            self._reset_appear_hold()
 
-        def fits(count):
-            doc.setHtml(self._join_render_blocks(pair_blocks_for(count), fixed))
-            return doc.size().height() <= avail_h
+        had_fade_key = self._fade_key
+        if not items:
+            self._visible_pair_keys = []
+            self._shown_at.clear()
+            self._hold_deadline = None
+            self._schedule_hold()
+            if had_fade_key is not None:
+                self._stop_fade()
+            if not fixed:
+                return  # 什么都没有就保持现状（避免闪空白）
+            html_str = self._join_render_blocks([], fixed)
+            self._last_html = html_str
+            self.window.setText(html_str)
+            self.window.show()
+            return
 
-        # 二分找能装下的最多句对数（fits随count单调递减；每次渲染最多
-        # ~5次排版测量，之前线性试装最多20次，UI线程上省一截）。
-        # 最新一条保底：窗口再小也至少显示1条
-        shown = 0
-        if cap:
-            shown = 1
-            lo, hi = 2, cap
-            while lo <= hi:
-                mid = (lo + hi) // 2
-                if fits(mid):
-                    shown = mid
-                    lo = mid + 1
-                else:
-                    hi = mid - 1
+        held_key = (
+            self._visible_pair_keys[0]
+            if self._hold_deadline is not None and self._visible_pair_keys
+            else None
+        )
+        prev_keys = [key for key in self._visible_pair_keys if key in item_map]
+        has_new = False
+        if env_changed or not prev_keys:
+            # 环境变了（或首次渲染）允许按当前高度重新收拢；这里不保护
+            # minHold——用户把窗口缩小/换字号时本来就预期历史条数变化。
+            selected = self._fit_from_scratch(item_keys, item_map, fixed, doc, avail_h)
+            protected_key = None
+        else:
+            # 已上屏集合是一个后缀：从最旧那句开始取到最新，天然包含新到的句对。
+            start = item_keys.index(prev_keys[0])
+            selected = list(item_keys[start:])
+            prev_set = set(prev_keys)
+            has_new = any(key not in prev_set for key in selected)
+            protected_key = None
+            if _allow_evict or has_new:
+                while selected and not self._fits_keys(selected, item_map, fixed, doc, avail_h):
+                    if len(selected) <= 1:
+                        break
+                    oldest = selected[0]
+                    shown_at = self._shown_at.get(oldest)
+                    if shown_at is not None and (now - shown_at) < float(design_tokens.MOTION_MIN_HOLD_SEC):
+                        # 未满最短停留：保留它，允许顶部被裁，等定时器到期再放。
+                        protected_key = oldest
+                        break
+                    selected.pop(0)
 
-        pair_blocks = pair_blocks_for(shown) if shown else []
-        if not pair_blocks and not fixed:
-            return  # 什么都没有就保持现状（避免闪空白）
+        if not selected and item_keys:
+            selected = [item_keys[-1]]
 
-        self._last_html = self._join_render_blocks(pair_blocks, fixed)
-        self.window.setText(self._last_html)
+        now_visible = set(selected)
+        for key in list(self._shown_at):
+            if key not in now_visible:
+                del self._shown_at[key]
+        for key in selected:
+            if key not in self._shown_at:
+                self._shown_at[key] = now
+
+        self._visible_pair_keys = list(selected)
+
+        # 淡入只给「从未上过屏」的 key；选最新那个（通常也是刚到的句对）。
+        new_fade_keys = [key for key in selected if key not in self._ever_shown]
+        chosen = new_fade_keys[-1] if new_fade_keys else None
+        if chosen is not None and self._fade_key is not None and self._fade_key != chosen:
+            # 淡入进行中又来新句：旧动画直接结束到终值，再淡入新的。
+            self._stop_fade()
+        if chosen is not None:
+            self._fade_key = chosen
+            self._fade_alpha = 0.0
+        elif self._fade_key is not None and self._fade_key not in now_visible:
+            self._stop_fade()
+        self._ever_shown.update(now_visible)
+
+        html_str = self._html_for_keys(selected, item_map, fixed, fade=False)
+        self._last_html = html_str
+        if chosen is not None or self._fade_key is not None:
+            html_str = self._html_for_keys(selected, item_map, fixed, fade=True)
+        self.window.setText(html_str)
         self.window.show()
+
+        # 淡入每帧/结束时也复用这份可见集合，只换颜色 alpha。
+        self._fade_view_keys = list(selected)
+        self._fade_item_map = item_map
+        self._fade_fixed = fixed
+
+        if protected_key is not None:
+            self._hold_deadline = self._shown_at.get(protected_key, now) + float(
+                design_tokens.MOTION_MIN_HOLD_SEC)
+        elif (
+            not env_changed
+            and not _allow_evict
+            and not has_new
+            and self._hold_deadline is not None
+            and self._hold_deadline > now
+            and held_key in selected
+        ):
+            # live/草稿/译文的局部更新不触发挤出判断；若上一轮因超量而
+            # 保留了旧句，不能在这里撤销它的到期定时器。
+            pass
+        else:
+            self._hold_deadline = None
+        self._schedule_hold()
+
+        if chosen is not None:
+            anim = getattr(self, "_fade_anim", None)
+            if anim is not None:
+                anim.stop()
+                anim.setDuration(int(design_tokens.MOTION_FADE_IN_MS))
+                anim.setStartValue(0.0)
+                anim.setEndValue(1.0)
+                anim.start()
 
     def _handle_retry_click(self, key):
         """点击「未翻译 ⟳」触发重试"""
@@ -440,7 +671,9 @@ class LiveTextRenderMixin:
         # 内容区 = 标签减 padding(15px 20px) 和 2px 边框
         content_x0, content_y0 = 22, 17
         content_h = self.window.height() - 34
-        doc_y0 = content_y0 + max(0, content_h - doc.size().height())  # AlignBottom
+        # 文档高于内容区时 QLabel 仍从内容区底部对齐，顶部坐标可为负；
+        # 不能截成 0，否则命中点会向上错开被裁掉的那段高度。
+        doc_y0 = content_y0 + content_h - doc.size().height()  # AlignBottom
         doc_pt = QPointF(lp.x() - content_x0, lp.y() - doc_y0)
         hit = doc.documentLayout().hitTest(doc_pt, Qt.HitTestAccuracy.ExactHit)
         if hit < 0:

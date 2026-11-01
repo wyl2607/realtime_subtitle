@@ -15,6 +15,7 @@ enum DesignTokens {
     enum Opacity {
         static let backgroundDefault: Double = 0.72
         static let olderPair: Double = 0.6
+        static let waterfallOldest: Double = 0.35
     }
     enum TypeScale {
         static let subtitleDefault: Double = 28.0
