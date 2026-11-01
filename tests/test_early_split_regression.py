@@ -215,3 +215,83 @@ def test_negative_must_close_on_realistic_news_sentences_with_short_words():
         sents, rest = _split_sentences(full_text, final=True, lang="de")
         assert sents == [s1, s2], f"Failed splitting {full_text}: got {sents}"
         assert rest == ""
+
+
+# ======================================================================
+# 6. D1 放行时的 lookahead：remainder 为空也要让否决看到下文（PR #91 补修）
+# ======================================================================
+
+def test_held_boundary_lookahead_does_not_release_ellipsis(monkeypatch):
+    """当前块停在 'Wir brauchen …'，unstable 看到 'Geduld' 时不能提前切成一句。"""
+    monkeypatch.setattr(config, "SOURCE_LANGUAGE", "de", raising=False)
+    t = _translator([(TimedText("Wir brauchen …"), "Geduld für")])
+
+    _round(t)
+
+    assert t._tx_queue == []
+    assert t.pending_text == "Wir brauchen …"
+
+
+def test_held_boundary_lookahead_does_not_release_spaced_abbreviation(monkeypatch):
+    """当前块停在 'Das gilt z.'，unstable 看到 'B. für alle' 时不能提前切成一句。"""
+    monkeypatch.setattr(config, "SOURCE_LANGUAGE", "de", raising=False)
+    t = _translator([(TimedText("Das gilt z."), "B. für alle")])
+
+    _round(t)
+
+    assert t._tx_queue == []
+    assert t.pending_text == "Das gilt z."
+
+
+def test_held_boundary_lookahead_still_releases_normal_sentence(monkeypatch):
+    """反向守卫：真句尾 + 大写下文，D1 必须照常放行（原语义不变）。"""
+    monkeypatch.setattr(config, "SOURCE_LANGUAGE", "de", raising=False)
+    t = _translator([(TimedText("Das ist gut."), "Morgen kommt er")])
+
+    _round(t)
+
+    assert [str(s) for s in t._tx_queue] == ["Das ist gut."]
+    assert t.pending_text == ""
+
+
+def test_held_boundary_lookahead_still_releases_single_capital_letter(monkeypatch):
+    """反向守卫：'Vitamin D.' 后接大写词，不能被单字母规则误扣留。"""
+    monkeypatch.setattr(config, "SOURCE_LANGUAGE", "de", raising=False)
+    t = _translator([(TimedText("Er nimmt Vitamin D."), "Das hilft")])
+
+    _round(t)
+
+    assert [str(s) for s in t._tx_queue] == ["Er nimmt Vitamin D."]
+    assert t.pending_text == ""
+
+
+def test_split_after_name_phil():
+    """'Phil.' 是人名句尾，不能被当成学位缩写（phil.）而并句。"""
+    sents, rest = _split_sentences("Das sagt auch Phil. Er hat recht.", final=True, lang="de")
+    assert sents == ["Das sagt auch Phil.", "Er hat recht."], sents
+    assert rest == ""
+
+
+def test_split_on_ellipsis_after_modal_verb():
+    """情态动词后的省略号是句中停顿：整句成句，且第一句含省略号。"""
+    text = "Wir müssen … Geduld haben. Dann geht es."
+    sents, rest = _split_sentences(text, final=True, lang="de")
+    assert sents == ["Wir müssen … Geduld haben.", "Dann geht es."], sents
+    assert "…" in sents[0]
+    assert rest == ""
+
+
+def test_split_on_ellipsis_after_pronoun_still_splits():
+    """人称代词后的省略号是省略号停顿，不能当不完整词否决。"""
+    text = "Das war es … Morgen geht es weiter."
+    sents, rest = _split_sentences(text, final=True, lang="de")
+    assert sents == ["Das war es …", "Morgen geht es weiter."], sents
+    assert rest == ""
+
+
+def test_chinese_lookahead_is_ignored():
+    """无空格语言不吃 lookahead，行为必须与不传时完全相同。"""
+    text = "我们需要……耐心。"
+    without = _split_sentences(text, final=True, lang="zh")
+    with_lookahead = _split_sentences(text, final=True, lang="zh", lookahead="然后")
+    assert with_lookahead == without, (with_lookahead, without)
