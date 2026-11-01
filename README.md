@@ -87,7 +87,7 @@
 | 显卡 | NVIDIA 8GB+ 显存 | 无独显可 CPU（延迟更大），或改用 Windows 实时字幕识别（见下文「可选识别来源」） |
 | 内存 | 16GB | 8GB |
 | 硬盘 | 约 10GB | 约 6GB |
-| Python | 3.10–3.13 | 同左 |
+| Python | 3.11–3.13 | 同左 |
 | 其它 | [Ollama](https://ollama.com/) | 同左 |
 
 ## 安装

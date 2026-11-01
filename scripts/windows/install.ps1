@@ -7,7 +7,7 @@
 #
 # 做的事：
 #   0. 拦住非英文安装路径（会把生成的 .bat 弄坏）
-#   1. 检查 Python 3.10-3.13（本机 3.13 实测可用）
+#   1. 检查 Python 3.11-3.13（本机 3.13 实测可用）
 #   2. 检测 NVIDIA 显卡（没有就自动生成 CPU 降级配置）
 #   3. 创建 venv 并安装依赖（无 N 卡时跳过 CUDA 运行库）
 #   4. 检查/引导安装 Ollama，拉取翻译模型
@@ -70,7 +70,7 @@ Write-Host "[1/6] 检查 Python..."
 $python = $null
 $candidates = @()
 if (Get-Command py -ErrorAction SilentlyContinue) {
-    $candidates += @("py -3.13", "py -3.12", "py -3.11", "py -3.10")
+    $candidates += @("py -3.13", "py -3.12", "py -3.11")
 }
 if (Get-Command python -ErrorAction SilentlyContinue) {
     $candidates += "python"
@@ -80,7 +80,7 @@ foreach ($cand in $candidates) {
         $ver = Invoke-PythonCand -Spec $cand -ArgList @(
             "-c", "import sys; print('%d.%d' % sys.version_info[:2])"
         ) 2>$null
-        if ($ver -match "^3\.(10|11|12|13)$") {
+        if ($ver -match "^3\.(11|12|13)$") {
             $python = $cand
             Write-Host "  ✅ 找到 Python $ver ($cand)"
             break
@@ -88,7 +88,7 @@ foreach ($cand in $candidates) {
     } catch { }
 }
 if (-not $python) {
-    Write-Host "  ❌ 没有找到 Python 3.10-3.13。"
+    Write-Host "  ❌ 没有找到 Python 3.11-3.13。"
     Write-Host "     请到 https://www.python.org/downloads/ 安装 Python 3.13，"
     Write-Host "     安装时勾选 'Add python.exe to PATH'，然后重新运行本脚本。"
     Start-Process "https://www.python.org/downloads/"
