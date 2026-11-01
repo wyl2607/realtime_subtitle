@@ -466,13 +466,12 @@ class LiveTextRenderMixin:
     def _render_fade_frame(self):
         """淡入每一帧只重建 HTML + setText，不重跑可见集合二分。"""
         keys = getattr(self, "_fade_view_keys", None)
-        if not keys:
+        if not keys or not self.window.isVisible():
             return
         html_str = self._html_for_keys(keys, self._fade_item_map, self._fade_fixed, fade=True)
         # _last_html 始终保留终值版本：点词命中测试按它重建排版，没必要
         # 去解析一个可能正淡到一半颜色的文档；屏幕上的标签才用 faded 版。
         self.window.setText(html_str)
-        self.window.show()
 
     def _render(self, _allow_evict=False):
         """把句对历史+live行渲染成富文本。
@@ -539,7 +538,13 @@ class LiveTextRenderMixin:
             self.window.show()
             return
 
+        held_key = (
+            self._visible_pair_keys[0]
+            if self._hold_deadline is not None and self._visible_pair_keys
+            else None
+        )
         prev_keys = [key for key in self._visible_pair_keys if key in item_map]
+        has_new = False
         if env_changed or not prev_keys:
             # 环境变了（或首次渲染）允许按当前高度重新收拢；这里不保护
             # minHold——用户把窗口缩小/换字号时本来就预期历史条数变化。
@@ -605,6 +610,17 @@ class LiveTextRenderMixin:
         if protected_key is not None:
             self._hold_deadline = self._shown_at.get(protected_key, now) + float(
                 design_tokens.MOTION_MIN_HOLD_SEC)
+        elif (
+            not env_changed
+            and not _allow_evict
+            and not has_new
+            and self._hold_deadline is not None
+            and self._hold_deadline > now
+            and held_key in selected
+        ):
+            # live/草稿/译文的局部更新不触发挤出判断；若上一轮因超量而
+            # 保留了旧句，不能在这里撤销它的到期定时器。
+            pass
         else:
             self._hold_deadline = None
         self._schedule_hold()
@@ -655,7 +671,9 @@ class LiveTextRenderMixin:
         # 内容区 = 标签减 padding(15px 20px) 和 2px 边框
         content_x0, content_y0 = 22, 17
         content_h = self.window.height() - 34
-        doc_y0 = content_y0 + max(0, content_h - doc.size().height())  # AlignBottom
+        # 文档高于内容区时 QLabel 仍从内容区底部对齐，顶部坐标可为负；
+        # 不能截成 0，否则命中点会向上错开被裁掉的那段高度。
+        doc_y0 = content_y0 + content_h - doc.size().height()  # AlignBottom
         doc_pt = QPointF(lp.x() - content_x0, lp.y() - doc_y0)
         hit = doc.documentLayout().hitTest(doc_pt, Qt.HitTestAccuracy.ExactHit)
         if hit < 0:

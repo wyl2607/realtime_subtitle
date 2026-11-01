@@ -13,6 +13,8 @@ os.environ.setdefault("REALTIME_SUBTITLE_NO_SINGLETON", "1")
 import torch  # noqa: F401,E402  先于 PyQt6（项目惯例）
 import sys  # noqa: E402
 
+from PyQt6.QtCore import QPoint  # noqa: E402
+from PyQt6.QtGui import QTextCursor  # noqa: E402
 from PyQt6.QtWidgets import QApplication  # noqa: E402
 
 import realtime_subtitle.config as config  # noqa: E402
@@ -204,6 +206,83 @@ def test_min_hold_keeps_oldest_until_deadline_then_releases():
         assert "s0" not in win._visible_pair_keys
         assert win._hold_deadline is None
         win._hold_timer.stop()
+    finally:
+        _restore(saved)
+
+
+def test_partial_refresh_preserves_min_hold_deadline_until_release():
+    """partial 重排不能停掉已保护旧句的到期定时器。"""
+    saved = _defaults()
+    try:
+        config.FONT_SIZE = design_tokens.TYPE_SUBTITLE_DEFAULT
+        config.SHOW_BILINGUAL = True
+        config.MAX_SENTENCE_PAIRS = 20
+        win = _new_window()
+        _size_window(win, 2)
+        _reset_view(win)
+
+        clock = [0.0]
+        win._now = lambda: clock[0]
+        _add(win, *_SAMPLES[0], "s0")
+        clock[0] = 2.4
+        _add(win, *_SAMPLES[1], "s1")
+        clock[0] = 2.6
+        _add(win, *_SAMPLES[2], "s2")
+        deadline = win._hold_deadline
+        assert deadline is not None
+
+        win._update_live("partial recognition update", "tail")
+        assert win._hold_deadline == deadline
+        win._update_live("", "")
+        assert win._hold_deadline == deadline
+
+        clock[0] = deadline + 0.05
+        win._on_hold_release()
+        assert "s0" not in win._visible_pair_keys
+        assert win._hold_deadline is None
+        win._hold_timer.stop()
+    finally:
+        _restore(saved)
+
+
+def test_word_click_uses_bottom_origin_when_document_overflows():
+    """粘住三句而窗口只够两句时，仍命中可见文本的真实文档坐标。"""
+    saved = _defaults()
+    try:
+        config.FONT_SIZE = design_tokens.TYPE_SUBTITLE_DEFAULT
+        config.SHOW_BILINGUAL = True
+        config.MAX_SENTENCE_PAIRS = 20
+        win = _new_window()
+        _size_window(win, 2)
+        _reset_view(win)
+
+        clock = [0.0]
+        win._now = lambda: clock[0]
+        _add(win, *_SAMPLES[0], "s0")
+        _add(win, *_SAMPLES[1], "s1")
+        _add(win, *_SAMPLES[2], "s2")
+        doc = win._build_doc(win._last_html)
+        content_x0, content_y0 = 22, 17
+        content_h = win.window.height() - 34
+        assert doc.size().height() > content_h
+
+        target = "Mittag"
+        index = doc.toPlainText().find(target)
+        assert index >= 0
+        cursor = QTextCursor(doc)
+        cursor.setPosition(index + len(target) // 2)
+        block = cursor.block()
+        line = block.layout().lineForTextPosition(cursor.position() - block.position())
+        x = line.cursorToX(cursor.position() - block.position())[0] + 3
+        y = block.layout().position().y() + line.y() + line.height() / 2
+        doc_y0 = content_y0 + content_h - doc.size().height()
+        label_pt = QPoint(int(x) + content_x0, int(y + doc_y0))
+        assert win.window.rect().contains(label_pt)
+
+        captured = []
+        win.on_lookup = lambda word, context: captured.append((word, context))
+        win._on_label_click(label_pt + win.window.pos())
+        assert captured and captured[0][0] == target
     finally:
         _restore(saved)
 

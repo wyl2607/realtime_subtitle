@@ -32,9 +32,9 @@
 复现命令：
 
 ```bash
-QT_QPA_PLATFORM=offscreen /Users/yumei/projects/rs-mac-native/.venv/bin/python \
+QT_QPA_PLATFORM=offscreen <venv>/bin/python \
   scripts/bench/p4_appear_probe.py --pairs-fit 2
-QT_QPA_PLATFORM=offscreen /Users/yumei/projects/rs-mac-native/.venv/bin/python \
+QT_QPA_PLATFORM=offscreen <venv>/bin/python \
   scripts/bench/p4_appear_probe.py --pairs-fit 6 --json p4_6.json
 ```
 
@@ -160,7 +160,7 @@ UI 侧首字延迟：p50=0.539ms p90=1.537ms max=1.608ms (n=33)
 2. **新句淡入**
    - 改哪些函数：每句对 label 的创建/更新路径 + `_render`；时长只用
      `MOTION_FADE_IN_MS`（`design_tokens.py:36`）。
-   - 建议：新 key 首次上屏时给该 label 挂 `QGraphicsOpacityEffect` + 
+   - 建议：新 key 首次上屏时给该 label 挂 `QGraphicsOpacityEffect` +
      `QPropertyAnimation(opacity)`，从 0 到目标不透明度；旧 key 不动。不要对整个
      `self.window` 做淡入（会把历史一起闪）。
    - 风险：中。每 label 一个 effect 有额外合成开销；与现有 hover chrome 的 effect

@@ -38,8 +38,9 @@ enum OverlayMotion {
         return shown.suffix(count).map(\.key)
     }
 
-    /// 瀑布流 fit 之后的最短停留：紧挨可见段上方的那一对若上屏未满 `minHoldSec`，
-    /// 就再多留它一对，并靠顶部渐隐裁切。回看时不保最短停留。
+    /// 瀑布流 fit 之后的最短停留：紧挨完整可见段上方的那一对若上屏未满 `minHoldSec`，
+    /// 就再多留它一对，并靠顶部渐隐裁切。`clipsTop` 时 `fit.pairCount` 已含顶部
+    /// 半可见的一对，不能再加一对。回看时不保最短停留。
     /// `shown` 与 `pool` 同序（从旧到新），`fit` 是本轮按高度算出的结果。
     static func waterfallHoldCount(
         shown: [ShownLine],
@@ -48,7 +49,7 @@ enum OverlayMotion {
         reviewing: Bool,
         minHoldSec: Double = DesignTokens.Motion.minHoldSec
     ) -> WaterfallFit {
-        guard !reviewing, !shown.isEmpty else { return fit }
+        guard !reviewing, !fit.clipsTop, !shown.isEmpty else { return fit }
         let base = min(max(0, fit.pairCount), shown.count)
         guard base > 0, base < shown.count else { return fit }
         let outside = shown[shown.count - base - 1]
@@ -367,6 +368,16 @@ enum OverlayMotion {
             minHoldSec: hold
         )
         check(waterfallHolding == WaterfallFit(pairCount: 3, clipsTop: true), "瀑布流最短停留：未满多留一对并裁顶")
+        check(
+            waterfallHoldCount(
+                shown: waterfallShown,
+                now: 1,
+                fit: WaterfallFit(pairCount: 3, clipsTop: true),
+                reviewing: false,
+                minHoldSec: hold
+            ) == WaterfallFit(pairCount: 3, clipsTop: true),
+            "瀑布流最短停留：顶部半可见句已计入，不再额外加一对"
+        )
         let waterfallAged = waterfallHoldCount(
             shown: waterfallShown,
             now: hold,

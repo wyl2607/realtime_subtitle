@@ -28,7 +28,7 @@ win.on_lookup = lambda word, ctx: captured.append((word, ctx))
 doc = win._build_doc(win._last_html)
 content_x0, content_y0 = 22, 17
 content_h = win.window.height() - 34
-doc_y0 = content_y0 + max(0, content_h - doc.size().height())
+doc_y0 = content_y0 + content_h - doc.size().height()
 
 failed = 0
 for target in ("Bundestag", "entschieden", "morgen"):
