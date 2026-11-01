@@ -44,7 +44,8 @@ REPO_IOS_TOKENS = ROOT / "ios" / "Shared" / "DesignTokens.swift"
 
 def _display(path: Path, root: Path) -> str:
     try:
-        return str(path.relative_to(root))
+        # 统一成 / 分隔：Windows 上也输出同一种路径，日志和测试断言不用分平台。
+        return path.relative_to(root).as_posix()
     except ValueError:
         return str(path)
 
