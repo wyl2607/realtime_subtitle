@@ -317,6 +317,14 @@ struct AutoFallback {
         return reconcileTier()
     }
 
+    /// 原样应用路由事件（保留 type，如 quota_reset_confirmed）。
+    /// 由 QuotaLedger.routeEvent() 产生，SubtitleEngine 在 stateQueue 内调用。
+    mutating func applyRouteEvent(_ event: RouteEvent) -> AutoFallbackDecision? {
+        route.apply(event)
+        noteCooldownDeadline()
+        return reconcileTier()
+    }
+
     /// 节点配没配对。配对了才可能选节点档。
     mutating func setNodeEnabled(_ enabled: Bool) {
         route.nodeEnabled = enabled

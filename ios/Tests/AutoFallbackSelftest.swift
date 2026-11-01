@@ -321,4 +321,34 @@ func runAutoFallbackSelftest(_ check: @escaping (Bool, String) -> Void) {
         let third = fallback.handle(.cloudSegmentFailed)
         check(third.action == .stopCloudAndSwitchToNode, "第三次失败应退到节点（实际 \(third.action)）")
     }
+
+    // G4: applyRouteEvent 保留 event type（quota_reset_confirmed），
+    // 且只有在 cooldownQuota 时才消费恢复记录。
+    do {
+        var fallback = AutoFallback(
+            nodeName: "mini2",
+            localAvailable: true,
+            cloud: CloudAvailability(hasKey: true, enabled: true, translationAvailable: true, keyRevision: 1)
+        )
+        _ = fallback.startDecision()
+        _ = fallback.handle(.nodeReady)
+        // 先用 quota_update 打入配额冷却
+        let hotEvent = RouteEvent(type: "quota_update", status: nil, retryAfter: nil, usagePercent: 95)
+        let hotDecision = fallback.applyRouteEvent(hotEvent)
+        check(hotDecision != nil, "G4: quota_update ≥90% 应进入配额冷却")
+        check(fallback.cloudState == .cooldownQuota, "G4: 状态机应进入 cooldownQuota")
+
+        // 在 cooldownQuota 时，applyRouteEvent(quota_reset_confirmed) 应放行云端
+        let resetEvent = RouteEvent(type: "quota_reset_confirmed", status: nil, retryAfter: nil, usagePercent: 50)
+        let resetDecision = fallback.applyRouteEvent(resetEvent)
+        check(resetDecision != nil, "G4: cooldownQuota 时 quota_reset_confirmed 应产生决策")
+        check(fallback.cloudState == .available, "G4: quota_reset_confirmed <80% 应放行回云端")
+        check(resetDecision?.action == .startCloud, "G4: 放行后动作应为 startCloud")
+
+        // 不在 cooldownQuota 时，applyRouteEvent(quota_reset_confirmed) 不应改变状态
+        let resetEvent2 = RouteEvent(type: "quota_reset_confirmed", status: nil, retryAfter: nil, usagePercent: 50)
+        let resetDecision2 = fallback.applyRouteEvent(resetEvent2)
+        check(resetDecision2 == nil, "G4: 非 cooldownQuota 时 quota_reset_confirmed 不应产生决策")
+        check(fallback.cloudState == .available, "G4: 非冷却时状态不应改变")
+    }
 }
