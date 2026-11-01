@@ -41,6 +41,12 @@ jobs:
       - name: ruff check
         # --output-format github 让告警直接标在 PR 的对应行上
         run: ruff check --output-format github .
+      # 也在这里跑一次跨端一致性（iOS / rslite / Python 三份令牌副本）：
+      # ios job 里那条是在 macOS 构建之后，构建一挂后面的步骤就被跳过，令牌漂移
+      # 会被掩盖成"反正 iOS 本来就红"。这一条只要 checkout 就能跑，不依赖构建。
+      # Android 部分只能本地跑（私有仓库，CI 拿不到），这里不带 --android。
+      - name: Cross-platform parity (repo side)
+        run: python3 scripts/design/check_parity.py
 
   # requirements.txt 必须在**所有声明支持的 Python** 上解得出来。
   #
