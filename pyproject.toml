@@ -39,7 +39,7 @@ addopts = [
 # 全是风格分歧（try-except-pass 是这里的有意设计，manual-from-import 26 处也是），
 # 那种噪音的唯一效果是训练人忽略 CI。
 [tool.ruff]
-target-version = "py310"
+target-version = "py311"
 line-length = 120
 
 [tool.ruff.lint]
