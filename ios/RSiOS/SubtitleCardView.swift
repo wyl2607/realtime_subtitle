@@ -18,6 +18,8 @@ struct SubtitleCardView: View {
     let lines: [RecentLine]
     let style: SubtitleStyle
     let status: StatusSummary?
+    /// 未定稿的实时草稿原文：显示在最新句对下面，不翻译、不进存档。
+    var draft: String = ""
     var maxPairs: Int = 4
 
     private var shownLines: [RecentLine] {
@@ -55,6 +57,16 @@ struct SubtitleCardView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
                 self.pairs
+            }
+
+            if !self.draft.isEmpty {
+                Text(self.draft)
+                    .font(.system(
+                        size: self.style.fontSize * DesignTokens.TypeScale.sourceScale,
+                        weight: .regular
+                    ))
+                    .foregroundColor(Color(styleHex: DesignTokens.Color.subtitleDraft))
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         .padding(.vertical, DesignTokens.Space.windowPadV)

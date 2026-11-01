@@ -10,6 +10,8 @@ public enum SharedKeychain {
         public static let extStatus = "ext_status"
         public static let nodeConfig = "node_config"
         public static let latestLines = "latest_lines"
+        /// 未定稿的实时草稿原文：只给主界面/画中画显示，不进字幕存档。
+        public static let latestDraft = "latest_draft"
         public static let engineMode = "engine_mode"
         /// Groq API key。只进 Keychain：UserDefaults 会随备份/共享出去，日志和 URL 更不能带。
         public static let groqKey = "groq_key"
@@ -108,6 +110,15 @@ public enum SharedKeychain {
 
     public static func readLatestLines() -> String? {
         read(account: Account.latestLines)
+    }
+
+    @discardableResult
+    public static func writeLatestDraft(_ string: String) -> Bool {
+        write(string, account: Account.latestDraft)
+    }
+
+    public static func readLatestDraft() -> String? {
+        read(account: Account.latestDraft)
     }
 
     @discardableResult

@@ -46,6 +46,10 @@ final class SubtitleEngine {
     private var translationsCount: Int = 0
     private var preReadyDropped: UInt64 = 0
     private var lastStatusCode: String = ""
+    /// 草稿写 Keychain 的节流状态：同一文本不重复写，非空最多每 0.25 秒一次。
+    /// 只在 stateQueue 上读写。
+    private var lastDraftText: String = ""
+    private var lastDraftWriteTime: CFAbsoluteTime = 0
     private var fatalErrorOccurred = false
     private var fatalErrorReason: String = ""
 
@@ -130,6 +134,8 @@ final class SubtitleEngine {
 
     func start() {
         let generation = stateQueue.sync { runGate.begin() }
+        // 新一轮广播从干净的草稿开始：上一轮若崩溃退出，Keychain 里可能还留着旧文本。
+        clearDraft()
         logger.info("Subtitle engine started source=\(self.source)")
         engineMode = SharedKeychain.readEngineMode()
         // 真机状态行必须直接暴露本轮实际读到的档位，才能区分保存失败与路由问题。
@@ -221,6 +227,9 @@ final class SubtitleEngine {
         if engineMode == "auto" {
             stopLocalEngine()
             stopCloudTier()
+        } else {
+            // 显式节点档不会启动本机引擎；上一轮本机留下的草稿仍要擦掉。
+            clearDraft()
         }
         let translator = stateQueue.sync { () -> AnyObject? in
             let translator = cloudTranslator
@@ -401,6 +410,41 @@ final class SubtitleEngine {
         if #available(iOS 26.0, *) {
             (engine as? LocalEngine)?.stop()
         }
+        // 停止 / 换引擎 / 切到别的档位：草稿没有定稿的机会了，必须擦掉，
+        // 否则主界面和画中画会一直挂着最后一段未定稿文本。
+        clearDraft()
+    }
+
+    /// 草稿按会话与广播状态过滤，写 Keychain 前同样节流。
+    private func handleLocalDraft(_ text: String, session: String) {
+        let accepted = stateQueue.sync { () -> Bool in
+            guard broadcastActive, localEngine != nil, localSessionCode == session else { return false }
+            if text == lastDraftText { return false }
+            let now = CFAbsoluteTimeGetCurrent()
+            // 空串是清屏信号，永远放行；非空草稿最多 4 次/秒。
+            if !text.isEmpty, now - lastDraftWriteTime < 0.25 { return false }
+            lastDraftText = text
+            lastDraftWriteTime = now
+            return true
+        }
+        guard accepted else { return }
+        publishDraft(text)
+    }
+
+    private func publishDraft(_ text: String) {
+        if !SharedKeychain.writeLatestDraft(text) {
+            logger.error("Failed to write latest_draft to keychain")
+        }
+        postLinesNotification()
+    }
+
+    /// 清掉共享 Keychain 里的草稿原文（不碰定稿句对）。
+    private func clearDraft() {
+        stateQueue.sync {
+            lastDraftText = ""
+            lastDraftWriteTime = 0
+        }
+        publishDraft("")
     }
 
     /// 新会话代号：随机十六进制，不含制表符（它会被写进存档文件的行尾）。
@@ -834,6 +878,9 @@ final class SubtitleEngine {
             onFinal: { [weak self] id, text, range in
                 self?.handleLocalFinal(id: id, text: text, range: range, session: sessionCode)
             },
+            onDraft: { [weak self] text in
+                self?.handleLocalDraft(text, session: sessionCode)
+            },
             onTranslation: { [weak self] id, text in
                 self?.handleLocalTranslation(id: id, text: text, session: sessionCode)
             },
@@ -874,6 +921,8 @@ final class SubtitleEngine {
         if #available(iOS 26.0, *) {
             (transition.1 as? LocalEngine)?.stop()
         }
+        // 换引擎就是换会话：旧会话的最后一段草稿不能留在 Keychain 里。
+        clearDraft()
         Task {
             await engine.start()
         }

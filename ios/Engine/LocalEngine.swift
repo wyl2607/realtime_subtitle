@@ -58,6 +58,10 @@ final class LocalEngine {
     /// yield 都在锁外，所以音频线程最多等几十条指令。
     private let stateLock = NSLock()
     private var nextID = 1
+    /// 草稿节流的最后状态：只由 resultTask 里那个串行结果循环读写，
+    /// 和 nextID 一样不需要锁。
+    private var lastDraftText = ""
+    private var lastDraftEmitTime: CFAbsoluteTime = 0
     private var isRunning = false
     /// stop() 之后一律不再回调。
     ///
@@ -68,6 +72,9 @@ final class LocalEngine {
 
     private let mode: Mode
     private let onFinal: (Int, String, LocalSentenceRange?) -> Void
+    /// 未定稿文本的实时回调：同一文本不重复发，最多每 0.25 秒一次；
+    /// 收到定稿后发一次空串清掉。
+    private let onDraft: (String) -> Void
     private let onTranslation: (Int, String) -> Void
     /// 这一句已经收尾：译文落地了，或者翻译失败了。
     /// 切回节点必须等这一刻——早一步切走会把还在路上的译文取消掉，
@@ -90,12 +97,14 @@ final class LocalEngine {
     init(
         mode: Mode = .recognizeAndTranslate,
         onFinal: @escaping (Int, String, LocalSentenceRange?) -> Void,
+        onDraft: @escaping (String) -> Void = { _ in },
         onTranslation: @escaping (Int, String) -> Void,
         onSentenceSettled: @escaping (Int) -> Void,
         onStatus: @escaping (String) -> Void
     ) {
         self.mode = mode
         self.onFinal = onFinal
+        self.onDraft = onDraft
         self.onTranslation = onTranslation
         self.onSentenceSettled = onSentenceSettled
         self.onStatus = onStatus
@@ -128,6 +137,22 @@ final class LocalEngine {
         let allowed = stateLock.withLock { !stopped }
         guard allowed else { return }
         onFinal(id, text, range)
+    }
+
+    /// 草稿节流：同一文本不重复发；非空草稿最多每 0.25 秒一次。
+    /// 定稿后的空串必须强制发，否则最后一段草稿会永远留在屏幕上。
+    private func emitDraft(_ draft: String, force: Bool = false) {
+        let now = CFAbsoluteTimeGetCurrent()
+        if !force {
+            guard draft != lastDraftText else { return }
+            guard now - lastDraftEmitTime >= 0.25 else { return }
+        }
+        // 锁内只读闸门，回调在锁外调。
+        let allowed = stateLock.withLock { !stopped }
+        guard allowed else { return }
+        lastDraftText = draft
+        lastDraftEmitTime = now
+        onDraft(draft)
     }
 
     private func emitTranslation(_ id: Int, _ text: String) {
@@ -483,33 +508,67 @@ final class LocalEngine {
         guard !isStopped() else { return }
         let raw = String(result.text.characters)
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, result.isFinal else { return }
 
-        // nextID 只在本方法里读写，而本方法只由 resultTask 里那个单个串行的
-        // for-await 结果循环调用，同一时刻只有一个执行者，所以不需要锁。
-        let id = nextID
-        nextID += 1
+        if !result.isFinal {
+            // volatile（草稿）结果：实时上屏，等系统定稿再换成正式句对。
+            guard !text.isEmpty else { return }
+            emitDraft(text)
+            return
+        }
 
-        guard !isStopped() else { return }
-        emitFinal(id, text, Self.rangeSeconds(result.range))
+        // 定稿：先把草稿清掉，再按句子各自上屏。
+        emitDraft("", force: true)
+        guard !text.isEmpty else { return }
 
-        // 翻译挂到串行尾链上，不在结果循环里等：否则翻译还在准备（或上一句还在翻）时，
-        // 下一句的原文也得排队等着才能上屏。串行是为了译文和收尾仍按句子顺序到达。
-        let previous = stateLock.withLock { () -> (Task<Void, Never>?, Bool) in
-            (translationTail, stopped)
+        // SpeechTranscriber 一次定稿常常是「好几句话拼在一条」，按句子切开，
+        // 每句各分配一个 id，翻译尾链仍然串行、按句顺序到达。
+        let sentences = SentenceSplitter.split(text)
+        guard !sentences.isEmpty else { return }
+
+        let ranges: [LocalSentenceRange?]
+        if let whole = Self.rangeSeconds(result.range) {
+            let pieces = SentenceSplitter.splitRange(
+                start: whole.start,
+                end: whole.end,
+                characterCounts: sentences.map(\.count)
+            )
+            ranges = pieces.map { LocalSentenceRange(start: $0.start, end: $0.end) }
+        } else {
+            ranges = Array(repeating: nil, count: sentences.count)
         }
-        guard !previous.1 else { return }
-        let newTail = Task { [weak self] in
-            await previous.0?.value
-            await self?.translateAndSettle(id: id, text: text)
+
+        for (index, sentence) in sentences.enumerated() {
+            guard !isStopped() else { return }
+
+            // nextID 只在本方法里读写，而本方法只由 resultTask 里那个单个串行的
+            // for-await 结果循环调用，同一时刻只有一个执行者，所以不需要锁。
+            let id = nextID
+            nextID += 1
+
+            let range = index < ranges.count ? ranges[index] : nil
+            emitFinal(id, sentence, range)
+
+            // 翻译挂到串行尾链上，不在结果循环里等：否则翻译还在准备（或上一句还在翻）时，
+            // 下一句的原文也得排队等着才能上屏。串行是为了译文和收尾仍按句子顺序到达。
+            let previous = stateLock.withLock { () -> (Task<Void, Never>?, Bool) in
+                (translationTail, stopped)
+            }
+            guard !previous.1 else { return }
+            let newTail = Task { [weak self] in
+                await previous.0?.value
+                await self?.translateAndSettle(id: id, text: sentence)
+            }
+            // 和 stop() 在同一把锁里核对 stopped：stop() 刚清完就不要再挂尾链。
+            let kept = stateLock.withLock { () -> Bool in
+                guard !stopped else { return false }
+                translationTail = newTail
+                return true
+            }
+            if !kept {
+                newTail.cancel()
+                return
+            }
         }
-        // 和 stop() 在同一把锁里核对 stopped：stop() 刚清完就不要再挂尾链。
-        let kept = stateLock.withLock { () -> Bool in
-            guard !stopped else { return false }
-            translationTail = newTail
-            return true
-        }
-        if !kept { newTail.cancel() }
     }
 
     private func translateAndSettle(id: Int, text: String) async {

@@ -99,7 +99,8 @@ struct ContentView: View {
                             SubtitleCardView(
                                 lines: linesMonitor.lines,
                                 style: subtitleStyle,
-                                status: statusSummary
+                                status: statusSummary,
+                                draft: linesMonitor.draft
                             )
 
                             // 本机引擎失败时把原始码映射成可读提示（纯逻辑，不删原状态行）。
@@ -1090,6 +1091,7 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
 
     private var cachedLines: [RecentLine] = []
     private var lastRenderedLinesJSON: String = ""
+    private var lastRenderedDraft: String = ""
     private var lastRenderedStatus: String = ""
     private var lastRenderedStyle: SubtitleStyle?
     private var lastStatusSummary: StatusSummary?
@@ -1102,14 +1104,19 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
             cachedLines = lines
             linesJSON = json
         }
+        let draft = SharedKeychain.readLatestDraft() ?? ""
 
         // 样式也要参与变化判断：用户改颜色/字号后即使句子没变也得立刻重绘。
         let style = SubtitleStyle.load(from: UserDefaults.standard.data(forKey: "subtitleStyle"))
 
-        if linesJSON == lastRenderedLinesJSON && status == lastRenderedStatus && style == lastRenderedStyle {
+        if linesJSON == lastRenderedLinesJSON
+            && draft == lastRenderedDraft
+            && status == lastRenderedStatus
+            && style == lastRenderedStyle {
             return nil
         }
         lastRenderedLinesJSON = linesJSON
+        lastRenderedDraft = draft
         lastRenderedStatus = status
         lastRenderedStyle = style
 
@@ -1166,6 +1173,20 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
                                                       attributes: dstAttrs, context: nil).height
                 dstText.draw(in: CGRect(x: 40, y: y, width: 1200, height: dstHeight), withAttributes: dstAttrs)
                 y += dstHeight + pairGap
+            }
+
+            // 未定稿草稿：只显示原文，放在最新句对下面，用草稿色区分。
+            if !draft.isEmpty {
+                let draftAttrs: [NSAttributedString.Key: Any] = [
+                    .font: UIFont.systemFont(ofSize: sourceSize * 0.95, weight: .regular),
+                    .foregroundColor: uiColor(hex: DesignTokens.Color.subtitleDraft, alpha: 0.9),
+                    .paragraphStyle: paragraphStyle
+                ]
+                let draftText = draft as NSString
+                let draftHeight = draftText.boundingRect(with: CGSize(width: 1200, height: 200),
+                                                          options: .usesLineFragmentOrigin,
+                                                          attributes: draftAttrs, context: nil).height
+                draftText.draw(in: CGRect(x: 40, y: y, width: 1200, height: draftHeight), withAttributes: draftAttrs)
             }
 
             let summaryLevel = self.lastStatusSummary?.level ?? .idle
@@ -1350,6 +1371,8 @@ final class StatusMonitor: ObservableObject {
 
 final class LinesMonitor: ObservableObject {
     @Published var lines: [RecentLine] = []
+    /// 未定稿草稿原文：与定稿句对分开，只给界面显示。
+    @Published var draft: String = ""
     @Published var darwinNotificationCount: Int = 0
 
     private var linesObserver: UnsafeRawPointer?
@@ -1403,6 +1426,12 @@ final class LinesMonitor: ObservableObject {
            let lines = try? JSONDecoder().decode([RecentLine].self, from: data) {
             DispatchQueue.main.async {
                 self.lines = lines
+            }
+        }
+        let draft = SharedKeychain.readLatestDraft() ?? ""
+        DispatchQueue.main.async {
+            if self.draft != draft {
+                self.draft = draft
             }
         }
     }
