@@ -188,6 +188,65 @@ func runCloudClientSelftest(_ check: @escaping (Bool, String) -> Void) {
         }
     }
 
+    // 200 + 合法配额头 + 非法 JSON：解析失败仍须带着配额进账本，结果和成功响应一致。
+    do {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".tmp/cloud-decode-quota-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let headers: [AnyHashable: Any] = [
+            "x_groq.id": "groq-decode",
+            "x-ratelimit-remaining-requests": "5",
+            "x-ratelimit-reset-requests": "100s",
+        ]
+        let now = Date(timeIntervalSince1970: 10_000)
+        let fingerprint = CloudClient.keyFingerprint(fakeKey)
+        let error = parseError(200, headers: headers, body: "not json", check)
+        if case .decodeFailed(let quota)? = error {
+            check(quota?.remainingRequests == 5, "decodeFailed 应保留 remaining=5")
+            check(abs((quota?.resetRequestsS ?? 0) - 100) < 1e-9, "decodeFailed 应保留 resetRequestsS=100")
+            var stamped = quota ?? CloudQuotaHeaders()
+            stamped.keyFingerprint = fingerprint
+            stamped.sentAt = 1_000
+            let decodeURL = root.appendingPathComponent("decode.json")
+            let decodeLedger = QuotaLedger(url: decodeURL, now: now)
+            _ = try? decodeLedger.recordRequest(duration: 1, at: now, requestID: "req")
+            try? decodeLedger.observeResponse(
+                remainingRequests: stamped.remainingRequests,
+                resetRequestsSeconds: stamped.resetRequestsS,
+                keyFingerprint: stamped.keyFingerprint,
+                sentAt: stamped.sentAt.map { Date(timeIntervalSince1970: $0) },
+                at: now,
+                requestID: "req"
+            )
+            check(decodeLedger.usage(at: now).dayRequests == 1_995, "decodeFailed 的 remaining 应校正每日额度下限")
+            let record = try? JSONDecoder().decode(QuotaLedgerSnapshot.self, from: Data(contentsOf: decodeURL))
+            check(record?.serverResetAt == now.timeIntervalSince1970 + 100, "decodeFailed 应建立恢复记录")
+            check(record?.serverResetKeyFp == fingerprint, "decodeFailed 恢复记录应绑定 key 指纹")
+
+            let success = try? CloudClient.parse(
+                statusCode: 200,
+                headers: headers,
+                body: Data(#"{"text":"Hallo","segments":[]}"#.utf8),
+                a0: 0
+            )
+            let successLedger = QuotaLedger(url: root.appendingPathComponent("success.json"), now: now)
+            _ = try? successLedger.recordRequest(duration: 1, at: now, requestID: "req")
+            try? successLedger.observeResponse(
+                remainingRequests: success?.remainingRequests,
+                resetRequestsSeconds: success?.resetRequestsS,
+                keyFingerprint: fingerprint,
+                sentAt: Date(timeIntervalSince1970: 1_000),
+                at: now,
+                requestID: "req"
+            )
+            check(successLedger.usage(at: now).dayRequests == decodeLedger.usage(at: now).dayRequests,
+                  "decodeFailed 与成功响应的每日额度下限应一致")
+        } else if error != nil {
+            check(false, "200 非法 JSON 应抛 decodeFailed，实际 \(String(describing: error))")
+        }
+    }
+
     do {
         let fingerprint = CloudClient.keyFingerprint(fakeKey)
         check(fingerprint == "8ab40e0a271191a4833e19e6db160047d0987086ff44df1c8d662eef0c88d586",
