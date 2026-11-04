@@ -44,6 +44,26 @@ def _rgba_color(color, alpha):
     return f"rgba({rgb[0]},{rgb[1]},{rgb[2]},{a})"
 
 
+def _remove_promoted(live, src):
+    """从 live 行里去掉刚晋升成正式句对的那段原文；找不到返回 None。
+
+    为什么要按"接缝"补空格：live 行是 ASR 逐词拼起来的，原句前后通常各带
+    一个空格。直接切掉会在中间留下 "A  C"（两个词粘不住）或 "A C" 变
+    "AC"（无空格语言反而正常）。这里只在接缝原来就有空白时补一个空格，
+    中文这类无空格语言两侧都没空白，直接拼即可。
+    """
+    if not live or not src:
+        return None
+    index = live.find(src)
+    if index < 0:
+        return None
+    left = live[:index]
+    right = live[index + len(src):]
+    if (left and left[-1].isspace()) or (right and right[0].isspace()):
+        return (left.rstrip() + " " + right.lstrip()).strip()
+    return (left + right).strip()
+
+
 def _display_mode():
     mode = str(getattr(config, "DISPLAY_MODE", "") or "").lower()
     if mode not in {"bilingual", "target", "source"}:
@@ -109,8 +129,18 @@ class LiveTextRenderMixin:
         self._render()
 
     def _on_history_event(self, event):
-        """主窗不做原位替换（P4 未做的那半）：任何 history 事件都整窗重绘，第 20 条量过它很便宜。"""
+        """主窗整窗重绘，但对「晋升」做原位替换（P4 R1）。"""
         if event.kind == "insert":
+            row = self.history.get(event.keys[0]) if event.keys else None
+            src = (row.src or "").strip() if row is not None else ""
+            if src:
+                promoted = _remove_promoted(self.live_committed, src)
+                if promoted is not None:
+                    # 这句原文本来就在屏幕上（live 行），从 live 里摘掉并记为
+                    # 已上过屏，_render 就不会再给它淡入——视觉上是原地变成
+                    # 正式句对，而不是先消失再淡出来。
+                    self.live_committed = promoted
+                    self._ever_shown.add(self._pair_key(row))
             self.live_draft = ""
             self.status_line = ""
             self._status_clear_timer.stop()
