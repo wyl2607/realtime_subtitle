@@ -89,7 +89,7 @@ Legende: ✅ stabil · 🟢 nutzbar · 🧪 experimentell · ⬜ nicht begonnen.
 | GPU | NVIDIA ≥ 8 GB VRAM | CPU möglich (höhere Latenz) oder Windows-Liveuntertitel (siehe „Optionale Erkennungsquellen“) |
 | RAM | 16 GB | 8 GB |
 | Speicher | ca. 10 GB | ca. 6 GB |
-| Python | 3.10–3.13 | gleich |
+| Python | 3.11–3.13 | gleich |
 | Sonstiges | [Ollama](https://ollama.com/) | gleich |
 
 ## Installation

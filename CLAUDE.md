@@ -28,7 +28,7 @@ Zero Data Retention（ZDR）。**支持 Windows**（音频捕获用 WASAPI Loopb
 
 | 依赖 | 干什么用 | 怎么装 | 怎么验证 |
 |---|---|---|---|
-| Python 3.10–3.13 | 运行主程序 | `winget install --id Python.Python.3.13 -e` | `py -3.13 --version` |
+| Python 3.11–3.13 | 运行主程序 | `winget install --id Python.Python.3.13 -e` | `py -3.13 --version` |
 | Git | clone 仓库 + 一键更新 | `winget install --id Git.Git -e` | `git --version` |
 | Ollama | 本地翻译模型运行时 | `winget install --id Ollama.Ollama -e` | `ollama --version` |
 | NVIDIA 驱动 | CUDA 12 运行库要求驱动较新 | GeForce 官网/GeForce Experience 更新 | `nvidia-smi` 右上角 CUDA Version **≥ 12.0** |
@@ -635,11 +635,18 @@ issue 模板都用 `Select-String` 正则读它（这样 venv 坏掉/还没建�
     理由写在 `requirements.txt` 文件头。
 
     **这件事现在有 CI 守卫**：`deps-resolve` job 拿 `pip install --dry-run
-    --python-version X --platform win_amd64` 在 3.10/3.11/3.12/3.13 上各解析
+    --python-version X --platform win_amd64` 在 3.11/3.12/3.13 上各解析
     一遍 `requirements.txt`，任一失败就红。它存在的理由是——出事的时候 CI
     是**全绿**的：另外几个 job 装的都是自己写死的 `numpy>=1.24,<3` 之类，
     从来没有任何一个 job 装过 `requirements.txt` 本身。改依赖钉法时先在本地
     跑一遍那段循环，别等 PR 变红。
+
+    **2026-11-01 起最低支持 Python 3.11**（上面 3.10 的说法是当时的矩阵）：
+    yt-dlp 2026.10.26 和 torch 2.15 都不再出 3.10 的版本，dependabot 的
+    #114/#115 在 3.10 上解析失败。支持范围要四处一起改：README 三语、
+    `install.ps1`/`bootstrap.ps1` 的候选列表和版本正则、`deps-resolve` 循环、
+    `pyproject.toml` 的 ruff `target-version`。numpy 下限现在的天花板是 2.4
+    （2.5 起要 3.12）。
 
 31. **☠️ 自动语言切换（`AUTO_DETECT_LANGUAGE`）默认关，别顺手打开。** 它能用
     （2026-08-12 用 Windows TTS 造中/德音频端到端验过：de(1.00)×3 → 切中→德，

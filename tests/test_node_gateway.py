@@ -2295,6 +2295,9 @@ def _write_secret(path: Path, text: str, mode: int = 0o600) -> Path:
     return path
 
 
+_last_bumped_mtime_ns: dict[Path, int] = {}
+
+
 def _bump_dir_mtime_ns(directory: Path) -> None:
     """把目录 mtime 显式推进到严格更大的 ns 值。
 
@@ -2302,9 +2305,15 @@ def _bump_dir_mtime_ns(directory: Path) -> None:
     连续文件操作可能读回同一个 st_mtime_ns，reload_if_dir_changed() 就会误判成
     "没变"。这里要验的是"变了就重读"，不是文件系统的时钟粒度，所以不依赖写入
     自身会不会刷新 mtime。
+
+    还必须比**上一次推进的值**大：unlink 会把目录 mtime 拉回"现在"（比上次推进的
+    "现在 + 1s" 小），而 Windows 上 Python ≤3.12 的 time.time_ns() 精度约 15.6ms，
+    两次调用落在同一格里就算出和上次一模一样的值（#115 pytest-windows 挂过）。
     """
     st = directory.stat()
-    os.utime(directory, ns=(st.st_atime_ns, max(st.st_mtime_ns, time.time_ns()) + 1_000_000_000))
+    target = max(st.st_mtime_ns, time.time_ns(), _last_bumped_mtime_ns.get(directory, 0)) + 1_000_000_000
+    _last_bumped_mtime_ns[directory] = target
+    os.utime(directory, ns=(st.st_atime_ns, target))
 
 
 TOK_DEFAULT = "d" * 32

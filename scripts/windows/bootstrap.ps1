@@ -102,12 +102,12 @@ function Install-WingetPackage {
 }
 
 # 返回本机可用的 Python 启动说明（如 "py -3.12" / "python"），没有返回 $null。
-# 只认 install.ps1 同样接受的范围：3.10 - 3.13。
+# 只认 install.ps1 同样接受的范围：3.11 - 3.13。
 # ☠️ 别用 $parts[1..($parts.Count-1)]：Count=1 时 1..0 会把自身塞回参数。
 function Get-PythonSpec {
     $candidates = @()
     if (Test-CommandExists "py") {
-        $candidates += @("py -3.12", "py -3.13", "py -3.11", "py -3.10")
+        $candidates += @("py -3.12", "py -3.13", "py -3.11")
     }
     if (Test-CommandExists "python") { $candidates += "python" }
     $code = 'import sys; print("%d.%d" % sys.version_info[:2])'
@@ -124,7 +124,7 @@ function Get-PythonSpec {
         } catch {
             $out = $null
         }
-        if ($out -match "^3\.(10|11|12|13)$") { return $cand }
+        if ($out -match "^3\.(11|12|13)$") { return $cand }
     }
     return $null
 }

@@ -12,7 +12,7 @@ permissions:
 
 # Coverage map (see issue #23):
 # - lint:          ruff（E9 + F，规则集为什么这么窄见 pyproject.toml）
-# - deps-resolve:  requirements.txt 在 3.10–3.13 上都解得出来（见第 4 节第 30 条）
+# - deps-resolve:  requirements.txt 在 3.11–3.13 上都解得出来（见第 4 节第 30 条）
 # - ubuntu:        pure pipeline helpers (no torch/PyQt/WASAPI)
 # - windows:       full pytest suite except standalone GUI harness scripts
 #   (those open real windows and sys.exit; still manual / optional)
@@ -84,14 +84,14 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           failed=0
-          for v in 3.10 3.11 3.12 3.13; do
+          for v in 3.11 3.12 3.13; do
             echo "::group::python $v"
             if pip install --dry-run --ignore-installed \
                  --python-version "$v" --only-binary=:all: \
                  --target "/tmp/resolve-$v" -r requirements.txt; then
               echo "OK   python $v"
             else
-              echo "::error::requirements.txt 在 Python $v 上解析失败（README/CLAUDE.md 声称支持 3.10-3.13）"
+              echo "::error::requirements.txt 在 Python $v 上解析失败（README/CLAUDE.md 声称支持 3.11-3.13）"
               failed=1
             fi
             echo "::endgroup::"

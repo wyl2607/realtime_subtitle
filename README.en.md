@@ -92,7 +92,7 @@ Stage legend: ✅ stable · 🟢 usable · 🧪 experimental · ⬜ not started.
 | GPU | NVIDIA 8 GB+ VRAM | CPU-only works (higher latency), or use Windows Live Captions (see "Optional recognition sources") |
 | RAM | 16 GB | 8 GB |
 | Disk | ~10 GB (deps + models) | ~6 GB |
-| Python | 3.10–3.13 | same |
+| Python | 3.11–3.13 | same |
 | Other | [Ollama](https://ollama.com/) for translation | same |
 
 ## Install
