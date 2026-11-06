@@ -131,12 +131,40 @@ func runQuotaLedgerSelftest(_ check: @escaping (Bool, String) -> Void) {
         check(replaced.usage(at: t0).usagePercent == 100, "再次损坏的账本仍应饱和")
         check((try? String(contentsOf: corruptURL, encoding: .utf8)) == "[", "已存在的 .corrupt 应被覆盖")
 
+        // 可空持久化数值不能把非有限值读成「没有字段」：那会清掉已有的用量下限/周期锚点。
+        // NaN / Infinity 是 JSON 扩展写法，1e9999 是标准 JSON 但 Double 溢出的写法；day_epoch 三种值都必须隔离整本账本。
+        for field in ["day_epoch"] {
+            for token in ["NaN", "Infinity", "1e9999"] {
+                let nonFiniteFieldURL = root.appendingPathComponent("quota-nonfinite-\(field)-\(token).json")
+                let nonFiniteFieldJSON = "{\"events\":[{\"ts\":10000,\"billed_s\":10}],\"request_corrections\":[],\"\(field)\":\(token)}"
+                try Data(nonFiniteFieldJSON.utf8).write(to: nonFiniteFieldURL)
+                let nonFiniteField = QuotaLedger(url: nonFiniteFieldURL, now: t0)
+                check(nonFiniteField.usage(at: t0).usagePercent == 100,
+                      "\(field)=\(token) 必须隔离并饱和")
+                check(FileManager.default.fileExists(atPath: nonFiniteFieldURL.appendingPathExtension("corrupt").path),
+                      "\(field)=\(token) 必须生成 .corrupt")
+            }
+        }
+
+        // 恢复记录字段的坏值只丢记录、不隔离（R7，对齐 Python test_old_or_nonfinite_reset_fields_do_not_quarantine_the_ledger）。
+        for field in ["server_reset_at", "server_reset_observed_at"] {
+            for token in ["NaN", "Infinity", "1e9999"] {
+                let badRecordURL = root.appendingPathComponent("quota-badrecord-\(field)-\(token).json")
+                let badRecordJSON = "{\"events\":[{\"ts\":10000,\"billed_s\":10}],\"request_corrections\":[],\"\(field)\":\(token)}"
+                try Data(badRecordJSON.utf8).write(to: badRecordURL)
+                let badRecord = QuotaLedger(url: badRecordURL, now: t0)
+                check(badRecord.usage(at: t0).dayRequests == 1, "\(field)=\(token) 只丢恢复记录，事件仍在")
+                check(!FileManager.default.fileExists(atPath: badRecordURL.appendingPathExtension("corrupt").path),
+                      "\(field)=\(token) 不应生成 .corrupt")
+            }
+        }
+
         let mixedURL = root.appendingPathComponent("quota-mixed.json")
-        let mixedJSON = #"{"events":[{"ts":10000,"billed_s":-4},{"ts":10000,"billed_s":NaN},{"ts":10000,"billed_s":Infinity},{"ts":10000,"billed_s":-Infinity},{"ts":10000,"billed_s":10},{"ts":10000,"billed_s":12.5}],"request_corrections":[]}"#
+        let mixedJSON = #"{"events":[{"ts":NaN,"billed_s":10},{"ts":10000,"billed_s":-4},{"ts":10000,"billed_s":NaN},{"ts":10000,"billed_s":Infinity},{"ts":10000,"billed_s":-Infinity},{"ts":10000,"billed_s":10},{"ts":10000,"billed_s":12.5}],"request_corrections":[]}"#
         try Data(mixedJSON.utf8).write(to: mixedURL)
         let mixed = QuotaLedger(url: mixedURL, now: t0)
         let mixedUsage = mixed.usage(at: t0)
-        check(mixedUsage.dayRequests == 2, "负数与 NaN 事件应被丢弃，实际 \(mixedUsage.dayRequests)")
+        check(mixedUsage.dayRequests == 2, "负数与 NaN 的 ts/billed_s 事件应被丢弃，实际 \(mixedUsage.dayRequests)")
         check(mixedUsage.dayAudioSeconds == 22.5, "非有限与负数 billed_s 不应累加，实际 \(mixedUsage.dayAudioSeconds)")
         check(!FileManager.default.fileExists(atPath: root.appendingPathComponent("quota-mixed.json.corrupt").path),
               "可过滤的坏事件不应整文件隔离")
