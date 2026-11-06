@@ -1,6 +1,11 @@
 import Darwin
 import Foundation
 
+/// 非有限 JSON 数字先替换成这个字符串：事件解码会把它当坏事件丢掉，账本级可空数值则会抛错并隔离。
+private enum QuotaLedgerNonFiniteMarker {
+    static let value = "__rs_quota_non_finite__"
+}
+
 /// 限额常量对齐 rslite 的 QuotaLedgerLimits：Groq 免费档按分钟/小时/每日三维记账。
 struct QuotaLedgerLimits: Codable, Equatable {
     var requestsPerMinute: Int = 20
@@ -64,9 +69,14 @@ struct QuotaLedgerSnapshot: Codable, Equatable {
         // 两个列表仍是必填：缺键说明文件坏了，要走隔离 + 饱和，不能读成空账本。
         events = try container.decode([QuotaLedgerEvent].self, forKey: .events)
         requestCorrections = try container.decode([QuotaRequestCorrection].self, forKey: .requestCorrections)
-        let (decodedDayEpoch, _) = Self.decodeRecoveryField(Double.self, from: container, forKey: .dayEpoch)
-        dayEpoch = decodedDayEpoch?.isFinite == true ? decodedDayEpoch : nil
-        // 恢复记录字段类型不对/非有限数只丢弃记录，不隔离整份账本（R7）。
+        // 与 Python 一致：day_epoch 类型不对或非有限就隔离整本账本，不能读成「没有锚点」。
+        let (decodedDayEpoch, badDayEpoch) = Self.decodeRecoveryField(Double.self, from: container, forKey: .dayEpoch)
+        guard !badDayEpoch, decodedDayEpoch?.isFinite ?? true else {
+            throw DecodingError.dataCorruptedError(forKey: .dayEpoch, in: container,
+                                                    debugDescription: "day_epoch must be finite")
+        }
+        dayEpoch = decodedDayEpoch
+        // 恢复记录字段类型不对/非有限数只丢弃记录，不隔离整份账本（R7，与 Python 一致）。
         let (resetAt, badReset) = Self.decodeRecoveryField(Double.self, from: container, forKey: .serverResetAt)
         let (observedAt, badObserved) = Self.decodeRecoveryField(Double.self, from: container, forKey: .serverResetObservedAt)
         let (keyFp, badKey) = Self.decodeRecoveryField(String.self, from: container, forKey: .serverResetKeyFp)
@@ -107,6 +117,7 @@ struct QuotaLedgerSnapshot: Codable, Equatable {
     }
 
     /// 区分「字段缺失 / 明确为 null」与「类型不对」：后者要把整条恢复记录丢掉（R7）。
+    /// 非有限 marker 是字符串，对 Double 字段天然落进「类型不对」，不会被读成缺失值。
     private static func decodeRecoveryField<T: Decodable>(
         _ type: T.Type,
         from container: KeyedDecodingContainer<CodingKeys>,
@@ -159,14 +170,14 @@ struct QuotaLedgerEvent: Codable, Equatable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        ts = try container.decode(Double.self, forKey: .ts)
-        // 非法数字（null / 非数字 / NaN 文本被换成 null）先记成 NaN，解码后由 pruned 丢弃。
+        // 事件的坏 ts / billed_s 只丢这一条，不隔离整本账本。
+        ts = (try? container.decode(Double.self, forKey: .ts)) ?? .nan
         if let value = try? container.decode(Double.self, forKey: .billedS) {
             billedS = value
         } else {
             billedS = .nan
         }
-        // dur_s 是可选：旧账本没有它；NaN/Infinity 被换成 null 后也按缺失处理。
+        // dur_s 是可选：旧账本没有它；非有限 marker 类型不匹配时也按缺失处理。
         durS = try? container.decodeIfPresent(Double.self, forKey: .durS)
         // 缺字段才按旧格式推断；已有字段但损坏时按未确认处理，不能低估用量。
         inServerDay = container.contains(.inServerDay)
@@ -191,6 +202,22 @@ struct QuotaRequestCorrection: Codable, Equatable {
     enum CodingKeys: String, CodingKey {
         case ts
         case usedRequests = "used_requests"
+    }
+}
+
+/// 云回调入账前的共同门禁：代次相同仍不足以证明 key 没换。
+/// 没有指纹的本地网络错误只能按代次处理；带指纹的 200/HTTP 回调必须匹配刚从 Keychain 读到的当前 key。
+enum CloudCallbackGate {
+    static func isCurrent(
+        requestGeneration: UInt64,
+        currentGeneration: UInt64,
+        requestKeyFingerprint: String?,
+        currentKeyFingerprint: String?
+    ) -> Bool {
+        guard requestGeneration == currentGeneration else { return false }
+        guard let requestKeyFingerprint else { return true }
+        guard let currentKeyFingerprint else { return false }
+        return requestKeyFingerprint == currentKeyFingerprint
     }
 }
 
@@ -644,8 +671,7 @@ final class QuotaLedger: @unchecked Sendable {
         try JSONDecoder().decode(QuotaLedgerSnapshot.self, from: normalizingNonFiniteTokens(data))
     }
 
-    /// JSON 不允许 NaN / Infinity。账本里出现这些记号时换成 null，让同文件里的其它事件还能解码；
-    /// 整个文件因此不会被判成损坏而饱和 24 小时。
+    /// JSON 不接受非有限数字。换成 marker 后，事件字段会丢掉那条事件，账本级可空数值会隔离整本账本。
     private static func normalizingNonFiniteTokens(_ data: Data) -> Data {
         let bytes = [UInt8](data)
         var out: [UInt8] = []
@@ -655,8 +681,9 @@ final class QuotaLedger: @unchecked Sendable {
             Array("+Infinity".utf8),
             Array("Infinity".utf8),
             Array("NaN".utf8),
+            Array("1e9999".utf8),
         ]
-        let nullToken = Array("null".utf8)
+        let markerToken = Array("\"\(QuotaLedgerNonFiniteMarker.value)\"".utf8)
         var inString = false
         var escaped = false
         var index = 0
@@ -686,7 +713,7 @@ final class QuotaLedger: @unchecked Sendable {
                 for token in tokens where bytes[index...].starts(with: token) {
                     let end = index + token.count
                     if end == bytes.count || isJSONBoundary(bytes[end]) {
-                        out.append(contentsOf: nullToken)
+                        out.append(contentsOf: markerToken)
                         index = end
                         replaced = true
                         break

@@ -5,6 +5,28 @@ import Foundation
 func runCloudSegmenterSelftest(_ check: @escaping (Bool, String) -> Void) {
     let sampleRate = CloudSegmenter.sampleRate
 
+    // Keychain 可能在下一次 5 秒 refresh 之前已经换 key。此时同代次的旧请求也不能进入路由或账本。
+    let oldKeyFingerprint = "old-key-fingerprint"
+    let currentKeyFingerprint = "current-key-fingerprint"
+    check(!CloudCallbackGate.isCurrent(
+        requestGeneration: 7,
+        currentGeneration: 7,
+        requestKeyFingerprint: oldKeyFingerprint,
+        currentKeyFingerprint: currentKeyFingerprint
+    ), "旧 key 的 200 回调必须在路由和记账前丢弃")
+    check(!CloudCallbackGate.isCurrent(
+        requestGeneration: 7,
+        currentGeneration: 7,
+        requestKeyFingerprint: oldKeyFingerprint,
+        currentKeyFingerprint: currentKeyFingerprint
+    ), "旧 key 的 401 回调必须在路由和记账前丢弃")
+    check(CloudCallbackGate.isCurrent(
+        requestGeneration: 7,
+        currentGeneration: 7,
+        requestKeyFingerprint: currentKeyFingerprint,
+        currentKeyFingerprint: currentKeyFingerprint
+    ), "当前 key 的回调必须继续进入后续处理")
+
     func feed(
         _ segmenter: CloudSegmenter,
         _ amplitude: Float,

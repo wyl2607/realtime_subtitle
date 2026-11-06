@@ -1,6 +1,10 @@
 import Darwin
 import Foundation
 
+/// JSON 本身不接纳非有限浮点；预处理时用它保留“这里原来是坏数字”的信息。
+/// 事件解码器把标记当作坏事件丢弃，账本的可空数值字段则会因类型不符隔离整本账本。
+private let quotaLedgerNonFiniteMarker = "__rslite_nonfinite_number__"
+
 struct QuotaLedgerLimits: Codable, Equatable {
     var requestsPerMinute: Int = 20
     var audioSecondsPerHour: Double = 7_200
@@ -61,7 +65,7 @@ struct QuotaLedgerSnapshot: Codable, Equatable {
         events = try container.decode([QuotaLedgerEvent].self, forKey: .events)
         requestCorrections = try container.decode([QuotaRequestCorrection].self, forKey: .requestCorrections)
         dayEpoch = try container.decodeIfPresent(Double.self, forKey: .dayEpoch)
-        // 恢复记录是可选扩展：任一字段损坏只丢记录，绝不能隔离整份账本。
+        // 恢复记录是可选扩展：任一字段损坏（含非有限标记）只丢记录，绝不能隔离整份账本（R7，与 Python 一致）。
         let resetAt = try? container.decodeIfPresent(Double.self, forKey: .resetAt)
         let observedAt = try? container.decodeIfPresent(Double.self, forKey: .observedAt)
         let keyFP = try? container.decodeIfPresent(String.self, forKey: .resetKeyFingerprint)
@@ -122,14 +126,19 @@ struct QuotaLedgerEvent: Codable, Equatable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        ts = try container.decode(Double.self, forKey: .ts)
-        // 非法数字（null / 非数字 / NaN 文本被换成 null）先记成 NaN，解码后丢弃。
+        // 事件里的坏数字只应丢这一条，不能让整个账本被隔离。
+        if let value = try? container.decode(Double.self, forKey: .ts) {
+            ts = value
+        } else {
+            ts = .nan
+        }
+        // 非法数字（null / 非数字 / 非有限标记）先记成 NaN，解码后丢弃。
         if let value = try? container.decode(Double.self, forKey: .billedS) {
             billedS = value
         } else {
             billedS = .nan
         }
-        // dur_s 是可选：旧账本没有它，NaN/Infinity 被换成 null 后也按缺失处理。
+        // dur_s 是可选：旧账本没有它，非有限标记也按缺失处理。
         durS = try? container.decodeIfPresent(Double.self, forKey: .durS)
         // 缺字段才按旧格式推断；已有字段损坏时按未确认处理，不能低估用量。
         inServerDay = container.contains(.inServerDay)
@@ -438,7 +447,7 @@ final class QuotaLedger: @unchecked Sendable {
     }
 
     private static func isBillable(_ event: QuotaLedgerEvent) -> Bool {
-        event.billedS.isFinite && event.billedS >= 0
+        event.ts.isFinite && event.billedS.isFinite && event.billedS >= 0
     }
 
     private static func saturatedSnapshot(now: Date, requestLimit: Int) -> QuotaLedgerSnapshot {
@@ -512,7 +521,8 @@ final class QuotaLedger: @unchecked Sendable {
         try JSONDecoder().decode(QuotaLedgerSnapshot.self, from: normalizingNonFiniteTokens(data))
     }
 
-    /// JSON 不允许 NaN / Infinity。账本里出现这些记号时，换成 null，让同文件里的其它事件还能解码。
+    /// JSON 不允许 NaN / Infinity。账本里出现非有限字面量时，换成标记字符串：
+    /// 事件解码器会丢弃该事件；可空账本数值字段则必须隔离整本账本，不能 fail-open 成 null。
     private static func normalizingNonFiniteTokens(_ data: Data) -> Data {
         let bytes = [UInt8](data)
         var out: [UInt8] = []
@@ -523,7 +533,7 @@ final class QuotaLedger: @unchecked Sendable {
             Array("Infinity".utf8),
             Array("NaN".utf8),
         ]
-        let nullToken = Array("null".utf8)
+        let markerToken = Array("\"\(quotaLedgerNonFiniteMarker)\"".utf8)
         var inString = false
         var escaped = false
         var index = 0
@@ -553,11 +563,16 @@ final class QuotaLedger: @unchecked Sendable {
                 for token in tokens where bytes[index...].starts(with: token) {
                     let end = index + token.count
                     if end == bytes.count || isJSONBoundary(bytes[end]) {
-                        out.append(contentsOf: nullToken)
+                        out.append(contentsOf: markerToken)
                         index = end
                         replaced = true
                         break
                     }
+                }
+                if !replaced, let end = nonFiniteNumberEnd(in: bytes, from: index) {
+                    out.append(contentsOf: markerToken)
+                    index = end
+                    replaced = true
                 }
             }
             if replaced { continue }
@@ -565,6 +580,21 @@ final class QuotaLedger: @unchecked Sendable {
             index += 1
         }
         return Data(out)
+    }
+
+    /// `1e9999` 可绕过关键字替换，并且在某些 Foundation 版本中会被读成 Infinity。
+    /// 仅替换能被 Double 识别、但不有限的完整 JSON 标量，其他格式错误仍交给 JSONDecoder 隔离。
+    private static func nonFiniteNumberEnd(in bytes: [UInt8], from start: Int) -> Int? {
+        guard bytes[start] == UInt8(ascii: "-") || (UInt8(ascii: "0")...UInt8(ascii: "9")).contains(bytes[start]) else {
+            return nil
+        }
+        var end = start
+        while end < bytes.count, !isJSONBoundary(bytes[end]) {
+            end += 1
+        }
+        let literal = String(decoding: bytes[start..<end], as: UTF8.self)
+        guard let value = Double(literal), !value.isFinite else { return nil }
+        return end
     }
 
     private static func isJSONBoundary(_ byte: UInt8?) -> Bool {
@@ -730,7 +760,7 @@ final class QuotaLedger: @unchecked Sendable {
             check(try String(contentsOf: corruptURL, encoding: .utf8) == "[", "已存在的 .corrupt 应被覆盖")
 
             let mixedURL = dir.appendingPathComponent("quota-mixed.json")
-            let mixedJSON = #"{"events":[{"ts":10000,"billed_s":-4},{"ts":10000,"billed_s":NaN},{"ts":10000,"billed_s":Infinity},{"ts":10000,"billed_s":-Infinity},{"ts":10000,"billed_s":10},{"ts":10000,"billed_s":12.5}],"request_corrections":[]}"#
+            let mixedJSON = #"{"events":[{"ts":10000,"billed_s":-4},{"ts":10000,"billed_s":NaN},{"ts":10000,"billed_s":Infinity},{"ts":10000,"billed_s":-Infinity},{"ts":10000,"billed_s":1e9999},{"ts":NaN,"billed_s":10},{"ts":Infinity,"billed_s":10},{"ts":1e9999,"billed_s":10},{"ts":10000,"billed_s":10},{"ts":10000,"billed_s":12.5}],"request_corrections":[]}"#
             try Data(mixedJSON.utf8).write(to: mixedURL)
             let mixed = QuotaLedger(url: mixedURL, now: t0)
             let mixedUsage = mixed.usage(at: t0)
@@ -738,6 +768,34 @@ final class QuotaLedger: @unchecked Sendable {
             check(mixedUsage.dayAudioSeconds == 22.5, "非有限与负数 billed_s 不应累加")
             check(FileManager.default.fileExists(atPath: mixedURL.path), "可过滤的坏事件不应整文件隔离")
             check(!FileManager.default.fileExists(atPath: dir.appendingPathComponent("quota-mixed.json.corrupt").path), "负数/NaN 事件不应生成 .corrupt")
+
+            // 恢复记录字段的坏值只丢记录、不隔离（R7，对齐 Python test_old_or_nonfinite_reset_fields_do_not_quarantine_the_ledger）。
+            for (field, companion) in [
+                ("reset_at", ",\"observed_at\":10000,\"key_fp\":\"fp\",\"consumed\":false"),
+                ("observed_at", ",\"reset_at\":10100,\"key_fp\":\"fp\",\"consumed\":false"),
+            ] {
+                for badValue in ["NaN", "Infinity", "1e9999"] {
+                    let badRecordURL = dir.appendingPathComponent("quota-badrecord-\(field)-\(badValue).json")
+                    let badRecordJSON = "{\"events\":[],\"request_corrections\":[],\"\(field)\":\(badValue)\(companion)}"
+                    try Data(badRecordJSON.utf8).write(to: badRecordURL)
+                    let badRecord = QuotaLedger(url: badRecordURL, now: t0)
+                    check(badRecord.usage(at: t0).usagePercent < 100, "\(field)=\(badValue) 只丢恢复记录，不应饱和")
+                    check(!FileManager.default.fileExists(atPath: badRecordURL.appendingPathExtension("corrupt").path), "\(field)=\(badValue) 不应生成 .corrupt")
+                }
+            }
+
+            // day_epoch 不是可过滤事件：三种非有限值都必须隔离，避免把周期锚点读成缺失。
+            for (field, companion) in [("day_epoch", "")] {
+                for badValue in ["NaN", "Infinity", "1e9999"] {
+                    let nonFiniteURL = dir.appendingPathComponent("quota-nonfinite-\(field)-\(badValue).json")
+                    let nonFiniteJSON = "{\"events\":[],\"request_corrections\":[],\"\(field)\":\(badValue)\(companion)}"
+                    try Data(nonFiniteJSON.utf8).write(to: nonFiniteURL)
+                    let nonFinite = QuotaLedger(url: nonFiniteURL, now: t0)
+                    check(nonFinite.usage(at: t0).usagePercent == 100, "\(field)=\(badValue) 应隔离并饱和账本")
+                    let nonFiniteCorrupt = nonFiniteURL.appendingPathExtension("corrupt")
+                    check(FileManager.default.fileExists(atPath: nonFiniteCorrupt.path), "\(field)=\(badValue) 应生成 .corrupt")
+                }
+            }
 
             // 新字段：recordRequest 应把实际音频秒按 3 位小数写进 dur_s，billed_s 仍按 max(10, duration)。
             let durURL = dir.appendingPathComponent("quota-dur.json")

@@ -330,6 +330,26 @@ def test_old_or_nonfinite_reset_fields_do_not_quarantine_the_ledger(tmp_path):
     assert not (tmp_path / "quota.json.corrupt").exists()
 
 
+@pytest.mark.parametrize("field", ["day_epoch", "server_day_used", "server_day_used_at"])
+@pytest.mark.parametrize("bad_value", ["NaN", "Infinity", "1e9999"])
+def test_nonfinite_ledger_fields_quarantine_and_saturate(tmp_path, field, bad_value):
+    """非有限值导致账本隔离（生成 .corrupt）并饱和用量。"""
+    path = tmp_path / "quota.json"
+    # 写入包含非有限值的 JSON。需用字节写入保留 NaN/Infinity 字面量。
+    payload = (
+        b'{"version":1,"events":[],"server_day_used":3,"server_day_used_at":1000,'
+        b'"' + field.encode() + b'":' + bad_value.encode() + b'}'
+    )
+    path.write_bytes(payload)
+    ledger, _state = _ledger(tmp_path, now=1000)
+    usage = ledger.usage(now=1000)
+    assert usage.day_requests == 2000
+    assert usage.usage_percent == 100.0
+    assert usage.saturated is True
+    assert _state.cloud_state == "cooldown_quota"
+    assert (tmp_path / "quota.json.corrupt").exists()
+
+
 def test_parse_reset_record_validates_time_bounds(tmp_path):
     """G1: reset_at - observed_at must be in [0, MAX_RESET_REQUESTS_S]; otherwise record is discarded."""
     path = tmp_path / "quota.json"
