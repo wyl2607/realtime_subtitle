@@ -13,6 +13,8 @@ os.environ.setdefault("REALTIME_SUBTITLE_NO_SINGLETON", "1")
 import torch  # noqa: F401,E402  先于 PyQt6（项目惯例）
 import sys  # noqa: E402
 
+import pytest  # noqa: E402
+
 from PyQt6.QtCore import QPoint  # noqa: E402
 from PyQt6.QtGui import QTextCursor  # noqa: E402
 from PyQt6.QtWidgets import QApplication  # noqa: E402
@@ -20,6 +22,7 @@ from PyQt6.QtWidgets import QApplication  # noqa: E402
 import realtime_subtitle.config as config  # noqa: E402
 import realtime_subtitle.ui.design_tokens as design_tokens  # noqa: E402
 import realtime_subtitle.ui.subtitle_window as subtitle_window  # noqa: E402
+from realtime_subtitle.ui.subtitle_render import _remove_promoted  # noqa: E402
 from realtime_subtitle.ui.subtitle_window import SubtitleWindow  # noqa: E402
 
 _APP = None
@@ -377,3 +380,103 @@ def test_language_switch_resets_hold_deadline_and_does_not_release_new_sentence(
         win._hold_timer.stop()
     finally:
         _restore(saved)
+
+
+def test_insert_promotion_removes_live_text_without_refade():
+    """R1：原文已在 live 行 → insert 原地变成正式句对，不淡入、不重复出现。"""
+    saved = _defaults()
+    try:
+        config.FONT_SIZE = design_tokens.TYPE_SUBTITLE_DEFAULT
+        config.SHOW_BILINGUAL = True
+        config.MAX_SENTENCE_PAIRS = 20
+        win = _new_window()
+        _size_window(win, 2)
+        _reset_view(win)
+
+        win.live_committed = _SAMPLES[0][0] + " " + "Rest des Satzes"
+        win.live_draft = "草稿"
+        win._render()
+
+        _add(win, *_SAMPLES[0], "s0")
+
+        assert win.live_committed == "Rest des Satzes"
+        assert win.live_draft == ""
+        assert win._fade_key is None
+        assert win._last_html.count(_SAMPLES[0][0]) == 1
+
+        before = win._last_html
+        win._update_live("Rest des Satzes", "")
+        assert win._last_html == before
+    finally:
+        _restore(saved)
+
+
+def test_insert_with_empty_live_still_fades_in():
+    """R2：原文不在 live 行（云端/节点/已清空）→ 新 key 照旧淡入。"""
+    saved = _defaults()
+    try:
+        config.FONT_SIZE = design_tokens.TYPE_SUBTITLE_DEFAULT
+        config.SHOW_BILINGUAL = True
+        config.MAX_SENTENCE_PAIRS = 20
+        win = _new_window()
+        _size_window(win, 2)
+        _reset_view(win)
+
+        assert win.live_committed == ""
+        _add(win, *_SAMPLES[0], "s0")
+        assert win._fade_key == "s0"
+        assert _pump_until(lambda: win._fade_key is None)
+    finally:
+        _restore(saved)
+
+
+def test_update_dst_in_place_keeps_keys_fade_and_height():
+    """R3/R4：同长度换译文不改变可见集合、不淡入、块高度不变。"""
+    saved = _defaults()
+    try:
+        config.FONT_SIZE = design_tokens.TYPE_SUBTITLE_DEFAULT
+        config.SHOW_BILINGUAL = True
+        config.MAX_SENTENCE_PAIRS = 20
+        win = _new_window()
+        _size_window(win, 2)
+        _reset_view(win)
+
+        _add(win, *_SAMPLES[0], "s0")
+        _add(win, *_SAMPLES[1], "s1")
+        assert _pump_until(lambda: win._fade_key is None)
+
+        keys = list(win._visible_pair_keys)
+        old = _SAMPLES[1][1]
+        new = "改" * len(old)
+        assert new != old and len(new) == len(old)
+
+        before_html = win._last_html
+        doc = win._doc_for_render()
+        doc.setHtml(before_html)
+        before_height = doc.size().height()
+
+        win.update_dst("s1", new)
+
+        doc.setHtml(win._last_html)
+        after_height = doc.size().height()
+        assert win._visible_pair_keys == keys
+        assert win._fade_key is None
+        assert abs(after_height - before_height) < 0.5
+        assert old not in win._last_html
+        assert new in win._last_html
+    finally:
+        _restore(saved)
+
+
+@pytest.mark.parametrize(
+    ("live", "src", "expected"),
+    [
+        ("Anfang. Rest des Satzes", "Anfang.", "Rest des Satzes"),
+        ("Bleibt Anfang. Mitte. Ende.", "Mitte.", "Bleibt Anfang. Ende."),
+        ("Anfang. Ende.", "Ende.", "Anfang."),
+        ("Anfang.", "Fehlt.", None),
+        ("第一句。第二句", "第一句。", "第二句"),
+    ],
+)
+def test_remove_promoted(live, src, expected):
+    assert _remove_promoted(live, src) == expected
