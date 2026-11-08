@@ -1575,3 +1575,81 @@ def test_disabled_key_change_invalidates_reset_before_poll(tmp_path, clear):
         assert bridge.routing.cloud_state == "off"
     finally:
         bridge.close()
+
+
+def test_key_change_before_refresh_drops_old_key_callbacks(tmp_path):
+    """发请求时是 key A，存成 key B 之后、任何刷新之前，A 的成功/401 回调被 _cloud_callback_current_locked 丢弃。"""
+    import hashlib
+    from realtime_subtitle.remote.cloud_client import CloudError, CloudTranscript, MappedSegment
+
+    key_a = "gsk_test_callback_drop_old_abcdef"
+    key_b = "gsk_test_callback_drop_new_abcdef"
+    fp_a = hashlib.sha256(key_a.encode()).hexdigest()[:12]
+    key_path = tmp_path / "groq.key"
+    key_path.write_text(key_a)
+
+    # 成功响应带 key A 的指纹
+    class SuccessCloud(_Cloud):
+        def transcribe(self, pcm, *, a0, language):
+            return CloudTranscript(
+                text="Hallo",
+                segments=(MappedSegment(start=a0, end=a0 + 1.0, text="Hallo"),),
+                groq_id=None,
+                audio_s=1.0,
+                duration_s=1.0,
+                status=200,
+                remaining_requests=9,
+                reset_requests_s=12.5,
+                key_fingerprint=fp_a,
+                sent_at=1000.0,
+            )
+
+    # 401 响应带 key A 的指纹
+    class ErrorCloud(_Cloud):
+        def transcribe(self, pcm, *, a0, language):
+            raise CloudError(
+                status=401, reason="unauthorized", exc_type="HTTPStatus", secret=key_a,
+                duration_s=1.0, remaining_requests=9, reset_requests_s=12.5,
+                key_fingerprint=fp_a, sent_at=1000.0,
+            )
+
+    # 先测试成功回调被丢弃
+    ledger_a = _Ledger(tmp_path / "quota.json")
+    bridge, ui, _ = _open(
+        cloud_on=True, node_on=False, key_path=key_path,
+        cloud_client_factory=lambda key_path=None: SuccessCloud(), segmenter_factory=_Segmenter,
+        ledger_factory=lambda path, routing=None: ledger_a,
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs), quota_path=tmp_path / "quota.json",
+    )
+    try:
+        # 把 key 文件换成 B，不调用 _recover_routing
+        key_path.write_text(key_b)
+        # 触发转录：请求发出时桥内部仍用 key A 的指纹，但回调到来时 _cloud_callback_current_locked 会读到新 key B
+        bridge.feed_audio(np.zeros(1600, dtype=np.float32))
+        bridge.flush()
+        # 成功回调被丢弃：不记账、不改路由、不上屏
+        assert ledger_a.notes == []  # 无记账
+        assert bridge.routing.cloud_state == "available"  # 路由未变
+        assert ui.lines == []  # 无上屏
+    finally:
+        bridge.close()
+
+    # 再测试 401 回调被丢弃
+    ledger_b = _Ledger(tmp_path / "quota2.json")
+    bridge2, ui2, _ = _open(
+        cloud_on=True, node_on=False, key_path=key_path,
+        cloud_client_factory=lambda key_path=None: ErrorCloud(), segmenter_factory=_Segmenter,
+        ledger_factory=lambda path, routing=None: ledger_b,
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs), quota_path=tmp_path / "quota2.json",
+    )
+    try:
+        # key 文件已是 B
+        bridge2.feed_audio(np.zeros(1600, dtype=np.float32))
+        bridge2.flush()
+        # 401 回调被丢弃：不标 key 无效、不记账、不改路由
+        assert ledger_b.notes == []
+        assert bridge2.routing.cloud_state == "available"
+        assert bridge2.routing.cloud_state != "disabled_invalid_key"
+        assert ui2.lines == []
+    finally:
+        bridge2.close()

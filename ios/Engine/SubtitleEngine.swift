@@ -723,23 +723,30 @@ final class SubtitleEngine {
         generation: UInt64,
         requestID: String
     ) {
-        // 先判作废：旧代次（换过 key / 关过开关）的结果不进路由状态机、不记额度、不上屏。
-        let stale = stateQueue.sync { () -> Bool in
-            let stale = HandoffRules.isStaleCloudResponse(requestGeneration: generation, currentGeneration: cloudGeneration)
-            if !stale {
-                cloudUploadBusy = false
-                // 校验与记账不能被换 key 插入；每日头只校正 24h，不校正分钟窗口。
-                try? cloudLedger?.observeResponse(
-                    remainingRequests: result.remainingRequests,
-                    resetRequestsSeconds: result.resetRequestsS,
-                    keyFingerprint: result.keyFingerprint,
-                    sentAt: result.sentAt.map { Date(timeIntervalSince1970: $0) },
-                    requestID: requestID
-                )
+        // 先判作废：代次相同也要重读 Keychain。用户换 key 到下一次 refresh 前，旧 key 的 200
+        // 仍可能回来；校验、记账和清 busy 都必须放在同一条 stateQueue 临界区里。
+        let callbackCurrent = self.stateQueue.sync { () -> Bool in
+            let currentKeyFingerprint = SharedKeychain.readGroqKey().map { CloudClient.keyFingerprint($0) }
+            guard CloudCallbackGate.isCurrent(
+                requestGeneration: generation,
+                currentGeneration: self.cloudGeneration,
+                requestKeyFingerprint: result.keyFingerprint,
+                currentKeyFingerprint: currentKeyFingerprint
+            ) else {
+                return false
             }
-            return stale
+            self.cloudUploadBusy = false
+            // 校验与记账不能被换 key 插入；每日头只校正 24h，不校正分钟窗口。
+            try? self.cloudLedger?.observeResponse(
+                remainingRequests: result.remainingRequests,
+                resetRequestsSeconds: result.resetRequestsS,
+                keyFingerprint: result.keyFingerprint,
+                sentAt: result.sentAt.map { Date(timeIntervalSince1970: $0) },
+                requestID: requestID
+            )
+            return true
         }
-        guard !stale else { return }
+        guard callbackCurrent else { return }
         let decision = handleAutoEvent(.cloudSegmentSucceeded)
         let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else {
@@ -756,33 +763,46 @@ final class SubtitleEngine {
     /// 云端这一段失败：HTTP 状态码喂给状态机（401/429/5xx 各自的规则在 Routing.swift 里），
     /// 其余按段失败处理。
     private func handleCloudFailure(_ error: CloudClientError, generation: UInt64, requestID: String) {
-        let stale = stateQueue.sync { () -> Bool in
-            let stale = HandoffRules.isStaleCloudResponse(requestGeneration: generation, currentGeneration: cloudGeneration)
-            // 旧代次的回执不能清 busy：那会放行新 key 的第二段并发上传。作废时 busy 已在推进代次处清掉。
-            if !stale {
-                cloudUploadBusy = false
-                if case .httpStatus(_, _, _, let quota) = error {
-                    try? cloudLedger?.observeResponse(
-                        remainingRequests: quota?.remainingRequests,
-                        resetRequestsSeconds: quota?.resetRequestsS,
-                        keyFingerprint: quota?.keyFingerprint,
-                        sentAt: quota?.sentAt.map { Date(timeIntervalSince1970: $0) },
-                        requestID: requestID
-                    )
-                }
-                if case .decodeFailed(let quota) = error {
-                    try? cloudLedger?.observeResponse(
-                        remainingRequests: quota?.remainingRequests,
-                        resetRequestsSeconds: quota?.resetRequestsS,
-                        keyFingerprint: quota?.keyFingerprint,
-                        sentAt: quota?.sentAt.map { Date(timeIntervalSince1970: $0) },
-                        requestID: requestID
-                    )
-                }
-            }
-            return stale
+        let callbackKeyFingerprint: String?
+        switch error {
+        case .httpStatus(_, _, _, let quota), .decodeFailed(let quota):
+            callbackKeyFingerprint = quota?.keyFingerprint
+        case .network, .invalidResponse, .cancelled:
+            callbackKeyFingerprint = nil
         }
-        guard !stale else { return }
+        let callbackCurrent = self.stateQueue.sync { () -> Bool in
+            let currentKeyFingerprint = SharedKeychain.readGroqKey().map { CloudClient.keyFingerprint($0) }
+            guard CloudCallbackGate.isCurrent(
+                requestGeneration: generation,
+                currentGeneration: self.cloudGeneration,
+                requestKeyFingerprint: callbackKeyFingerprint,
+                currentKeyFingerprint: currentKeyFingerprint
+            ) else {
+                return false
+            }
+            // 旧 key 的回执不能清 busy：那会放行新 key 的第二段并发上传。作废时 busy 已在推进代次处清掉。
+            self.cloudUploadBusy = false
+            if case .httpStatus(_, _, _, let quota) = error {
+                try? self.cloudLedger?.observeResponse(
+                    remainingRequests: quota?.remainingRequests,
+                    resetRequestsSeconds: quota?.resetRequestsS,
+                    keyFingerprint: quota?.keyFingerprint,
+                    sentAt: quota?.sentAt.map { Date(timeIntervalSince1970: $0) },
+                    requestID: requestID
+                )
+            }
+            if case .decodeFailed(let quota) = error {
+                try? self.cloudLedger?.observeResponse(
+                    remainingRequests: quota?.remainingRequests,
+                    resetRequestsSeconds: quota?.resetRequestsS,
+                    keyFingerprint: quota?.keyFingerprint,
+                    sentAt: quota?.sentAt.map { Date(timeIntervalSince1970: $0) },
+                    requestID: requestID
+                )
+            }
+            return true
+        }
+        guard callbackCurrent else { return }
         switch error {
         case .httpStatus(let status, let retryAfter, _, _):
             applyAutoDecision(handleAutoEvent(.cloudHTTPStatus(status, retryAfter: retryAfter)))
