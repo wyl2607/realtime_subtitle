@@ -234,6 +234,8 @@ final class OverlayController: NSObject {
 
     // 字幕历史（含已滚出屏幕的行）。固定行数只画末尾 style.lines 对；瀑布流最多画 displayHistoryLimit 对。
     private var store = LineStore()
+    private let archive = TranscriptArchive()
+    private var transcriptWindow: TranscriptWindow?
     private var pairViews: [Int: SubtitlePairView] = [:]
     private var appearedAt: [Int: Double] = [:]
     private var renderedKeys: Set<Int> = []
@@ -323,6 +325,10 @@ final class OverlayController: NSObject {
 
     func addFinal(id: Int, text: String, t0: Double? = nil, t1: Double? = nil) {
         store.addLocal(key: id, t0: t0, t1: t1, text: text)
+        if let line = store.lines.first(where: { $0.key == id }) {
+            archive.upsert(key: id, src: line.srcText, dst: nil)
+            reloadTranscriptWindow()
+        }
         render()
     }
 
@@ -341,6 +347,10 @@ final class OverlayController: NSObject {
         if store.lines.contains(where: { $0.key == id }) {
             store.setTranslation(key: id, text: text)
             pendingTranslation.removeValue(forKey: id)
+            if let line = store.lines.first(where: { $0.key == id }) {
+                archive.upsert(key: id, src: line.srcText, dst: line.dstText)
+                reloadTranscriptWindow()
+            }
         } else {
             pendingTranslation[id] = text
         }
@@ -457,10 +467,17 @@ final class OverlayController: NSObject {
         let shown = (provided?.isEmpty == false ? provided : nil)
             ?? inheritedSubtitleTranslation(lines: store.lines, t0: t0, t1: t1)
         let before = Set(store.lines.map(\.key))
-        store.applyNode(nodeID: nodeID, t0: t0, t1: t1, srcText: src, dstText: shown)
+        let replaced = store.applyNode(nodeID: nodeID, t0: t0, t1: t1, srcText: src, dstText: shown)
+        archive.remove(keys: replaced)
         if let created = store.lines.first(where: { !before.contains($0.key) }),
            let pending = pendingTranslation.removeValue(forKey: created.key) {
             store.setTranslation(key: created.key, text: pending)
+        }
+        if let created = store.lines.first(where: { !before.contains($0.key) }) {
+            archive.upsert(key: created.key, src: created.srcText, dst: created.dstText)
+        }
+        if !replaced.isEmpty || store.lines.contains(where: { !before.contains($0.key) }) {
+            reloadTranscriptWindow()
         }
         render()
     }
@@ -641,6 +658,9 @@ final class OverlayController: NSObject {
         statusMenu.addItem(smaller)
 
         statusMenu.addItem(.separator())
+        let transcript = NSMenuItem(title: "今天的字幕…", action: #selector(openTranscript), keyEquivalent: "")
+        transcript.target = self
+        statusMenu.addItem(transcript)
         let settings = NSMenuItem(title: "设置…", action: #selector(openSettings), keyEquivalent: ",")
         settings.keyEquivalentModifierMask = [.command]
         settings.target = self
@@ -1492,6 +1512,16 @@ final class OverlayController: NSObject {
         SettingsWindow.open { [weak self] style in
             self?.applyExternalStyle(style)
         }
+    }
+
+    @objc private func openTranscript() {
+        let transcriptWindow = transcriptWindow ?? TranscriptWindow(archive: archive)
+        self.transcriptWindow = transcriptWindow
+        transcriptWindow.show()
+    }
+
+    private func reloadTranscriptWindow() {
+        transcriptWindow?.reload()
     }
 
     /// 设置窗口改样式走这里。位置和用户拖出的尺寸以悬浮窗自己为准，不用设置页从磁盘读到的那份，
