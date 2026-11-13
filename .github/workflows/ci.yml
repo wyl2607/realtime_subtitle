@@ -10,6 +10,12 @@ on:
 permissions:
   contents: read
 
+# 同一个 PR 连续推送时取消上一次还没跑完的 CI，省 macOS/Windows runner 分钟；
+# master 上的运行不取消（history 是发布证据，不能被后一次 push 抹掉）
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # Coverage map (see issue #23):
 # - lint:          ruff（E9 + F，规则集为什么这么窄见 pyproject.toml）
 # - deps-resolve:  requirements.txt 在 3.11–3.13 上都解得出来（见第 4 节第 30 条）
@@ -31,6 +37,7 @@ jobs:
   # 小版本都可能给已有规则加新检查，浮动版本会让 CI 在没人改代码的日子变红。
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7
@@ -74,6 +81,7 @@ jobs:
   # 解析本来就是更诚实的测法。
   deps-resolve:
     runs-on: windows-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7
@@ -100,6 +108,7 @@ jobs:
 
   pipeline-helpers-ubuntu:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7
@@ -118,6 +127,7 @@ jobs:
 
   pytest-windows:
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7
