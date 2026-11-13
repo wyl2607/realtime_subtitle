@@ -66,7 +66,7 @@ $ python3 scripts/design/gen_tokens.py --check
 $ python3 scripts/design/check_parity.py
 PARITY OK
 
-$ TMPDIR=/tmp /Users/yumei/projects/rs-mac-native/.venv/bin/python -m pytest -q tests/test_design_tokens.py
+$ TMPDIR=/tmp <HOME>/projects/rs-mac-native/.venv/bin/python -m pytest -q tests/test_design_tokens.py
 ...                                                                      [100%]
 3 passed
 ```

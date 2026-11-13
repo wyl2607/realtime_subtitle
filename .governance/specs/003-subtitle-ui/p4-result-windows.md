@@ -133,12 +133,12 @@ UI 侧首字延迟：p50=0.081ms p90=1.562ms max=3.098ms (n=33)
 ```bash
 ruff check realtime_subtitle tests scripts/bench
 
-TMPDIR=/tmp /Users/yumei/projects/rs-mac-native/.venv/bin/python -m pytest -q
+TMPDIR=/tmp <HOME>/projects/rs-mac-native/.venv/bin/python -m pytest -q
 # 1491 passed, 33 skipped
 
-QT_QPA_PLATFORM=offscreen TMPDIR=/tmp /Users/yumei/projects/rs-mac-native/.venv/bin/python \
+QT_QPA_PLATFORM=offscreen TMPDIR=/tmp <HOME>/projects/rs-mac-native/.venv/bin/python \
   scripts/bench/p4_appear_probe.py --pairs-fit 2
-QT_QPA_PLATFORM=offscreen TMPDIR=/tmp /Users/yumei/projects/rs-mac-native/.venv/bin/python \
+QT_QPA_PLATFORM=offscreen TMPDIR=/tmp <HOME>/projects/rs-mac-native/.venv/bin/python \
   scripts/bench/p4_appear_probe.py --pairs-fit 6
 ```
 
