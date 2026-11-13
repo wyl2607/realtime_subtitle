@@ -83,7 +83,7 @@
 
 | | 推荐 | 最低 |
 |---|---|---|
-| 系统 | Windows 10/11 64 位 | 同左（**仅 Windows**，WASAPI） |
+| 系统 | Windows 10/11 64 位；macOS 仅 Apple Silicon（识别走 MLX，见下方 macOS 章节） | 同左；Windows 用 WASAPI 抓系统声音，macOS 抓系统声音见下方 macOS 章节 |
 | 显卡 | NVIDIA 8GB+ 显存 | 无独显可 CPU（延迟更大），或改用 Windows 实时字幕识别（见下文「可选识别来源」） |
 | 内存 | 16GB | 8GB |
 | 硬盘 | 约 10GB | 约 6GB |
