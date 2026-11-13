@@ -88,7 +88,7 @@ Stage legend: ✅ stable · 🟢 usable · 🧪 experimental · ⬜ not started.
 
 | | Recommended | Minimum |
 |---|---|---|
-| OS | Windows 10/11 64-bit | Windows 10/11 (**Windows only** — WASAPI loopback) |
+| OS | Windows 10/11 64-bit; macOS on Apple Silicon only (recognition via MLX, see the macOS section below) | Same; Windows captures system audio via WASAPI, macOS capture is described in the macOS section below |
 | GPU | NVIDIA 8 GB+ VRAM | CPU-only works (higher latency), or use Windows Live Captions (see "Optional recognition sources") |
 | RAM | 16 GB | 8 GB |
 | Disk | ~10 GB (deps + models) | ~6 GB |

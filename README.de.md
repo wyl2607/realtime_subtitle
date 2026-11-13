@@ -85,7 +85,7 @@ Legende: ✅ stabil · 🟢 nutzbar · 🧪 experimentell · ⬜ nicht begonnen.
 
 | | Empfohlen | Minimum |
 |---|---|---|
-| OS | Windows 10/11 64-Bit | Windows 10/11 (**nur Windows** — WASAPI) |
+| OS | Windows 10/11 64-Bit; macOS nur auf Apple Silicon (Erkennung über MLX, siehe macOS-Abschnitt unten) | Gleich; Windows nimmt Systemton über WASAPI auf, die macOS-Aufnahme steht im macOS-Abschnitt unten |
 | GPU | NVIDIA ≥ 8 GB VRAM | CPU möglich (höhere Latenz) oder Windows-Liveuntertitel (siehe „Optionale Erkennungsquellen“) |
 | RAM | 16 GB | 8 GB |
 | Speicher | ca. 10 GB | ca. 6 GB |
