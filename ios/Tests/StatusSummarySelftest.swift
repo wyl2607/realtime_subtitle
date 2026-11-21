@@ -31,9 +31,15 @@ enum StatusSummarySelftest {
             StatusSummaryParser.summary(forStatusLine: "finished src=broadcast") == StatusSummary(label: DesignTokens.Text.micStatusIdle, level: .idle),
             "finished → 未启动"
         )
+        // HC-I02：没配对节点 ≠ 空闲。广播已经起来了，只是没有可用的识别档，
+        // 显示成「未启动」会让用户以为广播没开。
         check(
-            StatusSummaryParser.summary(forStatusLine: "no_config src=broadcast") == StatusSummary(label: DesignTokens.Text.micStatusIdle, level: .idle),
-            "no_config → 未启动"
+            StatusSummaryParser.summary(forStatusLine: "no_config src=broadcast")
+                == StatusSummary(
+                    label: DesignTokens.Text.statusHybridPrefix + "电脑节点" + DesignTokens.Text.nodeUnavailableSuffix,
+                    level: .warning
+                ),
+            "HC-I02 no_config → warning 并说明节点不可用（不是未启动）"
         )
 
         // 三种 engine 档位。
@@ -139,6 +145,53 @@ enum StatusSummarySelftest {
         check(
             StatusSummaryParser.summary(forStatusLine: "engine=node node=mini2 last=asr_assets_missing ready=1")?.level == .normal,
             "节点档的旧本机失败码不抬等级"
+        )
+
+        // HC-I02：节点侧失败码以前被当成「不知道」直接吞掉，界面一直显示上一次的
+        // 正常状态。not_tailnet/resolve_failed 是可恢复的重连失败（warning），
+        // 带 fatal: 的才是节点放弃（error）。
+        check(
+            StatusSummaryParser.summary(forStatusLine: "last=not_tailnet src=broadcast")
+                == StatusSummary(
+                    label: DesignTokens.Text.statusHybridPrefix + "电脑节点" + DesignTokens.Text.nodeUnavailableReconnectingSuffix,
+                    level: .warning
+                ),
+            "HC-I02 last=not_tailnet → warning 并说明正在重连"
+        )
+        check(
+            StatusSummaryParser.summary(forStatusLine: "last=resolve_failed src=broadcast")
+                == StatusSummary(
+                    label: DesignTokens.Text.statusHybridPrefix + "电脑节点" + DesignTokens.Text.nodeUnavailableReconnectingSuffix,
+                    level: .warning
+                ),
+            "HC-I02 last=resolve_failed → warning 并说明正在重连"
+        )
+        check(
+            StatusSummaryParser.summary(
+                forStatusLine: "blocks=90 src=broadcast engine=node node=mini2 ready=1 last=not_tailnet drop=0 reconn=1"
+            )
+            == StatusSummary(
+                label: DesignTokens.Text.statusHybridPrefix + "mini2" + DesignTokens.Text.nodeUnavailableReconnectingSuffix,
+                level: .warning
+            ),
+            "HC-I02 完整状态行里的 not_tailnet 也显示节点名和原因"
+        )
+        check(
+            StatusSummaryParser.summary(
+                forStatusLine: "blocks=90 src=broadcast engine=node node=mini2 ready=1 last=engine_load_failed"
+                    + " drop=0 reconn=0 fatal:engine_load_failed"
+            )
+            == StatusSummary(
+                label: DesignTokens.Text.statusHybridPrefix + "mini2" + DesignTokens.Text.nodeUnavailableSuffix,
+                level: .error
+            ),
+            "HC-I02 节点 fatal → error，不能被当成正常状态"
+        )
+        // 本机短行还没有 engine= 时要按 LocalEngineStatus 抬成 error，不能吞掉。
+        check(
+            StatusSummaryParser.summary(forStatusLine: "last=local_needs_ios26 src=broadcast")
+                == StatusSummary(label: DesignTokens.Text.statusLocal, level: .error),
+            "HC-I02 本机失败短行 → 本机 error"
         )
 
         return !failed
