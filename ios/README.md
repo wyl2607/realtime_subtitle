@@ -36,8 +36,9 @@
 ### 字幕显示
 
 - 最近句对：引擎把最近 3 句写进 Keychain `latest_lines`，主 App 每 0.5 秒轮询并监听 Darwin 通知。
-- 画中画：`RSiOS/ContentView.swift` 的 `PiPManager` 把最近 2 句渲染成 1280×360 图像，经 `AVSampleBufferDisplayLayer` 送 PiP；主 App `UIBackgroundModes` 含 `audio`。
-- 今日字幕：`RSiOS/TranscriptStore.swift` 写 `Documents/transcripts/YYYY-MM-DD.txt`，每行 `HH:mm:ss\t原文\t中文\t去重键`；「今天的字幕」页面读当天文件回看。
+- 画中画：`RSiOS/PiP/PiPManager.swift` 把最近 2 句渲染成 1280×360 图像，经 `AVSampleBufferDisplayLayer` 的 `sampleBufferRenderer` 送 PiP；主 App `UIBackgroundModes` 含 `audio`。
+- 熄屏：麦克风模式靠后台音频继续识别、翻译、存档；锁屏和灵动岛用实时活动（`RSLiveActivity` 扩展，`App/LiveActivityController.swift` 每秒最多推一次最新句对）。
+- 今日字幕：`RSiOS/TranscriptStore.swift` 写 `Documents/transcripts/YYYY-MM-DD.txt`，每行 `HH:mm:ss\t原文\t中文\t去重键`；「回看」页读当天文件。
 
 ## 生成 Xcode 工程
 
@@ -105,12 +106,22 @@ xcodebuild -project RSiOS.xcodeproj -scheme RSiOS -sdk iphoneos -configuration D
 
 | 文件 | 职责 |
 |---|---|
-| `ContentView.swift` | 主界面：广播选择器、麦克风开始/停止、节点配对、引擎档位、准备本机资源、Groq key/开关、PiP、扩展状态、最近句对、今日字幕入口；以及 `PiPManager` |
+| `RSiOSApp.swift` | App 入口：建一份 `AppModel` 放进环境 |
+| `App/AppModel.swift` | 四个页面共享的 `@Observable` 状态：引擎档位、节点配对、云端 key、状态词、存档刷新、锁屏实时活动 |
+| `App/AssetPreparer.swift` | 本机识别/翻译资源检查与安装；打开 App 时缺资源自动准备 |
+| `App/LiveActivityController.swift` | 锁屏/灵动岛实时活动：采集开始时开、每秒最多更新一次、采集结束时关 |
+| `App/AppStateMonitor.swift` | 前后台状态 |
+| `Pages/RootView.swift` | 四个标签页（字幕 / 回看 / 设置 / 诊断）；运行态监听只在这里做一次 |
+| `Pages/LivePage.swift` | 字幕页：资源缺失横幅、字幕卡片、屏幕广播、麦克风、画中画 |
+| `Pages/HistoryPage.swift` | 回看页：当天存档（搜索、导出） |
+| `Pages/SettingsPage.swift` | 设置：字幕样式 / 识别与语言 / 算力节点 |
+| `Pages/DiagnosticsPage.swift` | 诊断：本机资源、前后台、扩展状态行、原始句对、跨进程通知计数 |
+| `PiP/PiPManager.swift` | 画中画渲染与控制 |
+| `Capture/BroadcastPickerView.swift` | 系统屏幕广播按钮 |
 | `LiveFeed.swift` | 主 App 唯一的运行态轮询源：一个定时器读一次扩展状态 / 最近句对 / 草稿，内容变化才发布（`StatusMonitor`、`LinesMonitor` 已并入） |
 | `MicCapture.swift` | 麦克风采集：权限申请、音频会话（开始 `playAndRecord` / 停止还原 `playback`）、中断与路由变化处理，buffer 投给共享引擎 |
 | `TranscriptStore.swift` | 当天字幕存档，按「会话代号 + 句子 id」去重，译文后到原地更新；写盘异步合并（约 1 秒一次），进后台 flush |
-| `TranscriptView.swift` | 「今天的字幕」只读页面 |
-| `RSiOSApp.swift` | App 入口 |
+| `TranscriptView.swift` | 回看页内容（当天存档，只读） |
 | `Assets.xcassets/` | App 图标资源 |
 | `Info.plist` | 主 App 声明：麦克风/语音识别用途说明、`rsnode` URL scheme、`UIBackgroundModes: audio`、ATS |
 | `RSiOS.entitlements` | 共享 Keychain access group |
@@ -268,10 +279,9 @@ python3 scripts/design/check_parity.py
 
 以 `ios/project.yml` 为准：
 
-- 部署目标 iOS 17.0（`IPHONEOS_DEPLOYMENT_TARGET` / `deploymentTarget.iOS`）
-- Swift 5.0（`SWIFT_VERSION` / `swiftVersion`）
-- `SWIFT_STRICT_CONCURRENCY: minimal`
+- 部署目标 iOS 26.0（`IPHONEOS_DEPLOYMENT_TARGET` / `deploymentTarget.iOS`）
+- Swift 6.0 语言模式（`SWIFT_VERSION` / `swiftVersion`），不降级并发检查
 - XcodeGen 最低 2.40.0，`xcodeVersion: 27.0`
-- Bundle ID：主 App `com.yilinwang.realtimesubtitle`，扩展 `com.yilinwang.realtimesubtitle.broadcast`
+- Bundle ID：主 App `com.yilinwang.realtimesubtitle`，广播扩展 `com.yilinwang.realtimesubtitle.broadcast`，锁屏实时活动 `com.yilinwang.realtimesubtitle.liveactivity`
 
-本机识别与云端档在运行时用 `#available(iOS 26.0, *)` 判断；iOS 17–25 仍可用广播/麦克风 + 电脑节点。
+只支持 iOS 26/27（部署目标 26.0）。iOS 27 才有的 API 用 `#available(iOS 27, *)`，不再为更老的系统写兼容分支（`tests/test_ios_redesign_constraints.py` 盯着）。

@@ -27,8 +27,15 @@ struct RootView: View {
         .translationTask(model.assets.translationConfig, action: AssetPreparer.translationAction(for: model.assets))
         .onAppear { model.bootstrap() }
         .onOpenURL { model.handleOpenURL($0) }
-        .onChange(of: model.feed.lines) { model.ingestFeedLines() }
-        .onChange(of: model.feed.status) { _, line in model.statusChanged(line) }
+        .onChange(of: model.feed.lines) {
+            model.ingestFeedLines()
+            model.refreshLiveActivity()
+        }
+        .onChange(of: model.feed.status) { _, line in
+            model.statusChanged(line)
+            model.refreshLiveActivity()
+        }
+        .onChange(of: model.mic.isRunning) { model.refreshLiveActivity() }
         .onChange(of: model.feed.lastStatusUpdate) { _, updatedAt in model.extensionStatusUpdated(updatedAt) }
         .onChange(of: model.appState.isInBackground) { _, inBackground in model.backgroundChanged(inBackground) }
     }

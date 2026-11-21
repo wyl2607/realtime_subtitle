@@ -29,6 +29,7 @@ final class AppModel {
     let mic = MicCapture()
     let appState = AppStateMonitor.shared
     let assets = AssetPreparer()
+    @ObservationIgnored private let liveActivity = LiveActivityController()
 
     var selectedTab: AppTab = .live
     var settingsPath: [SettingsRoute] = []
@@ -82,6 +83,28 @@ final class AppModel {
 
     func extensionStatusUpdated(_ updatedAt: Date?) {
         mic.reconcileBroadcast(extensionStatus: feed.status, extensionStatusUpdatedAt: updatedAt)
+    }
+
+    /// 广播在跑：扩展最近一次写状态还在新鲜窗口内，且不是结束状态。
+    private var broadcastActive: Bool {
+        guard let updatedAt = feed.lastStatusUpdate,
+              Date().timeIntervalSince(updatedAt) < CaptureArbiter.broadcastFreshness else { return false }
+        return !feed.status.hasPrefix("finished")
+    }
+
+    /// 锁屏实时活动跟着采集状态和最新一句走。熄屏后画中画看不见，这是唯一的字幕出口。
+    func refreshLiveActivity() {
+        let latest = feed.lines.last
+        let state = SubtitleActivityAttributes.ContentState(
+            source: latest?.src ?? "",
+            translation: latest?.dst ?? "",
+            status: statusSummary?.label ?? DesignTokens.Text.micStatusIdle
+        )
+        liveActivity.sync(
+            capturing: mic.isRunning || broadcastActive,
+            sourceName: mic.isRunning ? DesignTokens.Text.micSubtitleTitle : "屏幕广播",
+            state: state
+        )
     }
 
     func startMic() {

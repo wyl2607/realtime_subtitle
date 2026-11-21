@@ -14,6 +14,7 @@ options:
   groups:
     - RSiOS
     - RSBroadcast
+    - RSLiveActivity
     - Engine
 settings:
   base:
@@ -58,6 +59,8 @@ targets:
     dependencies:
       - target: RSBroadcast
         embed: true
+      - target: RSLiveActivity
+        embed: true
     scheme:
       testTargets: []
   RSBroadcast:
@@ -78,6 +81,20 @@ targets:
         NSEXTENSION_PRINCIPAL_CLASS: $(PRODUCT_MODULE_NAME).SampleHandler
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks @executable_path/../Frameworks"
         ENABLE_BITCODE: "NO"
+        TARGETED_DEVICE_FAMILY: "1"
+    scheme:
+      testTargets: []
+  RSLiveActivity:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: RSLiveActivity
+      - path: Shared/SubtitleActivityAttributes.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.yilinwang.realtimesubtitle.liveactivity
+        INFOPLIST_FILE: RSLiveActivity/Info.plist
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks"
         TARGETED_DEVICE_FAMILY: "1"
     scheme:
       testTargets: []
