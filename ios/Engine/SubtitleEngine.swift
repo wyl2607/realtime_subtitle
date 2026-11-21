@@ -182,15 +182,7 @@ final class SubtitleEngine {
                 fatalErrorOccurred = false
                 fatalErrorReason = ""
             }
-            if #available(iOS 26.0, *) {
-                startLocalEngine()
-            } else {
-                writeStatus("last=local_needs_ios26")
-                let fatal = stateQueue.sync { markFatalError(code: "local_needs_ios26") }
-                if let fatal {
-                    onFatalError?(fatal)
-                }
-            }
+            startLocalEngine()
             return
         }
 
@@ -231,7 +223,6 @@ final class SubtitleEngine {
 
     func finish() {
         logger.info("Subtitle engine finished source=\(self.source)")
-        
         if engineMode == "local" {
             stateQueue.sync {
                 broadcastActive = false
@@ -269,19 +260,12 @@ final class SubtitleEngine {
             cloudTranslationAvailable = false
             return translator
         }
-        if #available(iOS 26.0, *) {
-            (translator as? LocalEngine)?.stop()
-        }
+        (translator as? LocalEngine)?.stop()
         converter = nil
         writeStatus("finished")
     }
 
     // MARK: - 自动模式（C1/C2）：决策全在 AutoFallback，这里只做接线
-
-    private var autoLocalEngineAvailable: Bool {
-        if #available(iOS 26.0, *) { return true }
-        return false
-    }
 
     private func startAutoMode(generation: Int) {
         converter = PCMConverter()
@@ -290,7 +274,7 @@ final class SubtitleEngine {
         // 准备好了再 updateCloud 让路由状态机重新选档。
         autoFallback = AutoFallback(
             nodeName: "电脑节点",
-            localAvailable: autoLocalEngineAvailable,
+            localAvailable: true,
             cloud: readCloudAvailability()
         )
         stateQueue.sync {
@@ -365,9 +349,7 @@ final class SubtitleEngine {
         case .keep:
             break
         case .startLocal:
-            if #available(iOS 26.0, *) {
-                startLocalEngine()
-            }
+            startLocalEngine()
         case .stopLocalAndSwitchToNode:
             stopLocalEngine()
             stateQueue.sync {
@@ -391,9 +373,7 @@ final class SubtitleEngine {
             }
         case .stopCloudAndStartLocal:
             stopCloudTier()
-            if #available(iOS 26.0, *) {
-                startLocalEngine()
-            }
+            startLocalEngine()
         case .stopCloud:
             // 没有档位能接手：只把云端停掉，节点重连成功后由 nodeReady 接管。
             stopCloudTier()
@@ -438,9 +418,7 @@ final class SubtitleEngine {
             localSentenceActive = false
             return engine
         }
-        if #available(iOS 26.0, *) {
-            (engine as? LocalEngine)?.stop()
-        }
+        (engine as? LocalEngine)?.stop()
         // 停止 / 换引擎 / 切到别的档位：草稿没有定稿的机会了，必须擦掉，
         // 否则主界面和画中画会一直挂着最后一段未定稿文本。
         clearDraft()
@@ -514,7 +492,6 @@ final class SubtitleEngine {
     /// 翻译用不了（iOS < 26、系统翻译没装、准备失败）时这一档直接不参与路由：
     /// 状态机那边按「开关关」处理（switch_off），规则仍在 Routing.swift 里。
     private func prepareCloudTier() {
-        guard #available(iOS 26.0, *) else { return }
         let availability = readCloudAvailability()
         guard availability.hasKey, availability.enabled else { return }
         let token = newSessionCode()
@@ -613,7 +590,6 @@ final class SubtitleEngine {
 
     /// 进云端档：音频改喂云端分段器，译文走本机翻译。
     private func startCloudTier() {
-        guard #available(iOS 26.0, *) else { return }
         guard let key = SharedKeychain.readGroqKey() else { return }
         let revision = key.hashValue
         if cloudClient == nil {
@@ -886,9 +862,7 @@ final class SubtitleEngine {
         writeLatestLines()
         // 译文用本机翻译：云端只给原文。
         let translator = stateQueue.sync { cloudTranslator }
-        if #available(iOS 26.0, *) {
-            (translator as? LocalEngine)?.translate(text, id: lineID)
-        }
+        (translator as? LocalEngine)?.translate(text, id: lineID)
     }
 
     /// 云端那句的译文到了。
@@ -913,7 +887,6 @@ final class SubtitleEngine {
         localSentenceActive || !pendingLocalSettles.isEmpty
     }
 
-    @available(iOS 26.0, *)
     private func startLocalEngine() {
         // 自动回退时 converter 已经在跑节点链路：复用同一个实例，
         // 既避免和音频线程抢写，也保住重采样器的滤波状态。
@@ -969,9 +942,7 @@ final class SubtitleEngine {
             return (true, oldEngine)
         }
         guard transition.0 else { return }
-        if #available(iOS 26.0, *) {
-            (transition.1 as? LocalEngine)?.stop()
-        }
+        (transition.1 as? LocalEngine)?.stop()
         // 换引擎就是换会话：旧会话的最后一段草稿不能留在 Keychain 里。
         clearDraft()
         Task {
@@ -1186,15 +1157,13 @@ final class SubtitleEngine {
         }
         let localRoute = stateQueue.sync { (routingTier, localEngine) }
         if engineMode == "local" || localRoute.0 == .local {
-            if #available(iOS 26.0, *) {
-                guard let engine = localRoute.1 as? LocalEngine else { return }
-                if !frames.isEmpty {
-                    // 节点 ready 时靠这个标记判断“本机还有一句没定稿”，
-                    // 避免切回节点把半句截断。
-                    stateQueue.sync { localSentenceActive = true }
-                    for frame in frames {
-                        engine.append(pcm16k: frame)
-                    }
+            guard let engine = localRoute.1 as? LocalEngine else { return }
+            if !frames.isEmpty {
+                // 节点 ready 时靠这个标记判断“本机还有一句没定稿”，
+                // 避免切回节点把半句截断。
+                stateQueue.sync { localSentenceActive = true }
+                for frame in frames {
+                    engine.append(pcm16k: frame)
                 }
             }
             return

@@ -14,7 +14,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 STORE = ROOT / "ios" / "RSiOS" / "TranscriptStore.swift"
-CONTENT = ROOT / "ios" / "RSiOS" / "ContentView.swift"
+MODEL = ROOT / "ios" / "RSiOS" / "App" / "AppModel.swift"
+ROOT_VIEW = ROOT / "ios" / "RSiOS" / "Pages" / "RootView.swift"
 
 
 def _swift_function_body(text: str, signature: str) -> str:
@@ -86,18 +87,20 @@ def test_hc_p02_store_has_a_coalescing_window_and_flush():
 def test_hc_p02_background_flushes_the_store():
     """硬约束 HC-P02：进后台必须 flush 存档。
 
-    违反的表现：ContentView 没有挂上 flush，或没走已有的前后台钩子。
+    违反的表现：AppModel 没有在进后台时调 flush，或 RootView 没把前后台变化接过去。
 
     为什么不行：iOS 在后台随时可能回收进程，合并窗口里未落盘的句子会静默丢失。
-    必须怎么改：在 ContentView 已有的前后台钩子（AppStateMonitor）变化时
-    调 `transcriptStore.flush()`。
+    必须怎么改：RootView 监听 `model.appState.isInBackground` 变化，交给
+    `AppModel.backgroundChanged`，后者在进后台时调 `store.flush()`。
     """
-    text = CONTENT.read_text(encoding="utf-8")
-    assert "transcriptStore.flush()" in text, (
-        "违反 HC-P02：ContentView 没有调用 transcriptStore.flush()。"
+    model = MODEL.read_text(encoding="utf-8")
+    body = _swift_function_body(model, "func backgroundChanged(")
+    assert "store.flush()" in body, (
+        "违反 HC-P02：AppModel.backgroundChanged 没有调用 store.flush()。"
         "进后台必须把待写内容写掉，不能靠合并窗口自己到点。"
     )
-    assert re.search(r"onChange\(of:\s*self\.appStateMonitor\.isInBackground", text), (
-        "违反 HC-P02：flush 没有挂在已有的前后台钩子上。"
-        "必须怎么改：用 ContentView 里现成的 appStateMonitor.isInBackground 变化来触发。"
+    root = ROOT_VIEW.read_text(encoding="utf-8")
+    assert re.search(r"onChange\(of:\s*model\.appState\.isInBackground", root), (
+        "违反 HC-P02：前后台变化没有接到 AppModel。"
+        "必须怎么改：RootView 用 model.appState.isInBackground 的变化调 backgroundChanged。"
     )

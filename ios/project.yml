@@ -1,7 +1,7 @@
 name: RSiOS
 options:
   deploymentTarget:
-    iOS: "17.0"
+    iOS: "26.0"
   minimumXcodeGenVersion: "2.40.0"
   xcodeVersion: "27.0"
   swiftVersion: "5.0"
@@ -18,7 +18,7 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "26.0"
     CODE_SIGN_STYLE: Automatic
     DEVELOPMENT_TEAM: ""
     MARKETING_VERSION: "0.1.0"

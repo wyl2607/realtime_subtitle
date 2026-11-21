@@ -66,7 +66,6 @@ private final class TranslationTimeoutRace<Value>: @unchecked Sendable {
     }
 }
 
-@available(iOS 26.0, *)
 final class LocalEngine {
     private let logger = Logger(subsystem: "com.wyl2607.rsios.spike", category: "local-engine")
 

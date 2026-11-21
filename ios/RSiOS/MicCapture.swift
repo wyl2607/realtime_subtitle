@@ -1,6 +1,6 @@
 import AVFoundation
-import Combine
 import Foundation
+import Observation
 import Speech
 
 /// 主 App 麦克风采集的可观察状态；错误详情只留给诊断，界面只显示设计令牌里的稳定文案。
@@ -12,23 +12,24 @@ enum MicCaptureState: Equatable {
     case error(String)
 }
 
-final class MicCapture: ObservableObject {
-    @Published private(set) var state: MicCaptureState = .idle
+@Observable
+final class MicCapture {
+    private(set) var state: MicCaptureState = .idle
     /// 语音识别被拒绝时的提示文案（不改变麦克风采集状态）。
-    @Published private(set) var speechDeniedHint: String? = nil
+    private(set) var speechDeniedHint: String? = nil
     /// 点击「开始」那一刻读到的引擎档位。界面靠它判断档位是否真的改过，
     /// 只有改过才提示「停止后重新开始才生效」。
-    @Published private(set) var startedEngineMode: String? = nil
+    private(set) var startedEngineMode: String? = nil
 
-    private let audioEngine = AVAudioEngine()
-    private let subtitleEngine = SubtitleEngine(source: "mic")
+    @ObservationIgnored private let audioEngine = AVAudioEngine()
+    @ObservationIgnored private let subtitleEngine = SubtitleEngine(source: "mic")
     /// tap 在 Core Audio 的实时线程调用；转换和路由只能在这条队列，避免占用实时线程或与 stop 竞争。
-    private let ingestQueue = DispatchQueue(label: "com.wyl2607.rsios.mic-ingest")
-    private var notificationObservers: [NSObjectProtocol] = []
-    private var isRequestingPermission = false
-    private var shouldResumeAfterInterruption = false
-    private var latestExtensionStatus: String?
-    private var latestExtensionStatusUpdatedAt: Date?
+    @ObservationIgnored private let ingestQueue = DispatchQueue(label: "com.wyl2607.rsios.mic-ingest")
+    @ObservationIgnored private var notificationObservers: [NSObjectProtocol] = []
+    @ObservationIgnored private var isRequestingPermission = false
+    @ObservationIgnored private var shouldResumeAfterInterruption = false
+    @ObservationIgnored private var latestExtensionStatus: String?
+    @ObservationIgnored private var latestExtensionStatusUpdatedAt: Date?
 
     init() {
         let center = NotificationCenter.default
