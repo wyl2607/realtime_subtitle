@@ -7,7 +7,7 @@
       "精修中位延迟 ≤ 4s": null,
       "首字不慢于 B": true
     },
-    "events_file": "/Users/yumei/projects/rs-mac-native/scripts/bench/results/hybrid_e2e_20261010_234717/B.jsonl",
+    "events_file": "<HOME>/projects/rs-mac-native/scripts/bench/results/hybrid_e2e_20261010_234717/B.jsonl",
     "final_wer": 0.07894736842105263,
     "first_text_s": 5.196,
     "lines": 5,
@@ -30,7 +30,7 @@
       "精修中位延迟 ≤ 4s": false,
       "首字不慢于 B": null
     },
-    "events_file": "/Users/yumei/projects/rs-mac-native/scripts/bench/results/hybrid_e2e_20261010_234717/C.jsonl",
+    "events_file": "<HOME>/projects/rs-mac-native/scripts/bench/results/hybrid_e2e_20261010_234717/C.jsonl",
     "final_wer": 0.19298245614035087,
     "first_text_s": 5.15,
     "lines": 7,
@@ -48,7 +48,7 @@
     "refine_n": 6,
     "refs_n": 5
   },
-  "events_dir": "/Users/yumei/projects/rs-mac-native/scripts/bench/results/hybrid_e2e_20261010_234717",
+  "events_dir": "<HOME>/projects/rs-mac-native/scripts/bench/results/hybrid_e2e_20261010_234717",
   "hybrid_mode": {
     "b_first_text_s": 5.196,
     "c_wer": 0.19298245614035087,
@@ -58,7 +58,7 @@
       "精修中位延迟 ≤ 4s": false,
       "首字不慢于 B": true
     },
-    "events_file": "/Users/yumei/projects/rs-mac-native/scripts/bench/results/hybrid_e2e_20261010_234717/hybrid.jsonl",
+    "events_file": "<HOME>/projects/rs-mac-native/scripts/bench/results/hybrid_e2e_20261010_234717/hybrid.jsonl",
     "final_wer": 0.21052631578947367,
     "first_text_s": 5.165,
     "lines": 7,
