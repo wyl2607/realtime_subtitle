@@ -197,34 +197,34 @@ struct NodeSelftest {
     }
 
     static func testSessionLoadingCallback(_ check: (Bool, String) -> Void) {
-        var events: [NodeEvent] = []
-        var loadings: [Double] = []
-        var closes: [Int] = []
+        let events = Locked<[NodeEvent]>([])
+        let loadings = Locked<[Double]>([])
+        let closes = Locked<[Int]>([])
         let session = NodeSession(
             url: URL(string: "ws://127.0.0.1:1/v2/session")!,
             token: "gsk_test_fake_key_not_real",
             src: "de",
             dst: "zh",
-            onEvent: { events.append($0) },
-            onClose: { closes.append($0) },
-            onLoading: { loadings.append($0) }
+            onEvent: { event in events.withValue { $0.append(event) } },
+            onClose: { code in closes.withValue { $0.append(code) } },
+            onLoading: { elapsed in loadings.withValue { $0.append(elapsed) } }
         )
-        check(closes.isEmpty, "未 start 的会话不应触发 onClose")
+        check(closes.current.isEmpty, "未 start 的会话不应触发 onClose")
 
         // 假帧：和现有 testParse 一样直接喂协议文本，不开真连接
         session.handle(eventText: #"{"ev":"status","code":"loading","text":"正在加载模型","elapsed_s":0.0}"#)
         session.handle(eventText: #"{"ev":"status","code":"loading","text":"正在加载模型","elapsed_s":5.25}"#)
-        check(loadings == [0.0, 5.25], "NodeSession 收到 loading 时回调 elapsed_s（实际 \(loadings)）")
-        check(events.count == 2, "loading 同时继续按事件上报（实际 \(events.count)）")
+        check(loadings.current == [0.0, 5.25], "NodeSession 收到 loading 时回调 elapsed_s（实际 \(loadings.current)）")
+        check(events.current.count == 2, "loading 同时继续按事件上报（实际 \(events.current.count)）")
         check(NodeEvent.loadingElapsed(from: #"{"ev":"status","code":"loading","text":"x","elapsed_s":5.25}"#) == 5.25,
               "假帧 elapsed_s 可单独读取")
 
         session.handle(eventText: #"{"ev":"status","code":"audio_dropped","text":"y"}"#)
-        check(loadings.count == 2, "非 loading 状态不触发 onLoading")
+        check(loadings.current.count == 2, "非 loading 状态不触发 onLoading")
 
         session.handle(eventText: #"{"ev":"ready","cold":true}"#)
-        check(loadings.count == 2, "ready 后不再触发 onLoading")
-        check(events.count == 4, "ready 仍按事件上报（实际 \(events.count)）")
+        check(loadings.current.count == 2, "ready 后不再触发 onLoading")
+        check(events.current.count == 4, "ready 仍按事件上报（实际 \(events.current.count)）")
     }
 
     static func testPreReadyAudioBuffer(_ check: (Bool, String) -> Void) {
@@ -261,9 +261,8 @@ struct NodeSelftest {
     }
 
     static func testStartReadyWatchdog(_ check: (Bool, String) -> Void) {
-        let closeLock = NSLock()
-        var closeCodes: [Int] = []
-        var eventCount = 0
+        let closeCodes = Locked<[Int]>([])
+        let eventCount = Locked(0)
         let closed = DispatchSemaphore(value: 0)
         let session = NodeSession(
             // 不可达地址让握手可能一直挂住，验证看门狗不依赖 send 完成回调。
@@ -271,15 +270,9 @@ struct NodeSelftest {
             token: "gsk_test_fake_key_not_real",
             src: "de",
             dst: "zh",
-            onEvent: { _ in
-                closeLock.lock()
-                eventCount += 1
-                closeLock.unlock()
-            },
+            onEvent: { _ in eventCount.withValue { $0 += 1 } },
             onClose: { code in
-                closeLock.lock()
-                closeCodes.append(code)
-                closeLock.unlock()
+                closeCodes.withValue { $0.append(code) }
                 closed.signal()
             },
             readyTimeout: 0.3
@@ -290,23 +283,18 @@ struct NodeSelftest {
         check(arrived, "不可达节点应在 2s 内结束会话")
         // 等待 cancel 触发的 delegate 回调，确认它和看门狗竞争时不会重复通知上层。
         Thread.sleep(forTimeInterval: 0.1)
-        closeLock.lock()
-        let codes = closeCodes
-        closeLock.unlock()
+        let codes = closeCodes.current
         check(codes.count == 1, "不可达节点 onClose 只能回调一次（实际 \(codes)）")
         check(codes.first == 1001 || codes.first == 1006,
               "不可达节点应以握手超时或连接失败结束（实际 \(codes)）")
         session.handle(eventText: #"{"ev":"ready","cold":true}"#)
-        closeLock.lock()
-        let eventsAfterClose = eventCount
-        closeLock.unlock()
+        let eventsAfterClose = eventCount.current
         check(eventsAfterClose == 0, "notifyClosed 后的 ready 不应再上报事件（实际 \(eventsAfterClose)）")
         session.close()
     }
 
     static func testExplicitCloseDoesNotNotify(_ check: (Bool, String) -> Void) {
-        let closeLock = NSLock()
-        var closeCount = 0
+        let closeCount = Locked(0)
         let session = NodeSession(
             // 不可达地址让建连一直挂着；readyTimeout 拉长，避免看门狗抢先上报。
             url: URL(string: "ws://100.64.0.1:9/v2/session")!,
@@ -314,11 +302,7 @@ struct NodeSelftest {
             src: "de",
             dst: "zh",
             onEvent: { _ in },
-            onClose: { _ in
-                closeLock.lock()
-                closeCount += 1
-                closeLock.unlock()
-            },
+            onClose: { _ in closeCount.withValue { $0 += 1 } },
             readyTimeout: 30
         )
 
@@ -326,9 +310,7 @@ struct NodeSelftest {
         // start 后立刻 close：URLSession 的取消回调不能变成 onClose。
         session.close()
         Thread.sleep(forTimeInterval: 0.5)
-        closeLock.lock()
-        let count = closeCount
-        closeLock.unlock()
+        let count = closeCount.current
         check(count == 0, "显式 close 后 onClose 不应回调（实际 \(count) 次）")
     }
 
@@ -883,4 +865,24 @@ struct NodeSelftest {
         guard status2 == noErr, let finalBuffer else { return nil }
         return finalBuffer
     }
+}
+
+/// 自测里给节点回调收集结果用：回调跑在 URLSession / 看门狗的队列上，和断言所在线程并发，
+/// 读写都必须过锁。值只经 withValue / current 访问，所以 unchecked 是安全的。
+final class Locked<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Value
+
+    init(_ value: Value) {
+        self.value = value
+    }
+
+    @discardableResult
+    func withValue<Result>(_ body: (inout Value) -> Result) -> Result {
+        lock.lock()
+        defer { lock.unlock() }
+        return body(&value)
+    }
+
+    var current: Value { withValue { $0 } }
 }

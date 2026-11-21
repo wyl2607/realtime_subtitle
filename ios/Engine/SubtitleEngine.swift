@@ -330,6 +330,9 @@ final class SubtitleEngine: @unchecked Sendable {
         autoFallback?.nodeName = config.name
         autoFallback?.setNodeEnabled(true)
         startPinnedSession(config, generation: generation)
+        // 本机优先（HC-U13）：连节点的同时先用本机出字，节点 ready 后等本句定稿再切回。
+        // 以前要干等节点握手（基础 15 秒、冷启动最多 60 秒）才出第一句。
+        applyAutoDecision(handleAutoEvent { fallback in fallback.localFirstDecision() })
         // 云端档：先确认本机翻译能用，再决定要不要进云端档。
         prepareCloudTier()
     }
@@ -337,9 +340,14 @@ final class SubtitleEngine: @unchecked Sendable {
     /// 在 stateQueue 上改 AutoFallback 并取回决策；动作本身在锁外执行，
     /// 因为启动/停止本机引擎也会进 stateQueue。
     private func handleAutoEvent(_ event: AutoFallbackEvent) -> AutoFallbackDecision? {
+        handleAutoEvent { $0.handle(event) }
+    }
+
+    /// 在 stateQueue 上对 AutoFallback 做一次修改并取回决策（事件和 localFirstDecision 共用）。
+    private func handleAutoEvent(_ mutate: (inout AutoFallback) -> AutoFallbackDecision) -> AutoFallbackDecision? {
         stateQueue.sync {
             guard engineMode == "auto", var fallback = autoFallback else { return nil }
-            let decision = fallback.handle(event)
+            let decision = mutate(&fallback)
             autoFallback = fallback
             return decision
         }

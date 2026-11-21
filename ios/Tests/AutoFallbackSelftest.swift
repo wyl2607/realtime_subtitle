@@ -428,4 +428,86 @@ func runAutoFallbackSelftest(_ check: @escaping (Bool, String) -> Void) {
               "PR88 F5: 旧下限自然老化到 80% 以下，轮询应解除额度冷却")
     }
 
+    // MARK: - HC-U13: local-first（自动模式本机先出字）
+
+    // 本机可用、非云端：localFirstDecision → .startLocal，之后 nodeReady（无进行中句子）→ .stopLocalAndSwitchToNode
+    do {
+        var fallback = AutoFallback(nodeName: "mini2", localAvailable: true)
+        let decision = fallback.localFirstDecision()
+        check(decision.action == .startLocal, "HC-U13: 本机可用时 localFirstDecision 应启动本机")
+        check(decision.status == "mini2" + DesignTokens.Text.nodeLoadingSuffix, "HC-U13: 状态文案应为节点加载中（实际 \(decision.status ?? "nil")）")
+        check(fallback.usingLocal, "HC-U13: 应标记正在用本机")
+
+        let switched = fallback.handle(.nodeReady)
+        check(switched.action == .stopLocalAndSwitchToNode, "HC-U13: 无进行中句子时 nodeReady 应立刻切回节点")
+        check(!fallback.usingLocal, "HC-U13: 切回后应标记不再用本机")
+    }
+
+    // 本机正在说一句时 nodeReady → .keep 且等待；localSentenceFinalized → .stopLocalAndSwitchToNode
+    do {
+        var fallback = AutoFallback(nodeName: "mini2", localAvailable: true)
+        _ = fallback.localFirstDecision()
+        _ = fallback.handle(.localSentenceStarted)
+        let waiting = fallback.handle(.nodeReady)
+        check(waiting.action == .keep, "HC-U13: 本机句未定稿时 nodeReady 应继续等（实际 \(waiting.action)）")
+        check(waiting.status == "mini2" + DesignTokens.Text.nodeRecoveredWaitingSuffix, "HC-U13: 等待切回状态文案（实际 \(waiting.status ?? "nil")）")
+        check(fallback.usingLocal, "HC-U13: 等待期间应继续用本机")
+        check(fallback.awaitingSentenceEnd, "HC-U13: 等待期间应记住待切回")
+
+        let switched = fallback.handle(.localSentenceFinalized)
+        check(switched.action == .stopLocalAndSwitchToNode, "HC-U13: 本机句定稿后应切回节点")
+        check(!fallback.usingLocal, "HC-U13: 切回后应标记不再用本机")
+        check(!fallback.awaitingSentenceEnd, "HC-U13: 切回后应清掉等待标记")
+    }
+
+    // 本机不可用 → .keep
+    do {
+        var fallback = AutoFallback(nodeName: "mini2", localAvailable: false)
+        let decision = fallback.localFirstDecision()
+        check(decision.action == .keep, "HC-U13: 本机不可用时 localFirstDecision 应保持")
+        check(!fallback.usingLocal, "HC-U13: 本机不可用时不应标记正在用本机")
+    }
+
+    // 云端档在跑 → .keep
+    do {
+        var fallback = AutoFallback(
+            nodeName: "mini2",
+            localAvailable: true,
+            cloud: CloudAvailability(hasKey: true, enabled: true, translationAvailable: true, keyRevision: 1)
+        )
+        _ = fallback.startDecision()
+        let decision = fallback.localFirstDecision()
+        check(decision.action == .keep, "HC-U13: 云端档在跑时 localFirstDecision 应保持")
+        check(fallback.usingCloud, "HC-U13: 云端档在跑时 usingCloud 仍为 true")
+    }
+
+    // broadcastEnded 之后 → .keep
+    do {
+        var fallback = AutoFallback(nodeName: "mini2", localAvailable: true)
+        fallback.broadcastEnded()
+        let decision = fallback.localFirstDecision()
+        check(decision.action == .keep, "HC-U13: 广播结束后 localFirstDecision 应保持")
+        check(!fallback.usingLocal, "HC-U13: 广播结束后不应标记正在用本机")
+    }
+
+    // 本机先跑着时收到 nodeLoading → .keep，usingLocal 仍为 true
+    do {
+        var fallback = AutoFallback(nodeName: "mini2", localAvailable: true)
+        _ = fallback.localFirstDecision()
+        check(fallback.usingLocal, "HC-U13: localFirstDecision 后 usingLocal 应为 true")
+
+        let loading = fallback.handle(.nodeLoading)
+        check(loading.action == .keep, "HC-U13: 本机已跑时 nodeLoading 应保持（实际 \(loading.action)）")
+        check(loading.status == nil, "HC-U13: 本机已跑时 nodeLoading 不应改状态行（实际 \(loading.status ?? "nil")）")
+        check(fallback.usingLocal, "HC-U13: 本机已跑时 usingLocal 仍为 true")
+    }
+
+    // localFirst 之后 nodeFailed → .keep（本机已在跑，不重复启动）
+    do {
+        var fallback = AutoFallback(nodeName: "mini2", localAvailable: true)
+        _ = fallback.localFirstDecision()
+        let failed = fallback.handle(.nodeFailed)
+        check(failed.action == .keep, "HC-U13: 本机已跑时 nodeFailed 应保持（实际 \(failed.action)）")
+        check(fallback.usingLocal, "HC-U13: 本机已跑时 nodeFailed 后 usingLocal 仍为 true")
+    }
 }

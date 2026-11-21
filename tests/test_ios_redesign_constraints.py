@@ -252,3 +252,20 @@ def test_hc_u12_no_orphan_live_activities():
     assert "refreshLiveActivity()" in bootstrap, (
         "HC-U12 违反：bootstrap 没有同步一次实时活动，上次留下的活动不会被结束。"
     )
+
+
+def test_hc_u13_auto_mode_starts_local_first():
+    """硬约束 HC-U13：自动档连节点的同时先用本机出字。
+
+    为什么不行：以前要等节点握手失败（基础 15 秒、冷启动最多 60 秒）才启本机，
+    用户开麦克风后长时间没有字幕。节点 ready 后由 handleNodeReady 等本句定稿再切回。
+    必须怎么改：SubtitleEngine.startAutoMode 在 startPinnedSession 之后调用
+    AutoFallback.localFirstDecision() 并执行决策；行为用例在 AutoFallbackSelftest（HC-U13）。
+    """
+    engine = (IOS / "Engine" / "SubtitleEngine.swift").read_text(encoding="utf-8")
+    start = engine[engine.index("private func startAutoMode"):engine.index("private func handleAutoEvent")]
+    assert "localFirstDecision()" in start and start.index("startPinnedSession(") < start.index("localFirstDecision()"), (
+        "HC-U13 违反：startAutoMode 没有在连节点之后立刻走 localFirstDecision，自动档又要干等节点。"
+    )
+    selftest = (IOS / "Tests" / "AutoFallbackSelftest.swift").read_text(encoding="utf-8")
+    assert selftest.count("HC-U13") >= 5, "HC-U13 违反：AutoFallbackSelftest 里的 local-first 行为用例被删了。"
