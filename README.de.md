@@ -1,6 +1,6 @@
 # Realtime Subtitle
 
-**Live-Untertitel für Windows und macOS** — Systemton aufnehmen, Sprache erkennen, lokal übersetzen und als zweisprachiges Always-on-Top-Overlay anzeigen. Standardmäßig vollständig lokal; Audio wird nur an den Cloud-Erkennungsdienst gesendet, wenn ein Groq-Schlüssel in den Programmeinstellungen konfiguriert ist. Aktuelle Version **v3.2.0**.
+**Live-Untertitel für Windows und macOS** — Systemton aufnehmen, Sprache erkennen, lokal übersetzen und als zweisprachiges Always-on-Top-Overlay anzeigen. Standardmäßig vollständig lokal; Audio wird nur an den Cloud-Erkennungsdienst gesendet, wenn ein Groq-Schlüssel in den Programmeinstellungen konfiguriert ist. Aktuelle Version **v3.3.0**.
 
 > **Datenschutzversprechen & Datenwege außerhalb des Rechners:**
 >
@@ -42,7 +42,7 @@ Systemton ──WASAPI-Loopback──▶ Faster-Whisper (CUDA oder CPU)
 
 ## Plattformstatus
 
-Stand 2026-10-25. Aktuelle Release-Version für Windows / macOS ist v3.2.0 (2026-10-25).
+Stand 2026-11-21. Aktuelle Release-Version für Windows / macOS ist v3.3.0 (2026-11-21).
 
 Legende: ✅ stabil · 🟢 nutzbar · 🧪 experimentell · ⬜ nicht begonnen.
 
