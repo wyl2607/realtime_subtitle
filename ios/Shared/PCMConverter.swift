@@ -51,8 +51,9 @@ final class PCMConverter {
 
     /// 不依赖 CMSampleBuffer 的入口（自测用）：交错的 Int16 小端样本 → 16kHz 单声道 s16le。
     static func convert(interleavedInt16 samples: [Int16], sampleRate: Double, channels: Int) -> Data {
+        guard channels > 0 else { return Data() }
         let frames = samples.count / channels
-        guard frames > 0, channels > 0,
+        guard frames > 0,
               let format = AVAudioFormat(
                 commonFormat: .pcmFormatInt16,
                 sampleRate: sampleRate,

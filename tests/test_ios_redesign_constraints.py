@@ -269,3 +269,33 @@ def test_hc_u13_auto_mode_starts_local_first():
     )
     selftest = (IOS / "Tests" / "AutoFallbackSelftest.swift").read_text(encoding="utf-8")
     assert selftest.count("HC-U13") >= 5, "HC-U13 违反：AutoFallbackSelftest 里的 local-first 行为用例被删了。"
+
+
+def test_hc_u14_engine_invariants_from_free_model_audit():
+    """硬约束 HC-U14：引擎的几条不变式（2026-11-22 多模型审计后核实的 bug）。
+
+    1. 翻译会话不是 Sendable，只能串行使用：LocalEngine.translate（云端句）也必须挂到 translationTail，
+       不许每句一个独立 Task 并发打同一个会话。
+    2. 等翻译会话准备好必须有上限（preparedSession），否则 prepareTranslation 卡住时每一句都永远
+       不收尾，自动档再也切不回节点。
+    3. 分析器输入队列必须有界（bufferingNewest），掉队时内存不能一直涨。
+    4. 停本机引擎和切档位必须在同一个临界区（stopLocalEngine(switchingTo:)），否则中间几帧音频被丢。
+    """
+    local = (IOS / "Engine" / "LocalEngine.swift").read_text(encoding="utf-8")
+    translate = local[local.index("func translate(_ text: String, id: Int)"):local.index("func stop()")]
+    assert "translationTail = newTail" in translate, (
+        "HC-U14 违反：LocalEngine.translate 没有挂到串行尾链，同一个 TranslationSession 会被并发调用。"
+    )
+    settle = local[local.index("private func translateAndSettle"):]
+    assert "await preparedSession(ready)" in settle and "ready?.value" not in settle.split("private func preparedSession")[0], (
+        "HC-U14 违反：translateAndSettle 又直接无上限地等 translationReady。"
+    )
+    assert re.search(r"AsyncStream<AnalyzerInput>\(bufferingPolicy:\s*\.bufferingNewest", local), (
+        "HC-U14 违反：分析器输入 AsyncStream 没有设有界缓冲。"
+    )
+    engine = (IOS / "Engine" / "SubtitleEngine.swift").read_text(encoding="utf-8")
+    for m in re.finditer(r"stopLocalEngine\(\)\s*\n\s*stateQueue\.sync\s*\{[^}]*routingTier\s*=", engine):
+        raise AssertionError(
+            "HC-U14 违反：" + _locate(IOS / "Engine" / "SubtitleEngine.swift", engine, m.start())
+            + " 先停本机引擎、再另开临界区改 routingTier；用 stopLocalEngine(switchingTo:)。"
+        )

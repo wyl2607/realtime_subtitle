@@ -361,9 +361,8 @@ final class SubtitleEngine: @unchecked Sendable {
         case .startLocal:
             startLocalEngine()
         case .stopLocalAndSwitchToNode:
-            stopLocalEngine()
+            stopLocalEngine(switchingTo: .node)
             stateQueue.sync {
-                routingTier = .node
                 localSentenceActive = false
                 // 本机档已经离开：上一轮的本机失败码留着会让状态行提示误报。
                 if Self.isLocalFailureCode(lastStatusCode) {
@@ -417,11 +416,14 @@ final class SubtitleEngine: @unchecked Sendable {
         applyAutoDecision(decision)
     }
 
-    private func stopLocalEngine() {
+    /// - Parameter nextTier: 要切去的档位。必须和清引用在同一个临界区里改：分两次加锁时，
+    ///   音频线程可能读到「档位还是本机、本机引擎已经没了」，这几帧直接被丢掉。
+    private func stopLocalEngine(switchingTo nextTier: ProviderTier? = nil) {
         let engine = stateQueue.sync { () -> AnyObject? in
             // 在锁内清掉引用：回调的闸门也在锁内核对它，迟到的回调到这里就进不来了。
             let engine = localEngine
             localEngine = nil
+            if let nextTier { routingTier = nextTier }
             // 引擎没了，在途的译文不会再回调：把没收尾的句子清掉，
             // 否则「本机还忙」的判断会一直挂着。
             pendingLocalSettles.removeAll()
@@ -618,11 +620,8 @@ final class SubtitleEngine: @unchecked Sendable {
             cloudSegmenter = CloudSegmenter()
         }
         // 本机识别不再需要：云端给原文，本机只做翻译。
-        stopLocalEngine()
-        stateQueue.sync {
-            routingTier = .cloud
-            cloudProbeUsed = false
-        }
+        stopLocalEngine(switchingTo: .cloud)
+        stateQueue.sync { cloudProbeUsed = false }
     }
 
     /// 退出云端档：在飞请求作废，分段器丢掉（回来时重新开始，不带着旧缓冲）。
@@ -743,8 +742,9 @@ final class SubtitleEngine: @unchecked Sendable {
     ) {
         // 先判作废：代次相同也要重读 Keychain。用户换 key 到下一次 refresh 前，旧 key 的 200
         // 仍可能回来；校验、记账和清 busy 都必须放在同一条 stateQueue 临界区里。
+        // Keychain 读放在临界区外：stateQueue 上排着音频线程和各路回调，不在锁里做跨进程 I/O。
+        let currentKeyFingerprint = SharedKeychain.readGroqKey().map { CloudClient.keyFingerprint($0) }
         let callbackCurrent = self.stateQueue.sync { () -> Bool in
-            let currentKeyFingerprint = SharedKeychain.readGroqKey().map { CloudClient.keyFingerprint($0) }
             guard CloudCallbackGate.isCurrent(
                 requestGeneration: generation,
                 currentGeneration: self.cloudGeneration,
@@ -788,8 +788,9 @@ final class SubtitleEngine: @unchecked Sendable {
         case .network, .invalidResponse, .cancelled:
             callbackKeyFingerprint = nil
         }
+        // Keychain 读放在临界区外：stateQueue 上排着音频线程和各路回调，不在锁里做跨进程 I/O。
+        let currentKeyFingerprint = SharedKeychain.readGroqKey().map { CloudClient.keyFingerprint($0) }
         let callbackCurrent = self.stateQueue.sync { () -> Bool in
-            let currentKeyFingerprint = SharedKeychain.readGroqKey().map { CloudClient.keyFingerprint($0) }
             guard CloudCallbackGate.isCurrent(
                 requestGeneration: generation,
                 currentGeneration: self.cloudGeneration,
@@ -978,6 +979,11 @@ final class SubtitleEngine: @unchecked Sendable {
                 let t1 = localClockOrigin + range.end
                 p5Store.addLocal(key: storeKey, t0: t0, t1: t1, text: text)
                 p5Identity[storeKey] = (session: session, id: id)
+                // 仓库按容量淘汰旧行时不会通知这里：只留仍在仓库里的映射，长时间运行不无界增长。
+                if p5Identity.count > 2 * p5Store.lines.count + 16 {
+                    let live = Set(p5Store.lines.map(\.key))
+                    p5Identity = p5Identity.filter { live.contains($0.key) }
+                }
                 // 已经被远端行盖住的本机句不再上屏（P5）。
                 display = p5Store.lines.contains { $0.key == storeKey }
             } else {
@@ -1047,6 +1053,8 @@ final class SubtitleEngine: @unchecked Sendable {
                     return markFatalError(code: status)
                 }
                 guard let fatal else { return }
+                // 识别链路死了就不会再有定稿：最后一段灰色草稿要擦掉，不能一直挂在屏幕上。
+                clearDraft()
                 onFatalError?(fatal)
             }
         }
