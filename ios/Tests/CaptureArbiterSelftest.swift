@@ -71,6 +71,16 @@ struct CaptureArbiterSelftest {
             )
         }
 
+        check(
+            CaptureArbiter.decide(
+                extensionStatus: "finished src=broadcast",
+                extensionStatusUpdatedAt: fresh,
+                now: now,
+                micIsRunning: false
+            ) == .allowMicStart,
+            "HC-U12：广播刚结束（finished）不应挡住麦克风"
+        )
+
         let activePlan = MicAudioSessionPlan.forMic(active: true)
         check(activePlan.category == .playAndRecord, "麦克风运行时必须是 playAndRecord")
         check(activePlan.mode == .defaultMode, "麦克风运行时保持默认音频模式")

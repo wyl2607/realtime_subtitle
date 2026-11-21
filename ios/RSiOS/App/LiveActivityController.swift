@@ -16,6 +16,17 @@ final class LiveActivityController {
     /// 中间的变化合并成最后一次（尾随更新），不丢最后一句。
     private static let minInterval: TimeInterval = 1
 
+    /// 进程被杀时实时活动不会跟着结束，会在锁屏上冻结好几个小时；下次启动再开一个就成了两个。
+    /// 所以启动时接管上次留下的第一个，其余的直接结束。
+    init() {
+        let existing = Activity<SubtitleActivityAttributes>.activities
+        activity = existing.first
+        for orphan in existing.dropFirst() {
+            let handle = ActivityHandle(activity: orphan)
+            Task.detached { await handle.activity.end(nil, dismissalPolicy: .immediate) }
+        }
+    }
+
     func sync(capturing: Bool, sourceName: String, state: SubtitleActivityAttributes.ContentState) {
         guard capturing else {
             end(with: state)
@@ -68,6 +79,7 @@ final class LiveActivityController {
         guard let activity else { return }
         self.activity = nil
         lastPushed = nil
+        lastPushAt = .distantPast
         let handle = ActivityHandle(activity: activity)
         Task.detached { await handle.activity.end(ActivityContent(state: state, staleDate: nil), dismissalPolicy: .default) }
     }

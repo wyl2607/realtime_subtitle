@@ -36,7 +36,7 @@ struct DiagnosticsPage: View {
                     if model.feed.lines.isEmpty {
                         Text("暂无字幕").foregroundStyle(.secondary)
                     } else {
-                        ForEach(model.feed.lines) { line in
+                        ForEach(model.feed.lines, id: \.key) { line in
                             VStack(alignment: .leading, spacing: DesignTokens.Space.xs) {
                                 Text("[\(line.id)] \(line.src)")
                                 Text(line.dst.isEmpty ? "…" : line.dst)

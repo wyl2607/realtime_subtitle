@@ -78,33 +78,20 @@ struct SubtitleCardView: View {
         )
         .animation(
             .easeOut(duration: DesignTokens.Motion.fadeInMs / 1000),
-            value: self.lines.map(\.id)
+            value: self.lines.map(\.key)
         )
     }
 
     private var pairs: some View {
         VStack(alignment: .leading, spacing: DesignTokens.Space.pairGap) {
-            ForEach(Array(self.shownLines.enumerated()), id: \.offset) { index, line in
-                let isNewest = index == self.shownLines.count - 1
-                let translation = SubtitleDisplay.translation(line.dst, isNewest: isNewest)
-
-                VStack(alignment: .leading, spacing: DesignTokens.Space.s) {
-                    Text(line.src)
-                        .font(.system(
-                            size: self.style.fontSize * DesignTokens.TypeScale.sourceScale,
-                            weight: .medium
-                        ))
-                        .foregroundColor(Color(styleHex: self.style.sourceHex))
-                    Text(translation.text)
-                        .font(.system(size: self.style.fontSize, weight: .regular))
-                        .foregroundColor(
-                            translation.isPlaceholder
-                                ? Color(styleHex: DesignTokens.Color.untranslated)
-                                : Color(styleHex: self.style.translationHex)
-                        )
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .opacity(SubtitleDisplay.pairOpacity(index: index, count: self.shownLines.count))
+            // 按句子身份而不是位置做 id：新句进来时旧句整体往上移，而不是每一格原地换字。
+            ForEach(Array(self.shownLines.enumerated()), id: \.element.key) { index, line in
+                SubtitlePairRow(
+                    line: line,
+                    style: self.style,
+                    isNewest: index == self.shownLines.count - 1,
+                    opacity: SubtitleDisplay.pairOpacity(index: index, count: self.shownLines.count)
+                )
             }
         }
         // 只渐隐最上面约 20%：再多会把最新一句也压暗，用户分不清哪句在更新。
@@ -119,5 +106,32 @@ struct SubtitleCardView: View {
                 endPoint: .bottom
             )
         )
+    }
+}
+
+/// 一组原文 + 译文。字幕卡片和字幕页的滚动字幕共用，保证两处排版一致。
+struct SubtitlePairRow: View {
+    let line: RecentLine
+    let style: SubtitleStyle
+    let isNewest: Bool
+    let opacity: Double
+
+    var body: some View {
+        let translation = SubtitleDisplay.translation(line.dst, isNewest: isNewest)
+        VStack(alignment: .leading, spacing: DesignTokens.Space.s) {
+            Text(line.src)
+                .font(.system(size: style.fontSize * DesignTokens.TypeScale.sourceScale, weight: .medium))
+                .foregroundColor(Color(styleHex: style.sourceHex))
+            Text(translation.text)
+                .font(.system(size: style.fontSize, weight: .regular))
+                .foregroundColor(
+                    translation.isPlaceholder
+                        ? Color(styleHex: DesignTokens.Color.untranslated)
+                        : Color(styleHex: style.translationHex)
+                )
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .opacity(opacity)
+        .transition(.move(edge: .bottom).combined(with: .opacity))
     }
 }

@@ -38,6 +38,8 @@ final class AppModel {
 
     /// 状态词只在解析出档位时更新；解析返回 nil（如 started）时保留上一次，否则每秒闪一下空白。
     private(set) var statusSummary: StatusSummary?
+    /// 字幕页滚动显示的句子：本次运行累积，最多 CaptionHistory.limit 句。
+    private(set) var captionLines: [RecentLine] = []
     /// 每收到新句对 +1：回看页靠它触发重新读存档文件。
     private(set) var transcriptRefresh = 0
 
@@ -73,6 +75,8 @@ final class AppModel {
         loadCloudSettings()
         statusChanged(feed.status)
         ingestFeedLines()
+        // 上次运行被系统杀掉时留下的锁屏活动：没在采集就立刻结束，在采集就接着用。
+        refreshLiveActivity()
         assets.prepareIfMissing()
     }
 
@@ -91,6 +95,7 @@ final class AppModel {
     /// 把最近句对交给存档。ingest 是异步合并写，不挡主线程。
     func ingestFeedLines() {
         ingestedLines = feed.lines
+        captionLines = CaptionHistory.merge(captionLines, with: feed.lines)
         store.ingest(feed.lines.map {
             TranscriptStore.Sentence(id: $0.id, session: $0.session, src: $0.src, dst: $0.dst)
         })
@@ -106,11 +111,15 @@ final class AppModel {
         mic.reconcileBroadcast(extensionStatus: feed.status, extensionStatusUpdatedAt: updatedAt)
     }
 
-    /// 广播在跑：扩展最近一次写状态还在新鲜窗口内，且不是结束状态。
+    /// 广播在跑：和麦克风互斥用同一个判定。以前这里自己判「新鲜且不是 finished」，
+    /// 没看 src——麦克风引擎自己也会发状态通知，结果麦克风停了以后锁屏活动还当广播在跑。
     private var broadcastActive: Bool {
-        guard let updatedAt = feed.lastStatusUpdate,
-              Date().timeIntervalSince(updatedAt) < CaptureArbiter.broadcastFreshness else { return false }
-        return !feed.status.hasPrefix("finished")
+        CaptureArbiter.decide(
+            extensionStatus: feed.status,
+            extensionStatusUpdatedAt: feed.lastStatusUpdate,
+            now: Date(),
+            micIsRunning: false
+        ) == .rejectMicStart
     }
 
     /// 锁屏实时活动跟着采集状态和最新一句走。熄屏后画中画看不见，这是唯一的字幕出口。
@@ -118,7 +127,8 @@ final class AppModel {
         let latest = feed.lines.last
         let state = SubtitleActivityAttributes.ContentState(
             source: latest?.src ?? "",
-            translation: latest?.dst ?? "",
+            // 译文比原文晚到：没到时用和字幕卡片同样的占位，锁屏上不留一行空白。
+            translation: latest.map { SubtitleDisplay.translation($0.dst, isNewest: true).text } ?? "",
             status: statusSummary?.label ?? DesignTokens.Text.micStatusIdle
         )
         liveActivity.sync(

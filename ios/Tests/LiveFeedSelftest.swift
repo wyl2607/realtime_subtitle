@@ -88,6 +88,20 @@ struct LiveFeedSelftest {
         check(feed.draft == "Guten", "HC-U08：读不到草稿时不应清空草稿")
         check(changes == beforeLock, "HC-U08：读不到时不应发布变更")
 
+        // HC-U11：字幕页滚动字幕的累积。引擎只给最近 3 句，主 App 必须自己按「会话+id」接起来。
+        let a1 = RecentLine(id: 1, src: "A", dst: "", session: "s1")
+        let a2 = RecentLine(id: 2, src: "B", dst: "", session: "s1")
+        let a3 = RecentLine(id: 3, src: "C", dst: "", session: "s1")
+        var history = CaptionHistory.merge([], with: [a1, a2, a3])
+        history = CaptionHistory.merge(history, with: [a2, a3, RecentLine(id: 4, src: "D", dst: "", session: "s1")])
+        check(history.map(\.src) == ["A", "B", "C", "D"], "HC-U11：滑出最近 3 句的旧句要留在滚动字幕里")
+        history = CaptionHistory.merge(history, with: [RecentLine(id: 3, src: "C", dst: "丙", session: "s1")])
+        check(history.count == 4 && history[2].dst == "丙", "HC-U11：后到的译文要原地补上，不能多出一句")
+        history = CaptionHistory.merge(history, with: [RecentLine(id: 1, src: "E", dst: "", session: "s2")])
+        check(history.map(\.src) == ["A", "B", "C", "D", "E"], "HC-U11：新会话 id 从 1 重计时不能顶替旧会话的句子")
+        let many = (1...10).map { RecentLine(id: $0, src: "\($0)", dst: "", session: "s3") }
+        check(CaptionHistory.merge([], with: many, limit: 4).map(\.id) == [7, 8, 9, 10], "HC-U11：超过上限只留最新的")
+
         if failures.isEmpty {
             print("LIVE FEED SELFTEST OK")
         } else {

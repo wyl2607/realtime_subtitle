@@ -16,12 +16,14 @@ struct LivePage: View {
                         AssetBanner()
                     }
 
-                    SubtitleCardView(
-                        lines: model.feed.lines,
+                    // 字幕区固定占屏幕约一半高：句子在里面往上滚，下面的按钮不会被一起推走。
+                    LiveCaptionsView(
+                        lines: model.captionLines,
                         style: SubtitleStyle.load(from: subtitleStyleData.isEmpty ? nil : subtitleStyleData),
                         status: model.statusSummary,
                         draft: model.feed.draft
                     )
+                    .containerRelativeFrame(.vertical) { height, _ in height * 0.5 }
 
                     // 本机引擎失败时把原始码映射成可读提示。
                     if let message = LocalEngineStatus.userMessage(forStatusLine: model.feed.status) {

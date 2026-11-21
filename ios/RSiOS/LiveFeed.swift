@@ -137,11 +137,35 @@ final class LiveFeed {
     }
 }
 
-struct RecentLine: Codable, Identifiable, Equatable {
+/// 故意不遵守 Identifiable：id 只在单个引擎会话内唯一，SwiftUI 列表必须显式用 `\.key`（HC-U11）。
+struct RecentLine: Codable, Equatable {
     let id: Int
     let src: String
     var dst: String
     /// 产生这一句的引擎会话代号：各引擎的 id 都从 1 重新计数，
     /// 存档靠「代号 + id」去重，不然后一个会话会覆盖前一个会话的句子。
     let session: String
+
+    /// 跨会话唯一的身份：各引擎会话的 id 都从 1 计数，只用 id 会让两句互相顶替。
+    var key: String { "\(session)#\(id)" }
+}
+
+/// 字幕页的滚动字幕：引擎只往 Keychain 放最近 3 句（画中画就显示那么多），
+/// 主 App 自己按「会话 + id」把本次运行的句子累积起来，字幕页才能像字幕机一样往上滚。
+enum CaptionHistory {
+    /// 只留最近这么多句：再往前去「回看」页看全天存档。
+    static let limit = 200
+
+    /// 同一句（同会话同 id）原地更新——译文是后到的；新句接在末尾。
+    static func merge(_ history: [RecentLine], with latest: [RecentLine], limit: Int = limit) -> [RecentLine] {
+        var merged = history
+        for line in latest {
+            if let index = merged.lastIndex(where: { $0.key == line.key }) {
+                merged[index] = line
+            } else {
+                merged.append(line)
+            }
+        }
+        return merged.count > limit ? Array(merged.suffix(limit)) : merged
+    }
 }

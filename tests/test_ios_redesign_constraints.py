@@ -206,3 +206,49 @@ def test_hc_u10_pip_frames_are_iosurface_backed():
         "HC-U10 违反：这些文件创建像素缓冲却没有 IOSurface 支撑：" + ", ".join(offenders)
         + "。画中画是系统进程绘制的，没有 IOSurface 帧传不过去。"
     )
+
+
+def test_hc_u11_captions_scroll_with_stable_identity():
+    """硬约束 HC-U11：字幕页的字幕要自动往上滚，句子按身份（会话+id）做 ForEach 的 id。
+
+    违反的是什么：用 `id: \\.offset` 遍历句子，或字幕页退回只显示最近几句的卡片。
+    为什么不行：按位置做 id，新句进来时每一格原地换字，看起来字幕不会滚
+    （2026-11-21 用户真机反馈「字幕不会自动向上滚动」）；引擎只给最近 3 句，不累积就没有可滚的内容。
+    必须怎么改：ForEach 用 `\\.key`；字幕页用 LiveCaptionsView 显示 AppModel.captionLines。
+    """
+    offenders = []
+    for path in sorted((IOS / "RSiOS").rglob("*.swift")):
+        text = path.read_text(encoding="utf-8")
+        for m in re.finditer(r"id:\s*\\\.offset", text):
+            offenders.append(_locate(path, text, m.start()))
+    assert not offenders, (
+        "HC-U11 违反：按位置做 ForEach 的 id：" + ", ".join(offenders) + "。句子用 \\.key（会话+id）。"
+    )
+    feed = (IOS / "RSiOS" / "LiveFeed.swift").read_text(encoding="utf-8")
+    assert not re.search(r"struct RecentLine:[^{]*Identifiable", feed), (
+        "HC-U11 违反：RecentLine 又遵守了 Identifiable。它的 id 只在单个会话内唯一，"
+        "列表按它做 id 会让不同会话的同号句子互相顶替；ForEach 显式写 id: \\.key。"
+    )
+    live = (IOS / "RSiOS" / "Pages" / "LivePage.swift").read_text(encoding="utf-8")
+    assert "LiveCaptionsView(" in live and "model.captionLines" in live, (
+        "HC-U11 违反：字幕页没有用 LiveCaptionsView 显示累积的 captionLines，字幕不会往上滚。"
+    )
+
+
+def test_hc_u12_no_orphan_live_activities():
+    """硬约束 HC-U12：启动时接管/结束上次留下的锁屏实时活动；启动时同步一次。
+
+    为什么不行：进程被系统杀掉时实时活动不会自己结束，锁屏上冻结着最后一句好几个小时；
+    下次启动再开一个，锁屏上就是两条。
+    必须怎么改：LiveActivityController 初始化时读 Activity<SubtitleActivityAttributes>.activities，
+    接管第一个、结束其余；AppModel.bootstrap 调 refreshLiveActivity()（没在采集就结束它）。
+    """
+    controller = (IOS / "RSiOS" / "App" / "LiveActivityController.swift").read_text(encoding="utf-8")
+    assert "Activity<SubtitleActivityAttributes>.activities" in controller, (
+        "HC-U12 违反：LiveActivityController 没有接管上次留下的实时活动，会冻结在锁屏或重复出现。"
+    )
+    model = (IOS / "RSiOS" / "App" / "AppModel.swift").read_text(encoding="utf-8")
+    bootstrap = model[model.index("func bootstrap()"):model.index("private func feedChanged()")]
+    assert "refreshLiveActivity()" in bootstrap, (
+        "HC-U12 违反：bootstrap 没有同步一次实时活动，上次留下的活动不会被结束。"
+    )

@@ -443,8 +443,9 @@ final class SubtitleEngine: @unchecked Sendable {
     }
 
     private func publishDraft(_ text: String) {
-        if !SharedKeychain.writeLatestDraft(text) {
+        guard SharedKeychain.writeLatestDraft(text) else {
             logger.error("Failed to write latest_draft to keychain")
+            return
         }
         postLinesNotification()
     }
