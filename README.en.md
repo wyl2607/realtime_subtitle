@@ -1,6 +1,6 @@
 # Realtime Subtitle
 
-**Live subtitles for Windows & macOS** — capture system audio, recognize speech, translate, and show a bilingual always-on-top overlay. Default to fully local; audio is only sent to the cloud recognition service when a Groq key is configured in the program settings. Current version **v3.2.0**.
+**Live subtitles for Windows & macOS** — capture system audio, recognize speech, translate, and show a bilingual always-on-top overlay. Default to fully local; audio is only sent to the cloud recognition service when a Groq key is configured in the program settings. Current version **v3.3.0**.
 
 > **Privacy commitment & off-device paths:**
 >
@@ -41,7 +41,7 @@ System audio ──WASAPI loopback──▶ Faster-Whisper (CUDA or CPU)
 
 ## Platform status
 
-As of 2026-10-25. The current release for Windows / macOS is v3.2.0 (2026-10-25).
+As of 2026-11-21. The current release for Windows / macOS is v3.3.0 (2026-11-21).
 
 Stage legend: ✅ stable · 🟢 usable · 🧪 experimental · ⬜ not started.
 
