@@ -19,6 +19,33 @@ final class SubtitleEngine {
         self.source = source
     }
 
+    /// 记录致命错误并返回要交给宿主的中文错误；已经 fatal 过就返回 nil。
+    /// 必须在 stateQueue 上调用：置位和「要不要通知」必须在同一把锁里判断，
+    /// 否则同一轮里多个回调会各结束一次广播（ReplayKit 不接受二次 finish）。
+    private func markFatalError(code: String) -> Error? {
+        guard !fatalErrorOccurred else { return nil }
+        fatalErrorOccurred = true
+        fatalErrorReason = "fatal:\(code)"
+        return Self.fatalError(code: code, nodeName: nodeName)
+    }
+
+    /// 结束广播的原因不能另写一份文案：四端共用 design/tokens.json 的状态文案，
+    /// 本机失败码交给 LocalEngineStatus，节点失败复用已有的节点不可用文案。
+    private static func fatalError(code: String, nodeName: String) -> NSError {
+        let message: String
+        if let local = LocalEngineStatus.userMessage(forStatusLine: "fatal:\(code)") {
+            message = local
+        } else {
+            let name = nodeName.isEmpty ? "电脑节点" : nodeName
+            message = DesignTokens.Text.statusHybridPrefix + name + DesignTokens.Text.nodeUnavailableSuffix
+        }
+        return NSError(
+            domain: "com.wyl2607.rsios.spike",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: message]
+        )
+    }
+
     private var blockCount: UInt64 = 0
     private var lastWriteTime: CFAbsoluteTime = 0
     private var lastStatusWriteTime: CFAbsoluteTime = 0
@@ -150,14 +177,18 @@ final class SubtitleEngine {
                 reconnectPolicy = ReconnectPolicy()
                 session = nil
                 nodeSessionToken = nil
+                // 本机档以前不清这两个标志：上一轮遗留的 fatal 会让本轮的
+                // 致命错误不再通知宿主（markFatalError 见到 true 就返回 nil）。
+                fatalErrorOccurred = false
+                fatalErrorReason = ""
             }
             if #available(iOS 26.0, *) {
                 startLocalEngine()
             } else {
                 writeStatus("last=local_needs_ios26")
-                stateQueue.sync {
-                    fatalErrorOccurred = true
-                    fatalErrorReason = "fatal:local_needs_ios26"
+                let fatal = stateQueue.sync { markFatalError(code: "local_needs_ios26") }
+                if let fatal {
+                    onFatalError?(fatal)
                 }
             }
             return
@@ -1029,13 +1060,12 @@ final class SubtitleEngine {
                 // 本机引擎自己坏了：停掉它、把音频交还给节点重连，别让音频继续喂给死引擎。
                 applyAutoDecision(handleAutoEvent(.localAvailabilityChanged(false)))
             } else {
-                let shouldFatal = stateQueue.sync { () -> Bool in
-                    guard broadcastActive, localEngine != nil, localSessionCode == session else { return false }
-                    fatalErrorOccurred = true
-                    fatalErrorReason = "fatal:\(status)"
-                    return true
+                let fatal = stateQueue.sync { () -> Error? in
+                    guard broadcastActive, localEngine != nil, localSessionCode == session else { return nil }
+                    return markFatalError(code: status)
                 }
-                guard shouldFatal else { return }
+                guard let fatal else { return }
+                onFatalError?(fatal)
             }
         }
         writeStatus("last=\(status)")
@@ -1454,10 +1484,12 @@ final class SubtitleEngine {
                     // 自动模式不把节点致命错误记成全局 fatal——那会连本机一起停掉。
                     applyAutoDecision(handleAutoEvent(.reconnectAbandoned))
                 } else {
-                    stateQueue.sync {
-                        guard runGate.isCurrent(generation), nodeSessionToken == sessionToken, session != nil, broadcastActive else { return }
-                        fatalErrorOccurred = true
-                        fatalErrorReason = "fatal:\(code)"
+                    let fatal = stateQueue.sync { () -> Error? in
+                        guard runGate.isCurrent(generation), nodeSessionToken == sessionToken, session != nil, broadcastActive else { return nil }
+                        return markFatalError(code: code)
+                    }
+                    if let fatal {
+                        onFatalError?(fatal)
                     }
                 }
             }
