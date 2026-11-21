@@ -37,6 +37,8 @@ struct ContentView: View {
     /// 拼进去的拒绝提示会被覆盖，用户就再也看不到。
     @State private var prepareSpeechDeniedHint: String?
     @State private var isPreparing = false
+    /// 每次启动只自动查一次资源，切 Tab 回来不重复弹系统下载确认。
+    @State private var didAutoCheckAssets = false
     /// 翻译资源下载只能借 SwiftUI 的 `.translationTask` 拿到 TranslationSession。
     /// 该类型 iOS 18 起才可用，而工程部署目标是 iOS 17。存储属性不能标 `@available`
     /// （Xcode 26 直接报错，Xcode 27 才放行），所以用 Any? 存，用的地方都在 iOS 18 分支里再转回。
@@ -129,6 +131,10 @@ struct ContentView: View {
                     .onAppear {
                         self.loadPairedConfig()
                         self.loadCloudSettings()
+                        if !self.didAutoCheckAssets {
+                            self.didAutoCheckAssets = true
+                            self.prepareLocalAssetsIfMissing()
+                        }
                     }
                     // 相机扫配对码 / 点 rsnode://pair 链接：只把链接填进配对框，用户点「应用配对」才写入钥匙串。
                     // 顺手切到设置里的配对页，省得用户在字幕页找不到输入框。
@@ -678,6 +684,33 @@ struct ContentView: View {
         cloudKeyStatus = "已清除"
     }
 
+    /// 打开 App 时自动查一次：缺资源就直接走准备流程。以前只有手点「准备本机识别资源」才会装，
+    /// 重装 App 后资源跟着没了，用户开了广播只看到空白画中画，根本不知道还差这一步。
+    /// 节点档用不到本机资源，不查。
+    private func prepareLocalAssetsIfMissing() {
+        guard #available(iOS 26.0, *) else { return }
+        let mode = SharedKeychain.readEngineMode()
+        guard mode == "local" || mode == "auto" else { return }
+        Task {
+            guard let supported = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: "de-DE")) else { return }
+            let transcriber = SpeechTranscriber(
+                locale: supported,
+                transcriptionOptions: [],
+                reportingOptions: [.volatileResults, .fastResults],
+                attributeOptions: [.audioTimeRange]
+            )
+            let asrStatus = await AssetInventory.status(forModules: [transcriber])
+            let txStatus = await LanguageAvailability().status(
+                from: Locale.Language(identifier: "de"),
+                to: Locale.Language(identifier: "zh-Hans")
+            )
+            guard asrStatus != .installed || txStatus != .installed else { return }
+            await MainActor.run {
+                if !self.isPreparing { self.prepareLocalAssets() }
+            }
+        }
+    }
+
     private func prepareLocalAssets() {
         guard #available(iOS 26.0, *) else {
             prepareStatus = "需要 iOS 26"
@@ -1141,52 +1174,67 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
             let startY: CGFloat = 20
 
             var y = startY
-            for (idx, line) in displayLines.enumerated() {
-                let isNewest = idx == displayLines.count - 1
-                let alpha = CGFloat(SubtitleDisplay.pairOpacity(index: idx, count: displayLines.count))
-                let translation = SubtitleDisplay.translation(line.dst, isNewest: isNewest)
-
-                let srcAttrs: [NSAttributedString.Key: Any] = [
-                    .font: UIFont.systemFont(ofSize: sourceSize, weight: .medium),
-                    .foregroundColor: uiColor(hex: style.sourceHex, alpha: alpha),
+            // 本机引擎失败（如识别资源没下载）时，画中画常常是用户唯一看着的地方：
+            // 把原因画出来，别留一块空白让人以为还在等字幕。
+            if let localMessage = LocalEngineStatus.userMessage(forStatusLine: status) {
+                let messageAttrs: [NSAttributedString.Key: Any] = [
+                    .font: UIFont.systemFont(ofSize: translationSize * 0.75, weight: .medium),
+                    .foregroundColor: uiColor(hex: DesignTokens.Color.statusError, alpha: 1),
                     .paragraphStyle: paragraphStyle
                 ]
-                let dstAttrs: [NSAttributedString.Key: Any] = [
-                    .font: UIFont.systemFont(ofSize: translationSize, weight: .regular),
-                    .foregroundColor: uiColor(
-                        hex: translation.isPlaceholder ? DesignTokens.Color.untranslated : style.translationHex,
-                        alpha: alpha
-                    ),
-                    .paragraphStyle: paragraphStyle
-                ]
+                let messageText = localMessage as NSString
+                let messageHeight = messageText.boundingRect(with: CGSize(width: 1200, height: 240),
+                                                             options: .usesLineFragmentOrigin,
+                                                             attributes: messageAttrs, context: nil).height
+                messageText.draw(in: CGRect(x: 40, y: y, width: 1200, height: messageHeight), withAttributes: messageAttrs)
+            } else {
+                for (idx, line) in displayLines.enumerated() {
+                    let isNewest = idx == displayLines.count - 1
+                    let alpha = CGFloat(SubtitleDisplay.pairOpacity(index: idx, count: displayLines.count))
+                    let translation = SubtitleDisplay.translation(line.dst, isNewest: isNewest)
 
-                let srcText = line.src as NSString
-                let srcHeight = srcText.boundingRect(with: CGSize(width: 1200, height: 200),
-                                                      options: .usesLineFragmentOrigin,
-                                                      attributes: srcAttrs, context: nil).height
-                srcText.draw(in: CGRect(x: 40, y: y, width: 1200, height: srcHeight), withAttributes: srcAttrs)
-                y += srcHeight + gap
+                    let srcAttrs: [NSAttributedString.Key: Any] = [
+                        .font: UIFont.systemFont(ofSize: sourceSize, weight: .medium),
+                        .foregroundColor: uiColor(hex: style.sourceHex, alpha: alpha),
+                        .paragraphStyle: paragraphStyle
+                    ]
+                    let dstAttrs: [NSAttributedString.Key: Any] = [
+                        .font: UIFont.systemFont(ofSize: translationSize, weight: .regular),
+                        .foregroundColor: uiColor(
+                            hex: translation.isPlaceholder ? DesignTokens.Color.untranslated : style.translationHex,
+                            alpha: alpha
+                        ),
+                        .paragraphStyle: paragraphStyle
+                    ]
 
-                let dstText = translation.text as NSString
-                let dstHeight = dstText.boundingRect(with: CGSize(width: 1200, height: 200),
-                                                      options: .usesLineFragmentOrigin,
-                                                      attributes: dstAttrs, context: nil).height
-                dstText.draw(in: CGRect(x: 40, y: y, width: 1200, height: dstHeight), withAttributes: dstAttrs)
-                y += dstHeight + pairGap
-            }
-
-            // 未定稿草稿：只显示原文，放在最新句对下面，用草稿色区分。
-            if !draft.isEmpty {
-                let draftAttrs: [NSAttributedString.Key: Any] = [
-                    .font: UIFont.systemFont(ofSize: sourceSize * 0.95, weight: .regular),
-                    .foregroundColor: uiColor(hex: DesignTokens.Color.subtitleDraft, alpha: 0.9),
-                    .paragraphStyle: paragraphStyle
-                ]
-                let draftText = draft as NSString
-                let draftHeight = draftText.boundingRect(with: CGSize(width: 1200, height: 200),
+                    let srcText = line.src as NSString
+                    let srcHeight = srcText.boundingRect(with: CGSize(width: 1200, height: 200),
                                                           options: .usesLineFragmentOrigin,
-                                                          attributes: draftAttrs, context: nil).height
-                draftText.draw(in: CGRect(x: 40, y: y, width: 1200, height: draftHeight), withAttributes: draftAttrs)
+                                                          attributes: srcAttrs, context: nil).height
+                    srcText.draw(in: CGRect(x: 40, y: y, width: 1200, height: srcHeight), withAttributes: srcAttrs)
+                    y += srcHeight + gap
+
+                    let dstText = translation.text as NSString
+                    let dstHeight = dstText.boundingRect(with: CGSize(width: 1200, height: 200),
+                                                          options: .usesLineFragmentOrigin,
+                                                          attributes: dstAttrs, context: nil).height
+                    dstText.draw(in: CGRect(x: 40, y: y, width: 1200, height: dstHeight), withAttributes: dstAttrs)
+                    y += dstHeight + pairGap
+                }
+
+                // 未定稿草稿：只显示原文，放在最新句对下面，用草稿色区分。
+                if !draft.isEmpty {
+                    let draftAttrs: [NSAttributedString.Key: Any] = [
+                        .font: UIFont.systemFont(ofSize: sourceSize * 0.95, weight: .regular),
+                        .foregroundColor: uiColor(hex: DesignTokens.Color.subtitleDraft, alpha: 0.9),
+                        .paragraphStyle: paragraphStyle
+                    ]
+                    let draftText = draft as NSString
+                    let draftHeight = draftText.boundingRect(with: CGSize(width: 1200, height: 200),
+                                                              options: .usesLineFragmentOrigin,
+                                                              attributes: draftAttrs, context: nil).height
+                    draftText.draw(in: CGRect(x: 40, y: y, width: 1200, height: draftHeight), withAttributes: draftAttrs)
+                }
             }
 
             let summaryLevel = self.lastStatusSummary?.level ?? .idle
