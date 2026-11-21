@@ -23,7 +23,10 @@ final class MicSource: AudioSource {
 
         let (stream, cont) = AsyncStream<AVAudioPCMBuffer>.makeStream()
         input.installTap(onBus: 0, bufferSize: 4096, format: fmt) { buffer, _ in
-            cont.yield(buffer)
+            // AVAudioEngine 会复用 tap 交来的缓冲；不复制就跨异步边界，消费端读到的
+            // 可能已被下一块覆盖或释放（HC-S01）。和 ProcessTapSource 一样先拷贝。
+            guard let copy = Self.copy(buffer) else { return }
+            cont.yield(copy)
         }
         do {
             engine.prepare()
@@ -44,5 +47,22 @@ final class MicSource: AudioSource {
         engine.stop()
         cont.finish()
         continuation = nil
+    }
+
+    /// 把 tap 缓冲按帧拷进新的 AVAudioPCMBuffer。在音频线程上运行，不做日志；结构对不上就丢这一块。
+    static func copy(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard buffer.frameLength > 0,
+              let out = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: buffer.frameLength)
+        else { return nil }
+        out.frameLength = buffer.frameLength
+        let src = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: buffer.audioBufferList))
+        let dst = UnsafeMutableAudioBufferListPointer(out.mutableAudioBufferList)
+        guard src.count == dst.count else { return nil }
+        for i in 0..<src.count {
+            let n = Int(src[i].mDataByteSize)
+            guard n <= Int(dst[i].mDataByteSize), let from = src[i].mData, let to = dst[i].mData else { return nil }
+            memcpy(to, from, n)
+        }
+        return out
     }
 }

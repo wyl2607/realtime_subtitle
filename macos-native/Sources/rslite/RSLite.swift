@@ -365,8 +365,18 @@ struct RSLite {
         guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else {
             return
         }
-        FileHandle.standardOutput.write(data)
-        FileHandle.standardOutput.write(Data([0x0A]))
+        writeLine(data)
+    }
+
+    /// headless 事件来自多条线程（识别结果、翻译链、云端/节点回调）。一行拆成
+    /// payload 和换行两次 write，并发时会交错成坏 JSON 行（HC-S02），所以整行拼好
+    /// 后在同一把锁里只写一次。
+    private static let stdoutLock = NSLock()
+
+    static func writeLine(_ payload: Data) {
+        var line = payload
+        line.append(0x0A)
+        stdoutLock.withLockVoid { FileHandle.standardOutput.write(line) }
     }
 
     private static func round3(_ value: Double) -> Double {
@@ -386,8 +396,7 @@ struct RSLite {
         guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else {
             return
         }
-        FileHandle.standardOutput.write(data)
-        FileHandle.standardOutput.write(Data([0x0A]))
+        writeLine(data)
     }
 
     private static func runSelfTest() async -> Int32 {
