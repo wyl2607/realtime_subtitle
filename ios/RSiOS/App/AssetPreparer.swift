@@ -104,12 +104,27 @@ final class AssetPreparer {
 
     /// `.translationTask` 回调：prepareTranslation 正常返回不代表真的装上（用户可能取消），
     /// 以再次查询 LanguageAvailability 为准。
-    func prepareTranslation(_ session: TranslationSession) async {
+    /// nonisolated：会话不是 Sendable，必须留在 `.translationTask` 给它的上下文里用，
+    /// 只把查询结果带回主线程。
+    nonisolated func prepareTranslation(_ session: TranslationSession) async {
         _ = try? await session.prepareTranslation()
-        let status = await LanguageAvailability().status(from: Self.source, to: Self.target)
-        translation = status == .installed ? .ready : .missing
+        let status = await LanguageAvailability().status(
+            from: Locale.Language(identifier: "de"),
+            to: Locale.Language(identifier: "zh-Hans")
+        )
+        await finishTranslationPrep(installed: status == .installed, description: "\(status)")
+    }
+
+    /// 给 `.translationTask` 的回调在非隔离的静态函数里创建：写在视图里会被推断成主线程隔离，
+    /// 会话就得跨隔离边界传递（Swift 6 拒绝，它不是 Sendable）。
+    nonisolated static func translationAction(for preparer: AssetPreparer) -> @Sendable (TranslationSession) async -> Void {
+        { session in await preparer.prepareTranslation(session) }
+    }
+
+    private func finishTranslationPrep(installed: Bool, description: String) {
+        translation = installed ? .ready : .missing
         isPreparing = false
-        statusText = "翻译 de→zh-Hans: \(status)"
+        statusText = "翻译 de→zh-Hans: \(description)"
     }
 
     private func checkSpeechAuthorization() {

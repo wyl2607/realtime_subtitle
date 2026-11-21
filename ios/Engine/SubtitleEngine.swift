@@ -8,7 +8,9 @@ import Translation
 
 /// 广播扩展与未来的麦克风采集共用的字幕路由引擎。
 /// 不引入 ReplayKit，主 App 才能复用同一套节点、本机、云端与状态逻辑。
-final class SubtitleEngine {
+/// unchecked Sendable：本类不用 actor，所有跨线程读写的状态都经 stateQueue 串行化，
+/// 音频回调、节点回调、本机引擎回调各在自己的线程里引用 self。
+final class SubtitleEngine: @unchecked Sendable {
     private let logger = Logger(subsystem: "com.wyl2607.rsios.spike", category: "ext")
     private let source: String
 

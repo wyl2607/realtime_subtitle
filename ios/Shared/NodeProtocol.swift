@@ -152,7 +152,8 @@ final class ReadyDeadlineBox: @unchecked Sendable {
 
 /// v2 节点会话客户端。不自动重连、不做 TailnetPin（以后做）。
 /// 日志/打印绝不输出 token 与字幕正文——本类不做任何日志输出。
-final class NodeSession: NSObject, URLSessionWebSocketDelegate {
+/// unchecked Sendable：URLSession 委托要求 Sendable；可变状态都由 `lock` 守护。
+final class NodeSession: NSObject, URLSessionWebSocketDelegate, @unchecked Sendable {
     enum SendResult: Equatable {
         case sent
         case buffered
@@ -193,9 +194,9 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
     private let token: String
     private let src: String
     private let dst: String
-    private let onEvent: (NodeEvent) -> Void
-    private let onClose: (Int) -> Void
-    private let onLoading: ((Double) -> Void)?
+    private let onEvent: @Sendable (NodeEvent) -> Void
+    private let onClose: @Sendable (Int) -> Void
+    private let onLoading: (@Sendable (Double) -> Void)?
     private let readyTimeout: Double
 
     private let lock = NSLock()
@@ -228,9 +229,9 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
         token: String,
         src: String,
         dst: String,
-        onEvent: @escaping (NodeEvent) -> Void,
-        onClose: @escaping (Int) -> Void,
-        onLoading: ((Double) -> Void)? = nil,
+        onEvent: @escaping @Sendable (NodeEvent) -> Void,
+        onClose: @escaping @Sendable (Int) -> Void,
+        onLoading: (@Sendable (Double) -> Void)? = nil,
         readyTimeout: Double = readyTimeoutSeconds
     ) {
         self.url = url

@@ -11,6 +11,7 @@ import os
 ///
 /// 为什么还留 0.5 秒轮询：Darwin 通知在扩展崩溃、系统合并通知时会丢；
 /// 定时器只是兜底，让状态最多晚半秒，节奏和原来四个定时器一致。
+@MainActor
 @Observable
 final class LiveFeed {
     static let shared = LiveFeed()
@@ -54,7 +55,7 @@ final class LiveFeed {
         start()
     }
 
-    deinit {
+    isolated deinit {
         timer?.invalidate()
         let center = CFNotificationCenterGetDarwinNotifyCenter()
         for observer in darwinObservers {
@@ -105,7 +106,7 @@ final class LiveFeed {
         refresh()
         registerDarwinNotifications()
         timer = Timer.scheduledTimer(withTimeInterval: Self.pollInterval, repeats: true) { [weak self] _ in
-            self?.refresh()
+            MainActor.assumeIsolated { self?.refresh() }
         }
         timer?.fire()
     }

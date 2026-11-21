@@ -24,9 +24,7 @@ struct RootView: View {
                 DiagnosticsPage()
             }
         }
-        .translationTask(model.assets.translationConfig) { session in
-            await model.assets.prepareTranslation(session)
-        }
+        .translationTask(model.assets.translationConfig, action: AssetPreparer.translationAction(for: model.assets))
         .onAppear { model.bootstrap() }
         .onOpenURL { model.handleOpenURL($0) }
         .onChange(of: model.feed.lines) { model.ingestFeedLines() }

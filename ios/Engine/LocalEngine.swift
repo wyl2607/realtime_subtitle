@@ -13,6 +13,13 @@ struct LocalSentenceRange: Equatable {
     var end: Double
 }
 
+/// TranslationSession 没标 Sendable，而准备好的会话要经 Task 交给翻译链。
+/// 这里可以 unchecked：同一个会话只被串行尾链（translationTail）一次一句地使用，
+/// 从不并发调用。
+private struct PreparedSession: @unchecked Sendable {
+    let session: TranslationSession
+}
+
 /// 单句翻译超时的失败。只用来在日志里和真的翻译错误区分开；
 /// 上层仍然走「翻译失败只显示原文」的同一条路径。
 private struct TranslationTimeoutError: LocalizedError {
@@ -29,7 +36,7 @@ private struct TranslationTimeoutError: LocalizedError {
 /// 所以必须用锁把「第一次交卷」钉死。为什么不直接用 TaskGroup 竞速：
 /// 作用域退出前会等所有子任务结束，而 Translation 不保证响应取消——
 /// 超时分支抛出去了也照样卡在作用域尾部，串行尾链还是堵住。
-private final class TranslationTimeoutRace<Value>: @unchecked Sendable {
+private final class TranslationTimeoutRace<Value: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
     private var settled: Result<Value, Error>?
     private var waiter: CheckedContinuation<Value, Error>?
@@ -66,7 +73,9 @@ private final class TranslationTimeoutRace<Value>: @unchecked Sendable {
     }
 }
 
-final class LocalEngine {
+/// unchecked Sendable：本类没有 actor 隔离，全部可变状态都由 stateLock 守护
+/// （见下面 stateLock 的说明）。启动、结果循环、翻译链各在自己的 Task 里引用 self。
+final class LocalEngine: @unchecked Sendable {
     private let logger = Logger(subsystem: "com.wyl2607.rsios.spike", category: "local-engine")
 
     /// 单句翻译超时（秒）。TranslationSession 一旦对某句不返回，串行尾链后面
@@ -90,13 +99,13 @@ final class LocalEngine {
     private var analysisTask: Task<Void, Never>?
     private var resultTask: Task<Void, Never>?
     /// 识别不能等翻译模型准备好；结果到达时再等这个任务，首句既不丢译文也不挡原文。
-    private var translationReady: Task<TranslationSession?, Never>?
+    private var translationReady: Task<PreparedSession?, Never>?
     /// 最近一句的翻译任务；下一句接在它后面。
     private var translationTail: Task<Void, Never>?
 
     /// stop() 锁内摘出来的待取消/待结束对象；cancel()/finish() 一律在锁外做。
     private struct StopSnapshot {
-        var translationReady: Task<TranslationSession?, Never>?
+        var translationReady: Task<PreparedSession?, Never>?
         var translationTail: Task<Void, Never>?
         var inputContinuation: AsyncStream<AnalyzerInput>.Continuation?
         var analysisTask: Task<Void, Never>?
@@ -327,7 +336,7 @@ final class LocalEngine {
         if txStatus == .installed {
             // 翻译模型首次准备可能很久，独立执行才能让识别任务立即消费已到的音频。
             // 放在识别器预热和结果任务之前创建：两边的准备并行，最早的结果也一定看得到这个任务。
-            let ready = Task { [weak self] () -> TranslationSession? in
+            let ready = Task { [weak self] () -> PreparedSession? in
                 guard let self, !self.isStopped() else { return nil }
                 let session = TranslationSession(installedSource: self.sourceLocale, target: self.targetLocale)
                 do {
@@ -338,7 +347,7 @@ final class LocalEngine {
                         self.translationSession = session
                         return true
                     }
-                    return kept ? session : nil
+                    return kept ? PreparedSession(session: session) : nil
                 } catch {
                     guard !self.isStopped() else { return nil }
                     self.logger.error("TranslationSession prepare failed: \(error.localizedDescription)")
@@ -509,9 +518,9 @@ final class LocalEngine {
         Task { [weak self] in
             guard let self else { return }
             do {
-                let response = try await self.translateWithTimeout(session, text: trimmed)
+                let targetText = try await self.translateWithTimeout(session, text: trimmed)
                 guard !self.isStopped() else { return }
-                let translated = response.targetText.trimmingCharacters(in: .whitespacesAndNewlines)
+                let translated = targetText.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !translated.isEmpty {
                     self.emitTranslation(id, translated)
                 } else {
@@ -634,11 +643,13 @@ final class LocalEngine {
     private func translateWithTimeout(
         _ session: TranslationSession,
         text: String
-    ) async throws -> TranslationSession.Response {
-        let race = TranslationTimeoutRace<TranslationSession.Response>()
+    ) async throws -> String {
+        let race = TranslationTimeoutRace<String>()
+        // 会话本身不是 Sendable；装进 PreparedSession 交给工作任务，理由见那个类型的说明。
+        let prepared = PreparedSession(session: session)
         let work = Task {
             do {
-                race.settle(.success(try await session.translate(text)))
+                race.settle(.success(try await prepared.session.translate(text).targetText))
             } catch {
                 race.settle(.failure(error))
             }
@@ -664,11 +675,11 @@ final class LocalEngine {
     private func translateAndSettle(id: Int, text: String) async {
         guard !isStopped() else { return }
         let ready = stateLock.withLock { translationReady }
-        if let session = await ready?.value {
+        if let session = await ready?.value?.session {
             do {
-                let response = try await translateWithTimeout(session, text: text)
+                let targetText = try await translateWithTimeout(session, text: text)
                 guard !isStopped() else { return }
-                let translated = response.targetText.trimmingCharacters(in: .whitespacesAndNewlines)
+                let translated = targetText.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !translated.isEmpty {
                     emitTranslation(id, translated)
                 } else {

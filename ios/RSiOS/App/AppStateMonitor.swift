@@ -10,6 +10,7 @@ extension DateFormatter {
     }()
 }
 
+@MainActor
 @Observable
 final class AppStateMonitor {
     static let shared = AppStateMonitor()

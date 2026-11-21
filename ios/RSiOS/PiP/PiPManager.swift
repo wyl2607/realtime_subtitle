@@ -46,8 +46,9 @@ fileprivate func uiColor(hex: String, alpha: CGFloat) -> UIColor {
     return UIColor(red: CGFloat(rgb.r), green: CGFloat(rgb.g), blue: CGFloat(rgb.b), alpha: alpha)
 }
 
+@MainActor
 @Observable
-final class PiPManager: NSObject, AVPictureInPictureSampleBufferPlaybackDelegate {
+final class PiPManager: NSObject, @preconcurrency AVPictureInPictureSampleBufferPlaybackDelegate {
     var isPiPActive = false
     var isStarting = false
     var lastError: String?
@@ -84,7 +85,7 @@ final class PiPManager: NSObject, AVPictureInPictureSampleBufferPlaybackDelegate
         startRendering()
     }
 
-    deinit {
+    isolated deinit {
         stopRendering()
         if let observer = feedObserver {
             NotificationCenter.default.removeObserver(observer)
@@ -141,7 +142,7 @@ final class PiPManager: NSObject, AVPictureInPictureSampleBufferPlaybackDelegate
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.backgroundFrameCount = 0
+            MainActor.assumeIsolated { self?.backgroundFrameCount = 0 }
         }
     }
 
@@ -153,7 +154,7 @@ final class PiPManager: NSObject, AVPictureInPictureSampleBufferPlaybackDelegate
             object: LiveFeed.shared,
             queue: .main
         ) { [weak self] _ in
-            self?.renderFrame()
+            MainActor.assumeIsolated { self?.renderFrame() }
         }
     }
 
@@ -191,8 +192,9 @@ final class PiPManager: NSObject, AVPictureInPictureSampleBufferPlaybackDelegate
         stopRendering()
         frameCount = 0
         backgroundFrameCount = 0
+        // 主线程 RunLoop 上的定时器，回调一定在主线程。
         renderTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            self?.tickRender()
+            MainActor.assumeIsolated { self?.tickRender() }
         }
         // 内嵌预览要先有一帧，「未激活 + 前台」的定时器跳过规则不适用于首帧。
         renderFrame()
@@ -255,10 +257,12 @@ final class PiPManager: NSObject, AVPictureInPictureSampleBufferPlaybackDelegate
 
         let sbWithAttachment = setDisplayImmediately(sb)
 
-        if layer.status == .failed {
-            layer.flush()
+        // iOS 18 起队列/状态在 sampleBufferRenderer 上，图层上的同名 API 已弃用。
+        let renderer = layer.sampleBufferRenderer
+        if renderer.status == .failed {
+            renderer.flush()
         }
-        layer.enqueue(sbWithAttachment)
+        renderer.enqueue(sbWithAttachment)
 
         if AppStateMonitor.shared.isInBackground {
             DispatchQueue.main.async {
@@ -466,7 +470,7 @@ final class PiPManager: NSObject, AVPictureInPictureSampleBufferPlaybackDelegate
     func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, didTransitionToRenderSize newRenderSize: CMVideoDimensions) {}
 }
 
-extension PiPManager: AVPictureInPictureControllerDelegate {
+extension PiPManager: @preconcurrency AVPictureInPictureControllerDelegate {
     func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
         DispatchQueue.main.async {
             self.isPiPActive = true

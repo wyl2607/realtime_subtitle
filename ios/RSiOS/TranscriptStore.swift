@@ -26,7 +26,8 @@ import os
 /// 一小时视频上千行。以前每次都在 `queue.sync` 里原子重写整份文件——同步等磁盘、
 /// 行数越多越慢。现在内存状态在串行队列上立即合并（一句都不丢），落盘推迟到
 /// 合并窗口到点后写一次；进后台/退出必须 `flush()`，因为进程可能被系统随时回收。
-final class TranscriptStore {
+/// unchecked Sendable：可变状态只在私有串行队列 `queue` 上读写。
+final class TranscriptStore: @unchecked Sendable {
     struct Sentence {
         let id: Int
         /// 产生这一句的引擎会话代号：各引擎的 id 都从 1 重新计数，只靠 id 会覆盖旧句。

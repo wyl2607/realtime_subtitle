@@ -1,4 +1,4 @@
-import AVFoundation
+@preconcurrency import AVFoundation
 import Foundation
 import Observation
 import Speech
@@ -12,6 +12,7 @@ enum MicCaptureState: Equatable {
     case error(String)
 }
 
+@MainActor
 @Observable
 final class MicCapture {
     private(set) var state: MicCaptureState = .idle
@@ -39,19 +40,22 @@ final class MicCapture {
                 object: AVAudioSession.sharedInstance(),
                 queue: .main
             ) { [weak self] notification in
-                self?.handleInterruption(notification)
+                // queue: .main 保证在主线程回调；Notification 不是 Sendable，只在这一次同步调用里用。
+                nonisolated(unsafe) let notification = notification
+                MainActor.assumeIsolated { self?.handleInterruption(notification) }
             },
             center.addObserver(
                 forName: AVAudioSession.routeChangeNotification,
                 object: AVAudioSession.sharedInstance(),
                 queue: .main
             ) { [weak self] notification in
-                self?.handleRouteChange(notification)
+                nonisolated(unsafe) let notification = notification
+                MainActor.assumeIsolated { self?.handleRouteChange(notification) }
             },
         ]
     }
 
-    deinit {
+    isolated deinit {
         notificationObservers.forEach(NotificationCenter.default.removeObserver)
     }
 
@@ -157,15 +161,7 @@ final class MicCapture {
         guard format.sampleRate > 0, format.channelCount > 0 else {
             throw MicCaptureError.invalidInputFormat
         }
-        let queue = ingestQueue
-        let subtitleEngine = subtitleEngine
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { buffer, _ in
-            // tap 返回后原 buffer 可被 Core Audio 复用；先复制再投递，实时线程只做这两件事。
-            guard let copiedBuffer = copy(buffer) else { return }
-            queue.async {
-                subtitleEngine.ingest(pcmBuffer: copiedBuffer)
-            }
-        }
+        Self.installIngestTap(on: inputNode, format: format, queue: ingestQueue, engine: subtitleEngine)
 
         // 先装 tap 再启动路由：audioEngine.start() 之后的第一帧不会落在尚未初始化的引擎前面。
         if startingSubtitleEngine {
@@ -173,6 +169,24 @@ final class MicCapture {
         }
         audioEngine.prepare()
         try audioEngine.start()
+    }
+
+    /// tap 回调跑在 Core Audio 实时线程上。闭包必须在非隔离的静态函数里创建：
+    /// 写在 @MainActor 方法里会被推断成主线程隔离，Swift 6 的运行期检查会在音频线程上直接崩溃。
+    private nonisolated static func installIngestTap(
+        on inputNode: AVAudioInputNode,
+        format: AVAudioFormat,
+        queue: DispatchQueue,
+        engine: SubtitleEngine
+    ) {
+        inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { buffer, _ in
+            // tap 返回后原 buffer 可被 Core Audio 复用；先复制再投递，实时线程只做这两件事。
+            guard let copiedBuffer = copy(buffer) else { return }
+            let owned = OwnedBuffer(buffer: copiedBuffer)
+            queue.async {
+                engine.ingest(pcmBuffer: owned.buffer)
+            }
+        }
     }
 
     private func stopAudioPipeline() {
@@ -302,6 +316,11 @@ final class MicCapture {
 
 /// `AVAudioPCMBuffer(copying:)` 是 iOS 27 才新增的 API；部署目标 iOS 17 时手动拷贝各 AudioBuffer。
 /// 此函数只在 tap 内调用，不能做格式转换、同步等待或访问共享状态。
+/// 复制出来的缓冲只交给 ingestQueue 一处使用，所有权单向转移，可以 unchecked。
+private struct OwnedBuffer: @unchecked Sendable {
+    let buffer: AVAudioPCMBuffer
+}
+
 private func copy(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
     guard buffer.frameLength > 0,
           let copiedBuffer = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: buffer.frameLength) else {
