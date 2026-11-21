@@ -599,7 +599,14 @@ class AudioCapture:
         while self.running:
             try:
                 # 从队列获取音频（阻塞等待）
-                audio_data, capture_time = self.audio_queue.get(timeout=1.0)
+                try:
+                    # 提交周期可调长，必须等正常块有机会攒够，才把空闲当作静音。
+                    audio_data, capture_time = self.audio_queue.get(
+                        timeout=max(1.0, 2 * config.CHUNK_SUBMIT_SECONDS))
+                except queue.Empty:
+                    # 静音门停止提交（或 WASAPI 停止投递）时远程仍需收尾。
+                    # 空块只通知时间，由 app 给远程补有界静音，不唤醒本机 Whisper。
+                    audio_data, capture_time = np.empty(0, dtype=np.float32), time.time()
 
                 # 调用回调函数
                 if self.callback:
@@ -610,8 +617,6 @@ class AudioCapture:
                         import traceback
                         traceback.print_exc()
 
-            except queue.Empty:
-                continue
             except Exception as e:
                 if self.running:
                     print(f"❌ 音频处理错误: {e}")

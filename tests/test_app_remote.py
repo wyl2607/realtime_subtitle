@@ -164,6 +164,173 @@ def test_both_off_constructs_nothing():
     assert bridge is None
 
 
+@pytest.mark.parametrize("failure", ["deadline", "read_timeout", "disconnect"])
+def test_hc_r01_no_reply_is_billed_once_without_daily_correction(tmp_path, monkeypatch, failure):
+    """硬约束 HC-R01：发出后无回复也按至少 10 秒记一次，不校正每日窗口。"""
+    import json
+    import requests
+    from realtime_subtitle.remote.cloud_client import CloudClient
+    from realtime_subtitle.remote.quota import QuotaLedger
+
+    release = threading.Event()
+
+    class Session:
+        def post(self, *_args, **_kwargs):
+            if failure == "deadline":
+                release.wait(timeout=2)
+            if failure == "read_timeout":
+                raise requests.ReadTimeout("slow")
+            raise requests.ConnectionError("connection lost")
+
+        def close(self):
+            pass
+
+    key_path = tmp_path / "groq.key"
+    key_path.write_text("gsk_hc_r01_fake_key")
+    client = CloudClient(key_path=key_path, session_factory=Session)
+    monkeypatch.setattr("realtime_subtitle.remote.cloud_client.REQUEST_DEADLINE_S", 0.05)
+    bridge, _ui, _translator = _open(
+        cloud_on=True, node_on=False, key_path=key_path,
+        cloud_client_factory=lambda key_path=None: client, segmenter_factory=_Segmenter,
+        ledger_factory=lambda path, routing=None: QuotaLedger(path, routing=routing),
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs), quota_path=tmp_path / "quota.json",
+    )
+    try:
+        bridge.feed_audio(np.ones(3200, dtype=np.float32) * 0.2)
+        bridge.flush()
+        usage = bridge.ledger.usage()
+        assert (usage.minute_requests, usage.day_requests, usage.hour_audio_s, usage.day_audio_s) == (1, 1, 10, 10), (
+            "违反 HC-R01：已发出的无响应请求漏记或重复记账；"
+            "Groq 可能已收费，必须按 audio_s 和至少 10 秒下限只记一次。")
+        saved = json.loads(bridge.ledger.path.read_text())
+        assert saved.get("server_day_used") is None and saved.get("reset_record") is None, (
+            "违反 HC-R01：没有响应头却校正了每日窗口；必须用 None 记账且不能建立重置证明。")
+    finally:
+        release.set()
+        bridge.close()
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_hc_r01_unsent_failure_is_not_billed(tmp_path, cancelled):
+    """硬约束 HC-R01：读 key 失败、发送前取消不能记额度。"""
+    from realtime_subtitle.remote.cloud_client import CloudCancelled, CloudError
+
+    bridge, _ui, _translator = _open(
+        cloud_on=True, node_on=False,
+        cloud_client_factory=lambda key_path=None: _Cloud(), segmenter_factory=_Segmenter,
+        ledger_factory=lambda path, routing=None: _Ledger(path, routing),
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs), quota_path=tmp_path / "quota.json",
+    )
+    try:
+        error = (CloudCancelled(audio_s=0.2) if cancelled else
+                 CloudError(status=None, reason="key_unreadable", exc_type="OSError", audio_s=0.2))
+        bridge._on_cloud_exception(error, bridge._generation)
+        assert bridge.ledger.notes == [], (
+            "违反 HC-R01：未发送请求也扣了额度；必须区分可能已送达与发送前失败/取消。")
+    finally:
+        bridge.close()
+
+
+@pytest.mark.parametrize("provider", ["cloud", "node"])
+@pytest.mark.parametrize("tail_s", [0.0, 0.5])
+def test_hc_r02_idle_releases_tail_and_keeps_local_sample_clock(tmp_path, monkeypatch, provider, tail_s):
+    """硬约束 HC-R02：静音时独立释放尾句，补零有界且远端时间仍对齐本机样本钟。"""
+    from types import SimpleNamespace
+    from realtime_subtitle.app import SubtitleApp
+    from realtime_subtitle.node.segmenter import SAMPLE_RATE, Segmenter, WINDOW
+    from realtime_subtitle.remote.cloud_segmenter import CloudSegmenter
+
+    def vad(window):
+        return float(np.max(np.abs(window)) > 0.02)
+
+    class EchoCloud(_Cloud):
+        def transcribe(self, pcm, *, a0, language):
+            self.calls.append((a0, language, len(pcm)))
+            duration = len(pcm) / SAMPLE_RATE
+            return CloudTranscript(
+                text=f"sentence {len(self.calls)}", segments=(), groq_id=None,
+                audio_s=duration, duration_s=duration, status=200, remaining_requests=None)
+
+    nodes = []
+
+    class SegmentingNode(_Node):
+        def __init__(self, callbacks):
+            super().__init__()
+            self.segmenter = Segmenter(vad)
+            self.callbacks = callbacks
+            self.origin = None
+            self.count = 0
+
+        async def send(self, data, start_seconds):
+            await super().send(data, start_seconds)
+            if self.origin is None:
+                self.origin = start_seconds
+            for seg in self.segmenter.feed(np.frombuffer(data, dtype=np.int16)):
+                self.count += 1
+                self.callbacks.on_final("desk", 0, self.count, f"sentence {self.count}",
+                                        self.origin + seg.a0, self.origin + seg.a1)
+
+    def node_factory(_cfg, _info, callbacks):
+        node = SegmentingNode(callbacks)
+        nodes.append(node)
+        return node
+
+    monkeypatch.setattr("realtime_subtitle.remote.router.read_self_node_id", lambda: "this-machine")
+    cloud = EchoCloud()
+    segmenter = CloudSegmenter(vad)
+    translator = _Translator()
+    translator._sample_clock_samples = 10 * SAMPLE_RATE
+    local_audio = []
+    translator.enqueue_audio = lambda audio, capture_time: local_audio.append((audio, capture_time))
+    bridge, ui, _ = _open(
+        translator=translator, cloud_on=provider == "cloud", node_on=provider == "node",
+        cloud_client_factory=lambda key_path=None: cloud, segmenter_factory=lambda: segmenter,
+        ledger_factory=lambda path, routing=None: _Ledger(path, routing),
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs),
+        prepare=lambda cfg: ("100.64.0.8", object()), node_client_factory=node_factory,
+        node_entries=[NodeConfig(id="desk", node_id="tk007nodeid0001",
+                                 url="ws://100.64.0.8:8791", token_file="unused")],
+        quota_path=tmp_path / "quota.json",
+    )
+    app = SimpleNamespace(running=True, translator=translator, remote=bridge)
+    speech = np.full(20 * WINDOW, 0.2, dtype=np.float32)
+    silence = np.zeros(int(tail_s * SAMPLE_RATE), dtype=np.float32)
+    idle = np.empty(0, dtype=np.float32)
+    received = lambda: (segmenter._segmenter.samples_received if provider == "cloud" else
+                        nodes[0].segmenter.samples_received)
+    try:
+        SubtitleApp.on_audio_received(app, speech, 1000.64)
+        SubtitleApp.on_audio_received(app, silence, 1000.64 + tail_s)
+        SubtitleApp.on_audio_received(app, idle, 1002.64)
+        bridge.flush()
+        assert len(ui.lines) == 1, (
+            "违反 HC-R02：停讲话后尾句仍被扣住；必须用 capture_time 推进远程静音样本钟，"
+            "不等下一句、不依赖 flush 才发出。")
+        first = ui.lines[0]
+        assert (first["t0"], first["t1"]) == pytest.approx((10.0, 10.64)), (
+            "违反 HC-R02：补零改变了远端句与本机样本钟的对应；必须保留开桥 origin。")
+        for capture_time in (1004.14, 2000.0, 3000.0):
+            SubtitleApp.on_audio_received(app, idle, capture_time)
+        bridge.flush()
+        assert received() <= len(speech) + len(silence) + 2 * SAMPLE_RATE, (
+            "违反 HC-R02：长时间静音无限补零；必须将每次空闲补零限制到足够释放尾句的长度。")
+        SubtitleApp.on_audio_received(app, speech, 3000.64)
+        SubtitleApp.on_audio_received(app, silence, 3000.64 + tail_s)
+        SubtitleApp.on_audio_received(app, idle, 3002.64)
+        bridge.flush()
+        assert len(ui.lines) == 2, (
+            "违反 HC-R02：最后一句与下一次开口合并或丢失；必须在空闲时结束前段。")
+        second = ui.lines[-1]
+        assert (second["t0"], second["t1"]) == pytest.approx((10.64 + tail_s, 11.28 + tail_s), abs=0.032), (
+            "违反 HC-R02：补零时长混入本机时间轴；必须在远端结果回传时扣掉虚拟静音。")
+        assert len(local_audio) == 2 + 2 * bool(tail_s) and sum(len(audio) for audio, _ in local_audio) == 2 * (len(speech) + len(silence)), (
+            "违反 HC-R02：远程空闲样本进入本机 Whisper；必须只给远程补零，本机只接收采集的真实块。")
+        assert bridge._fed_samples == 2 * (len(speech) + len(silence)), (
+            "违反 HC-R02：_fed_samples 混入补零导致本机对齐漂移；必须只计真实采集样本。")
+    finally:
+        bridge.close()
+
+
 def test_cloud_on_builds_cloud_stack_not_node_client(tmp_path):
     cloud = _Cloud()
     segmenter = _Segmenter()
