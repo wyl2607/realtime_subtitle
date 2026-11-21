@@ -30,6 +30,7 @@ final class TranscriptArchive {
     private var days: [String: [Row]] = [:]
     private var index: [String: (day: String, row: Int)] = [:]
     private var loadedDays: Set<String> = []
+    private var dirtyDays: Set<String> = []
     private var writeCount = 0
 
     init(
@@ -66,20 +67,24 @@ final class TranscriptArchive {
         self.queue.sync {
             let timestamp = self.now()
             let today = self.dateKey(for: timestamp)
-            self.ensureLoaded(today)
+            let todayLoaded = self.ensureLoaded(today)
             let archiveKey = self.archiveKey(for: key)
             let sanitizedSource = self.sanitize(src)
             let sanitizedTranslation = self.sanitize(dst ?? "")
 
             if let location = self.index[archiveKey] {
                 let row = self.days[location.day]![location.row]
-                guard row.src != sanitizedSource || row.dst != sanitizedTranslation else { return }
-                self.days[location.day]![location.row].src = sanitizedSource
-                self.days[location.day]![location.row].dst = sanitizedTranslation
+                if row.src != sanitizedSource || row.dst != sanitizedTranslation {
+                    self.days[location.day]![location.row].src = sanitizedSource
+                    self.days[location.day]![location.row].dst = sanitizedTranslation
+                    self.dirtyDays.insert(location.day)
+                }
                 self.write(location.day)
                 return
             }
 
+            // 未读回原文件时不构造可写快照；下一次调用会重新尝试读取。
+            guard todayLoaded else { return }
             var rows = self.days[today] ?? []
             rows.append(Row(
                 key: archiveKey,
@@ -89,6 +94,7 @@ final class TranscriptArchive {
             ))
             self.days[today] = rows
             self.index[archiveKey] = (today, rows.count - 1)
+            self.dirtyDays.insert(today)
             self.write(today)
         }
     }
@@ -98,7 +104,6 @@ final class TranscriptArchive {
         self.queue.sync {
             self.ensureLoaded(self.dateKey(for: self.now()))
             let archiveKeys = Set(keys.map { self.archiveKey(for: $0) })
-            var dirtyDays: Set<String> = []
 
             for day in self.loadedDays {
                 guard let rows = self.days[day] else { continue }
@@ -108,11 +113,20 @@ final class TranscriptArchive {
                 }
                 guard kept.count != rows.count else { continue }
                 self.days[day] = kept
-                dirtyDays.insert(day)
+                self.rebuildIndex(for: day)
+                self.dirtyDays.insert(day)
             }
 
-            for day in dirtyDays {
-                self.rebuildIndex(for: day)
+            for day in self.dirtyDays.sorted() {
+                self.write(day)
+            }
+        }
+    }
+
+    /// 每个待写日期只尝试一次；失败仍保留 dirty 状态，供后续调用重试。
+    func flushPending() {
+        self.queue.sync {
+            for day in self.dirtyDays.sorted() {
                 self.write(day)
             }
         }
@@ -250,6 +264,94 @@ final class TranscriptArchive {
         check(dayArchive.lines(for: today).contains { $0.src == "Gestern neu" }, "昨天的 key 今天更新应写回昨天文件")
         check(dayArchive.lines(for: clock.date).contains { $0.src == "Heute" }, "今天的新 key 应写入今天文件")
 
+        for invalidUTF8 in [false, true] {
+            let readDirectory = directory.appendingPathComponent("read-failure-\(invalidUTF8)", isDirectory: true)
+            let reader = TranscriptArchive(directory: readDirectory, session: "read-test", now: { today }, timeZone: timeZone)
+            let url = reader.fileURL(for: today)
+            let original = Data("09:10:11\tOriginal\t原文\told#1\n".utf8)
+                + (invalidUTF8 ? Data([0xff]) : Data())
+            do {
+                try fileManager.createDirectory(at: readDirectory, withIntermediateDirectories: true)
+                try original.write(to: url)
+                defer { try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path) }
+                if !invalidUTF8 {
+                    try fileManager.setAttributes([.posixPermissions: 0o000], ofItemAtPath: url.path)
+                }
+                do {
+                    _ = try String(contentsOf: url, encoding: .utf8)
+                    failures.append("读取失败用例必须实际拒绝读取或解码")
+                } catch {}
+                reader.upsert(key: 1, src: "New", dst: nil)
+                reader.flushPending()
+                try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+                check(try Data(contentsOf: url) == original, "读取失败后 upsert 必须保留原文件")
+                try Data("09:10:11\tOriginal\t原文\told#1\n".utf8).write(to: url)
+                reader.upsert(key: 1, src: "New", dst: nil)
+                let recovered = TranscriptArchive(directory: readDirectory, session: "check", now: { today }, timeZone: timeZone)
+                    .lines(for: today)
+                check(recovered.map(\.src) == ["Original", "New"], "读取恢复后应重新加载旧行并接受 upsert")
+            } catch {
+                failures.append("读取失败用例执行失败：\(error.localizedDescription)")
+            }
+        }
+
+        let retryDirectory = directory.appendingPathComponent("write-retry", isDirectory: true)
+        let retry = TranscriptArchive(directory: retryDirectory, session: "retry", now: { today }, timeZone: timeZone)
+        let retryURL = retry.fileURL(for: today)
+        do {
+            // 先加载不存在的日期，再用目录占据文件路径，稳定制造原子写失败。
+            _ = retry.lines(for: today)
+            try fileManager.createDirectory(at: retryURL, withIntermediateDirectories: true)
+            retry.upsert(key: 1, src: "Pending", dst: "待写")
+            check(retry.writesForTesting() == 0, "故障期间写盘必须实际失败")
+            try fileManager.removeItem(at: retryURL)
+            retry.upsert(key: 1, src: "Pending", dst: "待写")
+            let persisted = TranscriptArchive(directory: retryDirectory, session: "check", now: { today }, timeZone: timeZone)
+                .lines(for: today)
+            check(persisted == [Line(time: retry.timeString(for: today), src: "Pending", dst: "待写")], "写盘恢复后相同 upsert 应重试落盘")
+
+            try fileManager.removeItem(at: retryURL)
+            try fileManager.createDirectory(at: retryURL, withIntermediateDirectories: true)
+            let writesBeforeRemove = retry.writesForTesting()
+            retry.remove(keys: [1])
+            check(retry.writesForTesting() == writesBeforeRemove, "删除故障期间写盘必须实际失败")
+            try fileManager.removeItem(at: retryURL)
+            retry.remove(keys: [1])
+            check((try? Data(contentsOf: retryURL)) == Data(), "写盘恢复后相同 remove 应重试落盘")
+        } catch {
+            failures.append("写盘重试用例执行失败：\(error.localizedDescription)")
+        }
+
+        let flushDirectory = directory.appendingPathComponent("flush-pending", isDirectory: true)
+        let flushClock = TranscriptArchiveTestClock(today)
+        let pending = TranscriptArchive(directory: flushDirectory, session: "flush", now: { flushClock.date }, timeZone: timeZone)
+        let tomorrow = today.addingTimeInterval(86_400)
+        let todayURL = pending.fileURL(for: today)
+        let tomorrowURL = pending.fileURL(for: tomorrow)
+        do {
+            _ = pending.lines(for: today)
+            _ = pending.lines(for: tomorrow)
+            try fileManager.createDirectory(at: todayURL, withIntermediateDirectories: true)
+            try fileManager.createDirectory(at: tomorrowURL, withIntermediateDirectories: true)
+            pending.upsert(key: 1, src: "Day one", dst: nil)
+            flushClock.date = tomorrow
+            pending.upsert(key: 2, src: "Day two", dst: nil)
+            pending.flushPending()
+            check(pending.writesForTesting() == 0, "flush 失败应保留各日期待写状态")
+            try fileManager.removeItem(at: todayURL)
+            pending.flushPending()
+            check(pending.writesForTesting() == 1, "flush 应独立保存已恢复的日期")
+            try fileManager.removeItem(at: tomorrowURL)
+            pending.flushPending()
+            pending.flushPending()
+            check(pending.writesForTesting() == 2, "成功日期应清除 dirty，失败日期应继续重试")
+            let saved = TranscriptArchive(directory: flushDirectory, session: "check", now: { tomorrow }, timeZone: timeZone)
+            check(saved.lines(for: today).map(\.src) == ["Day one"], "flush 应写回昨天待写记录")
+            check(saved.lines(for: tomorrow).map(\.src) == ["Day two"], "flush 应写回今天待写记录")
+        } catch {
+            failures.append("退出 flush 用例执行失败：\(error.localizedDescription)")
+        }
+
         let searchable = [
             Line(time: "10:00:00", src: "Über den Fluss", dst: "越过河流"),
             Line(time: "10:01:00", src: "Guten Tag", dst: "你好世界"),
@@ -278,13 +380,25 @@ final class TranscriptArchive {
         self.timeFormatter.string(from: date)
     }
 
-    private func ensureLoaded(_ day: String) {
-        guard !self.loadedDays.contains(day) else { return }
-        self.loadedDays.insert(day)
+    @discardableResult
+    private func ensureLoaded(_ day: String) -> Bool {
+        guard !self.loadedDays.contains(day) else { return true }
 
         let url = self.directory.appendingPathComponent("\(day).txt")
-        guard let data = try? Data(contentsOf: url), let text = String(data: data, encoding: .utf8) else {
-            return
+        let text: String
+        do {
+            let data = try Data(contentsOf: url)
+            guard let decoded = String(data: data, encoding: .utf8) else {
+                throw CocoaError(.fileReadInapplicableStringEncoding)
+            }
+            text = decoded
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {
+            self.days[day] = []
+            self.loadedDays.insert(day)
+            return true
+        } catch {
+            self.logger.error("Transcript read failed day=\(day, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+            return false
         }
 
         let rows = text.split(separator: "\n", omittingEmptySubsequences: true).map { line -> Row in
@@ -299,6 +413,8 @@ final class TranscriptArchive {
         }
         self.days[day] = rows
         self.rebuildIndex(for: day)
+        self.loadedDays.insert(day)
+        return true
     }
 
     private func rebuildIndex(for day: String) {
@@ -311,7 +427,7 @@ final class TranscriptArchive {
     }
 
     private func write(_ day: String) {
-        guard let rows = self.days[day] else { return }
+        guard self.loadedDays.contains(day), self.dirtyDays.contains(day), let rows = self.days[day] else { return }
         do {
             try FileManager.default.createDirectory(at: self.directory, withIntermediateDirectories: true)
             let body = rows.map { row in
@@ -319,6 +435,7 @@ final class TranscriptArchive {
             }.joined(separator: "\n") + (rows.isEmpty ? "" : "\n")
             try Data(body.utf8).write(to: self.directory.appendingPathComponent("\(day).txt"), options: .atomic)
             self.writeCount += 1
+            self.dirtyDays.remove(day)
         } catch {
             self.logger.error("Transcript write failed day=\(day, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
         }

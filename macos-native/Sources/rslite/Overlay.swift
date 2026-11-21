@@ -293,6 +293,9 @@ final class OverlayController: NSObject {
         super.init()
         configurePanel()
         configureStatusItem()
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(flushTranscriptOnTermination), name: NSApplication.willTerminateNotification, object: nil
+        )
         panel.delegate = self
         panel.arrowKeyHandler = { [weak self] event in
             self?.handleArrowKey(event) ?? false
@@ -1553,6 +1556,10 @@ final class OverlayController: NSObject {
         reviewIdleTask?.cancel()
         reviewIdleTask = nil
         render(animate: true)
+    }
+
+    @objc private func flushTranscriptOnTermination(_ notification: Notification) {
+        archive.flushPending()
     }
 
     @objc private func quit() {

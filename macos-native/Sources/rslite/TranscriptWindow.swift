@@ -14,6 +14,7 @@ final class TranscriptWindow: NSObject, NSWindowDelegate, NSSearchFieldDelegate 
     private var textView: NSTextView { self.scrollView.documentView as! NSTextView }
     private var allLines: [TranscriptArchive.Line] = []
     private var filteredLines: [TranscriptArchive.Line] = []
+    private var loadedDate: Date?
 
     init(archive: TranscriptArchive) {
         self.archive = archive
@@ -25,6 +26,12 @@ final class TranscriptWindow: NSObject, NSWindowDelegate, NSSearchFieldDelegate 
         )
         super.init()
         self.configureWindow()
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(self.reloadIfDayChanged), name: .NSCalendarDayChanged, object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(self.reloadIfDayChanged), name: NSApplication.didBecomeActiveNotification, object: nil
+        )
     }
 
     func show() {
@@ -37,8 +44,21 @@ final class TranscriptWindow: NSObject, NSWindowDelegate, NSSearchFieldDelegate 
     func reload() {
         guard self.window.isVisible else { return }
         let shouldScrollToBottom = self.isAtBottom()
-        self.allLines = self.archive.lines(for: Date())
+        let date = Date()
+        self.allLines = self.archive.lines(for: date)
+        self.loadedDate = date
         self.refreshText(scrollToBottom: shouldScrollToBottom)
+    }
+
+    @objc nonisolated private func reloadIfDayChanged(_ notification: Notification) {
+        // 日历通知不保证投递线程，AppKit 的读取与刷新统一回到主线程。
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if let loadedDate = self.loadedDate, Calendar.current.isDate(loadedDate, inSameDayAs: Date()) {
+                return
+            }
+            self.reload()
+        }
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
