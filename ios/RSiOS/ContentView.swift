@@ -1176,7 +1176,9 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
             var y = startY
             // 本机引擎失败（如识别资源没下载）时，画中画常常是用户唯一看着的地方：
             // 把原因画出来，别留一块空白让人以为还在等字幕。
-            if let localMessage = LocalEngineStatus.userMessage(forStatusLine: status) {
+            // 翻译不可用时原文照常在出，那种情况原因只放底部状态行，不能把字幕盖掉。
+            let localMessage = LocalEngineStatus.userMessage(forStatusLine: status)
+            if let localMessage, displayLines.isEmpty, draft.isEmpty {
                 let messageAttrs: [NSAttributedString.Key: Any] = [
                     .font: UIFont.systemFont(ofSize: translationSize * 0.75, weight: .medium),
                     .foregroundColor: uiColor(hex: DesignTokens.Color.statusError, alpha: 1),
@@ -1255,7 +1257,7 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
                 .paragraphStyle: paragraphStyle
             ]
 
-            let label = self.lastStatusSummary?.label ?? DesignTokens.Text.micStatusIdle
+            let label = localMessage ?? self.lastStatusSummary?.label ?? DesignTokens.Text.micStatusIdle
             let statusStr = "\(time) · \(label)" as NSString
             let statusHeight = statusStr.boundingRect(with: CGSize(width: 1200, height: 100),
                                                        options: .usesLineFragmentOrigin,
