@@ -30,6 +30,8 @@ final class AppModel {
     let appState = AppStateMonitor.shared
     let assets = AssetPreparer()
     @ObservationIgnored private let liveActivity = LiveActivityController()
+    @ObservationIgnored private var feedObserver: NSObjectProtocol?
+    @ObservationIgnored private var ingestedLines: [RecentLine] = []
 
     var selectedTab: AppTab = .live
     var settingsPath: [SettingsRoute] = []
@@ -54,12 +56,30 @@ final class AppModel {
 
     /// App 启动时调用一次：onChange 不会补发当前值，启动前扩展就写好的状态和句对要先处理。
     func bootstrap() {
+        guard feedObserver == nil else { return }
+        // 此刻在前台、已解锁：把老版本写下的 WhenUnlocked 条目改成锁屏可读。
+        SharedKeychain.migrateAccessibility()
+        // 存档和锁屏实时活动跟 LiveFeed 的变更通知走，不挂在视图的 onChange 上：
+        // 熄屏/后台时 SwiftUI 不重新求值视图，onChange 不触发，存档和锁屏字幕就停了。
+        feedObserver = NotificationCenter.default.addObserver(
+            forName: LiveFeed.didChangeNotification,
+            object: feed,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.feedChanged() }
+        }
         engineMode = SharedKeychain.readEngineMode()
         loadPairedConfig()
         loadCloudSettings()
         statusChanged(feed.status)
         ingestFeedLines()
         assets.prepareIfMissing()
+    }
+
+    private func feedChanged() {
+        statusChanged(feed.status)
+        if feed.lines != ingestedLines { ingestFeedLines() }
+        refreshLiveActivity()
     }
 
     func statusChanged(_ line: String) {
@@ -70,6 +90,7 @@ final class AppModel {
 
     /// 把最近句对交给存档。ingest 是异步合并写，不挡主线程。
     func ingestFeedLines() {
+        ingestedLines = feed.lines
         store.ingest(feed.lines.map {
             TranscriptStore.Sentence(id: $0.id, session: $0.session, src: $0.src, dst: $0.dst)
         })

@@ -12,9 +12,16 @@ struct TranscriptView: View {
 
     @State private var lines: [TranscriptStore.Line] = []
     @State private var query = ""
+    /// 回看默认最新在上：打开就看到刚才那句，不用滑到底。用户可在工具栏切回时间顺序，记住选择。
+    @AppStorage("transcriptNewestFirst") private var newestFirst = true
 
-    private var visibleLines: [TranscriptStore.Line] {
+    /// 存档文件按时间顺序；复制/导出也用这个顺序，只有屏幕上的排列跟着开关走。
+    private var matchedLines: [TranscriptStore.Line] {
         TranscriptStore.filter(lines, query: query)
+    }
+
+    private var displayedLines: [TranscriptStore.Line] {
+        newestFirst ? matchedLines.reversed() : matchedLines
     }
 
     /// 当天文件真的落盘了才给导出项：存档是后台边跑边写的，刚打开页面时可能还没有文件。
@@ -28,10 +35,10 @@ struct TranscriptView: View {
             LazyVStack(alignment: .leading, spacing: DesignTokens.Space.pairGap) {
                 if lines.isEmpty {
                     emptyHint("今天还没有字幕")
-                } else if visibleLines.isEmpty {
+                } else if matchedLines.isEmpty {
                     emptyHint("没有匹配的字幕")
                 } else {
-                    ForEach(visibleLines) { line in
+                    ForEach(displayedLines) { line in
                         card(line)
                     }
                 }
@@ -42,14 +49,26 @@ struct TranscriptView: View {
         .navigationTitle("今天的字幕")
         .searchable(text: $query, prompt: "搜索原文或译文")
         .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button {
+                    newestFirst.toggle()
+                } label: {
+                    Label(
+                        newestFirst ? "最新在上" : "最早在上",
+                        systemImage: newestFirst ? "arrow.up.to.line" : "arrow.down.to.line"
+                    )
+                    .labelStyle(.titleAndIcon)
+                }
+                .accessibilityHint("切换字幕的排列顺序")
+            }
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
                     Button {
-                        UIPasteboard.general.string = TranscriptStore.plainText(self.visibleLines)
+                        UIPasteboard.general.string = TranscriptStore.plainText(self.matchedLines)
                     } label: {
                         Label("复制全部", systemImage: "doc.on.doc")
                     }
-                    .disabled(self.visibleLines.isEmpty)
+                    .disabled(self.matchedLines.isEmpty)
 
                     if self.canExport {
                         ShareLink(item: self.store.fileURL(for: Date())) {

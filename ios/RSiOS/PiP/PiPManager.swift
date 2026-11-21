@@ -223,8 +223,18 @@ final class PiPManager: NSObject, @preconcurrency AVPictureInPictureSampleBuffer
         }
         let timeString = DateFormatter.timeFormatter.string(from: Date())
 
-        guard let image = renderSubtitleImage(status: status, time: timeString),
-              let pixelBuffer = pixelBuffer(from: image) else { return }
+        let pixelBuffer: CVPixelBuffer
+        if let image = renderSubtitleImage(status: status, time: timeString),
+           let rendered = PiPFrame.pixelBuffer(from: image) {
+            lastPixelBuffer = rendered
+            pixelBuffer = rendered
+        } else if isPiPActive || AppStateMonitor.shared.isInBackground, let last = lastPixelBuffer {
+            // 内容没变也要续帧：画中画窗口靠持续到来的帧判断「在播放」，停更会被当成卡住。
+            // 重发上一帧不重绘，代价只是一次入队。
+            pixelBuffer = last
+        } else {
+            return
+        }
 
         let hostTime = CMClockGetTime(CMClockGetHostTimeClock())
         var timingInfo = CMSampleTimingInfo(
@@ -255,7 +265,7 @@ final class PiPManager: NSObject, @preconcurrency AVPictureInPictureSampleBuffer
         )
         guard sbStatus == noErr, let sb = sampleBuffer else { return }
 
-        let sbWithAttachment = setDisplayImmediately(sb)
+        let sbWithAttachment = PiPFrame.displayImmediately(sb)
 
         // iOS 18 起队列/状态在 sampleBufferRenderer 上，图层上的同名 API 已弃用。
         let renderer = layer.sampleBufferRenderer
@@ -271,6 +281,7 @@ final class PiPManager: NSObject, @preconcurrency AVPictureInPictureSampleBuffer
         }
     }
 
+    @ObservationIgnored private var lastPixelBuffer: CVPixelBuffer?
     @ObservationIgnored private var lastRenderedLines: [RecentLine] = []
     @ObservationIgnored private var lastRenderedDraft: String = ""
     @ObservationIgnored private var lastRenderedStatus: String = ""
@@ -407,40 +418,6 @@ final class PiPManager: NSObject, @preconcurrency AVPictureInPictureSampleBuffer
             let statusY = size.height - statusHeight - 20
             statusStr.draw(in: CGRect(x: 40, y: statusY, width: 1200, height: statusHeight), withAttributes: statusAttrs)
         }
-    }
-
-    private func pixelBuffer(from image: UIImage) -> CVPixelBuffer? {
-        let attrs: [String: Any] = [
-            kCVPixelBufferCGImageCompatibilityKey as String: true,
-            kCVPixelBufferCGBitmapContextCompatibilityKey as String: true,
-            kCVPixelBufferWidthKey as String: 1280,
-            kCVPixelBufferHeightKey as String: 360,
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
-        ]
-
-        var pixelBuffer: CVPixelBuffer?
-        let status = CVPixelBufferCreate(kCFAllocatorDefault, 1280, 360,
-                                          kCVPixelFormatType_32BGRA, attrs as CFDictionary,
-                                          &pixelBuffer)
-        guard status == kCVReturnSuccess, let pb = pixelBuffer else { return nil }
-
-        CVPixelBufferLockBaseAddress(pb, [])
-        defer { CVPixelBufferUnlockBaseAddress(pb, []) }
-
-        guard let context = CGContext(data: CVPixelBufferGetBaseAddress(pb),
-                                       width: 1280, height: 360,
-                                       bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(pb),
-                                       space: CGColorSpaceCreateDeviceRGB(),
-                                       bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue),
-              let cgImage = image.cgImage else { return nil }
-
-        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: 1280, height: 360))
-        return pb
-    }
-
-    private func setDisplayImmediately(_ sampleBuffer: CMSampleBuffer) -> CMSampleBuffer {
-        CMSetAttachment(sampleBuffer, key: kCMSampleAttachmentKey_DisplayImmediately, value: kCFBooleanTrue, attachmentMode: kCMAttachmentMode_ShouldNotPropagate)
-        return sampleBuffer
     }
 
     // MARK: - AVPictureInPictureSampleBufferPlaybackDelegate

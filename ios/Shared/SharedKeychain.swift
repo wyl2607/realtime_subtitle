@@ -26,27 +26,38 @@ public enum SharedKeychain {
         return "\(prefix)\(accessGroupPrefix)"
     }
 
-    public static func write(_ value: String, account: String) -> Bool {
-        let accessGroup = makeAccessGroup()
-        let data = value.data(using: .utf8)!
+    /// 锁屏后也要能读写：广播扩展和麦克风引擎熄屏后照常出字幕，状态/句对全靠这里传。
+    /// 默认的 WhenUnlocked 在锁屏后一律返回 -25308，主 App 读到空状态会误判成别的采集
+    /// 抢占而把麦克风停掉（2026-11-21 真机：锁屏 3 秒后录音停止）。ThisDeviceOnly：
+    /// 这些值（含 Groq key）不该跟着备份去别的设备。
+    static var accessibility: CFString { kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly }
 
-        let query: [String: Any] = [
+    private static func itemQuery(account: String) -> [String: Any] {
+        [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
-            kSecAttrAccessGroup as String: accessGroup,
-            kSecValueData as String: data,
+            kSecAttrAccessGroup as String: makeAccessGroup(),
             kSecAttrSynchronizable as String: kCFBooleanFalse!,
         ]
+    }
 
-        var status = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+    public static func write(_ value: String, account: String) -> Bool {
+        let query = itemQuery(account: account)
+        // 每次更新都带上可访问性：老版本写下的 WhenUnlocked 条目第一次解锁状态下更新时就被改过来。
+        let attributes: [String: Any] = [
+            kSecValueData as String: Data(value.utf8),
+            kSecAttrAccessible as String: accessibility,
+        ]
+
+        var status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
         if status == errSecSuccess {
             logger.debug("Keychain updated account=\(account, privacy: .public)")
             return true
         }
 
         if status == errSecItemNotFound {
-            status = SecItemAdd(query as CFDictionary, nil)
+            status = SecItemAdd(query.merging(attributes) { $1 } as CFDictionary, nil)
             if status == errSecSuccess {
                 logger.debug("Keychain added account=\(account, privacy: .public)")
                 return true
@@ -55,6 +66,24 @@ public enum SharedKeychain {
 
         logger.error("Keychain write failed account=\(account, privacy: .public) status=\(status)")
         return false
+    }
+
+    /// App 启动（前台、已解锁）时把所有已有条目改成锁屏可读。节点配置、档位、key 这些
+    /// 很少重写，不迁移的话熄屏后引擎重连时仍然读不到。没有的条目跳过。
+    public static func migrateAccessibility() {
+        let accounts = [
+            Account.extStatus, Account.nodeConfig, Account.latestLines, Account.latestDraft,
+            Account.engineMode, Account.groqKey, Account.cloudEnabled,
+        ]
+        for account in accounts {
+            let status = SecItemUpdate(
+                itemQuery(account: account) as CFDictionary,
+                [kSecAttrAccessible as String: accessibility] as CFDictionary
+            )
+            if status != errSecSuccess && status != errSecItemNotFound {
+                logger.error("Keychain migrate failed account=\(account, privacy: .public) status=\(status)")
+            }
+        }
     }
 
     public static func read(account: String) -> String? {

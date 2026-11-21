@@ -33,9 +33,10 @@ enum CaptureArbiter {
             return false
         }
 
-        // I8-A 之前的状态行没有 src；升级中的旧扩展宁可视作广播，不能让两种采集并发。
-        guard let source = source(in: extensionStatus) else { return true }
-        return source == "broadcast"
+        // 只认明确写着 src=broadcast 的状态行。扩展和主 App 同一个包发布，所有状态行都带 src；
+        // 读不到 / 读到 "无"（锁屏时 Keychain 拒绝访问）绝不能当成广播——以前这么判，
+        // 麦克风自己写状态失败后发的通知就把自己停了（2026-11-21 真机：锁屏 3 秒后录音停止）。
+        return source(in: extensionStatus) == "broadcast"
     }
 
     private static func source(in status: String?) -> String? {

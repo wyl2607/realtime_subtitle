@@ -76,6 +76,18 @@ struct LiveFeedSelftest {
         feed.refresh()
         check(feed.lines.count == 1, "坏 JSON 不应清空上一份句对")
 
+        // HC-U08：锁屏时 Keychain 拒绝访问，三份读取都返回 nil——必须保留上一次的值，
+        // 不能把状态改成「无」、把字幕和草稿清空（否则画中画/锁屏实时活动一起变空，麦克风还会被误停）。
+        let beforeLock = changes
+        statusSource = nil
+        linesSource = nil
+        draftSource = nil
+        feed.refresh()
+        check(feed.status == "engine=node last=ok", "HC-U08：读不到状态时应保留上一次的状态")
+        check(feed.lines.count == 1, "HC-U08：读不到句对时不应清空字幕")
+        check(feed.draft == "Guten", "HC-U08：读不到草稿时不应清空草稿")
+        check(changes == beforeLock, "HC-U08：读不到时不应发布变更")
+
         if failures.isEmpty {
             print("LIVE FEED SELFTEST OK")
         } else {

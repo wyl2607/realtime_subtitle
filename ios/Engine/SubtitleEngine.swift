@@ -1628,9 +1628,10 @@ final class SubtitleEngine: @unchecked Sendable {
     private func writeStatus(_ text: String) {
         // start/finish/错误也会写状态；所有行都带来源，主 App 才不会把自己刚写的短状态误判成旧版广播。
         let sourcedText = text.contains("src=") ? text : "\(text) src=\(source)"
-        let success = SharedKeychain.writeExtStatus(sourcedText)
-        if !success {
+        // 写失败不发通知：主 App 收到通知就当成「状态刚更新」，读回来的却是旧值或空值。
+        guard SharedKeychain.writeExtStatus(sourcedText) else {
             logger.error("Failed to write status to keychain")
+            return
         }
         postDarwinNotification()
     }
@@ -1641,11 +1642,12 @@ final class SubtitleEngine: @unchecked Sendable {
         if let data = try? encoder.encode(recentLines),
            let json = String(data: data, encoding: .utf8) {
             if json != lastLinesJSON {
-                lastLinesJSON = json
-                let success = SharedKeychain.writeLatestLines(json)
-                if !success {
+                // 写失败不记 lastLinesJSON：下一句来时整份重写，不会因为一次失败永远缺句。
+                guard SharedKeychain.writeLatestLines(json) else {
                     logger.error("Failed to write latest_lines to keychain")
+                    return
                 }
+                lastLinesJSON = json
                 postLinesNotification()
             }
         }

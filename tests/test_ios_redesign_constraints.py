@@ -140,3 +140,69 @@ def test_hc_u06_keeps_working_with_screen_off():
     assert re.search(r"- target: RSLiveActivity\s+embed: true", project), (
         "HC-U06 违反：RSLiveActivity 没有作为依赖嵌进主 App。"
     )
+
+
+def test_hc_u07_keychain_is_readable_while_locked():
+    """硬约束 HC-U07：共享 Keychain 条目必须锁屏可读写（AfterFirstUnlock），启动时迁移老条目。
+
+    违反的是什么：写 Keychain 不设 kSecAttrAccessible（默认 WhenUnlocked），或改回 WhenUnlocked。
+    为什么不行：扩展/引擎和主 App 之间的状态、句对全靠 Keychain 传。2026-11-21 真机：
+    锁屏后每次读写都返回 -25308，主 App 读到空状态，把它当成广播抢占，3 秒后自己停了麦克风；
+    画中画和锁屏实时活动也拿不到新句子。
+    必须怎么改：SharedKeychain.write 的更新和新增都带 kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly，
+    AppModel.bootstrap 调 SharedKeychain.migrateAccessibility()。
+    """
+    keychain = (IOS / "Shared" / "SharedKeychain.swift").read_text(encoding="utf-8")
+    assert "kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly" in keychain, (
+        "HC-U07 违反：SharedKeychain 没有用 AfterFirstUnlockThisDeviceOnly，锁屏后读写会失败（-25308）。"
+    )
+    write_body = keychain[keychain.index("func write("):keychain.index("func migrateAccessibility")]
+    assert "kSecAttrAccessible" in write_body, (
+        "HC-U07 违反：SharedKeychain.write 没有带 kSecAttrAccessible，新条目会落成默认的 WhenUnlocked。"
+    )
+    offenders = []
+    for path in _swift_files():
+        text = path.read_text(encoding="utf-8")
+        for m in re.finditer(r"kSecAttrAccessibleWhenUnlocked\w*", text):
+            offenders.append(_locate(path, text, m.start()))
+    assert not offenders, "HC-U07 违反：出现 WhenUnlocked 可访问性：" + ", ".join(offenders)
+    model = (IOS / "RSiOS" / "App" / "AppModel.swift").read_text(encoding="utf-8")
+    assert "SharedKeychain.migrateAccessibility()" in model, (
+        "HC-U07 违反：AppModel 没有在启动时迁移老条目的可访问性。"
+    )
+
+
+def test_hc_u09_background_work_not_driven_by_view_on_change():
+    """硬约束 HC-U09：存档和锁屏实时活动不许挂在视图的 onChange 上。
+
+    为什么不行：熄屏/后台时 SwiftUI 不重新求值视图，`.onChange(of: model.feed.lines)` 不触发，
+    存档停写、锁屏字幕停更——而这恰恰是熄屏场景唯一要它们干活的时候。
+    必须怎么改：AppModel 订阅 LiveFeed.didChangeNotification，在回调里存档、刷新实时活动。
+    """
+    root = (IOS / "RSiOS" / "Pages" / "RootView.swift").read_text(encoding="utf-8")
+    for pattern in [r"onChange\(of:\s*model\.feed\.lines", r"onChange\(of:\s*model\.feed\.status"]:
+        assert not re.search(pattern, root), (
+            f"HC-U09 违反：RootView 又用 {pattern} 驱动后台工作。后台时它不触发，改由 AppModel 订阅 LiveFeed 通知。"
+        )
+    model = (IOS / "RSiOS" / "App" / "AppModel.swift").read_text(encoding="utf-8")
+    assert "LiveFeed.didChangeNotification" in model, (
+        "HC-U09 违反：AppModel 没有订阅 LiveFeed.didChangeNotification，后台时存档和锁屏字幕会停。"
+    )
+
+
+def test_hc_u10_pip_frames_are_iosurface_backed():
+    """硬约束 HC-U10：画中画的像素缓冲必须由 IOSurface 支撑。
+
+    为什么不行：画中画窗口在系统进程里绘制，帧要跨进程共享；普通内存的 CVPixelBuffer
+    共享失败（PixelBufferSharing err=-15596），App 内预览正常、画中画里却一帧字幕都没有。
+    必须怎么改：CVPixelBufferCreate 的属性里带 kCVPixelBufferIOSurfacePropertiesKey。
+    """
+    offenders = []
+    for path in sorted((IOS / "RSiOS").rglob("*.swift")):
+        text = path.read_text(encoding="utf-8")
+        if "CVPixelBufferCreate(" in text and "kCVPixelBufferIOSurfacePropertiesKey" not in text:
+            offenders.append(str(path.relative_to(ROOT)))
+    assert not offenders, (
+        "HC-U10 违反：这些文件创建像素缓冲却没有 IOSurface 支撑：" + ", ".join(offenders)
+        + "。画中画是系统进程绘制的，没有 IOSurface 帧传不过去。"
+    )

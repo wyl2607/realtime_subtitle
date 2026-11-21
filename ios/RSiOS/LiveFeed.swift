@@ -67,26 +67,25 @@ final class LiveFeed {
     func refresh() {
         var changed = false
 
-        let newStatus = readStatus() ?? "无"
-        if newStatus != status {
+        // 读不到（锁屏时 Keychain 拒绝、或条目还没写过）就保留上一次的值，不改成「无」/清空：
+        // 读失败不代表扩展停了，清掉会让字幕、画中画、锁屏实时活动一起变空。
+        if let newStatus = readStatus(), newStatus != status {
             status = newStatus
             changed = true
         }
 
-        let linesJSON = readLines()
-        if linesJSON != lastLinesJSON {
+        if let linesJSON = readLines(), linesJSON != lastLinesJSON {
             lastLinesJSON = linesJSON
             // 坏 JSON 保留上一份好句对：扩展写到一半时不能把字幕清空。
             if let decoded = Self.decodeLines(linesJSON) {
                 lines = decoded
                 changed = true
-            } else if linesJSON != nil {
+            } else {
                 logger.error("LiveFeed latest lines decode failed")
             }
         }
 
-        let newDraft = readDraft() ?? ""
-        if newDraft != draft {
+        if let newDraft = readDraft(), newDraft != draft {
             draft = newDraft
             changed = true
         }
@@ -96,8 +95,7 @@ final class LiveFeed {
         }
     }
 
-    private static func decodeLines(_ json: String?) -> [RecentLine]? {
-        guard let json else { return [] }
+    private static func decodeLines(_ json: String) -> [RecentLine]? {
         guard let data = json.data(using: .utf8) else { return nil }
         return try? JSONDecoder().decode([RecentLine].self, from: data)
     }

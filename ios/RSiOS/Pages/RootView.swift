@@ -3,8 +3,8 @@ import Translation
 
 /// 四个标签页：字幕 / 回看 / 设置 / 诊断。
 ///
-/// 页面之间只通过 AppModel 共享状态；监听运行态变化（状态词、句对、前后台）放在这里
-/// 统一做一次，不跟着某个页面的生命周期——否则用户停在设置页时存档就不写了。
+/// 页面之间只通过 AppModel 共享状态。句对/状态变化由 AppModel 订阅 LiveFeed 通知处理
+/// （后台也要跑，见 HC-U09）；这里只留必须在前台响应的几个 onChange。
 struct RootView: View {
     @Environment(AppModel.self) private var model
 
@@ -27,14 +27,6 @@ struct RootView: View {
         .translationTask(model.assets.translationConfig, action: AssetPreparer.translationAction(for: model.assets))
         .onAppear { model.bootstrap() }
         .onOpenURL { model.handleOpenURL($0) }
-        .onChange(of: model.feed.lines) {
-            model.ingestFeedLines()
-            model.refreshLiveActivity()
-        }
-        .onChange(of: model.feed.status) { _, line in
-            model.statusChanged(line)
-            model.refreshLiveActivity()
-        }
         .onChange(of: model.mic.isRunning) { model.refreshLiveActivity() }
         .onChange(of: model.feed.lastStatusUpdate) { _, updatedAt in model.extensionStatusUpdated(updatedAt) }
         .onChange(of: model.appState.isInBackground) { _, inBackground in model.backgroundChanged(inBackground) }
