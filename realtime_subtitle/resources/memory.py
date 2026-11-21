@@ -20,12 +20,10 @@ class MemorySnapshot:
     total_bytes: int | None = None
     available_bytes: int | None = None
     pressure_level: int | None = None
-    swap_used_bytes: int | None = None
 
 
 _VM_STAT_PAGE_RE = re.compile(r"page size of (\d+) bytes")
 _VM_STAT_LINE_RE = re.compile(r"^Pages\s+(.+?):\s+([0-9.]+)\.?$")
-_SWAP_USED_RE = re.compile(r"used\s*=\s*([0-9.]+)\s*([KMGTP])", re.IGNORECASE)
 
 
 def _is_darwin() -> bool:
@@ -102,25 +100,14 @@ def parse_vm_stat(text: str) -> int | None:
     return available_pages * page_size
 
 
-def parse_swapusage(text: str) -> int | None:
-    """Parse used swap bytes from sysctl vm.swapusage output."""
-    match = _SWAP_USED_RE.search(text)
-    if not match:
-        return None
-    value = float(match.group(1))
-    unit = match.group(2).upper()
-    scale = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4, "P": 1024**5}[unit]
-    return int(value * scale)
-
-
 def _read_darwin_memory_snapshot() -> MemorySnapshot:
+    # 每 2 秒（config.AUTO_TIER_POLL_SEC）跑一次，一次 sysctl 派生进程就是实打实的
+    # 系统开销；swap 用量不参与降档决策也没人显示，所以这里只探真正用到的两项。
     vm_stat = _run_text(["vm_stat"])
-    swapusage = _run_text(["sysctl", "vm.swapusage"])
     return MemorySnapshot(
         total_bytes=_sysctl_int("hw.memsize"),
         available_bytes=parse_vm_stat(vm_stat) if vm_stat else None,
         pressure_level=read_pressure_level(),
-        swap_used_bytes=parse_swapusage(swapusage) if swapusage else None,
     )
 
 
@@ -130,12 +117,10 @@ def _read_psutil_memory_snapshot() -> MemorySnapshot:
     except ImportError:
         return MemorySnapshot()
     mem = psutil.virtual_memory()
-    swap = psutil.swap_memory()
     return MemorySnapshot(
         total_bytes=int(mem.total),
         available_bytes=int(mem.available),
         pressure_level=None,
-        swap_used_bytes=int(swap.used),
     )
 
 
