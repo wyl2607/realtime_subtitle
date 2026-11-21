@@ -168,7 +168,7 @@ def test_clamp_screen_index():
 
 - [ ] **Step 3: 跑测试确认失败**
 
-Run: `cd C:\Users\wyl26\realtime_subtitle && venv\Scripts\python -m pytest test_tv_window.py -q`
+Run: `cd <WIN_HOME>\realtime_subtitle && venv\Scripts\python -m pytest test_tv_window.py -q`
 Expected: FAIL/ERROR（`ModuleNotFoundError: No module named 'tv_window'`）
 
 - [ ] **Step 4: 实现 tv_window.py**
@@ -395,7 +395,7 @@ class TVWindow(QWidget):
 
 - [ ] **Step 5: 跑测试确认通过**
 
-Run: `cd C:\Users\wyl26\realtime_subtitle && venv\Scripts\python -m pytest test_tv_window.py -q`
+Run: `cd <WIN_HOME>\realtime_subtitle && venv\Scripts\python -m pytest test_tv_window.py -q`
 Expected: 7 passed
 
 注意：`test_clamp_screen_index` 里 `n + 5` 钳到 `n-1`、单屏机器上 `cycle_screen` 直接 return——如果本机只有一块屏跑出意外结果，检查 `_clamp_screen_index` 而不是改测试。
@@ -403,7 +403,7 @@ Expected: 7 passed
 - [ ] **Step 6: Commit**
 
 ```bash
-cd C:\Users\wyl26\realtime_subtitle
+cd <WIN_HOME>\realtime_subtitle
 git add config.py tv_window.py test_tv_window.py
 git commit -m "feat: 电视全屏模式核心窗口（滚动大字/草稿替换/Ctrl+滚轮字号/多屏）"
 ```
@@ -656,7 +656,7 @@ git commit -m "feat: 主窗字号上限 36→72（滑块+Ctrl+滚轮两处同步
 
 - [ ] **Step 1: 全量 pytest**
 
-Run: `cd C:\Users\wyl26\realtime_subtitle && venv\Scripts\python -m pytest -q`
+Run: `cd <WIN_HOME>\realtime_subtitle && venv\Scripts\python -m pytest -q`
 Expected: 全绿（50+ 项 + 新增 10 项）。已知：test_ui_polish 两个 fade 用例对动画计时敏感，偶发挂单独重跑即绿，别当回归追。
 
 - [ ] **Step 2: 独立脚本套件（BTN_RESERVE 改了必须跑 hittest）**

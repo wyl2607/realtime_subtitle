@@ -26,14 +26,36 @@ realtime_subtitle/                  # clone root
 │   ├── migrate_legacy.py           # moves runtime files left by pre-package versions
 │   ├── capture/audio_capture.py    # WASAPI loopback + device hot-swap
 │   ├── capture/live_captions.py    # ASR_SOURCE="livecaptions": read Windows Live Captions via UIA
+│   ├── capture/macos_tap.py        # macOS Core Audio Process Tap helper (aggregate device)
+│   ├── capture/_sounddevice_pyaudio.py  # minimal PyAudio-shaped adapter over sounddevice
 │   ├── asr/streaming_asr.py        # local-agreement streaming ASR (word-level commits)
+│   ├── asr/backends.py             # Whisper backend selection (auto → MLX / faster-whisper)
+│   ├── asr/mlx_backend.py          # MLX Whisper adapter exposing the faster-whisper surface
+│   ├── remote/                     # out-of-process recognition clients + routing rules
+│   │   ├── cloud_client.py         # Groq Whisper cloud ASR client
+│   │   ├── cloud_segmenter.py      # cloud segmentation (merge short segments, close gaps)
+│   │   ├── node_client.py          # WebSocket compute-node client (pinned Tailscale IP)
+│   │   ├── line_store.py           # P5 line store / replay
+│   │   ├── quota.py                # local Groq free-tier accounting (four rolling windows)
+│   │   ├── router.py               # provider abstraction + routing
+│   │   └── routing_rules.py        # routing state machine rules (P5)
+│   ├── node/                       # compute-node processes (gateway + worker)
+│   │   ├── gateway.py              # resident gateway: listen, auth, spawn/reap workers
+│   │   ├── worker.py               # ASR subprocess: stdin audio → stdout events
+│   │   ├── engines.py              # worker ASR/translation engine interfaces + Mac impl
+│   │   ├── info.py                 # node capabilities for GET /v1/info (stdlib only)
+│   │   ├── segmenter.py            # VAD segmenter: continuous PCM → utterance segments
+│   │   ├── ollama_watchdog.py      # probe/restart local `ollama serve` for translation
+│   │   └── requirements.txt        # node-only dependency list
+│   ├── resources/memory.py         # macOS memory-pressure probes + tier decisions
 │   ├── translate/
 │   │   ├── translator_queue.py     # Whisper/Ollama owner: ASR loop, queue, drafts
 │   │   ├── text_rules.py           # sentence split + no-space-language rules (pure)
 │   │   ├── language_switch.py      # language pairs, vote, rescue, switching (mixin)
 │   │   ├── lookup.py               # click-a-word lookup + AI analysis   (mixin)
 │   │   ├── transcript.py           # daily archive + retention           (mixin)
-│   │   └── runtime_stats.py        # per-minute performance summary      (mixin)
+│   │   ├── runtime_stats.py        # per-minute performance summary      (mixin)
+│   │   └── apple_translate.py      # macOS system Translation helper client
 │   └── ui/
 │       ├── subtitle_window.py      # the overlay (main class)
 │       ├── window_frame.py         # dragging + WM_NCHITTEST native hit-test
@@ -43,11 +65,22 @@ realtime_subtitle/                  # clone root
 │       ├── settings_window.py      # ⚙ panel
 │       ├── popups.py               # history / word lookup / AI analysis popups
 │       ├── tv_window.py            # 📺 fullscreen large-type window
-│       └── cinema_bar.py           # 🎞 transparent caption strip
+│       ├── cinema_bar.py           # 🎞 transparent caption strip
+│       ├── design_tokens.py        # generated from design/tokens.json (do not edit)
+│       ├── history_store.py        # shared in-session subtitle history (no PyQt6 import)
+│       └── macos_hotkeys.py        # macOS global hotkeys via Carbon RegisterEventHotKey
 │
 ├── scripts/
 │   ├── prune_venv.py               # remove orphan packages + pip leftover dirs
-│   └── windows/                    # install / start / stop / pause / update / uninstall / download
+│   ├── windows/                    # install / start / stop / pause / update / uninstall / download
+│   ├── macos/                      # macOS install / lifecycle + build_rslite_app.sh
+│   ├── node/                       # node install / cluster ops / pairing / tailscale keepalive
+│   ├── design/                     # generate + check design-token constants
+│   └── bench/                      # accuracy / latency / hybrid acceptance benchmarks
+├── design/                         # design tokens: single source of truth (tokens.json)
+├── ios/                            # iOS client: broadcast extension + mic capture + shared engine
+├── macos-native/                   # Swift package: rslite overlay, rstranslate helper, rsbench
+├── .governance/                    # sprint records, specs, release notes, experience notes
 ├── tests/                          # pytest + three standalone GUI harnesses
 └── docs/                           # see below
 ```
@@ -59,7 +92,11 @@ docs/
 ├── STRUCTURE.md                    # this file
 ├── TODO.md                         # open items, each with "how to call it done"
 ├── README-i18n.md                  # which README is the source of truth for what
+├── protocol-v2.md                  # node protocol v2: gateway + worker (code is truth)
+├── node-acceptance.md              # node (remote-offload) end-to-end acceptance record
+├── ai-agent-node-runbook.md        # AI assistant node deployment / operations runbook
 ├── zh/  WINDOWS-RUNBOOK.md · user-guide-template.txt · optimization-notes.md
+│       install-rslite-app.md · install-windows-bootstrap.md · local-only.md · node-setup-guide.md
 ├── en/  WINDOWS-RUNBOOK.md
 ├── de/  WINDOWS-RUNBOOK.md
 └── design/
