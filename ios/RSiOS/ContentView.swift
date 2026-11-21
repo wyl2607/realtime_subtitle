@@ -20,11 +20,11 @@ enum SettingsRoute: Hashable {
 
 struct ContentView: View {
     @StateObject private var pipManager = PiPManager()
-    @StateObject private var statusMonitor = StatusMonitor()
-    @StateObject private var linesMonitor = LinesMonitor()
     @StateObject private var transcriptStore = TranscriptStore()
     @StateObject private var micCapture = MicCapture()
     @ObservedObject private var appStateMonitor = AppStateMonitor.shared
+    /// 状态 / 最近句对 / 草稿的唯一轮询源（见 LiveFeed.swift）。
+    private let feed = LiveFeed.shared
 
     @State private var pairingLinkText = ""
     @State private var pairingStatus = ""
@@ -99,14 +99,14 @@ struct ContentView: View {
                     ScrollView {
                         VStack(spacing: DesignTokens.Space.l) {
                             SubtitleCardView(
-                                lines: linesMonitor.lines,
+                                lines: feed.lines,
                                 style: subtitleStyle,
                                 status: statusSummary,
-                                draft: linesMonitor.draft
+                                draft: feed.draft
                             )
 
                             // 本机引擎失败时把原始码映射成可读提示（纯逻辑，不删原状态行）。
-                            if let localMsg = LocalEngineStatus.userMessage(forStatusLine: statusMonitor.keychainStatus) {
+                            if let localMsg = LocalEngineStatus.userMessage(forStatusLine: feed.status) {
                                 Text(localMsg)
                                     .font(.caption)
                                     .foregroundColor(.red)
@@ -131,6 +131,13 @@ struct ContentView: View {
                     .onAppear {
                         self.loadPairedConfig()
                         self.loadCloudSettings()
+                        // onChange 不像原来的 @Published 订阅那样补发当前值：
+                        // 启动前扩展就写好的状态词要在这里先解析一次，否则会一直空着。
+                        if let summary = StatusSummaryParser.summary(forStatusLine: self.feed.status) {
+                            self.statusSummary = summary
+                        }
+                        // 同理：启动前已经在 Keychain 里的句对，onChange 不会补发。
+                        self.ingestFeedLines()
                         if !self.didAutoCheckAssets {
                             self.didAutoCheckAssets = true
                             self.prepareLocalAssetsIfMissing()
@@ -145,11 +152,8 @@ struct ContentView: View {
                         self.selectedTab = 1
                         self.settingsPath = [.node]
                     }
-                    .onReceive(linesMonitor.$lines) { lines in
-                        self.transcriptStore.ingest(lines.map {
-                            TranscriptStore.Sentence(id: $0.id, session: $0.session, src: $0.src, dst: $0.dst)
-                        })
-                        self.transcriptRefresh += 1
+                    .onChange(of: feed.lines) { _, _ in
+                        self.ingestFeedLines()
                     }
                 }
                 .tabItem {
@@ -185,18 +189,33 @@ struct ContentView: View {
                 }
                 .tag(1)
             }
-            .onReceive(statusMonitor.$lastStatusUpdate) { updatedAt in
+            .onChange(of: feed.lastStatusUpdate) { _, updatedAt in
                 self.micCapture.reconcileBroadcast(
-                    extensionStatus: self.statusMonitor.keychainStatus,
+                    extensionStatus: self.feed.status,
                     extensionStatusUpdatedAt: updatedAt
                 )
             }
-            .onReceive(statusMonitor.$keychainStatus) { line in
+            .onChange(of: feed.status) { _, line in
                 if let summary = StatusSummaryParser.summary(forStatusLine: line) {
                     self.statusSummary = summary
                 }
             }
+            // 存档写盘是合并写的（约 1 秒一次）。进后台后 iOS 随时可能回收进程，
+            // 必须把窗口里的句子强制写掉，不能靠「等定时器」。
+            .onChange(of: self.appStateMonitor.isInBackground) { _, inBackground in
+                if inBackground {
+                    self.transcriptStore.flush()
+                }
+            }
         )
+    }
+
+    /// 把 LiveFeed 的最近句对交给存档。ingest 是异步合并写，不会挡主线程。
+    private func ingestFeedLines() {
+        self.transcriptStore.ingest(self.feed.lines.map {
+            TranscriptStore.Sentence(id: $0.id, session: $0.session, src: $0.src, dst: $0.dst)
+        })
+        self.transcriptRefresh += 1
     }
 
     @ViewBuilder
@@ -221,8 +240,8 @@ struct ContentView: View {
             HStack {
                 Button(DesignTokens.Text.micStartButton) {
                     self.micCapture.start(
-                        extensionStatus: self.statusMonitor.keychainStatus,
-                        extensionStatusUpdatedAt: self.statusMonitor.lastStatusUpdate
+                        extensionStatus: self.feed.status,
+                        extensionStatusUpdatedAt: self.feed.lastStatusUpdate
                     )
                 }
                 .buttonStyle(.borderedProminent)
@@ -524,18 +543,18 @@ struct ContentView: View {
             }
 
             Section("Extension Status") {
-                Text(self.statusMonitor.keychainStatus)
+                Text(self.feed.status)
                     .font(.system(.body, design: .monospaced))
                     .foregroundColor(.secondary)
             }
 
             Section("最近句对（原始）") {
-                if self.linesMonitor.lines.isEmpty {
+                if self.feed.lines.isEmpty {
                     Text("暂无字幕")
                         .font(.system(.body, design: .monospaced))
                         .foregroundColor(.secondary)
                 } else {
-                    ForEach(Array(self.linesMonitor.lines.enumerated()), id: \.offset) { _, line in
+                    ForEach(Array(self.feed.lines.enumerated()), id: \.offset) { _, line in
                         VStack(alignment: .leading, spacing: DesignTokens.Space.xs) {
                             Text("[\(line.id)] \(line.src)")
                                 .font(.system(.body, design: .monospaced))
@@ -548,7 +567,7 @@ struct ContentView: View {
             }
 
             Section("Darwin Notifications") {
-                Text("Tick: \(self.statusMonitor.darwinNotificationCount)  Lines: \(self.linesMonitor.darwinNotificationCount)")
+                Text("Tick: \(self.feed.statusNotificationCount)  Lines: \(self.feed.linesNotificationCount)")
                     .font(.system(.body, design: .monospaced))
                     .foregroundColor(.secondary)
             }
@@ -865,15 +884,6 @@ final class PiPHostUIView: UIView {
     }
 }
 
-struct RecentLine: Codable, Identifiable {
-    let id: Int
-    let src: String
-    var dst: String
-    /// 产生这一句的引擎会话代号：各引擎的 id 都从 1 重新计数，
-    /// 存档靠「代号 + id」去重，不然后一个会话会覆盖前一个会话的句子。
-    let session: String
-}
-
 /// 画中画走 Core Graphics，不能直接吃 SwiftUI 的 Color；颜色仍从同一份令牌/样式解析。
 fileprivate func uiColor(hex: String, alpha: CGFloat) -> UIColor {
     guard let rgb = SubtitleStyle.rgb(hex: hex) else {
@@ -894,8 +904,7 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
     private var renderTimer: Timer?
     private var frameCount = 0
     private var pipPossibleObservation: NSKeyValueObservation?
-    private var linesObserver: UnsafeRawPointer?
-    private var pollTimer: Timer?
+    private var feedObserver: NSObjectProtocol?
     private var appStateObserver: NSObjectProtocol?
 
     var pipStatusLine: String {
@@ -915,17 +924,15 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
         setupAudioSession()
         setupPiPLayerAndController()
         observePiPPossible()
-        registerLinesNotification()
-        startPolling()
+        observeLiveFeed()
         observeAppState()
         startRendering()
     }
 
     deinit {
         stopRendering()
-        stopPolling()
-        if let observer = linesObserver {
-            CFNotificationCenterRemoveObserver(CFNotificationCenterGetDarwinNotifyCenter(), observer, nil, nil)
+        if let observer = feedObserver {
+            NotificationCenter.default.removeObserver(observer)
         }
         if let observer = appStateObserver {
             NotificationCenter.default.removeObserver(observer)
@@ -983,47 +990,21 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
         }
     }
 
-    private func registerLinesNotification() {
-        let center = CFNotificationCenterGetDarwinNotifyCenter()
-        let name = "com.wyl2607.rsios.spike.lines" as CFString
-        let observer = UnsafeRawPointer(Unmanaged.passUnretained(self).toOpaque())
-
-        CFNotificationCenterAddObserver(center, observer, { _, observer, _, _, _ in
-            guard let observer = observer else { return }
-            let manager = Unmanaged<PiPManager>.fromOpaque(observer).takeUnretainedValue()
-            DispatchQueue.main.async {
-                manager.refreshLinesFromKeychain()
-            }
-        }, name, nil, .deliverImmediately)
-
-        self.linesObserver = observer
-        refreshLinesFromKeychain()
-    }
-
-    private func startPolling() {
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            self?.refreshLinesFromKeychain()
-        }
-        pollTimer?.fire()
-    }
-
-    private func stopPolling() {
-        pollTimer?.invalidate()
-        pollTimer = nil
-    }
-
-    private func refreshLinesFromKeychain() {
-        if let json = SharedKeychain.readLatestLines(),
-           let data = json.data(using: .utf8),
-           let lines = try? JSONDecoder().decode([RecentLine].self, from: data) {
-            DispatchQueue.main.async {
-                self.objectWillChange.send()
-            }
+    /// 画中画不再自己读 Keychain：内容变化统一由 LiveFeed 通知。
+    /// 未激活且在前台时定时器不再整帧重绘，这一帧负责让内嵌预览跟上。
+    private func observeLiveFeed() {
+        feedObserver = NotificationCenter.default.addObserver(
+            forName: LiveFeed.didChangeNotification,
+            object: LiveFeed.shared,
+            queue: .main
+        ) { [weak self] _ in
+            self?.renderFrame()
         }
     }
 
     private func extractStatusLine() -> String? {
-        guard let status = SharedKeychain.readExtStatus() else { return nil }
+        let status = LiveFeed.shared.status
+        guard status != "无" else { return nil }
         let parts = status.split(separator: " ")
         var nodeInfo: [String] = []
         for part in parts {
@@ -1056,9 +1037,10 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
         frameCount = 0
         backgroundFrameCount = 0
         renderTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            self?.renderFrame()
+            self?.tickRender()
         }
-        renderTimer?.fire()
+        // 内嵌预览要先有一帧，「未激活 + 前台」的定时器跳过规则不适用于首帧。
+        renderFrame()
     }
 
     private func stopRendering() {
@@ -1066,10 +1048,18 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
         renderTimer = nil
     }
 
+    /// 定时器节奏：画中画未激活、App 又在前台时这块画面没人看，不必每 0.5 秒
+    /// 整帧重绘；激活时保持原来的 0.5 秒（系统按帧保活，停更会被判成卡住），
+    /// 后台同理。前台未激活时的内容变化由 LiveFeed 的通知单独补帧。
+    private func tickRender() {
+        guard isPiPActive || AppStateMonitor.shared.isInBackground else { return }
+        renderFrame()
+    }
+
     private func renderFrame() {
         guard let layer = sampleBufferDisplayLayer else { return }
 
-        let status = SharedKeychain.readExtStatus() ?? "无"
+        let status = LiveFeed.shared.status
         // 解析不到档位（如刚 started）时保留上一次，避免状态词闪空。
         if let summary = StatusSummaryParser.summary(forStatusLine: status) {
             lastStatusSummary = summary
@@ -1122,38 +1112,31 @@ final class PiPManager: NSObject, ObservableObject, AVPictureInPictureSampleBuff
         }
     }
 
-    private var cachedLines: [RecentLine] = []
-    private var lastRenderedLinesJSON: String = ""
+    private var lastRenderedLines: [RecentLine] = []
     private var lastRenderedDraft: String = ""
     private var lastRenderedStatus: String = ""
     private var lastRenderedStyle: SubtitleStyle?
     private var lastStatusSummary: StatusSummary?
 
     private func renderSubtitleImage(status: String, time: String) -> UIImage? {
-        var linesJSON = ""
-        if let json = SharedKeychain.readLatestLines(),
-           let data = json.data(using: .utf8),
-           let lines = try? JSONDecoder().decode([RecentLine].self, from: data) {
-            cachedLines = lines
-            linesJSON = json
-        }
-        let draft = SharedKeychain.readLatestDraft() ?? ""
+        let lines = LiveFeed.shared.lines
+        let draft = LiveFeed.shared.draft
 
         // 样式也要参与变化判断：用户改颜色/字号后即使句子没变也得立刻重绘。
         let style = SubtitleStyle.load(from: UserDefaults.standard.data(forKey: "subtitleStyle"))
 
-        if linesJSON == lastRenderedLinesJSON
+        if lines == lastRenderedLines
             && draft == lastRenderedDraft
             && status == lastRenderedStatus
             && style == lastRenderedStyle {
             return nil
         }
-        lastRenderedLinesJSON = linesJSON
+        lastRenderedLines = lines
         lastRenderedDraft = draft
         lastRenderedStatus = status
         lastRenderedStyle = style
 
-        let displayLines = Array(cachedLines.suffix(2))
+        let displayLines = Array(lines.suffix(2))
 
         // 画中画画面按样式字号等比缩放：译文基准 48，原文再乘 sourceScale。
         let scale = style.fontSize / DesignTokens.TypeScale.subtitleDefault
@@ -1357,134 +1340,6 @@ extension DateFormatter {
         df.dateFormat = "HH:mm:ss"
         return df
     }()
-}
-
-final class StatusMonitor: ObservableObject {
-    @Published var keychainStatus: String = "无"
-    @Published var darwinNotificationCount: Int = 0
-    /// 只有 Darwin 通知才代表扩展刚写过状态；轮询读到旧 Keychain 值不能延长广播占用时间。
-    @Published private(set) var lastStatusUpdate: Date?
-
-    private var timer: Timer?
-    private var darwinObserver: UnsafeRawPointer?
-
-    init() {
-        startMonitoring()
-        registerDarwinNotification()
-    }
-
-    deinit {
-        stopMonitoring()
-        if let observer = darwinObserver {
-            CFNotificationCenterRemoveObserver(CFNotificationCenterGetDarwinNotifyCenter(), observer, nil, nil)
-        }
-    }
-
-    private func startMonitoring() {
-        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            self?.updateKeychainStatus()
-        }
-        timer?.fire()
-    }
-
-    private func stopMonitoring() {
-        timer?.invalidate()
-        timer = nil
-    }
-
-    private func updateKeychainStatus(markingFreshUpdate: Bool = false) {
-        DispatchQueue.main.async {
-            self.keychainStatus = SharedKeychain.readExtStatus() ?? "无"
-            if markingFreshUpdate {
-                self.lastStatusUpdate = Date()
-            }
-        }
-    }
-
-    private func registerDarwinNotification() {
-        let center = CFNotificationCenterGetDarwinNotifyCenter()
-        let name = "com.wyl2607.rsios.spike.tick" as CFString
-        let observer = UnsafeRawPointer(Unmanaged.passUnretained(self).toOpaque())
-
-        CFNotificationCenterAddObserver(center, observer, { _, observer, _, _, _ in
-            guard let observer = observer else { return }
-            let monitor = Unmanaged<StatusMonitor>.fromOpaque(observer).takeUnretainedValue()
-            DispatchQueue.main.async {
-                monitor.darwinNotificationCount += 1
-                monitor.updateKeychainStatus(markingFreshUpdate: true)
-            }
-        }, name, nil, .deliverImmediately)
-
-        self.darwinObserver = observer
-    }
-}
-
-final class LinesMonitor: ObservableObject {
-    @Published var lines: [RecentLine] = []
-    /// 未定稿草稿原文：与定稿句对分开，只给界面显示。
-    @Published var draft: String = ""
-    @Published var darwinNotificationCount: Int = 0
-
-    private var linesObserver: UnsafeRawPointer?
-    private var pollTimer: Timer?
-
-    init() {
-        registerLinesNotification()
-        startPolling()
-        refreshFromKeychain()
-    }
-
-    deinit {
-        stopPolling()
-        if let observer = linesObserver {
-            CFNotificationCenterRemoveObserver(CFNotificationCenterGetDarwinNotifyCenter(), observer, nil, nil)
-        }
-    }
-
-    private func registerLinesNotification() {
-        let center = CFNotificationCenterGetDarwinNotifyCenter()
-        let name = "com.wyl2607.rsios.spike.lines" as CFString
-        let observer = UnsafeRawPointer(Unmanaged.passUnretained(self).toOpaque())
-
-        CFNotificationCenterAddObserver(center, observer, { _, observer, _, _, _ in
-            guard let observer = observer else { return }
-            let monitor = Unmanaged<LinesMonitor>.fromOpaque(observer).takeUnretainedValue()
-            DispatchQueue.main.async {
-                monitor.darwinNotificationCount += 1
-                monitor.refreshFromKeychain()
-            }
-        }, name, nil, .deliverImmediately)
-
-        self.linesObserver = observer
-    }
-
-    private func startPolling() {
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            self?.refreshFromKeychain()
-        }
-        pollTimer?.fire()
-    }
-
-    private func stopPolling() {
-        pollTimer?.invalidate()
-        pollTimer = nil
-    }
-
-    private func refreshFromKeychain() {
-        if let json = SharedKeychain.readLatestLines(),
-           let data = json.data(using: .utf8),
-           let lines = try? JSONDecoder().decode([RecentLine].self, from: data) {
-            DispatchQueue.main.async {
-                self.lines = lines
-            }
-        }
-        let draft = SharedKeychain.readLatestDraft() ?? ""
-        DispatchQueue.main.async {
-            if self.draft != draft {
-                self.draft = draft
-            }
-        }
-    }
 }
 
 final class AppStateMonitor: ObservableObject {

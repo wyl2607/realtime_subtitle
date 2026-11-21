@@ -13,9 +13,68 @@ struct LocalSentenceRange: Equatable {
     var end: Double
 }
 
+/// 单句翻译超时的失败。只用来在日志里和真的翻译错误区分开；
+/// 上层仍然走「翻译失败只显示原文」的同一条路径。
+private struct TranslationTimeoutError: LocalizedError {
+    let seconds: TimeInterval
+
+    var errorDescription: String? {
+        "Translation timed out after \(Int(seconds))s"
+    }
+}
+
+/// 一次性交卷的竞速闸门：翻译结果和超时谁先到谁算数，后到的静默丢弃。
+///
+/// CheckedContinuation 被 resume 两次会直接 crash，而这两条路径天然会竞争，
+/// 所以必须用锁把「第一次交卷」钉死。为什么不直接用 TaskGroup 竞速：
+/// 作用域退出前会等所有子任务结束，而 Translation 不保证响应取消——
+/// 超时分支抛出去了也照样卡在作用域尾部，串行尾链还是堵住。
+private final class TranslationTimeoutRace<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var settled: Result<Value, Error>?
+    private var waiter: CheckedContinuation<Value, Error>?
+
+    func settle(_ result: Result<Value, Error>) {
+        lock.lock()
+        guard settled == nil else {
+            lock.unlock()
+            return
+        }
+        if let waiter {
+            settled = result
+            self.waiter = nil
+            lock.unlock()
+            waiter.resume(with: result)
+        } else {
+            // 结果比 wait() 先到：先存着，等 value() 来取。
+            settled = result
+            lock.unlock()
+        }
+    }
+
+    func value() async throws -> Value {
+        try await withCheckedThrowingContinuation { continuation in
+            lock.lock()
+            if let settled {
+                lock.unlock()
+                continuation.resume(with: settled)
+            } else {
+                waiter = continuation
+                lock.unlock()
+            }
+        }
+    }
+}
+
 @available(iOS 26.0, *)
 final class LocalEngine {
     private let logger = Logger(subsystem: "com.wyl2607.rsios.spike", category: "local-engine")
+
+    /// 单句翻译超时（秒）。TranslationSession 一旦对某句不返回，串行尾链后面
+    /// 每一句都会一直等下去：原文照常上屏、译文从某句起永久停住，而引擎既
+    /// 不报错也不自愈。10 秒比实测单句（约 0.1–1 秒）宽得多，又比用户能忍受
+    /// 的「字幕永远缺一句」短得多。
+    private static let translationTimeout: TimeInterval = 10
 
     /// 引擎模式。
     enum Mode {
@@ -451,7 +510,7 @@ final class LocalEngine {
         Task { [weak self] in
             guard let self else { return }
             do {
-                let response = try await session.translate(trimmed)
+                let response = try await self.translateWithTimeout(session, text: trimmed)
                 guard !self.isStopped() else { return }
                 let translated = response.targetText.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !translated.isEmpty {
@@ -571,12 +630,44 @@ final class LocalEngine {
         }
     }
 
+    /// 给单句翻译套一层超时。超时后抛 TranslationTimeoutError，调用方走既有的
+    /// 「翻译失败只显示原文」路径，并继续处理下一句。
+    private func translateWithTimeout(
+        _ session: TranslationSession,
+        text: String
+    ) async throws -> TranslationSession.Response {
+        let race = TranslationTimeoutRace<TranslationSession.Response>()
+        let work = Task {
+            do {
+                race.settle(.success(try await session.translate(text)))
+            } catch {
+                race.settle(.failure(error))
+            }
+        }
+        let timer = Task {
+            try? await Task.sleep(nanoseconds: UInt64(Self.translationTimeout * 1_000_000_000))
+            race.settle(.failure(TranslationTimeoutError(seconds: Self.translationTimeout)))
+        }
+        defer {
+            timer.cancel()
+            // 超时赢的时候这里会请求取消；Translation 不一定响应，但那个任务
+            // 已经不再被等，不会挡住下一句。
+            work.cancel()
+        }
+        return try await withTaskCancellationHandler {
+            try await race.value()
+        } onCancel: {
+            // stop() 会 cancel 串行尾链：别让停机陪着翻译一起等满 10 秒。
+            race.settle(.failure(CancellationError()))
+        }
+    }
+
     private func translateAndSettle(id: Int, text: String) async {
         guard !isStopped() else { return }
         let ready = stateLock.withLock { translationReady }
         if let session = await ready?.value {
             do {
-                let response = try await session.translate(text)
+                let response = try await translateWithTimeout(session, text: text)
                 guard !isStopped() else { return }
                 let translated = response.targetText.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !translated.isEmpty {

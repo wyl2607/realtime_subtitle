@@ -105,9 +105,10 @@ xcodebuild -project RSiOS.xcodeproj -scheme RSiOS -sdk iphoneos -configuration D
 
 | 文件 | 职责 |
 |---|---|
-| `ContentView.swift` | 主界面：广播选择器、麦克风开始/停止、节点配对、引擎档位、准备本机资源、Groq key/开关、PiP、扩展状态、最近句对、今日字幕入口；以及 `PiPManager`、`StatusMonitor`、`LinesMonitor` 等监听 |
+| `ContentView.swift` | 主界面：广播选择器、麦克风开始/停止、节点配对、引擎档位、准备本机资源、Groq key/开关、PiP、扩展状态、最近句对、今日字幕入口；以及 `PiPManager` |
+| `LiveFeed.swift` | 主 App 唯一的运行态轮询源：一个定时器读一次扩展状态 / 最近句对 / 草稿，内容变化才发布（`StatusMonitor`、`LinesMonitor` 已并入） |
 | `MicCapture.swift` | 麦克风采集：权限申请、音频会话（开始 `playAndRecord` / 停止还原 `playback`）、中断与路由变化处理，buffer 投给共享引擎 |
-| `TranscriptStore.swift` | 当天字幕存档，按「会话代号 + 句子 id」去重，译文后到原地更新 |
+| `TranscriptStore.swift` | 当天字幕存档，按「会话代号 + 句子 id」去重，译文后到原地更新；写盘异步合并（约 1 秒一次），进后台 flush |
 | `TranscriptView.swift` | 「今天的字幕」只读页面 |
 | `RSiOSApp.swift` | App 入口 |
 | `Assets.xcassets/` | App 图标资源 |
