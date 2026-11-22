@@ -1820,3 +1820,35 @@ def test_key_change_before_refresh_drops_old_key_callbacks(tmp_path):
         assert ui2.lines == []
     finally:
         bridge2.close()
+
+
+def test_flush_waits_for_follow_up_work_spawned_by_pool_tasks(tmp_path):
+    """flush() 必须等任务派生的后续任务：先池后循环的固定屏障会漏掉「池任务 → 再提交池任务」这一跳。
+
+    节点 send（事件循环）触发 on_final，再往线程池提交翻译/发布；
+    这里用最小等价结构：池任务 A 结束后才提交池任务 B，flush 返回时 B 必须已完成。
+    """
+    bridge, _ui, _translator = _open(
+        cloud_on=True, node_on=False,
+        cloud_client_factory=lambda key_path=None: _Cloud(), segmenter_factory=_Segmenter,
+        ledger_factory=lambda path, routing=None: _Ledger(path, routing),
+        router_factory=lambda **kwargs: RemoteRouter(**kwargs), quota_path=tmp_path / "quota.json",
+    )
+    done = []
+    gate = threading.Event()
+
+    def second():
+        done.append("B")
+
+    def first():
+        gate.wait(2)
+        # 在 A 还没返回时才提交 B：模拟「循环里的回调晚一步往线程池提交」
+        bridge._submit(second)
+
+    try:
+        bridge._submit(first)
+        threading.Timer(0.05, gate.set).start()
+        bridge.flush()
+        assert done == ["B"], "flush 返回时派生的后续任务还没跑完"
+    finally:
+        bridge.close()
