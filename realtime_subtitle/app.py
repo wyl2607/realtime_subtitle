@@ -266,6 +266,11 @@ class RemoteBridge:
         # 线程会和它抢同一个 Ollama session。收成一条，至少云端/节点之间不并发。
         self._pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="remote-asr")
+        # 已提交但还没跑完的后台活（线程池任务 + 发往事件循环的节点音频）。
+        # flush() 靠它判断「真的空了」：任务之间会互相派活（节点 send 在事件循环里触发
+        # on_final，再往线程池提交翻译/发布），固定顺序的「先池后循环」屏障会漏掉后一跳。
+        self._inflight = 0
+        self._inflight_cv = __import__("threading").Condition()
         self._announce_route(notify=False)
 
     def close(self):
@@ -281,16 +286,46 @@ class RemoteBridge:
         self._pool = None
         if pool is not None:
             pool.shutdown(wait=False, cancel_futures=True)
+            # 被取消的任务不会再跑 run() 的 finally，在飞计数在这里归零，flush 不会挂到超时。
+            with self._inflight_cv:
+                self._inflight = 0
+                self._inflight_cv.notify_all()
 
-    def flush(self):
-        """等已经提交的云端/翻译任务跑完。测试用来同步，不关线程池。"""
+    def _inflight_add(self):
+        with self._inflight_cv:
+            self._inflight += 1
+
+    def _inflight_done(self, *_):
+        with self._inflight_cv:
+            self._inflight -= 1
+            if self._inflight <= 0:
+                self._inflight_cv.notify_all()
+
+    def _submit(self, fn, *args):
+        """提交到后台线程池并计入在飞任务（异常照旧由 Future 吞掉，和直接 submit 一致）。"""
         pool = self._pool
-        if pool is not None:
-            pool.submit(lambda: None).result()
-        loop = self._loop
-        if loop is not None:
-            import asyncio
-            asyncio.run_coroutine_threadsafe(asyncio.sleep(0), loop).result(timeout=2)
+        if pool is None:
+            return None
+        self._inflight_add()
+
+        def run():
+            try:
+                return fn(*args)
+            finally:
+                self._inflight_done()
+
+        try:
+            return pool.submit(run)
+        except BaseException:
+            self._inflight_done()
+            raise
+
+    def flush(self, timeout=5):
+        """等已经提交的云端/翻译/节点任务全部跑完（含任务派生的后续任务）。
+        测试用来同步，不关线程池。"""
+        with self._inflight_cv:
+            if not self._inflight_cv.wait_for(lambda: self._inflight <= 0, timeout=timeout):
+                raise TimeoutError(f"flush 超时：仍有 {self._inflight} 个后台任务未完成")
 
     def set_prefs(self, cloud_on, node_on):
         """只改开关。关云端要作废在飞结果；组合变了由 app 拆掉重建。"""
@@ -450,7 +485,7 @@ class RemoteBridge:
             if tier == "cloud" and self._pool is not None:
                 for a0, a1, seg in segments:
                     copied = np.array(seg, dtype=np.int16, copy=True)
-                    self._pool.submit(self._transcribe_one, float(a0), float(a1), copied, self._generation)
+                    self._submit(self._transcribe_one, float(a0), float(a1), copied, self._generation)
         if not self.node_on or tier == "cloud":
             return
         # 从云端退到节点要等一段静音，免得一句话被切两半。本机识别一直在跑。
@@ -949,7 +984,13 @@ class RemoteBridge:
         if client is None or loop is None or self._closed or not data:
             return
         import asyncio
-        asyncio.run_coroutine_threadsafe(client.send(data, start), loop)
+        self._inflight_add()
+        try:
+            future = asyncio.run_coroutine_threadsafe(client.send(data, start), loop)
+        except BaseException:
+            self._inflight_done()
+            raise
+        future.add_done_callback(self._inflight_done)
 
     def _close_node(self):
         client = self._node_client
@@ -993,7 +1034,7 @@ class RemoteBridge:
             remote_key = self._publish_remote(node_id, t0, t1, text, dst)
             self._node_dst_keys[node_key] = remote_key
 
-        self._pool.submit(work)
+        self._submit(work)
 
     def _on_node_translation(self, node_id, generation, tx_id, body, conn=None):
         if self._node_conn_stale(conn):
@@ -1016,7 +1057,7 @@ class RemoteBridge:
             if self._ui_update_dst is not None:
                 self._ui_update_dst(key, body or "")
 
-        self._pool.submit(work)
+        self._submit(work)
 
     def _notify_node_translate_failed_once(self, node_id, generation):
         marker = (node_id, generation)
@@ -1059,7 +1100,7 @@ class RemoteBridge:
             if self._ui_update_dst is not None:
                 self._ui_update_dst(key, dst)
 
-        self._pool.submit(work)
+        self._submit(work)
 
     def _on_node_status(self, text, conn=None):
         if self._node_conn_stale(conn):
