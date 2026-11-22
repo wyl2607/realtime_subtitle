@@ -73,6 +73,38 @@ private final class TranslationTimeoutRace<Value: Sendable>: @unchecked Sendable
     }
 }
 
+/// 翻译会话「准备好了」这件事的广播：只起一个等待任务，每一句只登记/摘掉一个竞速闸门。
+/// 以前每句都新开一个 `await ready.value` 的 Task，而 cancel 唤不醒它，
+/// prepareTranslation 卡住时每句都会永久留下一个挂起的 Task。
+private final class PreparedBroadcast: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: PreparedSession??
+    private var listeners: [ObjectIdentifier: TranslationTimeoutRace<PreparedSession?>] = [:]
+
+    func add(_ race: TranslationTimeoutRace<PreparedSession?>) {
+        let done = lock.withLock { () -> PreparedSession?? in
+            if result == nil { listeners[ObjectIdentifier(race)] = race }
+            return result
+        }
+        if let done { race.settle(.success(done)) }
+    }
+
+    func remove(_ race: TranslationTimeoutRace<PreparedSession?>) {
+        lock.withLock { _ = listeners.removeValue(forKey: ObjectIdentifier(race)) }
+    }
+
+    func finish(_ value: PreparedSession?) {
+        let pending = lock.withLock { () -> [TranslationTimeoutRace<PreparedSession?>] in
+            result = .some(value)
+            defer { listeners.removeAll() }
+            return Array(listeners.values)
+        }
+        for race in pending { race.settle(.success(value)) }
+    }
+
+    var listenerCount: Int { lock.withLock { listeners.count } }
+}
+
 /// unchecked Sendable：本类没有 actor 隔离，全部可变状态都由 stateLock 守护
 /// （见下面 stateLock 的说明）。启动、结果循环、翻译链各在自己的 Task 里引用 self。
 final class LocalEngine: @unchecked Sendable {
@@ -102,6 +134,7 @@ final class LocalEngine: @unchecked Sendable {
     private var resultTask: Task<Void, Never>?
     /// 识别不能等翻译模型准备好；结果到达时再等这个任务，首句既不丢译文也不挡原文。
     private var translationReady: Task<PreparedSession?, Never>?
+    private var translationBroadcast: PreparedBroadcast?
     /// 最近一句的翻译任务；下一句接在它后面。
     private var translationTail: Task<Void, Never>?
 
@@ -565,6 +598,7 @@ final class LocalEngine: @unchecked Sendable {
                 translationTail: translationTail
             )
             translationReady = nil
+            translationBroadcast = nil
             translationTail = nil
             guard isRunning else { return snapshot }
             isRunning = false
@@ -720,13 +754,20 @@ final class LocalEngine: @unchecked Sendable {
     private func preparedSession(_ ready: Task<PreparedSession?, Never>?) async -> TranslationSession? {
         guard let ready else { return nil }
         let race = TranslationTimeoutRace<PreparedSession?>()
-        let waiter = Task { race.settle(.success(await ready.value)) }
+        let broadcast = stateLock.withLock { () -> PreparedBroadcast in
+            if let existing = translationBroadcast { return existing }
+            let created = PreparedBroadcast()
+            translationBroadcast = created
+            Task { created.finish(await ready.value) }
+            return created
+        }
+        broadcast.add(race)
         let timer = Task {
             try? await Task.sleep(nanoseconds: UInt64(Self.translationTimeout * 1_000_000_000))
             race.settle(.failure(TranslationTimeoutError(seconds: Self.translationTimeout)))
         }
         defer {
-            waiter.cancel()
+            broadcast.remove(race)
             timer.cancel()
         }
         do {
