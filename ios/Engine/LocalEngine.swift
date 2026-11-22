@@ -458,7 +458,8 @@ final class LocalEngine: @unchecked Sendable {
         sourceBuffer.frameLength = AVAudioFrameCount(frameCount)
         pcm16k.withUnsafeBytes { raw in
             guard let base = raw.baseAddress, let dst = sourceBuffer.int16ChannelData?[0] else { return }
-            memcpy(dst, base, pcm16k.count)
+            // 奇数长度时多出的半个样本不拷：缓冲只有 frameCount 帧，按字节数拷会越界写 1 字节。
+            memcpy(dst, base, frameCount * 2)
         }
 
         if analyzerFormat == sourceFormat {

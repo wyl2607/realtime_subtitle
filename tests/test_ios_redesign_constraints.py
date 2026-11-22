@@ -321,3 +321,22 @@ def test_hc_u15_node_session_never_uses_system_proxy():
     assert "linesWriteQueue.sync" in body and "stateQueue.sync" in body and "encode(recentLines)" in body, (
         "HC-U15 违反：writeLatestLines 又在锁外读 recentLines（数据竞争，旧快照可能覆盖新字幕）。"
     )
+
+
+def test_hc_u16_bounded_copies_and_watchdog_recheck():
+    """硬约束 HC-U16：PCM 拷贝按帧数算字节；节点就绪看门狗到点前在锁内重新核对。
+
+    为什么不行（2026-11-22 剩余审计核实）：
+    - LocalEngine.append 按 Data 字节数 memcpy，奇数长度时比 frameCount 帧的缓冲多写 1 字节。
+    - readyWatchdogFired 解锁算剩余时间后直接清 readyBox 并关 socket，期间 ready 刚到也会被当超时掐断。
+    必须怎么改：memcpy 长度用 frameCount * 2；关 socket 前 `guard readyBox === box`。
+    """
+    local = (IOS / "Engine" / "LocalEngine.swift").read_text(encoding="utf-8")
+    assert "memcpy(dst, base, pcm16k.count)" not in local, (
+        "HC-U16 违反：LocalEngine.append 按字节数拷 PCM，奇数长度会越界写。"
+    )
+    node = (IOS / "Shared" / "NodeProtocol.swift").read_text(encoding="utf-8")
+    body = node[node.index("private func readyWatchdogFired()"):node.index("private func cancelReadyWatch()")]
+    assert "readyBox === box" in body, (
+        "HC-U16 违反：就绪看门狗关连接前没在锁内核对 readyBox，会掐断刚就绪的会话。"
+    )

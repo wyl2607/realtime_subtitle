@@ -459,7 +459,13 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate, @unchecked Senda
         }
         // 到点仍未 ready：按握手超时结束会话。rslite 到点用 .goingAway 取消 socket
         // 再上报 timeout，这里同样以 1001 通知 onClose，让调用方走正常重连退避。
+        // 解锁算剩余时间的这段空档里 ready 可能刚到（readyBox 已被清掉或换新）：
+        // 不再核对一次就会把刚就绪的会话按超时掐断。
         lock.lock()
+        guard readyBox === box else {
+            lock.unlock()
+            return
+        }
         readyBox = nil
         let socket = self.socket
         lock.unlock()
