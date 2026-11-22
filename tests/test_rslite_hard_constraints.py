@@ -10,6 +10,22 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCES = ROOT / "macos-native" / "Sources" / "rslite"
 
 
+def _closure_after(text: str, start: int) -> str:
+    """从 start 之后第一个 `{` 起，按花括号配对取出整个闭包体（不能在第一个 `}` 截断）。"""
+    open_at = text.find("{", start)
+    if open_at < 0:
+        return ""
+    depth = 0
+    for i in range(open_at, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_at:i + 1]
+    return text[open_at:]
+
+
 def _swift_files():
     return sorted(SOURCES.rglob("*.swift"))
 
@@ -23,11 +39,11 @@ def test_hc_s01_tap_buffers_are_copied_before_crossing_async_boundary():
     AVAudioPCMBuffer（参考 MicSource.copy / ProcessTapSource.copy）再 yield。
     """
     offenders = []
+    assert _swift_files(), "HC-S01：找不到 rslite 源码，守卫不能空跑通过"
     for path in _swift_files():
         text = path.read_text(encoding="utf-8")
         for match in re.finditer(r"installTap\(", text):
-            block = text[match.start():match.start() + 600]
-            closure = block.split("}", 1)[0]
+            closure = _closure_after(text, match.end())
             if re.search(r"yield\(\s*buffer\s*\)", closure):
                 line = text.count("\n", 0, match.start()) + 1
                 offenders.append(f"{path.relative_to(ROOT)}:{line}")
