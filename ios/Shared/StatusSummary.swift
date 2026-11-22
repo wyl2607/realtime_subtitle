@@ -29,8 +29,10 @@ enum StatusSummaryParser {
         if parts.first == "no_config" {
             // 没配对节点不是「空闲」：广播已经起来了，只是没有可用的识别档，
             // 显示成「未启动」会让用户以为广播没开。
+            // 显式 node 档与自动档都会写 no_config，解析不出是否已回退本机，
+            // 所以只说「不可用」，不承诺「已用本机」。
             return StatusSummary(
-                label: nodeLabel(in: parts) + DesignTokens.Text.nodeUnavailableSuffix,
+                label: nodeLabel(in: parts) + DesignTokens.Text.nodeUnavailablePlainSuffix,
                 level: .warning
             )
         }
@@ -112,7 +114,7 @@ enum StatusSummaryParser {
                 let code = String(part.dropFirst("fatal:".count))
                 if LocalEngineStatus.userMessage(forStatusLine: "fatal:\(code)") == nil {
                     return StatusSummary(
-                        label: nodeLabel(in: parts) + DesignTokens.Text.nodeUnavailableSuffix,
+                        label: nodeLabel(in: parts) + DesignTokens.Text.nodeUnavailablePlainSuffix,
                         level: .error
                     )
                 }
