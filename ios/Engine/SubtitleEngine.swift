@@ -134,6 +134,8 @@ final class SubtitleEngine: @unchecked Sendable {
     private let maxRecentLines = 3
     private let stateQueue = DispatchQueue(label: "com.wyl2607.rsios.spike.state")
     private let connectionQueue = DispatchQueue(label: "com.wyl2607.rsios.spike.connection")
+    /// 只给 writeLatestLines 用：把「取快照 → 写 Keychain」串起来，不在 stateQueue 里做 I/O。
+    private let linesWriteQueue = DispatchQueue(label: "com.wyl2607.rsios.spike.lines-write")
     private var broadcastActive = false
     /// 所有节点异步回调都带着创建时的代号；必须在 stateQueue 上核对，不能跨轮次写状态。
     private var runGate = EngineRunGate()
@@ -1653,20 +1655,25 @@ final class SubtitleEngine: @unchecked Sendable {
         postDarwinNotification()
     }
 
+    /// 节点/本机/云端回调各在自己的队列上调这里。以前在锁外直接读 recentLines、写 lastLinesJSON：
+    /// 数据竞争，而且较旧的快照可能后写、把较新的字幕盖掉。现在整段在串行写队列里做，
+    /// 快照在 stateQueue 内取——最后一次写进 Keychain 的一定是最新内容。
     private func writeLatestLines() {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = []
-        if let data = try? encoder.encode(recentLines),
-           let json = String(data: data, encoding: .utf8) {
-            if json != lastLinesJSON {
-                // 写失败不记 lastLinesJSON：下一句来时整份重写，不会因为一次失败永远缺句。
-                guard SharedKeychain.writeLatestLines(json) else {
-                    logger.error("Failed to write latest_lines to keychain")
-                    return
-                }
-                lastLinesJSON = json
-                postLinesNotification()
+        linesWriteQueue.sync {
+            let json: String? = stateQueue.sync {
+                guard let data = try? JSONEncoder().encode(recentLines),
+                      let json = String(data: data, encoding: .utf8),
+                      json != lastLinesJSON else { return nil }
+                return json
             }
+            guard let json else { return }
+            // 写失败不记 lastLinesJSON：下一句来时整份重写，不会因为一次失败永远缺句。
+            guard SharedKeychain.writeLatestLines(json) else {
+                logger.error("Failed to write latest_lines to keychain")
+                return
+            }
+            stateQueue.sync { lastLinesJSON = json }
+            postLinesNotification()
         }
     }
 

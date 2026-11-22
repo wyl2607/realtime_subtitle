@@ -258,6 +258,10 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate, @unchecked Senda
         var request = URLRequest(url: url)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         let configuration = URLSessionConfiguration.ephemeral
+        // 节点连接绝不走系统代理（CLAUDE.md 第 4 节第 47 条）：ephemeral 仍会继承系统 HTTP/SOCKS/PAC 代理，
+        // 代理就能看到 Bearer token 和原始音频，也能把连接带出 tailnet。空字典＝不用任何代理。
+        // 云端客户端相反，要保留系统代理（有的用户只能经代理访问 Groq）。
+        configuration.connectionProxyDictionary = [:]
         let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
         let socket = session.webSocketTask(with: request)
         // 截止时间从开始建连起算：握手卡住时 send 回调不会返回，必须先让看门狗接管。

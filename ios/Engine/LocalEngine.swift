@@ -764,11 +764,18 @@ final class LocalEngine: @unchecked Sendable {
         stateLock.withLock { translationTail = nil }
     }
 
+    /// 识别链路结束（正常收尾或出错）：除了放掉会话，还要把「在运行」清掉、结束输入流。
+    /// 以前只放会话，引擎自认还在跑：append 继续往没人消费的流里塞，start() 也永远是空操作。
     private func finish() async {
-        stateLock.withLock {
+        let continuation = stateLock.withLock { () -> AsyncStream<AnalyzerInput>.Continuation? in
             analyzer = nil
             transcriber = nil
             translationSession = nil
+            isRunning = false
+            let continuation = inputContinuation
+            inputContinuation = nil
+            return continuation
         }
+        continuation?.finish()
     }
 }

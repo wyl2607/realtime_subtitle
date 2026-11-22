@@ -299,3 +299,25 @@ def test_hc_u14_engine_invariants_from_free_model_audit():
             "HC-U14 违反：" + _locate(IOS / "Engine" / "SubtitleEngine.swift", engine, m.start())
             + " 先停本机引擎、再另开临界区改 routingTier；用 stopLocalEngine(switchingTo:)。"
         )
+
+
+def test_hc_u15_node_session_never_uses_system_proxy():
+    """硬约束 HC-U15：节点 WebSocket 绝不走系统代理；云端客户端保留系统代理。
+
+    为什么不行：URLSessionConfiguration.ephemeral 仍继承系统 HTTP/SOCKS/PAC 代理（codex 审计 2026-11-22），
+    代理能看到 Bearer token 和原始音频，也能把连接带出 tailnet——违反 CLAUDE.md 第 4 节第 47 条。
+    必须怎么改：NodeSession 建连前 `configuration.connectionProxyDictionary = [:]`；CloudClient 不许这么设。
+    """
+    node = (IOS / "Shared" / "NodeProtocol.swift").read_text(encoding="utf-8")
+    assert "connectionProxyDictionary = [:]" in node, (
+        "HC-U15 违反：NodeSession 的 URLSession 没有禁用系统代理，token 和音频会经过代理。"
+    )
+    cloud = (IOS / "Shared" / "CloudClient.swift").read_text(encoding="utf-8")
+    assert "connectionProxyDictionary" not in cloud, (
+        "HC-U15 违反：CloudClient 改了代理设置。Groq 在公网，有的用户只能经系统代理访问，不许关。"
+    )
+    engine = (IOS / "Engine" / "SubtitleEngine.swift").read_text(encoding="utf-8")
+    body = engine[engine.index("private func writeLatestLines()"):engine.index("private func postDarwinNotification()")]
+    assert "linesWriteQueue.sync" in body and "stateQueue.sync" in body and "encode(recentLines)" in body, (
+        "HC-U15 违反：writeLatestLines 又在锁外读 recentLines（数据竞争，旧快照可能覆盖新字幕）。"
+    )
