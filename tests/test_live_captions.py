@@ -697,7 +697,7 @@ def test_pause_full_screen_change_does_not_replay_on_resume():
 
 def test_reader_same_exception_printed_once(monkeypatch, tmp_path, capsys):
     """相同异常只打印一次，不同异常各打印一次。"""
-    events = _fake_reader_environment(monkeypatch, tmp_path)
+    _fake_reader_environment(monkeypatch, tmp_path)
     reader = lc.LiveCaptionsReader("LiveCaptions.exe", hide_window=False)
     
     attempts = []
