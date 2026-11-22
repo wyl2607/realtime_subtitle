@@ -107,6 +107,9 @@ final class CloudClient: @unchecked Sendable {
     ) {
         self.key = key
         self.endpointURL = endpoint
+        // NWPathMonitor 启动后首个回调是异步的；在这里先把单例建起来，
+        // 否则第一次上传失败时快照还是默认的 wifi=false/cellular=false，蜂窝重发必然不触发。
+        _ = NetworkPaths.shared
         self.session = URLSession(configuration: sessionConfiguration)
     }
 

@@ -51,8 +51,8 @@ def test_hc_i01_every_fatal_assignment_goes_through_mark_fatal_error():
         f"实际有 {len(assignments)} 处。新增 fatal 分支必须走 markFatalError，"
         "否则不会通知宿主结束广播。"
     )
-    assert src.count("markFatalError(code:") - src.count("func markFatalError(code:") >= 3, (
-        "HC-I01 违反：三条 fatal 分支（local_needs_ios26、本机失败码、节点 fatal）"
+    assert src.count("markFatalError(code:") - src.count("func markFatalError(code:") >= 2, (
+        "HC-I01 违反：两条 fatal 分支（本机失败码、节点 fatal；改版后只支持 iOS 26+，local_needs_ios26 已不再致命）"
         "都必须调用 markFatalError(code:)。"
     )
 

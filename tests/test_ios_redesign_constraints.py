@@ -356,6 +356,9 @@ def test_hc_u17_cloud_upload_falls_back_to_cellular_only_safely():
         "HC-U17 违反：CloudClient 换蜂窝重发没走 CellularFallback.shouldRetry（会绕过系统代理）。"
     )
     assert "beforeCellularRetry?()" in cloud, "HC-U17 违反：重发前没通知调用方记账。"
+    assert "_ = NetworkPaths.shared" in cloud, (
+        "HC-U17 违反：CloudClient 初始化时没有预热 NetworkPaths，首次失败时路径快照还是 false/false，蜂窝重发不会触发。"
+    )
     fallback = (IOS / "Shared" / "NetworkPaths.swift").read_text(encoding="utf-8")
     assert "!systemProxyConfigured" in fallback, "HC-U17 违反：开了系统代理仍会直连蜂窝。"
     cellular = (IOS / "Shared" / "CellularHTTP.swift").read_text(encoding="utf-8")
