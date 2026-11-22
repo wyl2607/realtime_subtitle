@@ -76,6 +76,17 @@ struct LiveFeedSelftest {
         feed.refresh()
         check(feed.lines.count == 1, "坏 JSON 不应清空上一份句对")
 
+        // 读不到（nil）：同样保留上一份，不能清空。
+        linesSource = "[]"
+        feed.refresh()
+        check(feed.lines.isEmpty, "明确的空数组应清空句对")
+        linesSource = "[{\"id\":2,\"src\":\"Hallo.\",\"dst\":\"你好\",\"session\":\"s1\"}]"
+        feed.refresh()
+        let before = feed.lines.count
+        linesSource = nil
+        feed.refresh()
+        check(feed.lines.count == before && before > 0, "读取返回 nil 不应清空句对")
+
         if failures.isEmpty {
             print("LIVE FEED SELFTEST OK")
         } else {

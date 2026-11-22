@@ -72,14 +72,14 @@ final class LiveFeed {
             changed = true
         }
 
-        let linesJSON = readLines()
-        if linesJSON != lastLinesJSON {
+        // 读不到（nil，如锁屏时 Keychain 暂时不可读）和坏 JSON 一样保留上一份好句对，
+        // 只有明确读到 "[]" 才清空；这与旧实现「读取并解码成功才覆盖」一致。
+        if let linesJSON = readLines(), linesJSON != lastLinesJSON {
             lastLinesJSON = linesJSON
-            // 坏 JSON 保留上一份好句对：扩展写到一半时不能把字幕清空。
             if let decoded = Self.decodeLines(linesJSON) {
                 lines = decoded
                 changed = true
-            } else if linesJSON != nil {
+            } else {
                 logger.error("LiveFeed latest lines decode failed")
             }
         }
@@ -95,8 +95,7 @@ final class LiveFeed {
         }
     }
 
-    private static func decodeLines(_ json: String?) -> [RecentLine]? {
-        guard let json else { return [] }
+    private static func decodeLines(_ json: String) -> [RecentLine]? {
         guard let data = json.data(using: .utf8) else { return nil }
         return try? JSONDecoder().decode([RecentLine].self, from: data)
     }
