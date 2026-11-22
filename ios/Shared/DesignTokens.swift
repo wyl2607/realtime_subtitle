@@ -65,6 +65,7 @@ enum DesignTokens {
         static let untranslated: String = "未翻译 ⟳"
         static let translating: String = "翻译中…"
         static let nodeUnavailableSuffix: String = " 不可用，已用本机"
+        static let nodeUnavailablePlainSuffix: String = " 不可用，未回退本机"
         static let nodeRecoveredWaitingSuffix: String = " 已恢复，等本句结束后切回"
         static let nodeRecoveredSwitchedSuffix: String = " 已恢复，已切回节点"
         static let nodeLoadingSuffix: String = " 正在加载模型…"
