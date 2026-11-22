@@ -37,7 +37,8 @@ final class SubtitleEngine {
             message = local
         } else {
             let name = nodeName.isEmpty ? "电脑节点" : nodeName
-            message = DesignTokens.Text.statusHybridPrefix + name + DesignTokens.Text.nodeUnavailableSuffix
+            // fatal 只在显式 node 档产生（自动档走回退），本机没有接手，不能写「已用本机」。
+            message = DesignTokens.Text.statusHybridPrefix + name + DesignTokens.Text.nodeUnavailablePlainSuffix
         }
         return NSError(
             domain: "com.wyl2607.rsios.spike",

@@ -36,7 +36,7 @@ enum StatusSummarySelftest {
         check(
             StatusSummaryParser.summary(forStatusLine: "no_config src=broadcast")
                 == StatusSummary(
-                    label: DesignTokens.Text.statusHybridPrefix + "电脑节点" + DesignTokens.Text.nodeUnavailableSuffix,
+                    label: DesignTokens.Text.statusHybridPrefix + "电脑节点" + DesignTokens.Text.nodeUnavailablePlainSuffix,
                     level: .warning
                 ),
             "HC-I02 no_config → warning 并说明节点不可用（不是未启动）"
@@ -182,7 +182,7 @@ enum StatusSummarySelftest {
                     + " drop=0 reconn=0 fatal:engine_load_failed"
             )
             == StatusSummary(
-                label: DesignTokens.Text.statusHybridPrefix + "mini2" + DesignTokens.Text.nodeUnavailableSuffix,
+                label: DesignTokens.Text.statusHybridPrefix + "mini2" + DesignTokens.Text.nodeUnavailablePlainSuffix,
                 level: .error
             ),
             "HC-I02 节点 fatal → error，不能被当成正常状态"
