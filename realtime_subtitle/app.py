@@ -238,6 +238,10 @@ class RemoteBridge:
         self._node_translate_failed = set()
         self._node_translate_failed_notified = set()
         self._fed_samples = 0
+        self._last_capture_end = None
+        self._idle_padding = 0
+        self._padding_samples = 0
+        self._padding_spans = []
         self._language_revision = 0
         # 冷却时长只存在 routing_rules.cooldown_seconds，到点与否由桥自己记。
         self._routing_checked_at = None
@@ -385,15 +389,50 @@ class RemoteBridge:
         if kept:
             self._ui_show(src, tgt, t0, t1, key, "local", revision)
 
-    def feed_audio(self, audio):
+    def feed_audio(self, audio, capture_time=None):
         if self._closed:
             return
         pcm = _pcm_int16(audio)
+        rate = float(config.SAMPLE_RATE)
+        if capture_time is not None:
+            # 时间戳是采集段尾；减去块长才是上一块之后真正漏掉的静音。
+            self._pad_remote_silence(float(capture_time) - pcm.size / rate)
         if pcm.size == 0:
             return
-        rate = float(config.SAMPLE_RATE)
-        start = self._origin_seconds + (self._fed_samples / rate)
+        self._last_capture_end = capture_time
+        self._idle_padding = 0
+        start = self._origin_seconds + (self._fed_samples + self._padding_samples) / rate
         self._fed_samples += int(pcm.shape[0])
+        self._feed_remote_pcm(pcm, start)
+
+    def _pad_remote_silence(self, capture_time):
+        if self._last_capture_end is None:
+            return
+        import numpy as np
+        rate = float(config.SAMPLE_RATE)
+        gap = capture_time - self._last_capture_end
+        # 连续采集的段尾时间有调度抖动，不把毫秒级误差补成越来越长的假静音。
+        if gap < 0.1:
+            return
+        # 0.6s 收段、短段再等到段尾后 1.5s；2s 含 VAD 窗口对齐余量，
+        # 足以释放尾句。整晚没声音也只补这些，不随墙钟无限制造样本。
+        target = min(int(2 * rate), int(round(gap * rate)))
+        count = target - self._idle_padding
+        if count <= 0:
+            return
+        start_sample = self._fed_samples + self._padding_samples
+        with self._lock:
+            if self._padding_spans and self._padding_spans[-1][1] == start_sample:
+                begin, _end = self._padding_spans[-1]
+                self._padding_spans[-1] = (begin, start_sample + count)
+            else:
+                self._padding_spans.append((start_sample, start_sample + count))
+        self._idle_padding += count
+        self._padding_samples += count
+        self._feed_remote_pcm(np.zeros(count, dtype=np.int16), self._origin_seconds + start_sample / rate)
+
+    def _feed_remote_pcm(self, pcm, start):
+        rate = float(config.SAMPLE_RATE)
         self._track_silence(pcm, pcm.shape[0] / rate)
         self._recover_routing()
         self._sync_provider()
@@ -489,11 +528,12 @@ class RemoteBridge:
                         })
                     else:
                         self.routing.apply({"type": "segment_failure"})
-                    if reached and self.ledger is not None:
+                    if (reached or exc.possibly_delivered) and self.ledger is not None:
                         self.ledger.note(
-                            exc.duration_s,
-                            remaining_requests=exc.remaining_requests,
-                            reset_requests_s=exc.reset_requests_s,
+                            exc.duration_s if reached else exc.audio_s,
+                            # 没响应只能保守累加，不能凭空建立每日额度/窗口证明。
+                            remaining_requests=exc.remaining_requests if reached else None,
+                            reset_requests_s=exc.reset_requests_s if reached else None,
                             key_fp=exc.key_fingerprint,
                             sent_at=exc.sent_at,
                         )
@@ -588,6 +628,10 @@ class RemoteBridge:
 
     def _publish_remote(self, node_id, t0, t1, src, dst):
         with self._lock:
+            # 分段器/节点需要连续的远程样本钟；本机只计真实采集样本。
+            # 回传时扣掉各时间点之前的补零，迟到的旧句也按自己的位置换算。
+            t0 = self._remote_time_to_local(t0)
+            t1 = self._remote_time_to_local(t1)
             replaced = self.line_store.apply_remote(node_id, t0, t1, src, dst)
             remote_key = None
             for line in reversed(self.line_store.lines):
@@ -598,6 +642,18 @@ class RemoteBridge:
             self._ui_drop(replaced)
         self._ui_show(src, dst or "", t0, t1, remote_key, "remote", self._language_revision)
         return remote_key
+
+    def _remote_time_to_local(self, seconds):
+        if seconds is None:
+            return None
+        rate = float(config.SAMPLE_RATE)
+        sample = (seconds - self._origin_seconds) * rate
+        padding = 0
+        for begin, end in self._padding_spans:
+            if sample <= begin:
+                break
+            padding += min(sample, end) - begin
+        return seconds - padding / rate
 
     def _recover_routing(self):
         """音频驱动的冷却恢复。至少隔 1 秒看一次，避免每个音频块都打状态机。
@@ -1423,12 +1479,14 @@ class SubtitleApp:
 
         # 音频进translator收件箱：识别线程忙时块在收件箱里攒着，
         # 醒来一口气全塞进缓冲只识别一遍——GPU被游戏抢走时字幕只滞后不丢词
-        self.translator.enqueue_audio(audio_data, capture_time)
+        # 空块只是采集空闲的时钟通知，本机 Whisper 不需要因此醒来做静音推理。
+        if len(audio_data):
+            self.translator.enqueue_audio(audio_data, capture_time)
         # 本机识别始终在跑。远端是额外的一路，两个开关都关时 remote 是 None，这里什么都不做。
         remote = self.remote
         if remote is not None:
             try:
-                remote.feed_audio(audio_data)
+                remote.feed_audio(audio_data, capture_time)
             except Exception as exc:
                 print(f"⚠️  远端音频投递失败: {type(exc).__name__}")
 

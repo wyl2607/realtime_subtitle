@@ -5,6 +5,32 @@ from realtime_subtitle.capture import audio_capture
 from realtime_subtitle.capture.audio_capture import AudioCapture
 
 
+@pytest.mark.parametrize("submit_s", [0.5, 2.0])
+def test_hc_r02_idle_capture_notifies_time_without_audio(monkeypatch, submit_s):
+    """硬约束 HC-R02：没有下一块采集数据时，也要通知远程推进静音。"""
+    calls = []
+    waits = []
+    capture = AudioCapture(callback=lambda audio, captured: calls.append((audio, captured)))
+
+    class IdleQueue:
+        def get(self, timeout):
+            waits.append(timeout)
+            capture.running = False
+            raise audio_capture.queue.Empty
+
+    capture.audio_queue = IdleQueue()
+    capture.running = True
+    monkeypatch.setattr(config, "CHUNK_SUBMIT_SECONDS", submit_s)
+    monkeypatch.setattr(audio_capture.time, "time", lambda: 1234.5)
+    capture._process_loop()
+    assert waits[0] >= 2 * submit_s, (
+        "违反 HC-R02：完整音频块还未攒够就宣告空闲，会向连续讲话插入假静音；"
+        "必须让空闲等待覆盖正常采集提交周期并留出调度余量。")
+    assert len(calls) == 1 and len(calls[0][0]) == 0 and calls[0][1] == 1234.5, (
+        "违反 HC-R02：采集空闲没有时间回调，远程尾句仍等下次开口；"
+        "必须发送带当前采集时间的空块通知，不能把整段静音送给本机 Whisper。")
+
+
 class _FakeMacPyAudio:
     def __init__(self, devices, default_index=0):
         self.devices = devices
