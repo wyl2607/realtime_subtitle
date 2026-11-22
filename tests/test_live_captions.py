@@ -365,6 +365,7 @@ def test_disappearing_element_reconnects(monkeypatch, tmp_path):
 
 
 def test_paused_reader_consumes_snapshots_without_replay(monkeypatch, tmp_path):
+    """暂停期间消费全屏快照，恢复后若内容未变则不重放。"""
     _fake_reader_environment(monkeypatch, tmp_path)
     pause = tmp_path / ".paused"
     pause.touch()
@@ -383,7 +384,8 @@ def test_paused_reader_consumes_snapshots_without_replay(monkeypatch, tmp_path):
     reader.start(update)
     assert completed.wait(2)
     reader.stop()
-    assert updates == [([], ""), ([], "新的草稿")]
+    # 新行为：暂停期间 consume_all 标记全屏已消费，恢复后同一内容不再产出草稿
+    assert updates == [([], ""), ([], "")]
 
 
 def test_stop_flag_prevents_uia_import(monkeypatch, tmp_path):
@@ -656,3 +658,78 @@ def test_german_closing_quotes_and_ellipsis():
         ['„Das stimmt!“', 'Danach…'], 'Weiter')
     assert differ.update('„Das stimmt!“ Danach… Weiter…', now=.1).finalized == []
     assert differ.update('„Das stimmt!“ Danach… Weiter…', now=1.2).finalized == ['Weiter…']
+
+
+def test_pause_during_half_sentence_does_not_finalize_on_resume():
+    """暂停期间说了一半、还没定稿的候选句，恢复后不会被超时定稿上屏。"""
+    differ = lc.CaptionDiffer(stable_seconds=1, max_seconds=2)
+    # 正常识别一句（需要稳定后才定稿）
+    assert differ.update("Guten Morgen.", now=0).finalized == []
+    assert differ.update("Guten Morgen.", now=1).finalized == ["Guten Morgen."]
+    # 开始新句子但没说完（无标点），此时暂停
+    assert differ.update("Heute ist ein schöner", now=2).finalized == []
+    assert differ.update("Heute ist ein schöner", now=2.5).finalized == []
+    # 暂停期间消费所有内容（模拟 consume_all）——部分句子被标记为已消费
+    differ.consume_all("Heute ist ein schöner")
+    # 恢复后系统补出暂停前那半句的尾巴：" Tag." 只是残片，和 prime 同样跳过，
+    # 也不会被 max_seconds 把 "Heute ist ein schöner" 强制定稿
+    assert differ.update("Heute ist ein schöner Tag.", now=3).finalized == []
+    assert differ.update("Heute ist ein schöner Tag.", now=4).finalized == []
+    # 恢复后真正的新句子照常交付
+    assert differ.update("Heute ist ein schöner Tag. Wir gehen raus.", now=5).finalized == []
+    assert differ.update("Heute ist ein schöner Tag. Wir gehen raus.", now=6).finalized == ["Wir gehen raus."]
+
+
+def test_pause_full_screen_change_does_not_replay_on_resume():
+    """暂停期间整屏内容变化，恢复后不重放旧内容。"""
+    differ = lc.CaptionDiffer(stable_seconds=1)
+    # 正常识别几句（第一句有后续所以立即定稿，第二句需稳定）
+    assert differ.update("Satz eins. Satz zwei.", now=0).finalized == ["Satz eins."]
+    assert differ.update("Satz eins. Satz zwei.", now=1).finalized == ["Satz zwei."]
+    # 暂停期间，系统字幕窗口内容完全换了（比如切换了频道）
+    # consume_all 会把新内容记为已消费
+    differ.consume_all("Völlig neuer Inhalt. Ganz anders.")
+    # 恢复后，同样的新内容不应被当作新句子交付
+    assert differ.update("Völlig neuer Inhalt. Ganz anders.", now=5).finalized == []
+    assert differ.update("Völlig neuer Inhalt. Ganz anders. Neuer Satz.", now=6).finalized == []
+    assert differ.update("Völlig neuer Inhalt. Ganz anders. Neuer Satz.", now=7).finalized == ["Neuer Satz."]
+
+
+def test_reader_same_exception_printed_once(monkeypatch, tmp_path, capsys):
+    """相同异常只打印一次，不同异常各打印一次。"""
+    events = _fake_reader_environment(monkeypatch, tmp_path)
+    reader = lc.LiveCaptionsReader("LiveCaptions.exe", hide_window=False)
+    
+    attempts = []
+    def find(auto):
+        attempts.append(True)
+        if len(attempts) <= 2:
+            raise LookupError("not ready")
+        if len(attempts) <= 4:
+            raise ConnectionError("network down")
+        return object(), SimpleNamespace(Exists=lambda *args: True, Name="")
+    
+    monkeypatch.setattr(reader, "_find_controls", find)
+    # 加速重连
+    monkeypatch.setattr(lc, "RECONNECT_INITIAL_SECONDS", 0.001)
+    monkeypatch.setattr(lc, "RECONNECT_MAX_SECONDS", 0.002)
+    monkeypatch.setattr(lc, "POLL_INTERVAL_SECONDS", 0.001)
+    
+    statuses = []
+    completed = Event()
+    def update(finalized, draft):
+        if len(attempts) >= 5:
+            reader.stop()
+            completed.set()
+    reader.start(update, statuses.append)
+    assert completed.wait(3)
+    reader.stop()
+    
+    out = capsys.readouterr().out
+    # LookupError 应该只打印一次（前两次是同一个异常类型和消息）
+    assert out.count("Windows 实时字幕异常（LookupError: not ready）") == 1
+    # ConnectionError 应该只打印一次（后两次是同一个异常类型和消息）
+    assert out.count("Windows 实时字幕异常（ConnectionError: network down）") == 1
+    # 总共应该有两种不同的异常提示
+    assert "LookupError" in out
+    assert "ConnectionError" in out
