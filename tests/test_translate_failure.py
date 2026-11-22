@@ -1,6 +1,8 @@
 from collections import OrderedDict, deque
 from threading import Lock
 from types import SimpleNamespace
+import json
+import pytest
 import requests
 
 import realtime_subtitle.config as config
@@ -449,3 +451,143 @@ def test_translate_single_sentence_failure_reasons_and_payload(monkeypatch):
     res = t._translate_single_sentence("Ein Test", "")
     assert res == "Ein Test"
     assert t._last_tx_failure_reason == "error"
+
+
+def _make_stream_translator(frames):
+    t = _make_test_translator()
+    results = []
+    response = SimpleNamespace(status_code=200, closed=False)
+
+    def iter_lines():
+        for frame in frames:
+            if isinstance(frame, Exception):
+                raise frame
+            yield json.dumps(frame).encode()
+
+    response.iter_lines = iter_lines
+    response.close = lambda: setattr(response, "closed", True)
+    t.ollama_session = SimpleNamespace(post=lambda *a, **kw: response)
+    t._circuit_open = lambda: False
+    t._ollama_identity_ok = lambda: True
+    t._await_model_ready = lambda: None
+    t._note_tx_result = lambda ok, hard=False: results.append(ok)
+    t._ollama_down_notified = 0.0
+    return t, response, results
+
+
+@pytest.mark.parametrize("tail", [
+    [{"error": "generation failed"}],
+    [{"error": "", "done": True}],
+    [],
+    [{"done": False}],
+    [requests.ConnectionError("stream disconnected")],
+    [{"done": True, "done_reason": "length"}],
+], ids=["error", "empty-error", "eof", "done-false", "disconnect", "length"])
+@pytest.mark.parametrize("queue", ["initial", "retry", "no-callback"])
+def test_stream_failure_never_succeeds_or_enters_context(tail, queue):
+    """硬约束 HC-T01：部分文字不能掩盖错误帧、未完成断流或 length 截断。"""
+    t, response, results = _make_stream_translator([
+        {"response": "尚未完成的译文"}, *tail,
+    ])
+    t.context_history.append("此前已成功的原文。")
+    pairs = []
+    t.on_pair = lambda src, tgt, *a: pairs.append((src, tgt))
+    if queue != "no-callback":
+        t.on_translate_failed = lambda *a: None
+    sentence = TimedSentence("Dieser Satz muss fertig werden.", t0=1, t1=2,
+                             key="hc-t01", revision=0)
+    (t._tx_retry_queue if queue == "retry" else t._tx_queue).append(sentence)
+
+    t._translation_worker()
+
+    why = ("违反硬约束 HC-T01：错误、断流或 length 截断不是完整译文；"
+           "必须记录失败原因及 ok=False、仅显示原文，并禁止写入上下文。")
+    assert results == [False], why
+    assert t._last_tx_failure_reason == "error", why
+    assert list(t.context_history) == ["此前已成功的原文。"], why
+    assert all(not tgt for _, tgt in pairs), why
+    assert response.closed, why
+
+
+def test_stream_completed_translation_still_succeeds():
+    """硬约束 HC-T01：正常 done:true 的完整翻译必须仍可成功并写入上下文。"""
+    t, response, results = _make_stream_translator([
+        {"response": "完整"}, {"response": "译文", "done": True, "done_reason": "stop"},
+    ])
+    t._tx_queue.append(TimedSentence("Ein vollstaendiger Satz.", key="complete"))
+    pairs = []
+    t.on_pair = lambda src, tgt, *a: pairs.append(tgt)
+
+    t._translation_worker()
+
+    why = "违反硬约束 HC-T01：正常完成帧不能被误判失败；必须保留完整译文和上下文。"
+    assert results == [True] and pairs == ["完整译文"], why
+    assert list(t.context_history) == ["Ein vollstaendiger Satz."], why
+    assert response.closed, why
+
+
+def test_stream_size_fuse_still_accepts_partial_translation(monkeypatch):
+    """硬约束 HC-T01：主动超长截断是有意的，不能当作未收到 done 的失败。"""
+    import realtime_subtitle.translate.translator_queue as tq
+
+    monkeypatch.setattr(tq, "_MAX_STREAM_CHARS", 4)
+    t, response, results = _make_stream_translator([
+        {"response": "超长但保留的译文"}, {"error": "不应读到此帧"},
+    ])
+
+    out = t._translate_single_sentence("Dieser Satz ist lang.", "")
+
+    why = "违反硬约束 HC-T01：超长保险丝必须继续保留已收文本；不得改成普通断流失败。"
+    assert results == [True] and out == "超长但保留的译文", why
+    assert response.closed, why
+
+
+def test_stream_closing_is_neither_success_nor_failure():
+    """硬约束 HC-T01：退出时中止流式读取，不得计入翻译成败或上下文。"""
+    t, response, results = _make_stream_translator([])
+
+    def closing_stream():
+        yield b'{"response": "partial"}'
+        t.closing = True
+        yield b'{"done": true}'
+
+    response.iter_lines = closing_stream
+    t._tx_queue.append(TimedSentence("Beim Beenden abbrechen.", key="closing"))
+    t._translation_worker()
+
+    why = "违反硬约束 HC-T01：主动退出不是请求结果；必须关闭连接且不记成功、失败或上下文。"
+    assert results == [] and t._last_tx_failure_reason is None, why
+    assert not t.context_history, why
+    assert response.closed, why
+
+
+@pytest.mark.parametrize("cap", [30, 1], ids=["normal-budget", "one-oversized-sentence"])
+def test_retry_queue_is_bounded_and_reports_oldest_drops(monkeypatch, cap):
+    """硬约束 HC-T02：持续失败时重试队列必须有界，最旧句必须进入终态失败。"""
+    monkeypatch.setattr(config, "TRANSLATE_QUEUE_MAX_CHARS", cap)
+    t, _, _ = _make_stream_translator([{"error": "Ollama unavailable"}])
+    failed = []
+
+    def on_failed(*event):
+        assert not t._tx_lock.locked(), (
+            "违反硬约束 HC-T02：锁内失败回调可能死锁；必须放锁后通知丢弃。")
+        failed.append(event)
+
+    t.on_translate_failed = on_failed
+    sentences = [TimedSentence(f"Neuer Satz {i:02d}.", t0=i, t1=i + 1,
+                               key=f"retry-{i}", revision=0) for i in range(8)]
+    keep = 2 if cap == 30 else 1
+    why = ("违反硬约束 HC-T02：持续失败不能无限积累重试；必须沿用字符上限、"
+           "丢最旧句并记录可手动重试的失败句，保留一条超长句以免饥饿。")
+    for sentence in sentences:
+        t._tx_queue.append(sentence)
+        t._translation_worker()
+        assert len(t._tx_retry_queue) <= keep, why
+
+    assert [s.key for s in t._tx_retry_queue] == [s.key for s in sentences[-keep:]], why
+    expected = [(str(s), s.t0, s.t1, s.key, s.revision) for s in sentences[:-keep]]
+    assert failed == [(*item, "dropped") for item in expected], why
+    assert list(t._failed_sentences.values()) == expected, why
+    assert t._tx_dropped == len(expected), why
+    assert t.retry_translation(sentences[0].key), why
+    assert t._tx_queue[-1].key == sentences[0].key, why

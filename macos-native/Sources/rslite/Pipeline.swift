@@ -48,14 +48,18 @@ final class Pipeline: @unchecked Sendable {
     private var analyzer: SpeechAnalyzer?
     private var resultTask: Task<Void, Never>?
     private var analysisTask: Task<Void, Never>?
-    private var finishContinuation: CheckedContinuation<Void, Never>?
+    /// stop()、自然结束和 waitUntilFinished() 来自不同任务：等待者和「已放行」标志
+    /// 必须在同一把锁里，否则 continuation 会被 resume 两次（直接 trap），或者 stop()
+    /// 之后才来的等待者永远没人放行（HC-S03）。
+    private let finishLock = NSLock()
+    private var finishWaiters: [CheckedContinuation<Void, Never>] = []
+    private var finishReleased = false
     private var nextID = 1
     // 只在 resultTask 里串行读写
     private var committer = SentenceCommitter()
     private var didCheckAssets = false
     private var isPaused = false
     private var isStopped = false
-    private var hasFinished = false
 
     init(config: PipelineConfig, callbacks: PipelineCallbacks) {
         self.config = config
@@ -73,7 +77,7 @@ final class Pipeline: @unchecked Sendable {
     func start() async throws {
         isStopped = false
         isPaused = false
-        hasFinished = false
+        finishLock.withLockVoid { finishReleased = false }
         try await startRun()
     }
 
@@ -100,17 +104,29 @@ final class Pipeline: @unchecked Sendable {
         isStopped = true
         await stopCurrentRun()
         translator.cancel()
-        finishContinuation?.resume()
-        finishContinuation = nil
+        releaseFinishWaiters()
     }
 
     func waitUntilFinished() async {
-        guard !hasFinished else {
-            return
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let releasedAlready = finishLock.withLockValue { () -> Bool in
+                if finishReleased { return true }
+                finishWaiters.append(continuation)
+                return false
+            }
+            if releasedAlready { continuation.resume() }
         }
-        await withCheckedContinuation { continuation in
-            finishContinuation = continuation
+    }
+
+    /// 取出全部等待者再在锁外 resume：每个 continuation 只会被取走一次。
+    private func releaseFinishWaiters() {
+        let waiters = finishLock.withLockValue { () -> [CheckedContinuation<Void, Never>] in
+            finishReleased = true
+            let taken = finishWaiters
+            finishWaiters = []
+            return taken
         }
+        for waiter in waiters { waiter.resume() }
     }
 
     private func startRun() async throws {
@@ -214,9 +230,7 @@ final class Pipeline: @unchecked Sendable {
         analysisTask = nil
         await translator.waitUntilIdle()
         if !isPaused && !isStopped {
-            hasFinished = true
-            finishContinuation?.resume()
-            finishContinuation = nil
+            releaseFinishWaiters()
             callbacks.onFinished()
         }
     }
@@ -300,6 +314,32 @@ final class Pipeline: @unchecked Sendable {
         var failures: [String] = []
         func check(_ ok: Bool, _ name: String) {
             if !ok { failures.append(name) }
+        }
+
+        // HC-S03：stop() 之后再 waitUntilFinished() 必须立刻返回；多个等待者都要被放行。
+        // 违反会让调用方永久挂起（HybridEngine.waitUntilFinished 转发到这里）。
+        do {
+            final class Flag: @unchecked Sendable {
+                private let lock = NSLock()
+                private var count = 0
+                func hit() { lock.withLockVoid { count += 1 } }
+                func value() -> Int { lock.withLockValue { count } }
+            }
+            let pipeline = Pipeline(
+                config: PipelineConfig(sourceSpec: "mic", sourceLocaleID: "de-DE", targetLanguageID: "zh-Hans"),
+                callbacks: PipelineCallbacks()
+            )
+            let early = Flag()
+            let waiting = Task { await pipeline.waitUntilFinished(); early.hit() }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            await pipeline.stop()
+            let late = Flag()
+            let after = Task { await pipeline.waitUntilFinished(); late.hit() }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            check(early.value() == 1, "HC-S03 违反：stop() 没有放行 stop 之前就在等的 waitUntilFinished()")
+            check(late.value() == 1, "HC-S03 违反：stop() 之后调用 waitUntilFinished() 永久挂起；stop 必须把结束状态记为已放行")
+            waiting.cancel()
+            after.cancel()
         }
 
         // 失败句环形缓冲上限 50，超出丢最旧

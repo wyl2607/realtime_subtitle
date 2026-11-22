@@ -1394,7 +1394,8 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
         cb_failed = getattr(self, "on_translate_failed", None)
         with self._tx_lock:
             stale = (epoch != self._tx_epoch)
-            if not stale and translation and (not failed or is_retry or cb_failed is None):
+            # 失败句尚无完整译文，重试或未接 UI 回调也不能冒充已完成的上下文。
+            if not stale and not self.closing and translation and not failed:
                 self.context_history.extend(batch)
         if stale or self.closing or translation is None:
             return  # 期间切了语言/正在退出：旧语言结果不上屏不写回
@@ -1412,10 +1413,25 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
                 revision=batch_rev,
             )
             retry_sentence.fail_reason = fail_reason
+            dropped = []
             with self._tx_lock:
                 if not getattr(self, "_tx_retry_queue", None):
                     self._tx_retry_queue = []
                 self._tx_retry_queue.append(retry_sentence)
+                # 主队列优先，持续故障时重试可能一直轮不到；沿用主队列的字符
+                # 硬顶和保留最后一句的规则，否则只是把无限积压转移到了这里。
+                cap = getattr(config, "TRANSLATE_QUEUE_MAX_CHARS", 3000)
+                total = sum(len(s) for s in self._tx_retry_queue)
+                while total > cap and len(self._tx_retry_queue) > 1:
+                    s = self._tx_retry_queue.pop(0)
+                    total -= len(s)
+                    item = (str(s), s.t0, s.t1, s.key, s.revision)
+                    self._record_failed_sentence_locked(*item)
+                    dropped.append(item)
+                self._tx_dropped += len(dropped)
+            self._emit_dropped(dropped)
+            if dropped:
+                self._warn_tx_dropped(len(dropped))
         else:
             if failed:
                 # 终态失败（重试仍失败，或未设回调）
@@ -1722,6 +1738,7 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
                         parts = []
                         grown = 0
                         last_emit = 0.0
+                        stream_ok = False
                         for line in response.iter_lines():
                             if self.closing:
                                 break  # 正在退出：别等整句生成完，finally会close连接
@@ -1731,30 +1748,40 @@ class WhisperQueueTranslator(LookupMixin, TranscriptMixin, StatsMixin,
                                 data = json.loads(line)
                             except ValueError:
                                 continue
+                            # HTTP 200 后仍可能返回错误帧，部分文字不能证明生成成功。
+                            if "error" in data:
+                                break
                             parts.append(data.get("response", ""))
                             grown += len(parts[-1])
-                            if data.get("done"):
+                            if data.get("done") is True:
+                                stream_ok = data.get("done_reason") != "length"
                                 break
                             if grown > _MAX_STREAM_CHARS:
                                 # 见 _MAX_STREAM_CHARS：模型复读或服务端异常，
                                 # 已经拿到的部分照常用，别再无限收下去
                                 print(f"   ⚠️  翻译响应超过 {_MAX_STREAM_CHARS} 字符，提前截断")
+                                stream_ok = True
                                 break
                             if on_partial and time.time() - last_emit > 0.15:
                                 partial = "".join(parts).strip()
                                 if partial:
                                     last_emit = time.time()
                                     on_partial(partial)
+                        if self.closing:
+                            return sentence  # 主动退出没有翻译结果，不计入成败
                         translation = re.sub(r'<think>.*?</think>', '', "".join(parts), flags=re.DOTALL)
                         # ☠️ 拿到 200 但一个字都没生成时不能算成功（撞上模型卸载
                         # 边界、或整段被 <think> 吃掉都会这样）。算成功的话
                         # _note_tx_result 会把 _ollama_hot 置真、熔断计数清零、
                         # 超时从冷档翻回 15 秒——而这一句其实根本没有中文，
                         # 等于用一次空响应把所有降级保护都解除了
-                        ok = bool(translation.strip())
+                        # 正常响应必须明确完成且未被 num_predict 截断；只有上面的
+                        # 超长保险丝允许保留部分文本，普通 EOF 不能冒充正常完成。
+                        ok = stream_ok and bool(translation.strip())
                         self._note_tx_result(ok=ok)
                         if not ok:
                             self._last_tx_failure_reason = "error"
+                            return sentence
                         # 出口统一繁转简：小模型即使被要求"简体中文"仍会偶发繁体
                         return to_simplified_if_target(
                             _strip_translator_note(translation),

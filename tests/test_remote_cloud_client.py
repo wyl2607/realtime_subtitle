@@ -348,6 +348,58 @@ def test_timeout_is_a_segment_failure_for_the_state_machine(tmp_path):
     assert state.cloud_state == "available"
 
 
+@pytest.mark.parametrize("failure", ["deadline", "read_timeout", "disconnect"])
+def test_hc_r01_post_without_response_is_possibly_delivered(tmp_path, monkeypatch, failure):
+    """硬约束 HC-R01：post 已开始但无响应时，必须标记可能送达供保守记账。"""
+    release = threading.Event()
+
+    class NoReply(FakeSession):
+        def post(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            if failure == "deadline":
+                release.wait(timeout=2)
+            if failure == "read_timeout":
+                raise requests.ReadTimeout("slow")
+            raise requests.ConnectionError("connection lost")
+
+    session = NoReply()
+    client = _client(tmp_path, session)
+    monkeypatch.setattr("realtime_subtitle.remote.cloud_client.REQUEST_DEADLINE_S", 0.05)
+    try:
+        with pytest.raises(CloudError) as caught:
+            client.transcribe(_pcm(0.2), a0=0.0, language="de")
+        error = caught.value
+        assert session.calls and getattr(error, "possibly_delivered", False), (
+            "违反 HC-R01：post 已开始却没有送达标记，可能漏记云端收费；"
+            "必须在无响应的超时/断连错误上标记 possibly_delivered。")
+        assert (error.audio_s, error.remaining_requests, error.reset_requests_s) == (0.2, None, None), (
+            "违反 HC-R01：无响应不得伪造每日窗口证明；必须只保留上传音频秒数且额度头为 None。")
+        assert error.key_fingerprint and error.sent_at is not None, (
+            "违反 HC-R01：无响应记账也必须保留请求指纹与发送时间，避免串用其它 key 的额度。")
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize("failure", ["missing_key", "unreadable_key", "cancelled"])
+def test_hc_r01_failure_before_post_is_not_delivered(tmp_path, monkeypatch, failure):
+    """硬约束 HC-R01：读 key 失败或发送前取消不能假装已发出请求。"""
+    session = FakeSession()
+    client = _client(tmp_path, session, key=None if failure == "missing_key" else FAKE_KEY)
+    if failure == "unreadable_key":
+        def read_key():
+            raise CloudError(status=None, reason="key_unreadable", exc_type="OSError")
+        monkeypatch.setattr(client, "_read_key", read_key)
+    elif failure == "cancelled":
+        def read_key():
+            client.cancel()
+            return FAKE_KEY
+        monkeypatch.setattr(client, "_read_key", read_key)
+    with pytest.raises(CloudError) as caught:
+        client.transcribe(_pcm(0.2), a0=0.0, language="de")
+    assert not session.calls and not getattr(caught.value, "possibly_delivered", False), (
+        "违反 HC-R01：发送前失败没有产生云端请求；必须不发送、不标记可能送达，避免误扣额度。")
+
+
 def test_bad_json_does_not_include_the_body(tmp_path, caplog):
     caplog.set_level(logging.DEBUG)
 

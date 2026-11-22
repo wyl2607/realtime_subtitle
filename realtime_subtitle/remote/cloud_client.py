@@ -76,6 +76,7 @@ class CloudError(Exception):
         duration_s: float | None = None,
         key_fingerprint: str | None = None,
         sent_at: float | None = None,
+        possibly_delivered: bool = False,
         secret: str = "",
     ):
         self.status = status
@@ -88,6 +89,8 @@ class CloudError(Exception):
         self.audio_s = audio_s
         self.key_fingerprint = key_fingerprint if key_fingerprint is not None else _key_fingerprint(secret)
         self.sent_at = sent_at
+        # 没收到响应不代表没收费；只由真正进入 post 的路径给出这个保守标记。
+        self.possibly_delivered = possibly_delivered
         # 计费时长：有响应 duration 用响应的，否则用送出去的音频长度。max(10, ·) 在 quota。
         self.duration_s = audio_s if duration_s is None else duration_s
         super().__init__(f"status={self.status} reason={self.reason} exc={self.exc_type}")
@@ -225,9 +228,16 @@ class CloudClient:
         sent_at = time.time()
         outcome: dict[str, Any] = {}
         finished = threading.Event()
+        post_started = threading.Event()
 
         def _post() -> None:
             try:
+                # 与截止时的 cancel 原子交接：未启动的线程不能在作废后补发，
+                # 已跨过发送边界的请求则必须留下可能送达的记账证明。
+                with self._lock:
+                    if self._generation != generation:
+                        return
+                    post_started.set()
                 try:
                     response = session.post(
                         GROQ_TRANSCRIPTIONS_URL,
@@ -268,6 +278,7 @@ class CloudClient:
                 audio_s=audio_s,
                 key_fingerprint=key_fingerprint,
                 sent_at=sent_at,
+                possibly_delivered=post_started.is_set(),
                 secret=key,
             ) from None
         error = outcome.get("error")
@@ -409,6 +420,7 @@ class CloudClient:
             exc_type=exc_type,
             audio_s=audio_s,
             sent_at=sent_at,
+            possibly_delivered=True,
             secret=secret,
         ) from None
 

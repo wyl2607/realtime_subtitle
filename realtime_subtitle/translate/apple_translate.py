@@ -67,7 +67,15 @@ class AppleTranslator:
             self._proc = None
             return False
 
-        self._reader = Thread(target=self._read_stdout, daemon=True, name="AppleTranslateReader")
+        # 把这一代的 proc/queue 钉进线程参数：超时重启会重建 self._lines，旧线程
+        # 收尾时若还去读 self._lines，就会把 EOF（None）或旧响应塞进新一代队列，
+        # 让新一代第一句被误判成 helper 已退出/协议错位。
+        self._reader = Thread(
+            target=self._read_stdout,
+            args=(self._proc, self._lines),
+            daemon=True,
+            name="AppleTranslateReader",
+        )
         self._reader.start()
 
         deadline = time.monotonic() + self.startup_timeout
@@ -96,17 +104,16 @@ class AppleTranslator:
                 return True
             print(f"   ⚠️  Apple Translation helper ready 行异常: {data!r}", file=sys.stderr)
 
-    def _read_stdout(self) -> None:
-        proc = self._proc
+    def _read_stdout(self, proc: subprocess.Popen, lines: queue.Queue[str | None]) -> None:
         stdout = proc.stdout if proc is not None else None
         if stdout is None:
-            self._lines.put(None)
+            lines.put(None)
             return
         try:
             for raw in stdout:
-                self._lines.put(raw.rstrip("\n"))
+                lines.put(raw.rstrip("\n"))
         finally:
-            self._lines.put(None)
+            lines.put(None)
 
     def _get_line(self, timeout: float) -> str | None:
         try:
