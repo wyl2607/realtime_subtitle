@@ -179,8 +179,11 @@ final class CloudClient: @unchecked Sendable {
         var sentAt = Date().timeIntervalSince1970
         let fingerprint = Self.keyFingerprint(key)
         let reply: HTTPReply
+        // 首次请求与重发共用同一代次：首次失败后、重发前用户关云端/换 key（cancelInflightRequests
+        // 推进了代次），重发必须当作已取消，不能被当成新代次的新请求把音频发出去。
+        let startGeneration = lockValue { cancelGeneration }
         do {
-            reply = try await perform(urlSessionLaunch(request))
+            reply = try await perform(urlSessionLaunch(request), generation: startGeneration)
         } catch let error as CloudClientError where CellularFallback.shouldRetry(
             after: error,
             paths: NetworkPaths.shared.snapshot,
@@ -188,9 +191,12 @@ final class CloudClient: @unchecked Sendable {
         ) {
             // Wi-Fi 连着但这一段没传上去：同一段换蜂窝重发一次，字幕不断。
             // 重发是另一个计费请求，调用方在回调里记账。
+            guard lockValue({ cancelGeneration }) == startGeneration else {
+                throw CloudClientError.cancelled
+            }
             beforeCellularRetry?()
             sentAt = Date().timeIntervalSince1970
-            reply = try await perform(cellularLaunch(request))
+            reply = try await perform(cellularLaunch(request), generation: startGeneration)
         }
         do {
             var result = try Self.parse(
@@ -325,8 +331,10 @@ final class CloudClient: @unchecked Sendable {
 
     /// 登记 slot → 启动 → 完成时注销。取消代次在登记前、登记时各查一次，
     /// cancelInflightRequests 和 Task 取消都能打断尚未启动或正在跑的请求。
-    private func perform(_ makeLaunch: (@escaping CellularHTTPExchange.Completion) -> Launch) async throws -> HTTPReply {
-        let generation = lockValue { cancelGeneration }
+    private func perform(
+        _ makeLaunch: (@escaping CellularHTTPExchange.Completion) -> Launch,
+        generation: Int
+    ) async throws -> HTTPReply {
         let id = lockValue { () -> Int? in
             if cancelGeneration != generation {
                 return nil

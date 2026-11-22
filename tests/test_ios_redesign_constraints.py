@@ -366,3 +366,16 @@ def test_hc_u17_cloud_upload_falls_back_to_cellular_only_safely():
     engine = (IOS / "Engine" / "SubtitleEngine.swift").read_text(encoding="utf-8")
     m = re.search(r"beforeCellularRetry:\s*\{(.*?)\n\s*\}\n", engine, re.S)
     assert m and "recordRequest" in m.group(1), "HC-U17 违反：换蜂窝重发没记进额度账本。"
+
+
+def test_hc_u17_retry_followups_generation_and_single_waiter():
+    """HC-U17 / HC-U14 跟进：重发绑同一取消代次；翻译准备只留一个等待任务。"""
+    cloud = (IOS / "Shared" / "CloudClient.swift").read_text(encoding="utf-8")
+    assert "perform(cellularLaunch(request), generation: startGeneration)" in cloud and \
+        "guard lockValue({ cancelGeneration }) == startGeneration" in cloud, (
+        "违反：蜂窝重发没有绑定首次请求的取消代次，首次失败后用户关云端/换 key，重发仍会把音频发出去。"
+    )
+    local = (IOS / "Engine" / "LocalEngine.swift").read_text(encoding="utf-8")
+    assert "let waiter = Task { race.settle" not in local and "PreparedBroadcast" in local, (
+        "违反：preparedSession 又为每一句新开 await ready.value 的 Task，prepareTranslation 卡住时会无界挂起。"
+    )
