@@ -722,7 +722,12 @@ final class SubtitleEngine: @unchecked Sendable {
                             a0: segment.audioOrigin,
                             duration: segment.duration,
                             language: language,
-                            segmentID: segment.id
+                            segmentID: segment.id,
+                            beforeCellularRetry: { [weak self] in
+                                // 换蜂窝重发是 Groq 的另一次计费请求，账本照记。
+                                _ = try? ledger.recordRequest(duration: segment.duration, requestID: UUID().uuidString)
+                                self?.logger.info("Cloud upload failed on Wi-Fi, retrying over cellular segment=\(segment.id)")
+                            }
                         )
                         self?.handleCloudSuccess(result, segment: segment, generation: generation, requestID: requestID)
                     } catch let error as CloudClientError {

@@ -90,8 +90,14 @@ final class CloudClient: @unchecked Sendable {
 
     private enum InflightSlot {
         case reserved
-        case running(URLSessionDataTask)
+        case running(@Sendable () -> Void)
         case cancelRequested
+    }
+
+    /// 一次请求的启动与取消。URLSession 和蜂窝直连各给一份，共用同一套 slot / 取消代次。
+    private struct Launch {
+        let start: () -> Void
+        let cancel: @Sendable () -> Void
     }
 
     init(
@@ -115,14 +121,14 @@ final class CloudClient: @unchecked Sendable {
 
     /// 开关关闭时丢掉全部在飞请求。单个任务取消走 task.cancel()，不会进这里。
     func cancelInflightRequests() {
-        let active = lockValue { () -> [URLSessionDataTask] in
+        let active = lockValue { () -> [@Sendable () -> Void] in
             cancelGeneration += 1
-            var found: [URLSessionDataTask] = []
+            var found: [@Sendable () -> Void] = []
             var pending: [Int: InflightSlot] = [:]
             for (id, slot) in slots {
                 switch slot {
-                case .running(let task):
-                    found.append(task)
+                case .running(let cancel):
+                    found.append(cancel)
                 case .reserved, .cancelRequested:
                     pending[id] = .cancelRequested
                 }
@@ -130,15 +136,15 @@ final class CloudClient: @unchecked Sendable {
             slots = pending
             return found
         }
-        active.forEach { $0.cancel() }
+        active.forEach { $0() }
     }
 
     private func cancelTask(_ id: Int) {
-        let task = lockValue { () -> URLSessionDataTask? in
+        let cancel = lockValue { () -> (@Sendable () -> Void)? in
             switch slots[id] {
-            case .running(let task):
+            case .running(let cancel):
                 slots.removeValue(forKey: id)
-                return task
+                return cancel
             case .reserved:
                 slots[id] = .cancelRequested
                 return nil
@@ -146,7 +152,7 @@ final class CloudClient: @unchecked Sendable {
                 return nil
             }
         }
-        task?.cancel()
+        cancel?()
     }
 
     func transcribe(
@@ -154,7 +160,8 @@ final class CloudClient: @unchecked Sendable {
         a0: Double,
         duration: Double,
         language: String,
-        segmentID: Int? = nil
+        segmentID: Int? = nil,
+        beforeCellularRetry: (@Sendable () -> Void)? = nil
     ) async throws -> CloudTranscriptionResult {
         // duration / segmentID 只给下一轮的上传调度记账与诊断用，这一层不发日志也不改请求。
         _ = duration
@@ -166,17 +173,27 @@ final class CloudClient: @unchecked Sendable {
             endpoint: endpointURL
         )
         // 请求发出时刻与 key 指纹随结果/错误一起返回；账本用它们做恢复记录的绑定与乱序判定。
-        let sentAt = Date().timeIntervalSince1970
+        var sentAt = Date().timeIntervalSince1970
         let fingerprint = Self.keyFingerprint(key)
-        let (data, response) = try await data(for: request)
-        guard let http = response as? HTTPURLResponse else {
-            throw CloudClientError.invalidResponse
+        let reply: HTTPReply
+        do {
+            reply = try await perform(urlSessionLaunch(request))
+        } catch let error as CloudClientError where CellularFallback.shouldRetry(
+            after: error,
+            paths: NetworkPaths.shared.snapshot,
+            systemProxyConfigured: CellularFallback.systemProxyConfigured()
+        ) {
+            // Wi-Fi 连着但这一段没传上去：同一段换蜂窝重发一次，字幕不断。
+            // 重发是另一个计费请求，调用方在回调里记账。
+            beforeCellularRetry?()
+            sentAt = Date().timeIntervalSince1970
+            reply = try await perform(cellularLaunch(request))
         }
         do {
             var result = try Self.parse(
-                statusCode: http.statusCode,
-                headers: http.allHeaderFields,
-                body: data,
+                statusCode: reply.statusCode,
+                headers: reply.headers,
+                body: reply.body,
                 a0: a0
             )
             result.keyFingerprint = fingerprint
@@ -272,7 +289,40 @@ final class CloudClient: @unchecked Sendable {
         }
     }
 
-    private func data(for request: URLRequest) async throws -> (Data, URLResponse) {
+    private func urlSessionLaunch(_ request: URLRequest) -> (@escaping CellularHTTPExchange.Completion) -> Launch {
+        { complete in
+            let task = self.session.dataTask(with: request) { data, response, error in
+                if let error {
+                    complete(.failure((error as NSError).code == NSURLErrorCancelled
+                        ? .cancelled : .network(Self.errorType(error))))
+                    return
+                }
+                guard let data, let http = response as? HTTPURLResponse else {
+                    complete(.failure(.invalidResponse))
+                    return
+                }
+                var headers: [String: String] = [:]
+                for (key, value) in http.allHeaderFields {
+                    headers[String(describing: key).lowercased()] = String(describing: value)
+                }
+                complete(.success(HTTPReply(statusCode: http.statusCode, headers: headers, body: data)))
+            }
+            return Launch(start: { task.resume() }, cancel: { task.cancel() })
+        }
+    }
+
+    private func cellularLaunch(_ request: URLRequest) -> (@escaping CellularHTTPExchange.Completion) -> Launch {
+        { complete in
+            guard let exchange = CellularHTTPExchange(request: request, timeout: Self.totalTimeout, complete: complete) else {
+                return Launch(start: { complete(.failure(.invalidResponse)) }, cancel: {})
+            }
+            return Launch(start: { exchange.start() }, cancel: { exchange.cancel() })
+        }
+    }
+
+    /// 登记 slot → 启动 → 完成时注销。取消代次在登记前、登记时各查一次，
+    /// cancelInflightRequests 和 Task 取消都能打断尚未启动或正在跑的请求。
+    private func perform(_ makeLaunch: (@escaping CellularHTTPExchange.Completion) -> Launch) async throws -> HTTPReply {
         let generation = lockValue { cancelGeneration }
         let id = lockValue { () -> Int? in
             if cancelGeneration != generation {
@@ -286,7 +336,7 @@ final class CloudClient: @unchecked Sendable {
             throw CloudClientError.cancelled
         }
         return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<(Data, URLResponse), Error>) in
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<HTTPReply, Error>) in
                 let aborted = lockValue { () -> Bool in
                     if cancelGeneration != generation {
                         slots.removeValue(forKey: id)
@@ -302,23 +352,9 @@ final class CloudClient: @unchecked Sendable {
                     continuation.resume(throwing: CloudClientError.cancelled)
                     return
                 }
-                let task = session.dataTask(with: request) { data, response, error in
+                let launch = makeLaunch { result in
                     self.lockVoid { self.slots.removeValue(forKey: id) }
-                    if let error {
-                        if (error as NSError).code == NSURLErrorCancelled {
-                            continuation.resume(throwing: CloudClientError.cancelled)
-                        } else {
-                            continuation.resume(
-                                throwing: CloudClientError.network(Self.errorType(error))
-                            )
-                        }
-                        return
-                    }
-                    guard let data, let response else {
-                        continuation.resume(throwing: CloudClientError.invalidResponse)
-                        return
-                    }
-                    continuation.resume(returning: (data, response))
+                    continuation.resume(with: result.mapError { $0 as any Error })
                 }
                 let cancelNow = lockValue { () -> Bool in
                     if cancelGeneration != generation {
@@ -329,12 +365,12 @@ final class CloudClient: @unchecked Sendable {
                         slots.removeValue(forKey: id)
                         return true
                     }
-                    slots[id] = .running(task)
+                    slots[id] = .running(launch.cancel)
                     return false
                 }
-                task.resume()
+                launch.start()
                 if cancelNow {
-                    task.cancel()
+                    launch.cancel()
                 }
             }
         } onCancel: {

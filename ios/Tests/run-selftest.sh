@@ -16,7 +16,7 @@ xcrun swiftc -O ios/Shared/Routing.swift ios/Shared/LineStore.swift ios/Shared/A
 # 云端档纯逻辑（Groq 请求/响应、额度账本、分段器）：第三个独立入口，
 # 只编这三个 Shared 文件 + QuotaLedger 需要的 Routing.swift（滞回判定在路由状态机里）。
 # 不发网络请求，也不读任何真实 key。
-xcrun swiftc -O ios/Shared/Routing.swift ios/Shared/CloudClient.swift ios/Shared/QuotaLedger.swift ios/Shared/CloudSegmenter.swift ios/Tests/CloudSelftestMain.swift ios/Tests/CloudClientSelftest.swift ios/Tests/QuotaLedgerSelftest.swift ios/Tests/CloudSegmenterSelftest.swift -o .tmp/cloudselftest
+xcrun swiftc -O ios/Shared/Routing.swift ios/Shared/CloudClient.swift ios/Shared/QuotaLedger.swift ios/Shared/CloudSegmenter.swift ios/Shared/NetworkPaths.swift ios/Shared/CellularHTTP.swift ios/Tests/CloudSelftestMain.swift ios/Tests/CellularHTTPSelftest.swift ios/Tests/CloudClientSelftest.swift ios/Tests/QuotaLedgerSelftest.swift ios/Tests/CloudSegmenterSelftest.swift -o .tmp/cloudselftest
 .tmp/cloudselftest
 # I5：SampleHandler 抽出来的纯判定（切回时机、按会话回填译文、广播结束闸门、换 key 作废）。
 xcrun swiftc -O ios/Shared/RecentLines.swift ios/Tests/RecentLinesSelftest.swift -o .tmp/handoffselftest

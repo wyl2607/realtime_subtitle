@@ -340,3 +340,26 @@ def test_hc_u16_bounded_copies_and_watchdog_recheck():
     assert "readyBox === box" in body, (
         "HC-U16 违反：就绪看门狗关连接前没在锁内核对 readyBox，会掐断刚就绪的会话。"
     )
+
+
+def test_hc_u17_cloud_upload_falls_back_to_cellular_only_safely():
+    """硬约束 HC-U17：云端上传 Wi-Fi 失败换蜂窝重发，但不许绕过系统代理、不许漏记账。
+
+    为什么（2026-11-22 用户：5G 很差但 Wi-Fi 还好，要两条网互为备份）：URLSession 选不了网卡，
+    换蜂窝只能走 NWConnection 直连——直连会绕过系统代理（CLAUDE.md 第 4 节第 47 条），
+    重发又是 Groq 的另一次计费请求，本地账本必须照记（第 49 条：配额只能本地记）。
+    必须怎么做：重发只经 CellularFallback.shouldRetry 判定（含 systemProxyConfigured）；
+    引擎传 beforeCellularRetry 并在里面 recordRequest；蜂窝直连必须 requiredInterfaceType = .cellular。
+    """
+    cloud = (IOS / "Shared" / "CloudClient.swift").read_text(encoding="utf-8")
+    assert "CellularFallback.shouldRetry(" in cloud and "systemProxyConfigured: CellularFallback.systemProxyConfigured()" in cloud, (
+        "HC-U17 违反：CloudClient 换蜂窝重发没走 CellularFallback.shouldRetry（会绕过系统代理）。"
+    )
+    assert "beforeCellularRetry?()" in cloud, "HC-U17 违反：重发前没通知调用方记账。"
+    fallback = (IOS / "Shared" / "NetworkPaths.swift").read_text(encoding="utf-8")
+    assert "!systemProxyConfigured" in fallback, "HC-U17 违反：开了系统代理仍会直连蜂窝。"
+    cellular = (IOS / "Shared" / "CellularHTTP.swift").read_text(encoding="utf-8")
+    assert "requiredInterfaceType = .cellular" in cellular, "HC-U17 违反：蜂窝直连没钉蜂窝网卡。"
+    engine = (IOS / "Engine" / "SubtitleEngine.swift").read_text(encoding="utf-8")
+    m = re.search(r"beforeCellularRetry:\s*\{(.*?)\n\s*\}\n", engine, re.S)
+    assert m and "recordRequest" in m.group(1), "HC-U17 违反：换蜂窝重发没记进额度账本。"
