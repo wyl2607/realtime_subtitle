@@ -13,9 +13,78 @@ struct LocalSentenceRange: Equatable {
     var end: Double
 }
 
-@available(iOS 26.0, *)
-final class LocalEngine {
+/// TranslationSession 没标 Sendable，而准备好的会话要经 Task 交给翻译链。
+/// 这里可以 unchecked：同一个会话只被串行尾链（translationTail）一次一句地使用，
+/// 从不并发调用。
+private struct PreparedSession: @unchecked Sendable {
+    let session: TranslationSession
+}
+
+/// 单句翻译超时的失败。只用来在日志里和真的翻译错误区分开；
+/// 上层仍然走「翻译失败只显示原文」的同一条路径。
+private struct TranslationTimeoutError: LocalizedError {
+    let seconds: TimeInterval
+
+    var errorDescription: String? {
+        "Translation timed out after \(Int(seconds))s"
+    }
+}
+
+/// 一次性交卷的竞速闸门：翻译结果和超时谁先到谁算数，后到的静默丢弃。
+///
+/// CheckedContinuation 被 resume 两次会直接 crash，而这两条路径天然会竞争，
+/// 所以必须用锁把「第一次交卷」钉死。为什么不直接用 TaskGroup 竞速：
+/// 作用域退出前会等所有子任务结束，而 Translation 不保证响应取消——
+/// 超时分支抛出去了也照样卡在作用域尾部，串行尾链还是堵住。
+private final class TranslationTimeoutRace<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var settled: Result<Value, Error>?
+    private var waiter: CheckedContinuation<Value, Error>?
+
+    func settle(_ result: Result<Value, Error>) {
+        lock.lock()
+        guard settled == nil else {
+            lock.unlock()
+            return
+        }
+        if let waiter {
+            settled = result
+            self.waiter = nil
+            lock.unlock()
+            waiter.resume(with: result)
+        } else {
+            // 结果比 wait() 先到：先存着，等 value() 来取。
+            settled = result
+            lock.unlock()
+        }
+    }
+
+    func value() async throws -> Value {
+        try await withCheckedThrowingContinuation { continuation in
+            lock.lock()
+            if let settled {
+                lock.unlock()
+                continuation.resume(with: settled)
+            } else {
+                waiter = continuation
+                lock.unlock()
+            }
+        }
+    }
+}
+
+/// unchecked Sendable：本类没有 actor 隔离，全部可变状态都由 stateLock 守护
+/// （见下面 stateLock 的说明）。启动、结果循环、翻译链各在自己的 Task 里引用 self。
+final class LocalEngine: @unchecked Sendable {
     private let logger = Logger(subsystem: "com.wyl2607.rsios.spike", category: "local-engine")
+
+    /// 单句翻译超时（秒）。TranslationSession 一旦对某句不返回，串行尾链后面
+    /// 每一句都会一直等下去：原文照常上屏、译文从某句起永久停住，而引擎既
+    /// 不报错也不自愈。10 秒比实测单句（约 0.1–1 秒）宽得多，又比用户能忍受
+    /// 的「字幕永远缺一句」短得多。
+    private static let translationTimeout: TimeInterval = 10
+    /// 分析器输入队列上限：每次 append 一帧 100ms，200 帧约 20 秒。
+    private static let maxQueuedInputs = 200
 
     /// 引擎模式。
     enum Mode {
@@ -32,13 +101,13 @@ final class LocalEngine {
     private var analysisTask: Task<Void, Never>?
     private var resultTask: Task<Void, Never>?
     /// 识别不能等翻译模型准备好；结果到达时再等这个任务，首句既不丢译文也不挡原文。
-    private var translationReady: Task<TranslationSession?, Never>?
+    private var translationReady: Task<PreparedSession?, Never>?
     /// 最近一句的翻译任务；下一句接在它后面。
     private var translationTail: Task<Void, Never>?
 
     /// stop() 锁内摘出来的待取消/待结束对象；cancel()/finish() 一律在锁外做。
     private struct StopSnapshot {
-        var translationReady: Task<TranslationSession?, Never>?
+        var translationReady: Task<PreparedSession?, Never>?
         var translationTail: Task<Void, Never>?
         var inputContinuation: AsyncStream<AnalyzerInput>.Continuation?
         var analysisTask: Task<Void, Never>?
@@ -224,7 +293,9 @@ final class LocalEngine {
             emitStatus("tx_unavailable")
         }
 
-        let inputStream = AsyncStream<AnalyzerInput> { continuation in
+        // 有界：分析器掉队（首次加载模型、热降频、后台降优先级）时只留最新约 20 秒，
+        // 默认的无界缓冲会让内存一直涨、字幕越走越晚。
+        let inputStream = AsyncStream<AnalyzerInput>(bufferingPolicy: .bufferingNewest(Self.maxQueuedInputs)) { continuation in
             // build 闭包同步执行，但 stop() 可能正并发跑：赋值同样要进锁，
             // 已停就当场 finish，免得留下一个没人消费也没人结束的 continuation。
             let kept = stateLock.withLock { () -> Bool in
@@ -269,7 +340,7 @@ final class LocalEngine {
         if txStatus == .installed {
             // 翻译模型首次准备可能很久，独立执行才能让识别任务立即消费已到的音频。
             // 放在识别器预热和结果任务之前创建：两边的准备并行，最早的结果也一定看得到这个任务。
-            let ready = Task { [weak self] () -> TranslationSession? in
+            let ready = Task { [weak self] () -> PreparedSession? in
                 guard let self, !self.isStopped() else { return nil }
                 let session = TranslationSession(installedSource: self.sourceLocale, target: self.targetLocale)
                 do {
@@ -280,7 +351,7 @@ final class LocalEngine {
                         self.translationSession = session
                         return true
                     }
-                    return kept ? session : nil
+                    return kept ? PreparedSession(session: session) : nil
                 } catch {
                     guard !self.isStopped() else { return nil }
                     self.logger.error("TranslationSession prepare failed: \(error.localizedDescription)")
@@ -387,7 +458,8 @@ final class LocalEngine {
         sourceBuffer.frameLength = AVAudioFrameCount(frameCount)
         pcm16k.withUnsafeBytes { raw in
             guard let base = raw.baseAddress, let dst = sourceBuffer.int16ChannelData?[0] else { return }
-            memcpy(dst, base, pcm16k.count)
+            // 奇数长度时多出的半个样本不拷：缓冲只有 frameCount 帧，按字节数拷会越界写 1 字节。
+            memcpy(dst, base, frameCount * 2)
         }
 
         if analyzerFormat == sourceFormat {
@@ -448,12 +520,18 @@ final class LocalEngine {
             emitSettled(id)
             return
         }
-        Task { [weak self] in
+        // 云端句也挂到同一条串行尾链：会话不是 Sendable，PreparedSession 的前提是「同一时刻只翻一句」。
+        // 以前每句一个独立 Task，云端两段一秒内先后到达就并发打同一个会话；某次卡住后每句都白等 10 秒。
+        let previous = stateLock.withLock { translationTail }
+        let prepared = PreparedSession(session: session)
+        let newTail = Task { [weak self] in
+            await previous?.value
             guard let self else { return }
+            let session = prepared.session
             do {
-                let response = try await session.translate(trimmed)
+                let targetText = try await self.translateWithTimeout(session, text: trimmed)
                 guard !self.isStopped() else { return }
-                let translated = response.targetText.trimmingCharacters(in: .whitespacesAndNewlines)
+                let translated = targetText.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !translated.isEmpty {
                     self.emitTranslation(id, translated)
                 } else {
@@ -466,6 +544,12 @@ final class LocalEngine {
             }
             self.emitSettled(id)
         }
+        let kept = stateLock.withLock { () -> Bool in
+            guard !stopped else { return false }
+            translationTail = newTail
+            return true
+        }
+        if !kept { newTail.cancel() }
     }
 
     func stop() {
@@ -571,14 +655,48 @@ final class LocalEngine {
         }
     }
 
+    /// 给单句翻译套一层超时。超时后抛 TranslationTimeoutError，调用方走既有的
+    /// 「翻译失败只显示原文」路径，并继续处理下一句。
+    private func translateWithTimeout(
+        _ session: TranslationSession,
+        text: String
+    ) async throws -> String {
+        let race = TranslationTimeoutRace<String>()
+        // 会话本身不是 Sendable；装进 PreparedSession 交给工作任务，理由见那个类型的说明。
+        let prepared = PreparedSession(session: session)
+        let work = Task {
+            do {
+                race.settle(.success(try await prepared.session.translate(text).targetText))
+            } catch {
+                race.settle(.failure(error))
+            }
+        }
+        let timer = Task {
+            try? await Task.sleep(nanoseconds: UInt64(Self.translationTimeout * 1_000_000_000))
+            race.settle(.failure(TranslationTimeoutError(seconds: Self.translationTimeout)))
+        }
+        defer {
+            timer.cancel()
+            // 超时赢的时候这里会请求取消；Translation 不一定响应，但那个任务
+            // 已经不再被等，不会挡住下一句。
+            work.cancel()
+        }
+        return try await withTaskCancellationHandler {
+            try await race.value()
+        } onCancel: {
+            // stop() 会 cancel 串行尾链：别让停机陪着翻译一起等满 10 秒。
+            race.settle(.failure(CancellationError()))
+        }
+    }
+
     private func translateAndSettle(id: Int, text: String) async {
         guard !isStopped() else { return }
         let ready = stateLock.withLock { translationReady }
-        if let session = await ready?.value {
+        if let session = await preparedSession(ready) {
             do {
-                let response = try await session.translate(text)
+                let targetText = try await translateWithTimeout(session, text: text)
                 guard !isStopped() else { return }
-                let translated = response.targetText.trimmingCharacters(in: .whitespacesAndNewlines)
+                let translated = targetText.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !translated.isEmpty {
                     emitTranslation(id, translated)
                 } else {
@@ -594,6 +712,36 @@ final class LocalEngine {
         // 翻译成功、翻译失败、或者压根没有翻译会话，这一句都算收尾了。
         // 放在最后：调用方据此判断「本机这边可以放手了」，能安全切回节点。
         emitSettled(id)
+    }
+
+    /// 等翻译会话准备好，最多等 translationTimeout 秒。prepareTranslation 卡住时（资源被系统换出、
+    /// 下载确认框没人点）不能让每一句都永远挂在这里：那样 onSentenceSettled 永远不来，
+    /// 自动档也永远切不回节点。超时这一句按「没有译文」收尾，准备任务本身继续跑，下一句还能用上。
+    private func preparedSession(_ ready: Task<PreparedSession?, Never>?) async -> TranslationSession? {
+        guard let ready else { return nil }
+        let race = TranslationTimeoutRace<PreparedSession?>()
+        let waiter = Task { race.settle(.success(await ready.value)) }
+        let timer = Task {
+            try? await Task.sleep(nanoseconds: UInt64(Self.translationTimeout * 1_000_000_000))
+            race.settle(.failure(TranslationTimeoutError(seconds: Self.translationTimeout)))
+        }
+        defer {
+            waiter.cancel()
+            timer.cancel()
+        }
+        do {
+            let prepared = try await withTaskCancellationHandler {
+                try await race.value()
+            } onCancel: {
+                race.settle(.failure(CancellationError()))
+            }
+            return prepared?.session
+        } catch is TranslationTimeoutError {
+            emitStatus("tx_prepare_failed")
+            return nil
+        } catch {
+            return nil
+        }
     }
 
     /// CMTimeRange → 秒。整句区间为零/非法时返回 nil：宁可没有时间，
@@ -617,11 +765,18 @@ final class LocalEngine {
         stateLock.withLock { translationTail = nil }
     }
 
+    /// 识别链路结束（正常收尾或出错）：除了放掉会话，还要把「在运行」清掉、结束输入流。
+    /// 以前只放会话，引擎自认还在跑：append 继续往没人消费的流里塞，start() 也永远是空操作。
     private func finish() async {
-        stateLock.withLock {
+        let continuation = stateLock.withLock { () -> AsyncStream<AnalyzerInput>.Continuation? in
             analyzer = nil
             transcriber = nil
             translationSession = nil
+            isRunning = false
+            let continuation = inputContinuation
+            inputContinuation = nil
+            return continuation
         }
+        continuation?.finish()
     }
 }

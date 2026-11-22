@@ -271,6 +271,23 @@ struct AutoFallback {
         return AutoFallbackDecision(action: .keep, status: nil)
     }
 
+    /// 本机优先决策：在连节点的同时，本机可用且非云端档时直接启动本机引擎。
+    ///
+    /// - 广播已结束、云端档在跑、或本机不可用 → `.keep`（不抢、不启本机）。
+    /// - 否则 usingLocal = true，返回 `.startLocal`，状态行复用「节点正在加载」文案，
+    ///   避免新增设计令牌、避免在代码里写死中文。
+    mutating func localFirstDecision() -> AutoFallbackDecision {
+        guard broadcastActive, !usingCloud, localAvailable else {
+            return AutoFallbackDecision(action: .keep, status: nil)
+        }
+        usingLocal = true
+        awaitingSentenceEnd = false
+        return AutoFallbackDecision(
+            action: .startLocal,
+            status: AutoFallbackStatus.nodeLoading(displayName)
+        )
+    }
+
     /// 冷却到点：路由状态机进 probe，档位回到云端，下一段只发一次试探。
     /// 调用方（SampleHandler）按秒调 `tick(now:)`，这里只判断到没到点。
     mutating func tick(now: Date) -> AutoFallbackDecision? {
@@ -442,6 +459,10 @@ struct AutoFallback {
         route.nodeHealthy = false
         if usingCloud {
             return AutoFallbackDecision(action: .keep, status: AutoFallbackStatus.cloud)
+        }
+        // 本机已经在跑：保持当前状态行（显示「节点不可用，已用本机」），不改成「正在加载」。
+        if usingLocal {
+            return AutoFallbackDecision(action: .keep, status: nil)
         }
         return AutoFallbackDecision(
             action: .keep,

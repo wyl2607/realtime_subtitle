@@ -16,7 +16,7 @@ xcrun swiftc -O ios/Shared/Routing.swift ios/Shared/LineStore.swift ios/Shared/A
 # 云端档纯逻辑（Groq 请求/响应、额度账本、分段器）：第三个独立入口，
 # 只编这三个 Shared 文件 + QuotaLedger 需要的 Routing.swift（滞回判定在路由状态机里）。
 # 不发网络请求，也不读任何真实 key。
-xcrun swiftc -O ios/Shared/Routing.swift ios/Shared/CloudClient.swift ios/Shared/QuotaLedger.swift ios/Shared/CloudSegmenter.swift ios/Tests/CloudSelftestMain.swift ios/Tests/CloudClientSelftest.swift ios/Tests/QuotaLedgerSelftest.swift ios/Tests/CloudSegmenterSelftest.swift -o .tmp/cloudselftest
+xcrun swiftc -O ios/Shared/Routing.swift ios/Shared/CloudClient.swift ios/Shared/QuotaLedger.swift ios/Shared/CloudSegmenter.swift ios/Shared/NetworkPaths.swift ios/Shared/CellularHTTP.swift ios/Tests/CloudSelftestMain.swift ios/Tests/CellularHTTPSelftest.swift ios/Tests/CloudClientSelftest.swift ios/Tests/QuotaLedgerSelftest.swift ios/Tests/CloudSegmenterSelftest.swift -o .tmp/cloudselftest
 .tmp/cloudselftest
 # I5：SampleHandler 抽出来的纯判定（切回时机、按会话回填译文、广播结束闸门、换 key 作废）。
 xcrun swiftc -O ios/Shared/RecentLines.swift ios/Tests/RecentLinesSelftest.swift -o .tmp/handoffselftest
@@ -39,3 +39,9 @@ xcrun swiftc -O ios/Shared/StatusSummary.swift ios/Shared/SubtitleStyle.swift io
 # 定稿分句是纯逻辑：本机档十几秒才定稿一次，切句规则错一点就会退回「一条字幕塞好几句」。
 xcrun swiftc -O ios/Shared/SentenceSplitter.swift ios/Tests/SentenceSplitterSelftest.swift -o .tmp/sentencesplitterselftest
 .tmp/sentencesplitterselftest
+# HC-P01：主 App 的运行态只允许有一个轮询源。LiveFeed 要求内容没变不发布属性，
+# 否则合并了读取次数、SwiftUI 还是每次整树重绘。SharedKeychain 一起编是为了
+# 走真实默认读取闭包（自测里注入的是内存闭包，不碰真实 Keychain）；
+# Routing.swift 提供 SharedKeychain.readEngineMode 需要的 EngineMode。
+xcrun swiftc -O ios/RSiOS/LiveFeed.swift ios/Shared/SharedKeychain.swift ios/Shared/Routing.swift ios/Tests/LiveFeedSelftest.swift -o .tmp/livefeedselftest
+.tmp/livefeedselftest

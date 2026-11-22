@@ -16,7 +16,13 @@ func runTranscriptStoreSelftest(_ check: @escaping (Bool, String) -> Void) {
     // 第一句原文先到，译文为空。
     store.ingest([TranscriptStore.Sentence(id: 1, session: "s1", src: "Guten Tag.", dst: "")])
     let day1URL = store.fileURL(for: clock)
-    check(FileManager.default.fileExists(atPath: day1URL.path), "第一次写入应创建当天文件")
+    // 硬约束 HC-P02：ingest 由主界面调用，不能同步等到磁盘写完再返回。
+    check(
+        !FileManager.default.fileExists(atPath: day1URL.path),
+        "违反 HC-P02：ingest 返回时不该已经落盘（写盘必须异步合并，不能阻塞调用方）"
+    )
+    store.flush()
+    check(FileManager.default.fileExists(atPath: day1URL.path), "flush 后应创建当天文件")
 
     var day1Lines = readLines(day1URL)
     check(day1Lines.count == 1, "第一天首句应只有 1 行（实际 \(day1Lines.count)）")
@@ -28,11 +34,13 @@ func runTranscriptStoreSelftest(_ check: @escaping (Bool, String) -> Void) {
 
     // Keychain 每 0.5 秒读一次，同一句会反复出现——不能重复写。
     store.ingest([TranscriptStore.Sentence(id: 1, session: "s1", src: "Guten Tag.", dst: "")])
+    store.flush()
     day1Lines = readLines(day1URL)
     check(day1Lines.count == 1, "同键重复轮询不应追加（实际 \(day1Lines.count) 行）")
 
     // 译文后到：更新同一行，而不是新增一行。
     store.ingest([TranscriptStore.Sentence(id: 1, session: "s1", src: "Guten Tag.", dst: "你好")])
+    store.flush()
     day1Lines = readLines(day1URL)
     check(day1Lines.count == 1, "译文后到不应新增行（实际 \(day1Lines.count) 行）")
     check(day1Lines.first?[2] == "你好", "译文应写回同一行（实际 \(day1Lines.first?[2] ?? "nil")）")
@@ -41,6 +49,7 @@ func runTranscriptStoreSelftest(_ check: @escaping (Bool, String) -> Void) {
     // 换了一个引擎会话（同一天、同一个 id）：必须追加新行，不能覆盖上一句。
     // 各引擎的 id 都从 1 重新计数，只按 id 去重就会把这一句写到上一句头上。
     store.ingest([TranscriptStore.Sentence(id: 1, session: "s2", src: "Guten Abend.", dst: "")])
+    store.flush()
     day1Lines = readLines(day1URL)
     check(day1Lines.count == 2, "不同会话的同 id 应追加新行（实际 \(day1Lines.count) 行）")
     check(field(day1Lines, 0, 1) == "Guten Tag.", "旧行不应被改写")
@@ -51,6 +60,7 @@ func runTranscriptStoreSelftest(_ check: @escaping (Bool, String) -> Void) {
     // 跨天：新句写到新日期文件。
     clock = date(year: 2026, month: 10, day: 21, hour: 0, minute: 0, second: 10, timeZone: timeZone)
     store.ingest([TranscriptStore.Sentence(id: 2, session: "s1", src: "Wie geht es?", dst: "你好吗？")])
+    store.flush()
     let day2URL = store.fileURL(for: clock)
     check(day2URL.lastPathComponent == "2026-10-21.txt", "跨天文件名为 YYYY-MM-DD（实际 \(day2URL.lastPathComponent)）")
     check(FileManager.default.fileExists(atPath: day2URL.path), "跨天应创建新文件")
@@ -62,6 +72,7 @@ func runTranscriptStoreSelftest(_ check: @escaping (Bool, String) -> Void) {
 
     // 跨天后上一句的迟到译文仍应更新前一天的同一行。
     store.ingest([TranscriptStore.Sentence(id: 1, session: "s1", src: "Guten Tag.", dst: "您好")])
+    store.flush()
     day1Lines = readLines(day1URL)
     check(day1Lines.count == 2, "跨天迟到译文不应新增行")
     check(field(day1Lines, 0, 2) == "您好", "跨天迟到译文应更新前一天的行")
@@ -74,12 +85,14 @@ func runTranscriptStoreSelftest(_ check: @escaping (Bool, String) -> Void) {
     clock = date(year: 2026, month: 10, day: 20, hour: 23, minute: 59, second: 55, timeZone: timeZone)
     let reopened = TranscriptStore(directory: base, now: { clock }, timeZone: timeZone)
     reopened.ingest([TranscriptStore.Sentence(id: 1, session: "s1", src: "Guten Tag.", dst: "您好")])
+    reopened.flush()
     day1Lines = readLines(day1URL)
     check(day1Lines.count == 2, "重启后同键句子不应被重复追加（实际 \(day1Lines.count) 行）")
     check(field(day1Lines, 0, 2) == "您好", "重启后同键句子应改写原行而不是新增")
 
     // 重启后换个会话的同 id 仍要追加新行（重建索引不能把会话维度弄丢）。
     reopened.ingest([TranscriptStore.Sentence(id: 1, session: "s3", src: "Guten Abend.", dst: "")])
+    reopened.flush()
     day1Lines = readLines(day1URL)
     check(day1Lines.count == 3, "重启后新会话的同 id 应追加新行（实际 \(day1Lines.count) 行）")
     check(field(day1Lines, 2, 3) == "s3#1", "重启后新行的去重键应带新会话代号（实际 \(field(day1Lines, 2, 3))）")
@@ -91,12 +104,37 @@ func runTranscriptStoreSelftest(_ check: @escaping (Bool, String) -> Void) {
     try? "12:00:00\tAlter Satz\t旧句子\n".write(to: legacyURL, atomically: true, encoding: .utf8)
     let legacyStore = TranscriptStore(directory: legacyDir, now: { clock }, timeZone: timeZone)
     legacyStore.ingest([TranscriptStore.Sentence(id: 1, session: "s1", src: "Neuer Satz", dst: "新句子")])
+    legacyStore.flush()
     let legacyLines = readLines(legacyURL)
     check(legacyLines.count == 2, "老文件的行不应被覆盖，应追加新行（实际 \(legacyLines.count) 行）")
     check(field(legacyLines, 0, 1) == "Alter Satz", "老行应原样保留")
     check(field(legacyLines, 0, 3) == "", "老行没有去重键（第四列为空）")
     check(field(legacyLines, 1, 1) == "Neuer Satz", "新行应是新句子")
     check(field(legacyLines, 1, 3) == "s1#1", "新行应带去重键（实际 \(field(legacyLines, 1, 3))）")
+
+    // 硬约束 HC-P02：合并写不能丢句。原文先到、译文后到，窗口里只落一次盘，
+    // 但最终文件必须一行不少、译文是最后一版。
+    let asyncDir = base.appendingPathComponent("async")
+    let asyncStore = TranscriptStore(directory: asyncDir, now: { clock }, timeZone: timeZone)
+    let asyncURL = asyncStore.fileURL(for: clock)
+    for id in 1...50 {
+        asyncStore.ingest([TranscriptStore.Sentence(id: id, session: "batch", src: "Satz \(id)", dst: "")])
+    }
+    check(
+        !FileManager.default.fileExists(atPath: asyncURL.path),
+        "违反 HC-P02：连续 ingest 期间不该每次落盘（合并窗口内只写一次）"
+    )
+    asyncStore.ingest([TranscriptStore.Sentence(id: 50, session: "batch", src: "Satz 50", dst: "第五十句")])
+    asyncStore.flush()
+    let asyncLines = readLines(asyncURL)
+    check(
+        asyncLines.count == 50,
+        "违反 HC-P02：合并写丢了句子（期望 50 行，实际 \(asyncLines.count)）"
+    )
+    check(
+        field(asyncLines, 49, 2) == "第五十句",
+        "违反 HC-P02：合并写丢了迟到的译文（实际 \(field(asyncLines, 49, 2))）"
+    )
 
     // 「今天的字幕」页面读的是同一个文件：行数与顺序要和写出去的一致。
     let pageLines = reopened.lines(for: clock)

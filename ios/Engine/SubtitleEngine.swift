@@ -8,7 +8,9 @@ import Translation
 
 /// 广播扩展与未来的麦克风采集共用的字幕路由引擎。
 /// 不引入 ReplayKit，主 App 才能复用同一套节点、本机、云端与状态逻辑。
-final class SubtitleEngine {
+/// unchecked Sendable：本类不用 actor，所有跨线程读写的状态都经 stateQueue 串行化，
+/// 音频回调、节点回调、本机引擎回调各在自己的线程里引用 self。
+final class SubtitleEngine: @unchecked Sendable {
     private let logger = Logger(subsystem: "com.wyl2607.rsios.spike", category: "ext")
     private let source: String
 
@@ -133,6 +135,8 @@ final class SubtitleEngine {
     private let maxRecentLines = 3
     private let stateQueue = DispatchQueue(label: "com.wyl2607.rsios.spike.state")
     private let connectionQueue = DispatchQueue(label: "com.wyl2607.rsios.spike.connection")
+    /// 只给 writeLatestLines 用：把「取快照 → 写 Keychain」串起来，不在 stateQueue 里做 I/O。
+    private let linesWriteQueue = DispatchQueue(label: "com.wyl2607.rsios.spike.lines-write")
     private var broadcastActive = false
     /// 所有节点异步回调都带着创建时的代号；必须在 stateQueue 上核对，不能跨轮次写状态。
     private var runGate = EngineRunGate()
@@ -183,15 +187,7 @@ final class SubtitleEngine {
                 fatalErrorOccurred = false
                 fatalErrorReason = ""
             }
-            if #available(iOS 26.0, *) {
-                startLocalEngine()
-            } else {
-                writeStatus("last=local_needs_ios26")
-                let fatal = stateQueue.sync { markFatalError(code: "local_needs_ios26") }
-                if let fatal {
-                    onFatalError?(fatal)
-                }
-            }
+            startLocalEngine()
             return
         }
 
@@ -232,7 +228,6 @@ final class SubtitleEngine {
 
     func finish() {
         logger.info("Subtitle engine finished source=\(self.source)")
-        
         if engineMode == "local" {
             stateQueue.sync {
                 broadcastActive = false
@@ -270,19 +265,12 @@ final class SubtitleEngine {
             cloudTranslationAvailable = false
             return translator
         }
-        if #available(iOS 26.0, *) {
-            (translator as? LocalEngine)?.stop()
-        }
+        (translator as? LocalEngine)?.stop()
         converter = nil
         writeStatus("finished")
     }
 
     // MARK: - 自动模式（C1/C2）：决策全在 AutoFallback，这里只做接线
-
-    private var autoLocalEngineAvailable: Bool {
-        if #available(iOS 26.0, *) { return true }
-        return false
-    }
 
     private func startAutoMode(generation: Int) {
         converter = PCMConverter()
@@ -291,7 +279,7 @@ final class SubtitleEngine {
         // 准备好了再 updateCloud 让路由状态机重新选档。
         autoFallback = AutoFallback(
             nodeName: "电脑节点",
-            localAvailable: autoLocalEngineAvailable,
+            localAvailable: true,
             cloud: readCloudAvailability()
         )
         stateQueue.sync {
@@ -345,6 +333,9 @@ final class SubtitleEngine {
         autoFallback?.nodeName = config.name
         autoFallback?.setNodeEnabled(true)
         startPinnedSession(config, generation: generation)
+        // 本机优先（HC-U13）：连节点的同时先用本机出字，节点 ready 后等本句定稿再切回。
+        // 以前要干等节点握手（基础 15 秒、冷启动最多 60 秒）才出第一句。
+        applyAutoDecision(handleAutoEvent { fallback in fallback.localFirstDecision() })
         // 云端档：先确认本机翻译能用，再决定要不要进云端档。
         prepareCloudTier()
     }
@@ -352,9 +343,14 @@ final class SubtitleEngine {
     /// 在 stateQueue 上改 AutoFallback 并取回决策；动作本身在锁外执行，
     /// 因为启动/停止本机引擎也会进 stateQueue。
     private func handleAutoEvent(_ event: AutoFallbackEvent) -> AutoFallbackDecision? {
+        handleAutoEvent { $0.handle(event) }
+    }
+
+    /// 在 stateQueue 上对 AutoFallback 做一次修改并取回决策（事件和 localFirstDecision 共用）。
+    private func handleAutoEvent(_ mutate: (inout AutoFallback) -> AutoFallbackDecision) -> AutoFallbackDecision? {
         stateQueue.sync {
             guard engineMode == "auto", var fallback = autoFallback else { return nil }
-            let decision = fallback.handle(event)
+            let decision = mutate(&fallback)
             autoFallback = fallback
             return decision
         }
@@ -366,13 +362,10 @@ final class SubtitleEngine {
         case .keep:
             break
         case .startLocal:
-            if #available(iOS 26.0, *) {
-                startLocalEngine()
-            }
+            startLocalEngine()
         case .stopLocalAndSwitchToNode:
-            stopLocalEngine()
+            stopLocalEngine(switchingTo: .node)
             stateQueue.sync {
-                routingTier = .node
                 localSentenceActive = false
                 // 本机档已经离开：上一轮的本机失败码留着会让状态行提示误报。
                 if Self.isLocalFailureCode(lastStatusCode) {
@@ -392,9 +385,7 @@ final class SubtitleEngine {
             }
         case .stopCloudAndStartLocal:
             stopCloudTier()
-            if #available(iOS 26.0, *) {
-                startLocalEngine()
-            }
+            startLocalEngine()
         case .stopCloud:
             // 没有档位能接手：只把云端停掉，节点重连成功后由 nodeReady 接管。
             stopCloudTier()
@@ -428,20 +419,21 @@ final class SubtitleEngine {
         applyAutoDecision(decision)
     }
 
-    private func stopLocalEngine() {
+    /// - Parameter nextTier: 要切去的档位。必须和清引用在同一个临界区里改：分两次加锁时，
+    ///   音频线程可能读到「档位还是本机、本机引擎已经没了」，这几帧直接被丢掉。
+    private func stopLocalEngine(switchingTo nextTier: ProviderTier? = nil) {
         let engine = stateQueue.sync { () -> AnyObject? in
             // 在锁内清掉引用：回调的闸门也在锁内核对它，迟到的回调到这里就进不来了。
             let engine = localEngine
             localEngine = nil
+            if let nextTier { routingTier = nextTier }
             // 引擎没了，在途的译文不会再回调：把没收尾的句子清掉，
             // 否则「本机还忙」的判断会一直挂着。
             pendingLocalSettles.removeAll()
             localSentenceActive = false
             return engine
         }
-        if #available(iOS 26.0, *) {
-            (engine as? LocalEngine)?.stop()
-        }
+        (engine as? LocalEngine)?.stop()
         // 停止 / 换引擎 / 切到别的档位：草稿没有定稿的机会了，必须擦掉，
         // 否则主界面和画中画会一直挂着最后一段未定稿文本。
         clearDraft()
@@ -464,8 +456,9 @@ final class SubtitleEngine {
     }
 
     private func publishDraft(_ text: String) {
-        if !SharedKeychain.writeLatestDraft(text) {
+        guard SharedKeychain.writeLatestDraft(text) else {
             logger.error("Failed to write latest_draft to keychain")
+            return
         }
         postLinesNotification()
     }
@@ -515,7 +508,6 @@ final class SubtitleEngine {
     /// 翻译用不了（iOS < 26、系统翻译没装、准备失败）时这一档直接不参与路由：
     /// 状态机那边按「开关关」处理（switch_off），规则仍在 Routing.swift 里。
     private func prepareCloudTier() {
-        guard #available(iOS 26.0, *) else { return }
         let availability = readCloudAvailability()
         guard availability.hasKey, availability.enabled else { return }
         let token = newSessionCode()
@@ -614,7 +606,6 @@ final class SubtitleEngine {
 
     /// 进云端档：音频改喂云端分段器，译文走本机翻译。
     private func startCloudTier() {
-        guard #available(iOS 26.0, *) else { return }
         guard let key = SharedKeychain.readGroqKey() else { return }
         let revision = key.hashValue
         if cloudClient == nil {
@@ -632,11 +623,8 @@ final class SubtitleEngine {
             cloudSegmenter = CloudSegmenter()
         }
         // 本机识别不再需要：云端给原文，本机只做翻译。
-        stopLocalEngine()
-        stateQueue.sync {
-            routingTier = .cloud
-            cloudProbeUsed = false
-        }
+        stopLocalEngine(switchingTo: .cloud)
+        stateQueue.sync { cloudProbeUsed = false }
     }
 
     /// 退出云端档：在飞请求作废，分段器丢掉（回来时重新开始，不带着旧缓冲）。
@@ -735,7 +723,12 @@ final class SubtitleEngine {
                             a0: segment.audioOrigin,
                             duration: segment.duration,
                             language: language,
-                            segmentID: segment.id
+                            segmentID: segment.id,
+                            beforeCellularRetry: { [weak self] in
+                                // 换蜂窝重发是 Groq 的另一次计费请求，账本照记。
+                                _ = try? ledger.recordRequest(duration: segment.duration, requestID: UUID().uuidString)
+                                self?.logger.info("Cloud upload failed on Wi-Fi, retrying over cellular segment=\(segment.id)")
+                            }
                         )
                         self?.handleCloudSuccess(result, segment: segment, generation: generation, requestID: requestID)
                     } catch let error as CloudClientError {
@@ -757,8 +750,9 @@ final class SubtitleEngine {
     ) {
         // 先判作废：代次相同也要重读 Keychain。用户换 key 到下一次 refresh 前，旧 key 的 200
         // 仍可能回来；校验、记账和清 busy 都必须放在同一条 stateQueue 临界区里。
+        // Keychain 读放在临界区外：stateQueue 上排着音频线程和各路回调，不在锁里做跨进程 I/O。
+        let currentKeyFingerprint = SharedKeychain.readGroqKey().map { CloudClient.keyFingerprint($0) }
         let callbackCurrent = self.stateQueue.sync { () -> Bool in
-            let currentKeyFingerprint = SharedKeychain.readGroqKey().map { CloudClient.keyFingerprint($0) }
             guard CloudCallbackGate.isCurrent(
                 requestGeneration: generation,
                 currentGeneration: self.cloudGeneration,
@@ -802,8 +796,9 @@ final class SubtitleEngine {
         case .network, .invalidResponse, .cancelled:
             callbackKeyFingerprint = nil
         }
+        // Keychain 读放在临界区外：stateQueue 上排着音频线程和各路回调，不在锁里做跨进程 I/O。
+        let currentKeyFingerprint = SharedKeychain.readGroqKey().map { CloudClient.keyFingerprint($0) }
         let callbackCurrent = self.stateQueue.sync { () -> Bool in
-            let currentKeyFingerprint = SharedKeychain.readGroqKey().map { CloudClient.keyFingerprint($0) }
             guard CloudCallbackGate.isCurrent(
                 requestGeneration: generation,
                 currentGeneration: self.cloudGeneration,
@@ -887,9 +882,7 @@ final class SubtitleEngine {
         writeLatestLines()
         // 译文用本机翻译：云端只给原文。
         let translator = stateQueue.sync { cloudTranslator }
-        if #available(iOS 26.0, *) {
-            (translator as? LocalEngine)?.translate(text, id: lineID)
-        }
+        (translator as? LocalEngine)?.translate(text, id: lineID)
     }
 
     /// 云端那句的译文到了。
@@ -914,7 +907,6 @@ final class SubtitleEngine {
         localSentenceActive || !pendingLocalSettles.isEmpty
     }
 
-    @available(iOS 26.0, *)
     private func startLocalEngine() {
         // 自动回退时 converter 已经在跑节点链路：复用同一个实例，
         // 既避免和音频线程抢写，也保住重采样器的滤波状态。
@@ -970,9 +962,7 @@ final class SubtitleEngine {
             return (true, oldEngine)
         }
         guard transition.0 else { return }
-        if #available(iOS 26.0, *) {
-            (transition.1 as? LocalEngine)?.stop()
-        }
+        (transition.1 as? LocalEngine)?.stop()
         // 换引擎就是换会话：旧会话的最后一段草稿不能留在 Keychain 里。
         clearDraft()
         Task {
@@ -997,6 +987,11 @@ final class SubtitleEngine {
                 let t1 = localClockOrigin + range.end
                 p5Store.addLocal(key: storeKey, t0: t0, t1: t1, text: text)
                 p5Identity[storeKey] = (session: session, id: id)
+                // 仓库按容量淘汰旧行时不会通知这里：只留仍在仓库里的映射，长时间运行不无界增长。
+                if p5Identity.count > 2 * p5Store.lines.count + 16 {
+                    let live = Set(p5Store.lines.map(\.key))
+                    p5Identity = p5Identity.filter { live.contains($0.key) }
+                }
                 // 已经被远端行盖住的本机句不再上屏（P5）。
                 display = p5Store.lines.contains { $0.key == storeKey }
             } else {
@@ -1066,6 +1061,8 @@ final class SubtitleEngine {
                     return markFatalError(code: status)
                 }
                 guard let fatal else { return }
+                // 识别链路死了就不会再有定稿：最后一段灰色草稿要擦掉，不能一直挂在屏幕上。
+                clearDraft()
                 onFatalError?(fatal)
             }
         }
@@ -1187,15 +1184,13 @@ final class SubtitleEngine {
         }
         let localRoute = stateQueue.sync { (routingTier, localEngine) }
         if engineMode == "local" || localRoute.0 == .local {
-            if #available(iOS 26.0, *) {
-                guard let engine = localRoute.1 as? LocalEngine else { return }
-                if !frames.isEmpty {
-                    // 节点 ready 时靠这个标记判断“本机还有一句没定稿”，
-                    // 避免切回节点把半句截断。
-                    stateQueue.sync { localSentenceActive = true }
-                    for frame in frames {
-                        engine.append(pcm16k: frame)
-                    }
+            guard let engine = localRoute.1 as? LocalEngine else { return }
+            if !frames.isEmpty {
+                // 节点 ready 时靠这个标记判断“本机还有一句没定稿”，
+                // 避免切回节点把半句截断。
+                stateQueue.sync { localSentenceActive = true }
+                for frame in frames {
+                    engine.append(pcm16k: frame)
                 }
             }
             return
@@ -1658,26 +1653,33 @@ final class SubtitleEngine {
     private func writeStatus(_ text: String) {
         // start/finish/错误也会写状态；所有行都带来源，主 App 才不会把自己刚写的短状态误判成旧版广播。
         let sourcedText = text.contains("src=") ? text : "\(text) src=\(source)"
-        let success = SharedKeychain.writeExtStatus(sourcedText)
-        if !success {
+        // 写失败不发通知：主 App 收到通知就当成「状态刚更新」，读回来的却是旧值或空值。
+        guard SharedKeychain.writeExtStatus(sourcedText) else {
             logger.error("Failed to write status to keychain")
+            return
         }
         postDarwinNotification()
     }
 
+    /// 节点/本机/云端回调各在自己的队列上调这里。以前在锁外直接读 recentLines、写 lastLinesJSON：
+    /// 数据竞争，而且较旧的快照可能后写、把较新的字幕盖掉。现在整段在串行写队列里做，
+    /// 快照在 stateQueue 内取——最后一次写进 Keychain 的一定是最新内容。
     private func writeLatestLines() {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = []
-        if let data = try? encoder.encode(recentLines),
-           let json = String(data: data, encoding: .utf8) {
-            if json != lastLinesJSON {
-                lastLinesJSON = json
-                let success = SharedKeychain.writeLatestLines(json)
-                if !success {
-                    logger.error("Failed to write latest_lines to keychain")
-                }
-                postLinesNotification()
+        linesWriteQueue.sync {
+            let json: String? = stateQueue.sync {
+                guard let data = try? JSONEncoder().encode(recentLines),
+                      let json = String(data: data, encoding: .utf8),
+                      json != lastLinesJSON else { return nil }
+                return json
             }
+            guard let json else { return }
+            // 写失败不记 lastLinesJSON：下一句来时整份重写，不会因为一次失败永远缺句。
+            guard SharedKeychain.writeLatestLines(json) else {
+                logger.error("Failed to write latest_lines to keychain")
+                return
+            }
+            stateQueue.sync { lastLinesJSON = json }
+            postLinesNotification()
         }
     }
 

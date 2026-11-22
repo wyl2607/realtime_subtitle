@@ -1,5 +1,4 @@
 import Foundation
-import Combine
 import os
 
 /// 主 App 的当天字幕存档：`Documents/transcripts/YYYY-MM-DD.txt`，
@@ -22,7 +21,13 @@ import os
 ///
 /// 实现方式：内存里按日期保存整天的行，任何一行变化就把当天文件整体原子重写。
 /// 一天最多几千行，重写只在内容真的变化时发生（轮询读到相同句对什么都不做）。
-final class TranscriptStore: ObservableObject {
+///
+/// 写盘为什么异步 + 合并：`ingest` 由主界面在句对变化时调用，原文一次、译文一次，
+/// 一小时视频上千行。以前每次都在 `queue.sync` 里原子重写整份文件——同步等磁盘、
+/// 行数越多越慢。现在内存状态在串行队列上立即合并（一句都不丢），落盘推迟到
+/// 合并窗口到点后写一次；进后台/退出必须 `flush()`，因为进程可能被系统随时回收。
+/// unchecked Sendable：可变状态只在私有串行队列 `queue` 上读写。
+final class TranscriptStore: @unchecked Sendable {
     struct Sentence {
         let id: Int
         /// 产生这一句的引擎会话代号：各引擎的 id 都从 1 重新计数，只靠 id 会覆盖旧句。
@@ -55,9 +60,16 @@ final class TranscriptStore: ObservableObject {
     private let queue = DispatchQueue(label: "com.wyl2607.rsios.transcript-store")
     private let logger = Logger(subsystem: "com.wyl2607.rsios.spike", category: "transcript-store")
 
+    /// 合并窗口：这段时间里的多次 ingest 只落盘一次。从第一批变化开始计时，
+    /// 不因为持续有新句子而无限推迟——否则直播场景可能一直不写盘。
+    static let coalesceWindow: TimeInterval = 1.0
+
     private var days: [String: [Row]] = [:]
     private var index: [String: (day: String, row: Int)] = [:]
     private var loadedDays: Set<String> = []
+    /// 待写的日期和已经登记好的延迟写任务；只在串行队列上读写。
+    private var dirtyDays: Set<String> = []
+    private var pendingWrite: DispatchWorkItem?
 
     init(
         directory: URL? = nil,
@@ -114,41 +126,82 @@ final class TranscriptStore: ObservableObject {
     }
 
     /// 喂入 Keychain 里当前的最近句对。同一句（同键）会被合并，译文后到会原地更新。
+    ///
+    /// 这里只把这一批句子交给串行队列就返回：调用方是主界面，不能等磁盘。
     func ingest(_ sentences: [Sentence]) {
         guard !sentences.isEmpty else { return }
-        queue.sync {
-            var dirtyDays: Set<String> = []
-            let today = dateKey(for: now())
-            // 先把当天文件读回来并重建去重索引：App 重启后内存里是空的，
-            // 不先读回就会把最近几句当成新句子再追加一遍。
-            ensureLoaded(today)
+        queue.async {
+            let dirty = self.merge(sentences)
+            guard !dirty.isEmpty else { return }
+            self.dirtyDays.formUnion(dirty)
+            self.scheduleWrite()
+        }
+    }
 
-            for sentence in sentences {
-                let src = sanitize(sentence.src)
-                let dst = sanitize(sentence.dst)
-                let key = Self.makeKey(session: sentence.session, id: sentence.id)
+    /// 立刻把待写内容落盘并等它完成。进后台/退出时调——合并窗口只推迟写盘，
+    /// 进程被系统回收时窗口里的句子不能靠「等一秒」。
+    func flush() {
+        let done = DispatchGroup()
+        done.enter()
+        queue.async {
+            self.pendingWrite?.cancel()
+            self.pendingWrite = nil
+            self.writePending()
+            done.leave()
+        }
+        done.wait()
+    }
 
-                if let location = index[key] {
-                    let row = days[location.day]![location.row]
-                    // 同一句（原文/译文都允许以最后一版为准）。
-                    if row.src != src || row.dst != dst {
-                        days[location.day]![location.row].src = src
-                        days[location.day]![location.row].dst = dst
-                        dirtyDays.insert(location.day)
-                    }
-                    continue
+    /// 合并这一批句子，返回有变化的日期。在串行队列上跑，不碰磁盘。
+    private func merge(_ sentences: [Sentence]) -> Set<String> {
+        var dirtyDays: Set<String> = []
+        let today = dateKey(for: now())
+        // 先把当天文件读回来并重建去重索引：App 重启后内存里是空的，
+        // 不先读回就会把最近几句当成新句子再追加一遍。
+        ensureLoaded(today)
+
+        for sentence in sentences {
+            let src = sanitize(sentence.src)
+            let dst = sanitize(sentence.dst)
+            let key = Self.makeKey(session: sentence.session, id: sentence.id)
+
+            if let location = index[key] {
+                let row = days[location.day]![location.row]
+                // 同一句（原文/译文都允许以最后一版为准）。
+                if row.src != src || row.dst != dst {
+                    days[location.day]![location.row].src = src
+                    days[location.day]![location.row].dst = dst
+                    dirtyDays.insert(location.day)
                 }
-
-                var rows = days[today] ?? []
-                rows.append(Row(key: key, time: timeString(for: now()), src: src, dst: dst))
-                days[today] = rows
-                index[key] = (today, rows.count - 1)
-                dirtyDays.insert(today)
+                continue
             }
 
-            for day in dirtyDays {
-                write(day)
-            }
+            var rows = days[today] ?? []
+            rows.append(Row(key: key, time: timeString(for: now()), src: src, dst: dst))
+            days[today] = rows
+            index[key] = (today, rows.count - 1)
+            dirtyDays.insert(today)
+        }
+        return dirtyDays
+    }
+
+    /// 合并窗口内只登记一次写盘：后面的 ingest 只往 dirtyDays 里加日期，到点一起写。
+    private func scheduleWrite() {
+        guard pendingWrite == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            self?.writePending()
+        }
+        pendingWrite = work
+        queue.asyncAfter(deadline: .now() + Self.coalesceWindow, execute: work)
+    }
+
+    /// 只由串行队列调用：写掉当前所有脏日期，并允许下一批重新登记窗口。
+    private func writePending() {
+        pendingWrite = nil
+        let days = dirtyDays
+        dirtyDays.removeAll()
+        for day in days {
+            write(day)
         }
     }
 

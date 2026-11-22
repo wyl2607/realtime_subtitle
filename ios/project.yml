@@ -1,10 +1,10 @@
 name: RSiOS
 options:
   deploymentTarget:
-    iOS: "17.0"
+    iOS: "26.0"
   minimumXcodeGenVersion: "2.40.0"
   xcodeVersion: "27.0"
-  swiftVersion: "5.0"
+  swiftVersion: "6.0"
   generateSharedSchemes: true
   bundleIdPrefix: com.wyl2607
   createIntermediateGroups: true
@@ -14,17 +14,17 @@ options:
   groups:
     - RSiOS
     - RSBroadcast
+    - RSLiveActivity
     - Engine
 settings:
   base:
-    SWIFT_VERSION: "5.0"
-    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    SWIFT_VERSION: "6.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "26.0"
     CODE_SIGN_STYLE: Automatic
     DEVELOPMENT_TEAM: ""
     MARKETING_VERSION: "0.1.0"
     CURRENT_PROJECT_VERSION: "1"
     ENABLE_USER_SCRIPT_SANDBOXING: "YES"
-    SWIFT_STRICT_CONCURRENCY: "minimal"
     OTHER_SWIFT_FLAGS: -D DEBUG
   configs:
     Debug:
@@ -59,6 +59,8 @@ targets:
     dependencies:
       - target: RSBroadcast
         embed: true
+      - target: RSLiveActivity
+        embed: true
     scheme:
       testTargets: []
   RSBroadcast:
@@ -79,6 +81,20 @@ targets:
         NSEXTENSION_PRINCIPAL_CLASS: $(PRODUCT_MODULE_NAME).SampleHandler
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks @executable_path/../Frameworks"
         ENABLE_BITCODE: "NO"
+        TARGETED_DEVICE_FAMILY: "1"
+    scheme:
+      testTargets: []
+  RSLiveActivity:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: RSLiveActivity
+      - path: Shared/SubtitleActivityAttributes.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.yilinwang.realtimesubtitle.liveactivity
+        INFOPLIST_FILE: RSLiveActivity/Info.plist
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks"
         TARGETED_DEVICE_FAMILY: "1"
     scheme:
       testTargets: []

@@ -152,7 +152,8 @@ final class ReadyDeadlineBox: @unchecked Sendable {
 
 /// v2 节点会话客户端。不自动重连、不做 TailnetPin（以后做）。
 /// 日志/打印绝不输出 token 与字幕正文——本类不做任何日志输出。
-final class NodeSession: NSObject, URLSessionWebSocketDelegate {
+/// unchecked Sendable：URLSession 委托要求 Sendable；可变状态都由 `lock` 守护。
+final class NodeSession: NSObject, URLSessionWebSocketDelegate, @unchecked Sendable {
     enum SendResult: Equatable {
         case sent
         case buffered
@@ -193,9 +194,9 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
     private let token: String
     private let src: String
     private let dst: String
-    private let onEvent: (NodeEvent) -> Void
-    private let onClose: (Int) -> Void
-    private let onLoading: ((Double) -> Void)?
+    private let onEvent: @Sendable (NodeEvent) -> Void
+    private let onClose: @Sendable (Int) -> Void
+    private let onLoading: (@Sendable (Double) -> Void)?
     private let readyTimeout: Double
 
     private let lock = NSLock()
@@ -228,9 +229,9 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
         token: String,
         src: String,
         dst: String,
-        onEvent: @escaping (NodeEvent) -> Void,
-        onClose: @escaping (Int) -> Void,
-        onLoading: ((Double) -> Void)? = nil,
+        onEvent: @escaping @Sendable (NodeEvent) -> Void,
+        onClose: @escaping @Sendable (Int) -> Void,
+        onLoading: (@Sendable (Double) -> Void)? = nil,
         readyTimeout: Double = readyTimeoutSeconds
     ) {
         self.url = url
@@ -257,6 +258,10 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
         var request = URLRequest(url: url)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         let configuration = URLSessionConfiguration.ephemeral
+        // 节点连接绝不走系统代理（CLAUDE.md 第 4 节第 47 条）：ephemeral 仍会继承系统 HTTP/SOCKS/PAC 代理，
+        // 代理就能看到 Bearer token 和原始音频，也能把连接带出 tailnet。空字典＝不用任何代理。
+        // 云端客户端相反，要保留系统代理（有的用户只能经代理访问 Groq）。
+        configuration.connectionProxyDictionary = [:]
         let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
         let socket = session.webSocketTask(with: request)
         // 截止时间从开始建连起算：握手卡住时 send 回调不会返回，必须先让看门狗接管。
@@ -454,7 +459,13 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate {
         }
         // 到点仍未 ready：按握手超时结束会话。rslite 到点用 .goingAway 取消 socket
         // 再上报 timeout，这里同样以 1001 通知 onClose，让调用方走正常重连退避。
+        // 解锁算剩余时间的这段空档里 ready 可能刚到（readyBox 已被清掉或换新）：
+        // 不再核对一次就会把刚就绪的会话按超时掐断。
         lock.lock()
+        guard readyBox === box else {
+            lock.unlock()
+            return
+        }
         readyBox = nil
         let socket = self.socket
         lock.unlock()

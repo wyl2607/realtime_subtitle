@@ -13,6 +13,7 @@ struct CloudSelftest {
         runCloudClientSelftest(check)
         runQuotaLedgerSelftest(check)
         runCloudSegmenterSelftest(check)
+        runCellularHTTPSelftest(check)
 
         if failures.isEmpty {
             print("SELFTEST OK")

@@ -56,8 +56,29 @@ struct CaptureArbiterSelftest {
                 extensionStatusUpdatedAt: fresh,
                 now: now,
                 micIsRunning: false
-            ) == .rejectMicStart,
-            "旧状态行解析不到 src 时按 broadcast 处理"
+            ) == .allowMicStart,
+            "HC-U08：解析不到 src 的状态行不是广播"
+        )
+        for unreadable in [nil, "无", ""] as [String?] {
+            check(
+                CaptureArbiter.decide(
+                    extensionStatus: unreadable,
+                    extensionStatusUpdatedAt: fresh,
+                    now: now,
+                    micIsRunning: true
+                ) == .allowMicStart,
+                "HC-U08：锁屏读不到状态（\(unreadable ?? "nil")）时不许停麦克风"
+            )
+        }
+
+        check(
+            CaptureArbiter.decide(
+                extensionStatus: "finished src=broadcast",
+                extensionStatusUpdatedAt: fresh,
+                now: now,
+                micIsRunning: false
+            ) == .allowMicStart,
+            "HC-U12：广播刚结束（finished）不应挡住麦克风"
         )
 
         let activePlan = MicAudioSessionPlan.forMic(active: true)

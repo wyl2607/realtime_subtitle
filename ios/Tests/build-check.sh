@@ -15,7 +15,7 @@ plutil -p "$APPEX/Info.plist" | grep -q AppIdentifierPrefix
 plutil -p build/Build/Products/Debug-iphonesimulator/RSiOS.app/Info.plist | grep -q AppIdentifierPrefix
 plutil -p build/Build/Products/Debug-iphonesimulator/RSiOS.app/Info.plist | grep -q NSMicrophoneUsageDescription
 # 主界面比一屏高，必须包在 ScrollView 里（否则顶部按钮和输入框点不到）
-grep -q 'ScrollView {' RSiOS/ContentView.swift
+grep -q 'ScrollView {' RSiOS/Pages/LivePage.swift
 # 扫配对码要能拉起 App：rsnode 链接必须注册在主 App 上
 plutil -p build/Build/Products/Debug-iphonesimulator/RSiOS.app/Info.plist | grep -q '"rsnode"'
 ! grep -rq "import Shared" RSiOS RSBroadcast Shared
