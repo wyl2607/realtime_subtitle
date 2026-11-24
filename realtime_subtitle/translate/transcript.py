@@ -42,6 +42,7 @@ import csv
 from datetime import datetime
 import io
 import os
+import re
 import time
 
 import realtime_subtitle.config as config
@@ -68,6 +69,10 @@ def estimate_duration(text: str) -> float:
     clean = text.strip() if text else ""
     est = len(clean) * 0.08
     return max(1.0, min(8.0, est))
+
+
+# 同一个会话文件持续 PermissionError 超过这么久就放弃它（Excel 开着的正常占用不会这么久还算「暂时」）。
+SESSION_BUSY_GIVEUP_S = 600.0
 
 
 def _atomic_write(path: str, text: str, encoding: str):
@@ -108,6 +113,9 @@ class TranscriptMixin:
     _session_index = 0
     # 用 None 而不是 {}：类属性是共享的，__new__ 造出来的壳必须各自拿一份
     _session_entries = None
+    # 同一文件连续 PermissionError 的起点（monotonic）与已放弃的文件；惰性创建（见 _write_session_file）
+    _session_busy_since = None
+    _session_gave_up = None
     _session_seq = 0
     _session_srt_file = None
     _session_csv_file = None
@@ -180,11 +188,13 @@ class TranscriptMixin:
             # ☠️ 只认会话导出的确切命名 %Y-%m-%d_%H%M%S。以前还接受纯日期
             # %Y-%m-%d，那和每日存档同名，很容易误删用户自己放进 sessions/
             # 的同名文件；认不出的命名一律不碰。
+            # 同一秒撞名时 _claim_session_id 会加 -2、-3 后缀，清理时按去掉后缀的时间戳算。
+            base = re.sub(r"(?<=\d{6})-\d+$", "", stem)
             try:
-                parsed = time.strptime(stem, "%Y-%m-%d_%H%M%S")
+                parsed = time.strptime(base, "%Y-%m-%d_%H%M%S")
             except ValueError:
                 continue
-            if time.strftime("%Y-%m-%d_%H%M%S", parsed) != stem:
+            if time.strftime("%Y-%m-%d_%H%M%S", parsed) != base:
                 continue  # strptime 也接受不补零的写法，回写一遍才算真匹配
             if current_session and stem == current_session:
                 continue
@@ -200,6 +210,34 @@ class TranscriptMixin:
         if removed:
             print(f"🧹 已清理 {removed} 个超过 {days} 天的字幕存档"
                   f"（保留期在 config.TRANSCRIPT_KEEP_DAYS，设 0 可关闭）")
+
+    def _claim_session_id(self, base, save_srt, save_csv):
+        """给本次会话挑一个没人用的文件名标识。
+
+        文件名只精确到秒：同一秒内起两个会话（或另一个进程）时，整份重写的
+        os.replace 会把先到的那份直接覆盖，数据就丢了。所以用独占创建（O_EXCL）
+        占位，撞名就加 -2、-3 后缀；占位的空文件随后被首次原子写入替换。
+        """
+        sessions_dir = os.path.join(self._transcript_dir, "sessions")
+        os.makedirs(sessions_dir, exist_ok=True)
+        exts = [e for e, on in ((".srt", save_srt), (".csv", save_csv)) if on]
+        n = 1
+        while True:
+            sid = base if n == 1 else f"{base}-{n}"
+            claimed = []
+            try:
+                for ext in exts:
+                    path = os.path.join(sessions_dir, sid + ext)
+                    os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
+                    claimed.append(path)
+                return sid
+            except FileExistsError:
+                for path in claimed:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+                n += 1
 
     def _close_session_export(self):
         """关闭会话导出文件句柄（现在每次整份重写、不再常驻句柄，留作兼容/兜底）。"""
@@ -220,12 +258,26 @@ class TranscriptMixin:
         会把漏掉的行一并补上。用户一边看字幕一边拿 Excel 开着 CSV 是这个功能的
         正常用法，不能因此把 SRT 也一起关掉（其它 OSError 仍按"失败一次就关"处理）。
         """
+        if self._session_busy_since is None:
+            self._session_busy_since = {}
+            self._session_gave_up = set()
+        if path in self._session_gave_up:
+            return
         try:
             _atomic_write(path, text, encoding)
         except PermissionError as e:
             if not getattr(self, "_session_busy_warned", False):
                 print(f"⚠️  会话导出文件被占用，暂时跳过，关掉占用它的程序后会自动补上: {e}")
                 self._session_busy_warned = True
+            # 单次/短时间被 Excel 占用是常态；但同一文件持续被拒超过窗口，多半是
+            # 只读属性、目录权限之类永久原因，不能永远静默跳过：放弃这一个文件并报一次。
+            first = self._session_busy_since.setdefault(path, time.monotonic())
+            if time.monotonic() - first >= SESSION_BUSY_GIVEUP_S:
+                self._session_gave_up.add(path)
+                print(f"⚠️  会话导出文件持续无法写入（超过 {int(SESSION_BUSY_GIVEUP_S)} 秒），"
+                      f"放弃这一份导出，其它文件不受影响: {path}: {e}")
+        else:
+            self._session_busy_since.pop(path, None)
 
     def _render_session_exports(self, save_srt, save_csv):
         """按句子自身的音频起点排序后整份重写 SRT/CSV。
@@ -349,9 +401,15 @@ class TranscriptMixin:
         if getattr(self, "_session_start_time", None) is None:
             self._session_start_time = now
         if getattr(self, "_session_id", None) is None:
-            self._session_id = time.strftime(
-                "%Y-%m-%d_%H%M%S", time.localtime(self._session_start_time)
-            )
+            try:
+                self._session_id = self._claim_session_id(
+                    time.strftime("%Y-%m-%d_%H%M%S", time.localtime(self._session_start_time)),
+                    save_srt, save_csv,
+                )
+            except OSError as e:
+                print(f"⚠️  会话导出写入失败，导出功能关闭: {e}")
+                self._session_export_ok = False
+                return
 
         try:
             audio_t0 = t0 if t0 is not None else getattr(source_text, "t0", None)

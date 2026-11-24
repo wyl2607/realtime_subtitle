@@ -503,3 +503,71 @@ def test_prune_ignores_plain_date_stem_in_sessions(tmp_path, monkeypatch):
     assert plain_srt.exists(), "纯日期 stem 不在会话命名规则里，不能删"
     assert plain_csv.exists(), "纯日期 stem 不在会话命名规则里，不能删"
     assert not exact_srt.exists(), "确切的会话命名仍应被正常清理"
+
+
+def test_same_second_sessions_do_not_overwrite_each_other(tmp_path):
+    """同一秒起两个会话：文件名撞了必须加后缀，后到的不能把先到的 SRT/CSV 整份替换掉。"""
+    a = _create_test_translator(tmp_path, session_start_time=1000.0)
+    b = _create_test_translator(tmp_path, session_start_time=1000.0)
+    a._save_transcript(TimedSentence("Satz A", t0=1.0, t1=2.0, key="a"), "句子A")
+    b._save_transcript(TimedSentence("Satz B", t0=1.0, t1=2.0, key="b"), "句子B")
+    assert a._session_id != b._session_id
+    assert b._session_id == a._session_id + "-2"
+    sessions = tmp_path / "sessions"
+    for ext in ("srt", "csv"):
+        assert "Satz A" in (sessions / f"{a._session_id}.{ext}").read_text(encoding="utf-8-sig")
+        assert "Satz B" in (sessions / f"{b._session_id}.{ext}").read_text(encoding="utf-8-sig")
+    # 第三个会话继续往后取号；后缀不能让保留期清理认不出
+    c = _create_test_translator(tmp_path, session_start_time=1000.0)
+    c._save_transcript(TimedSentence("Satz C", t0=1.0, t1=2.0, key="c"), "句子C")
+    assert c._session_id == a._session_id + "-3"
+
+
+def test_suffixed_session_files_are_still_pruned(tmp_path, monkeypatch):
+    """-2 后缀的会话文件要和普通会话文件一样被保留期清理，不能成为永远删不掉的垃圾。"""
+    monkeypatch.setattr(config, "TRANSCRIPT_KEEP_DAYS", 30, raising=False)
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    old = sessions / "2020-01-01_000000-2.srt"
+    old.write_text("x", encoding="utf-8")
+    t = _create_test_translator(tmp_path)
+    t._prune_old_transcripts()
+    assert not old.exists()
+
+
+def test_persistent_permission_error_gives_up_once_but_short_lock_does_not(tmp_path, monkeypatch, capsys):
+    """持续 PermissionError 超过窗口：只放弃这一个文件并报一次；短暂占用（窗口内）照旧只跳过。"""
+    from realtime_subtitle.translate import transcript as transcript_module
+
+    t = _create_test_translator(tmp_path, session_start_time=1000.0, session_id="stuck")
+    real_replace = transcript_module.os.replace
+    clock = [0.0]
+    monkeypatch.setattr(transcript_module.time, "monotonic", lambda: clock[0])
+
+    def locked_csv(src, dst):
+        if dst.endswith(".csv"):
+            raise PermissionError(13, "Permission denied", dst)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(transcript_module.os, "replace", locked_csv)
+    t._save_transcript(TimedSentence("Satz 1", t0=1.0, t1=2.0, key="k1"), "句子1")
+    clock[0] = transcript_module.SESSION_BUSY_GIVEUP_S - 1
+    t._save_transcript(TimedSentence("Satz 2", t0=3.0, t1=4.0, key="k2"), "句子2")
+    assert "放弃这一份导出" not in capsys.readouterr().out  # 窗口内：只是跳过
+    clock[0] = transcript_module.SESSION_BUSY_GIVEUP_S + 1
+    t._save_transcript(TimedSentence("Satz 3", t0=5.0, t1=6.0, key="k3"), "句子3")
+    t._save_transcript(TimedSentence("Satz 4", t0=7.0, t1=8.0, key="k4"), "句子4")
+    out = capsys.readouterr().out
+    assert out.count("放弃这一份导出") == 1
+    assert t._session_export_ok is True
+    # SRT 不受影响，仍在写
+    assert "Satz 4" in (tmp_path / "sessions" / "stuck.srt").read_text(encoding="utf-8")
+
+    # 解锁后一次成功会清掉计时（对没放弃的文件）
+    t2 = _create_test_translator(tmp_path, session_start_time=2000.0, session_id="brief")
+    clock[0] = 0.0
+    t2._save_transcript(TimedSentence("Satz 1", t0=1.0, t1=2.0, key="k1"), "句子1")
+    monkeypatch.setattr(transcript_module.os, "replace", real_replace)
+    clock[0] = 100.0
+    t2._save_transcript(TimedSentence("Satz 2", t0=3.0, t1=4.0, key="k2"), "句子2")
+    assert t2._session_busy_since == {}
