@@ -215,6 +215,10 @@ class CaptionDiffer:
         self._candidate = ""
         self._candidate_since = None
         self._pending_since = None
+        # 保持 _skip_first 与 prime() 同逻辑：若当前文本非空且不以句末标点结尾，
+        # 标记为要跳过首句（后续补完的残片属于旧内容）。若已为 True 则保留。
+        if self._text and not re.search(_SENTENCE_END.pattern + "$", self._text):
+            self._skip_first = True
 
 def _windows_supported():
     if sys.platform != "win32":

@@ -680,6 +680,22 @@ def test_pause_during_half_sentence_does_not_finalize_on_resume():
     assert differ.update("Heute ist ein schöner Tag. Wir gehen raus.", now=6).finalized == ["Wir gehen raus."]
 
 
+def test_pause_first_empty_frame_then_resume_completes_half_sentence():
+    """暂停首帧为空且已有文本停在半句上：恢复后补完的尾巴不上屏，新句照常交付。"""
+    differ = lc.CaptionDiffer(stable_seconds=1, max_seconds=2)
+    assert differ.update("Guten Morgen.", now=0).finalized == []
+    assert differ.update("Guten Morgen.", now=1).finalized == ["Guten Morgen."]
+    assert differ.update("Guten Morgen. Heute ist ein schöner", now=2).finalized == []
+    # 暂停首帧为空，走 consume_all 的空文本分支
+    differ.consume_all("")
+    # 恢复后系统补出尾巴
+    assert differ.update("Guten Morgen. Heute ist ein schöner Tag.", now=3).finalized == []
+    assert differ.update("Guten Morgen. Heute ist ein schöner Tag.", now=4.5).finalized == []
+    # 新句子照常交付
+    assert differ.update("Guten Morgen. Heute ist ein schöner Tag. Wir gehen.", now=5).finalized == []
+    assert differ.update("Guten Morgen. Heute ist ein schöner Tag. Wir gehen.", now=6).finalized == ["Wir gehen."]
+
+
 def test_pause_full_screen_change_does_not_replay_on_resume():
     """暂停期间整屏内容变化，恢复后不重放旧内容。"""
     differ = lc.CaptionDiffer(stable_seconds=1)
