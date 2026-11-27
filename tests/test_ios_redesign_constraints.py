@@ -379,3 +379,21 @@ def test_hc_u17_retry_followups_generation_and_single_waiter():
     assert "let waiter = Task { race.settle" not in local and "PreparedBroadcast" in local, (
         "违反：preparedSession 又为每一句新开 await ready.value 的 Task，prepareTranslation 卡住时会无界挂起。"
     )
+
+
+def test_hc_b01_chunked_parser_checks_bounds_crlf_and_terminator():
+    """硬约束 HC-B01：chunked 解码必须防整数溢出并验证每个 CRLF 与终止 trailer。
+
+    来源 bug：超大十六进制 chunk size 在 `size + 2` 处溢出触发 Swift trap；旧实现还会
+    无条件跳过 chunk 后两个字节，并把 `0\r\n` 直接判为完成，导致畸形蜂窝响应被接受或崩溃。
+    """
+    parser = (IOS / "Shared" / "CellularHTTP.swift").read_text(encoding="utf-8")
+    assert "remaining - size >= 2" in parser and "size + 2" not in parser, (
+        "HC-B01 违反：chunk 长度仍用 size + 2，超大十六进制值会整数溢出崩溃（来源：蜂窝 HTTP chunked bug）。"
+    )
+    assert "data[chunkEnd..<chunkCRLFEnd] == crlf" in parser, (
+        "HC-B01 违反：没有校验 chunk 数据后的 CRLF，畸形响应可被接受（来源：蜂窝 HTTP chunked bug）。"
+    )
+    assert 'range(of: Data("\\r\\n\\r\\n".utf8))' in parser, (
+        "HC-B01 违反：终止块没有验证 trailer 的最终 CRLF，截断响应可被判完成（来源：蜂窝 HTTP chunked bug）。"
+    )

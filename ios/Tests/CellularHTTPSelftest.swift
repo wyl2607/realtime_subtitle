@@ -43,13 +43,29 @@ func runCellularHTTPSelftest(_ check: @escaping (Bool, String) -> Void) {
     }
 
     do {
-        let raw = Data("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6;ext=1\r\n world\r\n0\r\n\r\n".utf8)
+        let raw = Data("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6;ext=1\r\n world\r\n0\r\nX-Trailer: yes\r\n\r\n".utf8)
         if case .complete(let reply) = HTTPResponseParser.parse(raw, atEOF: false) {
             check(reply.body == Data("hello world".utf8), "chunked 拼接，忽略分块扩展")
         } else {
             check(false, "chunked 响应应解析完成")
         }
         check(HTTPResponseParser.parse(raw.prefix(30), atEOF: false) == .incomplete, "chunked 没收完时等")
+
+        let oversized = Data("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n7FFFFFFFFFFFFFFF\r\n".utf8)
+        check(HTTPResponseParser.parse(oversized, atEOF: false) == .incomplete,
+              "超大 chunk size 应安全返回 incomplete，不得整数溢出崩溃")
+        check(HTTPResponseParser.parse(oversized, atEOF: true) == .invalid,
+              "超大 chunk size EOF 时应判 invalid")
+
+        let missingChunkCRLF = Data("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXX0\r\n\r\n".utf8)
+        check(HTTPResponseParser.parse(missingChunkCRLF, atEOF: true) == .invalid,
+              "chunk 数据后的 CRLF 缺失应判 invalid")
+
+        let truncatedTerminator = Data("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n".utf8)
+        check(HTTPResponseParser.parse(truncatedTerminator, atEOF: false) == .incomplete,
+              "终止块 trailer 未收完时应等待")
+        check(HTTPResponseParser.parse(truncatedTerminator, atEOF: true) == .invalid,
+              "截断终止块 EOF 时应判 invalid")
     }
 
     do {
