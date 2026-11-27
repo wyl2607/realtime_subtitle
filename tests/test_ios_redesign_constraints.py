@@ -58,6 +58,22 @@ def test_hc_u02_swift_6_language_mode():
     )
 
 
+def test_hc_b08_pairing_links_validate_language_codes():
+    """硬约束 HC-B08：配对链接解析阶段必须拒绝无效 src/dst 语言码。
+
+    违反的是什么：把语言码直接塞进 NodeConfig，恢复旧实现的「连接时才失败」行为。
+    来源 bug：ios/Shared/PairingLink.swift 原实现只接受 src/dst，不复用 NodeHello 的严格校验，
+    让 DE、zh_CN、空值和超长值先被保存，连接时才以 1008 失败。
+    必须怎么改：在返回 NodeConfig 前复用 NodeHello.isValidLanguageCode 对 src 和 dst 都校验；
+    合法 de/zh 仍须通过。此断言会在改回旧实现时变红。
+    """
+    pairing = (IOS / "Shared" / "PairingLink.swift").read_text(encoding="utf-8")
+    assert "NodeHello.isValidLanguageCode(src)" in pairing and "NodeHello.isValidLanguageCode(dst)" in pairing, (
+        "HC-B08 违反（来源 bug：配对链接解析提前校验缺失）：PairingLink.parse 必须在保存 src/dst 前"
+        "复用 NodeHello.isValidLanguageCode；否则 DE、zh_CN、空值、超长值会拖到连接时才 1008 失败。"
+    )
+
+
 def test_hc_u03_observation_not_combine():
     """硬约束 HC-U03：界面状态一律用 Observation（@Observable），不许回到 ObservableObject。
 

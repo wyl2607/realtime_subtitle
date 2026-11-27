@@ -32,6 +32,16 @@ func runPairingSelftest(_ check: (Bool, String) -> Void) {
         check(false, "带语言参数的合法链接应解析成功")
     }
 
+    for (label, src, dst) in [
+        ("src 大写 DE", "DE", "zh"),
+        ("dst 含下划线 zh_CN", "de", "zh_CN"),
+        ("src 为空", "", "zh"),
+        ("dst 过长", "de", "zhhhh")
+    ] {
+        let invalid = "rsnode://pair?v=1&id=node123&host=mini2.tailnet.ts.net&port=8791&tok=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&name=Mini2&src=\(src)&dst=\(dst)"
+        check(PairingLink.parse(invalid) == nil, "HC-B08：\(label) 的配对链接解析应失败")
+    }
+
     check(PairingLink.parse("rsnode://pair?v=2&id=node123&host=mini2.tailnet.ts.net&port=8791&tok=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&name=Mini2") == nil, "v≠1 应失败")
     check(PairingLink.parse("rsnode://pair?v=1&id=node123&host=mini2.tailnet.ts.net&port=8791&name=Mini2") == nil, "缺 tok 应失败")
     check(PairingLink.parse("rsnode://pair?v=1&id=node123&host=mini2.tailnet.ts.net&port=8791&tok=abc&name=Mini2") == nil, "tok 非 64 位 hex 应失败")

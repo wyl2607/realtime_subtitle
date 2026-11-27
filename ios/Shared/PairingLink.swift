@@ -86,6 +86,11 @@ enum PairingLink {
         let src = queryItems.first(where: { $0.name == "src" })?.value ?? "de"
         let dst = queryItems.first(where: { $0.name == "dst" })?.value ?? "zh"
 
+        guard NodeHello.isValidLanguageCode(src),
+              NodeHello.isValidLanguageCode(dst) else {
+            return nil
+        }
+
         return NodeConfig(id: id, host: host, port: port, token: token, name: name, src: src, dst: dst)
     }
 
