@@ -90,6 +90,9 @@ targets:
     sources:
       - path: RSLiveActivity
       - path: Shared/SubtitleActivityAttributes.swift
+      - path: Shared/CaptureArbiter.swift
+      - path: Shared/MicCaptionIntentPolicy.swift
+      - path: RSiOS/Intents/StartMicCaptionsIntent.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.yilinwang.realtimesubtitle.liveactivity

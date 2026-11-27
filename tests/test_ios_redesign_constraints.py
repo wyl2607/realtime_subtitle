@@ -379,3 +379,115 @@ def test_hc_u17_retry_followups_generation_and_single_waiter():
     assert "let waiter = Task { race.settle" not in local and "PreparedBroadcast" in local, (
         "违反：preparedSession 又为每一句新开 await ready.value 的 Task，prepareTranslation 卡住时会无界挂起。"
     )
+
+
+def _project_target_sources(project: str, target_name: str) -> list[str]:
+    m = re.search(rf"^  {re.escape(target_name)}:\n(.*?)(?=^  \w+:|\Z)", project, re.M | re.S)
+    assert m, f"HC-U20 违反：ios/project.yml 缺少 target {target_name}。"
+    src = re.search(r"^    sources:\n(.*?)(?=^    \w+:|\Z)", m.group(1), re.M | re.S)
+    assert src, f"HC-U20 违反：ios/project.yml 中 {target_name} 缺少 sources。"
+    return re.findall(r"^\s*-\s*path:\s*(\S+)", src.group(1), re.M)
+
+
+def _covers_path(sources: list[str], rel_path: str) -> bool:
+    rel = Path(rel_path)
+    return any(rel == Path(s) or Path(s) in rel.parents for s in sources)
+
+
+def _strip_swift_comments(text: str) -> str:
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    return re.sub(r"//[^\n]*", "", text)
+
+
+def test_hc_u20_app_intents_and_control_widget():
+    """硬约束 HC-U20：App Intents 快捷指令 + 控制中心按钮（不程序化启动广播）。
+
+    1. 必须存在 AppShortcutsProvider，且包含开始麦克风与停止麦克风两条快捷指令。
+    2. 不得出现「开始广播」类 AppIntent（ReplayKit 只能由系统 Broadcast Picker 启动）。
+    3. StartMicCaptionsIntent 必须声明前台运行（iOS 26 supportedModes = .foreground）。
+    4. RSLiveActivity 必须有 ControlWidget 且在 WidgetBundle 中注册，所用 intent 文件必须同时
+       出现在 RSiOS 与 RSLiveActivity 的 ios/project.yml sources 中。
+    """
+    all_swift = list(_swift_files())
+
+    # 1) AppShortcutsProvider + 开始/停止两条
+    shortcut_files = [
+        p for p in all_swift
+        if re.search(r":\s*AppShortcutsProvider\b", _strip_swift_comments(p.read_text(encoding="utf-8")))
+    ]
+    assert shortcut_files, "HC-U20 违反：缺少遵守 AppShortcutsProvider 的快捷指令提供者。"
+    shortcut_text = "\n".join(_strip_swift_comments(p.read_text(encoding="utf-8")) for p in shortcut_files)
+    assert "StartMicCaptionsIntent(" in shortcut_text and "StopCaptionsIntent(" in shortcut_text, (
+        "HC-U20 违反：AppShortcutsProvider 必须同时包含 StartMicCaptionsIntent 与 StopCaptionsIntent。"
+    )
+    assert shortcut_text.count("AppShortcut(") >= 2, (
+        "HC-U20 违反：AppShortcutsProvider 至少要有开始/停止两条 AppShortcut。"
+    )
+
+    # 2) 不得出现「开始广播」类 intent
+    broadcast_offenders = []
+    for path in all_swift:
+        text = path.read_text(encoding="utf-8")
+        for m in re.finditer(r"\b(?:struct|class)\s+(\w*Broadcast\w*)\s*:\s*[^\{]*AppIntent\b", text, re.I):
+            broadcast_offenders.append(f"{_locate(path, text, m.start())} ({m.group(1)})")
+        if re.search(r":\s*[^\{]*\bAppIntent\b", text):
+            for kw in ("RPBroadcast", "ReplayKit", "开始广播", "开始屏幕广播"):
+                if kw in text:
+                    broadcast_offenders.append(f"{path.relative_to(ROOT)} (含 {kw})")
+    assert not broadcast_offenders, (
+        "HC-U20 违反：检测到广播类 AppIntent（ReplayKit 不能被程序化启动）：" + ", ".join(broadcast_offenders)
+    )
+
+    # 3) StartMicCaptionsIntent 必须声明前台运行
+    start_intent_files = [
+        p for p in all_swift
+        if re.search(r"\bstruct\s+StartMicCaptionsIntent\s*:\s*[^\{]*\bAppIntent\b", p.read_text(encoding="utf-8"))
+    ]
+    assert len(start_intent_files) == 1, (
+        f"HC-U20 违反：StartMicCaptionsIntent 必须存在且唯一，当前找到 {len(start_intent_files)} 处。"
+    )
+    start_intent_file = start_intent_files[0]
+    start_intent_code = _strip_swift_comments(start_intent_file.read_text(encoding="utf-8"))
+    assert re.search(r"supportedModes\s*(?::\s*IntentModes)?\s*(?:=\s*|\{\s*(?:return\s+)?)\.foreground\b", start_intent_code), (
+        "HC-U20 违反：StartMicCaptionsIntent 必须声明前台运行（supportedModes = .foreground）。"
+    )
+    assert not re.search(r"\bstatic\s+(?:let|var)\s+openAppWhenRun\b", start_intent_code), (
+        "HC-U20 违反：部署目标已为 iOS 26，StartMicCaptionsIntent 应使用 supportedModes 而非已弃用的 openAppWhenRun。"
+    )
+
+    # 4) ControlWidget 存在且注册在 WidgetBundle，且所用 intent 文件同时在 RSiOS 与 RSLiveActivity sources 中
+    widget_files = list(sorted((IOS / "RSLiveActivity").rglob("*.swift")))
+    control_widgets = []
+    widget_bundle_text = ""
+    for path in widget_files:
+        text = _strip_swift_comments(path.read_text(encoding="utf-8"))
+        for m in re.finditer(r"\bstruct\s+(\w+)\s*:\s*ControlWidget\b", text):
+            control_widgets.append((path, text, m.group(1)))
+        if re.search(r":\s*WidgetBundle\b", text):
+            widget_bundle_text += text
+    assert control_widgets, "HC-U20 违反：ios/RSLiveActivity 缺少 ControlWidget 实现。"
+    cw_path, cw_text, cw_name = control_widgets[0]
+    assert f"{cw_name}()" in widget_bundle_text, (
+        f"HC-U20 违反：ControlWidget `{cw_name}` 没有在 RSLiveActivity 的 WidgetBundle 中注册。"
+    )
+    btn_match = re.search(r"ControlWidgetButton\s*\(\s*action:\s*(\w+)\s*\(", cw_text)
+    assert btn_match, f"HC-U20 违反：{cw_path.relative_to(ROOT)} 中没有使用 ControlWidgetButton(action: ...)。"
+    used_intent_name = btn_match.group(1)
+    used_intent_files = [
+        p for p in all_swift
+        if re.search(rf"\bstruct\s+{re.escape(used_intent_name)}\s*:\s*[^\{{\n]*\bAppIntent\b", p.read_text(encoding="utf-8"))
+    ]
+    assert len(used_intent_files) == 1, (
+        f"HC-U20 违反：ControlWidgetButton 使用的 {used_intent_name} 定义不明确。"
+    )
+    used_intent_rel = str(used_intent_files[0].relative_to(IOS))
+
+    project = (IOS / "project.yml").read_text(encoding="utf-8")
+    app_sources = _project_target_sources(project, "RSiOS")
+    ext_sources = _project_target_sources(project, "RSLiveActivity")
+    assert _covers_path(app_sources, used_intent_rel), (
+        f"HC-U20 违反：ios/project.yml 中 RSiOS 的 sources 未包含 {used_intent_rel}。"
+    )
+    assert _covers_path(ext_sources, used_intent_rel), (
+        f"HC-U20 违反：ios/project.yml 中 RSLiveActivity 的 sources 未包含 {used_intent_rel}。"
+    )
