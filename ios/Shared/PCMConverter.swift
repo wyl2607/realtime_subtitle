@@ -65,7 +65,9 @@ final class PCMConverter {
         input.frameLength = AVAudioFrameCount(frames)
         samples.withUnsafeBytes { raw in
             guard let base = raw.baseAddress, let dst = input.int16ChannelData?[0] else { return }
-            memcpy(dst, base, samples.count * MemoryLayout<Int16>.size)
+            // A trailing partial frame is deliberately discarded.  The buffer only owns
+            // `frames * channels` samples, so copying the full input would write past it.
+            memcpy(dst, base, frames * channels * MemoryLayout<Int16>.size)
         }
         let converter = PCMConverter()
         return converter.convertToWire(input, format: format)
@@ -264,11 +266,14 @@ final class PCMConverter {
         }
         buffer.frameLength = AVAudioFrameCount(frames)
 
-        guard let raw = sampleBufferData(sampleBuffer) else {
+        let bytesPerSample = isFloat ? 4 : 2
+        guard let raw = sampleBufferData(sampleBuffer),
+              raw.count >= frames * channels * bytesPerSample else {
+            // A truncated CMSampleBuffer is discarded rather than allowing the byte
+            // readers below to walk past the block buffer. Extra bytes are ignored.
             return nil
         }
 
-        let bytesPerSample = isFloat ? 4 : 2
         raw.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
             guard let base = src.baseAddress else { return }
             let byteBase = base.assumingMemoryBound(to: UInt8.self)
