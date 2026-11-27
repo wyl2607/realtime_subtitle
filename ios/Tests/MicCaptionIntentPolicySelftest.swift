@@ -87,6 +87,35 @@ struct MicCaptionIntentPolicySelftest {
             "麦克风未运行时重复停止应忽略"
         )
 
+        check(
+            MicCaptionIntentPolicy.isStartMicURL(URL(string: "rsnode://start-mic")!),
+            "合法 start-mic 链接应识别"
+        )
+        check(
+            MicCaptionIntentPolicy.isStartMicURL(URL(string: "RSNODE://Start-Mic/")!),
+            "大小写与尾斜杠的合法 start-mic 链接应识别"
+        )
+        check(
+            MicCaptionIntentPolicy.isStartMicURL(URL(string: "rsnode://start-mic?source=control&v=1")!),
+            "带多余参数的 start-mic 链接应识别"
+        )
+        check(
+            !MicCaptionIntentPolicy.isStartMicURL(URL(string: "https://start-mic")!),
+            "错误 scheme 不应识别为 start-mic"
+        )
+        check(
+            !MicCaptionIntentPolicy.isStartMicURL(URL(string: "rsnode://pair")!),
+            "其他 host（rsnode://pair）不应识别为 start-mic"
+        )
+        check(
+            !MicCaptionIntentPolicy.isStartMicURL(URL(string: "rsnode://start-mic/extra")!),
+            "带多余路径的 rsnode://start-mic/extra 不应识别为 start-mic"
+        )
+        check(
+            !MicCaptionIntentPolicy.isStartMicURL(URL(string: "rsnode:///start-mic")!),
+            "空 host 的 rsnode:///start-mic 不应识别为 start-mic"
+        )
+
         if failures.isEmpty {
             print("MIC CAPTION INTENT POLICY SELFTEST OK")
         } else {

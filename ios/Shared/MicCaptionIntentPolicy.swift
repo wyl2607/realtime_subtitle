@@ -18,8 +18,21 @@ enum MicCaptionStopDecision: Equatable, Sendable {
     case ignoreAlreadyStopped
 }
 
-/// App Intents 与控制中心按钮共用的状态判定纯函数（不依赖 AppModel / UIKit / Audio）。
+/// App Intents 与控制中心按钮共用的纯判定逻辑（不依赖 AppModel / UIKit / Audio）。
 enum MicCaptionIntentPolicy {
+    static let startMicScheme = "rsnode"
+    static let startMicHost = "start-mic"
+
+    /// 识别控制中心等入口打开主 App 的开始麦克风链接（`rsnode://start-mic`）。
+    /// 忽略大小写、尾斜杠与附加 query 参数；拒绝其他 scheme、host 或子路径。
+    static func isStartMicURL(_ url: URL) -> Bool {
+        guard url.scheme?.lowercased() == startMicScheme,
+              url.host?.lowercased() == startMicHost else {
+            return false
+        }
+        return url.path.isEmpty || url.path == "/"
+    }
+
     static func decideStart(
         micIsRunning: Bool,
         extensionStatus: String?,
@@ -46,8 +59,8 @@ enum MicCaptionIntentPolicy {
     }
 }
 
-/// 跨 target（RSiOS + RSLiveActivity）共享的依赖注入桥接：
-/// StartMicCaptionsIntent 只依赖这个 Sendable 类型，不直接引用主 App 才有的 AppModel。
+/// 主 App 内 StartMicCaptionsIntent 的 Sendable 依赖注入桥接，
+/// 避免 Intent 结构体直接持有非 Sendable 的主 App 状态对象。
 struct MicCaptionIntentController: Sendable {
     let decideStart: @MainActor @Sendable (Date) -> MicCaptionStartDecision
     let startMic: @MainActor @Sendable () -> Void

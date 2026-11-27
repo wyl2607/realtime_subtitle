@@ -399,14 +399,26 @@ def _strip_swift_comments(text: str) -> str:
     return re.sub(r"//[^\n]*", "", text)
 
 
+def _target_swift_files(sources: list[str]) -> list[Path]:
+    files: list[Path] = []
+    for src in sources:
+        p = IOS / src
+        if p.is_dir():
+            files.extend(sorted(p.rglob("*.swift")))
+        elif p.is_file() and p.suffix == ".swift":
+            files.append(p)
+    return files
+
+
 def test_hc_u20_app_intents_and_control_widget():
     """硬约束 HC-U20：App Intents 快捷指令 + 控制中心按钮（不程序化启动广播）。
 
     1. 必须存在 AppShortcutsProvider，且包含开始麦克风与停止麦克风两条快捷指令。
     2. 不得出现「开始广播」类 AppIntent（ReplayKit 只能由系统 Broadcast Picker 启动）。
-    3. StartMicCaptionsIntent 必须声明前台运行（iOS 26 supportedModes = .foreground）。
-    4. RSLiveActivity 必须有 ControlWidget 且在 WidgetBundle 中注册，所用 intent 文件必须同时
-       出现在 RSiOS 与 RSLiveActivity 的 ios/project.yml sources 中。
+    3. StartMicCaptionsIntent 必须声明前台运行（iOS 26 supportedModes = .foreground），留在主 App。
+    4. RSLiveActivity 必须有 ControlWidget 且在 WidgetBundle 中注册，ControlWidgetButton 必须使用
+       OpenURLIntent / OpenIntent；RSLiveActivity 的 sources 与 ios/RSLiveActivity/ 源码中
+       不得出现 AppModel、AppDependencyManager、@Dependency。
     """
     all_swift = list(_swift_files())
 
@@ -438,7 +450,7 @@ def test_hc_u20_app_intents_and_control_widget():
         "HC-U20 违反：检测到广播类 AppIntent（ReplayKit 不能被程序化启动）：" + ", ".join(broadcast_offenders)
     )
 
-    # 3) StartMicCaptionsIntent 必须声明前台运行
+    # 3) StartMicCaptionsIntent 必须声明前台运行且编入 RSiOS
     start_intent_files = [
         p for p in all_swift
         if re.search(r"\bstruct\s+StartMicCaptionsIntent\s*:\s*[^\{]*\bAppIntent\b", p.read_text(encoding="utf-8"))
@@ -455,7 +467,16 @@ def test_hc_u20_app_intents_and_control_widget():
         "HC-U20 违反：部署目标已为 iOS 26，StartMicCaptionsIntent 应使用 supportedModes 而非已弃用的 openAppWhenRun。"
     )
 
-    # 4) ControlWidget 存在且注册在 WidgetBundle，且所用 intent 文件同时在 RSiOS 与 RSLiveActivity sources 中
+    project = (IOS / "project.yml").read_text(encoding="utf-8")
+    app_sources = _project_target_sources(project, "RSiOS")
+    ext_sources = _project_target_sources(project, "RSLiveActivity")
+    start_intent_rel = str(start_intent_file.relative_to(IOS))
+    assert _covers_path(app_sources, start_intent_rel), (
+        f"HC-U20 违反：ios/project.yml 中 RSiOS 的 sources 未包含 {start_intent_rel}。"
+    )
+
+    # 4) ControlWidget 存在且注册在 WidgetBundle，必须使用 OpenURLIntent / OpenIntent；
+    #    RSLiveActivity 扩展 sources 与源码中不得出现 AppModel / AppDependencyManager / @Dependency。
     widget_files = list(sorted((IOS / "RSLiveActivity").rglob("*.swift")))
     control_widgets = []
     widget_bundle_text = ""
@@ -470,24 +491,47 @@ def test_hc_u20_app_intents_and_control_widget():
     assert f"{cw_name}()" in widget_bundle_text, (
         f"HC-U20 违反：ControlWidget `{cw_name}` 没有在 RSLiveActivity 的 WidgetBundle 中注册。"
     )
-    btn_match = re.search(r"ControlWidgetButton\s*\(\s*action:\s*(\w+)\s*\(", cw_text)
+    btn_match = re.search(r"ControlWidgetButton\s*\(\s*action:\s*([A-Za-z_]\w*)\s*\(", cw_text)
     assert btn_match, f"HC-U20 违反：{cw_path.relative_to(ROOT)} 中没有使用 ControlWidgetButton(action: ...)。"
-    used_intent_name = btn_match.group(1)
-    used_intent_files = [
-        p for p in all_swift
-        if re.search(rf"\bstruct\s+{re.escape(used_intent_name)}\s*:\s*[^\{{\n]*\bAppIntent\b", p.read_text(encoding="utf-8"))
-    ]
-    assert len(used_intent_files) == 1, (
-        f"HC-U20 违反：ControlWidgetButton 使用的 {used_intent_name} 定义不明确。"
+    used_action_name = btn_match.group(1)
+    is_open_url = used_action_name == "OpenURLIntent"
+    is_open_intent = any(
+        re.search(
+            rf"\bstruct\s+{re.escape(used_action_name)}\s*:\s*[^\{{\n]*\bOpenIntent\b",
+            _strip_swift_comments(p.read_text(encoding="utf-8")),
+        )
+        for p in widget_files
     )
-    used_intent_rel = str(used_intent_files[0].relative_to(IOS))
+    assert is_open_url or is_open_intent, (
+        f"HC-U20 违反：{cw_path.relative_to(ROOT)} 的 ControlWidgetButton 必须使用 OpenURLIntent 或 OpenIntent，"
+        f"当前使用了 `{used_action_name}`。"
+    )
 
-    project = (IOS / "project.yml").read_text(encoding="utf-8")
-    app_sources = _project_target_sources(project, "RSiOS")
-    ext_sources = _project_target_sources(project, "RSLiveActivity")
-    assert _covers_path(app_sources, used_intent_rel), (
-        f"HC-U20 违反：ios/project.yml 中 RSiOS 的 sources 未包含 {used_intent_rel}。"
+    forbidden_ext_paths = [
+        "RSiOS/Intents/StartMicCaptionsIntent.swift",
+        "Shared/MicCaptionIntentPolicy.swift",
+        "Shared/CaptureArbiter.swift",
+    ]
+    unexpected_ext_paths = [p for p in forbidden_ext_paths if _covers_path(ext_sources, p)]
+    assert not unexpected_ext_paths, (
+        "HC-U20 违反：RSLiveActivity 的 sources 不应再包含：" + ", ".join(unexpected_ext_paths)
     )
-    assert _covers_path(ext_sources, used_intent_rel), (
-        f"HC-U20 违反：ios/project.yml 中 RSLiveActivity 的 sources 未包含 {used_intent_rel}。"
+
+    ext_source_hits = [
+        s for s in ext_sources
+        if re.search(r"\bAppModel\b|\bAppDependencyManager\b|@Dependency\b", s)
+    ]
+    assert not ext_source_hits, (
+        "HC-U20 违反：RSLiveActivity 的 sources 路径出现禁止符号：" + ", ".join(ext_source_hits)
+    )
+
+    ext_code_offenders = []
+    seen_ext_files = set(widget_files) | set(_target_swift_files(ext_sources))
+    for path in sorted(seen_ext_files):
+        text = path.read_text(encoding="utf-8")
+        for m in re.finditer(r"\bAppModel\b|\bAppDependencyManager\b|@Dependency\b", text):
+            ext_code_offenders.append(f"{_locate(path, text, m.start())} ({m.group(0)})")
+    assert not ext_code_offenders, (
+        "HC-U20 违反：RSLiveActivity 源码中不得出现 AppModel / AppDependencyManager / @Dependency："
+        + ", ".join(ext_code_offenders)
     )
