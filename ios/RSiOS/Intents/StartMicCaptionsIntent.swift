@@ -17,7 +17,7 @@ struct StartMicCaptionsIntent: AppIntent {
         switch decision {
         case .start:
             await controller.startMic()
-            return .result(dialog: IntentDialog("已开始麦克风字幕"))
+            return .result(dialog: IntentDialog("正在启动麦克风字幕"))
         case .ignoreAlreadyRunning:
             return .result(dialog: IntentDialog("麦克风字幕已在运行"))
         case .blockedByBroadcast:

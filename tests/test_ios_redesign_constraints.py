@@ -416,9 +416,10 @@ def test_hc_u20_app_intents_and_control_widget():
     1. 必须存在 AppShortcutsProvider，且包含开始麦克风与停止麦克风两条快捷指令。
     2. 不得出现「开始广播」类 AppIntent（ReplayKit 只能由系统 Broadcast Picker 启动）。
     3. StartMicCaptionsIntent 必须声明前台运行（iOS 26 supportedModes = .foreground），留在主 App。
-    4. RSLiveActivity 必须有 ControlWidget 且在 WidgetBundle 中注册，ControlWidgetButton 必须使用
-       OpenURLIntent / OpenIntent；RSLiveActivity 的 sources 与 ios/RSLiveActivity/ 源码中
-       不得出现 AppModel、AppDependencyManager、@Dependency。
+    4. RSLiveActivity 的每个 ControlWidget 都必须在 WidgetBundle 中注册，且其
+       ControlWidgetButton 必须使用 OpenURLIntent / OpenIntent；start-mic URL 的 scheme
+       必须注册在主 App 的 Info.plist，并由 RootView/AppModel+Intents.swift 路由；
+       RSLiveActivity 的 sources 与源码中不得出现 AppModel、AppDependencyManager、@Dependency。
     """
     all_swift = list(_swift_files())
 
@@ -475,36 +476,70 @@ def test_hc_u20_app_intents_and_control_widget():
         f"HC-U20 违反：ios/project.yml 中 RSiOS 的 sources 未包含 {start_intent_rel}。"
     )
 
-    # 4) ControlWidget 存在且注册在 WidgetBundle，必须使用 OpenURLIntent / OpenIntent；
-    #    RSLiveActivity 扩展 sources 与源码中不得出现 AppModel / AppDependencyManager / @Dependency。
+    # 4) 每个 ControlWidget 都必须注册在 WidgetBundle，且使用 OpenURLIntent / OpenIntent；
+    #    start-mic URL 必须闭环到主 App 的 URL scheme 和路由；扩展不得依赖主 App。
     widget_files = list(sorted((IOS / "RSLiveActivity").rglob("*.swift")))
     control_widgets = []
     widget_bundle_text = ""
     for path in widget_files:
         text = _strip_swift_comments(path.read_text(encoding="utf-8"))
         for m in re.finditer(r"\bstruct\s+(\w+)\s*:\s*ControlWidget\b", text):
-            control_widgets.append((path, text, m.group(1)))
+            body = text[m.start():]
+            next_struct = re.search(r"\n\s*struct\s+\w+\s*:", body[1:])
+            if next_struct:
+                body = body[:next_struct.start() + 1]
+            control_widgets.append((path, body, m.group(1)))
         if re.search(r":\s*WidgetBundle\b", text):
             widget_bundle_text += text
     assert control_widgets, "HC-U20 违反：ios/RSLiveActivity 缺少 ControlWidget 实现。"
-    cw_path, cw_text, cw_name = control_widgets[0]
-    assert f"{cw_name}()" in widget_bundle_text, (
-        f"HC-U20 违反：ControlWidget `{cw_name}` 没有在 RSLiveActivity 的 WidgetBundle 中注册。"
-    )
-    btn_match = re.search(r"ControlWidgetButton\s*\(\s*action:\s*([A-Za-z_]\w*)\s*\(", cw_text)
-    assert btn_match, f"HC-U20 违反：{cw_path.relative_to(ROOT)} 中没有使用 ControlWidgetButton(action: ...)。"
-    used_action_name = btn_match.group(1)
-    is_open_url = used_action_name == "OpenURLIntent"
-    is_open_intent = any(
-        re.search(
-            rf"\bstruct\s+{re.escape(used_action_name)}\s*:\s*[^\{{\n]*\bOpenIntent\b",
-            _strip_swift_comments(p.read_text(encoding="utf-8")),
+    start_mic_urls = []
+    for cw_path, cw_text, cw_name in control_widgets:
+        assert f"{cw_name}()" in widget_bundle_text, (
+            f"HC-U20 违反：ControlWidget `{cw_name}` 没有在 RSLiveActivity 的 WidgetBundle 中注册。"
         )
-        for p in widget_files
+        btn_match = re.search(r"ControlWidgetButton\s*\(\s*action:\s*([A-Za-z_]\w*)\s*\(", cw_text)
+        assert btn_match, f"HC-U20 违反：{cw_path.relative_to(ROOT)} 中没有使用 ControlWidgetButton(action: ...)。"
+        used_action_name = btn_match.group(1)
+        is_open_url = used_action_name == "OpenURLIntent"
+        is_open_intent = any(
+            re.search(
+                rf"\bstruct\s+{re.escape(used_action_name)}\s*:\s*[^\{{\n]*\bOpenIntent\b",
+                _strip_swift_comments(p.read_text(encoding="utf-8")),
+            )
+            for p in widget_files
+        )
+        assert is_open_url or is_open_intent, (
+            f"HC-U20 违反：{cw_path.relative_to(ROOT)} 的 ControlWidgetButton 必须使用 OpenURLIntent 或 OpenIntent，"
+            f"当前使用了 `{used_action_name}`。"
+        )
+        if is_open_url and "start-mic" in cw_text:
+            raw_widget_text = cw_path.read_text(encoding="utf-8")
+            start_mic_urls.extend(
+                re.findall(r"URL\s*\(string:\s*[\"']([^\"']*start-mic[^\"']*)[\"']\s*\)", raw_widget_text)
+            )
+
+    assert start_mic_urls, "HC-U20 违反：ControlWidget 源码中缺少 start-mic URL。"
+    schemes = {url.split(":", 1)[0].lower() for url in start_mic_urls}
+    assert len(schemes) == 1, f"HC-U20 违反：start-mic URL 使用了多个 scheme：{sorted(schemes)}。"
+    start_mic_scheme = schemes.pop()
+    info = plistlib.loads((IOS / "RSiOS" / "Info.plist").read_bytes())
+    registered_schemes = {
+        scheme.lower()
+        for url_type in info.get("CFBundleURLTypes", [])
+        for scheme in url_type.get("CFBundleURLSchemes", [])
+    }
+    assert start_mic_scheme in registered_schemes, (
+        f"HC-U20 违反：start-mic URL scheme `{start_mic_scheme}` 未注册在 ios/RSiOS/Info.plist 的 CFBundleURLSchemes 中。"
     )
-    assert is_open_url or is_open_intent, (
-        f"HC-U20 违反：{cw_path.relative_to(ROOT)} 的 ControlWidgetButton 必须使用 OpenURLIntent 或 OpenIntent，"
-        f"当前使用了 `{used_action_name}`。"
+    root = (IOS / "RSiOS" / "Pages" / "RootView.swift").read_text(encoding="utf-8")
+    intents = (IOS / "RSiOS" / "Intents" / "AppModel+Intents.swift").read_text(encoding="utf-8")
+    assert "handleStartMicOpenURL(url)" in root, "HC-U20 违反：RootView 没有把打开 URL 路由给 handleStartMicOpenURL。"
+    assert "handleStartMicOpenURL" in intents and "MicCaptionIntentPolicy.isStartMicURL" in intents, (
+        "HC-U20 违反：AppModel+Intents.swift 没有实现 start-mic URL 路由。"
+    )
+    policy = (IOS / "Shared" / "MicCaptionIntentPolicy.swift").read_text(encoding="utf-8")
+    assert re.search(rf"startMicScheme\s*=\s*[\"']{re.escape(start_mic_scheme)}[\"']", policy), (
+        f"HC-U20 违反：MicCaptionIntentPolicy 没有使用 start-mic URL scheme `{start_mic_scheme}`。"
     )
 
     forbidden_ext_paths = [
@@ -535,3 +570,11 @@ def test_hc_u20_app_intents_and_control_widget():
         "HC-U20 违反：RSLiveActivity 源码中不得出现 AppModel / AppDependencyManager / @Dependency："
         + ", ".join(ext_code_offenders)
     )
+
+
+def test_start_mic_intent_does_not_claim_capture_started():
+    """权限拒绝或音频初始化失败时，Intent 只能报告正在启动，不能谎称已经开始。"""
+    intent = (IOS / "RSiOS" / "Intents" / "StartMicCaptionsIntent.swift").read_text(encoding="utf-8")
+    start_case = intent[intent.index("case .start:"):intent.index("case .ignoreAlreadyRunning:")]
+    assert 'IntentDialog("正在启动麦克风字幕")' in start_case
+    assert 'IntentDialog("已开始麦克风字幕")' not in start_case
