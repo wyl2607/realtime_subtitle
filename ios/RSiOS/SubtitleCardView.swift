@@ -22,6 +22,9 @@ struct SubtitleCardView: View {
     var draft: String = ""
     var maxPairs: Int = 4
 
+    // 状态行用语义字号，跟随系统动态字体。
+    @ScaledMetric(relativeTo: .caption) private var statusFontSize: CGFloat = DesignTokens.TypeScale.status
+
     private var shownLines: [RecentLine] {
         guard maxPairs > 0 else { return [] }
         return Array(lines.suffix(maxPairs))
@@ -43,16 +46,21 @@ struct SubtitleCardView: View {
         }
     }
 
+    private var statusLabel: String {
+        status?.label ?? DesignTokens.Text.micStatusIdle
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: DesignTokens.Space.s) {
-            Text(self.status?.label ?? DesignTokens.Text.micStatusIdle)
-                .font(.system(size: DesignTokens.TypeScale.status, weight: .regular))
+            Text(statusLabel)
+                .font(.system(size: statusFontSize, weight: .regular))
                 .foregroundColor(self.statusColor)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityHidden(true)   // 状态信息已合并到整卡的 accessibilityValue
 
             if self.shownLines.isEmpty {
                 Text("暂无字幕")
-                    .font(.system(size: DesignTokens.TypeScale.status, weight: .regular))
+                    .font(.system(size: statusFontSize, weight: .regular))
                     .foregroundColor(Color(styleHex: DesignTokens.Color.subtitleSecondary))
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
@@ -60,13 +68,9 @@ struct SubtitleCardView: View {
             }
 
             if !self.draft.isEmpty {
-                Text(self.draft)
-                    .font(.system(
-                        size: self.style.fontSize * DesignTokens.TypeScale.sourceScale,
-                        weight: .regular
-                    ))
-                    .foregroundColor(Color(styleHex: DesignTokens.Color.subtitleDraft))
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                // 草稿行：用户设置的字号通过 @ScaledMetric 等比放大（见 SubtitlePairRow）。
+                // 这里只用于外层卡片的直接草稿显示，子视图负责自己的 ScaledMetric。
+                ScaledDraftText(draft: self.draft, style: self.style)
             }
         }
         .padding(.vertical, DesignTokens.Space.windowPadV)
@@ -75,11 +79,28 @@ struct SubtitleCardView: View {
         .background(
             RoundedRectangle(cornerRadius: DesignTokens.Radius.card)
                 .fill(Color(styleHex: self.style.backgroundHex).opacity(self.style.backgroundOpacity))
+                .accessibilityHidden(true)
         )
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityCardLabel)
+        .accessibilityValue(statusLabel)
         .animation(
             .easeOut(duration: DesignTokens.Motion.fadeInMs / 1000),
             value: self.lines.map(\.key)
         )
+    }
+
+    private var accessibilityCardLabel: String {
+        if shownLines.isEmpty && draft.isEmpty {
+            return "字幕卡片，暂无字幕"
+        }
+        var parts: [String] = []
+        for line in shownLines {
+            parts.append(line.src)
+            if !line.dst.isEmpty { parts.append(line.dst) }
+        }
+        if !draft.isEmpty { parts.append(draft) }
+        return parts.joined(separator: "，")
     }
 
     private var pairs: some View {
@@ -106,6 +127,29 @@ struct SubtitleCardView: View {
                 endPoint: .bottom
             )
         )
+        // pairs 内的元素已被外层 .accessibilityElement(children: .ignore) 合并，不重复朗读。
+        .accessibilityHidden(true)
+    }
+}
+
+/// 草稿文本：用户设定字号为基准，ScaledMetric 等比跟随动态字体。
+private struct ScaledDraftText: View {
+    let draft: String
+    let style: SubtitleStyle
+
+    @ScaledMetric(relativeTo: .body) private var scaledSize: CGFloat = DesignTokens.TypeScale.subtitleDefault
+
+    private var resolvedSize: CGFloat {
+        // 用 scaledSize 的缩放比例乘以用户实际选择的字号。
+        let ratio = scaledSize / DesignTokens.TypeScale.subtitleDefault
+        return style.fontSize * DesignTokens.TypeScale.sourceScale * ratio
+    }
+
+    var body: some View {
+        Text(draft)
+            .font(.system(size: resolvedSize, weight: .regular))
+            .foregroundColor(Color(styleHex: DesignTokens.Color.subtitleDraft))
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -116,14 +160,27 @@ struct SubtitlePairRow: View {
     let isNewest: Bool
     let opacity: Double
 
+    // 以 .body 为基准缩放参考，取默认值作为比例基准。
+    @ScaledMetric(relativeTo: .body) private var scaledSize: CGFloat = DesignTokens.TypeScale.subtitleDefault
+
+    private var scaledSourceSize: CGFloat {
+        let ratio = scaledSize / DesignTokens.TypeScale.subtitleDefault
+        return style.fontSize * DesignTokens.TypeScale.sourceScale * ratio
+    }
+
+    private var scaledTranslationSize: CGFloat {
+        let ratio = scaledSize / DesignTokens.TypeScale.subtitleDefault
+        return style.fontSize * ratio
+    }
+
     var body: some View {
         let translation = SubtitleDisplay.translation(line.dst, isNewest: isNewest)
         VStack(alignment: .leading, spacing: DesignTokens.Space.s) {
             Text(line.src)
-                .font(.system(size: style.fontSize * DesignTokens.TypeScale.sourceScale, weight: .medium))
+                .font(.system(size: scaledSourceSize, weight: .medium))
                 .foregroundColor(Color(styleHex: style.sourceHex))
             Text(translation.text)
-                .font(.system(size: style.fontSize, weight: .regular))
+                .font(.system(size: scaledTranslationSize, weight: .regular))
                 .foregroundColor(
                     translation.isPlaceholder
                         ? Color(styleHex: DesignTokens.Color.untranslated)
@@ -133,5 +190,7 @@ struct SubtitlePairRow: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .opacity(opacity)
         .transition(.move(edge: .bottom).combined(with: .opacity))
+        // 原文+译文合并为单个无障碍元素，VoiceOver 一次读完一对。
+        .accessibilityElement(children: .combine)
     }
 }

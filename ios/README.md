@@ -285,3 +285,45 @@ python3 scripts/design/check_parity.py
 - Bundle ID：主 App `com.yilinwang.realtimesubtitle`，广播扩展 `com.yilinwang.realtimesubtitle.broadcast`，锁屏实时活动 `com.yilinwang.realtimesubtitle.liveactivity`
 
 只支持 iOS 26/27（部署目标 26.0）。iOS 27 才有的 API 用 `#available(iOS 27, *)`，不再为更老的系统写兼容分支（`tests/test_ios_redesign_constraints.py` 盯着）。
+
+## 无障碍
+
+### VoiceOver
+
+| 元素 | 处理方式 |
+|---|---|
+| 字幕卡片（SubtitleCardView） | `.accessibilityElement(children: .ignore)`，合并所有句对为单一元素；`accessibilityLabel` = 所有句对拼接；`accessibilityValue` = 当前状态标签 |
+| 字幕滚动区（LiveCaptionsView） | `accessibilityLabel("实时字幕")`，`accessibilityValue` = 当前状态标签 |
+| 句对行（SubtitlePairRow） | `.accessibilityElement(children: .combine)`，原文+译文合并为一个可读单元 |
+| BroadcastPickerView（屏幕广播按钮） | `accessibilityLabel("选择屏幕广播应用")` + `accessibilityHint` |
+| PiPHostView（画中画预览） | 不可用时 `accessibilityHidden(true)` |
+| 装饰性背景 / 渐变遮罩 | `accessibilityHidden(true)` |
+| 颜色选择器（SettingsPage 色块） | 每个 `.accessibilityLabel(item.name)` |
+| 诊断页句对 | `.accessibilityElement(children: .combine)` |
+
+### 动态字体（Dynamic Type）
+
+字幕正文字号由用户在「设置 → 字幕样式」中选定（`SubtitleStyle.fontSize`），以该值为基准通过 `@ScaledMetric(relativeTo: .body)` 等比跟随系统「更大辅助功能字体」放大，不固定。
+
+```swift
+// SubtitlePairRow 核心写法
+@ScaledMetric(relativeTo: .body) private var scaledSize: CGFloat = DesignTokens.TypeScale.subtitleDefault
+
+private var scaledTranslationSize: CGFloat {
+    let ratio = scaledSize / DesignTokens.TypeScale.subtitleDefault
+    return style.fontSize * ratio   // 用户选定字号 × 系统缩放比
+}
+```
+
+状态行、空占位文字使用语义字号（`.caption`）跟随系统动态字体。
+
+### 点按目标
+
+所有交互按钮由 SwiftUI `buttonStyle(.borderedProminent)` / `.bordered)` / `.plain` 渲染，系统会确保最小 44 × 44 pt 点按区域（iOS 26 HIG）。色块按钮（28 pt 圆形）通过 `.buttonStyle(.plain)` + 足够间距满足可及性。
+
+### 门禁
+
+`tests/test_ios_redesign_constraints.py` 中的 `test_hc_u21_accessibility_and_dynamic_type` 检查：
+
+1. `SubtitleCardView` / `LiveCaptionsView` / `LivePage` / `DiagnosticsPage` / `RootView` 中的 `Image(systemName:)` 必须有 `accessibilityLabel` 或 `accessibilityHidden(true)`。
+2. `SubtitleCardView` / `LiveCaptionsView` 中的 `.font(.system(size:` 必须经 `@ScaledMetric` 派生变量缩放。

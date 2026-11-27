@@ -42,6 +42,7 @@ struct DiagnosticsPage: View {
                         .font(.system(.body, design: .monospaced))
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
+                        .accessibilityLabel("扩展状态：\(model.feed.status)")
                 }
 
                 Section("最近句对（原始）") {
@@ -55,6 +56,8 @@ struct DiagnosticsPage: View {
                                     .foregroundStyle(.secondary)
                             }
                             .font(.system(.body, design: .monospaced))
+                            // 原文+译文合并为单个无障碍元素。
+                            .accessibilityElement(children: .combine)
                         }
                     }
                 }
