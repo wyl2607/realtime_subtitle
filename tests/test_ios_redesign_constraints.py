@@ -574,7 +574,11 @@ def test_hc_u20_app_intents_and_control_widget():
 
 def test_start_mic_intent_does_not_claim_capture_started():
     """权限拒绝或音频初始化失败时，Intent 只能报告正在启动，不能谎称已经开始。"""
+    import json
+
     intent = (IOS / "RSiOS" / "Intents" / "StartMicCaptionsIntent.swift").read_text(encoding="utf-8")
     start_case = intent[intent.index("case .start:"):intent.index("case .ignoreAlreadyRunning:")]
-    assert 'IntentDialog("正在启动麦克风字幕")' in start_case
-    assert 'IntentDialog("已开始麦克风字幕")' not in start_case
+    tokens = json.loads((ROOT / "design" / "tokens.json").read_text(encoding="utf-8"))["text"]
+    assert "DesignTokens.Text.micStarting" in start_case
+    assert tokens["micStarting"] == "正在启动麦克风字幕"
+    assert "已开始麦克风字幕" not in start_case

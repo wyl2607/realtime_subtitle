@@ -12,10 +12,10 @@ struct StartMicCaptionsControl: ControlWidget {
     var body: some ControlWidgetConfiguration {
         StaticControlConfiguration(kind: Self.kind) {
             ControlWidgetButton(action: OpenURLIntent(Self.startMicURL)) {
-                Label("开始麦克风字幕", systemImage: "mic.fill")
+                Label(DesignTokens.Text.micStartTitle, systemImage: "mic.fill")
             }
         }
-        .displayName("麦克风字幕")
+        .displayName(LocalizedStringResource(String.LocalizationValue(DesignTokens.Text.micSubtitleTitle)))
         .description("打开实时字幕并开始麦克风采集")
     }
 }

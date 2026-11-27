@@ -17,11 +17,11 @@ struct StartMicCaptionsIntent: AppIntent {
         switch decision {
         case .start:
             await controller.startMic()
-            return .result(dialog: IntentDialog("正在启动麦克风字幕"))
+            return .result(dialog: IntentDialog(LocalizedStringResource(String.LocalizationValue(DesignTokens.Text.micStarting))))
         case .ignoreAlreadyRunning:
-            return .result(dialog: IntentDialog("麦克风字幕已在运行"))
+            return .result(dialog: IntentDialog(LocalizedStringResource(String.LocalizationValue(DesignTokens.Text.micAlreadyRunning))))
         case .blockedByBroadcast:
-            return .result(dialog: IntentDialog("请先停止屏幕广播"))
+            return .result(dialog: IntentDialog(LocalizedStringResource(String.LocalizationValue(DesignTokens.Text.micBlockedByBroadcast))))
         }
     }
 }

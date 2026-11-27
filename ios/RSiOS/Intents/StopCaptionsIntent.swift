@@ -20,9 +20,9 @@ struct StopCaptionsIntent: AppIntent {
             await MainActor.run {
                 model.stopMic()
             }
-            return .result(dialog: IntentDialog("已停止麦克风字幕"))
+            return .result(dialog: IntentDialog(LocalizedStringResource(String.LocalizationValue(DesignTokens.Text.micStopped))))
         case .ignoreAlreadyStopped:
-            return .result(dialog: IntentDialog("麦克风字幕未在运行"))
+            return .result(dialog: IntentDialog(LocalizedStringResource(String.LocalizationValue(DesignTokens.Text.micNotRunning))))
         }
     }
 }
