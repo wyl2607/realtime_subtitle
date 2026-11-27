@@ -81,7 +81,7 @@ final class MicCapture {
 
         // 档位在用户点「开始」的这一刻定下：系统权限框停留期间 Picker 值若被改，
         // 也不能把新一轮启动记成另一个档位。
-        let mode = SharedKeychain.readEngineMode()
+        let mode = SharedStore.readEngineMode()
         startedEngineMode = mode
 
         isRequestingPermission = true

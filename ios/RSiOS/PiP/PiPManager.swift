@@ -146,7 +146,7 @@ final class PiPManager: NSObject, @preconcurrency AVPictureInPictureSampleBuffer
         }
     }
 
-    /// 画中画不再自己读 Keychain：内容变化统一由 LiveFeed 通知。
+    /// 画中画不再自己读共享存储：内容变化统一由 LiveFeed 通知。
     /// 未激活且在前台时定时器不再整帧重绘，这一帧负责让内嵌预览跟上。
     private func observeLiveFeed() {
         feedObserver = NotificationCenter.default.addObserver(

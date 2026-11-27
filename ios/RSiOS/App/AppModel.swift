@@ -70,7 +70,7 @@ final class AppModel {
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.feedChanged() }
         }
-        engineMode = SharedKeychain.readEngineMode()
+        engineMode = SharedStore.readEngineMode()
         loadPairedConfig()
         loadCloudSettings()
         statusChanged(feed.status)
@@ -145,8 +145,8 @@ final class AppModel {
     // MARK: - 引擎档位
 
     func saveEngineMode() {
-        // 档位只进 Keychain；写失败时不能让界面看起来像已经生效。
-        engineModeSaveFailed = !SharedKeychain.writeEngineMode(engineMode)
+        // 档位写进 App Group 共享容器；写失败时不能让界面看起来像已经生效。
+        engineModeSaveFailed = !SharedStore.writeEngineMode(engineMode)
     }
 
     /// 只有启动后真的换过档位才提示，否则麦克风一开就常驻这句话。
@@ -198,12 +198,12 @@ final class AppModel {
     // MARK: - 云端识别（Groq）
 
     private func loadCloudSettings() {
-        cloudEnabled = SharedKeychain.readCloudEnabled()
+        cloudEnabled = SharedStore.readCloudEnabled()
         groqKeyMasked = SharedKeychain.maskedGroqKey() ?? ""
     }
 
     func saveCloudEnabled() {
-        SharedKeychain.writeCloudEnabled(cloudEnabled)
+        SharedStore.writeCloudEnabled(cloudEnabled)
     }
 
     /// key 只进 Keychain：写完立刻清空输入框，界面以后只留后 4 位。

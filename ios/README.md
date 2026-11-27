@@ -15,7 +15,7 @@
 
 ### 三个引擎档位
 
-主界面「识别引擎」写入 Keychain 的 `engine_mode`，下次开始采集时生效。
+主界面「识别引擎」写入 `SharedStore`（App Group 容器）的 `engine_mode`，下次开始采集时生效。
 
 | 档位 | 行为 |
 |---|---|
@@ -35,7 +35,7 @@
 
 ### 字幕显示
 
-- 最近句对：引擎把最近 3 句写进 Keychain `latest_lines`，主 App 每 0.5 秒轮询并监听 Darwin 通知。
+- 最近句对：引擎把最近 3 句写进 App Group 共享文件 `latest_lines`（`SharedStore`），主 App 每 0.5 秒轮询并监听 Darwin 通知。
 - 画中画：`RSiOS/PiP/PiPManager.swift` 把最近 2 句渲染成 1280×360 图像，经 `AVSampleBufferDisplayLayer` 的 `sampleBufferRenderer` 送 PiP；主 App `UIBackgroundModes` 含 `audio`。
 - 熄屏：麦克风模式靠后台音频继续识别、翻译、存档；锁屏和灵动岛用实时活动（`RSLiveActivity` 扩展，`App/LiveActivityController.swift` 每秒最多推一次最新句对）。
 - 今日字幕：`RSiOS/TranscriptStore.swift` 写 `Documents/transcripts/YYYY-MM-DD.txt`，每行 `HH:mm:ss\t原文\t中文\t去重键`；「回看」页读当天文件。
@@ -80,7 +80,7 @@ xcodebuild -project RSiOS.xcodeproj -scheme RSiOS -sdk iphoneos -configuration D
 ```
 
 - `DEVELOPMENT_TEAM` 填自己的 Team ID（示例占位）。
-- 免费账号不支持 App Group，本工程只用 `keychain-access-groups` 共享数据。
+- 付费团队启用 App Group（`group.com.yilinwang.realtimesubtitle`）与 `keychain-access-groups`：运行态与非机密配置走 App Group 文件（`SharedStore`），凭据/密钥留 Keychain（`SharedKeychain`）。
 
 ## 目录结构
 
@@ -90,7 +90,7 @@ xcodebuild -project RSiOS.xcodeproj -scheme RSiOS -sdk iphoneos -configuration D
 
 | 文件 | 职责 |
 |---|---|
-| `SubtitleEngine.swift` | 共享路由引擎：`start` / `finish` / 两个 `ingest`、每 5 秒状态行、按档位分发音频、节点会话与重连、本机与云端档接线、写 Keychain |
+| `SubtitleEngine.swift` | 共享路由引擎：`start` / `finish` / 两个 `ingest`、每 5 秒状态行、按档位分发音频、节点会话与重连、本机与云端档接线、写 `SharedStore` |
 | `LocalEngine.swift` | iOS 26 的 `SpeechAnalyzer` + `Translation`；两种模式（识别+翻译 / 仅翻译，后者给云端档用），输出整句与时间区间 |
 | `ReconnectPolicy.swift` | 按 WebSocket 关闭码决定是否重连和等待秒数（1008/1003/1009 不重连，1013 固定 10 秒，其余 1/2/4/8/16/30 秒退避） |
 
@@ -100,7 +100,7 @@ xcodebuild -project RSiOS.xcodeproj -scheme RSiOS -sdk iphoneos -configuration D
 |---|---|
 | `SampleHandler.swift` | ReplayKit 适配层：`broadcastStarted` → `start()`、`broadcastFinished` → `finish()`、`.audioApp` 帧 → `ingest(sampleBuffer:)`；`onFatalError` 转成 `finishBroadcastWithError` |
 | `Info.plist` | 扩展声明：`com.apple.broadcast-services-upload`、`RPBroadcastProcessModeSampleBuffer`、语音识别用途说明 |
-| `RSBroadcast.entitlements` | 共享 Keychain access group |
+| `RSBroadcast.entitlements` | App Group（`group.com.yilinwang.realtimesubtitle`）与共享 Keychain access group |
 
 ### RSiOS/
 
@@ -124,13 +124,14 @@ xcodebuild -project RSiOS.xcodeproj -scheme RSiOS -sdk iphoneos -configuration D
 | `TranscriptView.swift` | 回看页内容（当天存档，只读） |
 | `Assets.xcassets/` | App 图标资源 |
 | `Info.plist` | 主 App 声明：麦克风/语音识别用途说明、`rsnode` URL scheme、`UIBackgroundModes: audio`、ATS |
-| `RSiOS.entitlements` | 共享 Keychain access group |
+| `RSiOS.entitlements` | App Group（`group.com.yilinwang.realtimesubtitle`）与共享 Keychain access group |
 
 ### Shared/（两个 target 都编）
 
 | 文件 | 职责 |
 |---|---|
-| `SharedKeychain.swift` | 跨进程 Keychain 读写；`Account` 定义全部共享键 |
+| `SharedStore.swift` | App Group 容器共享文件读写（原子写 + `AfterFirstUnlock` 文件保护）与旧 Keychain 键一次性迁移 |
+| `SharedKeychain.swift` | 跨进程 Keychain 读写；`Account` 仅存机密凭据（`groq_key`、`node_config`） |
 | `TailnetPin.swift` | 解析节点主机名，要求所有 IPv4 都在 `100.64.0.0/10`，再把 URL host 换成已校验的 IP 字面量 |
 | `Routing.swift` | `EngineMode`、云端/节点/本机三级状态机（`CloudRouteContext`）与夹具类型 |
 | `AutoFallback.swift` | 自动档决策：节点失败/就绪、本机句收尾、云端成功/失败/HTTP 状态/冷却、额度反馈 |
@@ -177,21 +178,28 @@ xcodebuild -project RSiOS.xcodeproj -scheme RSiOS -sdk iphoneos -configuration D
 
 ## 进程间共享
 
-主 App 与广播扩展没有 App Group（免费账号不支持），只共享 Keychain access group：
+主 App 与广播扩展分两层共享：
 
-- access group：`$(AppIdentifierPrefix)com.yilinwang.realtimesubtitle.shared`
-- service：`rsios.spike`
-
-`SharedKeychain.Account` 里的键：
+1. **App Group 容器小文件**（`SharedStore`，identifier `group.com.yilinwang.realtimesubtitle`，每个键一个文件；原子写 `.atomic` + `.completeFileProtectionUntilFirstUserAuthentication`，锁屏后照常读写，不回退写 Keychain）：
 
 | 键 | 用途 |
 |---|---|
-| `ext_status` | 引擎状态行；广播扩展或主 App 麦克风写入，主 App 轮询/通知读取 |
-| `node_config` | 已配对节点的 JSON（id/host/port/token/name/src/dst） |
+| `ext_status` | 引擎状态行；广播扩展或主 App 麦克风每 5 秒写入，主 App 轮询/通知读取 |
 | `latest_lines` | 最近 3 句的 JSON（id、原文、译文、会话代号） |
+| `latest_draft` | 未定稿的实时草稿原文；只给主界面/画中画显示，不进字幕存档 |
 | `engine_mode` | `auto` / `node` / `local`；没写过或旧值不认识时按 `auto` |
-| `groq_key` | Groq API key；只存 Keychain，界面只显示后 4 位，空值视为没有 key |
 | `cloud_enabled` | 云端开关 `"1"`/`"0"`；默认关闭 |
+
+   `engine_mode` 与 `cloud_enabled` 仅在 App Group 文件尚不存在且旧 Keychain 有值时写入 `SharedStore`，随后删除旧项（一次性迁移）。`ext_status`、`latest_lines`、`latest_draft` 是临时运行态：旧 Keychain 项只删除、不迁移，文件缺失时读取 `nil`；每个键在进程内最多检查一次旧 Keychain。
+
+2. **共享 Keychain**（`SharedKeychain.Account`，仅存机密凭据）：
+   - access group：`$(AppIdentifierPrefix)com.yilinwang.realtimesubtitle.shared`
+   - service：`rsios.spike`
+
+| 键 | 用途 |
+|---|---|
+| `node_config` | 已配对节点的 JSON（id/host/port/token/name/src/dst，含配对凭据） |
+| `groq_key` | Groq API key；只存 Keychain，界面只显示后 4 位，空值视为没有 key |
 
 状态与句对另用 Darwin 通知即时唤醒主 App：
 

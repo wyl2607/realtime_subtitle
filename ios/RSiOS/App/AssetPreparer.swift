@@ -40,7 +40,7 @@ final class AssetPreparer {
     func prepareIfMissing() {
         guard !didAutoCheck else { return }
         didAutoCheck = true
-        let mode = SharedKeychain.readEngineMode()
+        let mode = SharedStore.readEngineMode()
         guard mode == "local" || mode == "auto" else { return }
         Task {
             guard let transcriber = await Self.makeTranscriber() else { return }
@@ -128,7 +128,7 @@ final class AssetPreparer {
     }
 
     private func checkSpeechAuthorization() {
-        let mode = SharedKeychain.readEngineMode()
+        let mode = SharedStore.readEngineMode()
         guard mode == "local" || mode == "auto" else { return }
         switch SFSpeechRecognizer.authorizationStatus() {
         case .notDetermined:

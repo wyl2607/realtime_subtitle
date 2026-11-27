@@ -135,7 +135,7 @@ final class SubtitleEngine: @unchecked Sendable {
     private let maxRecentLines = 3
     private let stateQueue = DispatchQueue(label: "com.wyl2607.rsios.spike.state")
     private let connectionQueue = DispatchQueue(label: "com.wyl2607.rsios.spike.connection")
-    /// 只给 writeLatestLines 用：把「取快照 → 写 Keychain」串起来，不在 stateQueue 里做 I/O。
+    /// 只给 writeLatestLines 用：把「取快照 → 写 SharedStore」串起来，不在 stateQueue 里做 I/O。
     private let linesWriteQueue = DispatchQueue(label: "com.wyl2607.rsios.spike.lines-write")
     private var broadcastActive = false
     /// 所有节点异步回调都带着创建时的代号；必须在 stateQueue 上核对，不能跨轮次写状态。
@@ -166,10 +166,10 @@ final class SubtitleEngine: @unchecked Sendable {
 
     func start() {
         let generation = stateQueue.sync { runGate.begin() }
-        // 新一轮广播从干净的草稿开始：上一轮若崩溃退出，Keychain 里可能还留着旧文本。
+        // 新一轮广播从干净的草稿开始：上一轮若崩溃退出，共享存储里可能还留着旧文本。
         clearDraft()
         logger.info("Subtitle engine started source=\(self.source)")
-        engineMode = SharedKeychain.readEngineMode()
+        engineMode = SharedStore.readEngineMode()
         // 真机状态行必须直接暴露本轮实际读到的档位，才能区分保存失败与路由问题。
         writeStatus("started mode=\(engineMode)")
 
@@ -456,14 +456,14 @@ final class SubtitleEngine: @unchecked Sendable {
     }
 
     private func publishDraft(_ text: String) {
-        guard SharedKeychain.writeLatestDraft(text) else {
-            logger.error("Failed to write latest_draft to keychain")
+        guard SharedStore.writeLatestDraft(text) else {
+            logger.error("Failed to write latest_draft to shared store")
             return
         }
         postLinesNotification()
     }
 
-    /// 清掉共享 Keychain 里的草稿原文（不碰定稿句对）。
+    /// 清掉共享存储里的草稿原文（不碰定稿句对）。
     private func clearDraft() {
         stateQueue.sync {
             lastDraftText = ""
@@ -490,13 +490,13 @@ final class SubtitleEngine: @unchecked Sendable {
         let translationAvailable = stateQueue.sync { cloudTranslationAvailable }
         return CloudAvailability(
             hasKey: key != nil,
-            enabled: SharedKeychain.readCloudEnabled(),
+            enabled: SharedStore.readCloudEnabled(),
             translationAvailable: translationAvailable,
             keyRevision: key?.hashValue ?? 0
         )
     }
 
-    /// 每 5 秒看一眼 Keychain：用户可能在主 App 里改了开关或清了 key。
+    /// 每 5 秒看一眼 SharedStore/Keychain：用户可能在主 App 里改了开关或清了 key。
     /// 事实没变时状态机不会产生任何动作，这里只是白跑一次读。
     private func refreshCloudAvailability() {
         guard engineMode == "auto" else { return }
@@ -1654,8 +1654,8 @@ final class SubtitleEngine: @unchecked Sendable {
         // start/finish/错误也会写状态；所有行都带来源，主 App 才不会把自己刚写的短状态误判成旧版广播。
         let sourcedText = text.contains("src=") ? text : "\(text) src=\(source)"
         // 写失败不发通知：主 App 收到通知就当成「状态刚更新」，读回来的却是旧值或空值。
-        guard SharedKeychain.writeExtStatus(sourcedText) else {
-            logger.error("Failed to write status to keychain")
+        guard SharedStore.writeExtStatus(sourcedText) else {
+            logger.error("Failed to write status to shared store")
             return
         }
         postDarwinNotification()
@@ -1663,7 +1663,7 @@ final class SubtitleEngine: @unchecked Sendable {
 
     /// 节点/本机/云端回调各在自己的队列上调这里。以前在锁外直接读 recentLines、写 lastLinesJSON：
     /// 数据竞争，而且较旧的快照可能后写、把较新的字幕盖掉。现在整段在串行写队列里做，
-    /// 快照在 stateQueue 内取——最后一次写进 Keychain 的一定是最新内容。
+    /// 快照在 stateQueue 内取——最后一次写进 SharedStore 的一定是最新内容。
     private func writeLatestLines() {
         linesWriteQueue.sync {
             let json: String? = stateQueue.sync {
@@ -1674,8 +1674,8 @@ final class SubtitleEngine: @unchecked Sendable {
             }
             guard let json else { return }
             // 写失败不记 lastLinesJSON：下一句来时整份重写，不会因为一次失败永远缺句。
-            guard SharedKeychain.writeLatestLines(json) else {
-                logger.error("Failed to write latest_lines to keychain")
+            guard SharedStore.writeLatestLines(json) else {
+                logger.error("Failed to write latest_lines to shared store")
                 return
             }
             stateQueue.sync { lastLinesJSON = json }

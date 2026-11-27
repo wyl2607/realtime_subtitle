@@ -39,9 +39,12 @@ xcrun swiftc -O ios/Shared/StatusSummary.swift ios/Shared/SubtitleStyle.swift io
 # 定稿分句是纯逻辑：本机档十几秒才定稿一次，切句规则错一点就会退回「一条字幕塞好几句」。
 xcrun swiftc -O ios/Shared/SentenceSplitter.swift ios/Tests/SentenceSplitterSelftest.swift -o .tmp/sentencesplitterselftest
 .tmp/sentencesplitterselftest
+# HC-U18：App Group 文件存储（注入临时目录和内存旧 Keychain 闭包，不碰真实 Keychain）。
+xcrun swiftc -O ios/Shared/SharedStore.swift ios/Shared/SharedKeychain.swift ios/Shared/Routing.swift ios/Tests/SharedStoreSelftest.swift -o .tmp/sharedstoreselftest
+.tmp/sharedstoreselftest
 # HC-P01：主 App 的运行态只允许有一个轮询源。LiveFeed 要求内容没变不发布属性，
-# 否则合并了读取次数、SwiftUI 还是每次整树重绘。SharedKeychain 一起编是为了
-# 走真实默认读取闭包（自测里注入的是内存闭包，不碰真实 Keychain）；
-# Routing.swift 提供 SharedKeychain.readEngineMode 需要的 EngineMode。
-xcrun swiftc -O ios/RSiOS/LiveFeed.swift ios/Shared/SharedKeychain.swift ios/Shared/Routing.swift ios/Tests/LiveFeedSelftest.swift -o .tmp/livefeedselftest
+# 否则合并了读取次数、SwiftUI 还是每次整树重绘。SharedStore / SharedKeychain 一起编是为了
+# 走真实默认读取闭包（自测里注入的是内存闭包，不碰真实磁盘/Keychain）；
+# Routing.swift 提供 SharedStore.readEngineMode 需要的 EngineMode。
+xcrun swiftc -O ios/RSiOS/LiveFeed.swift ios/Shared/SharedStore.swift ios/Shared/SharedKeychain.swift ios/Shared/Routing.swift ios/Tests/LiveFeedSelftest.swift -o .tmp/livefeedselftest
 .tmp/livefeedselftest

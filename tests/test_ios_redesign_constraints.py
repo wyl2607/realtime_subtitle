@@ -379,3 +379,231 @@ def test_hc_u17_retry_followups_generation_and_single_waiter():
     assert "let waiter = Task { race.settle" not in local and "PreparedBroadcast" in local, (
         "违反：preparedSession 又为每一句新开 await ready.value 的 Task，prepareTranslation 卡住时会无界挂起。"
     )
+
+
+def _extract_brace_block(text: str, header_pattern: str) -> str:
+    """按花括号配平抽取 Swift 声明块（跳过字符串字面量与注释，避免按第一个 `}` 截断）。"""
+    match = re.search(header_pattern, text)
+    assert match is not None, f"找不到声明：{header_pattern}"
+    start = text.index("{", match.end() - 1)
+    depth = 0
+    i = start
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '"':
+            i += 1
+            while i < n:
+                if text[i] == "\\":
+                    i += 2
+                    continue
+                if text[i] == '"':
+                    i += 1
+                    break
+                i += 1
+            continue
+        if text.startswith("//", i):
+            nl = text.find("\n", i)
+            i = n if nl == -1 else nl + 1
+            continue
+        if text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+        i += 1
+    raise AssertionError(f"{header_pattern} 的花括号没有配平")
+
+
+def _strip_swift_comments(text: str) -> str:
+    """去掉单行/多行注释（保留字符串内容）。"""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '"':
+            j = i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    j += 1
+                    break
+                j += 1
+            out.append(text[i:j])
+            i = j
+            continue
+        if text.startswith("//", i):
+            nl = text.find("\n", i)
+            i = n if nl == -1 else nl
+            continue
+        if text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def test_hc_u18_non_secret_shared_data_uses_app_group_store():
+    """硬约束 HC-U18：非机密共享数据改走 App Group 容器（SharedStore），Keychain 只留机密。
+
+    违反的是什么：
+    1. SharedKeychain.Account 里又塞回 extStatus / latestLines / latestDraft / engineMode / cloudEnabled；
+    2. ios/ 下（除 SharedStore.swift 一次性迁移外）又对这 5 个键走 Keychain 读写；
+    3. SharedStore.swift 缺少原子写 `.atomic` 或锁屏可读写保护 `.completeFileProtectionUntilFirstUserAuthentication`，
+       或容器为 nil 时回退写 Keychain；
+    4. RSiOS 或 RSBroadcast 的 entitlements 缺少 `group.com.yilinwang.realtimesubtitle`。
+
+    为什么不行：高频状态和句对（5 秒 / 每句）长期走 Keychain 开销大且容易在锁屏态出现
+    -25308 错误；付费团队已支持 App Group，运行态与开关配置应放进容器小文件，Keychain 只留
+    `groq_key` 与 `node_config` 凭据。写入必须带 `AfterFirstUnlock` 保护，否则锁屏 3 秒后录音停。
+    必须怎么改：5 个非机密键统一走 `SharedStore`（原子写 + `completeFileProtectionUntilFirstUserAuthentication`），
+    两个 entitlements 保留 `keychain-access-groups` 并声明 `group.com.yilinwang.realtimesubtitle`。
+    """
+    app_group = "group.com.yilinwang.realtimesubtitle"
+    migrated_keys = ("ext_status", "latest_lines", "latest_draft", "engine_mode", "cloud_enabled")
+    migrated_pascal = ("ExtStatus", "LatestLines", "LatestDraft", "EngineMode", "CloudEnabled")
+
+    # 1. SharedKeychain.Account 只能有 groqKey、nodeConfig；且 SharedKeychain 不再保留旧键读写接口。
+    keychain_path = IOS / "Shared" / "SharedKeychain.swift"
+    keychain_text = keychain_path.read_text(encoding="utf-8")
+    account_block = _strip_swift_comments(
+        _extract_brace_block(keychain_text, r"\b(?:public\s+)?enum\s+Account\s*\{")
+    )
+    account_names = set(re.findall(r"(?:\blet\b|\bvar\b|\bcase\b)\s+([A-Za-z_]\w*)", account_block))
+    assert account_names == {"groqKey", "nodeConfig"}, (
+        f"HC-U18 违反：SharedKeychain.Account 只能有 groqKey 和 nodeConfig，实际为 {sorted(account_names)}。"
+        "非机密共享键必须迁出 Keychain 到 SharedStore。"
+    )
+    account_values = set(re.findall(r'"([^"]+)"', account_block))
+    assert account_values == {"groq_key", "node_config"}, (
+        f"HC-U18 违反：SharedKeychain.Account 的键值只能是 groq_key / node_config，实际为 {sorted(account_values)}。"
+    )
+
+    migrate_acc_body = _strip_swift_comments(
+        _extract_brace_block(keychain_text, r"func\s+migrateAccessibility\s*\([^)]*\)\s*\{")
+    )
+    for bad_key in migrated_keys + migrated_pascal:
+        assert bad_key not in migrate_acc_body, (
+            f"HC-U18 违反：SharedKeychain.migrateAccessibility 仍引用了已迁移键 {bad_key}。"
+        )
+    for suffix in migrated_pascal:
+        assert not re.search(rf"\b(?:read|write){suffix}\b", keychain_text), (
+            f"HC-U18 违反：SharedKeychain.swift 仍保留 read/write{suffix}，非机密键必须改走 SharedStore。"
+        )
+    for bad_key in migrated_keys:
+        assert bad_key not in _strip_swift_comments(keychain_text), (
+            f"HC-U18 违反：SharedKeychain.swift 仍出现非机密键 {bad_key}。"
+        )
+
+    # 2. SharedStore.swift 必须存在、含原子写和锁屏保护属性、不回退写 Keychain。
+    store_path = IOS / "Shared" / "SharedStore.swift"
+    assert store_path.is_file(), "HC-U18 违反：缺少 ios/Shared/SharedStore.swift。"
+    store_text = store_path.read_text(encoding="utf-8")
+    store_code = _strip_swift_comments(store_text)
+    assert app_group in store_code and re.search(
+        r"containerURL\s*\(\s*forSecurityApplicationGroupIdentifier\s*:", store_code
+    ), (
+        f"HC-U18 违反：SharedStore.swift 没有通过 App Group ({app_group}) 容器 URL 存储。"
+    )
+    assert "completeFileProtectionUntilFirstUserAuthentication" in store_code, (
+        "HC-U18 违反：SharedStore.swift 缺少 completeFileProtectionUntilFirstUserAuthentication，"
+        "锁屏后扩展/引擎读写会失败导致录音停止。"
+    )
+    assert ".atomic" in store_code, (
+        "HC-U18 违反：SharedStore.swift 缺少 .atomic 原子写，跨进程同时读写可能读到半截 JSON。"
+    )
+    write_impl = _extract_brace_block(store_text, r"func\s+writeUnlocked\b[^{]*\{")
+    assert ".atomic" in write_impl and "completeFileProtectionUntilFirstUserAuthentication" in write_impl, (
+        "HC-U18 违反：SharedStore 写文件实现没有同时使用 .atomic 和 .completeFileProtectionUntilFirstUserAuthentication。"
+    )
+    assert "SharedKeychain.write" not in store_code, (
+        "HC-U18 违反：SharedStore.swift 出现了 SharedKeychain.write，容器不可用时绝不许回退写 Keychain。"
+    )
+    for key in migrated_keys:
+        assert f'"{key}"' in store_code, (
+            f"HC-U18 违反：SharedStore.swift 缺少已迁移键 {key}。"
+        )
+
+    # 2a. 旧 Keychain 查询必须是进程内每键一次；只有用户设置键迁移值。
+    assert re.search(r"legacyKeysChecked\s*:\s*Set\s*<\s*String\s*>", store_code), (
+        "HC-U18 违反：SharedStore.swift 缺少每键只检查一次旧 Keychain 的记录集合。"
+    )
+    assert re.search(r"legacyKeysChecked\s*\.contains\s*\(\s*key\s*\)", store_code), (
+        "HC-U18 违反：SharedStore.swift 未用记录集合跳过同一键的重复旧 Keychain 查询。"
+    )
+    assert re.search(r"legacyKeysChecked\s*\.insert\s*\(\s*key\s*\)", store_code), (
+        "HC-U18 违反：SharedStore.swift 未记录已检查过旧 Keychain 的键。"
+    )
+    migration_values_match = re.search(
+        r"(?:static\s+)?let\s+migrationValueKeys\s*:[^=]+\s*=\s*\[(.*?)\]",
+        store_code,
+        re.DOTALL,
+    )
+    assert migration_values_match is not None, (
+        "HC-U18 违反：SharedStore.swift 缺少明确的迁移值键集合。"
+    )
+    migration_values_block = migration_values_match.group(1)
+    for runtime_key in ("Key.extStatus", "Key.latestLines", "Key.latestDraft"):
+        assert runtime_key not in migration_values_block, (
+            f"HC-U18 违反：运行态键 {runtime_key} 不得进入迁移值集合，只能删除旧 Keychain 项。"
+        )
+    for setting_key in ("Key.engineMode", "Key.cloudEnabled"):
+        assert setting_key in migration_values_block, (
+            f"HC-U18 违反：用户设置键 {setting_key} 必须进入迁移值集合。"
+        )
+
+    # 3. ios/ 下除 SharedStore.swift 迁移代码外，不再出现 5 个非机密键的 Keychain 读写。
+    offenders = []
+    all_swift = sorted(
+        path
+        for d in (*SOURCE_DIRS, "Tests")
+        for path in (IOS / d).rglob("*.swift")
+    )
+    for path in all_swift:
+        raw_text = path.read_text(encoding="utf-8")
+        code = _strip_swift_comments(raw_text)
+        for m in re.finditer(
+            r"SharedKeychain\s*\.\s*(?:read|write)(?:ExtStatus|LatestLines|LatestDraft|EngineMode|CloudEnabled)\b",
+            code,
+        ):
+            offenders.append(f"{path.relative_to(ROOT)}: {m.group(0)}")
+        if path != store_path:
+            for m in re.finditer(
+                r"SharedKeychain\s*\.\s*(?:read|write|delete)\s*\([^)]*\)",
+                code,
+                re.DOTALL,
+            ):
+                call = m.group(0)
+                if any(k in call for k in (*migrated_keys, "extStatus", "latestLines", "latestDraft", "engineMode", "cloudEnabled")):
+                    offenders.append(f"{path.relative_to(ROOT)}: {call}")
+    assert not offenders, (
+        "HC-U18 违反：以下位置仍对 ext_status/latest_lines/latest_draft/engine_mode/cloud_enabled 走 Keychain 读写：\n  "
+        + "\n  ".join(offenders)
+        + "\n必须怎么改：统一改为 SharedStore 读写（只有 SharedStore.swift 内一次性迁移可读/删旧 Keychain）。"
+    )
+
+    # 4. 两个 target 的 entitlements 都必须含 group.com.yilinwang.realtimesubtitle 并保留 keychain-access-groups。
+    for ent_path in (
+        IOS / "RSiOS" / "RSiOS.entitlements",
+        IOS / "RSBroadcast" / "RSBroadcast.entitlements",
+    ):
+        assert ent_path.is_file(), f"HC-U18 违反：缺少 entitlements 文件 {ent_path.relative_to(ROOT)}。"
+        plist = plistlib.loads(ent_path.read_bytes())
+        groups = plist.get("com.apple.security.application-groups", [])
+        assert isinstance(groups, list) and app_group in groups, (
+            f"HC-U18 违反：{ent_path.relative_to(ROOT)} 的 com.apple.security.application-groups 缺少 {app_group}。"
+        )
+        kc_groups = plist.get("keychain-access-groups", [])
+        assert isinstance(kc_groups, list) and "$(AppIdentifierPrefix)com.yilinwang.realtimesubtitle.shared" in kc_groups, (
+            f"HC-U18 违反：{ent_path.relative_to(ROOT)} 丢失了原有的 keychain-access-groups。"
+        )
