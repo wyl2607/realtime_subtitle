@@ -2,6 +2,15 @@ import Foundation
 import Observation
 import UIKit
 
+enum AppStateMonitorTransition: Equatable {
+    case background
+    case foreground
+
+    var isInBackground: Bool {
+        self == .background
+    }
+}
+
 extension DateFormatter {
     static let timeFormatter: DateFormatter = {
         let df = DateFormatter()
@@ -22,15 +31,22 @@ final class AppStateMonitor {
         NotificationCenter.default.addObserver(self, selector: #selector(willEnterForeground), name: UIApplication.willEnterForegroundNotification, object: nil)
     }
 
-    @objc private func didEnterBackground() {
-        DispatchQueue.main.async {
-            self.isInBackground = true
+    nonisolated static func transition(for notificationName: Notification.Name) -> AppStateMonitorTransition? {
+        switch notificationName {
+        case UIApplication.didEnterBackgroundNotification:
+            return .background
+        case UIApplication.willEnterForegroundNotification:
+            return .foreground
+        default:
+            return nil
         }
     }
 
+    @objc private func didEnterBackground() {
+        isInBackground = Self.transition(for: UIApplication.didEnterBackgroundNotification)?.isInBackground ?? isInBackground
+    }
+
     @objc private func willEnterForeground() {
-        DispatchQueue.main.async {
-            self.isInBackground = false
-        }
+        isInBackground = Self.transition(for: UIApplication.willEnterForegroundNotification)?.isInBackground ?? isInBackground
     }
 }

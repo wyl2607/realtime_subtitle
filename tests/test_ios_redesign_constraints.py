@@ -379,3 +379,27 @@ def test_hc_u17_retry_followups_generation_and_single_waiter():
     assert "let waiter = Task { race.settle" not in local and "PreparedBroadcast" in local, (
         "违反：preparedSession 又为每一句新开 await ready.value 的 Task，prepareTranslation 卡住时会无界挂起。"
     )
+
+
+def test_hc_b04_app_state_notifications_update_in_arrival_order_without_extra_tasks():
+    """硬约束 HC-B04：前后台通知在 MainActor 回调中直接更新，不得再异步排队。
+
+    来源 bug：AppStateMonitor 原实现的 selector 各自包了一层 DispatchQueue.main.async；
+    连续 background/foreground 到达时，额外任务可能乱序执行，最终状态反而落后。
+    """
+    monitor = (IOS / "RSiOS" / "App" / "AppStateMonitor.swift").read_text(encoding="utf-8")
+    assert "nonisolated static func transition(for notificationName: Notification.Name)" in monitor, (
+        "HC-B04 违反（来源：AppStateMonitor 通知乱序 bug）：状态转换没有抽成可测试的纯函数，"
+        "后续改回异步回调会失去顺序约束。"
+    )
+    assert "DispatchQueue.main.async" not in monitor, (
+        "HC-B04 违反（来源：AppStateMonitor 通知乱序 bug）：selector 又把通知放进额外的 "
+        "DispatchQueue.main.async，连续前后台通知可能乱序执行。"
+    )
+    for callback in ["didEnterBackground", "willEnterForeground"]:
+        start = monitor.index(f"@objc private func {callback}")
+        end = monitor.index("\n    }", start) + len("\n    }")
+        body = monitor[start:end]
+        assert "isInBackground = Self.transition(for:" in body, (
+            f"HC-B04 违反（来源：AppStateMonitor 通知乱序 bug）：{callback} 没有在通知回调内直接更新状态。"
+        )
