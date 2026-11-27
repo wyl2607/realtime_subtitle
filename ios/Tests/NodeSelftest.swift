@@ -95,6 +95,9 @@ struct NodeSelftest {
         check(NodeEvent.parse(#"{"ev":"ready"}"#) == nil, "ready 缺 cold → nil")
         check(NodeEvent.parse(#"{"ev":"final","id":3,"a0":1.0,"text":"x"}"#) == nil, "final 缺 a1 → nil")
         check(NodeEvent.parse(#"{"ev":"final","id":3,"a0":1.0,"a1":2.0}"#) == nil, "final 缺 text → nil")
+        check(NodeEvent.parse(#"{"ev":"final","id":3,"a0":-1.0,"a1":2.0,"text":"x"}"#) == nil, "final 负时间 → nil")
+        check(NodeEvent.parse(#"{"ev":"final","id":3,"a0":2.0,"a1":1.0,"text":"x"}"#) == nil, "final 倒序时间 → nil")
+        check(NodeEvent.parse(#"{"ev":"final","id":3,"a0":1e999,"a1":2.0,"text":"x"}"#) == nil, "final 非有限时间 → nil")
         check(NodeEvent.parse(#"{"ev":"translation","text":"x"}"#) == nil, "translation 缺 id → nil")
         check(NodeEvent.parse(#"{"ev":"status","code":"c"}"#) == nil, "status 缺 text → nil")
         check(NodeEvent.parse(#"{"ev":"unknown"}"#) == nil, "未知 ev → nil")
@@ -278,6 +281,7 @@ struct NodeSelftest {
             readyTimeout: 0.3
         )
 
+        session.start()
         session.start()
         let arrived = closed.wait(timeout: .now() + 2) == .success
         check(arrived, "不可达节点应在 2s 内结束会话")

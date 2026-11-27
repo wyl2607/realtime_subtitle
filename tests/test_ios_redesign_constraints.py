@@ -379,3 +379,24 @@ def test_hc_u17_retry_followups_generation_and_single_waiter():
     assert "let waiter = Task { race.settle" not in local and "PreparedBroadcast" in local, (
         "违反：preparedSession 又为每一句新开 await ready.value 的 Task，prepareTranslation 卡住时会无界挂起。"
     )
+
+
+def test_hc_b06_node_session_start_and_final_interval_guards():
+    """硬约束 HC-B06：NodeSession 只能启动一次，final 时间必须是有限正序区间。
+
+    来源 bug：重复 start 会覆盖旧 socket；非法 a0/a1 会把坏时间区间送入字幕链路。
+    必须怎么改：用 started 闸门拒绝重复建连，并在 NodeEvent.parse 入口校验有限性、非负和正序。
+    """
+    node = (IOS / "Shared" / "NodeProtocol.swift").read_text(encoding="utf-8")
+    assert "!started" in node and "started = true" in node, (
+        "HC-B06 违反：NodeSession.start 缺少一次性 started 闸门，重复调用会覆盖旧连接。"
+    )
+    final_start = node.index('case "final":')
+    final_end = node.index('case "translation":', final_start)
+    final_case = node[final_start:final_end]
+    assert "a0.isFinite" in final_case and "a1.isFinite" in final_case, (
+        "HC-B06 违反：final 时间未拒绝 NaN/Infinity。"
+    )
+    assert "a0 >= 0" in final_case and "a1 >= a0" in final_case, (
+        "HC-B06 违反：final 时间未拒绝负数或倒序区间。"
+    )
