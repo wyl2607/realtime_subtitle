@@ -45,3 +45,6 @@ xcrun swiftc -O ios/Shared/SentenceSplitter.swift ios/Tests/SentenceSplitterSelf
 # Routing.swift 提供 SharedKeychain.readEngineMode 需要的 EngineMode。
 xcrun swiftc -O ios/RSiOS/LiveFeed.swift ios/Shared/SharedKeychain.swift ios/Shared/Routing.swift ios/Tests/LiveFeedSelftest.swift -o .tmp/livefeedselftest
 .tmp/livefeedselftest
+# HC-B01：NetworkProbe 可取消闸门——保证 continuation 只恢复一次、取消即关闭连接不再等 5 秒。
+xcrun swiftc -swift-version 6 -O ios/Shared/NetworkProbeGate.swift ios/Tests/NetworkProbeSelftest.swift -o .tmp/networkprobeselftest
+.tmp/networkprobeselftest
