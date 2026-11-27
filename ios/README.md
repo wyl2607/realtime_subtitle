@@ -38,7 +38,7 @@
 - 最近句对：引擎把最近 3 句写进 Keychain `latest_lines`，主 App 每 0.5 秒轮询并监听 Darwin 通知。
 - 画中画：`RSiOS/PiP/PiPManager.swift` 把最近 2 句渲染成 1280×360 图像，经 `AVSampleBufferDisplayLayer` 的 `sampleBufferRenderer` 送 PiP；主 App `UIBackgroundModes` 含 `audio`。
 - 熄屏：麦克风模式靠后台音频继续识别、翻译、存档；锁屏和灵动岛用实时活动（`RSLiveActivity` 扩展，`App/LiveActivityController.swift` 每秒最多推一次最新句对）。
-- 今日字幕：`RSiOS/TranscriptStore.swift` 写 `Documents/transcripts/YYYY-MM-DD.txt`，每行 `HH:mm:ss\t原文\t中文\t去重键`；「回看」页读当天文件，未翻译的句子可点按「未翻译 ⟳」或长按菜单「重新翻译」调用本机已安装翻译资源补翻并写回存档。
+- 字幕存档与回看：`RSiOS/TranscriptStore.swift` 按天写 `Documents/transcripts/YYYY-MM-DD.txt`，每行 `HH:mm:ss\t原文\t中文\t去重键`；「回看」页默认读当天文件，存在往日存档时可通过工具栏日历菜单切换日期（无往日存档时不显示），搜索、复制/导出以及未翻译句子的点按「未翻译 ⟳」/长按菜单「重新翻译」均作用于当前所选日期并写回对应那天的文件。
 
 ## 生成 Xcode 工程
 
@@ -113,15 +113,15 @@ xcodebuild -project RSiOS.xcodeproj -scheme RSiOS -sdk iphoneos -configuration D
 | `App/AppStateMonitor.swift` | 前后台状态 |
 | `Pages/RootView.swift` | 四个标签页（字幕 / 回看 / 设置 / 诊断）；运行态监听只在这里做一次 |
 | `Pages/LivePage.swift` | 字幕页：资源缺失横幅、字幕卡片、屏幕广播、麦克风、画中画 |
-| `Pages/HistoryPage.swift` | 回看页：当天存档（搜索、导出） |
+| `Pages/HistoryPage.swift` | 回看页：按日查看存档（默认今天，可切换往日、搜索、导出） |
 | `Pages/SettingsPage.swift` | 设置：字幕样式 / 识别与语言 / 算力节点 |
 | `Pages/DiagnosticsPage.swift` | 诊断：本机资源、前后台、扩展状态行、原始句对、跨进程通知计数 |
 | `PiP/PiPManager.swift` | 画中画渲染与控制 |
 | `Capture/BroadcastPickerView.swift` | 系统屏幕广播按钮 |
 | `LiveFeed.swift` | 主 App 唯一的运行态轮询源：一个定时器读一次扩展状态 / 最近句对 / 草稿，内容变化才发布（`StatusMonitor`、`LinesMonitor` 已并入） |
 | `MicCapture.swift` | 麦克风采集：权限申请、音频会话（开始 `playAndRecord` / 停止还原 `playback`）、中断与路由变化处理，buffer 投给共享引擎 |
-| `TranscriptStore.swift` | 当天字幕存档，按「会话代号 + 句子 id」去重，译文后到原地更新；写盘异步合并（约 1 秒一次），进后台 flush；支持回看页按行补写译文 |
-| `TranscriptView.swift` | 回看页内容（当天存档，支持点按「未翻译 ⟳」或上下文菜单重新翻译） |
+| `TranscriptStore.swift` | 按天字幕存档，按「会话代号 + 句子 id」去重，译文后到原地更新；写盘异步合并（约 1 秒一次），进后台 flush；支持异步列出已有存档日期并按行补写任意日期译文 |
+| `TranscriptView.swift` | 回看页内容（默认今天，有往日存档时可在工具栏切换日期，支持按日搜索、导出与点按「未翻译 ⟳」/上下文菜单重新翻译） |
 | `RetryTranslator.swift` | 回看页单句重试翻译（仅用已安装的本机 de→zh-Hans 资源，带 10 秒超时与同句去重） |
 | `RetryTranslationPolicy.swift` | 回看页重试纯逻辑（可重试判定、同句并发去重、失败文案映射） |
 | `Assets.xcassets/` | App 图标资源 |
@@ -164,7 +164,7 @@ xcodebuild -project RSiOS.xcodeproj -scheme RSiOS -sdk iphoneos -configuration D
 | `RoutingSelftest.swift` | 路由夹具入口 |
 | `LineStoreSelftest.swift` | P5 夹具 |
 | `AutoFallbackSelftest.swift` | 三级自动回退决策 |
-| `TranscriptStoreSelftest.swift` | 存档去重、跨天与按句更新译文 |
+| `TranscriptStoreSelftest.swift` | 存档去重、跨天、列出存档日期校验与按日更新译文 |
 | `RetryTranslationSelftest.swift` | 回看页重试纯逻辑（可重试判定、并发去重、失败文案映射） |
 | `CloudSelftestMain.swift` | 云端纯逻辑独立入口 |
 | `CloudClientSelftest.swift` | multipart 与响应解析 |
