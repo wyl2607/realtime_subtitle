@@ -80,6 +80,33 @@ struct CaptureArbiterSelftest {
             ) == .allowMicStart,
             "HC-U12：广播刚结束（finished）不应挡住麦克风"
         )
+        check(
+            CaptureArbiter.decide(
+                extensionStatus: "blocks=1 src=broadcast",
+                extensionStatusUpdatedAt: now.addingTimeInterval(30),
+                now: now,
+                micIsRunning: false
+            ) == .allowMicStart,
+            "HC-B05：未来时间戳（时钟回拨）不应阻止启动麦克风"
+        )
+        check(
+            CaptureArbiter.decide(
+                extensionStatus: "blocks=1 src=broadcast",
+                extensionStatusUpdatedAt: now.addingTimeInterval(86_400),
+                now: now,
+                micIsRunning: true
+            ) == .allowMicStart,
+            "HC-B05：远未来时间戳不应永久停掉或阻塞麦克风"
+        )
+        check(
+            CaptureArbiter.decide(
+                extensionStatus: "blocks=1 src=broadcast",
+                extensionStatusUpdatedAt: nil,
+                now: now,
+                micIsRunning: false
+            ) == .allowMicStart,
+            "HC-B05：旧格式无时间戳（未知新鲜度）按保守规则不阻塞麦克风"
+        )
 
         let activePlan = MicAudioSessionPlan.forMic(active: true)
         check(activePlan.category == .playAndRecord, "麦克风运行时必须是 playAndRecord")

@@ -19,6 +19,26 @@ public final class SharedStore: @unchecked Sendable {
         public static let cloudEnabled = "cloud_enabled"
     }
 
+    public struct ExtStatusEntry: Equatable, Sendable {
+        public let status: String
+        public let updatedAt: Date?
+
+        public init(status: String, updatedAt: Date?) {
+            self.status = status
+            self.updatedAt = updatedAt
+        }
+    }
+
+    private struct ExtStatusPayload: Codable {
+        let status: String
+        let updatedAt: TimeInterval?
+
+        enum CodingKeys: String, CodingKey {
+            case status
+            case updatedAt = "updated_at"
+        }
+    }
+
     public enum LegacyAction: Equatable {
         case migrateValue
         case deleteOnly
@@ -151,13 +171,36 @@ public final class SharedStore: @unchecked Sendable {
 
     // MARK: - Instance convenience
 
+    /// 将状态文本与写入时间一起原子写入 `ext_status`（单文件 JSON），避免状态与时间戳撕裂；
+    /// 读到旧版纯文本或缺少 `updated_at` 时 `updatedAt` 保持 `nil`（未知新鲜度）。
     @discardableResult
-    public func writeExtStatus(_ string: String) -> Bool {
-        write(string, key: Key.extStatus)
+    public func writeExtStatus(_ string: String, at updatedAt: Date = Date()) -> Bool {
+        let payload = ExtStatusPayload(status: string, updatedAt: updatedAt.timeIntervalSince1970)
+        guard let data = try? JSONEncoder().encode(payload),
+              let encoded = String(data: data, encoding: .utf8) else {
+            logger.error("SharedStore encode ext_status failed")
+            return false
+        }
+        return write(encoded, key: Key.extStatus)
+    }
+
+    public static func decodeExtStatusEntry(_ raw: String) -> ExtStatusEntry {
+        if let data = raw.data(using: .utf8),
+           let payload = try? JSONDecoder().decode(ExtStatusPayload.self, from: data) {
+            let date = payload.updatedAt.flatMap { ts in
+                ts.isFinite ? Date(timeIntervalSince1970: ts) : nil
+            }
+            return ExtStatusEntry(status: payload.status, updatedAt: date)
+        }
+        return ExtStatusEntry(status: raw, updatedAt: nil)
+    }
+
+    public func readExtStatusEntry() -> ExtStatusEntry? {
+        read(key: Key.extStatus).map(Self.decodeExtStatusEntry)
     }
 
     public func readExtStatus() -> String? {
-        read(key: Key.extStatus)
+        readExtStatusEntry()?.status
     }
 
     @discardableResult
@@ -202,8 +245,12 @@ public final class SharedStore: @unchecked Sendable {
     // MARK: - Shared singleton API
 
     @discardableResult
-    public static func writeExtStatus(_ string: String) -> Bool {
-        shared.writeExtStatus(string)
+    public static func writeExtStatus(_ string: String, at updatedAt: Date = Date()) -> Bool {
+        shared.writeExtStatus(string, at: updatedAt)
+    }
+
+    public static func readExtStatusEntry() -> ExtStatusEntry? {
+        shared.readExtStatusEntry()
     }
 
     public static func readExtStatus() -> String? {

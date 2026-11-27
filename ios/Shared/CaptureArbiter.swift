@@ -27,9 +27,13 @@ enum CaptureArbiter {
         extensionStatusUpdatedAt: Date?,
         now: Date
     ) -> Bool {
-        guard let extensionStatusUpdatedAt,
-              now.timeIntervalSince(extensionStatusUpdatedAt) >= 0,
-              now.timeIntervalSince(extensionStatusUpdatedAt) <= broadcastFreshness else {
+        // 保守规则与时钟回拨防护：
+        // 1. 读到旧格式无时间戳（extensionStatusUpdatedAt == nil）视为未知新鲜度，不阻塞麦克风，
+        //    避免升级前遗留的旧状态永久锁死麦克风（同一安装包升级会结束旧扩展）。
+        // 2. 时钟回拨产生未来时间戳（age < 0）直接视作无效，防止一条未来时间旧状态永久阻塞麦克风。
+        guard let extensionStatusUpdatedAt else { return false }
+        let age = now.timeIntervalSince(extensionStatusUpdatedAt)
+        guard age >= 0, age <= broadcastFreshness else {
             return false
         }
 

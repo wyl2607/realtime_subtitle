@@ -24,7 +24,8 @@ final class LiveFeed {
     static let pollInterval: TimeInterval = 0.5
 
     private(set) var status: String = "无"
-    /// 只有 Darwin 通知才算「扩展刚写过」；兜底轮询读到旧值不能延长广播占用时间。
+    /// 由持久化的写入时间（冷启动/兜底轮询）或 Darwin 通知推进；
+    /// 兜底轮询读到未变化的时间戳时不会延长广播占用窗口。
     private(set) var lastStatusUpdate: Date?
     private(set) var lines: [RecentLine] = []
     private(set) var draft: String = ""
@@ -32,18 +33,19 @@ final class LiveFeed {
     private(set) var statusNotificationCount = 0
     private(set) var linesNotificationCount = 0
 
-    private let readStatus: () -> String?
+    private let readStatus: () -> SharedStore.ExtStatusEntry?
     private let readLines: () -> String?
     private let readDraft: () -> String?
     private let now: () -> Date
     private let logger = Logger(subsystem: "com.wyl2607.rsios.spike", category: "live-feed")
 
     private var lastLinesJSON: String?
+    private var lastPersistedStatusAt: Date?
     private var timer: Timer?
     private var darwinObservers: [UnsafeRawPointer] = []
 
     init(
-        readStatus: @escaping () -> String? = { SharedStore.readExtStatus() },
+        readStatus: @escaping () -> SharedStore.ExtStatusEntry? = { SharedStore.readExtStatusEntry() },
         readLines: @escaping () -> String? = { SharedStore.readLatestLines() },
         readDraft: @escaping () -> String? = { SharedStore.readLatestDraft() },
         now: @escaping () -> Date = Date.init
@@ -66,12 +68,30 @@ final class LiveFeed {
     /// 读一次三份运行态，只有内容变化才更新属性。
     func refresh() {
         var changed = false
+        let currentNow = now()
 
-        // 读不到（锁屏时 Keychain 拒绝、或条目还没写过）就保留上一次的值，不改成「无」/清空：
+        // 读不到（锁屏时容器访问拒绝、或条目还没写过）就保留上一次的值，不改成「无」/清空：
         // 读失败不代表扩展停了，清掉会让字幕、画中画、锁屏实时活动一起变空。
-        if let newStatus = readStatus(), newStatus != status {
-            status = newStatus
-            changed = true
+        if let entry = readStatus() {
+            if entry.status != status {
+                status = entry.status
+                changed = true
+            }
+            if let persistedAt = entry.updatedAt, persistedAt != lastPersistedStatusAt {
+                lastPersistedStatusAt = persistedAt
+                if currentNow.timeIntervalSince(persistedAt) >= 0 {
+                    // 冷启动或漏收 Darwin 通知时用持久化时间戳补齐；不把未来时间戳当新鲜状态，
+                    // 也不在重复轮询时把旧时间戳往前推。
+                    if lastStatusUpdate.map({ persistedAt > $0 }) ?? true {
+                        lastStatusUpdate = persistedAt
+                        changed = true
+                    }
+                } else if lastStatusUpdate != nil {
+                    // 时钟回拨导致持久化时间落在未来：清掉并记录已见过，避免系统时间追上后误判为新鲜广播。
+                    lastStatusUpdate = nil
+                    changed = true
+                }
+            }
         }
 
         if let linesJSON = readLines(), linesJSON != lastLinesJSON {

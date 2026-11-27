@@ -607,3 +607,82 @@ def test_hc_u18_non_secret_shared_data_uses_app_group_store():
         assert isinstance(kc_groups, list) and "$(AppIdentifierPrefix)com.yilinwang.realtimesubtitle.shared" in kc_groups, (
             f"HC-U18 违反：{ent_path.relative_to(ROOT)} 丢失了原有的 keychain-access-groups。"
         )
+
+
+def test_hc_b05_cold_start_reads_persisted_status_timestamp():
+    """硬约束 HC-B05：冷启动互斥必须读取持久化的状态写入时间，写状态处必须同时写时间。
+
+    违反的是什么：
+    1. SubtitleEngine.writeStatus 或 SharedStore.writeExtStatus 写 ext_status 时不同时持久化写入时间戳；
+    2. LiveFeed 只依赖进程内 Darwin 通知设置 lastStatusUpdate，refresh() 不读取持久化时间戳，
+       或直接用 readExtStatus() 丢掉时间戳；
+    3. LiveFeed.refresh() 或 CaptureArbiter.isFreshBroadcast 缺少未来时间戳（时钟回拨）防护；
+    4. 缺少对应的行为自测用例。
+
+    为什么不行：App 冷启动时还没收到过本进程 Darwin 通知，如果 lastStatusUpdate 为 nil，
+    即使广播扩展刚写了 src=broadcast，CaptureArbiter 仍会放行麦克风导致并发采集；
+    反过来如果只写时间却不防未来时间戳，时钟回拨后的一条旧状态会永久阻塞麦克风。
+    必须怎么改：SharedStore.writeExtStatus(_:at:) 与状态文本一起原子持久化时间戳，
+    SubtitleEngine.writeStatus 显式传时间，LiveFeed.refresh() 读取持久化时间戳并防护未来时间，
+    CaptureArbiter.isFreshBroadcast 校验 age >= 0 且 <= broadcastFreshness。
+    """
+    store_text = (IOS / "Shared" / "SharedStore.swift").read_text(encoding="utf-8")
+    store_code = _strip_swift_comments(store_text)
+    assert re.search(r"\bstruct\s+ExtStatusEntry\b", store_code), (
+        "HC-B05 违反：SharedStore.swift 缺少带时间戳的 ExtStatusEntry 返回结构。"
+    )
+    write_ext_body = _strip_swift_comments(
+        _extract_brace_block(store_text, r"public\s+func\s+writeExtStatus\b[^{]*\{")
+    )
+    assert "timeIntervalSince1970" in write_ext_body and "updatedAt" in write_ext_body, (
+        "HC-B05 违反：SharedStore.writeExtStatus 没有同时持久化写入时间戳。"
+    )
+    decode_ext_body = _strip_swift_comments(
+        _extract_brace_block(store_text, r"func\s+decodeExtStatusEntry\b[^{]*\{")
+    )
+    assert "updatedAt" in decode_ext_body and "isFinite" in decode_ext_body, (
+        "HC-B05 违反：SharedStore.decodeExtStatusEntry 没有解码持久化时间戳或缺少有限值校验。"
+    )
+
+    engine_text = (IOS / "Engine" / "SubtitleEngine.swift").read_text(encoding="utf-8")
+    write_status_body = _strip_swift_comments(
+        _extract_brace_block(engine_text, r"private\s+func\s+writeStatus\s*\([^)]*\)\s*\{")
+    )
+    assert re.search(r"SharedStore\.writeExtStatus\([^)]*,\s*at:\s*Date\(\)\s*\)", write_status_body), (
+        "HC-B05 违反：SubtitleEngine.writeStatus 写状态时没有同时传写入时间（at: Date()）。"
+    )
+
+    feed_text = (IOS / "RSiOS" / "LiveFeed.swift").read_text(encoding="utf-8")
+    feed_code = _strip_swift_comments(feed_text)
+    assert "SharedStore.readExtStatusEntry()" in feed_code, (
+        "HC-B05 违反：LiveFeed.init 默认没有调用 SharedStore.readExtStatusEntry() 读取持久化时间戳。"
+    )
+    assert not re.search(r"SharedStore\.readExtStatus\(\)", feed_code), (
+        "HC-B05 违反：LiveFeed 又回退到不带时间戳的 SharedStore.readExtStatus()。"
+    )
+    refresh_body = _strip_swift_comments(
+        _extract_brace_block(feed_text, r"\bfunc\s+refresh\s*\(\s*\)\s*\{")
+    )
+    assert re.search(r"lastStatusUpdate\s*=", refresh_body) and "entry.updatedAt" in refresh_body, (
+        "HC-B05 违反：LiveFeed.refresh() 没有从持久化时间戳更新 lastStatusUpdate（不能只靠进程内 Darwin 通知）。"
+    )
+    assert "timeIntervalSince(persistedAt) >= 0" in refresh_body and "lastStatusUpdate = nil" in refresh_body, (
+        "HC-B05 违反：LiveFeed.refresh() 缺少时钟回拨/未来时间戳防护（不得让未来时间戳持久化生效）。"
+    )
+
+    arbiter_text = (IOS / "Shared" / "CaptureArbiter.swift").read_text(encoding="utf-8")
+    fresh_body = _strip_swift_comments(
+        _extract_brace_block(arbiter_text, r"private\s+static\s+func\s+isFreshBroadcast\b[^{]*\{")
+    )
+    assert ">= 0" in fresh_body and "<= broadcastFreshness" in fresh_body, (
+        "HC-B05 违反：CaptureArbiter.isFreshBroadcast 缺少未来时间戳（>= 0）或窗口上限（<= broadcastFreshness）校验。"
+    )
+
+    live_feed_selftest = (IOS / "Tests" / "LiveFeedSelftest.swift").read_text(encoding="utf-8")
+    arbiter_selftest = (IOS / "Tests" / "CaptureArbiterSelftest.swift").read_text(encoding="utf-8")
+    assert live_feed_selftest.count("HC-B05") >= 4, (
+        "HC-B05 违反：LiveFeedSelftest 缺少冷启动/过期/未来时间戳/旧格式无时间戳的行为用例。"
+    )
+    assert arbiter_selftest.count("HC-B05") >= 3, (
+        "HC-B05 违反：CaptureArbiterSelftest 缺少未来时间戳与旧格式无时间戳的互斥用例。"
+    )

@@ -118,7 +118,7 @@ xcodebuild -project RSiOS.xcodeproj -scheme RSiOS -sdk iphoneos -configuration D
 | `Pages/DiagnosticsPage.swift` | 诊断：本机资源、前后台、扩展状态行、原始句对、跨进程通知计数 |
 | `PiP/PiPManager.swift` | 画中画渲染与控制 |
 | `Capture/BroadcastPickerView.swift` | 系统屏幕广播按钮 |
-| `LiveFeed.swift` | 主 App 唯一的运行态轮询源：一个定时器读一次扩展状态 / 最近句对 / 草稿，内容变化才发布（`StatusMonitor`、`LinesMonitor` 已并入） |
+| `LiveFeed.swift` | 主 App 唯一的运行态轮询源：一个定时器读一次扩展状态（含持久化时间戳）/ 最近句对 / 草稿，内容变化才发布（`StatusMonitor`、`LinesMonitor` 已并入） |
 | `MicCapture.swift` | 麦克风采集：权限申请、音频会话（开始 `playAndRecord` / 停止还原 `playback`）、中断与路由变化处理，buffer 投给共享引擎 |
 | `TranscriptStore.swift` | 当天字幕存档，按「会话代号 + 句子 id」去重，译文后到原地更新；写盘异步合并（约 1 秒一次），进后台 flush |
 | `TranscriptView.swift` | 回看页内容（当天存档，只读） |
@@ -184,13 +184,17 @@ xcodebuild -project RSiOS.xcodeproj -scheme RSiOS -sdk iphoneos -configuration D
 
 | 键 | 用途 |
 |---|---|
-| `ext_status` | 引擎状态行；广播扩展或主 App 麦克风每 5 秒写入，主 App 轮询/通知读取 |
+| `ext_status` | 引擎状态行与写入时间戳的 JSON（`{"status":...,"updated_at":...}`）；广播扩展或主 App 麦克风每 5 秒原子写入，主 App 冷启动与轮询/通知读取 |
 | `latest_lines` | 最近 3 句的 JSON（id、原文、译文、会话代号） |
 | `latest_draft` | 未定稿的实时草稿原文；只给主界面/画中画显示，不进字幕存档 |
 | `engine_mode` | `auto` / `node` / `local`；没写过或旧值不认识时按 `auto` |
 | `cloud_enabled` | 云端开关 `"1"`/`"0"`；默认关闭 |
 
    `engine_mode` 与 `cloud_enabled` 仅在 App Group 文件尚不存在且旧 Keychain 有值时写入 `SharedStore`，随后删除旧项（一次性迁移）。`ext_status`、`latest_lines`、`latest_draft` 是临时运行态：旧 Keychain 项只删除、不迁移，文件缺失时读取 `nil`；每个键在进程内最多检查一次旧 Keychain。
+
+   `ext_status` 单文件同时保存状态文本与写入时间戳（`SharedStore.writeExtStatus(_:at:)`），使主 App 冷启动（含快捷指令直接启动麦克风）在尚未收到本进程 Darwin 通知前就能用持久化的 `updated_at` 恢复 `LiveFeed.lastStatusUpdate` 并交给 `CaptureArbiter` 判定互斥；同一写入时间戳不会在后续 0.5 秒兜底轮询里重复延长占用窗口。边界取舍：
+   - **旧格式无时间戳（纯文本或缺少 `updated_at`）**：按「未知新鲜度」处理，`updatedAt` 保持 `nil`，`CaptureArbiter` 保守放行麦克风（`.allowMicStart`）。原因是同一安装包升级会结束旧扩展，无时间戳条目只可能来自升级前遗留或异常文件；若保守阻塞，旧文件会永久锁死麦克风。
+   - **时钟回拨 / 未来时间戳（`updated_at > now`）**：`LiveFeed` 丢弃未来时间戳且记为已见过（避免墙钟追上时旧状态复活），`CaptureArbiter` 同样要求 `age >= 0`，防止未来时间戳永久阻塞麦克风。
 
 2. **共享 Keychain**（`SharedKeychain.Account`，仅存机密凭据）：
    - access group：`$(AppIdentifierPrefix)com.yilinwang.realtimesubtitle.shared`

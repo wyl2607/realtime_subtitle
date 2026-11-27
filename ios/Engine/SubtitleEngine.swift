@@ -1654,7 +1654,7 @@ final class SubtitleEngine: @unchecked Sendable {
         // start/finish/错误也会写状态；所有行都带来源，主 App 才不会把自己刚写的短状态误判成旧版广播。
         let sourcedText = text.contains("src=") ? text : "\(text) src=\(source)"
         // 写失败不发通知：主 App 收到通知就当成「状态刚更新」，读回来的却是旧值或空值。
-        guard SharedStore.writeExtStatus(sourcedText) else {
+        guard SharedStore.writeExtStatus(sourcedText, at: Date()) else {
             logger.error("Failed to write status to shared store")
             return
         }

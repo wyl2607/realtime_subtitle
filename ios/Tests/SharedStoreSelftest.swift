@@ -29,8 +29,15 @@ struct SharedStoreSelftest {
         check(store.readCloudEnabled() == false, "缺文件时 readCloudEnabled 应返回 false")
 
         // 2. 往返读写
-        check(store.writeExtStatus("engine=node last=ready src=broadcast"), "writeExtStatus 应成功")
+        let writeDate = Date(timeIntervalSince1970: 1_700_000_123.5)
+        check(store.writeExtStatus("engine=node last=ready src=broadcast", at: writeDate), "writeExtStatus 应成功")
         check(store.readExtStatus() == "engine=node last=ready src=broadcast", "readExtStatus 应读回写入内容")
+        let entry = store.readExtStatusEntry()
+        check(entry?.status == "engine=node last=ready src=broadcast", "readExtStatusEntry 应读回状态文本")
+        check(
+            entry?.updatedAt.map { abs($0.timeIntervalSince(writeDate)) < 0.001 } == true,
+            "HC-B05：readExtStatusEntry 应读回持久化时间戳"
+        )
 
         let linesJSON = "[{\"id\":1,\"src\":\"Hallo\",\"dst\":\"你好\",\"session\":\"s1\"}]"
         check(store.writeLatestLines(linesJSON), "writeLatestLines 应成功")
@@ -45,9 +52,19 @@ struct SharedStoreSelftest {
         check(store.writeCloudEnabled(true), "writeCloudEnabled(true) 应成功")
         check(store.readCloudEnabled() == true, "readCloudEnabled 应读回 true")
 
-        // 3. 覆盖写入
+        // 3. 覆盖写入与旧格式无时间戳兼容（HC-B05）
         check(store.writeExtStatus("finished src=broadcast"), "覆盖 writeExtStatus 应成功")
         check(store.readExtStatus() == "finished src=broadcast", "覆盖后应读回最新值")
+        let legacyURL = tempDir.appendingPathComponent(SharedStore.Key.extStatus, isDirectory: false)
+        try? Data("blocks=2 src=broadcast".utf8).write(to: legacyURL, options: .atomic)
+        let legacyEntry = store.readExtStatusEntry()
+        check(legacyEntry?.status == "blocks=2 src=broadcast", "HC-B05：旧格式纯文本 ext_status 应读回原状态文本")
+        check(legacyEntry?.updatedAt == nil, "HC-B05：旧格式无时间戳时 updatedAt 应为 nil（未知新鲜度）")
+        try? Data("{\"status\":\"blocks=3 src=broadcast\"}".utf8).write(to: legacyURL, options: .atomic)
+        let missingTsEntry = store.readExtStatusEntry()
+        check(missingTsEntry?.status == "blocks=3 src=broadcast", "HC-B05：缺 updated_at 字段的 JSON 仍应读回状态文本")
+        check(missingTsEntry?.updatedAt == nil, "HC-B05：缺 updated_at 字段时 updatedAt 应为 nil")
+        check(store.writeExtStatus("finished src=broadcast"), "还原 writeExtStatus 应成功")
         check(store.writeLatestDraft(""), "写空草稿应成功")
         check(store.readLatestDraft() == "", "空草稿应原样读回空串")
         check(store.writeCloudEnabled(false), "覆盖 writeCloudEnabled(false) 应成功")
