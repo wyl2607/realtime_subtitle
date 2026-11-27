@@ -38,7 +38,7 @@
 - 最近句对：引擎把最近 3 句写进 Keychain `latest_lines`，主 App 每 0.5 秒轮询并监听 Darwin 通知。
 - 画中画：`RSiOS/PiP/PiPManager.swift` 把最近 2 句渲染成 1280×360 图像，经 `AVSampleBufferDisplayLayer` 的 `sampleBufferRenderer` 送 PiP；主 App `UIBackgroundModes` 含 `audio`。
 - 熄屏：麦克风模式靠后台音频继续识别、翻译、存档；锁屏和灵动岛用实时活动（`RSLiveActivity` 扩展，`App/LiveActivityController.swift` 每秒最多推一次最新句对）。
-- 今日字幕：`RSiOS/TranscriptStore.swift` 写 `Documents/transcripts/YYYY-MM-DD.txt`，每行 `HH:mm:ss\t原文\t中文\t去重键`；「回看」页读当天文件。
+- 今日字幕：`RSiOS/TranscriptStore.swift` 写 `Documents/transcripts/YYYY-MM-DD.txt`，每行 `HH:mm:ss\t原文\t中文\t去重键`；「回看」页读当天文件，未翻译的句子可点按「未翻译 ⟳」或长按菜单「重新翻译」调用本机已安装翻译资源补翻并写回存档。
 
 ## 生成 Xcode 工程
 
@@ -120,8 +120,10 @@ xcodebuild -project RSiOS.xcodeproj -scheme RSiOS -sdk iphoneos -configuration D
 | `Capture/BroadcastPickerView.swift` | 系统屏幕广播按钮 |
 | `LiveFeed.swift` | 主 App 唯一的运行态轮询源：一个定时器读一次扩展状态 / 最近句对 / 草稿，内容变化才发布（`StatusMonitor`、`LinesMonitor` 已并入） |
 | `MicCapture.swift` | 麦克风采集：权限申请、音频会话（开始 `playAndRecord` / 停止还原 `playback`）、中断与路由变化处理，buffer 投给共享引擎 |
-| `TranscriptStore.swift` | 当天字幕存档，按「会话代号 + 句子 id」去重，译文后到原地更新；写盘异步合并（约 1 秒一次），进后台 flush |
-| `TranscriptView.swift` | 回看页内容（当天存档，只读） |
+| `TranscriptStore.swift` | 当天字幕存档，按「会话代号 + 句子 id」去重，译文后到原地更新；写盘异步合并（约 1 秒一次），进后台 flush；支持回看页按行补写译文 |
+| `TranscriptView.swift` | 回看页内容（当天存档，支持点按「未翻译 ⟳」或上下文菜单重新翻译） |
+| `RetryTranslator.swift` | 回看页单句重试翻译（仅用已安装的本机 de→zh-Hans 资源，带 10 秒超时与同句去重） |
+| `RetryTranslationPolicy.swift` | 回看页重试纯逻辑（可重试判定、同句并发去重、失败文案映射） |
 | `Assets.xcassets/` | App 图标资源 |
 | `Info.plist` | 主 App 声明：麦克风/语音识别用途说明、`rsnode` URL scheme、`UIBackgroundModes: audio`、ATS |
 | `RSiOS.entitlements` | 共享 Keychain access group |
@@ -162,7 +164,8 @@ xcodebuild -project RSiOS.xcodeproj -scheme RSiOS -sdk iphoneos -configuration D
 | `RoutingSelftest.swift` | 路由夹具入口 |
 | `LineStoreSelftest.swift` | P5 夹具 |
 | `AutoFallbackSelftest.swift` | 三级自动回退决策 |
-| `TranscriptStoreSelftest.swift` | 存档去重与跨天 |
+| `TranscriptStoreSelftest.swift` | 存档去重、跨天与按句更新译文 |
+| `RetryTranslationSelftest.swift` | 回看页重试纯逻辑（可重试判定、并发去重、失败文案映射） |
 | `CloudSelftestMain.swift` | 云端纯逻辑独立入口 |
 | `CloudClientSelftest.swift` | multipart 与响应解析 |
 | `QuotaLedgerSelftest.swift` | 计费下限、90/80 滞回、落盘 |

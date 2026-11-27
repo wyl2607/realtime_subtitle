@@ -152,6 +152,49 @@ final class TranscriptStore: @unchecked Sendable {
         done.wait()
     }
 
+    /// 按行定位（文件内序号 + 原时间 + 原文）更新一句的译文并异步合并落盘。
+    /// 只改该句 dst，找不到该句时不改内存也不写盘。
+    func updateTranslation(
+        for line: Line,
+        on date: Date = Date(),
+        dst: String,
+        completion: (@Sendable (Bool) -> Void)? = nil
+    ) {
+        let cleanDst = sanitize(dst)
+        guard !cleanDst.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            completion?(false)
+            return
+        }
+        queue.async {
+            let day = self.dateKey(for: date)
+            self.ensureLoaded(day)
+            guard var rows = self.days[day],
+                  rows.indices.contains(line.id),
+                  rows[line.id].time == line.time,
+                  rows[line.id].src == line.src else {
+                completion?(false)
+                return
+            }
+            if rows[line.id].dst != cleanDst {
+                rows[line.id].dst = cleanDst
+                self.days[day] = rows
+                self.dirtyDays.insert(day)
+                self.scheduleWrite()
+            }
+            completion?(true)
+        }
+    }
+
+    /// 异步等待内存更新和写盘登记完成（不阻塞主线程磁盘 I/O）。
+    @discardableResult
+    func updateTranslation(for line: Line, on date: Date = Date(), dst: String) async -> Bool {
+        await withCheckedContinuation { continuation in
+            updateTranslation(for: line, on: date, dst: dst) { updated in
+                continuation.resume(returning: updated)
+            }
+        }
+    }
+
     /// 合并这一批句子，返回有变化的日期。在串行队列上跑，不碰磁盘。
     private func merge(_ sentences: [Sentence]) -> Set<String> {
         var dirtyDays: Set<String> = []

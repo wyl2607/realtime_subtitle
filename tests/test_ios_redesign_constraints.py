@@ -379,3 +379,73 @@ def test_hc_u17_retry_followups_generation_and_single_waiter():
     assert "let waiter = Task { race.settle" not in local and "PreparedBroadcast" in local, (
         "违反：preparedSession 又为每一句新开 await ready.value 的 Task，prepareTranslation 卡住时会无界挂起。"
     )
+
+
+def test_hc_u19_transcript_untranslated_retry():
+    """硬约束 HC-U19：回看页「未翻译 ⟳」可点按重新翻译，只用已安装本机资源且有超时，新文案只来自 DesignTokens。
+
+    为什么不行：如果占位只是不可点的 Text，用户没法补翻漏掉的句子；如果用 Configuration/.translationTask，
+    点按会弹出系统下载框或触网；如果不加超时，Translation 框架卡住会把该句永久锁在加载中；如果视图里写死文案，
+    会脱离 design/tokens.json 三端令牌同步。
+    """
+    view = (IOS / "RSiOS" / "TranscriptView.swift").read_text(encoding="utf-8")
+    # 1. 未翻译占位必须在 Button 里并调用重试（不允许退回裸 Text）。
+    untranslated_button = re.search(
+        r"Button\s*\{([^}]*retryTranslation\([^}]*)\}\s*label:\s*\{.*?DesignTokens\.Text\.untranslated.*?\}"
+        r".*?\.accessibilityLabel\(DesignTokens\.Text\.retryTranslation\)",
+        view,
+        re.S,
+    )
+    assert untranslated_button is not None, (
+        "HC-U19 违反：TranscriptView 的 DesignTokens.Text.untranslated 不在调用 retryTranslation 的 Button 内"
+        "或缺少 DesignTokens.Text.retryTranslation 无障碍标签。"
+    )
+    # 确认没有脱离 Button 的裸 Text(DesignTokens.Text.untranslated)（比如旧实现 if line.dst.isEmpty { Text(...) }）。
+    for m in re.finditer(r"Text\(DesignTokens\.Text\.untranslated\)", view):
+        prefix = view[max(0, m.start() - 250):m.start()]
+        assert "Button" in prefix and "label:" in prefix, (
+            "HC-U19 违反：TranscriptView 出现不在 Button label 里的 Text(DesignTokens.Text.untranslated)。"
+        )
+    # contextMenu 里也必须有「重新翻译」按钮。
+    context_menu = view[view.index(".contextMenu"):]
+    assert "Button(DesignTokens.Text.retryTranslation)" in context_menu and "retryTranslation(" in context_menu, (
+        "HC-U19 违反：TranscriptView 的 contextMenu 缺少重新翻译入口。"
+    )
+
+    # 2. RetryTranslator 必须用 installedSource，不能用触发下载的初始化，且有超时和去重。
+    translator = (IOS / "RSiOS" / "RetryTranslator.swift").read_text(encoding="utf-8")
+    assert "TranslationSession(installedSource:" in translator, (
+        "HC-U19 违反：RetryTranslator 必须使用 TranslationSession(installedSource:target:)。"
+    )
+    assert "prepareTranslation(" not in translator, (
+        "HC-U19 违反：RetryTranslator 不得调用 prepareTranslation()——它会请求下载语言资源，重试只能用已安装资源。"
+    )
+    assert "TranslationSession.Configuration" not in translator and ".translationTask" not in translator, (
+        "HC-U19 违反：RetryTranslator 不得使用会触发系统下载弹窗的 TranslationSession.Configuration / .translationTask。"
+    )
+    assert "LanguageAvailability" in translator and ".installed" in translator, (
+        "HC-U19 违反：RetryTranslator 必须先检查本机翻译资源是否已安装。"
+    )
+    assert "translationTimeout" in translator and "translateWithTimeout" in translator and "session.translate(" in translator, (
+        "HC-U19 违反：RetryTranslator 必须对单句翻译设置超时。"
+    )
+    assert "inFlight.begin(" in translator, (
+        "HC-U19 违反：RetryTranslator 必须做同句并发去重，避免重复点按排队。"
+    )
+
+    policy = (IOS / "RSiOS" / "RetryTranslationPolicy.swift").read_text(encoding="utf-8")
+    timeout_match = re.search(r"translationTimeout\s*:\s*TimeInterval\s*=\s*([0-9.]+)", policy)
+    assert timeout_match is not None and 5.0 <= float(timeout_match.group(1)) <= 20.0, (
+        "HC-U19 违反：RetryTranslationPolicy.translationTimeout 缺失或不在 5-20 秒范围内。"
+    )
+
+    # 3. 新文案只来自 DesignTokens（不在视图或翻译器里写死字面量）。
+    for path, src in ((IOS / "RSiOS" / "TranscriptView.swift", view), (IOS / "RSiOS" / "RetryTranslator.swift", translator)):
+        for literal in ("重新翻译", "本机翻译资源未安装", "翻译超时", "翻译失败", "点按重试", "翻译中"):
+            for m in re.finditer(rf'"[^"]*{re.escape(literal)}[^"]*"', src):
+                raise AssertionError(
+                    f"HC-U19 违反：{_locate(path, src, m.start())} 写死了新文案字面量，必须改用 DesignTokens.Text.*"
+                )
+    assert "DesignTokens.Text.translating" in view, (
+        "HC-U19 违反：TranscriptView 进行中提示必须使用 DesignTokens.Text.translating。"
+    )

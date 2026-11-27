@@ -30,6 +30,12 @@ ALLOW: dict[str, str] = {
     "realtime_subtitle/ui/subtitle_render.py:untranslated": (
         "重试处理函数的 docstring，未作为 UI 文案显示。"
     ),
+    "realtime_subtitle/translate/translator_queue.py:retryTranslation": (
+        "retry_translation 的 docstring，未作为 UI 文案显示。"
+    ),
+    "realtime_subtitle/offline.py:retryTranslation": (
+        "render_srt 的 docstring，未作为 UI 文案显示。"
+    ),
     "android:app/src/main/java/com/wyl26/dezhsubtitle/v2/ui/model/UiDefaults.kt:statusLocal": (
         "字幕行来源标签（本机/节点/云端）三值一组，另两个不是路由状态、令牌里没有；"
         "只把「本机」绑到 statusLocal 会把这组拆开，令牌改了行标签跟着变。"
