@@ -131,6 +131,30 @@ func runCloudClientSelftest(_ check: @escaping (Bool, String) -> Void) {
     }
 
     do {
+        let invalidSegments = [
+            #"[{"start":-0.1,"end":0.2,"text":"negative"}]"#,
+            #"[{"start":0.4,"end":0.2,"text":"reversed"}]"#,
+            #"[{"start":0.5,"end":0.8,"text":"later"},{"start":0.1,"end":0.4,"text":"earlier"}]"#,
+            #"[{"start":0,"end":1e309,"text":"non-finite"}]"#,
+        ]
+        for segments in invalidSegments {
+            let body = #"{"text":"bad","segments":"# + segments + #"}"#
+            do {
+                _ = try CloudClient.parse(statusCode: 200, headers: [:], body: Data(body.utf8), a0: 0)
+                check(false, "非法 segment 时间应让整条响应 decodeFailed：\(segments)")
+            } catch let error as CloudClientError {
+                if case .decodeFailed = error {
+                    // 预期：不把部分非法响应交给下游字幕区间。
+                } else {
+                    check(false, "非法 segment 时间应抛 decodeFailed，实际 \(error)")
+                }
+            } catch {
+                check(false, "非法 segment 时间应抛 CloudClientError，实际 \(error)")
+            }
+        }
+    }
+
+    do {
         let result = try? CloudClient.parse(
             statusCode: 200,
             headers: [:],

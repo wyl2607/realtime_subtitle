@@ -283,6 +283,20 @@ final class CloudClient: @unchecked Sendable {
         }
         do {
             let decoded = try JSONDecoder().decode(GroqVerboseResponse.self, from: body)
+            var previousStart = -Double.infinity
+            var previousEnd = -Double.infinity
+            for segment in decoded.segments {
+                guard segment.start.isFinite,
+                      segment.end.isFinite,
+                      segment.start >= 0,
+                      segment.end >= segment.start,
+                      segment.start >= previousStart,
+                      segment.end >= previousEnd else {
+                    throw CloudClientError.decodeFailed(quota: quota)
+                }
+                previousStart = segment.start
+                previousEnd = segment.end
+            }
             return CloudTranscriptionResult(
                 text: decoded.text ?? decoded.segments.map(\.text).joined(separator: " "),
                 segments: decoded.segments.map {

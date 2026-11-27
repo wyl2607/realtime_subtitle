@@ -379,3 +379,33 @@ def test_hc_u17_retry_followups_generation_and_single_waiter():
     assert "let waiter = Task { race.settle" not in local and "PreparedBroadcast" in local, (
         "违反：preparedSession 又为每一句新开 await ready.value 的 Task，prepareTranslation 卡住时会无界挂起。"
     )
+
+
+def test_hc_b09_cloud_segments_reject_invalid_times():
+    """硬约束 HC-B09：云端响应中的每个 segment 时间必须有限、非负且按序。
+
+    来源 bug：CloudClient.parse 曾把服务端 start/end 原样加到 a0，非法时间会进入首/末段
+    字幕区间，导致下游生成错误字幕范围。必须整条响应 decodeFailed，不能把部分结果继续下传。
+    这条约束同时锁住实现中的校验条件和 Swift 自测中的负值、倒序、非有限、多段用例；改回旧实现
+    时这些检查会缺失且自测会变红。
+    """
+    cloud = (IOS / "Shared" / "CloudClient.swift").read_text(encoding="utf-8")
+    for condition in [
+        "segment.start.isFinite",
+        "segment.end.isFinite",
+        "segment.start >= 0",
+        "segment.end >= segment.start",
+        "segment.start >= previousStart",
+        "segment.end >= previousEnd",
+        "CloudClientError.decodeFailed(quota: quota)",
+    ]:
+        assert condition in cloud, (
+            f"HC-B09 违反：CloudClient.parse 缺少 `{condition}`。来源 bug 是服务端非法 segment 时间"
+            " 被原样映射到 a0 后进入下游字幕区间；必须整条响应 decodeFailed。"
+        )
+    selftest = (IOS / "Tests" / "CloudClientSelftest.swift").read_text(encoding="utf-8")
+    for marker in ["-0.1", "reversed", "1e309", "later", "earlier"]:
+        assert marker in selftest, (
+            f"HC-B09 违反：CloudClientSelftest 缺少 `{marker}` 非法 segment 用例；"
+            "改回旧实现时必须能证明该 bug 重新出现。"
+        )
