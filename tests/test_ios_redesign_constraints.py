@@ -13,6 +13,148 @@ SOURCE_DIRS = ["RSiOS", "Engine", "Shared", "RSBroadcast", "RSLiveActivity"]
 MAX_LINES = 500
 
 
+def _swift_without_comments_and_strings(text: str, preserve_strings: bool = False) -> str:
+    """Keep Swift layout while blanking comments and string contents."""
+    out = list(text)
+    i = 0
+    state = "code"
+    block_depth = 0
+    while i < len(text):
+        if state == "code":
+            if text.startswith("//", i):
+                out[i:i + 2] = "  "
+                i += 2
+                state = "line_comment"
+            elif text.startswith("/*", i):
+                out[i:i + 2] = "  "
+                i += 2
+                block_depth = 1
+                state = "block_comment"
+            elif text[i] == '"':
+                if not preserve_strings:
+                    out[i] = " "
+                i += 1
+                state = "string"
+            else:
+                i += 1
+        elif state == "line_comment":
+            if text[i] == "\n":
+                state = "code"
+            else:
+                out[i] = " "
+            i += 1
+        elif state == "block_comment":
+            if text.startswith("/*", i):
+                out[i:i + 2] = "  "
+                block_depth += 1
+                i += 2
+            elif text.startswith("*/", i):
+                out[i:i + 2] = "  "
+                block_depth -= 1
+                i += 2
+                if block_depth == 0:
+                    state = "code"
+            else:
+                if not preserve_strings and text[i] != "\n":
+                    out[i] = " "
+                i += 1
+        else:
+            if text[i] == "\\":
+                if not preserve_strings:
+                    out[i] = " "
+                if i + 1 < len(text):
+                    if not preserve_strings and text[i + 1] != "\n":
+                        out[i + 1] = " "
+                    i += 2
+                else:
+                    i += 1
+            elif text[i] == '"':
+                if not preserve_strings:
+                    out[i] = " "
+                i += 1
+                state = "code"
+            else:
+                if not preserve_strings and text[i] != "\n":
+                    out[i] = " "
+                i += 1
+    return "".join(out)
+
+
+def _extract_brace_block(text: str, open_brace: int) -> str:
+    """Return the balanced block contents, using comment/string-free Swift."""
+    assert text[open_brace] == "{"
+    depth = 0
+    for index in range(open_brace, len(text)):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_brace + 1:index]
+    raise AssertionError("未找到配对的 Swift 大括号")
+
+
+def _extract_function_body(text: str, name: str) -> str:
+    clean = _swift_without_comments_and_strings(text)
+    match = re.search(rf"\b(?:static\s+)?func\s+{re.escape(name)}\s*\([^{{]*?\)\s*(?:async\s*)?(?:throws\s*)?(?:->[^{{]*)?\{{", clean)
+    assert match, f"未找到 Swift 函数 {name}()"
+    return _extract_brace_block(clean, clean.find("{", match.start()))
+
+
+def _extract_function_body_raw(text: str, name: str) -> str:
+    clean = _swift_without_comments_and_strings(text)
+    match = re.search(rf"\b(?:static\s+)?func\s+{re.escape(name)}\s*\([^{{]*?\)\s*(?:async\s*)?(?:throws\s*)?(?:->[^{{]*)?\{{", clean)
+    assert match, f"未找到 Swift 函数 {name}()"
+    open_brace = clean.find("{", match.start())
+    clean_body = _extract_brace_block(clean, open_brace)
+    close_brace = open_brace + 1 + len(clean_body)
+    return text[open_brace + 1:close_brace]
+
+
+def _extract_switch_case(text: str, label: str) -> str:
+    clean = _swift_without_comments_and_strings(text, preserve_strings=True)
+    case_matches = list(re.finditer(r"\bcase\b", clean))
+    for position, match in enumerate(case_matches):
+        original_tail = text[match.start():]
+        if not re.match(rf'case\s+"{re.escape(label)}"\s*:', original_tail):
+            continue
+        start = match.end()
+        end = case_matches[position + 1].start() if position + 1 < len(case_matches) else len(clean)
+        return _swift_without_comments_and_strings(text[start:end])
+    raise AssertionError(f"未找到 switch case {label!r}")
+
+
+def _count_marked_checks(text: str, marker: str) -> int:
+    """Count check(...) calls containing marker, ignoring comments."""
+    source = _swift_without_comments_and_strings(text, preserve_strings=True)
+    # Locate calls in the original source, but use a comment-free copy for nesting.
+    count = 0
+    for match in re.finditer(r"\bcheck\s*\(", source):
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(match.end() - 1, len(source)):
+            char = source[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+            elif char == '"':
+                in_string = True
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    if marker in source[match.start():index + 1]:
+                        count += 1
+                    break
+    return count
+
+
 def _swift_files():
     for name in SOURCE_DIRS:
         yield from sorted((IOS / name).rglob("*.swift"))
@@ -387,16 +529,50 @@ def test_hc_b06_node_session_start_and_final_interval_guards():
     来源 bug：重复 start 会覆盖旧 socket；非法 a0/a1 会把坏时间区间送入字幕链路。
     必须怎么改：用 started 闸门拒绝重复建连，并在 NodeEvent.parse 入口校验有限性、非负和正序。
     """
-    node = (IOS / "Shared" / "NodeProtocol.swift").read_text(encoding="utf-8")
-    assert "!started" in node and "started = true" in node, (
-        "HC-B06 违反：NodeSession.start 缺少一次性 started 闸门，重复调用会覆盖旧连接。"
+    node_path = IOS / "Shared" / "NodeProtocol.swift"
+    node = node_path.read_text(encoding="utf-8")
+    start = _extract_function_body(node, "start")
+    first_connection = min(
+        (index for index in (start.find("URLSession("), start.find("webSocketTask(")) if index >= 0),
+        default=-1,
     )
-    final_start = node.index('case "final":')
-    final_end = node.index('case "translation":', final_start)
-    final_case = node[final_start:final_end]
-    assert "a0.isFinite" in final_case and "a1.isFinite" in final_case, (
-        "HC-B06 违反：final 时间未拒绝 NaN/Infinity。"
+    assert first_connection >= 0, "HC-B06 违反：NodeSession.start 缺少可识别的建连调用。"
+
+    first_lock = start.find("lock.lock()")
+    first_gate = re.search(r"guard\s+[^\n{]*!started\s+else\s*\{", start)
+    assert first_lock >= 0 and first_gate, "HC-B06 违反：NodeSession.start 缺少可识别的首个锁区间。"
+    guard_open = start.find("{", first_gate.start())
+    guard_close = guard_open + 1 + len(_extract_brace_block(start, guard_open))
+    first_unlock = start.find("lock.unlock()", guard_close)
+    assert first_unlock > first_lock, "HC-B06 违反：首个锁区间没有在闸门后解锁。"
+    gate = start[first_lock:first_unlock]
+    assert re.search(r"guard\s+[^\n{]*!started", gate), (
+        "HC-B06 违反：!started 没有出现在 start() 首个锁内 guard 条件中。"
     )
-    assert "a0 >= 0" in final_case and "a1 >= a0" in final_case, (
-        "HC-B06 违反：final 时间未拒绝负数或倒序区间。"
+    assert "started = true" in gate, (
+        "HC-B06 违反：started = true 没有在同一把锁的首个 lock/unlock 区间内。"
+    )
+    assert start.find("!started", first_lock, first_unlock) < first_connection and \
+        start.find("started = true", first_lock, first_unlock) < first_connection, (
+        "HC-B06 违反：一次性闸门必须早于第一个 URLSession()/webSocketTask()。"
+    )
+
+    close_guards = list(re.finditer(r"guard\s+!closeNotified\s+else\s*\{", start))
+    assert len(close_guards) >= 1, "HC-B06 违反：start() 缺少 closeNotified 二次交接 guard。"
+    close_guard_body = _extract_brace_block(start, start.find("{", close_guards[-1].start()))
+    assert "socket.cancel" in close_guard_body and "finishTasksAndInvalidate" in close_guard_body, (
+        "HC-B06 违反：第二个 closeNotified 分支必须取消 socket 并结束 URLSession。"
+    )
+
+    parse = _extract_function_body_raw(node, "parse")
+    final_case = _extract_switch_case(parse, "final")
+    final_guard = re.search(r"guard\s+(.*?)\s+else\s*\{", final_case, re.S)
+    assert final_guard, "HC-B06 违反：final 分支缺少真实 guard。"
+    conditions = final_guard.group(1)
+    for condition in ("a0.isFinite", "a1.isFinite", "a0 >= 0", "a1 >= a0"):
+        assert condition in conditions, f"HC-B06 违反：final guard 缺少真实条件 {condition}。"
+
+    selftest = (IOS / "Tests" / "NodeSelftest.swift").read_text(encoding="utf-8")
+    assert _count_marked_checks(selftest, "HC-B06") >= 6, (
+        "HC-B06 违反：NodeSelftest 的 HC-B06 marker 必须落在实际 check(...) 调用中，不能只写注释。"
     )

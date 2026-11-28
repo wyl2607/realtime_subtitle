@@ -95,9 +95,9 @@ struct NodeSelftest {
         check(NodeEvent.parse(#"{"ev":"ready"}"#) == nil, "ready 缺 cold → nil")
         check(NodeEvent.parse(#"{"ev":"final","id":3,"a0":1.0,"text":"x"}"#) == nil, "final 缺 a1 → nil")
         check(NodeEvent.parse(#"{"ev":"final","id":3,"a0":1.0,"a1":2.0}"#) == nil, "final 缺 text → nil")
-        check(NodeEvent.parse(#"{"ev":"final","id":3,"a0":-1.0,"a1":2.0,"text":"x"}"#) == nil, "final 负时间 → nil")
-        check(NodeEvent.parse(#"{"ev":"final","id":3,"a0":2.0,"a1":1.0,"text":"x"}"#) == nil, "final 倒序时间 → nil")
-        check(NodeEvent.parse(#"{"ev":"final","id":3,"a0":1e999,"a1":2.0,"text":"x"}"#) == nil, "final 非有限时间 → nil")
+        check(NodeEvent.parse(#"{"ev":"final","id":3,"a0":-1.0,"a1":2.0,"text":"x"}"#) == nil, "HC-B06: final 负时间 → nil")
+        check(NodeEvent.parse(#"{"ev":"final","id":3,"a0":2.0,"a1":1.0,"text":"x"}"#) == nil, "HC-B06: final 倒序时间 → nil")
+        check(NodeEvent.parse(#"{"ev":"final","id":3,"a0":1e999,"a1":2.0,"text":"x"}"#) == nil, "HC-B06: final 非有限时间 → nil")
         check(NodeEvent.parse(#"{"ev":"translation","text":"x"}"#) == nil, "translation 缺 id → nil")
         check(NodeEvent.parse(#"{"ev":"status","code":"c"}"#) == nil, "status 缺 text → nil")
         check(NodeEvent.parse(#"{"ev":"unknown"}"#) == nil, "未知 ev → nil")
@@ -281,19 +281,20 @@ struct NodeSelftest {
             readyTimeout: 0.3
         )
 
+        // HC-B06：两次 start 只作重复调用 smoke，不统计真实建连次数。
         session.start()
         session.start()
         let arrived = closed.wait(timeout: .now() + 2) == .success
-        check(arrived, "不可达节点应在 2s 内结束会话")
+        check(arrived, "HC-B06: 不可达节点应在 2s 内结束会话")
         // 等待 cancel 触发的 delegate 回调，确认它和看门狗竞争时不会重复通知上层。
         Thread.sleep(forTimeInterval: 0.1)
         let codes = closeCodes.current
-        check(codes.count == 1, "不可达节点 onClose 只能回调一次（实际 \(codes)）")
+        check(codes.count == 1, "HC-B06: 不可达节点 onClose 只能回调一次（实际 \(codes)）")
         check(codes.first == 1001 || codes.first == 1006,
-              "不可达节点应以握手超时或连接失败结束（实际 \(codes)）")
+              "HC-B06: 不可达节点应以握手超时或连接失败结束（实际 \(codes)）")
         session.handle(eventText: #"{"ev":"ready","cold":true}"#)
         let eventsAfterClose = eventCount.current
-        check(eventsAfterClose == 0, "notifyClosed 后的 ready 不应再上报事件（实际 \(eventsAfterClose)）")
+        check(eventsAfterClose == 0, "HC-B06: notifyClosed 后的 ready 不应再上报事件（实际 \(eventsAfterClose)）")
         session.close()
     }
 
