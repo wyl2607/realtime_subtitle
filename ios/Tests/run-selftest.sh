@@ -54,3 +54,6 @@ xcrun swiftc -O ios/RSiOS/LiveFeed.swift ios/Shared/SharedStore.swift ios/Shared
 # HC-U20：快捷指令 / 控制中心开始与停止的纯状态判定（重复触发忽略、广播互斥）。
 xcrun swiftc -O ios/Shared/CaptureArbiter.swift ios/Shared/MicCaptionIntentPolicy.swift ios/Tests/MicCaptionIntentPolicySelftest.swift -o .tmp/miccaptionintentselftest
 .tmp/miccaptionintentselftest
+# HC-B01：NetworkProbe 可取消闸门——保证 continuation 只恢复一次、取消即关闭连接不再等 5 秒。
+xcrun swiftc -swift-version 6 -O ios/Shared/NetworkProbeGate.swift ios/Tests/NetworkProbeSelftest.swift -o .tmp/networkprobeselftest
+.tmp/networkprobeselftest

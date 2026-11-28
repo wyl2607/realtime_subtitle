@@ -154,6 +154,7 @@ xcodebuild -project RSiOS.xcodeproj -scheme RSiOS -sdk iphoneos -configuration D
 | `LineStore.swift` | P5 行合并/覆盖规则，与 mac rslite 同源 |
 | `RecentLines.swift` | 「会话代号 + id」查行；切回节点前的收尾判定 |
 | `LocalEngineStatus.swift` | 状态行里的本机失败码 → 中文提示 |
+| `NetworkProbeGate.swift` | 诊断页网络探针的取消/单次恢复状态闸门 |
 | `DesignTokens.swift` | 由 `scripts/design/gen_tokens.py` 生成的设计令牌 |
 | `Resources/Info.plist` | 未被两个 target 编入（`project.yml` 排除了 `**/Resources/**`） |
 
@@ -181,6 +182,7 @@ xcodebuild -project RSiOS.xcodeproj -scheme RSiOS -sdk iphoneos -configuration D
 | `CaptureArbiterSelftest.swift` | 互斥与音频会话目标 |
 | `EngineRunGateSelftest.swift` | 旧回调不能跨轮次 |
 | `LocalEngineStatusSelftest.swift` | 失败码 → 文案映射 |
+| `NetworkProbeSelftest.swift` | 诊断页网络探针四路径与取消闸门自测 |
 | `fixtures/p5_cases.json` | 与 mac rslite 共用的 P5 用例 |
 | `fixtures/route_cases.json` | 与 mac rslite 共用的路由用例 |
 | `ios/scripts/archive.sh` | TestFlight 打包：Release archive → 导出或上传 ipa |

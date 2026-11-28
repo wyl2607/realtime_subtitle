@@ -1619,3 +1619,47 @@ def test_hc_b02_pcm_input_bounds_are_explicitly_guarded():
     assert "非交错双声道完整数据应产出一帧" in selftest, (
         "HC-B02 违反：PCMConverterSelftest 缺少非交错双声道边界回归用例。"
     )
+
+
+def test_hc_b03_network_probe_is_cancellable():
+    """硬约束 HC-B03：NetworkProbe 必须在任务取消时立即取消连接并退出，不再干等 5 秒。
+
+    违反的表现：handshakeMillis 只用裸 withCheckedContinuation（没有 withTaskCancellationHandler），
+    或者 run() 在 await handshakeMillis 返回后不检查 Task.isCancelled 就继续写状态/睡眠，
+    或者缺少 NetworkProbeGate / NetworkProbeSelftest 行为回归。
+
+    来源 bug：诊断页离开后 SwiftUI .task 被取消，但 NetworkProbe.run() 和 handshakeMillis()
+    不处理取消，只能等 NWConnection 状态变化或固定 5 秒超时才释放连接和回调。
+    必须怎么改：handshakeMillis 用 withTaskCancellationHandler 包住 withCheckedContinuation，
+    经 NetworkProbeGate 在取消时立即 cancel 连接并只恢复一次 continuation；run() 在 await 后先判
+    Task.isCancelled 再更新读数，并在 NetworkProbeSelftest 覆盖成功/失败/超时/取消四条路径。
+    """
+    probe = (IOS / "RSiOS" / "NetworkProbe.swift").read_text(encoding="utf-8")
+    assert "withTaskCancellationHandler" in probe, (
+        "HC-B03 违反：NetworkProbe.handshakeMillis 没有使用 withTaskCancellationHandler 处理取消"
+        "（来源 bug：诊断页离开后 withCheckedContinuation 不响应取消，仍保留 NWConnection 直到 5 秒超时）。"
+    )
+    assert "NetworkProbeGate" in probe and "gate.cancel()" in probe, (
+        "HC-B03 违反：NetworkProbe.handshakeMillis 没有在取消处理里调用 NetworkProbeGate.cancel()"
+        "（来源 bug：离开诊断页后连接与回调未立即取消，continuation 无法立刻恢复）。"
+    )
+    run_start = probe.index("func run()")
+    handshake_start = probe.index("static func handshakeMillis(")
+    run_body = probe[run_start:handshake_start]
+    await_pos = run_body.index("await (wifiMs, cellularMs)")
+    wifi_assign_pos = run_body.index("wifi = Reading(")
+    assert "Task.isCancelled" in run_body[await_pos:wifi_assign_pos], (
+        "HC-B03 违反：NetworkProbe.run() 在 await (wifiMs, cellularMs) 返回后没有先检查 Task.isCancelled"
+        "（来源 bug：任务取消后仍会把已取消的 nil 读数写回状态或继续循环）。"
+    )
+    assert (IOS / "Shared" / "NetworkProbeGate.swift").is_file(), (
+        "HC-B03 违反：缺少 ios/Shared/NetworkProbeGate.swift（continuation 只恢复一次 + 取消即结束状态机）。"
+    )
+    selftest_path = IOS / "Tests" / "NetworkProbeSelftest.swift"
+    assert selftest_path.is_file(), (
+        "HC-B03 违反：缺少 ios/Tests/NetworkProbeSelftest.swift 行为自测。"
+    )
+    run_selftest = (IOS / "Tests" / "run-selftest.sh").read_text(encoding="utf-8")
+    assert "NetworkProbeSelftest.swift" in run_selftest, (
+        "HC-B03 违反：ios/Tests/run-selftest.sh 没有接入 NetworkProbeSelftest.swift。"
+    )

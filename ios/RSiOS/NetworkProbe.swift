@@ -13,6 +13,8 @@ final class NetworkProbe {
         var millis: Int?
     }
 
+    nonisolated static let handshakeTimeoutSeconds: TimeInterval = 5
+
     private(set) var wifi = Reading(available: false, millis: nil)
     private(set) var cellular = Reading(available: false, millis: nil)
     private(set) var cellularConstrained = false
@@ -23,52 +25,69 @@ final class NetworkProbe {
             let paths = NetworkPaths.shared.snapshot
             cellularConstrained = paths.cellularConstrained
             proxyConfigured = CellularFallback.systemProxyConfigured()
+            guard !Task.isCancelled else { break }
             async let wifiMs = paths.wifi ? Self.handshakeMillis(over: .wifi) : nil
             async let cellularMs = paths.cellular ? Self.handshakeMillis(over: .cellular) : nil
             let (w, c) = await (wifiMs, cellularMs)
+            guard !Task.isCancelled else { break }
             wifi = Reading(available: paths.wifi, millis: w)
             cellular = Reading(available: paths.cellular, millis: c)
-            try? await Task.sleep(for: .seconds(10))
+            do {
+                try await Task.sleep(for: .seconds(10))
+            } catch {
+                break
+            }
         }
     }
 
     nonisolated static func handshakeMillis(over interface: NWInterface.InterfaceType) async -> Int? {
+        guard !Task.isCancelled else { return nil }
         let parameters = NWParameters(tls: NWProtocolTLS.Options(), tcp: NWProtocolTCP.Options())
         parameters.requiredInterfaceType = interface
         let connection = NWConnection(host: "api.groq.com", port: .https, using: parameters)
-        let once = ProbeOnce()
+        let gate = NetworkProbeGate()
         let started = ContinuousClock.now
-        return await withCheckedContinuation { (continuation: CheckedContinuation<Int?, Never>) in
-            let finish: @Sendable (Int?) -> Void = { value in
-                guard once.claim() else { return }
-                connection.stateUpdateHandler = nil
-                connection.cancel()
-                continuation.resume(returning: value)
-            }
-            connection.stateUpdateHandler = { state in
-                switch state {
-                case .ready:
-                    let elapsed = ContinuousClock.now - started
-                    finish(Int(elapsed.components.seconds * 1000 + elapsed.components.attoseconds / 1_000_000_000_000_000))
-                case .waiting, .failed, .cancelled:
-                    finish(nil)
-                default:
-                    break
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Int?, Never>) in
+                let timeoutTask = Task { [weak gate] in
+                    try? await Task.sleep(for: .seconds(handshakeTimeoutSeconds))
+                    guard !Task.isCancelled else { return }
+                    gate?.finish(nil)
+                }
+                guard gate.activate(
+                    resume: { continuation.resume(returning: $0) },
+                    cancelConnection: {
+                        connection.stateUpdateHandler = nil
+                        connection.cancel()
+                    },
+                    cancelTimeout: { timeoutTask.cancel() }
+                ) else {
+                    return
+                }
+                connection.stateUpdateHandler = { [weak gate] state in
+                    switch state {
+                    case .ready:
+                        let elapsed = ContinuousClock.now - started
+                        let millis = Int(
+                            elapsed.components.seconds * 1000
+                                + elapsed.components.attoseconds / 1_000_000_000_000_000
+                        )
+                        gate?.finish(millis)
+                    case .waiting, .failed, .cancelled:
+                        gate?.finish(nil)
+                    default:
+                        break
+                    }
+                }
+                connection.start(queue: .global(qos: .utility))
+                if gate.isFinished {
+                    timeoutTask.cancel()
+                    connection.stateUpdateHandler = nil
+                    connection.cancel()
                 }
             }
-            connection.start(queue: .global(qos: .utility))
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5) { finish(nil) }
-        }
-    }
-}
-
-private final class ProbeOnce: @unchecked Sendable {
-    private let lock = NSLock()
-    private var claimed = false
-    func claim() -> Bool {
-        lock.withLock {
-            defer { claimed = true }
-            return !claimed
+        } onCancel: {
+            gate.cancel()
         }
     }
 }
