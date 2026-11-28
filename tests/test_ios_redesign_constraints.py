@@ -22,6 +22,120 @@ def _locate(path: Path, text: str, index: int) -> str:
     return f"{path.relative_to(ROOT)}:{text.count(chr(10), 0, index) + 1}"
 
 
+def _strip_swift_comments_and_strings(source: str, *, keep_strings: bool = False) -> str:
+    """Replace Swift comments and string contents while preserving source shape."""
+    out = list(source)
+    i = 0
+    n = len(source)
+    block_depth = 0
+    while i < n:
+        if block_depth:
+            if source.startswith("/*", i):
+                block_depth += 1
+                out[i:i + 2] = "  "
+                i += 2
+            elif source.startswith("*/", i):
+                block_depth -= 1
+                out[i:i + 2] = "  "
+                i += 2
+            else:
+                if source[i] not in "\r\n":
+                    out[i] = " "
+                i += 1
+            continue
+        if source.startswith("//", i):
+            out[i:i + 2] = "  "
+            i += 2
+            while i < n and source[i] not in "\r\n":
+                out[i] = " "
+                i += 1
+            continue
+        if source.startswith("/*", i):
+            block_depth = 1
+            out[i:i + 2] = "  "
+            i += 2
+            continue
+        raw_hashes = 0
+        if source[i] == '"':
+            quote = i
+        elif source[i] == "#":
+            while i + raw_hashes < n and source[i + raw_hashes] == "#":
+                raw_hashes += 1
+            quote = i + raw_hashes
+            if quote >= n or source[quote] != '"':
+                i += 1
+                continue
+        else:
+            i += 1
+            continue
+        if source[quote] == '"':
+            start = i
+            i = quote + 1
+            multiline = source.startswith('""', i)
+            if multiline:
+                i += 2
+            escaped = False
+            while i < n:
+                if not multiline and raw_hashes == 0 and escaped:
+                    escaped = False
+                    i += 1
+                    continue
+                if not multiline and raw_hashes == 0 and source[i] == "\\":
+                    escaped = True
+                    i += 1
+                    continue
+                closing = ('"""' if multiline else '"') + ('#' * raw_hashes)
+                if source.startswith(closing, i):
+                    i += len(closing)
+                    break
+                i += 1
+            if not keep_strings:
+                for j in range(start, min(i, n)):
+                    if source[j] not in "\r\n":
+                        out[j] = " "
+            continue
+        i += 1
+    return "".join(out)
+
+
+def _extract_swift_brace_block(source: str, signature: str) -> str:
+    """Return the brace-delimited body following a Swift function signature."""
+    code = _strip_swift_comments_and_strings(source)
+    start = code.find(signature)
+    assert start >= 0, f"未找到 Swift 函数签名：{signature}"
+    opening = code.find("{", start + len(signature))
+    assert opening >= 0, f"未找到 Swift 函数体：{signature}"
+    depth = 0
+    for index in range(opening, len(code)):
+        if code[index] == "{":
+            depth += 1
+        elif code[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return code[opening + 1:index]
+    raise AssertionError(f"Swift 函数体括号未闭合：{signature}")
+
+
+def _swift_calls_containing_marker(source: str, function_name: str, marker: str) -> list[str]:
+    """Find real balanced calls whose source span contains a marker string."""
+    without_comments = _strip_swift_comments_and_strings(source, keep_strings=True)
+    code = _strip_swift_comments_and_strings(without_comments)
+    calls = []
+    for match in re.finditer(rf"\b{re.escape(function_name)}\s*\(", code):
+        depth = 0
+        for index in range(match.end() - 1, len(code)):
+            if code[index] == "(":
+                depth += 1
+            elif code[index] == ")":
+                depth -= 1
+                if depth == 0:
+                    span = without_comments[match.start():index + 1]
+                    if marker in span:
+                        calls.append(span)
+                    break
+    return calls
+
+
 def test_hc_u01_only_ios_26_and_newer():
     """硬约束 HC-U01：部署目标 iOS 26，源码里不许再有 iOS 26 以下的可用性分支。
 
@@ -68,10 +182,25 @@ def test_hc_b08_pairing_links_validate_language_codes():
     合法 de/zh 仍须通过。此断言会在改回旧实现时变红。
     """
     pairing = (IOS / "Shared" / "PairingLink.swift").read_text(encoding="utf-8")
-    assert "NodeHello.isValidLanguageCode(src)" in pairing and "NodeHello.isValidLanguageCode(dst)" in pairing, (
-        "HC-B08 违反（来源 bug：配对链接解析提前校验缺失）：PairingLink.parse 必须在保存 src/dst 前"
-        "复用 NodeHello.isValidLanguageCode；否则 DE、zh_CN、空值、超长值会拖到连接时才 1008 失败。"
+    body = _extract_swift_brace_block(pairing, "static func parse(_ string: String) -> NodeConfig?")
+    return_config = re.search(r"\breturn\s+NodeConfig\s*\(", body)
+    guard_with_both_checks = re.search(
+        r"\bguard\b(?:(?!\bguard\b).)*?"
+        r"NodeHello\.isValidLanguageCode\s*\(\s*src\s*\)"
+        r"(?:(?!\bguard\b).)*?"
+        r"NodeHello\.isValidLanguageCode\s*\(\s*dst\s*\)"
+        r"(?:(?!\bguard\b).)*?\belse\b",
+        body,
+        re.DOTALL,
     )
+    assert return_config and guard_with_both_checks and guard_with_both_checks.start() < return_config.start(), (
+        "HC-B08 违反（来源 bug：配对链接提前校验缺失）：PairingLink.parse 的函数体内必须在"
+        "return NodeConfig 前，用真实 guard 同时校验 src/dst；不能只保留字符串或丢弃校验返回值。"
+    )
+
+    selftest = (IOS / "Tests" / "PairingSelftest.swift").read_text(encoding="utf-8")
+    marker_checks = _swift_calls_containing_marker(selftest, "check", "HC-B08")
+    assert marker_checks, "HC-B08 违反：PairingSelftest.swift 必须保留带 HC-B08 标记的失败用例 check( 调用。"
 
 
 def test_hc_u03_observation_not_combine():
