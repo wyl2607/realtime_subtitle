@@ -7,6 +7,8 @@ import plistlib
 import re
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 IOS = ROOT / "ios"
 SOURCE_DIRS = ["RSiOS", "Engine", "Shared", "RSBroadcast", "RSLiveActivity"]
@@ -20,6 +22,202 @@ def _swift_files():
 
 def _locate(path: Path, text: str, index: int) -> str:
     return f"{path.relative_to(ROOT)}:{text.count(chr(10), 0, index) + 1}"
+
+
+def _mask_swift_comments_and_strings(source: str) -> str:
+    """Replace Swift comments/strings with spaces while preserving offsets."""
+    masked = list(source)
+    index = 0
+    in_line_comment = False
+    in_block_comment = False
+    block_depth = 0
+    in_string = False
+    multiline_string = False
+    escaped = False
+    while index < len(source):
+        char = source[index]
+        next_two = source[index:index + 2]
+        next_three = source[index:index + 3]
+        if in_line_comment:
+            if char == "\n":
+                in_line_comment = False
+            else:
+                masked[index] = " "
+            index += 1
+            continue
+        if in_block_comment:
+            if next_two == "/*":
+                block_depth += 1
+                masked[index:index + 2] = [" ", " "]
+                index += 2
+            elif next_two == "*/":
+                block_depth -= 1
+                masked[index:index + 2] = [" ", " "]
+                index += 2
+                if block_depth == 0:
+                    in_block_comment = False
+            else:
+                if char != "\n":
+                    masked[index] = " "
+                index += 1
+            continue
+        if in_string:
+            closes = next_three == '"""' if multiline_string else char == '"'
+            if closes and not escaped:
+                width = 3 if multiline_string else 1
+                masked[index:index + width] = [" "] * width
+                index += width
+                in_string = False
+                multiline_string = False
+            else:
+                if char != "\n":
+                    masked[index] = " "
+                escaped = char == "\\" and not escaped
+                if char != "\\":
+                    escaped = False
+                index += 1
+            continue
+        if next_two == "//":
+            masked[index:index + 2] = [" ", " "]
+            index += 2
+            in_line_comment = True
+        elif next_two == "/*":
+            masked[index:index + 2] = [" ", " "]
+            index += 2
+            in_block_comment = True
+            block_depth = 1
+        elif next_three == '"""':
+            masked[index:index + 3] = [" "] * 3
+            index += 3
+            in_string = True
+            multiline_string = True
+            escaped = False
+        elif char == '"':
+            masked[index] = " "
+            index += 1
+            in_string = True
+            multiline_string = False
+            escaped = False
+        else:
+            index += 1
+    return "".join(masked)
+
+
+def _extract_brace_block(source: str, pattern: str) -> str:
+    """Extract a Swift brace block after *pattern*, ignoring comments/strings."""
+    masked = _mask_swift_comments_and_strings(source)
+    match = re.search(pattern, masked)
+    assert match, f"HC-B07 违反：找不到应受约束的 Swift 区域：{pattern}。"
+    opening = masked.find("{", match.end())
+    assert opening >= 0, f"HC-B07 违反：Swift 区域没有函数体：{pattern}。"
+    depth = 0
+    for index in range(opening, len(masked)):
+        if masked[index] == "{":
+            depth += 1
+        elif masked[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return masked[opening + 1:index]
+    raise AssertionError("HC-B07 违反：Swift 花括号不配对，无法确认约束范围。")
+
+
+def _mask_swift_comments(source: str) -> str:
+    """Replace Swift comments with spaces while preserving string literals."""
+    masked = list(source)
+    index = 0
+    in_line_comment = False
+    in_block_comment = False
+    block_depth = 0
+    in_string = False
+    multiline_string = False
+    escaped = False
+    while index < len(source):
+        char = source[index]
+        next_two = source[index:index + 2]
+        next_three = source[index:index + 3]
+        if in_line_comment:
+            if char == "\n":
+                in_line_comment = False
+            else:
+                masked[index] = " "
+            index += 1
+            continue
+        if in_block_comment:
+            if next_two == "/*":
+                block_depth += 1
+                masked[index:index + 2] = [" ", " "]
+                index += 2
+            elif next_two == "*/":
+                block_depth -= 1
+                masked[index:index + 2] = [" ", " "]
+                index += 2
+                if block_depth == 0:
+                    in_block_comment = False
+            else:
+                if char != "\n":
+                    masked[index] = " "
+                index += 1
+            continue
+        if in_string:
+            closes = next_three == '"""' if multiline_string else char == '"'
+            if closes and not escaped:
+                index += 3 if multiline_string else 1
+                in_string = False
+                multiline_string = False
+            else:
+                escaped = char == "\\" and not escaped
+                if char != "\\":
+                    escaped = False
+                index += 1
+            continue
+        if next_two == "//":
+            masked[index:index + 2] = [" ", " "]
+            index += 2
+            in_line_comment = True
+        elif next_two == "/*":
+            masked[index:index + 2] = [" ", " "]
+            index += 2
+            in_block_comment = True
+            block_depth = 1
+        elif next_three == '"""':
+            index += 3
+            in_string = True
+            multiline_string = True
+            escaped = False
+        elif char == '"':
+            index += 1
+            in_string = True
+            multiline_string = False
+            escaped = False
+        else:
+            index += 1
+    return "".join(masked)
+
+
+def _count_marked_check_calls(source: str, marker: str) -> int:
+    """Count check(...) calls containing marker, excluding commented-out calls."""
+    uncommented = _mask_swift_comments(source)
+    index = 0
+    count = 0
+    while True:
+        match = re.search(r"\bcheck\s*\(", uncommented[index:])
+        if not match:
+            return count
+        opening = index + match.end() - 1
+        depth = 0
+        close = None
+        for position in range(opening, len(uncommented)):
+            if uncommented[position] == "(":
+                depth += 1
+            elif uncommented[position] == ")":
+                depth -= 1
+                if depth == 0:
+                    close = position
+                    break
+        assert close is not None, "HC-B07 违反：自测里的 check(...) 括号不配对。"
+        if marker in uncommented[opening:close + 1]:
+            count += 1
+        index = close + 1
 
 
 def test_hc_u01_only_ios_26_and_newer():
@@ -378,4 +576,91 @@ def test_hc_u17_retry_followups_generation_and_single_waiter():
     local = (IOS / "Engine" / "LocalEngine.swift").read_text(encoding="utf-8")
     assert "let waiter = Task { race.settle" not in local and "PreparedBroadcast" in local, (
         "违反：preparedSession 又为每一句新开 await ready.value 的 Task，prepareTranslation 卡住时会无界挂起。"
+    )
+
+
+def test_hc_b07_quota_ledger_persist_failure_visible_and_fail_closed():
+    """硬约束 HC-B07：额度账本落盘失败必须可见，且额度判定 fail-closed。
+
+    来源 bug：多处 `try? persistLocked()` 静默吞掉落盘失败，内存额度没落盘、重启后回退。
+
+    持久化失败必须记录并可查询，额度判定必须 fail-closed；这些源码约束要在旧实现回退时变红。
+    """
+    source = (IOS / "Shared" / "QuotaLedger.swift").read_text(encoding="utf-8")
+
+    persist = _extract_brace_block(source, r"private func persistLocked\(\) throws")
+    catch = re.search(r"catch\s*\{", persist)
+    assert catch, "HC-B07 违反：persistLocked 没有 catch 分支记录持久化失败。"
+    catch_body = _extract_brace_block(persist, r"catch\s*")
+    throw = re.search(r"\bthrow\s+error\b", catch_body)
+    assert throw, "HC-B07 违反：persistLocked catch 没有重新抛出原始持久化错误。"
+    for pattern, message in [
+        (r"_lastPersistError\s*=\s*error", "没有记录错误"),
+        (r"persistenceFailed\s*=\s*true", "没有置失败标志"),
+        (r"logger\.error\s*\(", "没有用 os Logger.error 记录落盘失败"),
+    ]:
+        match = re.search(pattern, catch_body)
+        assert match and match.start() < throw.start(), (
+            f"HC-B07 违反：persistLocked catch {message}，且必须在 throw error 之前。"
+        )
+
+    usage = _extract_brace_block(source, r"private func usageLocked\(now: Date\)")
+    usage_match = re.search(
+        r"usagePercent\s*:\s*persistenceFailed\s*\?\s*max\(\s*100\s*,\s*usagePercent\s*\)\s*:\s*usagePercent",
+        usage,
+    )
+    assert usage_match, (
+        "HC-B07 违反：usageLocked 未在持久化失败标志下执行 max(100, usagePercent) fail-closed；"
+        "来源 bug 是落盘失败后内存额度仍被判定为可放行。"
+    )
+
+    getter = _extract_brace_block(source, r"var lastPersistError: Error\?\s*")
+    lock = re.search(r"\block\.lock\s*\(\s*\)", getter)
+    read = re.search(r"\breturn\s+_lastPersistError\b", getter)
+    unlock = re.search(r"\block\.unlock\s*\(\s*\)", getter)
+    assert lock and read and unlock and lock.start() < read.start() and lock.start() < unlock.start(), (
+        "HC-B07 违反：lastPersistError 必须先 lock 再读，并安排 unlock；QuotaLedger 状态统一由 NSLock 保护。"
+    )
+
+    def assert_return_clamps_after_persist(function_body: str, label: str, expected: int) -> None:
+        persists = list(re.finditer(r"try\?\s+persistLocked\(\)", function_body))
+        clamps = list(re.finditer(
+            r"persistenceFailed\s*\?\s*max\(\s*100\s*,\s*usage\.usagePercent\s*\)\s*:\s*usage\.usagePercent",
+            function_body,
+        ))
+        assert len(clamps) == expected, (
+            f"HC-B07 违反：{label} 的返回值必须有 {expected} 个落盘后 fail-closed 钳制；"
+            "来源 bug 是落盘失败后仍返回失败前的旧 usagePercent。"
+        )
+        assert persists and all(
+            persist.start() < clamp.start() for persist, clamp in zip(persists[-expected:], clamps)
+        ), (
+            f"HC-B07 违反：{label} 的 usagePercent 钳制必须位于 persistLocked() 之后；"
+            "来源 bug 是先算 usage 再落盘。"
+        )
+
+    route = _extract_brace_block(source, r"func routeEvent\(at now: Date = Date\(\)\) -> RouteEvent")
+    take = _extract_brace_block(source, r"func takeConfirmedReset\(at now: Date = Date\(\)\) -> Double\?")
+    assert_return_clamps_after_persist(route, "routeEvent", expected=2)
+    assert_return_clamps_after_persist(take, "takeConfirmedReset", expected=1)
+
+    # Mutation gates: removing a clamp, or moving it into a comment, must both turn this gate red.
+    route_without_clamp = route.replace(
+        "persistenceFailed ? max(100, usage.usagePercent) : usage.usagePercent", "usage.usagePercent", 1
+    )
+    with pytest.raises(AssertionError, match="HC-B07 违反"):
+        assert_return_clamps_after_persist(route_without_clamp, "routeEvent mutation", expected=2)
+    route_comment_clamp = route.replace(
+        "persistenceFailed ? max(100, usage.usagePercent) : usage.usagePercent",
+        "/* persistenceFailed ? max(100, usage.usagePercent) : usage.usagePercent */ usage.usagePercent",
+        1,
+    )
+    with pytest.raises(AssertionError, match="HC-B07 违反"):
+        assert_return_clamps_after_persist(
+            _mask_swift_comments(route_comment_clamp), "routeEvent comment mutation", expected=2
+        )
+
+    selftest = (IOS / "Tests" / "QuotaLedgerSelftest.swift").read_text(encoding="utf-8")
+    assert _count_marked_check_calls(selftest, "HC-B07") == 5, (
+        "HC-B07 违反：QuotaLedgerSelftest 必须有 5 个含 HC-B07 的 check(...) 调用，注释里的 marker 不计数。"
     )

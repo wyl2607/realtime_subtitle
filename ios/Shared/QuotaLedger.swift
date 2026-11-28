@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import os
 
 /// 非有限 JSON 数字先替换成这个字符串：事件解码会把它当坏事件丢掉，账本级可空数值则会抛错并隔离。
 private enum QuotaLedgerNonFiniteMarker {
@@ -236,6 +237,19 @@ final class QuotaLedger: @unchecked Sendable {
     /// 本账本此前把额度打进过冷却。跟 rslite 的 `_quota_hot` 同义，但不落盘。
     private var quotaHot = false
 
+    /// 最近一次持久化失败；调用方目前会兼容地忽略 throwing API 的错误，因此必须可查询。
+    /// fail-closed 只在进程内有效：落盘失败时无法把失败标记写进同一块坏盘，重启后依赖下一次写入再失败阻断。
+    private var _lastPersistError: Error?
+    var lastPersistError: Error? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _lastPersistError
+    }
+    /// 持久化失败期间 fail-closed，避免内存状态在重启前被误判为可放行。
+    private var persistenceFailed = false
+
+    private static let logger = Logger(subsystem: "com.wyl2607.rsios.spike", category: "quota-ledger")
+
     private static let enterPercent = 90.0
     private static let recoverPercent = 80.0
     private static let maxResetSeconds = 86_400.0 + 60
@@ -262,14 +276,18 @@ final class QuotaLedger: @unchecked Sendable {
             let decoded = try Self.decodeSnapshot(data)
             snapshot = Self.pruned(decoded, now: now)
             if decoded.droppedInvalidRecovery {
+                lock.lock()
                 try? persistLocked()
+                lock.unlock()
             }
         } catch {
             let quarantined = Self.quarantine(url)
             snapshot = Self.saturatedSnapshot(now: now, requestLimit: limits.requestsPerDay)
             // 隔离失败（比如只读目录）也不能让账本停在内存里：能写就写，写不了就只保留饱和状态。
             if quarantined {
+                lock.lock()
                 try? persistLocked()
+                lock.unlock()
             }
         }
         // 重启已知当前 key 时，先废弃别的 key 的证明，再进行任何自动翻日判断（R2）。
@@ -283,6 +301,7 @@ final class QuotaLedger: @unchecked Sendable {
             quotaHot = true
         }
         if discardRecoveryOnClockRollbackLocked(at: ts) || advanceDayEpochIfRolloverConfirmedLocked(at: ts) {
+            // 构造期对象尚未发布，无并发访问者，故此处无需加锁。
             try? persistLocked()
         }
     }
@@ -464,7 +483,7 @@ final class QuotaLedger: @unchecked Sendable {
                 type: "quota_reset_confirmed",
                 status: nil,
                 retryAfter: nil,
-                usagePercent: usage.usagePercent
+                usagePercent: persistenceFailed ? max(100, usage.usagePercent) : usage.usagePercent
             )
         }
         updateQuotaHotLocked(usage)
@@ -475,7 +494,7 @@ final class QuotaLedger: @unchecked Sendable {
             type: "quota_update",
             status: nil,
             retryAfter: nil,
-            usagePercent: usage.usagePercent
+            usagePercent: persistenceFailed ? max(100, usage.usagePercent) : usage.usagePercent
         )
     }
 
@@ -499,7 +518,7 @@ final class QuotaLedger: @unchecked Sendable {
         snapshot.serverResetConsumed = true
         updateQuotaHotLocked(usage)
         try? persistLocked()
-        return usage.usagePercent
+        return persistenceFailed ? max(100, usage.usagePercent) : usage.usagePercent
     }
 
     /// 只读查询：当前恢复记录是否已按 R4 构成可信翻日。
@@ -543,12 +562,14 @@ final class QuotaLedger: @unchecked Sendable {
             Double(dayRequests) / Double(limits.requestsPerDay),
             dayAudio / limits.audioSecondsPerDay,
         ]
+        let usagePercent = (percentages.max() ?? 0) * 100
         return QuotaUsage(
             minuteRequests: minuteRequests,
             hourAudioSeconds: hourAudio,
             dayRequests: dayRequests,
             dayAudioSeconds: dayAudio,
-            usagePercent: (percentages.max() ?? 0) * 100
+            // HC-B07: 持久化失败后不能因重启丢账而放宽额度；本进程内也立即 fail-closed。
+            usagePercent: persistenceFailed ? max(100, usagePercent) : usagePercent
         )
     }
 
@@ -613,8 +634,16 @@ final class QuotaLedger: @unchecked Sendable {
     }
 
     private func persistLocked() throws {
-        let data = try JSONEncoder().encode(snapshot)
-        try Self.atomicWrite(data, to: url, mode: 0o600)
+        do {
+            let data = try JSONEncoder().encode(snapshot)
+            try Self.atomicWrite(data, to: url, mode: 0o600)
+            persistenceFailed = false
+        } catch {
+            _lastPersistError = error
+            persistenceFailed = true
+            Self.logger.error("QuotaLedger persistence failed; keeping quota fail-closed: \(String(describing: error), privacy: .public)")
+            throw error
+        }
     }
 
     private static func pruned(_ snapshot: QuotaLedgerSnapshot, now: Date) -> QuotaLedgerSnapshot {

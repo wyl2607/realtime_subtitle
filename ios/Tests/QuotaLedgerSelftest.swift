@@ -112,6 +112,46 @@ func runQuotaLedgerSelftest(_ check: @escaping (Bool, String) -> Void) {
         check(missing.usage(at: t0).dayRequests == 0, "账本文件不存在时不应饱和")
         check(!FileManager.default.fileExists(atPath: missingURL.path), "空账本初始化不应创建文件")
 
+        // HC-B07：持久化失败不能被 try? 静默吞掉，也不能让内存额度判定放宽。
+        let blocker = root.appendingPathComponent("not-a-directory")
+        try Data("blocker".utf8).write(to: blocker)
+        let unwritableURL = blocker.appendingPathComponent("quota-ledger.json")
+        let unwritable = QuotaLedger(url: unwritableURL, now: t0)
+        _ = try? unwritable.recordRequest(duration: 10, at: t0)
+        check(unwritable.lastPersistError != nil,
+              "HC-B07：持久化失败必须暴露 lastPersistError；来源 bug 是 try? persistLocked() 静默吞错")
+        check(unwritable.usage(at: t0).usagePercent >= 100,
+              "HC-B07：持久化失败时额度必须 fail-closed；来源 bug 是未落盘状态可被判定为可放行")
+        check((unwritable.routeEvent(at: t0).usagePercent ?? 0) >= 100,
+              "HC-B07：持久化失败时路由事件必须保持耗尽；来源 bug 是 try? persistLocked() 后仍按内存账本放行")
+
+        // HC-B07 第 4 轮：首次失败发生在公开返回路径内时，返回值也必须立即钳到耗尽。
+        func makePersistFailureLedger(_ name: String) throws -> (QuotaLedger, Date) {
+            let directory = root.appendingPathComponent(name)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let url = directory.appendingPathComponent("quota.json")
+            let ledger = QuotaLedger(url: url, limits: QuotaLedgerLimits(requestsPerDay: 20), now: t0)
+            for _ in 0..<18 { try ledger.recordRequest(duration: 10, at: t0) }
+            try ledger.correctRemainingRequests([
+                "x-ratelimit-remaining-requests": "2",
+                "x-ratelimit-reset-requests": "1s",
+            ], at: t0, keyFingerprint: "test-key", sentAt: t0)
+            _ = ledger.usage(at: t0)
+            try FileManager.default.removeItem(at: directory)
+            try Data("blocker".utf8).write(to: directory)
+            return (ledger, t0.addingTimeInterval(2))
+        }
+
+        let (routeFailureLedger, routeFailureTime) = try makePersistFailureLedger("route-failure")
+        let routeFailureEvent = routeFailureLedger.routeEvent(at: routeFailureTime)
+        check(routeFailureLedger.lastPersistError != nil && (routeFailureEvent.usagePercent ?? 0) >= 100,
+              "HC-B07：routeEvent 首次落盘失败后返回 usagePercent 必须 >=100；来源 bug 是先算 usage 再 try? persistLocked()")
+
+        let (takeFailureLedger, takeFailureTime) = try makePersistFailureLedger("take-failure")
+        let takeFailureUsage = takeFailureLedger.takeConfirmedReset(at: takeFailureTime)
+        check(takeFailureLedger.lastPersistError != nil && (takeFailureUsage ?? 0) >= 100,
+              "HC-B07：takeConfirmedReset 首次落盘失败后返回 usagePercent 必须 >=100；来源 bug 是先算 usage 再 try? persistLocked()")
+
         try Data("{".utf8).write(to: file)
         let broken = QuotaLedger(url: file, now: t0)
         check(broken.usage(at: t0).usagePercent == 100, "非法 JSON 账本应 fail-safe 为 usagePercent=100")
