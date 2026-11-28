@@ -1594,3 +1594,28 @@ def test_hc_b01_chunked_parser_checks_bounds_crlf_and_terminator():
     assert 'range(of: Data("\\r\\n\\r\\n".utf8))' in parser, (
         "HC-B01 违反：终止块没有验证 trailer 的最终 CRLF，截断响应可被判完成（来源：蜂窝 HTTP chunked bug）。"
     )
+
+
+def test_hc_b02_pcm_input_bounds_are_explicitly_guarded():
+    """硬约束 HC-B02：PCM 输入边界必须在拷贝/逐样本读取前受控。
+
+    来源 bug：奇数交错样本按完整数组 memcpy，以及截断 CMSampleBuffer 未校验原始字节数，
+    都会把已分配 buffer 或 block buffer 读写越界；完整的非交错双声道也必须保留覆盖。
+    """
+    converter = (IOS / "Shared" / "PCMConverter.swift").read_text(encoding="utf-8")
+    assert "memcpy(dst, base, frames * channels * MemoryLayout<Int16>.size)" in converter, (
+        "HC-B02 违反：来源 bug 的奇数样本拷贝仍按 samples.count 写入，可能越过 AVAudioPCMBuffer 已分配容量。"
+    )
+    assert re.search(
+        r"guard let raw = sampleBufferData\(sampleBuffer\),\s*\n\s*raw\.count >= frames \* channels \* bytesPerSample",
+        converter,
+    ), (
+        "HC-B02 违反：来源 bug 的截断 CMSampleBuffer 仍未在逐样本读取前校验 raw 字节数。"
+    )
+    selftest = (IOS / "Tests" / "PCMConverterSelftest.swift").read_text(encoding="utf-8")
+    assert "奇数样本数应丢弃尾部半帧" in selftest and "截断 CMSampleBuffer 应被丢弃" in selftest, (
+        "HC-B02 违反：PCMConverterSelftest 缺少奇数样本和截断 CMSampleBuffer 回归用例。"
+    )
+    assert "非交错双声道完整数据应产出一帧" in selftest, (
+        "HC-B02 违反：PCMConverterSelftest 缺少非交错双声道边界回归用例。"
+    )
