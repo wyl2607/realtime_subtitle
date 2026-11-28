@@ -984,8 +984,8 @@ def test_hc_u19_transcript_untranslated_retry():
         "HC-U19 违反：retryTranslation 必须先翻译成功再调用 store.updateTranslation 写回。"
     )
     saved_body, _, _ = _extract_braced_block(do_body, r"\bif\s+saved\s*\{")
-    assert "reload()" in saved_body, (
-        "HC-U19 违反：retryTranslation 写回存档成功后必须调用 reload() 刷新回看列表。"
+    assert re.search(r"\breload\s*\(", saved_body), (
+        "HC-U19 违反：retryTranslation 写回存档成功后必须调用 reload(...) 刷新回看列表。"
     )
     assert not re.search(r"\bprepareTranslation\s*\(", view_code), (
         "HC-U19 违反：TranscriptView 不得调用 prepareTranslation()。"
@@ -1111,4 +1111,61 @@ def test_hc_b10_retry_translation_not_overwritten_by_feed_reingest():
         for start in (m.start() for m in re.finditer(r"\bcheck\s*\(", selftest_code))
     ), (
         "HC-B10 违反：TranscriptStoreSelftest 必须包含带 HC-B10 标记的 check( 回归断言。"
+    )
+
+
+def test_hc_u22_history_multiday_archive():
+    """硬约束 HC-U22：回看页导出必须用所选日期，列日期方法必须校验文件名格式且不阻塞主线程。
+
+    为什么不行：如果 ShareLink / 导出继续写死 Date()，切换往日后点导出仍会导出今天（或空文件）；
+    如果列日期不校验 `yyyy-MM-dd.txt` 格式或直接在视图里同步扫目录，非法文件会导致崩溃或卡死主线程。
+    必须怎么改：TranscriptView 用 selectedDate 驱动 fileURL(for:) 与 ShareLink；
+    TranscriptStore.availableDates 在私有队列扫描并校验 yyyy-MM-dd.txt 文件名格式。
+    """
+    view = (IOS / "RSiOS" / "TranscriptView.swift").read_text(encoding="utf-8")
+    # 1. ShareLink / canExport / fileURL(for:) 不得再写死 Date()。
+    hardcoded_date_exports = list(re.finditer(r"fileURL\(\s*for:\s*Date\(\)\s*\)", view))
+    assert not hardcoded_date_exports, (
+        "HC-U22 违反：TranscriptView 里 fileURL(for:) 仍写死 Date()（"
+        + ", ".join(_locate(IOS / "RSiOS" / "TranscriptView.swift", view, m.start()) for m in hardcoded_date_exports)
+        + "），切换往日存档后导出会出错。必须改为 selectedDate。"
+    )
+    assert re.search(r"ShareLink\(\s*item:\s*(?:self\.)?store\.fileURL\(\s*for:\s*(?:self\.)?selectedDate\s*\)", view), (
+        "HC-U22 违反：TranscriptView 的 ShareLink(item:) 没有使用 store.fileURL(for: selectedDate)。"
+    )
+    assert "store.availableDates(" in view, (
+        "HC-U22 违反：TranscriptView 没有通过 TranscriptStore.availableDates() 获取存档日期。"
+    )
+    assert "contentsOfDirectory" not in view, (
+        "HC-U22 违反：TranscriptView 不得直接扫描目录，必须走 TranscriptStore 队列。"
+    )
+    for token_name in ("historySelectDate", "historyToday", "historyEmptySelectedDay"):
+        assert f"DesignTokens.Text.{token_name}" in view, (
+            f"HC-U22 违反：TranscriptView 缺少 DesignTokens.Text.{token_name}。"
+        )
+    for literal in ("选择日期", "当天没有字幕"):
+        for m in re.finditer(rf'"[^"]*{re.escape(literal)}[^"]*"', view):
+            raise AssertionError(
+                f"HC-U22 违反：{_locate(IOS / 'RSiOS' / 'TranscriptView.swift', view, m.start())} "
+                "写死了新文案字面量，必须改用 DesignTokens.Text.*"
+            )
+
+    # 2. TranscriptStore 列日期方法必须在私有队列扫描且校验 yyyy-MM-dd.txt 文件名格式。
+    store = (IOS / "RSiOS" / "TranscriptStore.swift").read_text(encoding="utf-8")
+    assert "func availableDates(" in store, (
+        "HC-U22 违反：TranscriptStore 缺少列出存档日期的 availableDates 方法。"
+    )
+    avail_idx = store.index("func availableDates(")
+    avail_end = store.index("func lines(", avail_idx)
+    avail_block = store[avail_idx:avail_end]
+    scan_idx = store.index("private func scanAvailableDates(")
+    scan_block = store[scan_idx:store.index("func fileURL(", scan_idx)]
+    assert "queue.async" in avail_block and "queue.sync" not in avail_block and "queue.sync" not in scan_block, (
+        "HC-U22 违反：TranscriptStore.availableDates 必须在私有队列上 async 执行，不得同步阻塞调用方。"
+    )
+    assert "parseDateKey(" in store and '.hasSuffix(".txt")' in store and "isDirectory" in store, (
+        "HC-U22 违反：TranscriptStore 列日期方法必须校验 yyyy-MM-dd.txt 文件名格式并排除目录。"
+    )
+    assert "isLenient = false" in store and "dateFormatter.string(from: parsedDate) == key" in store, (
+        "HC-U22 违反：TranscriptStore 必须做非宽松日期解析与往返校验，拒绝 2026-02-30 这类非法日期。"
     )

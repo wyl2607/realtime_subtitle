@@ -257,6 +257,97 @@ func runTranscriptStoreSelftest(_ check: @escaping (Bool, String) -> Void) {
             "找不到该句时不应为不存在的日期创建文件"
         )
     }
+
+    // 硬约束 HC-U22：列日期（空目录/不存在目录返回空、忽略非法文件名与目录、合法 yyyy-MM-dd.txt 倒序），
+    // 以及往日存档 updateTranslation 写回对应那天的文件而不污染今天。
+    let missingArchiveDir = base.appendingPathComponent("missing-archives")
+    let missingArchiveStore = TranscriptStore(directory: missingArchiveDir, now: { clock }, timeZone: timeZone)
+    check(fetchAvailableDates(missingArchiveStore).isEmpty, "不存在的目录应返回空日期列表")
+
+    let emptyArchiveDir = base.appendingPathComponent("empty-archives")
+    try? FileManager.default.createDirectory(at: emptyArchiveDir, withIntermediateDirectories: true)
+    let emptyArchiveStore = TranscriptStore(directory: emptyArchiveDir, now: { clock }, timeZone: timeZone)
+    check(fetchAvailableDates(emptyArchiveStore).isEmpty, "空目录应返回空日期列表")
+
+    let multiDir = base.appendingPathComponent("multi-archives")
+    try? FileManager.default.createDirectory(at: multiDir, withIntermediateDirectories: true)
+    for validName in ["2026-10-18.txt", "2026-10-22.txt", "2026-10-20.txt"] {
+        try? "10:00:00\tHallo.\t\ts1#1\n".write(
+            to: multiDir.appendingPathComponent(validName),
+            atomically: true,
+            encoding: .utf8
+        )
+    }
+    for invalidName in [
+        "notes.txt",
+        "2026-10-19.md",
+        "2026-10-21.txt.bak",
+        "2026-1-5.txt",
+        "2026-02-30.txt",
+        "2026-13-01.txt",
+        "2026-10-23",
+        ".2026-10-17.txt",
+    ] {
+        try? "invalid\n".write(
+            to: multiDir.appendingPathComponent(invalidName),
+            atomically: true,
+            encoding: .utf8
+        )
+    }
+    try? FileManager.default.createDirectory(
+        at: multiDir.appendingPathComponent("2026-10-24.txt"),
+        withIntermediateDirectories: true
+    )
+
+    let todayClock = date(year: 2026, month: 10, day: 22, hour: 15, minute: 0, second: 0, timeZone: timeZone)
+    let multiStore = TranscriptStore(directory: multiDir, now: { todayClock }, timeZone: timeZone)
+    let listedDates = fetchAvailableDates(multiStore)
+    let listedKeys = listedDates.map { multiStore.dateKey(for: $0) }
+    check(
+        listedKeys == ["2026-10-22", "2026-10-20", "2026-10-18"],
+        "列日期应忽略非法文件名与子目录并按日期倒序（实际 \(listedKeys)）"
+    )
+
+    // 往日句子点按重译写回对应那天的文件，不改今天文件。
+    if let pastDate = listedDates.last {
+        let pastLinesBefore = multiStore.lines(for: pastDate)
+        let todayURL = multiStore.fileURL(for: todayClock)
+        let todayBytesBefore = try? Data(contentsOf: todayURL)
+
+        check(pastLinesBefore.count == 1, "往日存档应读出 1 行（实际 \(pastLinesBefore.count)）")
+        if let pastLine = pastLinesBefore.first {
+            let updateDone = DispatchGroup()
+            let updateOutcome = LockedResults()
+            updateDone.enter()
+            multiStore.updateTranslation(for: pastLine, on: pastDate, dst: "往日补翻") { ok in
+                updateOutcome.append(ok)
+                updateDone.leave()
+            }
+            updateDone.wait()
+            multiStore.flush()
+
+            check(updateOutcome.snapshot() == [true], "往日 updateTranslation 应返回 true")
+
+            let reopenedMulti = TranscriptStore(directory: multiDir, now: { todayClock }, timeZone: timeZone)
+            let pastLinesAfter = reopenedMulti.lines(for: pastDate)
+            check(pastLinesAfter.first?.dst == "往日补翻", "往日译文应写回 2026-10-18.txt（实际 \(pastLinesAfter.first?.dst ?? "nil")）")
+
+            let todayBytesAfter = try? Data(contentsOf: todayURL)
+            check(todayBytesBefore == todayBytesAfter, "更新往日译文不应改动当天文件")
+        }
+    }
+}
+
+private func fetchAvailableDates(_ store: TranscriptStore) -> [Date] {
+    let group = DispatchGroup()
+    let box = LockedDates()
+    group.enter()
+    store.availableDates { dates in
+        box.set(dates)
+        group.leave()
+    }
+    group.wait()
+    return box.snapshot()
 }
 
 private func date(
@@ -294,6 +385,19 @@ private final class LockedResults: @unchecked Sendable {
     }
 
     func snapshot() -> [Bool] {
+        lock.withLock { values }
+    }
+}
+
+private final class LockedDates: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [Date] = []
+
+    func set(_ dates: [Date]) {
+        lock.withLock { values = dates }
+    }
+
+    func snapshot() -> [Date] {
         lock.withLock { values }
     }
 }

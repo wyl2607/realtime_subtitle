@@ -86,6 +86,7 @@ final class TranscriptStore: @unchecked Sendable {
         dateFormatter.locale = Locale(identifier: "en_US_POSIX")
         dateFormatter.timeZone = timeZone
         dateFormatter.dateFormat = "yyyy-MM-dd"
+        dateFormatter.isLenient = false
         self.dateFormatter = dateFormatter
 
         let timeFormatter = DateFormatter()
@@ -250,16 +251,92 @@ final class TranscriptStore: @unchecked Sendable {
         }
     }
 
+    /// 校验存档文件名是否严格符合 `yyyy-MM-dd.txt`（四位年-两位月-两位日 + `.txt`）。
+    static func parseDateKey(fromFileName fileName: String) -> String? {
+        guard fileName.count == 14, fileName.hasSuffix(".txt") else { return nil }
+        let stem = String(fileName.dropLast(4))
+        let bytes = Array(stem.utf8)
+        guard bytes.count == 10,
+              bytes[4] == UInt8(ascii: "-"),
+              bytes[7] == UInt8(ascii: "-") else {
+            return nil
+        }
+        for (index, byte) in bytes.enumerated() where index != 4 && index != 7 {
+            guard byte >= UInt8(ascii: "0") && byte <= UInt8(ascii: "9") else {
+                return nil
+            }
+        }
+        return stem
+    }
+
+    /// 扫描存档目录中所有合法 `yyyy-MM-dd.txt` 的日期，按日期倒序（最新在前）。
+    /// 目录 I/O 在私有串行队列上执行，不阻塞主线程。
+    func availableDates(completion: @escaping @Sendable ([Date]) -> Void) {
+        queue.async {
+            completion(self.scanAvailableDates())
+        }
+    }
+
+    /// 异步列出已有存档日期（按日期倒序）。
+    func availableDates() async -> [Date] {
+        await withCheckedContinuation { continuation in
+            availableDates { dates in
+                continuation.resume(returning: dates)
+            }
+        }
+    }
+
     /// 某一天存档里的所有行（从磁盘读回当天文件后给出），按写入顺序。
     func lines(for date: Date) -> [Line] {
         queue.sync {
-            let day = dateKey(for: date)
-            ensureLoaded(day)
-            let rows = days[day] ?? []
-            return rows.enumerated().map { offset, row in
-                Line(id: offset, time: row.time, src: row.src, dst: row.dst)
+            readLines(for: date)
+        }
+    }
+
+    /// 异步读取某一天存档里的所有行（在私有串行队列上执行磁盘 I/O）。
+    func loadLines(for date: Date) async -> [Line] {
+        await withCheckedContinuation { continuation in
+            queue.async {
+                continuation.resume(returning: self.readLines(for: date))
             }
         }
+    }
+
+    private func readLines(for date: Date) -> [Line] {
+        let day = dateKey(for: date)
+        ensureLoaded(day)
+        let rows = days[day] ?? []
+        return rows.enumerated().map { offset, row in
+            Line(id: offset, time: row.time, src: row.src, dst: row.dst)
+        }
+    }
+
+    private func scanAvailableDates() -> [Date] {
+        let fileManager = FileManager.default
+        guard let urls = try? fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        var seenKeys: Set<String> = []
+        var parsedDates: [Date] = []
+
+        for url in urls {
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory),
+                  !isDirectory.boolValue,
+                  let stem = Self.parseDateKey(fromFileName: url.lastPathComponent),
+                  let parsedDate = date(forKey: stem),
+                  seenKeys.insert(stem).inserted else {
+                continue
+            }
+            parsedDates.append(parsedDate)
+        }
+
+        return parsedDates.sorted(by: >)
     }
 
     func fileURL(for date: Date) -> URL {
@@ -268,6 +345,20 @@ final class TranscriptStore: @unchecked Sendable {
 
     func dateKey(for date: Date) -> String {
         dateFormatter.string(from: date)
+    }
+
+    func date(forKey key: String) -> Date? {
+        guard Self.parseDateKey(fromFileName: "\(key).txt") != nil,
+              let parsedDate = dateFormatter.date(from: key),
+              dateFormatter.string(from: parsedDate) == key else {
+            return nil
+        }
+        return parsedDate
+    }
+
+    func dayStart(for date: Date) -> Date {
+        let key = dateKey(for: date)
+        return dateFormatter.date(from: key) ?? date
     }
 
     func timeString(for date: Date) -> String {
