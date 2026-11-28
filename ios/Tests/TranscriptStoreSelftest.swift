@@ -46,6 +46,28 @@ func runTranscriptStoreSelftest(_ check: @escaping (Bool, String) -> Void) {
     check(day1Lines.first?[2] == "你好", "译文应写回同一行（实际 \(day1Lines.first?[2] ?? "nil")）")
     check(day1Lines.first?[0] == "23:59:50", "译文更新不应改掉原时间")
 
+    // 硬约束 HC-B10：重译写回后，最近句对的空译文回灌不能覆盖已保存的译文；
+    // 但引擎随后给出的非空新译文仍应覆盖旧译文。
+    let retryProtectionStore = TranscriptStore(
+        directory: base.appendingPathComponent("retry-protection"),
+        now: { clock },
+        timeZone: timeZone
+    )
+    let retryProtectionURL = retryProtectionStore.fileURL(for: clock)
+    retryProtectionStore.ingest([TranscriptStore.Sentence(id: 10, session: "hc-b10", src: "Guten Tag.", dst: "")])
+    retryProtectionStore.flush()
+    retryProtectionStore.updateTranslation(
+        for: retryProtectionStore.lines(for: clock)[0], on: clock, dst: "你好"
+    )
+    retryProtectionStore.flush()
+    retryProtectionStore.ingest([TranscriptStore.Sentence(id: 10, session: "hc-b10", src: "Guten Tag.", dst: "")])
+    retryProtectionStore.flush()
+    check(field(readLines(retryProtectionURL), 0, 2) == "你好", "违反 HC-B10：空译文回灌覆盖了已保存的译文")
+
+    retryProtectionStore.ingest([TranscriptStore.Sentence(id: 10, session: "hc-b10", src: "Guten Tag.", dst: "您好")])
+    retryProtectionStore.flush()
+    check(field(readLines(retryProtectionURL), 0, 2) == "您好", "违反 HC-B10：非空新译文没有覆盖旧译文")
+
     // 换了一个引擎会话（同一天、同一个 id）：必须追加新行，不能覆盖上一句。
     // 各引擎的 id 都从 1 重新计数，只按 id 去重就会把这一句写到上一句头上。
     store.ingest([TranscriptStore.Sentence(id: 1, session: "s2", src: "Guten Abend.", dst: "")])

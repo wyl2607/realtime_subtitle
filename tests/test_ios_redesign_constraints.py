@@ -606,9 +606,22 @@ def test_hc_u19_transcript_untranslated_retry():
     assert "translateWithTimeout(" in translate_body, (
         "HC-U19 违反：RetryTranslator.translate 必须调用带超时的 translateWithTimeout。"
     )
-    assert translate_body.index(".installed") < translate_body.index("translateWithTimeout("), (
-        "HC-U19 违反：RetryTranslator.translate 必须在确认 .installed 后才执行翻译。"
+    installed_guard = re.search(r"\bguard\s+status\s*==\s*\.installed\s+else\s*\{", translate_body)
+    installed_if = re.search(r"\bif\s+status\s*==\s*\.installed\s*\{", translate_body)
+    assert installed_guard or installed_if, (
+        "HC-U19 违反：RetryTranslator.translate 必须用 guard status == .installed else 或 "
+        "if status == .installed 的真实控制流阻止未安装资源翻译。"
     )
+    if installed_guard:
+        guard_body, _, _ = _extract_braced_block(translate_body, r"\bguard\s+status\s*==\s*\.installed\s+else\s*\{")
+        assert "throw" in guard_body and "assetsNotInstalled" in guard_body, (
+            "HC-U19 违反：.installed guard 的失败分支必须真正 throw/return，而不能只是读取比较结果。"
+        )
+    else:
+        installed_block, _, _ = _extract_braced_block(translate_body, r"\bif\s+status\s*==\s*\.installed\s*\{")
+        assert "translateWithTimeout(" in installed_block, (
+            "HC-U19 违反：只有 status == .installed 的 if 分支内才允许执行翻译。"
+        )
 
     timeout_bodies = _extract_func_bodies(actor_body, "translateWithTimeout")
     assert len(timeout_bodies) == 1, "HC-U19 违反：RetryTranslator 必须存在唯一的 translateWithTimeout 函数。"
@@ -642,6 +655,13 @@ def test_hc_u19_transcript_untranslated_retry():
         and "scheduleWrite()" in body
         for body in update_bodies
     ), "HC-U19 违反：TranscriptStore.updateTranslation 必须校验行身份后原地更新 dst 并调度写盘。"
+    async_update_bodies = [body for body in update_bodies if "withCheckedContinuation" in body]
+    assert len(async_update_bodies) == 1 and re.search(
+        r"\bupdateTranslation\s*\(\s*for:\s*line\b", async_update_bodies[0]
+    ), (
+        "HC-U19 违反：TranscriptStore.updateTranslation 的 async 重载必须委托给同步重载，"
+        "不能只满足另一个重载的身份校验。"
+    )
 
     policy = (IOS / "RSiOS" / "RetryTranslationPolicy.swift").read_text(encoding="utf-8")
     timeout_match = re.search(r"translationTimeout\s*:\s*TimeInterval\s*=\s*([0-9.]+)", policy)
@@ -656,3 +676,34 @@ def test_hc_u19_transcript_untranslated_retry():
                 raise AssertionError(
                     f"HC-U19 违反：{_locate(path, src, m.start())} 写死了新文案字面量，必须改用 DesignTokens.Text.*"
                 )
+
+
+def test_hc_b10_retry_translation_not_overwritten_by_feed_reingest():
+    """硬约束 HC-B10：最近句对回灌时，空译文不得覆盖已有译文。
+
+    来源 bug：AppModel 在 feed 变化及启动时把最近几句整批重新 ingest，其中未翻译句 dst == ""；
+    TranscriptStore.merge 曾对已有行无条件 `dst = dst`，用户点「未翻译 ⟳」重译成功的句子
+    下一句一到（或重启）就被冲回「未翻译」。
+    必须怎么做：merge 里 `let mergedDst = dst.isEmpty ? row.dst : dst`，dirty 判断和写回都用 mergedDst；
+    非空新译文仍以最后一版为准。
+    """
+    store = (IOS / "RSiOS" / "TranscriptStore.swift").read_text(encoding="utf-8")
+    store_code = _blank_swift_comments(store)
+    merge_bodies = _extract_func_bodies(store_code, "merge")
+    assert len(merge_bodies) == 1, "HC-B10 违反：TranscriptStore 必须存在唯一的 merge 函数。"
+    merge_body = merge_bodies[0]
+    assert "let mergedDst = dst.isEmpty ? row.dst : dst" in merge_body, (
+        "HC-B10 违反：merge 必须用已有非空译文保护空 dst 回灌。"
+    )
+    assert "row.dst != mergedDst" in merge_body and "dst = mergedDst" in merge_body, (
+        "HC-B10 违反：merge 的 dirty 判断和写回都必须使用 mergedDst。"
+    )
+
+    selftest = (IOS / "Tests" / "TranscriptStoreSelftest.swift").read_text(encoding="utf-8")
+    selftest_code = _blank_swift_comments(selftest)
+    assert any(
+        "HC-B10" in selftest_code[start:start + 800]
+        for start in (m.start() for m in re.finditer(r"\bcheck\s*\(", selftest_code))
+    ), (
+        "HC-B10 违反：TranscriptStoreSelftest 必须包含带 HC-B10 标记的 check( 回归断言。"
+    )

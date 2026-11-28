@@ -210,10 +210,12 @@ final class TranscriptStore: @unchecked Sendable {
 
             if let location = index[key] {
                 let row = days[location.day]![location.row]
-                // 同一句（原文/译文都允许以最后一版为准）。
-                if row.src != src || row.dst != dst {
+                // 最近句对回灌时，空译文只是“尚未到达”，不能抹掉已经补译的结果。
+                // 非空译文仍以最后一版为准，允许引擎改进翻译。
+                let mergedDst = dst.isEmpty ? row.dst : dst
+                if row.src != src || row.dst != mergedDst {
                     days[location.day]![location.row].src = src
-                    days[location.day]![location.row].dst = dst
+                    days[location.day]![location.row].dst = mergedDst
                     dirtyDays.insert(location.day)
                 }
                 continue
