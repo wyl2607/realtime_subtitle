@@ -141,16 +141,28 @@ func runCloudClientSelftest(_ check: @escaping (Bool, String) -> Void) {
             let body = #"{"text":"bad","segments":"# + segments + #"}"#
             do {
                 _ = try CloudClient.parse(statusCode: 200, headers: [:], body: Data(body.utf8), a0: 0)
-                check(false, "非法 segment 时间应让整条响应 decodeFailed：\(segments)")
+                check(false, "HC-B09 非法 segment 时间应让整条响应 decodeFailed：\(segments)")
             } catch let error as CloudClientError {
                 if case .decodeFailed = error {
                     // 预期：不把部分非法响应交给下游字幕区间。
                 } else {
-                    check(false, "非法 segment 时间应抛 decodeFailed，实际 \(error)")
+                    check(false, "HC-B09 非法 segment 时间应抛 decodeFailed，实际 \(error)")
                 }
             } catch {
-                check(false, "非法 segment 时间应抛 CloudClientError，实际 \(error)")
+                check(false, "HC-B09 非法 segment 时间应抛 CloudClientError，实际 \(error)")
             }
+        }
+    }
+
+    do {
+        let body = #"{"text":"overlap","segments":[{"start":0,"end":5,"text":"outer"},{"start":2,"end":3,"text":"inner"},{"start":3,"end":3,"text":"zero"}]}"#
+        do {
+            let result = try CloudClient.parse(statusCode: 200, headers: [:], body: Data(body.utf8), a0: 10)
+            check(result.segments.count == 3, "HC-B09 重叠/嵌套与零长度 segment 应解析成功")
+            check(result.segments[1].t0 == 12 && result.segments[1].t1 == 13,
+                  "HC-B09 重叠 segment 应保留原始时间范围")
+        } catch {
+            check(false, "HC-B09 重叠/嵌套 segment 不应被 previousEnd 单调约束拒绝：\(error)")
         }
     }
 
