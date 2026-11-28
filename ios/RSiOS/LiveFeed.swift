@@ -4,9 +4,9 @@ import os
 
 /// 主 App 唯一的运行态来源：扩展状态行、最近句对、未定稿草稿。
 ///
-/// 为什么合并：这三份值都存在共享 Keychain 里，广播扩展每写一次就发一条 Darwin
+/// 为什么合并：这三份值都存在 App Group 共享容器（SharedStore）里，广播扩展每写一次就发一条 Darwin
 /// 通知。以前主界面和画中画各自开定时器各读各的——四个 0.5 秒轮询叠起来约每秒
-/// 十四次 SecItem 读取，而且内容没变也照样解 JSON、发布、整棵视图树重绘。
+/// 十几次读取，而且内容没变也照样解 JSON、发布、整棵视图树重绘。
 /// 现在只在这里读一次，内容真的变了才写属性（@Observable 只在属性变化时通知）。
 ///
 /// 为什么还留 0.5 秒轮询：Darwin 通知在扩展崩溃、系统合并通知时会丢；
@@ -43,9 +43,9 @@ final class LiveFeed {
     private var darwinObservers: [UnsafeRawPointer] = []
 
     init(
-        readStatus: @escaping () -> String? = { SharedKeychain.readExtStatus() },
-        readLines: @escaping () -> String? = { SharedKeychain.readLatestLines() },
-        readDraft: @escaping () -> String? = { SharedKeychain.readLatestDraft() },
+        readStatus: @escaping () -> String? = { SharedStore.readExtStatus() },
+        readLines: @escaping () -> String? = { SharedStore.readLatestLines() },
+        readDraft: @escaping () -> String? = { SharedStore.readLatestDraft() },
         now: @escaping () -> Date = Date.init
     ) {
         self.readStatus = readStatus

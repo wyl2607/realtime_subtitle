@@ -7,16 +7,9 @@ public enum SharedKeychain {
     public static let accessGroupPrefix = "com.yilinwang.realtimesubtitle.shared"
 
     public enum Account {
-        public static let extStatus = "ext_status"
         public static let nodeConfig = "node_config"
-        public static let latestLines = "latest_lines"
-        /// 未定稿的实时草稿原文：只给主界面/画中画显示，不进字幕存档。
-        public static let latestDraft = "latest_draft"
-        public static let engineMode = "engine_mode"
         /// Groq API key。只进 Keychain：UserDefaults 会随备份/共享出去，日志和 URL 更不能带。
         public static let groqKey = "groq_key"
-        /// 云端开关（用户是否允许把音频片段发给 Groq）。
-        public static let cloudEnabled = "cloud_enabled"
     }
 
     private static let logger = Logger(subsystem: "com.wyl2607.rsios.spike", category: "shared-keychain")
@@ -71,10 +64,7 @@ public enum SharedKeychain {
     /// App 启动（前台、已解锁）时把所有已有条目改成锁屏可读。节点配置、档位、key 这些
     /// 很少重写，不迁移的话熄屏后引擎重连时仍然读不到。没有的条目跳过。
     public static func migrateAccessibility() {
-        let accounts = [
-            Account.extStatus, Account.nodeConfig, Account.latestLines, Account.latestDraft,
-            Account.engineMode, Account.groqKey, Account.cloudEnabled,
-        ]
+        let accounts = [Account.nodeConfig, Account.groqKey]
         for account in accounts {
             let status = SecItemUpdate(
                 itemQuery(account: account) as CFDictionary,
@@ -115,50 +105,12 @@ public enum SharedKeychain {
     }
 
     @discardableResult
-    public static func writeExtStatus(_ string: String) -> Bool {
-        write(string, account: Account.extStatus)
-    }
-
-    public static func readExtStatus() -> String? {
-        read(account: Account.extStatus)
-    }
-
-    @discardableResult
     public static func writeNodeConfig(_ string: String) -> Bool {
         write(string, account: Account.nodeConfig)
     }
 
     public static func readNodeConfig() -> String? {
         read(account: Account.nodeConfig)
-    }
-
-    @discardableResult
-    public static func writeLatestLines(_ string: String) -> Bool {
-        write(string, account: Account.latestLines)
-    }
-
-    public static func readLatestLines() -> String? {
-        read(account: Account.latestLines)
-    }
-
-    @discardableResult
-    public static func writeLatestDraft(_ string: String) -> Bool {
-        write(string, account: Account.latestDraft)
-    }
-
-    public static func readLatestDraft() -> String? {
-        read(account: Account.latestDraft)
-    }
-
-    @discardableResult
-    public static func writeEngineMode(_ string: String) -> Bool {
-        write(string, account: Account.engineMode)
-    }
-
-    /// 没写过或读到不认识的旧值都按 `auto` 处理：升级后的老用户默认获得自动回退，
-    /// 已有的 `node` / `local` 值原样返回，显式选择不会被改掉。
-    public static func readEngineMode() -> String {
-        EngineMode.normalized(read(account: Account.engineMode)).rawValue
     }
 
     // MARK: - 云端档（Groq）
@@ -196,16 +148,6 @@ public enum SharedKeychain {
         guard let key = readGroqKey() else { return nil }
         guard key.count > 4 else { return String(repeating: "*", count: key.count) }
         return "••••" + key.suffix(4)
-    }
-
-    /// 云端开关。没写过时默认关：隐私默认是「不发到云端」（spec 002 C7）。
-    @discardableResult
-    public static func writeCloudEnabled(_ enabled: Bool) -> Bool {
-        write(enabled ? "1" : "0", account: Account.cloudEnabled)
-    }
-
-    public static func readCloudEnabled() -> Bool {
-        read(account: Account.cloudEnabled) == "1"
     }
 
     public static func delete(account: String) -> Bool {
