@@ -46,7 +46,8 @@ enum NodeEvent {
             guard let id = intValue(object["id"]),
                   let a0 = doubleValue(object["a0"]),
                   let a1 = doubleValue(object["a1"]),
-                  let text = object["text"] as? String else { return nil }
+                  let text = object["text"] as? String,
+                  a0.isFinite, a1.isFinite, a0 >= 0, a1 >= a0 else { return nil }
             return .final(id: id, a0: a0, a1: a1, text: text)
         case "translation":
             guard let id = intValue(object["id"]),
@@ -202,6 +203,7 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate, @unchecked Senda
     private let lock = NSLock()
     private var session: URLSession?
     private var socket: URLSessionWebSocketTask?
+    private var started = false
     private var closeNotified = false
     private var readyReceived = false
     private var preReadyFrames: [Data] = []
@@ -246,10 +248,11 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate, @unchecked Senda
 
     func start() {
         lock.lock()
-        guard !closeNotified else {
+        guard !closeNotified, !started else {
             lock.unlock()
             return
         }
+        started = true
         lock.unlock()
         guard let hello = NodeHello(src: src, dst: dst) else {
             notifyClosed(1008)
@@ -278,6 +281,8 @@ final class NodeSession: NSObject, URLSessionWebSocketDelegate, @unchecked Senda
         lock.lock()
         guard !closeNotified else {
             lock.unlock()
+            socket.cancel(with: .goingAway, reason: nil)
+            session.finishTasksAndInvalidate()
             return
         }
         self.session = session
