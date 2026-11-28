@@ -170,11 +170,24 @@ enum HTTPResponseParser {
                 return nil
             }
             index = lineEnd.upperBound
-            if size == 0 { return body }
-            guard data.distance(from: index, to: data.endIndex) >= size + 2 else { return nil }
+            if size == 0 {
+                // The zero-size chunk is followed by either an empty trailer
+                // or trailer fields, both terminated by the final CRLF.
+                let remaining = data.distance(from: index, to: data.endIndex)
+                if remaining >= 2 {
+                    let emptyTrailerEnd = data.index(index, offsetBy: 2)
+                    if data[index..<emptyTrailerEnd] == crlf { return body }
+                }
+                guard data[index...].range(of: Data("\r\n\r\n".utf8)) != nil else { return nil }
+                return body
+            }
+            let remaining = data.distance(from: index, to: data.endIndex)
+            guard size <= remaining, remaining - size >= 2 else { return nil }
             let chunkEnd = data.index(index, offsetBy: size)
+            let chunkCRLFEnd = data.index(chunkEnd, offsetBy: 2)
+            guard data[chunkEnd..<chunkCRLFEnd] == crlf else { return nil }
             body.append(data[index..<chunkEnd])
-            index = data.index(chunkEnd, offsetBy: 2)
+            index = chunkCRLFEnd
         }
     }
 }
