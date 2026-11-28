@@ -30,7 +30,7 @@ struct CaptureArbiterSelftest {
                 now: now,
                 micIsRunning: false
             ) == .allowMicStart,
-            "过期 broadcast 状态行不应阻止麦克风"
+            "HC-B05：过期 broadcast 状态行不应阻止麦克风"
         )
         check(
             CaptureArbiter.decide(

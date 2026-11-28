@@ -453,6 +453,91 @@ def _strip_swift_comments(text: str) -> str:
     return "".join(out)
 
 
+def _strip_swift_comments_and_strings_preserving_layout(text: str) -> str:
+    """用空白替换 Swift 注释和字符串，保留索引/换行以便精确定位代码块。"""
+    chars = list(text)
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] == '"':
+            chars[i] = " "
+            i += 1
+            while i < n:
+                if text[i] == "\\":
+                    chars[i] = " "
+                    i += 1
+                    if i < n and text[i] != "\n":
+                        chars[i] = " "
+                        i += 1
+                    continue
+                if text[i] == '"':
+                    chars[i] = " "
+                    i += 1
+                    break
+                if text[i] != "\n":
+                    chars[i] = " "
+                i += 1
+            continue
+        if text.startswith("//", i):
+            while i < n and text[i] != "\n":
+                chars[i] = " "
+                i += 1
+            continue
+        if text.startswith("/*", i):
+            chars[i] = chars[i + 1] = " "
+            i += 2
+            while i < n:
+                if text.startswith("*/", i):
+                    chars[i] = chars[i + 1] = " "
+                    i += 2
+                    break
+                if text[i] != "\n":
+                    chars[i] = " "
+                i += 1
+            continue
+        i += 1
+    return "".join(chars)
+
+
+def _extract_swift_code_block(text: str, header_pattern: str) -> str:
+    """先剥掉注释/字符串，再按配对花括号截取 Swift 代码块。"""
+    code = _strip_swift_comments_and_strings_preserving_layout(text)
+    match = re.search(header_pattern, code)
+    assert match is not None, f"找不到声明：{header_pattern}"
+    start = code.index("{", match.end() - 1)
+    depth = 0
+    for i in range(start, len(code)):
+        if code[i] == "{":
+            depth += 1
+        elif code[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return code[start:i + 1]
+    raise AssertionError(f"{header_pattern} 的花括号没有配平")
+
+
+def _count_check_calls_with_marker(text: str, marker: str) -> int:
+    """只统计同一个 check(...) 调用参数中的 marker，忽略注释和字符串外的括号。"""
+    code = _strip_swift_comments_and_strings_preserving_layout(text)
+    count = 0
+    for match in re.finditer(r"\bcheck\s*\(", code):
+        depth = 0
+        end = None
+        for i in range(match.end() - 1, len(code)):
+            if code[i] == "(":
+                depth += 1
+            elif code[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        assert end is not None, "check( 调用括号没有配平"
+        original_call = text[match.start():end]
+        if marker in original_call:
+            count += 1
+    return count
+
+
 def test_hc_u18_non_secret_shared_data_uses_app_group_store():
     """硬约束 HC-U18：非机密共享数据改走 App Group 容器（SharedStore），Keychain 只留机密。
 
@@ -631,37 +716,49 @@ def test_hc_b05_cold_start_reads_persisted_status_timestamp():
     assert re.search(r"\bstruct\s+ExtStatusEntry\b", store_code), (
         "HC-B05 违反：SharedStore.swift 缺少带时间戳的 ExtStatusEntry 返回结构。"
     )
-    write_ext_body = _strip_swift_comments(
-        _extract_brace_block(store_text, r"public\s+func\s+writeExtStatus\b[^{]*\{")
+    write_ext_body = _extract_swift_code_block(
+        store_text, r"public\s+func\s+writeExtStatus\b[^{]*\{"
     )
-    assert "timeIntervalSince1970" in write_ext_body and "updatedAt" in write_ext_body, (
-        "HC-B05 违反：SharedStore.writeExtStatus 没有同时持久化写入时间戳。"
+    payload_match = re.search(
+        r"let\s+payload\s*=\s*ExtStatusPayload\s*\(\s*status:\s*string\s*,\s*updatedAt:\s*updatedAt\.timeIntervalSince1970\s*\)",
+        write_ext_body,
     )
-    decode_ext_body = _strip_swift_comments(
-        _extract_brace_block(store_text, r"func\s+decodeExtStatusEntry\b[^{]*\{")
+    write_match = re.search(r"write\s*\(\s*encoded\s*,\s*key:\s*Key\.extStatus\s*\)", write_ext_body)
+    assert payload_match and write_match and payload_match.end() < write_match.start(), (
+        "HC-B05 违反：SharedStore.writeExtStatus 必须先构造含 updatedAt 的 ExtStatusPayload，"
+        "再把编码后的结构写入 ext_status。"
+    )
+    decode_ext_body = _extract_swift_code_block(
+        store_text, r"func\s+decodeExtStatusEntry\b[^{]*\{"
     )
     assert "updatedAt" in decode_ext_body and "isFinite" in decode_ext_body, (
         "HC-B05 违反：SharedStore.decodeExtStatusEntry 没有解码持久化时间戳或缺少有限值校验。"
     )
 
     engine_text = (IOS / "Engine" / "SubtitleEngine.swift").read_text(encoding="utf-8")
-    write_status_body = _strip_swift_comments(
-        _extract_brace_block(engine_text, r"private\s+func\s+writeStatus\s*\([^)]*\)\s*\{")
+    write_status_body = _extract_swift_code_block(
+        engine_text, r"private\s+func\s+writeStatus\s*\([^)]*\)\s*\{"
     )
     assert re.search(r"SharedStore\.writeExtStatus\([^)]*,\s*at:\s*Date\(\)\s*\)", write_status_body), (
         "HC-B05 违反：SubtitleEngine.writeStatus 写状态时没有同时传写入时间（at: Date()）。"
     )
 
     feed_text = (IOS / "RSiOS" / "LiveFeed.swift").read_text(encoding="utf-8")
-    feed_code = _strip_swift_comments(feed_text)
-    assert "SharedStore.readExtStatusEntry()" in feed_code, (
-        "HC-B05 违反：LiveFeed.init 默认没有调用 SharedStore.readExtStatusEntry() 读取持久化时间戳。"
+    feed_code = _strip_swift_comments_and_strings_preserving_layout(feed_text)
+    init_match = re.search(r"\binit\s*\((?P<params>.*?)\)\s*\{", feed_code, re.DOTALL)
+    assert init_match is not None, "HC-B05 违反：找不到 LiveFeed.init 参数列表。"
+    init_params = init_match.group("params")
+    assert re.search(
+        r"readStatus:\s*@escaping\s*\(\s*\)\s*->\s*SharedStore\.ExtStatusEntry\?\s*=\s*\{\s*SharedStore\.readExtStatusEntry\(\)\s*\}",
+        init_params,
+    ), (
+        "HC-B05 违反：LiveFeed.init 的默认 readStatus 闭包必须实际调用 SharedStore.readExtStatusEntry()。"
     )
-    assert not re.search(r"SharedStore\.readExtStatus\(\)", feed_code), (
-        "HC-B05 违反：LiveFeed 又回退到不带时间戳的 SharedStore.readExtStatus()。"
+    assert not re.search(r"SharedStore\.readExtStatus\(\)", init_params), (
+        "HC-B05 违反：LiveFeed.init 默认 readStatus 不得回退到不带时间戳的 readExtStatus()。"
     )
-    refresh_body = _strip_swift_comments(
-        _extract_brace_block(feed_text, r"\bfunc\s+refresh\s*\(\s*\)\s*\{")
+    refresh_body = _extract_swift_code_block(
+        feed_text, r"\bfunc\s+refresh\s*\(\s*\)\s*\{"
     )
     assert re.search(r"lastStatusUpdate\s*=", refresh_body) and "entry.updatedAt" in refresh_body, (
         "HC-B05 违反：LiveFeed.refresh() 没有从持久化时间戳更新 lastStatusUpdate（不能只靠进程内 Darwin 通知）。"
@@ -671,8 +768,8 @@ def test_hc_b05_cold_start_reads_persisted_status_timestamp():
     )
 
     arbiter_text = (IOS / "Shared" / "CaptureArbiter.swift").read_text(encoding="utf-8")
-    fresh_body = _strip_swift_comments(
-        _extract_brace_block(arbiter_text, r"private\s+static\s+func\s+isFreshBroadcast\b[^{]*\{")
+    fresh_body = _extract_swift_code_block(
+        arbiter_text, r"private\s+static\s+func\s+isFreshBroadcast\b[^{]*\{"
     )
     assert ">= 0" in fresh_body and "<= broadcastFreshness" in fresh_body, (
         "HC-B05 违反：CaptureArbiter.isFreshBroadcast 缺少未来时间戳（>= 0）或窗口上限（<= broadcastFreshness）校验。"
@@ -680,9 +777,11 @@ def test_hc_b05_cold_start_reads_persisted_status_timestamp():
 
     live_feed_selftest = (IOS / "Tests" / "LiveFeedSelftest.swift").read_text(encoding="utf-8")
     arbiter_selftest = (IOS / "Tests" / "CaptureArbiterSelftest.swift").read_text(encoding="utf-8")
-    assert live_feed_selftest.count("HC-B05") >= 4, (
-        "HC-B05 违反：LiveFeedSelftest 缺少冷启动/过期/未来时间戳/旧格式无时间戳的行为用例。"
+    assert _count_check_calls_with_marker(live_feed_selftest, "HC-B05") >= 4, (
+        "HC-B05 违反：LiveFeedSelftest 缺少真正带 HC-B05 的 check( 调用，"
+        "应覆盖冷启动/过期/未来时间戳/旧格式无时间戳。"
     )
-    assert arbiter_selftest.count("HC-B05") >= 3, (
-        "HC-B05 违反：CaptureArbiterSelftest 缺少未来时间戳与旧格式无时间戳的互斥用例。"
+    assert _count_check_calls_with_marker(arbiter_selftest, "HC-B05") >= 3, (
+        "HC-B05 违反：CaptureArbiterSelftest 缺少真正带 HC-B05 的 check( 调用，"
+        "应覆盖过期/未来时间戳/旧格式无时间戳。"
     )
