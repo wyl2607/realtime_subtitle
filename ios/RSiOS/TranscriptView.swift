@@ -11,7 +11,10 @@ struct TranscriptView: View {
     let refreshToken: Int
 
     @State private var lines: [TranscriptStore.Line] = []
+    @State private var loadedDate = Date()
     @State private var query = ""
+    @State private var translator = RetryTranslator()
+    @State private var retryStatuses: [RetryLineKey: RetryLineStatus] = [:]
     /// 回看默认最新在上：打开就看到刚才那句，不用滑到底。用户可在工具栏切回时间顺序，记住选择。
     @AppStorage("transcriptNewestFirst") private var newestFirst = true
 
@@ -85,19 +88,21 @@ struct TranscriptView: View {
         .onChange(of: refreshToken) { _, _ in reload() }
     }
 
-    /// 每句一张卡片，配色和桌面版一致：原文近白、译文暖黄、没译文显示占位符。
+    /// 每句一张卡片，配色和桌面版一致：原文近白、译文暖黄、没译文显示可点按的重试按钮。
     private func card(_ line: TranscriptStore.Line) -> some View {
-        VStack(alignment: .leading, spacing: DesignTokens.Space.xs) {
+        let retryKey = RetryLineKey(id: line.id, time: line.time, src: line.src)
+        let retryStatus = retryStatuses[retryKey] ?? .idle
+        let needsTranslation = line.dst.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+
+        return VStack(alignment: .leading, spacing: DesignTokens.Space.xs) {
             Text(line.time)
                 .font(.caption)
                 .foregroundColor(Color(tokenHex: DesignTokens.Color.subtitleSecondary))
             Text(line.src)
                 .font(.system(size: bodyFontSize * DesignTokens.TypeScale.sourceScale))
                 .foregroundColor(Color(tokenHex: DesignTokens.Color.subtitleSource))
-            if line.dst.isEmpty {
-                Text(DesignTokens.Text.untranslated)
-                    .font(.system(size: bodyFontSize))
-                    .foregroundColor(Color(tokenHex: DesignTokens.Color.untranslated))
+            if needsTranslation {
+                untranslatedButton(for: line, status: retryStatus)
             } else {
                 Text(line.dst)
                     .font(.system(size: bodyFontSize))
@@ -111,18 +116,95 @@ struct TranscriptView: View {
                 .fill(Color.white.opacity(0.06))
         )
         .contextMenu {
+            if RetryTranslationPolicy.canRetry(src: line.src, dst: line.dst, isRetrying: false) {
+                Button(DesignTokens.Text.retryTranslation) {
+                    retryTranslation(for: line)
+                }
+                .disabled(retryStatus == .retrying)
+            }
             Button("复制原文") {
                 UIPasteboard.general.string = line.src
             }
-            if !line.dst.isEmpty {
+            if !needsTranslation {
                 Button("复制译文") {
                     UIPasteboard.general.string = line.dst
                 }
             }
             Button("复制这一句") {
-                UIPasteboard.general.string = line.dst.isEmpty
+                UIPasteboard.general.string = needsTranslation
                     ? line.src
                     : "\(line.src)\n\(line.dst)"
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func untranslatedButton(for line: TranscriptStore.Line, status: RetryLineStatus) -> some View {
+        Button {
+            retryTranslation(for: line)
+        } label: {
+            switch status {
+            case .idle:
+                Text(DesignTokens.Text.untranslated)
+                    .font(.system(size: bodyFontSize))
+                    .foregroundColor(Color(tokenHex: DesignTokens.Color.untranslated))
+            case .retrying:
+                HStack(spacing: DesignTokens.Space.s) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text(DesignTokens.Text.translating)
+                        .font(.system(size: bodyFontSize))
+                        .foregroundColor(Color(tokenHex: DesignTokens.Color.untranslated))
+                }
+            case .failed(let reason):
+                Text(reason)
+                    .font(.system(size: bodyFontSize))
+                    .foregroundColor(Color(tokenHex: DesignTokens.Color.statusError))
+            }
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .tint(
+            status.isFailed
+                ? Color(tokenHex: DesignTokens.Color.statusError)
+                : Color(tokenHex: DesignTokens.Color.untranslated)
+        )
+        .disabled(status == .retrying)
+        .accessibilityLabel(DesignTokens.Text.retryTranslation)
+    }
+
+    private func retryTranslation(for line: TranscriptStore.Line) {
+        let key = RetryLineKey(id: line.id, time: line.time, src: line.src)
+        let current = retryStatuses[key] ?? .idle
+        guard RetryTranslationPolicy.canRetry(
+            src: line.src,
+            dst: line.dst,
+            isRetrying: current == .retrying
+        ) else {
+            return
+        }
+
+        let targetDate = loadedDate
+        retryStatuses[key] = .retrying
+
+        Task {
+            do {
+                let translated = try await translator.translate(key: key, text: line.src)
+                let saved = await store.updateTranslation(for: line, on: targetDate, dst: translated)
+                if saved {
+                    retryStatuses.removeValue(forKey: key)
+                    reload()
+                } else {
+                    retryStatuses[key] = .failed(DesignTokens.Text.retryTxFailed)
+                }
+            } catch RetryTranslationFailure.alreadyInFlight {
+                // 同一句已经在翻，保持当前进度状态不排队。
+            } catch let failure as RetryTranslationFailure {
+                retryStatuses[key] = .failed(RetryTranslationPolicy.failureMessage(for: failure))
+            } catch is CancellationError {
+                retryStatuses.removeValue(forKey: key)
+            } catch {
+                retryStatuses[key] = .failed(DesignTokens.Text.retryTxFailed)
             }
         }
     }
@@ -139,7 +221,9 @@ struct TranscriptView: View {
     }
 
     private func reload() {
-        lines = store.lines(for: Date())
+        let today = Date()
+        loadedDate = today
+        lines = store.lines(for: today)
     }
 }
 

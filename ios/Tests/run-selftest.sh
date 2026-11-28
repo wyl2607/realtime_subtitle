@@ -42,6 +42,9 @@ xcrun swiftc -O ios/Shared/SentenceSplitter.swift ios/Tests/SentenceSplitterSelf
 # HC-U18：App Group 文件存储（注入临时目录和内存旧 Keychain 闭包，不碰真实 Keychain）。
 xcrun swiftc -O ios/Shared/SharedStore.swift ios/Shared/SharedKeychain.swift ios/Shared/Routing.swift ios/Tests/SharedStoreSelftest.swift -o .tmp/sharedstoreselftest
 .tmp/sharedstoreselftest
+# HC-U19：回看页单句重新翻译纯逻辑（可重试判定、同句并发去重、失败文案映射），不依赖 Translation/SwiftUI。
+xcrun swiftc -O ios/RSiOS/RetryTranslationPolicy.swift ios/Shared/DesignTokens.swift ios/Tests/RetryTranslationSelftest.swift -o .tmp/retrytranslationselftest
+.tmp/retrytranslationselftest
 # HC-P01：主 App 的运行态只允许有一个轮询源。LiveFeed 要求内容没变不发布属性，
 # 否则合并了读取次数、SwiftUI 还是每次整树重绘。SharedStore / SharedKeychain 一起编是为了
 # 走真实默认读取闭包（自测里注入的是内存闭包，不碰真实磁盘/Keychain）；

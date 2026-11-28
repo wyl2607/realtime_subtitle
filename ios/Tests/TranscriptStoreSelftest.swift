@@ -46,6 +46,28 @@ func runTranscriptStoreSelftest(_ check: @escaping (Bool, String) -> Void) {
     check(day1Lines.first?[2] == "你好", "译文应写回同一行（实际 \(day1Lines.first?[2] ?? "nil")）")
     check(day1Lines.first?[0] == "23:59:50", "译文更新不应改掉原时间")
 
+    // 硬约束 HC-B10：重译写回后，最近句对的空译文回灌不能覆盖已保存的译文；
+    // 但引擎随后给出的非空新译文仍应覆盖旧译文。
+    let retryProtectionStore = TranscriptStore(
+        directory: base.appendingPathComponent("retry-protection"),
+        now: { clock },
+        timeZone: timeZone
+    )
+    let retryProtectionURL = retryProtectionStore.fileURL(for: clock)
+    retryProtectionStore.ingest([TranscriptStore.Sentence(id: 10, session: "hc-b10", src: "Guten Tag.", dst: "")])
+    retryProtectionStore.flush()
+    retryProtectionStore.updateTranslation(
+        for: retryProtectionStore.lines(for: clock)[0], on: clock, dst: "你好"
+    )
+    retryProtectionStore.flush()
+    retryProtectionStore.ingest([TranscriptStore.Sentence(id: 10, session: "hc-b10", src: "Guten Tag.", dst: "")])
+    retryProtectionStore.flush()
+    check(field(readLines(retryProtectionURL), 0, 2) == "你好", "违反 HC-B10：空译文回灌覆盖了已保存的译文")
+
+    retryProtectionStore.ingest([TranscriptStore.Sentence(id: 10, session: "hc-b10", src: "Guten Tag.", dst: "您好")])
+    retryProtectionStore.flush()
+    check(field(readLines(retryProtectionURL), 0, 2) == "您好", "违反 HC-B10：非空新译文没有覆盖旧译文")
+
     // 换了一个引擎会话（同一天、同一个 id）：必须追加新行，不能覆盖上一句。
     // 各引擎的 id 都从 1 重新计数，只按 id 去重就会把这一句写到上一句头上。
     store.ingest([TranscriptStore.Sentence(id: 1, session: "s2", src: "Guten Abend.", dst: "")])
@@ -171,6 +193,70 @@ func runTranscriptStoreSelftest(_ check: @escaping (Bool, String) -> Void) {
         "plainText 的格式或空译文的省略不对（实际 \(TranscriptStore.plainText(filterLines))）"
     )
     check(TranscriptStore.plainText([]) == "", "没有行时 plainText 应为空串")
+
+    // 按句更新译文（回看页重新翻译落盘）：覆盖重名同秒句、重新 load、其他句不变、找不到时不改文件。
+    let retryDir = base.appendingPathComponent("retry-update")
+    try? FileManager.default.createDirectory(at: retryDir, withIntermediateDirectories: true)
+    let retryDate = date(year: 2026, month: 10, day: 22, hour: 12, minute: 0, second: 0, timeZone: timeZone)
+    let retryStore = TranscriptStore(directory: retryDir, now: { retryDate }, timeZone: timeZone)
+    let retryURL = retryStore.fileURL(for: retryDate)
+    let initialContent = [
+        "12:00:00\tHallo.\t\ts1#1",
+        "12:00:00\tHallo.\t\ts1#2",
+        "12:00:01\tDanke.\t谢谢\ts1#3",
+    ].joined(separator: "\n") + "\n"
+    try? initialContent.write(to: retryURL, atomically: true, encoding: .utf8)
+
+    let loadedBefore = retryStore.lines(for: retryDate)
+    check(loadedBefore.count == 3, "重名测试应读出 3 行（实际 \(loadedBefore.count)）")
+    if loadedBefore.count == 3 {
+        // 同时间同原文的两句，只更新第二句（id=1）。
+        retryStore.updateTranslation(for: loadedBefore[1], on: retryDate, dst: "你好（第二句）")
+        retryStore.flush()
+
+        let reloadedStore = TranscriptStore(directory: retryDir, now: { retryDate }, timeZone: timeZone)
+        let loadedAfter = reloadedStore.lines(for: retryDate)
+        check(loadedAfter.count == 3, "按句更新后行数应不变（实际 \(loadedAfter.count)）")
+        check(loadedAfter[0].dst == "", "重名第一句不应被改写（实际 \(loadedAfter[0].dst)）")
+        check(loadedAfter[1].dst == "你好（第二句）", "重名第二句应读到更新后的译文（实际 \(loadedAfter[1].dst)）")
+        check(loadedAfter[2].dst == "谢谢", "其他已翻译句子应保持不变（实际 \(loadedAfter[2].dst)）")
+
+        let fileLinesAfter = readLines(retryURL)
+        check(field(fileLinesAfter, 1, 3) == "s1#2", "更新译文应保留原来的去重键（实际 \(field(fileLinesAfter, 1, 3))）")
+
+        // 找不到该句（越界 id / 错时间 / 错原文 / 不存在的日期）时不改任何文件。
+        let beforeMissingBytes = try? Data(contentsOf: retryURL)
+        let missingByID = TranscriptStore.Line(id: 99, time: "12:00:00", src: "Hallo.", dst: "")
+        let missingByTime = TranscriptStore.Line(id: 0, time: "12:00:59", src: "Hallo.", dst: "")
+        let missingBySrc = TranscriptStore.Line(id: 0, time: "12:00:00", src: "Anderer Satz", dst: "")
+        let otherDate = date(year: 2026, month: 10, day: 23, hour: 12, minute: 0, second: 0, timeZone: timeZone)
+
+        let missingResults = LockedResults()
+        let missingGroup = DispatchGroup()
+        for (targetLine, targetDay) in [
+            (missingByID, retryDate),
+            (missingByTime, retryDate),
+            (missingBySrc, retryDate),
+            (loadedBefore[0], otherDate),
+        ] {
+            missingGroup.enter()
+            reloadedStore.updateTranslation(for: targetLine, on: targetDay, dst: "不应写入") { ok in
+                missingResults.append(ok)
+                missingGroup.leave()
+            }
+        }
+        missingGroup.wait()
+        reloadedStore.flush()
+
+        let recordedResults = missingResults.snapshot()
+        check(recordedResults == [false, false, false, false], "找不到该句时应全部返回 false（实际 \(recordedResults)）")
+        let afterMissingBytes = try? Data(contentsOf: retryURL)
+        check(beforeMissingBytes == afterMissingBytes, "找不到该句时原存档文件字节不应被改动")
+        check(
+            !FileManager.default.fileExists(atPath: reloadedStore.fileURL(for: otherDate).path),
+            "找不到该句时不应为不存在的日期创建文件"
+        )
+    }
 }
 
 private func date(
@@ -197,4 +283,17 @@ private func readLines(_ url: URL) -> [[String]] {
 private func field(_ lines: [[String]], _ row: Int, _ column: Int) -> String {
     guard lines.indices.contains(row), lines[row].indices.contains(column) else { return "" }
     return lines[row][column]
+}
+
+private final class LockedResults: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [Bool] = []
+
+    func append(_ value: Bool) {
+        lock.withLock { values.append(value) }
+    }
+
+    func snapshot() -> [Bool] {
+        lock.withLock { values }
+    }
 }
