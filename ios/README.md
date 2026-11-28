@@ -40,6 +40,12 @@
 - 熄屏：麦克风模式靠后台音频继续识别、翻译、存档；锁屏和灵动岛用实时活动（`RSLiveActivity` 扩展，`App/LiveActivityController.swift` 每秒最多推一次最新句对）。
 - 字幕存档与回看：`RSiOS/TranscriptStore.swift` 按天写 `Documents/transcripts/YYYY-MM-DD.txt`，每行 `HH:mm:ss\t原文\t中文\t去重键`；「回看」页默认读当天文件，存在往日存档时可通过工具栏日历菜单切换日期（无往日存档时不显示），搜索、复制/导出以及未翻译句子的点按「未翻译 ⟳」/长按菜单「重新翻译」均作用于当前所选日期并写回对应那天的文件。
 
+### 快捷指令与控制中心
+
+- **Siri / 快捷指令 / 操作按钮**：`RSiOS/Intents/` 提供 `StartMicCaptionsIntent`（「用实时字幕开始字幕」）和 `StopCaptionsIntent`（「用实时字幕停止字幕」），通过 `AppDependencyManager` 注入 `RSiOSApp` 持有的 `AppModel`（不引入全局可变单例）。
+- **前台与后台语义**：`StartMicCaptionsIntent` 声明 iOS 26 的 `supportedModes = .foreground`，确保麦克风采集与锁屏实时活动从前台启动；`StopCaptionsIntent` 声明 `.background`，可在后台直接停止并结束实时活动。系统屏幕广播（ReplayKit）不支持程序化拉起，因此不提供广播类 Intent。
+- **控制中心按钮**：`RSLiveActivity/SubtitleControlWidget.swift` 提供 `StartMicCaptionsControl`（`ControlWidgetButton`）并注册在 `SubtitleLiveActivityBundle`；由于 Widget 扩展不能仅凭 `supportedModes = .foreground` 切回主 App 或注入主 App 依赖，按钮改用 iOS 18+ `OpenURLIntent` 打开 `rsnode://start-mic`，由主 App 在 `RootView` 的 `.onOpenURL` 识别后走 `AppModel` 的启动逻辑（`StartMicCaptionsIntent.swift` 与 `MicCaptionIntentPolicy.swift` 不再编入 `RSLiveActivity` 扩展）。
+
 ## 生成 Xcode 工程
 
 ```bash

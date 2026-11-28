@@ -90,6 +90,7 @@ targets:
     sources:
       - path: RSLiveActivity
       - path: Shared/SubtitleActivityAttributes.swift
+      - path: Shared/DesignTokens.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.yilinwang.realtimesubtitle.liveactivity

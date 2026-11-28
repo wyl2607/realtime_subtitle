@@ -26,7 +26,11 @@ struct RootView: View {
         }
         .translationTask(model.assets.translationConfig, action: AssetPreparer.translationAction(for: model.assets))
         .onAppear { model.bootstrap() }
-        .onOpenURL { model.handleOpenURL($0) }
+        .onOpenURL { url in
+            if !model.handleStartMicOpenURL(url) {
+                model.handleOpenURL(url)
+            }
+        }
         .onChange(of: model.mic.isRunning) { model.refreshLiveActivity() }
         .onChange(of: model.feed.lastStatusUpdate) { _, updatedAt in model.extensionStatusUpdated(updatedAt) }
         .onChange(of: model.appState.isInBackground) { _, inBackground in model.backgroundChanged(inBackground) }

@@ -48,10 +48,15 @@ enum DesignTokens {
     }
     enum Text {
         static let micSubtitleTitle: String = "麦克风字幕"
+        static let micStartTitle: String = "开始麦克风字幕"
         static let micStartButton: String = "开始"
         static let micStopButton: String = "停止"
         static let micStatusIdle: String = "未启动"
         static let micStatusRunning: String = "正在采集麦克风音频"
+        static let micStarting: String = "正在启动麦克风字幕"
+        static let micAlreadyRunning: String = "麦克风字幕已在运行"
+        static let micStopped: String = "已停止麦克风字幕"
+        static let micNotRunning: String = "麦克风字幕未在运行"
         static let micPermissionDenied: String = "麦克风权限被拒绝，请到 设置 → 实时字幕 打开"
         static let micBlockedByBroadcast: String = "请先停止屏幕广播"
         static let micStoppedByBroadcast: String = "屏幕广播已开始，麦克风已停止"

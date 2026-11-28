@@ -51,3 +51,6 @@ xcrun swiftc -O ios/RSiOS/RetryTranslationPolicy.swift ios/Shared/DesignTokens.s
 # Routing.swift 提供 SharedStore.readEngineMode 需要的 EngineMode。
 xcrun swiftc -O ios/RSiOS/LiveFeed.swift ios/Shared/SharedStore.swift ios/Shared/SharedKeychain.swift ios/Shared/Routing.swift ios/Tests/LiveFeedSelftest.swift -o .tmp/livefeedselftest
 .tmp/livefeedselftest
+# HC-U20：快捷指令 / 控制中心开始与停止的纯状态判定（重复触发忽略、广播互斥）。
+xcrun swiftc -O ios/Shared/CaptureArbiter.swift ios/Shared/MicCaptionIntentPolicy.swift ios/Tests/MicCaptionIntentPolicySelftest.swift -o .tmp/miccaptionintentselftest
+.tmp/miccaptionintentselftest

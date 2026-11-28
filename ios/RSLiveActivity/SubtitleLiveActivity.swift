@@ -6,6 +6,7 @@ import WidgetKit
 struct SubtitleLiveActivityBundle: WidgetBundle {
     var body: some Widget {
         SubtitleLiveActivity()
+        StartMicCaptionsControl()
     }
 }
 

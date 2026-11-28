@@ -43,6 +43,24 @@ ALLOW: dict[str, str] = {
     "android:app/src/main/java/com/wyl26/dezhsubtitle/v2/ui/home/HomeScreen.kt:statusLocal": (
         "@Preview 的示例数据（字幕行来源标签），不进运行时。"
     ),
+    "ios/RSiOS/Intents/RealtimeSubtitleShortcuts.swift:micSubtitleTitle": (
+        "AppShortcut 短语（AppShortcutPhrase 不支持动态字符串插值且 appintentsmetadataprocessor 要求编译期字面量）"
+        "与 shortTitle（LocalizedStringResource 编译期元数据提取要求字面量）。"
+    ),
+    "ios/RSiOS/Intents/RealtimeSubtitleShortcuts.swift:micStartTitle": (
+        "AppShortcut 短语与 shortTitle 的编译期字面量要求同上。"
+    ),
+    "ios/RSiOS/Intents/StartMicCaptionsIntent.swift:micSubtitleTitle": (
+        "AppIntent.title 与 IntentDescription 须为编译期字面量，否则 appintentsmetadataprocessor 提取元数据报错；"
+        "perform() 返回的 IntentDialog 已改为引用 DesignTokens.Text。"
+    ),
+    "ios/RSiOS/Intents/StartMicCaptionsIntent.swift:micStartTitle": (
+        "AppIntent.title 须为编译期字面量（appintentsmetadataprocessor 编译期要求），理由同上。"
+    ),
+    "ios/RSiOS/Intents/StopCaptionsIntent.swift:micSubtitleTitle": (
+        "AppIntent.title 与 IntentDescription 须为编译期字面量，否则 appintentsmetadataprocessor 提取元数据报错；"
+        "perform() 返回的 IntentDialog 已改为引用 DesignTokens.Text。"
+    ),
 }
 
 GENERATED = {

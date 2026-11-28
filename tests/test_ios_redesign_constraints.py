@@ -1169,3 +1169,206 @@ def test_hc_u22_history_multiday_archive():
     assert "isLenient = false" in store and "dateFormatter.string(from: parsedDate) == key" in store, (
         "HC-U22 违反：TranscriptStore 必须做非宽松日期解析与往返校验，拒绝 2026-02-30 这类非法日期。"
     )
+
+
+def _project_target_sources(project: str, target_name: str) -> list[str]:
+    m = re.search(rf"^  {re.escape(target_name)}:\n(.*?)(?=^  \w+:|\Z)", project, re.M | re.S)
+    assert m, f"HC-U20 违反：ios/project.yml 缺少 target {target_name}。"
+    src = re.search(r"^    sources:\n(.*?)(?=^    \w+:|\Z)", m.group(1), re.M | re.S)
+    assert src, f"HC-U20 违反：ios/project.yml 中 {target_name} 缺少 sources。"
+    return re.findall(r"^\s*-\s*path:\s*(\S+)", src.group(1), re.M)
+
+
+def _covers_path(sources: list[str], rel_path: str) -> bool:
+    rel = Path(rel_path)
+    return any(rel == Path(s) or Path(s) in rel.parents for s in sources)
+
+
+def _strip_swift_comments_u20(text: str) -> str:
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    return re.sub(r"//[^\n]*", "", text)
+
+
+def _target_swift_files(sources: list[str]) -> list[Path]:
+    files: list[Path] = []
+    for src in sources:
+        p = IOS / src
+        if p.is_dir():
+            files.extend(sorted(p.rglob("*.swift")))
+        elif p.is_file() and p.suffix == ".swift":
+            files.append(p)
+    return files
+
+
+def test_hc_u20_app_intents_and_control_widget():
+    """硬约束 HC-U20：App Intents 快捷指令 + 控制中心按钮（不程序化启动广播）。
+
+    1. 必须存在 AppShortcutsProvider，且包含开始麦克风与停止麦克风两条快捷指令。
+    2. 不得出现「开始广播」类 AppIntent（ReplayKit 只能由系统 Broadcast Picker 启动）。
+    3. StartMicCaptionsIntent 必须声明前台运行（iOS 26 supportedModes = .foreground），留在主 App。
+    4. RSLiveActivity 的每个 ControlWidget 都必须在 WidgetBundle 中注册，且其
+       ControlWidgetButton 必须使用 OpenURLIntent / OpenIntent；start-mic URL 的 scheme
+       必须注册在主 App 的 Info.plist，并由 RootView/AppModel+Intents.swift 路由；
+       RSLiveActivity 的 sources 与源码中不得出现 AppModel、AppDependencyManager、@Dependency。
+    """
+    all_swift = list(_swift_files())
+
+    # 1) AppShortcutsProvider + 开始/停止两条
+    shortcut_files = [
+        p for p in all_swift
+        if re.search(r":\s*AppShortcutsProvider\b", _strip_swift_comments_u20(p.read_text(encoding="utf-8")))
+    ]
+    assert shortcut_files, "HC-U20 违反：缺少遵守 AppShortcutsProvider 的快捷指令提供者。"
+    shortcut_text = "\n".join(_strip_swift_comments_u20(p.read_text(encoding="utf-8")) for p in shortcut_files)
+    assert "StartMicCaptionsIntent(" in shortcut_text and "StopCaptionsIntent(" in shortcut_text, (
+        "HC-U20 违反：AppShortcutsProvider 必须同时包含 StartMicCaptionsIntent 与 StopCaptionsIntent。"
+    )
+    assert shortcut_text.count("AppShortcut(") >= 2, (
+        "HC-U20 违反：AppShortcutsProvider 至少要有开始/停止两条 AppShortcut。"
+    )
+
+    # 2) 不得出现「开始广播」类 intent
+    broadcast_offenders = []
+    for path in all_swift:
+        text = path.read_text(encoding="utf-8")
+        for m in re.finditer(r"\b(?:struct|class)\s+(\w*Broadcast\w*)\s*:\s*[^\{]*AppIntent\b", text, re.I):
+            broadcast_offenders.append(f"{_locate(path, text, m.start())} ({m.group(1)})")
+        if re.search(r":\s*[^\{]*\bAppIntent\b", text):
+            for kw in ("RPBroadcast", "ReplayKit", "开始广播", "开始屏幕广播"):
+                if kw in text:
+                    broadcast_offenders.append(f"{path.relative_to(ROOT)} (含 {kw})")
+    assert not broadcast_offenders, (
+        "HC-U20 违反：检测到广播类 AppIntent（ReplayKit 不能被程序化启动）：" + ", ".join(broadcast_offenders)
+    )
+
+    # 3) StartMicCaptionsIntent 必须声明前台运行且编入 RSiOS
+    start_intent_files = [
+        p for p in all_swift
+        if re.search(r"\bstruct\s+StartMicCaptionsIntent\s*:\s*[^\{]*\bAppIntent\b", p.read_text(encoding="utf-8"))
+    ]
+    assert len(start_intent_files) == 1, (
+        f"HC-U20 违反：StartMicCaptionsIntent 必须存在且唯一，当前找到 {len(start_intent_files)} 处。"
+    )
+    start_intent_file = start_intent_files[0]
+    start_intent_code = _strip_swift_comments_u20(start_intent_file.read_text(encoding="utf-8"))
+    assert re.search(r"supportedModes\s*(?::\s*IntentModes)?\s*(?:=\s*|\{\s*(?:return\s+)?)\.foreground\b", start_intent_code), (
+        "HC-U20 违反：StartMicCaptionsIntent 必须声明前台运行（supportedModes = .foreground）。"
+    )
+    assert not re.search(r"\bstatic\s+(?:let|var)\s+openAppWhenRun\b", start_intent_code), (
+        "HC-U20 违反：部署目标已为 iOS 26，StartMicCaptionsIntent 应使用 supportedModes 而非已弃用的 openAppWhenRun。"
+    )
+
+    project = (IOS / "project.yml").read_text(encoding="utf-8")
+    app_sources = _project_target_sources(project, "RSiOS")
+    ext_sources = _project_target_sources(project, "RSLiveActivity")
+    start_intent_rel = str(start_intent_file.relative_to(IOS))
+    assert _covers_path(app_sources, start_intent_rel), (
+        f"HC-U20 违反：ios/project.yml 中 RSiOS 的 sources 未包含 {start_intent_rel}。"
+    )
+
+    # 4) 每个 ControlWidget 都必须注册在 WidgetBundle，且使用 OpenURLIntent / OpenIntent；
+    #    start-mic URL 必须闭环到主 App 的 URL scheme 和路由；扩展不得依赖主 App。
+    widget_files = list(sorted((IOS / "RSLiveActivity").rglob("*.swift")))
+    control_widgets = []
+    widget_bundle_text = ""
+    for path in widget_files:
+        text = _strip_swift_comments_u20(path.read_text(encoding="utf-8"))
+        for m in re.finditer(r"\bstruct\s+(\w+)\s*:\s*ControlWidget\b", text):
+            body = text[m.start():]
+            next_struct = re.search(r"\n\s*struct\s+\w+\s*:", body[1:])
+            if next_struct:
+                body = body[:next_struct.start() + 1]
+            control_widgets.append((path, body, m.group(1)))
+        if re.search(r":\s*WidgetBundle\b", text):
+            widget_bundle_text += text
+    assert control_widgets, "HC-U20 违反：ios/RSLiveActivity 缺少 ControlWidget 实现。"
+    start_mic_urls = []
+    for cw_path, cw_text, cw_name in control_widgets:
+        assert f"{cw_name}()" in widget_bundle_text, (
+            f"HC-U20 违反：ControlWidget `{cw_name}` 没有在 RSLiveActivity 的 WidgetBundle 中注册。"
+        )
+        btn_match = re.search(r"ControlWidgetButton\s*\(\s*action:\s*([A-Za-z_]\w*)\s*\(", cw_text)
+        assert btn_match, f"HC-U20 违反：{cw_path.relative_to(ROOT)} 中没有使用 ControlWidgetButton(action: ...)。"
+        used_action_name = btn_match.group(1)
+        is_open_url = used_action_name == "OpenURLIntent"
+        is_open_intent = any(
+            re.search(
+                rf"\bstruct\s+{re.escape(used_action_name)}\s*:\s*[^\{{\n]*\bOpenIntent\b",
+                _strip_swift_comments_u20(p.read_text(encoding="utf-8")),
+            )
+            for p in widget_files
+        )
+        assert is_open_url or is_open_intent, (
+            f"HC-U20 违反：{cw_path.relative_to(ROOT)} 的 ControlWidgetButton 必须使用 OpenURLIntent 或 OpenIntent，"
+            f"当前使用了 `{used_action_name}`。"
+        )
+        if is_open_url and "start-mic" in cw_text:
+            raw_widget_text = cw_path.read_text(encoding="utf-8")
+            start_mic_urls.extend(
+                re.findall(r"URL\s*\(string:\s*[\"']([^\"']*start-mic[^\"']*)[\"']\s*\)", raw_widget_text)
+            )
+
+    assert start_mic_urls, "HC-U20 违反：ControlWidget 源码中缺少 start-mic URL。"
+    schemes = {url.split(":", 1)[0].lower() for url in start_mic_urls}
+    assert len(schemes) == 1, f"HC-U20 违反：start-mic URL 使用了多个 scheme：{sorted(schemes)}。"
+    start_mic_scheme = schemes.pop()
+    info = plistlib.loads((IOS / "RSiOS" / "Info.plist").read_bytes())
+    registered_schemes = {
+        scheme.lower()
+        for url_type in info.get("CFBundleURLTypes", [])
+        for scheme in url_type.get("CFBundleURLSchemes", [])
+    }
+    assert start_mic_scheme in registered_schemes, (
+        f"HC-U20 违反：start-mic URL scheme `{start_mic_scheme}` 未注册在 ios/RSiOS/Info.plist 的 CFBundleURLSchemes 中。"
+    )
+    root = (IOS / "RSiOS" / "Pages" / "RootView.swift").read_text(encoding="utf-8")
+    intents = (IOS / "RSiOS" / "Intents" / "AppModel+Intents.swift").read_text(encoding="utf-8")
+    assert "handleStartMicOpenURL(url)" in root, "HC-U20 违反：RootView 没有把打开 URL 路由给 handleStartMicOpenURL。"
+    assert "handleStartMicOpenURL" in intents and "MicCaptionIntentPolicy.isStartMicURL" in intents, (
+        "HC-U20 违反：AppModel+Intents.swift 没有实现 start-mic URL 路由。"
+    )
+    policy = (IOS / "Shared" / "MicCaptionIntentPolicy.swift").read_text(encoding="utf-8")
+    assert re.search(rf"startMicScheme\s*=\s*[\"']{re.escape(start_mic_scheme)}[\"']", policy), (
+        f"HC-U20 违反：MicCaptionIntentPolicy 没有使用 start-mic URL scheme `{start_mic_scheme}`。"
+    )
+
+    forbidden_ext_paths = [
+        "RSiOS/Intents/StartMicCaptionsIntent.swift",
+        "Shared/MicCaptionIntentPolicy.swift",
+        "Shared/CaptureArbiter.swift",
+    ]
+    unexpected_ext_paths = [p for p in forbidden_ext_paths if _covers_path(ext_sources, p)]
+    assert not unexpected_ext_paths, (
+        "HC-U20 违反：RSLiveActivity 的 sources 不应再包含：" + ", ".join(unexpected_ext_paths)
+    )
+
+    ext_source_hits = [
+        s for s in ext_sources
+        if re.search(r"\bAppModel\b|\bAppDependencyManager\b|@Dependency\b", s)
+    ]
+    assert not ext_source_hits, (
+        "HC-U20 违反：RSLiveActivity 的 sources 路径出现禁止符号：" + ", ".join(ext_source_hits)
+    )
+
+    ext_code_offenders = []
+    seen_ext_files = set(widget_files) | set(_target_swift_files(ext_sources))
+    for path in sorted(seen_ext_files):
+        text = path.read_text(encoding="utf-8")
+        for m in re.finditer(r"\bAppModel\b|\bAppDependencyManager\b|@Dependency\b", text):
+            ext_code_offenders.append(f"{_locate(path, text, m.start())} ({m.group(0)})")
+    assert not ext_code_offenders, (
+        "HC-U20 违反：RSLiveActivity 源码中不得出现 AppModel / AppDependencyManager / @Dependency："
+        + ", ".join(ext_code_offenders)
+    )
+
+
+def test_start_mic_intent_does_not_claim_capture_started():
+    """权限拒绝或音频初始化失败时，Intent 只能报告正在启动，不能谎称已经开始。"""
+    import json
+
+    intent = (IOS / "RSiOS" / "Intents" / "StartMicCaptionsIntent.swift").read_text(encoding="utf-8")
+    start_case = intent[intent.index("case .start:"):intent.index("case .ignoreAlreadyRunning:")]
+    tokens = json.loads((ROOT / "design" / "tokens.json").read_text(encoding="utf-8"))["text"]
+    assert "DesignTokens.Text.micStarting" in start_case
+    assert tokens["micStarting"] == "正在启动麦克风字幕"
+    assert "已开始麦克风字幕" not in start_case
