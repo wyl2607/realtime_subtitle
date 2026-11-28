@@ -14,7 +14,10 @@ struct LiveFeedSelftest {
             if !condition { failures.append(message) }
         }
 
-        var statusSource: String? = "engine=node last=ready"
+        var statusSource: SharedStore.ExtStatusEntry? = SharedStore.ExtStatusEntry(
+            status: "engine=node last=ready",
+            updatedAt: nil
+        )
         var linesSource: String? = nil
         var draftSource: String? = nil
         let fixedNow = Date(timeIntervalSince1970: 1_000)
@@ -28,7 +31,7 @@ struct LiveFeedSelftest {
         check(feed.status == "engine=node last=ready", "首次 init 应读出状态")
         check(feed.lines.isEmpty, "没有句对时 lines 应为空")
         check(feed.draft.isEmpty, "没有草稿时 draft 应为空")
-        check(feed.lastStatusUpdate == nil, "兜底轮询不能标记「扩展刚写过」")
+        check(feed.lastStatusUpdate == nil, "旧格式无时间戳时兜底轮询不能编造「扩展刚写过」")
         check(feed.statusNotificationCount == 0, "兜底轮询不增加状态通知计数")
         check(feed.linesNotificationCount == 0, "兜底轮询不增加句对通知计数")
 
@@ -47,7 +50,7 @@ struct LiveFeedSelftest {
         check(changes == 0, "内容没变时不应发布变更（违反 HC-P01：合并轮询就不该重复通知）")
 
         // 状态真的变了：必须发布一次。
-        statusSource = "engine=node last=ok"
+        statusSource = SharedStore.ExtStatusEntry(status: "engine=node last=ok", updatedAt: nil)
         feed.refresh()
         check(changes == 1, "状态真的变了必须发布一次变更（实际 \(changes) 次）")
         check(feed.status == "engine=node last=ok", "状态应更新")
@@ -101,6 +104,79 @@ struct LiveFeedSelftest {
         check(history.map(\.src) == ["A", "B", "C", "D", "E"], "HC-U11：新会话 id 从 1 重计时不能顶替旧会话的句子")
         let many = (1...10).map { RecentLine(id: $0, src: "\($0)", dst: "", session: "s3") }
         check(CaptionHistory.merge([], with: many, limit: 4).map(\.id) == [7, 8, 9, 10], "HC-U11：超过上限只留最新的")
+
+        // HC-B05：冷启动从 SharedStore 恢复持久化状态时间戳，不依赖进程内 Darwin 通知。
+        let coldDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("livefeed-coldstart-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: coldDir) }
+        let coldStore = SharedStore(rootURL: coldDir, legacyRead: { _ in nil }, legacyDelete: { _ in true })
+
+        let freshWrittenAt = fixedNow.addingTimeInterval(-5)
+        check(coldStore.writeExtStatus("blocks=4 src=broadcast", at: freshWrittenAt), "HC-B05：写入带时间戳的状态应成功")
+        var simulatedNow = fixedNow
+        let coldFreshFeed = LiveFeed(
+            readStatus: { coldStore.readExtStatusEntry() },
+            readLines: { nil },
+            readDraft: { nil },
+            now: { simulatedNow }
+        )
+        check(coldFreshFeed.status == "blocks=4 src=broadcast", "HC-B05：冷启动应读出 broadcast 状态")
+        check(
+            coldFreshFeed.lastStatusUpdate.map { abs($0.timeIntervalSince(freshWrittenAt)) < 0.001 } == true,
+            "HC-B05：冷启动必须从持久化时间填充 lastStatusUpdate，供 CaptureArbiter 拒绝麦克风"
+        )
+        var coldChanges = 0
+        let coldToken = NotificationCenter.default.addObserver(
+            forName: LiveFeed.didChangeNotification,
+            object: coldFreshFeed,
+            queue: nil
+        ) { _ in
+            coldChanges += 1
+        }
+        defer { NotificationCenter.default.removeObserver(coldToken) }
+        simulatedNow = fixedNow.addingTimeInterval(20)
+        coldFreshFeed.refresh()
+        check(
+            coldFreshFeed.lastStatusUpdate.map { abs($0.timeIntervalSince(freshWrittenAt)) < 0.001 } == true,
+            "HC-B05：未发生新写入的轮询不得延长 lastStatusUpdate，状态过期后自然放行麦克风"
+        )
+        check(coldChanges == 0, "HC-B05 + HC-P01：时间戳未变化时轮询不应重复发通知")
+
+        // HC-B05：未来时间戳（时钟回拨）冷启动不得被采纳，也不能在时钟追上时重新生效。
+        let futureAt = fixedNow.addingTimeInterval(60)
+        check(coldStore.writeExtStatus("blocks=9 src=broadcast", at: futureAt), "HC-B05：写入未来时间戳测试状态")
+        var clockNow = fixedNow
+        let futureFeed = LiveFeed(
+            readStatus: { coldStore.readExtStatusEntry() },
+            readLines: { nil },
+            readDraft: { nil },
+            now: { clockNow }
+        )
+        check(futureFeed.lastStatusUpdate == nil, "HC-B05：未来时间戳不得设置 lastStatusUpdate")
+        clockNow = futureAt
+        futureFeed.refresh()
+        check(futureFeed.lastStatusUpdate == nil, "HC-B05：墙钟追上未来时间戳后旧状态也不得复活阻塞麦克风")
+
+        let recoveredAt = futureAt.addingTimeInterval(1)
+        clockNow = recoveredAt
+        check(coldStore.writeExtStatus("blocks=10 src=broadcast", at: recoveredAt), "HC-B05：回拨后新写入应恢复正常")
+        futureFeed.refresh()
+        check(
+            futureFeed.lastStatusUpdate.map { abs($0.timeIntervalSince(recoveredAt)) < 0.001 } == true,
+            "HC-B05：回拨后新的正常时间戳应恢复同步"
+        )
+
+        // HC-B05：旧格式无时间戳（纯文本 ext_status）→ lastStatusUpdate 保持 nil（未知新鲜度保守放行，不永久锁死）。
+        let legacyStatusURL = coldDir.appendingPathComponent(SharedStore.Key.extStatus, isDirectory: false)
+        try? Data("blocks=7 src=broadcast".utf8).write(to: legacyStatusURL, options: .atomic)
+        let legacyFeed = LiveFeed(
+            readStatus: { coldStore.readExtStatusEntry() },
+            readLines: { nil },
+            readDraft: { nil },
+            now: { fixedNow }
+        )
+        check(legacyFeed.status == "blocks=7 src=broadcast", "HC-B05：旧格式状态文本应正常显示")
+        check(legacyFeed.lastStatusUpdate == nil, "HC-B05：旧格式无时间戳时 lastStatusUpdate 应保持 nil")
 
         if failures.isEmpty {
             print("LIVE FEED SELFTEST OK")
