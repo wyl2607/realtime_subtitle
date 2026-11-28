@@ -37,6 +37,8 @@ struct LivePage: View {
                         HStack(spacing: DesignTokens.Space.m) {
                             BroadcastPickerView()
                                 .frame(width: 60, height: 60)
+                                .accessibilityLabel("选择屏幕广播应用")
+                                .accessibilityHint("点击选择「实时字幕」，然后切到要看的 App")
                             Text("点圆形按钮 → 选「实时字幕」→ 开始直播，然后切到要看的 App")
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
@@ -116,6 +118,7 @@ private struct MicSection: View {
                 Text(statusText)
                     .font(.caption)
                     .foregroundStyle(statusColor)
+                    .accessibilityLabel("麦克风状态：\(statusText)")
                 if let denied = model.mic.speechDeniedHint {
                     Text(denied)
                         .font(.caption)
@@ -136,6 +139,8 @@ private struct PiPSection: View {
                 PiPHostView(pipManager: model.pip)
                     .frame(height: 90)
                     .background(Color(.systemGray6), in: .rect(cornerRadius: DesignTokens.Radius.small))
+                    .accessibilityLabel("画中画预览")
+                    .accessibilityHidden(!model.pip.isPictureInPicturePossible)
                 Button {
                     model.pip.isPiPActive ? model.pip.stopPiP() : model.pip.startPiP()
                 } label: {

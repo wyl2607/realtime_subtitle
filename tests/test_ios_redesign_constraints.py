@@ -1372,3 +1372,207 @@ def test_start_mic_intent_does_not_claim_capture_started():
     assert "DesignTokens.Text.micStarting" in start_case
     assert tokens["micStarting"] == "正在启动麦克风字幕"
     assert "已开始麦克风字幕" not in start_case
+
+
+def test_hc_u21_accessibility_and_dynamic_type():
+    """硬约束 HC-U21：无障碍标签与动态字体。
+
+    1. 只有图标、没有文字的 Button/Image 必须带 accessibilityLabel 或 accessibilityHidden(true)。
+       检测范围：LivePage、DiagnosticsPage、RootView（Pages 目录下）及 SubtitleCardView、LiveCaptionsView。
+    2. SubtitleCardView 和 LiveCaptionsView 中不得出现未经 ScaledMetric/relativeTo 缩放的
+       `.font(.system(size:` 固定字号——用户设定的字号要通过 @ScaledMetric 等比放大。
+
+    违反 1：纯图标按钮/图片对盲人用户不可见。
+    违反 2：固定字号忽视系统「更大字体」设置，视力受损用户无法放大字幕。
+    """
+    target_pages = ["LivePage", "DiagnosticsPage", "RootView", "SettingsPage"]
+    target_views = ["SubtitleCardView", "LiveCaptionsView"]
+    pages_dir = IOS / "RSiOS" / "Pages"
+    rsiOS_dir = IOS / "RSiOS"
+
+    # ── 规则 1：纯图标 Button / Image 必须有 accessibilityLabel 或 accessibilityHidden ──
+    # 只扫上述 target 文件，其余页面（HistoryPage / SettingsPage 等）由各自任务保证。
+    target_files = (
+        [pages_dir / f"{name}.swift" for name in target_pages]
+        + [rsiOS_dir / f"{name}.swift" for name in target_views]
+    )
+    # 先遮蔽字符串和注释，再用配对括号定位闭包。不能用正则截到第一个 `}`：
+    # Button 的 action/label 闭包和 modifier 参数里都可能有嵌套闭包。
+    def masked_swift(source):
+        out = list(source)
+        i = 0
+        block_depth = 0
+        while i < len(source):
+            if block_depth:
+                if source.startswith("/*", i):
+                    out[i:i + 2] = "  "; i += 2; block_depth += 1; continue
+                if source.startswith("*/", i):
+                    out[i:i + 2] = "  "; i += 2; block_depth -= 1; continue
+                if source[i] != "\n": out[i] = " "
+                i += 1
+                continue
+            if source.startswith("//", i):
+                out[i:i + 2] = "  "; i += 2
+                while i < len(source) and source[i] != "\n": out[i] = " "; i += 1
+                continue
+            if source.startswith("/*", i):
+                out[i:i + 2] = "  "; i += 2; block_depth = 1; continue
+            if source.startswith('"""', i):
+                out[i:i + 3] = "   "; i += 3
+                while i < len(source) and not source.startswith('"""', i):
+                    if source[i] != "\n": out[i] = " "
+                    i += 1
+                if i < len(source): out[i:i + 3] = "   "; i += 3
+                continue
+            if source[i] == '"':
+                out[i] = " "; i += 1
+                while i < len(source) and source[i] != '"':
+                    if source[i] == "\\" and i + 1 < len(source):
+                        out[i] = " "; out[i + 1] = " " if source[i + 1] != "\n" else "\n"; i += 2
+                    else:
+                        if source[i] != "\n": out[i] = " "
+                        i += 1
+                if i < len(source): out[i] = " "; i += 1
+                continue
+            i += 1
+        return "".join(out)
+
+    def delimiter_pairs(source):
+        pairs, stack = {}, []
+        opens = "({["; closes = ")}]"; matching = dict(zip(closes, opens))
+        for index, char in enumerate(source):
+            if char in opens: stack.append((char, index))
+            elif char in closes and stack and stack[-1][0] == matching[char]:
+                _, start = stack.pop(); pairs[start] = index; pairs[index] = start
+        return pairs
+
+    def depth_before(source):
+        depths, depth = [0] * (len(source) + 1), 0
+        for index, char in enumerate(source):
+            depths[index] = depth
+            if char in "({[": depth += 1
+            elif char in ")}]": depth -= 1
+        depths[len(source)] = depth
+        return depths
+
+    def next_code(source, index):
+        while index < len(source) and source[index].isspace(): index += 1
+        return index
+
+    def modifier_chain(source, depths, end, base_depth):
+        """Return modifiers after a view expression, stopping at the next sibling."""
+        index = end + 1
+        while index < len(source):
+            if source[index] == "\n":
+                sibling = next_code(source, index + 1)
+                if sibling >= len(source) or depths[sibling] <= base_depth and source[sibling] != ".":
+                    return source[end:sibling]
+            if depths[index] < base_depth:
+                return source[end:index]
+            index += 1
+        return source[end:]
+
+    def icon_only_label(body):
+        # Strings are already blank, so only actual view calls remain. A label that
+        # contains Text/Label/another view is deliberately not classified as icon-only.
+        return bool(re.search(r"\b(?:Image|Circle)\s*\(", body)) and not re.search(
+            r"\b(?:Text|Label|ProgressView|HStack|VStack|ZStack|LabeledContent)\s*\(", body
+        )
+
+    def accessibility_in(chain):
+        return bool(re.search(r"\.accessibilityLabel\s*\(", chain)) or bool(
+            re.search(r"\.accessibilityHidden\s*\(\s*true\s*\)", chain)
+        )
+
+    def icon_button_end(source, masked, pairs, depths, button):
+        base = depths[button]
+        cursor = next_code(masked, button + len("Button"))
+        if cursor >= len(masked): return None
+        if masked[cursor] == "(":
+            close = pairs.get(cursor)
+            if close is None: return None
+            labels = [m for m in re.finditer(r"\blabel\s*:", masked[cursor + 1:close])
+                      if depths[cursor + 1 + m.start()] == base + 1]
+            if not labels: return None
+            brace = next_code(masked, cursor + 1 + labels[-1].end())
+        elif masked[cursor] == "{":
+            action_end = pairs.get(cursor)
+            if action_end is None: return None
+            label = re.search(r"\blabel\s*:", masked[action_end + 1:])
+            if not label: return None
+            brace = next_code(masked, action_end + 1 + label.end())
+        else:
+            return None
+        if brace >= len(masked) or masked[brace] != "{": return None
+        close = pairs.get(brace)
+        if close is None: return None
+        body = masked[brace + 1:close]
+        return close if icon_only_label(body) else None
+
+    offenders_label = []
+    for path in target_files:
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        masked = masked_swift(text)
+        pairs = delimiter_pairs(masked)
+        depths = depth_before(masked)
+        for m in re.finditer(r"\bButton\b", masked):
+            end = icon_button_end(text, masked, pairs, depths, m.start())
+            if end is not None and not accessibility_in(modifier_chain(masked, depths, end, depths[m.start()])):
+                offenders_label.append(_locate(path, text, m.start()))
+        for m in re.finditer(r"\bLabel\s*\(", masked):
+            open_paren = masked.find("(", m.start(), m.end())
+            close = pairs.get(open_paren)
+            if close is None: continue
+            chain = modifier_chain(masked, depths, close, depths[m.start()])
+            if re.search(r"\.labelStyle\s*\(\s*\.iconOnly\s*\)", chain) and not accessibility_in(chain):
+                offenders_label.append(_locate(path, text, m.start()))
+        # BroadcastPickerView is the system's icon-only picker control; PiPHostView
+        # is its icon-only preview surface. They are custom views, so the Button/Label
+        # syntax above cannot see their visual-only label.
+        for m in re.finditer(r"\b(?:BroadcastPickerView|PiPHostView)\s*\(", masked):
+            open_paren = masked.find("(", m.start(), m.end())
+            close = pairs.get(open_paren)
+            if close is not None and not accessibility_in(modifier_chain(masked, depths, close, depths[m.start()])):
+                offenders_label.append(_locate(path, text, m.start()))
+    assert not offenders_label, (
+        "HC-U21 违反（规则 1）：以下纯图标控件缺少 accessibilityLabel/"
+        "accessibilityHidden(true)：" + ", ".join(offenders_label)
+        + "。请为控件补 .accessibilityLabel(\"…\") 或 .accessibilityHidden(true)。"
+    )
+
+    # ── 规则 2：SubtitleCardView / LiveCaptionsView 不得有裸的 .font(.system(size: ──
+    # 允许的写法：.font(.system(size: someScaledMetricVar ...)) — scaledMetricVar 由 @ScaledMetric 派生。
+    # 禁止的写法：.font(.system(size: DesignTokens.TypeScale.xxx 或字面量，且该值不经任何运算)。
+    # 简化检测：在这两个文件里只要出现 .font(.system(size: 且同行 / 附近没有
+    # @ScaledMetric / scaledSize / scaledBodySize / statusFontSize / scaledDraftSize / resolvedSize，
+    # 就报错。
+    scaled_vars = {
+        "scaledSize", "scaledBodySize", "statusFontSize", "scaledDraftSize", "resolvedSize",
+        "scaledSourceSize", "scaledTranslationSize",
+    }
+    view_files = [rsiOS_dir / f"{name}.swift" for name in target_views]
+    offenders_font = []
+    for path in view_files:
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        for m in re.finditer(r'\.font\(\.system\(size:', text):
+            # 取该行
+            line_start = text.rfind('\n', 0, m.start()) + 1
+            line_end = text.find('\n', m.start())
+            line = text[line_start:line_end if line_end != -1 else len(text)]
+            # 也检查下一行（多行写法）
+            next_line = ""
+            if line_end != -1:
+                nl2 = text.find('\n', line_end + 1)
+                next_line = text[line_end + 1:nl2 if nl2 != -1 else len(text)]
+            combined = line + next_line
+            if not any(v in combined for v in scaled_vars):
+                offenders_font.append(_locate(path, text, m.start()))
+    assert not offenders_font, (
+        "HC-U21 违反（规则 2）：SubtitleCardView/LiveCaptionsView 出现未经 ScaledMetric 缩放的"
+        " .font(.system(size:：" + ", ".join(offenders_font)
+        + "。字幕字号须以用户设置为基准通过 @ScaledMetric 等比放大（动态字体支持）。"
+    )

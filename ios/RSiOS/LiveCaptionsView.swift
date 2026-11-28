@@ -15,17 +15,28 @@ struct LiveCaptionsView: View {
     /// 用户是不是停在底部：只有在底部时新句才自动滚过去。
     @State private var followsLatest = true
 
+    // 状态行用语义字号，跟随系统动态字体。
+    @ScaledMetric(relativeTo: .caption) private var statusFontSize: CGFloat = DesignTokens.TypeScale.status
+    // 草稿行字号以用户设置为基准通过 ScaledMetric 等比放大（见 scaledDraftSize）。
+    @ScaledMetric(relativeTo: .body) private var scaledBodySize: CGFloat = DesignTokens.TypeScale.subtitleDefault
+
+    private var scaledDraftSize: CGFloat {
+        let ratio = scaledBodySize / DesignTokens.TypeScale.subtitleDefault
+        return style.fontSize * DesignTokens.TypeScale.sourceScale * ratio
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: DesignTokens.Space.s) {
             Text(status?.label ?? DesignTokens.Text.micStatusIdle)
-                .font(.system(size: DesignTokens.TypeScale.status))
+                .font(.system(size: statusFontSize))
                 .foregroundStyle(Color(styleHex: statusHex))
+                .accessibilityHidden(true)   // 状态已通过整体 accessibilityValue 播报
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: DesignTokens.Space.pairGap) {
                     if lines.isEmpty && draft.isEmpty {
                         Text("暂无字幕")
-                            .font(.system(size: DesignTokens.TypeScale.status))
+                            .font(.system(size: statusFontSize))
                             .foregroundStyle(Color(styleHex: DesignTokens.Color.subtitleSecondary))
                     }
                     ForEach(lines, id: \.key) { line in
@@ -38,9 +49,10 @@ struct LiveCaptionsView: View {
                     }
                     if !draft.isEmpty {
                         Text(draft)
-                            .font(.system(size: style.fontSize * DesignTokens.TypeScale.sourceScale))
+                            .font(.system(size: scaledDraftSize))
                             .foregroundStyle(Color(styleHex: DesignTokens.Color.subtitleDraft))
                             .frame(maxWidth: .infinity, alignment: .leading)
+                            .accessibilityHidden(true)   // 草稿未定稿，不单独播报
                     }
                 }
                 .scrollTargetLayout()
@@ -65,6 +77,7 @@ struct LiveCaptionsView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .padding(DesignTokens.Space.s)
+                    // "回到最新" label 文字已明确，VoiceOver 能直接读出
                 }
             }
         }
@@ -74,7 +87,10 @@ struct LiveCaptionsView: View {
         .background(
             RoundedRectangle(cornerRadius: DesignTokens.Radius.card)
                 .fill(Color(styleHex: style.backgroundHex).opacity(style.backgroundOpacity))
+                .accessibilityHidden(true)
         )
+        .accessibilityLabel("实时字幕")
+        .accessibilityValue(status?.label ?? DesignTokens.Text.micStatusIdle)
     }
 
     private func scrollToLatestIfFollowing() {
