@@ -1832,3 +1832,134 @@ def test_hc_b08_pairing_links_validate_language_codes():
     selftest = (IOS / "Tests" / "PairingSelftest.swift").read_text(encoding="utf-8")
     marker_checks = _swift_calls_containing_marker(selftest, "check", "HC-B08")
     assert marker_checks, "HC-B08 违反：PairingSelftest.swift 必须保留带 HC-B08 标记的失败用例 check( 调用。"
+
+
+def _mask_swift_comments_and_strings_b09(source: str) -> str:
+    """Replace Swift comments/string contents while preserving offsets and newlines."""
+    masked = list(source)
+    i = 0
+    while i < len(source):
+        if source.startswith("//", i):
+            end = source.find("\n", i)
+            end = len(source) if end < 0 else end
+            for j in range(i, end):
+                masked[j] = " "
+            i = end
+            continue
+        if source.startswith("/*", i):
+            depth = 1
+            j = i + 2
+            while j < len(source) and depth:
+                if source.startswith("/*", j):
+                    depth += 1
+                    j += 2
+                elif source.startswith("*/", j):
+                    depth -= 1
+                    j += 2
+                else:
+                    j += 1
+            for k in range(i, min(j, len(source))):
+                if source[k] != "\n":
+                    masked[k] = " "
+            i = j
+            continue
+        if source[i] == "#":
+            hashes = 0
+            while i + hashes < len(source) and source[i + hashes] == "#":
+                hashes += 1
+            quote = i + hashes
+            if quote < len(source) and source[quote] == '"':
+                triple = source.startswith('"""', quote)
+                closing = ('"""' if triple else '"') + ("#" * hashes)
+                end = source.find(closing, quote + 1)
+                end = len(source) if end < 0 else end + len(closing)
+                for j in range(i, end):
+                    if source[j] != "\n":
+                        masked[j] = " "
+                i = end
+                continue
+        if source[i] == '"':
+            triple = source.startswith('"""', i)
+            closing = '"""' if triple else '"'
+            if triple:
+                end = source.find(closing, i + len(closing))
+                end = len(source) if end < 0 else end + len(closing)
+            else:
+                end = i + 1
+                while end < len(source):
+                    if source[end] == "\\":
+                        end += 2
+                    elif source[end] == '"':
+                        end += 1
+                        break
+                    else:
+                        end += 1
+                end = min(end, len(source))
+            for j in range(i, end):
+                if source[j] != "\n":
+                    masked[j] = " "
+            i = end
+            continue
+        i += 1
+    return "".join(masked)
+
+
+def _extract_brace_block_b09(source: str, function_pattern: str) -> str:
+    """Return a function body after masking comments and literals, using balanced braces."""
+    masked = _mask_swift_comments_and_strings_b09(source)
+    match = re.search(function_pattern, masked)
+    assert match, f"未找到目标函数：{function_pattern}"
+    opening = masked.find("{", match.end())
+    assert opening >= 0, f"目标函数没有函数体：{function_pattern}"
+    depth = 0
+    for index in range(opening, len(masked)):
+        if masked[index] == "{":
+            depth += 1
+        elif masked[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return masked[opening + 1:index]
+    raise AssertionError(f"目标函数的大括号未配对：{function_pattern}")
+
+
+def test_hc_b09_cloud_segments_reject_invalid_times():
+    """硬约束 HC-B09：云端响应中的每个 segment 时间必须有限、非负且按序。
+
+    来源 bug：CloudClient.parse 曾把服务端 start/end 原样加到 a0，非法时间会进入首/末段
+    字幕区间，导致下游生成错误字幕范围。必须整条响应 decodeFailed，不能把部分结果继续下传。
+    这条约束同时锁住 parse 函数体内的校验顺序和 Swift 自测中的非法/重叠用例；改回旧实现
+    时这些检查会缺失且自测会变红。
+    """
+    cloud = (IOS / "Shared" / "CloudClient.swift").read_text(encoding="utf-8")
+    body = _extract_brace_block_b09(cloud, r"\bstatic\s+func\s+parse\s*\(")
+    for condition in [
+        "segment.start.isFinite",
+        "segment.end.isFinite",
+        "segment.start >= 0",
+        "segment.end >= segment.start",
+        "segment.start >= previousStart",
+        "CloudClientError.decodeFailed(quota: quota)",
+    ]:
+        assert condition in body, (
+            f"HC-B09 违反：CloudClient.parse 函数体缺少 `{condition}`。来源 bug 是服务端非法 segment 时间"
+            " 被原样映射到 a0 后进入下游字幕区间；必须整条响应 decodeFailed。"
+        )
+    assert "previousEnd" not in body, "HC-B09 违反：parse 不得用 previousEnd 禁止字幕重叠/嵌套。"
+    decoded_at = body.index("JSONDecoder().decode")
+    validation_at = body.index("for segment in decoded.segments")
+    mapping_at = body.index("a0 +")
+    assert decoded_at < validation_at < mapping_at, (
+        "HC-B09 违反：segment 校验必须在 JSON 解码后、映射 a0 前执行。"
+    )
+    selftest = (IOS / "Tests" / "CloudClientSelftest.swift").read_text(encoding="utf-8")
+    selftest_without_comments = re.sub(r"//[^\n]*|/\*.*?\*/", "", selftest, flags=re.S)
+    for marker in ["-0.1", "reversed", "1e309", "later", "earlier", "overlap"]:
+        assert marker in selftest_without_comments, (
+            f"HC-B09 违反：CloudClientSelftest 缺少 `{marker}` segment 用例；"
+            "改回旧实现时必须能证明该 bug 重新出现。"
+        )
+    hc_b09_checks = re.findall(r"\bcheck\s*\([^\n]*HC-B09", selftest_without_comments)
+    assert len(hc_b09_checks) >= 2, (
+        "HC-B09 违反：CloudClientSelftest 至少要有两个带 HC-B09 标记的 check( 调用；"
+        "注释/字符串中的 marker 不计数。"
+    )
