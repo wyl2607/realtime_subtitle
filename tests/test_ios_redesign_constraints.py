@@ -381,6 +381,131 @@ def test_hc_u17_retry_followups_generation_and_single_waiter():
     )
 
 
+def _skip_comment(text: str, idx: int) -> int | None:
+    """若 idx 处是 Swift 行/块注释起点，返回注释结束后的下标；否则返回 None。"""
+    if text.startswith("//", idx):
+        nl = text.find("\n", idx + 2)
+        return len(text) if nl == -1 else nl + 1
+    if text.startswith("/*", idx):
+        depth = 1
+        i = idx + 2
+        n = len(text)
+        while i < n and depth > 0:
+            if text.startswith("/*", i):
+                depth += 1
+                i += 2
+            elif text.startswith("*/", i):
+                depth -= 1
+                i += 2
+            else:
+                i += 1
+        return i
+    return None
+
+
+def _skip_string_literal(text: str, idx: int) -> int:
+    """跳过 Swift 字符串字面量（含转义、多行字符串与 \\(...) 插值），返回结束后的下标。"""
+    n = len(text)
+    if text.startswith('"""', idx):
+        delim = '"""'
+        i = idx + 3
+    else:
+        delim = '"'
+        i = idx + 1
+    while i < n:
+        if text[i] == "\\":
+            if i + 1 < n and text[i + 1] == "(":
+                i = _skip_balanced(text, i + 1, "(", ")")
+            else:
+                i += 2
+            continue
+        if text.startswith(delim, i):
+            return i + len(delim)
+        i += 1
+    return n
+
+
+def _skip_balanced(text: str, open_idx: int, open_ch: str, close_ch: str) -> int:
+    """从 open_idx 处的开括号起做配对扫描（忽略字符串与注释里的括号），返回闭括号后下标。"""
+    n = len(text)
+    assert text[open_idx] == open_ch, f"期望 {open_ch!r}，实际为 {text[open_idx]!r}"
+    depth = 1
+    i = open_idx + 1
+    while i < n and depth > 0:
+        comment_end = _skip_comment(text, i)
+        if comment_end is not None:
+            i = comment_end
+            continue
+        if text[i] == '"':
+            i = _skip_string_literal(text, i)
+            continue
+        if text[i] == open_ch:
+            depth += 1
+        elif text[i] == close_ch:
+            depth -= 1
+        i += 1
+    assert depth == 0, f"括号未闭合：{open_ch}{close_ch}（起点下标 {open_idx}）"
+    return i
+
+
+def _blank_swift_comments(text: str) -> str:
+    """将 Swift 注释替换为空格（保留换行与字符串字面量），保持所有字符下标与行号不变。"""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        comment_end = _skip_comment(text, i)
+        if comment_end is not None:
+            out.append("".join("\n" if ch == "\n" else " " for ch in text[i:comment_end]))
+            i = comment_end
+            continue
+        if text[i] == '"':
+            str_end = _skip_string_literal(text, i)
+            out.append(text[i:str_end])
+            i = str_end
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+def _extract_braced_block(text: str, header_pattern: str, *, start: int = 0) -> tuple[str, int, int]:
+    """按 header_pattern（末尾含 `{`）提取括号配对块，返回 `(块文本, 左括号下标, 闭括号后下标)`。"""
+    m = re.search(header_pattern, text[start:])
+    assert m is not None, f"HC-U19 违反：未找到代码块 {header_pattern!r}。"
+    open_idx = start + m.end() - 1
+    end_idx = _skip_balanced(text, open_idx, "{", "}")
+    return text[open_idx:end_idx], open_idx, end_idx
+
+
+def _extract_func_bodies(text: str, name: str) -> list[str]:
+    """提取所有同名 Swift 函数体（支持多行/嵌套括号参数列表），按括号配对截断。"""
+    bodies: list[str] = []
+    for m in re.finditer(rf"\bfunc\s+{re.escape(name)}\s*\(", text):
+        param_end = _skip_balanced(text, m.end() - 1, "(", ")")
+        brace_match = re.match(r"[^{;]*?\{", text[param_end:])
+        assert brace_match is not None, f"HC-U19 违反：函数 {name} 缺少函数体。"
+        open_idx = param_end + brace_match.end() - 1
+        end_idx = _skip_balanced(text, open_idx, "{", "}")
+        bodies.append(text[open_idx:end_idx])
+    return bodies
+
+
+def _extract_button_action_label_spans(text: str) -> list[tuple[str, int, int]]:
+    """提取所有 `Button { action } label: { label }` 的 `(action文本, label起点, label终点)`。"""
+    spans: list[tuple[str, int, int]] = []
+    for m in re.finditer(r"\bButton\s*\{", text):
+        action_open = m.end() - 1
+        action_end = _skip_balanced(text, action_open, "{", "}")
+        label_match = re.match(r"\s*label:\s*\{", text[action_end:])
+        if label_match is None:
+            continue
+        label_open = action_end + label_match.end() - 1
+        label_end = _skip_balanced(text, label_open, "{", "}")
+        spans.append((text[action_open:action_end], label_open, label_end))
+    return spans
+
+
 def test_hc_u19_transcript_untranslated_retry():
     """硬约束 HC-U19：回看页「未翻译 ⟳」可点按重新翻译，只用已安装本机资源且有超时，新文案只来自 DesignTokens。
 
@@ -389,49 +514,134 @@ def test_hc_u19_transcript_untranslated_retry():
     会脱离 design/tokens.json 三端令牌同步。
     """
     view = (IOS / "RSiOS" / "TranscriptView.swift").read_text(encoding="utf-8")
-    # 1. 未翻译占位必须在 Button 里并调用重试（不允许退回裸 Text）。
-    untranslated_button = re.search(
-        r"Button\s*\{([^}]*retryTranslation\([^}]*)\}\s*label:\s*\{.*?DesignTokens\.Text\.untranslated.*?\}"
-        r".*?\.accessibilityLabel\(DesignTokens\.Text\.retryTranslation\)",
-        view,
-        re.S,
-    )
-    assert untranslated_button is not None, (
-        "HC-U19 违反：TranscriptView 的 DesignTokens.Text.untranslated 不在调用 retryTranslation 的 Button 内"
-        "或缺少 DesignTokens.Text.retryTranslation 无障碍标签。"
-    )
-    # 确认没有脱离 Button 的裸 Text(DesignTokens.Text.untranslated)（比如旧实现 if line.dst.isEmpty { Text(...) }）。
-    for m in re.finditer(r"Text\(DesignTokens\.Text\.untranslated\)", view):
-        prefix = view[max(0, m.start() - 250):m.start()]
-        assert "Button" in prefix and "label:" in prefix, (
-            "HC-U19 违反：TranscriptView 出现不在 Button label 里的 Text(DesignTokens.Text.untranslated)。"
-        )
-    # contextMenu 里也必须有「重新翻译」按钮。
-    context_menu = view[view.index(".contextMenu"):]
-    assert "Button(DesignTokens.Text.retryTranslation)" in context_menu and "retryTranslation(" in context_menu, (
-        "HC-U19 违反：TranscriptView 的 contextMenu 缺少重新翻译入口。"
+    view_code = _blank_swift_comments(view)
+
+    # 1. 回看页未翻译分支必须在 Button action 中调用 retryTranslation，且无障碍标签与文案令牌配对。
+    card_bodies = _extract_func_bodies(view_code, "card")
+    assert len(card_bodies) == 1, "HC-U19 违反：TranscriptView 必须存在唯一的 card 函数。"
+    card_body = card_bodies[0]
+    needs_tx_block, _, _ = _extract_braced_block(card_body, r"\bif\s+needsTranslation\s*\{")
+    assert "untranslatedButton(" in needs_tx_block and "Text(DesignTokens.Text.untranslated)" not in needs_tx_block, (
+        "HC-U19 违反：TranscriptView.card 的未翻译分支必须调用 untranslatedButton，不得退回裸 Text。"
     )
 
-    # 2. RetryTranslator 必须用 installedSource，不能用触发下载的初始化，且有超时和去重。
-    translator = (IOS / "RSiOS" / "RetryTranslator.swift").read_text(encoding="utf-8")
-    assert "TranslationSession(installedSource:" in translator, (
-        "HC-U19 违反：RetryTranslator 必须使用 TranslationSession(installedSource:target:)。"
+    untranslated_bodies = _extract_func_bodies(view_code, "untranslatedButton")
+    assert len(untranslated_bodies) == 1, "HC-U19 违反：TranscriptView 必须存在唯一的 untranslatedButton 函数。"
+    untranslated_body = untranslated_bodies[0]
+    untranslated_buttons = _extract_button_action_label_spans(untranslated_body)
+    assert any(
+        "retryTranslation(" in action
+        and "DesignTokens.Text.untranslated" in untranslated_body[l_start:l_end]
+        and "DesignTokens.Text.translating" in untranslated_body[l_start:l_end]
+        for action, l_start, l_end in untranslated_buttons
+    ), (
+        "HC-U19 违反：untranslatedButton 的 Button action 必须调用 retryTranslation，"
+        "且同一个 Button 的 label 必须使用 DesignTokens.Text.untranslated 与 DesignTokens.Text.translating。"
     )
-    assert "prepareTranslation(" not in translator, (
+    assert ".accessibilityLabel(DesignTokens.Text.retryTranslation)" in untranslated_body, (
+        "HC-U19 违反：untranslatedButton 缺少 DesignTokens.Text.retryTranslation 无障碍标签。"
+    )
+
+    # 确认 TranscriptView 中所有 DesignTokens.Text.untranslated 都位于调用 retryTranslation 的 Button label 区间内。
+    all_button_spans = _extract_button_action_label_spans(view_code)
+    for m in re.finditer(r"\bDesignTokens\.Text\.untranslated\b", view_code):
+        in_retry_button_label = any(
+            l_start <= m.start() < l_end and "retryTranslation(" in action
+            for action, l_start, l_end in all_button_spans
+        )
+        assert in_retry_button_label, (
+            f"HC-U19 违反：{_locate(IOS / 'RSiOS' / 'TranscriptView.swift', view, m.start())} "
+            "出现不在调用 retryTranslation 的 Button label 里的 DesignTokens.Text.untranslated。"
+        )
+
+    # contextMenu 区间内也必须有调用 retryTranslation 的「重新翻译」按钮。
+    context_menu, _, _ = _extract_braced_block(card_body, r"\.contextMenu\s*\{")
+    ctx_retry_action, _, _ = _extract_braced_block(
+        context_menu, r"\bButton\s*\(\s*DesignTokens\.Text\.retryTranslation\s*\)\s*\{"
+    )
+    assert "retryTranslation(" in ctx_retry_action, (
+        "HC-U19 违反：TranscriptView 的 contextMenu 中重新翻译按钮未调用 retryTranslation。"
+    )
+
+    # 重译入口（retryTranslation）必须在成功翻译后写回对应存档行并刷新列表，且不触网/不弹下载。
+    retry_bodies = _extract_func_bodies(view_code, "retryTranslation")
+    assert len(retry_bodies) == 1, "HC-U19 违反：TranscriptView 必须存在唯一的 retryTranslation 函数。"
+    retry_body = retry_bodies[0]
+    assert "RetryTranslationPolicy.canRetry(" in retry_body, (
+        "HC-U19 违反：retryTranslation 必须通过 RetryTranslationPolicy.canRetry 校验重试条件。"
+    )
+    task_body, _, _ = _extract_braced_block(retry_body, r"\bTask\s*\{")
+    do_body, _, _ = _extract_braced_block(task_body, r"\bdo\s*\{")
+    assert "translator.translate(" in do_body and "store.updateTranslation(" in do_body, (
+        "HC-U19 违反：retryTranslation 必须调用 translator.translate 并将结果写回 store.updateTranslation。"
+    )
+    assert do_body.index("translator.translate(") < do_body.index("store.updateTranslation("), (
+        "HC-U19 违反：retryTranslation 必须先翻译成功再调用 store.updateTranslation 写回。"
+    )
+    saved_body, _, _ = _extract_braced_block(do_body, r"\bif\s+saved\s*\{")
+    assert "reload()" in saved_body, (
+        "HC-U19 违反：retryTranslation 写回存档成功后必须调用 reload() 刷新回看列表。"
+    )
+    assert not re.search(r"\bprepareTranslation\s*\(", view_code), (
+        "HC-U19 违反：TranscriptView 不得调用 prepareTranslation()。"
+    )
+    assert "TranslationSession.Configuration" not in view_code and ".translationTask" not in view_code, (
+        "HC-U19 违反：TranscriptView 不得使用 TranslationSession.Configuration / .translationTask。"
+    )
+
+    # 2. RetryTranslator 必须仅走 installed 路径、先查已安装状态、不调 prepareTranslation，且有超时和去重。
+    translator = (IOS / "RSiOS" / "RetryTranslator.swift").read_text(encoding="utf-8")
+    translator_code = _blank_swift_comments(translator)
+    actor_body, _, _ = _extract_braced_block(translator_code, r"\bactor\s+RetryTranslator\s*\{")
+
+    translate_bodies = _extract_func_bodies(actor_body, "translate")
+    assert len(translate_bodies) == 1, "HC-U19 违反：RetryTranslator 必须存在唯一的 translate 函数。"
+    translate_body = translate_bodies[0]
+    assert "inFlight.begin(" in translate_body, (
+        "HC-U19 违反：RetryTranslator.translate 必须做同句并发去重，避免重复点按排队。"
+    )
+    assert "LanguageAvailability" in translate_body and ".installed" in translate_body, (
+        "HC-U19 违反：RetryTranslator.translate 必须先检查本机翻译资源是否已安装。"
+    )
+    assert "translateWithTimeout(" in translate_body, (
+        "HC-U19 违反：RetryTranslator.translate 必须调用带超时的 translateWithTimeout。"
+    )
+    assert translate_body.index(".installed") < translate_body.index("translateWithTimeout("), (
+        "HC-U19 违反：RetryTranslator.translate 必须在确认 .installed 后才执行翻译。"
+    )
+
+    timeout_bodies = _extract_func_bodies(actor_body, "translateWithTimeout")
+    assert len(timeout_bodies) == 1, "HC-U19 违反：RetryTranslator 必须存在唯一的 translateWithTimeout 函数。"
+    timeout_body = timeout_bodies[0]
+    assert "TranslationSession(installedSource:" in timeout_body and "session.translate(" in timeout_body, (
+        "HC-U19 违反：RetryTranslator.translateWithTimeout 必须使用 TranslationSession(installedSource:target:) 执行翻译。"
+    )
+    assert "translationTimeout" in timeout_body, (
+        "HC-U19 违反：RetryTranslator.translateWithTimeout 必须对单句翻译设置超时。"
+    )
+    for m in re.finditer(r"\bTranslationSession\s*\(", translator_code):
+        assert translator_code[m.end():].lstrip().startswith("installedSource:"), (
+            f"HC-U19 违反：{_locate(IOS / 'RSiOS' / 'RetryTranslator.swift', translator, m.start())} "
+            "使用了 installedSource 以外的 TranslationSession 初始化。"
+        )
+    assert not re.search(r"\bprepareTranslation\s*\(", translator_code), (
         "HC-U19 违反：RetryTranslator 不得调用 prepareTranslation()——它会请求下载语言资源，重试只能用已安装资源。"
     )
-    assert "TranslationSession.Configuration" not in translator and ".translationTask" not in translator, (
+    assert "TranslationSession.Configuration" not in translator_code and ".translationTask" not in translator_code, (
         "HC-U19 违反：RetryTranslator 不得使用会触发系统下载弹窗的 TranslationSession.Configuration / .translationTask。"
     )
-    assert "LanguageAvailability" in translator and ".installed" in translator, (
-        "HC-U19 违反：RetryTranslator 必须先检查本机翻译资源是否已安装。"
-    )
-    assert "translationTimeout" in translator and "translateWithTimeout" in translator and "session.translate(" in translator, (
-        "HC-U19 违反：RetryTranslator 必须对单句翻译设置超时。"
-    )
-    assert "inFlight.begin(" in translator, (
-        "HC-U19 违反：RetryTranslator 必须做同句并发去重，避免重复点按排队。"
-    )
+
+    # 3. TranscriptStore.updateTranslation 必须按行校对并原地更新译文与标脏落盘。
+    store = (IOS / "RSiOS" / "TranscriptStore.swift").read_text(encoding="utf-8")
+    store_code = _blank_swift_comments(store)
+    update_bodies = _extract_func_bodies(store_code, "updateTranslation")
+    assert any(
+        "rows[line.id].time == line.time" in body
+        and "rows[line.id].src == line.src" in body
+        and "rows[line.id].dst = cleanDst" in body
+        and "scheduleWrite()" in body
+        for body in update_bodies
+    ), "HC-U19 违反：TranscriptStore.updateTranslation 必须校验行身份后原地更新 dst 并调度写盘。"
 
     policy = (IOS / "RSiOS" / "RetryTranslationPolicy.swift").read_text(encoding="utf-8")
     timeout_match = re.search(r"translationTimeout\s*:\s*TimeInterval\s*=\s*([0-9.]+)", policy)
@@ -439,13 +649,10 @@ def test_hc_u19_transcript_untranslated_retry():
         "HC-U19 违反：RetryTranslationPolicy.translationTimeout 缺失或不在 5-20 秒范围内。"
     )
 
-    # 3. 新文案只来自 DesignTokens（不在视图或翻译器里写死字面量）。
+    # 4. 新文案只来自 DesignTokens（不在视图或翻译器里写死字面量）。
     for path, src in ((IOS / "RSiOS" / "TranscriptView.swift", view), (IOS / "RSiOS" / "RetryTranslator.swift", translator)):
         for literal in ("重新翻译", "本机翻译资源未安装", "翻译超时", "翻译失败", "点按重试", "翻译中"):
             for m in re.finditer(rf'"[^"]*{re.escape(literal)}[^"]*"', src):
                 raise AssertionError(
                     f"HC-U19 违反：{_locate(path, src, m.start())} 写死了新文案字面量，必须改用 DesignTokens.Text.*"
                 )
-    assert "DesignTokens.Text.translating" in view, (
-        "HC-U19 违反：TranscriptView 进行中提示必须使用 DesignTokens.Text.translating。"
-    )
